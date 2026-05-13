@@ -1,0 +1,17 @@
+{
+  "entries": ["tests/fixtures/forwarder.ts"],
+  "targets": {
+    "release": {
+      "outFile": "build/forwarder.wasm",
+      "textFile": "build/forwarder.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": false,
+      "noAssert": true,
+      "exportRuntime": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}

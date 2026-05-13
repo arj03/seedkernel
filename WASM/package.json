@@ -1,0 +1,28 @@
+{
+  "name": "seedkernel-wasm",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:kernel": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target release",
+    "build:bootstrap": "asc assembly/bootstrap/index.ts --config asconfig.bootstrap.json --target release",
+    "build:forwarder": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release",
+    "build:chat-app-v1": "asc assembly/chat-app-v1/index.ts --config asconfig.chat-app-v1.json --target release && node scripts/embed-ui.mjs build/chat-app-v1.wasm assembly/chat-app-v1/ui.html build/chat-app-v1.wasm",
+    "build:chat-app-v2": "asc assembly/chat-app-v2/index.ts --config asconfig.chat-app-v2.json --target release && node scripts/embed-ui.mjs build/chat-app-v2.wasm assembly/chat-app-v2/ui.html build/chat-app-v2.wasm",
+    "build:host": "tsc -p host",
+    "build:browser-sodium": "node scripts/build-libsodium.mjs",
+    "build": "npm run build:kernel && npm run build:bootstrap && npm run build:forwarder && npm run build:host",
+    "build:browser": "npm run build && npm run build:chat-app-v1 && npm run build:chat-app-v2 && npm run build:browser-sodium",
+    "build:debug": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target debug && asc assembly/bootstrap/index.ts --config asconfig.bootstrap.json --target debug",
+    "chat:relay": "node scripts/relay.mjs",
+    "test": "npm run build && node tests/run.mjs"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "0.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "assemblyscript": "0.28.14",
+    "typescript": "^5.4.0"
+  }
+}

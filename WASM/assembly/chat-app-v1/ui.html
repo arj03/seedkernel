@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>chat-app v1</title>
+<style>
+  /* ── cyberpunk theme — v1 is the "retro install" that looks distinctly
+       different from v2, so swapping installs is visible at a glance. ── */
+  :root {
+    --bg:        #07030f;
+    --panel:    #0e0820;
+    --panel-2: #160c2c;
+    --line:      #2a134d;
+    --line-2:  #4a1f7a;
+    --text:      #e6dcff;
+    --muted:    #9d7bc9;
+    --neon:      #ff2e88;       /* hot pink */
+    --neon-2:  #00f5ff;         /* electric cyan */
+    --neon-3:  #b14bff;         /* violet glow */
+    --me:        #00f5ff;
+    --peer:    #ff2e88;
+    --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.45;
+    letter-spacing: 0.02em;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+    background-image:
+      radial-gradient(ellipse at top left,    rgba(255, 46, 136, 0.10), transparent 55%),
+      radial-gradient(ellipse at bottom right, rgba(0, 245, 255, 0.10), transparent 55%),
+      linear-gradient(rgba(177, 75, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(177, 75, 255, 0.04) 1px, transparent 1px);
+    background-size: auto, auto, 32px 32px, 32px 32px;
+    background-attachment: fixed;
+  }
+
+  header {
+    padding: 0.55em 0.8em;
+    border-bottom: 1px solid var(--line);
+    background:
+      linear-gradient(90deg, rgba(255, 46, 136, 0.08), rgba(0, 245, 255, 0.06)),
+      var(--panel);
+    box-shadow: 0 1px 0 rgba(255, 46, 136, 0.25), 0 2px 14px rgba(0, 0, 0, 0.4);
+  }
+  .badge {
+    display: inline-block;
+    padding: 0.2em 0.7em;
+    background: transparent;
+    color: var(--neon);
+    border: 1px solid var(--neon);
+    border-radius: 999px;
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    box-shadow: 0 0 8px rgba(255, 46, 136, 0.35), inset 0 0 6px rgba(255, 46, 136, 0.18);
+    text-shadow: 0 0 6px rgba(255, 46, 136, 0.6);
+  }
+
+  #log {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.7em 0.9em;
+    overscroll-behavior: contain;
+    scroll-behavior: smooth;
+  }
+  #log div { padding: 2px 0; word-wrap: break-word; word-break: break-word; }
+  #log::-webkit-scrollbar { width: 8px; }
+  #log::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
+  #log::-webkit-scrollbar-thumb:hover { background: var(--neon-3); }
+
+  #form {
+    display: flex;
+    gap: 0.45em;
+    align-items: flex-end;
+    padding: 0.55em 0.75em calc(0.55em + env(safe-area-inset-bottom));
+    background:
+      linear-gradient(90deg, rgba(0, 245, 255, 0.06), rgba(255, 46, 136, 0.06)),
+      var(--panel);
+    border-top: 1px solid var(--line);
+    box-shadow: 0 -1px 0 rgba(0, 245, 255, 0.25);
+  }
+  #msg {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    padding: 0.6em 0.85em;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 4px;
+    font-size: 1em;
+    min-height: 40px;
+    letter-spacing: 0.02em;
+    transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  }
+  #msg::placeholder { color: var(--muted); }
+  #msg:focus {
+    outline: none;
+    border-color: var(--neon-2);
+    background: #0d0822;
+    box-shadow: 0 0 0 1px var(--neon-2), 0 0 12px rgba(0, 245, 255, 0.35);
+  }
+
+  button {
+    font-family: var(--mono);
+    background: transparent;
+    color: var(--neon);
+    border: 1px solid var(--neon);
+    border-radius: 4px;
+    padding: 0 1.1em;
+    cursor: pointer;
+    font-size: 0.9em;
+    min-height: 40px;
+    white-space: nowrap;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    box-shadow: 0 0 10px rgba(255, 46, 136, 0.25), inset 0 0 6px rgba(255, 46, 136, 0.12);
+    text-shadow: 0 0 6px rgba(255, 46, 136, 0.55);
+    transition: color 0.15s, background 0.15s, box-shadow 0.15s, border-color 0.15s, text-shadow 0.15s;
+  }
+  button:hover {
+    color: #07030f;
+    background: var(--neon);
+    border-color: var(--neon);
+    box-shadow: 0 0 18px rgba(255, 46, 136, 0.65), 0 0 32px rgba(255, 46, 136, 0.35);
+    text-shadow: none;
+  }
+  button:active { transform: translateY(1px); }
+
+  .me {
+    color: var(--me);
+    text-shadow: 0 0 6px rgba(0, 245, 255, 0.55);
+  }
+  .peer {
+    color: var(--peer);
+    text-shadow: 0 0 6px rgba(255, 46, 136, 0.55);
+  }
+  .sys { color: var(--muted); font-size: 0.85em; letter-spacing: 0.05em; }
+  .line-author { font-weight: 600; margin-right: 0.4em; }
+
+  @media (max-width: 720px) {
+    body { font-size: 14px; }
+    #log { padding: 0.55em 0.7em; }
+    #msg { font-size: 16px; }
+    header { padding: 0.45em 0.65em; }
+  }
+</style>
+</head>
+<body>
+
+<header><span class="badge">// chat-app v1 :: text-only</span></header>
+
+<div id="log"></div>
+
+<form id="form" autocomplete="off">
+  <input id="msg" type="text" placeholder="Message" autocapitalize="sentences" />
+  <button type="submit">Send</button>
+</form>
+
+<script>
+// chat-app v1 UI. Loaded into a sandboxed iframe by the shell.
+//
+// Protocol (postMessage with parent shell):
+//   parent → us: { type: "init",   pk: Uint8Array(32) }
+//   parent → us: { type: "render", payload: Uint8Array }
+//                  payload = [type u8][pk_len u8][pk ..][body ..]
+//   us → parent: { type: "ready" }              once the UI is wired up
+//   us → parent: { type: "send", chatType: 0,   body: Uint8Array }
+const CHAT_TYPE_TEXT = 0x00;
+
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const msgInput = document.getElementById("msg");
+let myPk = null;
+
+function shortPk(pk) {
+  return Array.from(pk.slice(0, 4)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function arraysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function isAtBottom() {
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 32;
+}
+function appendLine(node) {
+  const stick = isAtBottom();
+  log.appendChild(node);
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function print(text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  appendLine(line);
+}
+function printMessage(tag, text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  const author = document.createElement("span");
+  author.className = "line-author";
+  author.textContent = tag + ":";
+  line.appendChild(author);
+  line.appendChild(document.createTextNode(text));
+  appendLine(line);
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window.parent) return;
+  const msg = ev.data;
+  if (!msg) return;
+  if (msg.type === "init") {
+    myPk = new Uint8Array(msg.pk);
+    print(`You are ${shortPk(myPk)}. Invite a peer to start chatting.`, "sys");
+  } else if (msg.type === "sys") {
+    print(msg.text, "sys");
+  } else if (msg.type === "render") {
+    const payload = new Uint8Array(msg.payload);
+    let p = 0;
+    const type = payload[p++];
+    const pkLen = payload[p++];
+    if (p + pkLen > payload.length) return;
+    const pk = payload.slice(p, p + pkLen); p += pkLen;
+    const body = payload.slice(p);
+    if (type === CHAT_TYPE_TEXT) {
+      const isMe = myPk && arraysEqual(pk, myPk);
+      printMessage(shortPk(pk), new TextDecoder().decode(body), isMe ? "me" : "peer");
+    }
+  }
+});
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = msgInput.value;
+  if (!text) return;
+  window.parent.postMessage({
+    type: "send",
+    chatType: CHAT_TYPE_TEXT,
+    body: new TextEncoder().encode(text),
+  }, "*");
+  msgInput.value = "";
+  msgInput.focus();
+});
+
+window.parent.postMessage({ type: "ready" }, "*");
+msgInput.focus();
+</script>
+</body>
+</html>

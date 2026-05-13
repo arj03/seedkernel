@@ -1,0 +1,17 @@
+{
+  "entries": ["assembly/chat-app-v2/index.ts"],
+  "targets": {
+    "release": {
+      "outFile": "build/chat-app-v2.wasm",
+      "textFile": "build/chat-app-v2.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": false,
+      "noAssert": true,
+      "exportRuntime": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "entries": ["assembly/bootstrap/index.ts"],
+  "targets": {
+    "debug": {
+      "outFile": "build/bootstrap.debug.wasm",
+      "textFile": "build/bootstrap.debug.wat",
+      "sourceMap": true,
+      "debug": true,
+      "exportRuntime": true
+    },
+    "release": {
+      "outFile": "build/bootstrap.wasm",
+      "textFile": "build/bootstrap.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": false,
+      "noAssert": true,
+      "exportRuntime": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}

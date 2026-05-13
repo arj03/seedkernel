@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>chat-app v2</title>
+<style>
+  :root {
+    --bg:        #0e0f12;
+    --panel:    #16181d;
+    --panel-2: #1c1f25;
+    --line:      #2a2e36;
+    --line-2:  #3a3f49;
+    --text:      #d6d8dd;
+    --muted:    #8a8f99;
+    --me:        #6cc8ff;
+    --peer:    #7fd07f;
+    --err:      #ff6b6b;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.4;
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5em;
+    padding: 0.45em 0.7em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  .badge {
+    display: inline-block;
+    padding: 0.15em 0.55em;
+    background: #243524;
+    color: #b8d8b8;
+    border-radius: 999px;
+    font-size: 0.72em;
+  }
+  #nick-row {
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+    font-size: 0.82em;
+    color: var(--muted);
+    flex: 1;
+    min-width: 0;
+  }
+  #nick {
+    font-family: var(--mono);
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.35em 0.55em;
+    font-size: 0.85em;
+    width: 100%;
+    max-width: 16em;
+    min-height: 32px;
+  }
+  #nick:focus { outline: none; border-color: var(--me); background: #181c22; }
+
+  #log {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.7em 0.9em;
+    overscroll-behavior: contain;
+    scroll-behavior: smooth;
+  }
+  #log div { padding: 2px 0; word-wrap: break-word; word-break: break-word; }
+  #log img {
+    max-width: 100%;
+    max-height: 60vh;
+    display: block;
+    margin: 0.3em 0 0.4em;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    cursor: zoom-in;
+  }
+
+  /* sticky composer */
+  #form {
+    display: flex;
+    gap: 0.4em;
+    align-items: flex-end;
+    padding: 0.5em 0.7em calc(0.5em + env(safe-area-inset-bottom));
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+  }
+  #msg {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--mono);
+    padding: 0.6em 0.75em;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 18px;
+    font-size: 1em;
+    min-height: 40px;
+  }
+  #msg:focus { outline: none; border-color: var(--me); background: #181c22; }
+
+  button {
+    font-family: var(--mono);
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 18px;
+    padding: 0 0.95em;
+    cursor: pointer;
+    font-size: 0.95em;
+    min-height: 40px;
+    white-space: nowrap;
+  }
+  button:hover { background: #232730; }
+  button.primary {
+    background: #1f3a55;
+    border-color: #2c5680;
+    color: #d6eaff;
+  }
+  button.primary:hover { background: #244673; }
+  #image-btn { padding: 0; width: 40px; font-size: 1.15em; }
+
+  /* line styling */
+  .me   { color: var(--me); }
+  .peer { color: var(--peer); }
+  .sys  { color: var(--muted); font-size: 0.85em; }
+  .err  { color: var(--err); }
+  .line-author { font-weight: 600; margin-right: 0.4em; }
+
+  /* image lightbox */
+  #lightbox {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.92);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 1em;
+    cursor: zoom-out;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; }
+
+  /* responsive */
+  @media (max-width: 720px) {
+    body { font-size: 14px; }
+    #log { padding: 0.55em 0.7em; }
+    #msg { font-size: 16px; }    /* prevent iOS zoom-on-focus */
+    header { padding: 0.4em 0.6em; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="badge">chat-app v2</span>
+  <div id="nick-row">
+    <span>nick:</span>
+    <input id="nick" type="text" maxlength="32" placeholder="press Enter to set" autocapitalize="off" autocomplete="off" />
+  </div>
+</header>
+
+<div id="log"></div>
+
+<form id="form" autocomplete="off">
+  <input id="msg" type="text" placeholder="Message" autocapitalize="sentences" />
+  <button id="image-btn" type="button" title="Attach image" aria-label="Attach image">📎</button>
+  <button class="primary" type="submit">Send</button>
+  <input id="image-file" type="file" accept="image/*" hidden />
+</form>
+
+<div id="lightbox" role="dialog" aria-label="Image viewer"><img id="lightbox-img" alt="" /></div>
+
+<script>
+// chat-app v2 UI. Loaded into a sandboxed iframe by the shell.
+//
+// Protocol with parent shell:
+//   parent → us: { type: "init",   pk: Uint8Array(32) }
+//   parent → us: { type: "render", payload: Uint8Array }
+//                  payload = [type u8][pk_len u8][pk ..][nick_len u8][nick ..][body ..]
+//   us → parent: { type: "ready" }
+//   us → parent: { type: "send", chatType: 0|1|2, body: Uint8Array }
+const CHAT_TYPE_TEXT  = 0x00;
+const CHAT_TYPE_IMAGE = 0x01;
+const CHAT_TYPE_NICK  = 0x02;
+
+// Resize images to this width before sending so the JPEG-encoded bytes stay
+// under the 64 KB envelope cap.
+const IMAGE_MAX_WIDTH    = 600;
+const IMAGE_TARGET_BYTES = 50 * 1024;
+
+const log = document.getElementById("log");
+const form = document.getElementById("form");
+const msgInput = document.getElementById("msg");
+const nickInput = document.getElementById("nick");
+const imageBtn = document.getElementById("image-btn");
+const imageFile = document.getElementById("image-file");
+const lightbox = document.getElementById("lightbox");
+const lightboxImg = document.getElementById("lightbox-img");
+let myPk = null;
+
+function shortPk(pk) {
+  return Array.from(pk.slice(0, 4)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function arraysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function isAtBottom() {
+  // 32px slop so floaty scroll positions still count as "at bottom".
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 32;
+}
+function scrollToBottom() { log.scrollTop = log.scrollHeight; }
+
+function appendLine(node, wantsScroll = true) {
+  const stick = wantsScroll && isAtBottom();
+  log.appendChild(node);
+  if (stick) scrollToBottom();
+}
+
+function print(text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  appendLine(line);
+}
+
+function printMessage(tag, text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  const author = document.createElement("span");
+  author.className = "line-author";
+  author.textContent = tag + ":";
+  line.appendChild(author);
+  line.appendChild(document.createTextNode(text));
+  appendLine(line);
+}
+
+function appendImage(tag, imageBytes, cls) {
+  const wrap = document.createElement("div");
+  if (cls) wrap.className = cls;
+  const head = document.createElement("div");
+  const author = document.createElement("span");
+  author.className = "line-author";
+  author.textContent = tag + ":";
+  head.appendChild(author);
+  head.appendChild(document.createTextNode("[image]"));
+  wrap.appendChild(head);
+  const blob = new Blob([imageBytes], { type: "image/jpeg" });
+  const url = URL.createObjectURL(blob);
+  const img = document.createElement("img");
+  img.src = url;
+  img.alt = "image";
+  img.addEventListener("click", () => {
+    lightboxImg.src = url;
+    lightbox.classList.add("open");
+  });
+  wrap.appendChild(img);
+  appendLine(wrap);
+}
+
+lightbox.addEventListener("click", () => {
+  lightbox.classList.remove("open");
+  lightboxImg.src = "";
+});
+
+function send(chatType, body) {
+  window.parent.postMessage({ type: "send", chatType, body }, "*");
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window.parent) return;
+  const msg = ev.data;
+  if (!msg) return;
+  if (msg.type === "init") {
+    myPk = new Uint8Array(msg.pk);
+    print(`You are ${shortPk(myPk)}. Invite a peer to start chatting.`, "sys");
+  } else if (msg.type === "sys") {
+    print(msg.text, "sys");
+  } else if (msg.type === "render") {
+    const payload = new Uint8Array(msg.payload);
+    if (payload.length < 3) return;
+    let p = 0;
+    const type  = payload[p++];
+    const pkLen = payload[p++];
+    if (p + pkLen > payload.length) return;
+    const pk = payload.slice(p, p + pkLen); p += pkLen;
+    if (p >= payload.length) return;
+    const nLen = payload[p++];
+    if (p + nLen > payload.length) return;
+    const nick = nLen > 0 ? new TextDecoder().decode(payload.slice(p, p + nLen)) : "";
+    p += nLen;
+    const body = payload.slice(p);
+    const isMe = myPk && arraysEqual(pk, myPk);
+    const tag = nick ? `${nick} (${shortPk(pk)})` : shortPk(pk);
+    const cls = isMe ? "me" : "peer";
+    if (type === CHAT_TYPE_TEXT) {
+      printMessage(tag, new TextDecoder().decode(body), cls);
+    } else if (type === CHAT_TYPE_IMAGE) {
+      appendImage(tag, body, cls);
+    } else if (type === CHAT_TYPE_NICK) {
+      const newNick = body.length > 0 ? new TextDecoder().decode(body) : "(cleared)";
+      print(`${shortPk(pk)} is now ${newNick}`, "sys");
+    }
+  }
+});
+
+nickInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const trimmed = nickInput.value.slice(0, 32);
+    send(CHAT_TYPE_NICK, new TextEncoder().encode(trimmed));
+    msgInput.focus();
+  }
+});
+
+imageBtn.addEventListener("click", () => imageFile.click());
+imageFile.addEventListener("change", async () => {
+  const file = imageFile.files && imageFile.files[0];
+  imageFile.value = "";
+  if (!file) return;
+  try {
+    const bitmap = await createImageBitmap(file);
+    const targetW = bitmap.width <= IMAGE_MAX_WIDTH ? bitmap.width : IMAGE_MAX_WIDTH;
+    const targetH = Math.round(bitmap.height * (targetW / bitmap.width));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, targetW, targetH);
+    let bytes = null;
+    for (const q of [0.7, 0.5, 0.35, 0.25]) {
+      const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", q));
+      if (!blob) continue;
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      if (buf.length <= IMAGE_TARGET_BYTES) { bytes = buf; break; }
+      bytes = buf;
+    }
+    if (!bytes) { print("Image encode failed.", "err"); return; }
+    if (bytes.length > IMAGE_TARGET_BYTES) {
+      print(`Image is ${bytes.length} bytes — sending anyway, may exceed 64 KB envelope.`, "err");
+    }
+    send(CHAT_TYPE_IMAGE, bytes);
+  } catch (err) {
+    print(`Image failed: ${err.message}`, "err");
+  }
+});
+
+form.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const text = msgInput.value;
+  if (!text) return;
+  send(CHAT_TYPE_TEXT, new TextEncoder().encode(text));
+  msgInput.value = "";
+  msgInput.focus();
+});
+
+window.parent.postMessage({ type: "ready" }, "*");
+msgInput.focus();
+</script>
+</body>
+</html>
