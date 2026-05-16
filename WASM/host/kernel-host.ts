@@ -1264,10 +1264,18 @@ export class KernelHost {
     if (publicKey.length !== GENESIS_PUBKEY_LEN) {
       throw new Error(`wrap: publicKey must be ${GENESIS_PUBKEY_LEN} bytes (Ed25519), got ${publicKey.length}`);
     }
-    const sig = this.sodium.crypto_sign_detached(innerBytes, privateKey);
 
     // §6.3 wrapper payload: algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
     const wrapperPayloadLen = 2 + 2 + GENESIS_PUBKEY_LEN + 2 + GENESIS_SIGNATURE_LEN + innerBytes.length;
+    // Project the final envelope size and bail before signing — Ed25519 over
+    // a multi-KB inner is cheap but not free, and on the failure path the
+    // signature is just thrown away. Matches the §2.2 cap encodeEnvelope
+    // enforces at the end.
+    const projectedTotal = 4 + this._signatureId.length + wrapperPayloadLen;
+    if (projectedTotal > MAX_ENVELOPE_BYTES) {
+      throw new Error("wrap: envelope exceeds 64 KB");
+    }
+    const sig = this.sodium.crypto_sign_detached(innerBytes, privateKey);
     const wrapperPayload = new Uint8Array(wrapperPayloadLen);
     let o = 0;
     wrapperPayload[o++] = (GENESIS_ALGO_ID >> 8) & 0xff;

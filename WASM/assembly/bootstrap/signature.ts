@@ -177,7 +177,7 @@ export function pop_signer(): void {
 
 // ─── signature handler (README §6.3, §6.5) ──────────────────────────────
 //
-// Payload: [algo_id u16][signer_len u8][signer ..][sig_len u16][sig ..][inner_envelope ..]
+// Payload: [algo_id u16][signer_len u16 BE][signer ..][sig_len u16 BE][sig ..][inner_envelope ..]
 //
 // Returns 1 if verified (signer pushed, inner bytes available via get_inner_ptr/len),
 // 0 if the message should be dropped.
