@@ -49,6 +49,16 @@ export class InstallHandler {
   // Per-(signer) high-water mark for the §4.4 seq prefix on install payloads.
   // Persists across revocation (tombstone-forever) so re-granting trust to a
   // key cannot rewind its sequence and unlock replay of older install messages.
+  //
+  // LIMITATION: in-memory only — tombstone-forever holds for the lifetime
+  // of this host instance, not across process / page restarts. The companion
+  // tables in WASM/assembly/bootstrap/trust.ts (trustGrantSeqs, sigRegisterSeqs)
+  // share the same limitation. A host that persists the trust table across
+  // restarts MUST persist this map and those tables together, atomically.
+  // Persisting trust without seqs lets an attacker replay any signed install
+  // envelope captured before the restart against the empty post-restart map.
+  // The reference chat-shell is exempt: it reseeds the trust table from scratch
+  // on every reload, so pre-reload envelopes carry no authority afterward.
   private lastSeen = new Map<string, number>();
   private _approveInstall: ApproveInstall | null = null;
 

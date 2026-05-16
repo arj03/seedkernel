@@ -63,6 +63,18 @@ const trustTable: TrustEntry[] = [];
 // top signer. Storage is one entry per (algoId, pubKey) per handler; entries
 // persist across revocation (tombstone-forever) so re-granting trust to a
 // key cannot rewind its sequence and unlock replay of older messages.
+//
+// LIMITATION: these tables are in-memory only. Tombstone-forever holds
+// for the lifetime of this kernel instance — not across process / page
+// restarts. The README §4.4 wording is stronger than what this code delivers
+// in isolation. A deployment that persists the trust table across restarts
+// MUST persist these seq tables (trustGrantSeqs, sigRegisterSeqs) and the
+// install handler's lastSeen map alongside it, atomically. Persisting trust
+// without seqs is a replay vulnerability: an attacker who recorded a signed
+// trust.grant / signature.register / install envelope before the restart can
+// replay it afterward against the empty seq table. The reference chat-shell
+// is exempt because it also reseeds the trust table from scratch on reload,
+// so pre-reload envelopes carry no authority post-reload.
 
 class SeqEntry {
   algoId: u16;
