@@ -222,7 +222,7 @@ The host exposes these under the import module `"kernel"`. These are the **only*
 | Import name | WASM signature | Description |
 |---|---|---|
 | `call` | `(i32, i32, i32, i32) → i32` | `(schema_id_ptr, schema_id_len, payload_ptr, payload_len) → response_len` — synchronous dispatch to the handler registered for the given schema_id. The four pointers are into the **caller's own memory** (anywhere the caller likes). The response is written into the caller's scratch region; the return value is the response length, or `-1` on error (no handler registered, call depth exceeded, response too large for caller's scratch). See §4.4. |
-| `caller` | `(i32) → i32` | `(out_ptr) → schema_id_len` — writes the schema_id of the handler that invoked the current `kernel.call` into caller memory at `out_ptr` and returns its length. Returns `0` (writing nothing) when there is no parent frame — i.e. when the handler was reached by direct envelope dispatch rather than through `kernel.call`. The return is unambiguous because valid schema_ids are always at least 1 byte (§14). Primarily used by I/O bridges (§9) to identify the caller for capability checks. |
+| `caller` | `(i32) → i32` | `(out_ptr) → schema_id_len` — writes the schema_id of the handler that invoked the current `kernel.call` into caller memory at `out_ptr` and returns its length. Returns `0` (writing nothing) when there is no parent frame — i.e. when the handler was reached by direct envelope dispatch rather than through `kernel.call`. The return is unambiguous because valid schema_ids are always at least 1 byte (§15). Primarily used by I/O bridges (§9) to identify the caller for capability checks. |
 
 ### 4.3 Sandboxing
 
@@ -785,6 +785,8 @@ On load it generates an Ed25519 identity, instantiates `kernel.wasm` + `bootstra
 
 Peers connect via WebRTC using a perfect-negotiation mesh: either directly through the **Invite** / **Accept** tabs (copy-paste an SDP blob, no server involved), or via an optional signaling relay (`scripts/relay.mjs`) configured from the **Network** tab. Once a data channel is open, binary frames over it are raw kernel envelopes — `host.dispatch` is called with the bytes verbatim, signatures verify against the peer's pubkey, and the inner `chat.text` (or v2 schema) envelope routes to the installed handler. String frames on the same channel are reserved for transport-level renegotiation between that pair. A `Start call` button additionally negotiates audio/video tracks over the same `RTCPeerConnection`, rendered as per-peer tiles above the chat UI.
 
+The wire is DTLS underneath: WebRTC data channels run over DTLS (Datagram Transport Layer Security — TLS adapted for datagram transport, with the same handshake, key exchange, and per-record encryption-plus-MAC), so every dc is confidential and integrity-protected by default. But DTLS alone only authenticates "the other end of this handshake," not "the holder of kernel pubkey *X*." To bind the two, each peer signs its SDP's `a=fingerprint` lines under its kernel key and ships the signature alongside the offer/answer (RFC 8827 §5.6.4); the receiver verifies that signature against the fingerprint it actually sees in the SDP before touching the session. From then on, bytes coming out of that DTLS tunnel are provably from the holder of that pubkey. As defense-in-depth the dc receive path also pins each binary frame's outer signer to the pubkey bound to that channel, so a future unsigned-envelope code path could not smuggle in envelopes signed by some other key. Signaling itself (the SDP blob, copy-pasted or relayed) is not encrypted — but a relay cannot swap in its own fingerprint without producing a valid signature under some pubkey, at which point the swap shows up as "a different peer," not as impersonation. Kernel envelopes themselves are signed, not encrypted; confidentiality on the wire comes entirely from the DTLS layer underneath.
+
 The shell never sees plaintext message content beyond what the iframe chooses to render: the chat handler runs inside the kernel, talks to its UI through a scoped `chat.ui` bridge schema (§5.1 scoping rules), and the iframe is `sandbox="allow-scripts allow-forms"` with no same-origin access to the shell. Replacing the chat app with a new signed artifact (e.g. switching v1 → v2 live) goes through the install handler's replacement policy (§3.2): same installer key, new WASM hash, policy callback re-prompts.
 
 To run it locally: build the WASM artifacts (`kernel.wasm`, `bootstrap.wasm`, and the chat app modules) into `WASM/build/`, then serve `WASM/browser/` over HTTPS (the bundled `localhost+1.pem` / `localhost+1-key.pem` are mkcert certs for `localhost`) and open `chat-shell.html` in two browsers to chat between them.
@@ -838,13 +840,13 @@ That's the entire pipeline. Every step is a synchronous call across one of three
 
 ---
 
-## 13 Background
+## 14. Background
 
 This project was inspired by the [8k-demo](https://github.com/ssbc/8k-demo) P2P project built on top of secure scuttlebutt running in the browser.
 I wanted to strip it down to the bare essentials and make the core as small as possible, moving functionality into modules to be distributed in
 whatever fashion.
 
-## 14. Protocol constants
+## 15. Protocol constants
 
 All limits and reserved values in one place. Multi-byte integers are big-endian throughout the protocol.
 
