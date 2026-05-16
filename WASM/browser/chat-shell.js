@@ -129,6 +129,15 @@ shellPrint(`I am ${myPkHex.slice(0, 8)}`, "sys");
 const DTLS_AUTH_DOMAIN = "seedkernel-dtls-id-v1\0";
 const DTLS_AUTH_DOMAIN_BYTES = new TextEncoder().encode(DTLS_AUTH_DOMAIN);
 
+// Cap on speculative (unauthed) peer entries that the relay can force us to
+// allocate via unauthenticated `hello` signals. Authed peers do not count, so
+// genuine fleet size is unbounded; only the unauthenticated allocator is. A
+// hello that would push the count above this is dropped — the attacker can
+// recover slots by waiting for entries to time out / get torn down, but cannot
+// grow the table without bound. Sized for a worst-case legitimate burst
+// (everyone reconnecting after the relay flaps) with headroom.
+const MAX_UNAUTHED_PEERS = 32;
+
 function hexToBytes(hex) {
   if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
   const out = new Uint8Array(hex.length / 2);
@@ -605,23 +614,51 @@ async function onSignal(msg) {
   switch (msg.type) {
     case "hello": {
       // A hello with no `to` is a broadcast — only sent on relay-open, and
-      // semantically means "I'm starting fresh." If we have an entry for
-      // this peer it's a zombie (their tab reloaded; their previous pc is
-      // gone) and we MUST tear it down even if our dc.readyState still
-      // claims "open" — the SCTP session under it is dead and our pc
-      // won't notice for ~30s. A directed hello (reply to our broadcast)
-      // is just the bootstrap dance bouncing back; we leave any existing
-      // entry alone to avoid the entry-recreate / dc-recreate loop that
-      // would happen if we tore down on every directed hello.
+      // semantically means "I'm starting fresh." If we have an UN-AUTHED
+      // entry for this peer it's a zombie (we created it speculatively from
+      // some earlier signal that never produced a signed SDP, or their tab
+      // reloaded before we ever authed them) and we tear it down. A directed
+      // hello (reply to our broadcast) is just the bootstrap dance bouncing
+      // back; we leave any existing entry alone to avoid the entry-recreate /
+      // dc-recreate loop that would happen if we tore down on every directed
+      // hello.
+      //
+      // The hello case is unauthenticated — the relay (or anyone on it) can
+      // spam hellos with arbitrary `from` values — but two guards contain
+      // the blast radius:
+      //   1. Impersonation is blocked: each spawned entry stays authed=false
+      //      until a valid signed SDP arrives (sdp case verifies idSig
+      //      against a=fingerprint lines under msg.from's pubkey, RFC 8827
+      //      §5.6.4), and the dc-level filter in bindDataChannel refuses to
+      //      dispatch from any entry that isn't authed.
+      //   2. Memory growth is bounded: the MAX_UNAUTHED_PEERS cap below
+      //      limits how many speculative entries the relay can force us to
+      //      allocate. Authed peers don't count against the cap, so genuine
+      //      fleet size is unconstrained.
+      //   3. Targeted connection resets against authed peers are blocked:
+      //      we deliberately do NOT tear down an authed entry on a spoofed
+      //      broadcast hello. The trade-off is that a legitimate peer-reload
+      //      from an already-authed peer will not be auto-recovered by the
+      //      hello path; recovery has to come from the next signed SDP offer
+      //      (perfect-negotiation renegotiation on the existing pc) or from
+      //      a manual reconnect.
       const broadcast = !msg.to;
       if (broadcast) {
         const existing = peers.get(msg.from);
-        if (existing) {
+        if (existing && !existing.authed) {
           try { existing.pc.close(); } catch {}
           peers.delete(msg.from);
         }
       }
       const isFresh = !peers.has(msg.from);
+      // Cap unauthed allocations (see MAX_UNAUTHED_PEERS comment). Only
+      // applies when we're about to create a new entry; existing entries
+      // (authed or not) keep working.
+      if (isFresh) {
+        let unauthed = 0;
+        for (const e of peers.values()) if (!e.authed) unauthed++;
+        if (unauthed >= MAX_UNAUTHED_PEERS) return;
+      }
       const entry = ensurePeer(msg.from);
       // Reply only to broadcasts. Replying to directed hellos would loop
       // forever (each side keeps bouncing the directed reply).
