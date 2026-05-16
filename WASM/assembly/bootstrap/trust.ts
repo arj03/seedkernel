@@ -66,15 +66,61 @@ const trustTable: TrustEntry[] = [];
 //
 // LIMITATION: these tables are in-memory only. Tombstone-forever holds
 // for the lifetime of this kernel instance — not across process / page
-// restarts. The README §4.4 wording is stronger than what this code delivers
-// in isolation. A deployment that persists the trust table across restarts
-// MUST persist these seq tables (trustGrantSeqs, sigRegisterSeqs) and the
-// install handler's lastSeen map alongside it, atomically. Persisting trust
-// without seqs is a replay vulnerability: an attacker who recorded a signed
-// trust.grant / signature.register / install envelope before the restart can
-// replay it afterward against the empty seq table. The reference chat-shell
-// is exempt because it also reseeds the trust table from scratch on reload,
-// so pre-reload envelopes carry no authority post-reload.
+// restarts. The README §4.4 wording is stronger than what this code
+// delivers in isolation.
+//
+// A deployment that wants persistent trust MUST commit the following
+// state ATOMICALLY (all-or-nothing across a crash). Persisting any
+// proper subset re-opens replay or correctness holes that are otherwise
+// closed:
+//
+//   1. trustTable                  — who is trusted, and the granter
+//                                    chain needed for §7.2 cascading
+//                                    revocation.
+//   2. trustGrantSeqs              — per-signer seq high-water mark for
+//                                    handle_trust_grant. Without this,
+//                                    any pre-restart-recorded trust.grant
+//                                    envelope replays against an empty
+//                                    table after reload.
+//   3. sigRegisterSeqs             — same, for handle_signature_register.
+//                                    Replay here re-installs a recorded
+//                                    suite WASM under the signer's old
+//                                    authority.
+//   4. storedTrustGrantId,         — schema_ids these handlers gate on.
+//      storedSigRegisterId           Both fail-closed if zero-length, so
+//                                    persisting (1)–(3) without (4)
+//                                    locks the deployment out rather
+//                                    than leaking authority — but it
+//                                    still leaves the trust table
+//                                    holding subjects no one can
+//                                    administer.
+//   5. InstallHandler.lastSeen     — per-signer seq high-water mark for
+//                                    the §3.2 install handler. Lives in
+//                                    host JS (host/install-handler.ts)
+//                                    but shares (2)/(3)'s replay hazard:
+//                                    a recorded install envelope replays
+//                                    against the empty post-restart map
+//                                    and re-installs a (possibly long
+//                                    revoked) WASM handler.
+//   6. InstallHandler.installerAttribution
+//                                  — target_schema_id → (algoId, pubKey)
+//                                    of the installer. Required for the
+//                                    §7.3 revocation cascade to find
+//                                    which kernel slots to remove when
+//                                    an installer's key is revoked.
+//                                    Losing this strands installed
+//                                    handlers in the kernel after their
+//                                    installer's trust is gone.
+//   7. KernelHost.suiteRegistry    — registered suite WASM bytes (host
+//      WASM bytes                    JS). Without these, algoIds in (1)
+//                                    become meaningless after restart;
+//                                    signed envelopes from those signers
+//                                    fail to verify at all because there
+//                                    is no suite to dispatch to. The
+//                                    size meta inside the bootstrap-side
+//                                    suite registry is necessary but
+//                                    not sufficient — the host needs the
+//                                    instantiable bytes too.
 
 class SeqEntry {
   algoId: u16;
