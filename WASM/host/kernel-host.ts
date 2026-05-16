@@ -353,6 +353,7 @@ export class KernelHost {
       this.wasmHandlers.delete(oldId);
       this.handlers.delete(oldId);
       this.handlerIdToSchema.delete(oldId);
+      this.blockedFromCall.delete(oldId);
     }
   }
 
