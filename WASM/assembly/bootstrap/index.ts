@@ -1,6 +1,11 @@
 // Bootstrap WASM module (README §6, §7). Combines signature and trust into a
 // single sandbox. This file is the compiler entry point — it re-exports all
 // host-callable functions from the two sub-modules.
+//
+// Note: registerSuiteMeta / unregisterSuiteMeta / hasSuiteMeta are deliberately
+// NOT re-exported — they are bootstrap-internal helpers consumed by trust.ts
+// via the import in that file. The host never calls them directly; suite
+// registration goes through the signed handle_signature_register pipeline.
 
 export {
   alloc, dealloc,

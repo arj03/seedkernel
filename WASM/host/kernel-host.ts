@@ -730,11 +730,13 @@ export class KernelHost {
 
   /** Ed25519 verify — reads from bootstrap.wasm memory, calls libsodium. */
   private _ed25519Verify(pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number {
-    const pub  = this.readFromBootstrap(pubPtr, 32);
-    const sig  = this.readFromBootstrap(sigPtr, 64);
-    const data = this.readFromBootstrap(dataPtr, dataLen);
-    try { return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0; }
-    catch { return 0; }
+    try {
+      const mem  = this.bootstrapExports.memory.buffer;
+      const pub  = new Uint8Array(mem, pubPtr,  32);
+      const sig  = new Uint8Array(mem, sigPtr,  64);
+      const data = new Uint8Array(mem, dataPtr, dataLen);
+      return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0;
+    } catch { return 0; }
   }
 
   /** Revocation callback — called by bootstrap.wasm during the trust cascade

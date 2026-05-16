@@ -1,0 +1,527 @@
+  :root {
+    --bg:        #0e0f12;
+    --panel:    #16181d;
+    --panel-2: #1c1f25;
+    --line:      #2a2e36;
+    --line-2:  #3a3f49;
+    --text:      #d6d8dd;
+    --muted:    #8a8f99;
+    --accent:  #6cc8ff;
+    --me:        #6cc8ff;
+    --peer:    #7fd07f;
+    --warn:    #ffcc66;
+    --err:      #ff6b6b;
+    --ok:        #57c785;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 15px;
+    line-height: 1.4;
+    -webkit-text-size-adjust: 100%;
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* ── top bar ──────────────────────────────────────────────────────── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 0.7em;
+    padding: 0.6em 0.95em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45em;
+    font-weight: 600;
+    color: #fff;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+  }
+  .brand-icon {
+    width: 1.25em;
+    height: 1.25em;
+    flex: 0 0 auto;
+    color: var(--accent);
+    filter: drop-shadow(0 0 4px rgba(108, 200, 255, 0.25));
+  }
+  .status-row {
+    display: flex;
+    gap: 0.5em;
+    flex: 1;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-size: 0.78em;
+    padding: 0.3em 0.7em;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--muted);
+    white-space: nowrap;
+    user-select: none;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .pill.ok      { color: var(--ok);   border-color: #2d4d3a; }
+  .pill.warn  { color: var(--warn); border-color: #4d4023; }
+  .pill.err    { color: var(--err);  border-color: #4d2828; }
+  .pill .led {
+    width: 0.45em; height: 0.45em; border-radius: 50%;
+    background: currentColor; box-shadow: 0 0 0.4em currentColor;
+  }
+  .pill.identity { cursor: copy; }
+  .pill.identity:hover { color: var(--text); border-color: var(--line-2); background: #1f2229; }
+  .about-btn {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    width: 2em; height: 2em;
+    border-radius: 50%;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 0.85em;
+    font-style: italic;
+    padding: 0;
+    flex: 0 0 auto;
+    margin-left: 0.2em;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .about-btn:hover { color: var(--text); border-color: var(--line-2); background: #232730; }
+
+  /* ── about flyout (hidden by default) ─────────────────────────────── */
+  .about {
+    display: none;
+    padding: 0.85em 1em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--muted);
+    font-size: 0.85em;
+  }
+  .about.open { display: block; }
+  .about strong { color: var(--text); }
+  .about code { background: var(--panel-2); padding: 0.05em 0.35em; border-radius: 3px; }
+
+  /* ── tabs ─────────────────────────────────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 0.4em;
+    padding: 0 0.5em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tabs button {
+    /* sized to content so each label sits in its own visible slot;
+       border-radius reset because the base button rule sets it to 6px and
+       it leaks through here in Safari/iOS even with appearance:none. */
+    flex: 0 0 auto;
+    min-width: max-content;
+    appearance: none;
+    background: transparent;
+    color: var(--muted);
+    border: none;
+    border-radius: 0;
+    border-bottom: 2px solid transparent;
+    font-family: var(--mono);
+    font-size: 0.92em;
+    padding: 0.7em 0.9em;
+    margin-bottom: -1px;          /* overlap container border for a flush underline */
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.active {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  .tabs button.unread::after {
+    content: "";
+    display: inline-block;
+    width: 0.5em; height: 0.5em;
+    background: var(--peer);
+    border-radius: 50%;
+    margin-left: 0.45em;
+    vertical-align: middle;
+  }
+
+  /* ── main / panels ────────────────────────────────────────────────── */
+  main {
+    flex: 1;
+    min-height: 0;            /* allow flex children to shrink */
+    display: flex;
+    flex-direction: column;
+  }
+  .panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    padding: 0.85em;
+    gap: 0.75em;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .panel.hidden { display: none; }
+
+  /* form elements */
+  button {
+    appearance: none;
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    padding: 0.45em 0.85em;
+    cursor: pointer;
+    min-height: 34px;       /* still tappable on mobile */
+  }
+  button:hover { background: #232730; border-color: #4a505b; }
+  button.primary {
+    background: #1f3a55;
+    border-color: #2c5680;
+    color: #d6eaff;
+  }
+  button.primary:hover { background: #244673; border-color: #3a6da3; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:disabled:hover { background: var(--panel-2); border-color: var(--line-2); }
+  button.icon {
+    min-height: 0;
+    padding: 0.4em 0.7em;
+    font-size: 0.82em;
+  }
+  button.danger {
+    color: #ffd1d1;
+    background: #3a1f1f;
+    border-color: #5a2828;
+  }
+  button.danger:hover { background: #4a2828; }
+
+  label.field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3em;
+    font-size: 0.85em;
+    color: var(--muted);
+  }
+  input[type=text], textarea {
+    width: 100%;
+    font-family: var(--mono);
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.6em 0.75em;
+    font-size: 0.95em;
+    min-height: 40px;
+  }
+  input[type=text]:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: #181c22;
+  }
+  textarea {
+    min-height: 5.5em;
+    resize: vertical;
+    line-height: 1.35;
+    word-break: break-all;        /* SDP blobs are one long line */
+  }
+
+  .row { display: flex; gap: 0.5em; flex-wrap: wrap; align-items: center; }
+  .row.tight { gap: 0.35em; }
+  .row > .spacer { flex: 1; }
+
+  .hint {
+    font-size: 0.82em;
+    color: var(--muted);
+    margin: 0;
+  }
+  .hint code { background: var(--panel-2); padding: 0.05em 0.35em; border-radius: 3px; }
+  .hint kbd  { background: var(--panel-2); padding: 0.05em 0.4em; border-radius: 3px;
+                          border: 1px solid var(--line); font-size: 0.9em; }
+
+  .me   { color: var(--me); }
+  .peer { color: var(--peer); }
+  .sys  { color: var(--muted); }
+  .err  { color: var(--err); }
+
+  .notice {
+    color: var(--warn);
+    background: #2a2410;
+    border: 1px solid #4a3d1d;
+    border-left: 3px solid var(--warn);
+    padding: 0.55em 0.8em;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+  .notice strong { color: #ffd9a0; }
+
+  /* ── invite/accept stepper ────────────────────────────────────────── */
+  .lead-hint {
+    margin: 0;
+    padding: 0.65em 0.8em;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    font-size: 0.85em;
+    color: var(--muted);
+  }
+  .lead-hint strong { color: var(--text); }
+
+  .step {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55em;
+    padding: 0.85em 0.9em 0.95em;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .step-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55em;
+    margin: 0;
+  }
+  .step-pip {
+    flex: 0 0 1.55em;
+    width: 1.55em;
+    height: 1.55em;
+    border-radius: 50%;
+    background: #1f3a55;
+    border: 1px solid #2c5680;
+    color: #d6eaff;
+    font-size: 0.78em;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .step-title {
+    margin: 0;
+    font-size: 0.95em;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.3;
+  }
+  .step-body { display: flex; flex-direction: column; gap: 0.5em; }
+
+  /* readonly "output" container — visually distinct from input textareas.
+     Dashed border + dimmer background = "nothing here yet". When a value lands,
+     .ready is toggled and the border becomes a solid green hint. */
+  .output {
+    border: 1px dashed var(--line-2);
+    border-radius: 6px;
+    background: #101218;
+  }
+  .output textarea {
+    background: transparent;
+    border: none;
+    color: var(--text);
+    width: 100%;
+    padding: 0.55em 0.7em;
+    min-height: 4.5em;
+    font-size: 0.85em;
+    word-break: break-all;
+    resize: vertical;
+  }
+  .output textarea:focus { outline: none; background: transparent; }
+  .output.ready { border-style: solid; border-color: #2d4d3a; background: #121a16; }
+
+  .hint.subtle { font-size: 0.78em; }
+
+  /* ── chat (app) panel ─────────────────────────────────────────────── */
+  #panel-app {
+    padding: 0;
+    gap: 0;
+  }
+  .app-toolbar {
+    display: flex;
+    gap: 0.4em;
+    align-items: center;
+    padding: 0.5em 0.7em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  .app-toolbar select {
+    appearance: none;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    padding: 0.4em 1.8em 0.4em 0.6em;
+    font-family: var(--mono);
+    font-size: 0.85em;
+    cursor: pointer;
+    background-image:
+      linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position:
+      calc(100% - 12px) 50%,
+      calc(100% - 7px) 50%;
+    background-size: 5px 5px;
+    background-repeat: no-repeat;
+  }
+  #app-status {
+    font-size: 0.8em;
+    color: var(--muted);
+  }
+  #call-bar {
+    display: flex;
+    gap: 0.4em;
+    align-items: center;
+    padding: 0.5em 0.7em;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  #call-bar.idle #call-mute, #call-bar.idle #call-end { display: none; }
+  #call-status { font-size: 0.8em; color: var(--muted); margin-left: auto; }
+
+  #video-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.4em;
+    padding: 0.5em 0.7em;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  #video-tiles.hidden { display: none; }
+  .tile {
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    aspect-ratio: 4 / 3;
+  }
+  .tile video {
+    width: 100%;
+    height: 100%;
+    background: #000;
+    object-fit: cover;
+    display: block;
+  }
+  .tile-label {
+    position: absolute;
+    left: 0.4em;
+    bottom: 0.4em;
+    background: rgba(0,0,0,0.55);
+    color: var(--peer);
+    padding: 0.15em 0.5em;
+    border-radius: 4px;
+    font-size: 0.75em;
+    backdrop-filter: blur(2px);
+  }
+  .tile.local .tile-label { color: var(--me); }
+
+  #app-frame {
+    flex: 1;
+    width: 100%;
+    min-height: 200px;
+    border: none;
+    background: var(--bg);
+    display: block;
+  }
+  #app-frame.hidden { display: none; }
+
+  /* diagnostics disclosure */
+  details.diagnostics {
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    font-size: 0.82em;
+  }
+  details.diagnostics > summary {
+    padding: 0.5em 0.8em;
+    color: var(--muted);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  details.diagnostics > summary::-webkit-details-marker { display: none; }
+  details.diagnostics > summary::before {
+    content: "▸ ";
+    font-size: 0.85em;
+    transition: transform 0.1s;
+    display: inline-block;
+  }
+  details.diagnostics[open] > summary::before {
+    content: "▾ ";
+  }
+  details.diagnostics:hover > summary { color: var(--text); }
+  #shell-log {
+    max-height: 14em;
+    overflow-y: auto;
+    padding: 0.5em 0.9em 0.6em;
+    border-top: 1px solid var(--line);
+    background: var(--bg);
+  }
+  #shell-log div { padding: 1px 0; word-break: break-word; }
+
+  /* empty state inside chat tab when no app installed */
+  .empty-state {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 0.9em;
+    padding: 2em 1em;
+    text-align: center;
+  }
+
+  /* ── responsive ───────────────────────────────────────────────────── */
+  @media (max-width: 720px) {
+    body { font-size: 14px; }
+    .topbar { padding: 0.5em 0.65em; gap: 0.4em; }
+    .brand { font-size: 0.95em; }
+    .pill { font-size: 0.72em; padding: 0.18em 0.45em; }
+    .tabs button { padding: 0.7em 0.85em; font-size: 0.88em; }
+    .panel { padding: 0.7em; gap: 0.6em; }
+    textarea { font-size: 16px; }      /* iOS: prevent zoom-on-focus */
+    input[type=text] { font-size: 16px; }
+    .app-toolbar, #call-bar, #video-tiles { padding: 0.4em 0.55em; }
+    #shell-log { max-height: 10em; }
+  }
+
+  /* desktop max-width frame */
+  @media (min-width: 900px) {
+    body {
+      max-width: 920px;
+      margin: 0 auto;
+      border-left: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+    }
+  }
+
+  .field-inline {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4em;
+  }
+  .field-label-sm { font-size: 0.8em; }
+  .relay-status   { font-size: 0.82em; }

@@ -6,7 +6,11 @@
 // Uses the signer stack from signature.ts to identify the granter and to
 // check is_trusted_by_current_signers.
 
-import { Signer, signerStack, readBytes, readU16BE, readU32BE, registerSuiteMeta, hasSuiteMeta } from "./signature";
+import {
+  Signer, signerStack,
+  readBytes, readU16BE, readU32BE,
+  registerSuiteMeta, unregisterSuiteMeta, hasSuiteMeta,
+} from "./signature";
 
 // ─── host imports ────────────────────────────────────────────────────────
 
@@ -168,11 +172,13 @@ function trustRevoke(algoId: u16, pubKey: Uint8Array, schemaId: Uint8Array): voi
   const qAlgo: u16[] = [algoId];
   const qPub: Uint8Array[] = [pubKey];
   const qSchema: Uint8Array[] = [schemaId];
+  let qHead: i32 = 0;
 
-  while (qAlgo.length > 0) {
-    const vAlgo = qAlgo.shift();
-    const vPub = qPub.shift();
-    const vSchema = qSchema.shift();
+  while (qHead < qAlgo.length) {
+    const vAlgo = qAlgo[qHead];
+    const vPub = qPub[qHead];
+    const vSchema = qSchema[qHead];
+    qHead++;
 
     const idx = findTrust(vAlgo, vPub, vSchema);
     if (idx < 0) continue;
@@ -399,18 +405,21 @@ export function handle_signature_register(payloadPtr: i32, payloadLen: i32): voi
   const wasmLen = payload.length - o;
   if (wasmLen <= 0) return;
 
+  // register meta FIRST, then call into the host. If host instantiation
+  // fails we roll back the meta entry — this keeps the two registries in
+  // lockstep even if the host's WebAssembly.Module / Instance creation
+  // throws (which the host wraps in try/catch and surfaces as result == 0).
+  if (registerSuiteMeta(algoId as i32, pubkeyLen, sigMaxLen) == 0) return;
+
   const result = hostSuiteRegister(
     algoId as i32, pubkeyLen, sigMaxLen, hashLen,
     payload.dataStart as i32 + o, wasmLen
   );
-  if (result == 0) return;
-
-  // Record metadata in signature.ts so handle_signature can look up sizes.
-  // hasSuiteMeta() above already ruled out duplicates, so this should always
-  // succeed; if it doesn't (race-equivalent), we'd be left with host suite
-  // and stale meta — defensively unregister on the host.
-  if (registerSuiteMeta(algoId as i32, pubkeyLen, sigMaxLen) == 0) {
-    // Should be unreachable given the hasSuiteMeta check above.
+  if (result == 0) {
+    // Host failed to instantiate the suite WASM. Roll back the meta entry
+    // so a later register with a corrected binary can succeed instead of
+    // being permanently locked out by the duplicate-rejection rule.
+    unregisterSuiteMeta(algoId as i32);
     return;
   }
 }

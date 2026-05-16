@@ -8,7 +8,7 @@
 //   3. call pop_signer()        → pops the signer
 //
 // Exports used by trust.ts (not WASM exports):
-//   Signer, signerStack, readBytes, readU16BE, registerSuiteMeta
+//   Signer, signerStack, readBytes, readU16BE, registerSuiteMeta, unregisterSuiteMeta
 
 // ─── host imports ────────────────────────────────────────────────────────
 
@@ -84,11 +84,16 @@ class SuiteMeta {
 
 const suiteRegistry: SuiteMeta[] = [];
 
-function findSuiteMeta(algoId: u16): SuiteMeta | null {
+function findSuiteMetaIndex(algoId: u16): i32 {
   for (let i = 0; i < suiteRegistry.length; i++) {
-    if (suiteRegistry[i].algoId == algoId) return suiteRegistry[i];
+    if (suiteRegistry[i].algoId == algoId) return i;
   }
-  return null;
+  return -1;
+}
+
+function findSuiteMeta(algoId: u16): SuiteMeta | null {
+  const idx = findSuiteMetaIndex(algoId);
+  return idx >= 0 ? suiteRegistry[idx] : null;
 }
 
 /** Called by trust.ts after a successful signature.register message to record
@@ -99,6 +104,21 @@ function findSuiteMeta(algoId: u16): SuiteMeta | null {
 export function registerSuiteMeta(algoId: i32, pubkeyLen: i32, sigMaxLen: i32): i32 {
   if (findSuiteMeta(algoId as u16) != null) return 0;
   suiteRegistry.push(new SuiteMeta(algoId as u16, pubkeyLen, sigMaxLen));
+  return 1;
+}
+
+/** Remove a previously-registered suite's metadata. Used as a rollback when
+ *  hostSuiteRegister fails *after* registerSuiteMeta succeeded — without this
+ *  the bootstrap-side registry would be left with a meta entry pointing at a
+ *  suite the host never instantiated, and a subsequent register attempt for
+ *  that algoId would be permanently locked out by the duplicate-rejection
+ *  rule. Genesis (0x0000) cannot be removed — it lives outside the registry
+ *  and is always available via the host's ed25519_verify import (README §6.2). */
+export function unregisterSuiteMeta(algoId: i32): i32 {
+  if ((algoId as u16) == GENESIS_ALGO_ID) return 0;
+  const idx = findSuiteMetaIndex(algoId as u16);
+  if (idx < 0) return 0;
+  suiteRegistry.splice(idx, 1);
   return 1;
 }
 

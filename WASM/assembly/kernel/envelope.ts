@@ -32,7 +32,7 @@ export function decode(bytes: Uint8Array): Envelope | null {
   if (schemaLen == 0) return null; // zero-length schema_id is reserved/invalid (§2)
   if (4 + schemaLen > bytes.length) return null;
 
-  const schemaId = bytes.slice(4, 4 + schemaLen);
-  const payload = bytes.slice(4 + schemaLen);
+  const schemaId = bytes.subarray(4, 4 + schemaLen);
+  const payload = bytes.subarray(4 + schemaLen);
   return new Envelope(version, schemaId, payload);
 }

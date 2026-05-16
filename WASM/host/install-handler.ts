@@ -30,9 +30,14 @@ function schemaKey(schemaId: Uint8Array): string {
   return s;
 }
 
+const signerKeyCache = new WeakMap<Uint8Array, string>();
+
 function signerKey(algoId: number, pubKey: Uint8Array): string {
+  const cached = signerKeyCache.get(pubKey);
+  if (cached !== undefined) return cached;
   let s = `${algoId}:`;
   for (let i = 0; i < pubKey.length; i++) s += pubKey[i].toString(16).padStart(2, "0");
+  signerKeyCache.set(pubKey, s);
   return s;
 }
 

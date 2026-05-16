@@ -85,11 +85,16 @@ export function isConfigured(): bool {
 }
 
 /** Query `signature.signer` for the current message's signer stack and
- *  return a pointer into scratch at the top signer's pubkey, or -1 on
- *  failure. The kernel writes the signer-stack response into scratch:
- *      [count u8][algo u16 BE][pk_len u16 BE][pk ..]*
- *  We return scratch + 5 (the start of pk[0]) when count > 0 and the top
- *  signer is Ed25519 (pk_len == 32). Anything else yields -1.
+ *  return a pointer into scratch at the **top** (innermost, last-pushed)
+ *  signer's pubkey, or -1 on failure.
+ *
+ *  Wire format of the response (README §6.5):
+ *      [count u8] [algo u16 BE][pk_len u16 BE][pk ..]*   in push order —
+ *      outermost first, top signer LAST.
+ *
+ *  Only Ed25519 (pk_len == PK_LEN) is accepted; anything else yields -1.
+ *  Bounds-check every step so a truncated / malformed response never
+ *  reads past the kernel.call return length.
  *
  *  IMPORTANT: this clobbers scratch with the response. Callers must have
  *  staged any input bytes they still need elsewhere (typically in priv)
@@ -100,10 +105,27 @@ export function loadTopSignerPubkey(): i32 {
   if (respLen <= 0) return -1;
   const count = load<u8>(scratchPtr) as i32;
   if (count == 0) return -1;
-  const pkLen: i32 = ((load<u8>(scratchPtr + 3) as i32) << 8) |
-                     (load<u8>(scratchPtr + 4) as i32);
+
+  // Walk each [algo u16][pk_len u16][pk ..] entry to find the LAST one.
+  // Header per entry = 4 bytes; bounds checks defend against a malformed
+  // or truncated response.
+  let o: i32 = 1;            // skip count byte
+  let pkPtr: i32 = -1;
+  let pkLen: i32 = 0;
+  for (let i: i32 = 0; i < count; i++) {
+    if (o + 4 > respLen) return -1;
+    o += 2;                  // skip algo
+    pkLen = ((load<u8>(scratchPtr + o) as i32) << 8) |
+            (load<u8>(scratchPtr + o + 1) as i32);
+    o += 2;
+    if (pkLen <= 0 || o + pkLen > respLen) return -1;
+    pkPtr = scratchPtr + o;
+    o += pkLen;
+  }
+  // Only the top signer's algorithm matters for this helper. Apps that need
+  // multi-algorithm awareness can read the signer stack directly.
   if (pkLen != PK_LEN) return -1;
-  return scratchPtr + 5;
+  return pkPtr;
 }
 
 /** Forward a rendered event to the host-side route schema (the JS bridge
