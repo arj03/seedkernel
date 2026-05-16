@@ -112,6 +112,102 @@ const myPkHex = bytesToHex(myKeys.publicKey);
 host.trustGrant(0, myKeys.publicKey, installId);
 shellPrint(`I am ${myPkHex.slice(0, 8)}`, "sys");
 
+// ─── DTLS-fingerprint identity assertion (RFC 8827 §5.6.4) ─────────────
+//
+// WebRTC already gives us a confidential, integrity-protected DTLS channel
+// for each pc. To bind that channel to a kernel identity we sign the SDP's
+// a=fingerprint lines with the kernel privkey and ship the signature in the
+// signaling envelope. The peer verifies the signature against the fingerprint
+// it actually sees in the SDP, so from that point on every byte that comes
+// out of the resulting DTLS tunnel is provably from the holder of `pk`.
+//
+// As defense-in-depth we ALSO peek at each binary dc frame's wrapper bytes
+// and drop anything whose signer doesn't equal the pk we've bound to that
+// channel — so even if the kernel later grows an unsigned-envelope path,
+// a peer cannot smuggle envelopes signed by some other key over a dc we've
+// already authenticated to their identity.
+const DTLS_AUTH_DOMAIN = "seedkernel-dtls-id-v1\0";
+const DTLS_AUTH_DOMAIN_BYTES = new TextEncoder().encode(DTLS_AUTH_DOMAIN);
+
+function hexToBytes(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const b = parseInt(hex.substr(i * 2, 2), 16);
+    if (Number.isNaN(b)) return null;
+    out[i] = b;
+  }
+  return out;
+}
+
+function extractFingerprintsFromSdp(sdpString) {
+  // Canonical form: each `a=fingerprint:...` line trimmed, joined by '\n'
+  // in the order they appear in the SDP. Both peers see the same SDP text,
+  // so this is deterministic across the wire.
+  if (typeof sdpString !== "string") return "";
+  const lines = sdpString.split(/\r?\n/);
+  const fps = [];
+  for (const l of lines) if (l.startsWith("a=fingerprint:")) fps.push(l.trim());
+  return fps.join("\n");
+}
+
+function signSdpIdentity(sdpString) {
+  const fps = extractFingerprintsFromSdp(sdpString);
+  if (!fps) throw new Error("SDP has no a=fingerprint lines to bind");
+  const fpsBytes = new TextEncoder().encode(fps);
+  const msg = new Uint8Array(DTLS_AUTH_DOMAIN_BYTES.length + fpsBytes.length);
+  msg.set(DTLS_AUTH_DOMAIN_BYTES, 0);
+  msg.set(fpsBytes, DTLS_AUTH_DOMAIN_BYTES.length);
+  return sodium.crypto_sign_detached(msg, myKeys.privateKey);
+}
+
+function verifySdpIdentity(sdpString, pk, sig) {
+  const fps = extractFingerprintsFromSdp(sdpString);
+  if (!fps) return false;
+  const fpsBytes = new TextEncoder().encode(fps);
+  const msg = new Uint8Array(DTLS_AUTH_DOMAIN_BYTES.length + fpsBytes.length);
+  msg.set(DTLS_AUTH_DOMAIN_BYTES, 0);
+  msg.set(fpsBytes, DTLS_AUTH_DOMAIN_BYTES.length);
+  try { return sodium.crypto_sign_verify_detached(sig, msg, pk); }
+  catch { return false; }
+}
+
+// Peek the signer pubkey from a §6.3 signature envelope without invoking the
+// kernel — used to enforce signer==entry.pk on every dc frame.
+// Outer: MAGIC(2) | version(1) | schema_id_len(1) | schema_id | payload
+// Payload (signature schema): algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
+function peekEnvelopeSigner(bytes) {
+  if (bytes.length < 4) return null;
+  if (bytes[0] !== 0x53 || bytes[1] !== 0x44) return null;
+  const sidLen = bytes[3];
+  if (sidLen !== signatureId.length) return null;
+  if (bytes.length < 4 + sidLen) return null;
+  for (let i = 0; i < sidLen; i++) {
+    if (bytes[4 + i] !== signatureId[i]) return null;
+  }
+  let o = 4 + sidLen;
+  if (bytes.length < o + 4) return null;
+  o += 2; // skip algo
+  const signerLen = (bytes[o] << 8) | bytes[o + 1]; o += 2;
+  if (bytes.length < o + signerLen) return null;
+  return bytes.subarray(o, o + signerLen);
+}
+
+function bytesEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function sendSignedSdp(toPkHex, desc) {
+  const sig = signSdpIdentity(desc.sdp);
+  sendSignal(toPkHex, {
+    type: "sdp", from: myPkHex, to: toPkHex,
+    sdp: desc,
+    idSig: bytesToHex(sig),
+  });
+}
+
 // ─── top-bar status updates ───────────────────────────────────────────
 identityPill.textContent = `id ${myPkHex.slice(0, 8)}`;
 identityPill.addEventListener("click", async () => {
@@ -328,9 +424,9 @@ window.addEventListener("message", (ev) => {
       myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatId, payload);
     broadcastWire(wire);
     host.dispatch(wire);              // local echo
-  }
-  if (msg.chatType === 0x02) {
-    lastSentNickBody = body;   // cache for re-broadcast on new DC open
+    if (msg.chatType === 0x02) {
+      lastSentNickBody = body;   // cache for re-broadcast on new DC open
+    }
   }
 });
 
@@ -384,7 +480,15 @@ function bindDataChannel(entry, dc, pkHex) {
       onSignal(parsed).catch(err =>
         shellPrint(`Signaling error: ${err.message}`, "err"));
     } else {
-      host.dispatch(new Uint8Array(ev.data));
+      // The DTLS-fingerprint assertion binds this channel to entry.pk; the
+      // per-frame check below makes that binding load-bearing on the kernel
+      // path. Anything arriving before SDP-auth, or signed by a different
+      // key than the one we bound to this dc, is silently dropped.
+      if (!entry.authed) return;
+      const bytes = new Uint8Array(ev.data);
+      const signer = peekEnvelopeSigner(bytes);
+      if (!signer || !bytesEqual(signer, entry.pk)) return;
+      host.dispatch(bytes);
     }
   });
   dc.addEventListener("close", () => {
@@ -427,9 +531,7 @@ function attachPeerListeners(entry, pkHex) {
     try {
       entry.makingOffer = true;
       await pc.setLocalDescription();
-      sendSignal(pkHex, {
-        type: "sdp", from: myPkHex, to: pkHex, sdp: pc.localDescription,
-      });
+      sendSignedSdp(pkHex, pc.localDescription);
     } catch (err) {
       shellPrint(`Negotiation failed: ${err.message}`, "err");
     } finally {
@@ -464,12 +566,15 @@ function attachPeerListeners(entry, pkHex) {
 }
 
 function makeEntry(pc, pkHex) {
+  const pk = hexToBytes(pkHex);
   return {
     pc, dc: null, pendingIce: [],
+    pk,                       // Uint8Array form, pinned for per-frame signer check
     polite: myPkHex > pkHex,
     makingOffer: false,
     ignoreOffer: false,
     callSenders: null,
+    authed: false,            // flipped true once we've verified a signed SDP
   };
 }
 
@@ -532,12 +637,29 @@ async function onSignal(msg) {
       break;
     }
     case "sdp": {
+      // Identity binding (RFC 8827 §5.6.4). Before we touch the SDP we
+      // require msg.idSig to verify against the a=fingerprint lines IN this
+      // SDP, under msg.from's pubkey. That binds the DTLS endpoint described
+      // by this SDP to the identity we'll key the peer entry under. A MITM
+      // relay swapping in its own fingerprint must also swap in its own pk +
+      // its own valid sig — at which point msg.from changes and the swap is
+      // visible as "a different peer", not as impersonation.
+      if (typeof msg.from !== "string" || msg.from.length !== 64) return;
+      if (!msg.sdp || typeof msg.sdp.sdp !== "string") return;
+      const peerPk = hexToBytes(msg.from);
+      const idSig  = hexToBytes(msg.idSig);
+      if (!peerPk || peerPk.length !== 32 || !idSig || idSig.length !== 64 ||
+          !verifySdpIdentity(msg.sdp.sdp, peerPk, idSig)) {
+        shellPrint(`Rejected SDP from ${msg.from.slice(0,8)} — identity not bound to DTLS fingerprint`, "err");
+        return;
+      }
       // Only auto-create an entry on a fresh offer. An "answer" arriving
       // for a peer we don't know is meaningless — drop it.
       const entry = msg.sdp.type === "offer"
         ? (peers.get(msg.from) ?? ensurePeer(msg.from))
         : peers.get(msg.from);
       if (!entry) return;
+      entry.authed = true;
       // Glare check: an offer arriving while we are also offering (or are
       // mid-renegotiation) is a collision. Polite side accepts it (rolling
       // back its own offer implicitly via setRemoteDescription); impolite
@@ -552,9 +674,7 @@ async function onSignal(msg) {
         await flushPendingIce(entry);
         if (msg.sdp.type === "offer") {
           await entry.pc.setLocalDescription();
-          sendSignal(msg.from, {
-            type: "sdp", from: myPkHex, to: msg.from, sdp: entry.pc.localDescription,
-          });
+          sendSignedSdp(msg.from, entry.pc.localDescription);
         }
       } catch (err) {
         shellPrint(`SDP handling failed: ${err.message}`, "err");
@@ -924,7 +1044,10 @@ makeOfferBtn.addEventListener("click", async () => {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     await waitForIceGatheringComplete(pc);
-    lastOfferBlob = encodeBlob({ from: myPkHex, type: "offer", sdp: pc.localDescription });
+    lastOfferBlob = encodeBlob({
+      from: myPkHex, type: "offer", sdp: pc.localDescription,
+      idSig: bytesToHex(signSdpIdentity(pc.localDescription.sdp)),
+    });
     myOfferArea.value = lastOfferBlob;
     myOfferBox.classList.add("ready");
     copyLinkBtn.disabled = false;
@@ -966,6 +1089,17 @@ applyAnswerBtn.addEventListener("click", async () => {
     shellPrint("That doesn't look like an answer.", "err"); return;
   }
   const peerPkHex = parsed.from;
+  if (typeof peerPkHex !== "string" || peerPkHex.length !== 64) {
+    shellPrint("Answer has malformed identity.", "err"); return;
+  }
+  const peerPk = hexToBytes(peerPkHex);
+  const idSig  = hexToBytes(parsed.idSig);
+  if (!peerPk || peerPk.length !== 32 || !idSig || idSig.length !== 64 ||
+      !parsed.sdp || typeof parsed.sdp.sdp !== "string" ||
+      !verifySdpIdentity(parsed.sdp.sdp, peerPk, idSig)) {
+    shellPrint("Answer rejected — identity not bound to DTLS fingerprint.", "err");
+    return;
+  }
   const { pc, dc } = pendingManualOffer;
   pendingManualOffer = null;
   // Adopt the pre-built pc + dc into the peers map under the just-learned
@@ -974,6 +1108,7 @@ applyAnswerBtn.addEventListener("click", async () => {
   // future renegotiation (ICE restart on network change, future media-track
   // adds) flows through the perfect-negotiation path over the dc.
   const entry = makeEntry(pc, peerPkHex);
+  entry.authed = true;   // verified above against parsed.idSig
   peers.set(peerPkHex, entry);
   attachPeerListeners(entry, peerPkHex);
   bindDataChannel(entry, dc, peerPkHex);
@@ -994,6 +1129,17 @@ makeAnswerBtn.addEventListener("click", async () => {
     shellPrint("That doesn't look like an offer.", "err"); return;
   }
   const peerPkHex = parsed.from;
+  if (typeof peerPkHex !== "string" || peerPkHex.length !== 64) {
+    shellPrint("Offer has malformed identity.", "err"); return;
+  }
+  const peerPk = hexToBytes(peerPkHex);
+  const idSig  = hexToBytes(parsed.idSig);
+  if (!peerPk || peerPk.length !== 32 || !idSig || idSig.length !== 64 ||
+      !parsed.sdp || typeof parsed.sdp.sdp !== "string" ||
+      !verifySdpIdentity(parsed.sdp.sdp, peerPk, idSig)) {
+    shellPrint("Offer rejected — identity not bound to DTLS fingerprint.", "err");
+    return;
+  }
   if (peers.has(peerPkHex)) {
     shellPrint(`Already have a peer entry for ${peerPkHex.slice(0,8)}.`, "err"); return;
   }
@@ -1004,12 +1150,14 @@ makeAnswerBtn.addEventListener("click", async () => {
   myAnswerArea.placeholder = "gathering ICE candidates...";
   try {
     const entry = ensurePeer(peerPkHex);
+    entry.authed = true;   // offer's idSig already verified above
     await entry.pc.setRemoteDescription(parsed.sdp);
     const answer = await entry.pc.createAnswer();
     await entry.pc.setLocalDescription(answer);
     await waitForIceGatheringComplete(entry.pc);
     myAnswerArea.value = encodeBlob({
       from: myPkHex, type: "answer", sdp: entry.pc.localDescription,
+      idSig: bytesToHex(signSdpIdentity(entry.pc.localDescription.sdp)),
     });
     myAnswerBox.classList.add("ready");
     copyAnswerBtn.disabled = false;
