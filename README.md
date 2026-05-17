@@ -743,9 +743,9 @@ Measured in Node.js with `performance.now()` on an AMD Ryzen 7 PRO 7840U. The ke
 
 | Method | Node.js |
 |---|---|
-| Kernel pipeline (decode + verify + dispatch) | 1,040 ms (~104 µs/msg) |
-| Plain Ed25519 verify only | 954 ms (~95 µs/msg) |
-| **Overhead** | **~7–10%** |
+| Kernel pipeline (decode + verify + dispatch) | 834 ms (~83 µs/msg) |
+| Plain Ed25519 verify only | 810 ms (~81 µs/msg) |
+| **Overhead** | **~2.9%** |
 
 The Ed25519 verify dominates. The per-message sandbox tax pays for: host→kernel.wasm (parse envelope, find handler), kernel.wasm→host (invoke_handler callback), host→bootstrap.wasm (parse signature wrapper), bootstrap.wasm→host (ed25519_verify), host→kernel.wasm (dispatch inner), kernel.wasm→host (invoke_handler for inner handler), host→bootstrap.wasm (pop_signer).
 
@@ -755,13 +755,13 @@ The added security checks (installer tracking on register/revoke, signature-dept
 
 | Component | Size |
 |---|---|
-| kernel.wasm | 8 KB |
-| bootstrap.wasm (signature + trust table) | 11 KB |
-| seedkernel.js (host orchestration) | 12 KB |
+| kernel.wasm | 6 KB |
+| bootstrap.wasm (signature + trust table) | 12 KB |
+| host/*.js (host orchestration) | 69 KB |
 | libsodium.wasm (Ed25519 + SHA-3-256, default genesis suite) | ~350 KB |
 | **Total deployment with default genesis suite** | **~380 KB** |
 
-The kernel and signature/trust modules are pure protocol logic — no cryptographic code — and together come to ~20 KB of WASM. The `seedkernel.js` host layer orchestrates both WASM modules, wires bootstrap, and provides the `kernel.call` import. libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6. A future post-quantum suite registered via `signature.register` would be a larger module because it bundles its own algorithm implementation.
+The kernel and signature/trust modules are pure protocol logic — no cryptographic code — and together come to ~18 KB of WASM. The `host/*.js` host layer orchestrates both WASM modules, wires bootstrap, and provides the `kernel.call` import. libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6. A future post-quantum suite registered via `signature.register` would be a larger module because it bundles its own algorithm implementation.
 
 ---
 
