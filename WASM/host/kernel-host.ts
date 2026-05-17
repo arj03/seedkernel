@@ -70,7 +70,7 @@ interface KernelExports {
   remove_handler(schemaPtr: number, schemaLen: number): number;
   is_registered(schemaPtr: number, schemaLen: number): number;
   handler_count(): number;
-  dispatch(bytesPtr: number, bytesLen: number, ctx: number): void;
+  dispatch(bytesPtr: number, bytesLen: number): void;
 }
 
 // ─── bootstrap.wasm exports ──────────────────────────────────────────────
@@ -235,10 +235,9 @@ export class KernelHost {
           schemaPtr: number,
           schemaLen: number,
           payloadPtr: number,
-          payloadLen: number,
-          ctx: number
+          payloadLen: number
         ) => {
-          host._onInvokeHandler(handlerId, schemaPtr, schemaLen, payloadPtr, payloadLen, ctx);
+          host._onInvokeHandler(handlerId, schemaPtr, schemaLen, payloadPtr, payloadLen);
         },
         abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
           throw new Error(`kernel.wasm abort at ${line}:${col}`);
@@ -365,8 +364,7 @@ export class KernelHost {
     schemaPtr: number,
     schemaLen: number,
     payloadPtr: number,
-    payloadLen: number,
-    _ctxId: number
+    payloadLen: number
   ): void {
     if (handlerId === HANDLER_SIGNATURE) {
       // Copy payload directly from kernel to bootstrap memory — skip the JS
@@ -396,7 +394,7 @@ export class KernelHost {
         // A throw out of the inner dispatch (recursive handle_signature OOM,
         // a buggy WASM handler, etc.) is dropped here so the outer pipeline
         // still pops the signer cleanly.
-        try { this.kernelExports.dispatch(kPtr, innerLen, _ctxId); }
+        try { this.kernelExports.dispatch(kPtr, innerLen); }
         catch { /* drop — pop_signer in finally restores the stack */ }
       } finally {
         if (kPtr) this.kernelExports.dealloc(kPtr);
@@ -512,12 +510,27 @@ export class KernelHost {
    *  approveInstall callback, replacement policy, and recording installer
    *  attribution; this method just turns "here are the bytes" into "the
    *  module is now wired to the kernel and the cap index has the right row".
+   *
+   *  When `installer` is supplied, this method also auto-grants the installer
+   *  trust on `targetSchemaId` with `granter = installer` (self-granted) so
+   *  the §7.3 revocation cascade can reach the install: revoking any trust
+   *  entry of the installer walks the granter chain and fires
+   *  `onTrustRevoked(installer, targetSchemaId)`, which the install handler's
+   *  `RevokeInstallsBy` consumes to remove the kernel slot. Without this
+   *  link, revoking `(installer, installSchemaId)` would cascade to nothing
+   *  (the install handler's attribution table is keyed by target_schema_id,
+   *  not install schema), contradicting README §7.3 ("de-registers
+   *  everything"). The grant is idempotent — if the installer already has a
+   *  trust entry on `targetSchemaId` (e.g. an explicit root-seed grant), the
+   *  add is a no-op and the existing chain is preserved.
+   *
    *  Returns true on success, false on any failure (instantiation error,
    *  missing exports, scratch out of range). */
   installWasmHandler(
     targetSchemaId: Uint8Array,
     declaredCaps: readonly Uint8Array[],
     wasmBytes: Uint8Array,
+    installer?: Signer,
   ): boolean {
     if (targetSchemaId.length === 0) return false;
     if (wasmBytes.length === 0) return false;
@@ -587,6 +600,15 @@ export class KernelHost {
     this.schemaToHandlerId.set(targetKey, handlerId);
     this.handlerIdToSchema.set(handlerId, targetSchemaId.slice());
     this.handlerCapIndex.set(targetKey, declaredCaps.map((c) => c.slice()));
+
+    // Auto-grant installer trust on targetSchemaId, granter = installer, so
+    // the §7.3 cascade can find this install when the installer's trust is
+    // revoked. Idempotent: trustGrant rejects duplicates and we ignore the
+    // result. See the method-level comment for the rationale.
+    if (installer) {
+      this.trustGrant(installer.algoId, installer.publicKey, targetSchemaId, installer);
+    }
+
     return true;
   }
 
@@ -905,10 +927,11 @@ export class KernelHost {
     // setHandler entries are bootstrap-only by construction (§3.1) — they
     // declare no caps, so capability.of_handler returns [0x00] for them.
     // Drop any stale cap-index entry left over from a prior dynamic install
-    // at this schema. Installer attribution lives in the install handler's
-    // own table, which the install handler clears via revokeInstallsBy when
-    // the kernel slot is removed.
+    // at this schema and clear any matching install-handler attribution row
+    // so a later revocation of the original installer cannot yank this
+    // operator-installed handler.
     this.handlerCapIndex.delete(key);
+    if (this._installHandler) this._installHandler.clearAttribution(schemaId);
   }
 
   /** Remove a handler installed via setHandler (null handler case in §3.1). */
@@ -916,7 +939,10 @@ export class KernelHost {
     const ptr = this.writeToKernel(schemaId);
     try {
       const ok = this.kernelExports.remove_handler(ptr, schemaId.length) === 1;
-      if (ok) this._dropHostMaps(schemaId);
+      if (ok) {
+        this._dropHostMaps(schemaId);
+        if (this._installHandler) this._installHandler.clearAttribution(schemaId);
+      }
       return ok;
     } finally { this.kernelExports.dealloc(ptr); }
   }
@@ -1009,8 +1035,17 @@ export class KernelHost {
   ): Uint8Array {
     if (targetSchemaId.length === 0 || targetSchemaId.length > 255)
       throw new Error("encodeInstallPayload: target schema_id length must be 1..255");
-    if (seq < 0 || seq > 0xffffffff)
+    if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
       throw new Error("encodeInstallPayload: seq must fit in u32");
+    // caps_count and each cap_id_len are u8 on the wire (§3.2). Without these
+    // guards a caller passing > 255 caps or a > 255-byte cap_id would silently
+    // produce a truncated, mis-parseable payload.
+    if (caps.length > 255)
+      throw new Error("encodeInstallPayload: caps count must be 0..255");
+    for (const cap of caps) {
+      if (cap.length > 255)
+        throw new Error("encodeInstallPayload: each cap_id length must be 0..255");
+    }
     let headerLen = 4;     // seq u32 BE
     headerLen += 1;        // caps_count byte
     for (const cap of caps) headerLen += 1 + cap.length;
@@ -1094,8 +1129,11 @@ export class KernelHost {
     this.schemaToHandlerId.set(key, id);
     this.handlerIdToSchema.set(id, schemaId.slice());
     // Host-installed JS handlers have no declared caps — drop any stale
-    // cap-index entry left from a previous dynamic install at this slot.
+    // cap-index entry left from a previous dynamic install at this slot, and
+    // clear any matching install-handler attribution so a later revocation
+    // cascade of the original installer cannot yank this host handler.
     this.handlerCapIndex.delete(key);
+    if (this._installHandler) this._installHandler.clearAttribution(schemaId);
     return id;
   }
 
@@ -1121,7 +1159,7 @@ export class KernelHost {
     // message must not bring down the host loop.
     const ptr = this.writeToKernel(bytes);
     try {
-      try { this.kernelExports.dispatch(ptr, bytes.length, 0); }
+      try { this.kernelExports.dispatch(ptr, bytes.length); }
       catch { /* drop */ }
     } finally { this.kernelExports.dealloc(ptr); }
   }

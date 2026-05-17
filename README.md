@@ -251,7 +251,7 @@ The host exposes these under the import module `"kernel"`. These are the **only*
 - **The caller's scratch is overwritten when the callee returns a non-empty response.** A handler that still needs its original input across a `kernel.call` must copy it into private memory before calling — assume the worst, since any response overwrites scratch unconditionally. When the callee returns no bytes (return value `0`), the caller's scratch is left untouched, so callers MUST NOT rely on `kernel.call` to clear scratch. If a handler holds secrets in scratch and needs them cleared regardless of callee behaviour, it must zero scratch itself.
 - If the callee's response exceeds the caller's scratch size, the host returns `-1` and writes nothing. Tune scratch size per handler if you expect large responses.
 
-**Mutating handlers are not callable via `kernel.call`.** Any handler that mutates kernel, trust, or signature state — i.e. that calls `kernel.SetHandler`, registers a signature suite, or modifies the trust table — MUST cause `kernel.call` to return `-1` *before* the target handler is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers; without it, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent. These handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only bootstrap queries (`signature.signer`, `trust.is_trusted`, `capability.of_handler`) remain freely callable.
+**Mutating handlers are not callable via `kernel.call`.** Any handler that mutates kernel, trust, or signature state — i.e. that calls `kernel.SetHandler`, registers a signature suite, or modifies the trust table — MUST cause `kernel.call` to return `-1` *before* the target handler is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers; without it, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent. These handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only bootstrap queries (`signature.signer`, `capability.of_handler`) remain freely callable.
 
 The reference host auto-blocks the four bootstrap mutating handlers (`signature`, `signature.register`, `trust.grant`, and `install` when wired). Deployer-added mutators like `bootstrap.replace` (§10.1) MUST be marked blocked via `host.blockFromCall(handlerId)` immediately after `host.register`.
 
@@ -322,7 +322,7 @@ A one-line per layer index — full schema details live in §6 (Signature), §7 
 | **1.5: I/O bridges** | Deployer-defined (`net.send`, `ui.write`, `fs.read`, `clock.now`, …) | The only code that performs real I/O. `SetHandler`-installed, one capability each. |
 | **2: App modules** | Chat (example) | User-facing handlers installed via signed `install` messages (when the install handler is wired). |
 
-Each module is in its own file and can be used standalone — trust is a flat whitelist testable without a kernel, capability is a handler→caps index testable in isolation, and chat is just a handler testable without signatures. All inter-module queries go through `kernel.call` to the target module's schema (e.g. `signature.signer`, `trust.is_trusted`, `capability.of_handler`). Host-side wiring (the trust module's `OnRevoked` callback and the install handler's `RevokeInstallsBy`) is described in each module's section.
+Each module is in its own file and can be used standalone — trust is a flat whitelist testable without a kernel, capability is a handler→caps index testable in isolation, and chat is just a handler testable without signatures. Cross-module queries that handlers need at runtime go through `kernel.call` to the target module's schema (e.g. `signature.signer`, `capability.of_handler`); trust is consulted only by bootstrap-internal code paths (§7). Host-side wiring (the trust module's `OnRevoked` callback and the install handler's `RevokeInstallsBy`) is described in each module's section.
 
 **The hash function used for id derivation.** Throughout this section, `hash(…)` means the **genesis suite's hash** (§6.2) — the only hash function guaranteed to exist at boot. In the reference implementation that is SHA-3-256 (32-byte output). A deployment that swaps genesis suite swaps the hash: every derived `schema_id` and `cap_id` shifts, so the trust whitelist seeds in §10 must be re-derived. Pick the genesis suite once and treat it as a deployment-wide constant.
 
@@ -366,10 +366,9 @@ The signature module needs *something* to verify the very first message. By conv
 
 - **algo_id 0x0000** = Ed25519 + SHA-3-256
 - It is delivered as a **separate WASM module** (e.g. libsodium compiled to WASM), loaded at boot time.
-- The host trusts it **by hash** — the expected SHA-3-256 hash of the genesis WASM module is the one cryptographic constant in the bootstrap configuration.
 - It can never be removed, but it **can be superseded** for all new messages.
 
-The kernel itself does not know about a genesis suite. The hash is held by the host's bootstrap code, which inserts the suite into the signature module's registry before any messages are dispatched.
+The kernel itself does not know about a genesis suite. The host's bootstrap code instantiates the suite WASM and inserts it into the signature module's registry before any messages are dispatched.
 
 During a PQ migration, Ed25519 is typically the **outer** wrapper and the new PQ suite is the **inner** one. See §6.5 (wrapping convention).
 
@@ -567,16 +566,7 @@ flowchart TD
     DEREG --> KDEREG["module.RevokeInstallsBy(algoId, pubKey, schemaId) for each wired module (install handler calls SetHandler(_, null))"]
 ```
 
-### 7.4 WASM Contract (`trust.is_trusted`)
-
-Other handlers can query the trust whitelist via `kernel.call`:
-
-```
-payload  = [algo_id u16][pubkey_len u16][pubkey ..][schema_id_len u8][schema_id ..]
-response = kernel.call(trust_is_trusted_id, payload)
-```
-
-Returns `0x01` if the key is trusted for the given schema, `0x00` otherwise. This is primarily used by the install handler (§3.2) and by handlers that need to verify the signer is authorized (e.g. `trust.grant`, `signature.register`).
+Trust is an installer/bootstrap concern: which keys may grant trust, which may install handlers, which may register signature suites. The check is consumed by `handle_trust_grant` and `handle_signature_register` (both inside bootstrap.wasm, with direct access to the trust table) and by the host-side install handler (which uses the host's `KernelHost.isTrustedByCurrentSigners`). App-level handlers needing trust for anything else must build their own.
 
 ---
 

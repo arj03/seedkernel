@@ -753,9 +753,15 @@ async function testTrustRevokeSelectiveByInstaller() {
 
   host.trustGrant(GENESIS_ALGO_ID, rootPk, trustGrantId);
   host.trustGrant(GENESIS_ALGO_ID, rootPk, installId);
-  // Trust grants on the target schema_ids aren't required by the install
-  // handler (it gates on installId only), but we grant them so the trust
-  // cascade has rows to revoke.
+  // Pre-grant root trust on the target schemas as ROOT SEEDS (no granter)
+  // before the installs run. This anchors them outside the installer's
+  // grant subtree so revoking root's trust on one target does NOT cascade
+  // to other targets — letting this test verify the install handler's
+  // schema-selective revocation in isolation. Without these, the
+  // installWasmHandler auto-grant (granter=installer) would chain the
+  // targets together via root, and revoking either would cascade to both
+  // (per §7.3, "a key's authority is indivisible"). See
+  // testTrustRevokeCascadeViaInstallSchema for the cascade scenario.
   host.trustGrant(GENESIS_ALGO_ID, rootPk, chatTextId);
   host.trustGrant(GENESIS_ALGO_ID, rootPk, otherId);
   // Grant the bystander trust for root's exact schema_id bytes, even though
@@ -788,6 +794,57 @@ async function testTrustRevokeSelectiveByInstaller() {
     "chat.text removed: root was the installer");
   assert(host.isRegistered(otherId),
     "chat.other untouched (different schema)");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: revoking install trust cascades to all installs (§7.3) ────────
+//
+// installWasmHandler auto-grants `(installer, target_schema_id)` with
+// granter=installer at install time. Revoking the installer's trust on
+// installSchemaId fires no direct revokeInstallsBy match (attribution is
+// keyed by target_schema_id, not install) — the cascade must walk the
+// auto-grant chain to reach the target schemas.
+
+async function testTrustRevokeCascadeViaInstallSchema() {
+  console.log("Test: revoking installer's install-trust cascades to all installs (§7.3)");
+
+  const { host, trustGrantId, installId } = await makeHost();
+
+  const { publicKey: rootPk, privateKey: rootSk } = generateKeyPair();
+  const chatTextId = host.deriveScopedId("seedkernel.v1:chat.text",  rootPk);
+  const otherId    = host.deriveScopedId("seedkernel.v1:chat.other", rootPk);
+
+  // Only the two prerequisite grants — trust.grant and install. The target
+  // schema_ids are intentionally NOT pre-granted, so installWasmHandler's
+  // auto-grant takes effect.
+  host.trustGrant(GENESIS_ALGO_ID, rootPk, trustGrantId);
+  host.trustGrant(GENESIS_ALGO_ID, rootPk, installId);
+
+  const seq = makeSeq();
+  const { readFileSync } = await import("node:fs");
+  const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
+
+  host.dispatch(host.wrapAndEncode(rootSk, rootPk, CURRENT_VERSION, installId,
+    host.encodeInstallPayload(seq(rootPk), [], chatTextId, forwarderBytes)));
+  host.dispatch(host.wrapAndEncode(rootSk, rootPk, CURRENT_VERSION, installId,
+    host.encodeInstallPayload(seq(rootPk), [], otherId, forwarderBytes)));
+  assert(host.isRegistered(chatTextId), "chat.text installed by root");
+  assert(host.isRegistered(otherId),    "chat.other installed by root");
+  assert(host.isTrusted(GENESIS_ALGO_ID, rootPk, chatTextId),
+    "auto-grant: root trusted for chat.text");
+  assert(host.isTrusted(GENESIS_ALGO_ID, rootPk, otherId),
+    "auto-grant: root trusted for chat.other");
+
+  // Revoke root's trust on the install schema. The auto-grants chain
+  // (root, chatTextId) and (root, otherId) back to (root) — the cascade
+  // walks through them and fires onTrustRevoked for each, removing the
+  // installed handlers.
+  host.trustRevoke(GENESIS_ALGO_ID, rootPk, installId);
+  assert(!host.isRegistered(chatTextId),
+    "chat.text removed via cascade through auto-grant");
+  assert(!host.isRegistered(otherId),
+    "chat.other removed via cascade through auto-grant");
 
   console.log("  OK\n");
 }
@@ -1189,6 +1246,7 @@ await testBridgeCapabilityCheckEndToEnd();
 await testWrapRejectsInvalidKeySizes();
 await testSignatureNestingDepthBounded();
 await testTrustRevokeSelectiveByInstaller();
+await testTrustRevokeCascadeViaInstallSchema();
 await testBlockFromCallOnDeployerHandler();
 await testInvalidActionByteRejected();
 await testTrustGrantReplayRejected();

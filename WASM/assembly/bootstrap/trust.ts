@@ -431,7 +431,7 @@ export function handle_signature_register(payloadPtr: i32, payloadLen: i32): voi
 
   // Minimum header: seq(4) + algo_id(2) + hash_len(1) + pubkey_len(2) + sig_max_len(2) + name_len(1) = 12 bytes
   const payload = readBytes(payloadPtr, payloadLen);
-  if (payload.length <= 12) return;
+  if (payload.length < 12) return;
 
   let o: i32 = 0;
   // Replay protection (§4.4): consume seq before any state change.

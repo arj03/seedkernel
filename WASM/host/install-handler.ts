@@ -78,6 +78,17 @@ export class InstallHandler {
     return null;
   };
 
+  /** Drop the attribution row for `schemaId` without removing the kernel
+   *  handler. Called by `KernelHost.setHandler` / `register` / `removeHandler`
+   *  when an operator manually swaps the slot — without this, the stale row
+   *  would (a) gate future install-handler-driven installs on the *original*
+   *  installer match, and (b) cause a later trust-revocation cascade of the
+   *  original installer to yank the operator-installed handler. Idempotent.
+   *  Returns true if a row was removed. */
+  clearAttribution(schemaId: Uint8Array): boolean {
+    return this.installerAttribution.delete(schemaKey(schemaId));
+  }
+
   /** README §3.2 RevokeInstallsBy. Removes the kernel entry for `schemaId`
    *  iff the installing signer matches `(algoId, pubKey)` exactly. Wired
    *  into the trust module's OnRevoked cascade by the host. */
@@ -183,7 +194,10 @@ export class InstallHandler {
     if (!approved) return;
 
     // ── ask the host to instantiate + setHandler the WASM module ─────
-    const ok = this.host.installWasmHandler(targetSchemaId, declaredCaps, wasmBytes);
+    // Passing `installer` makes the host auto-grant `(installer, target)`
+    // with granter=installer so the §7.3 cascade can reach this install when
+    // any of the installer's trust entries is revoked.
+    const ok = this.host.installWasmHandler(targetSchemaId, declaredCaps, wasmBytes, installer);
     if (!ok) return;
 
     // ── record attribution for revocation cascades ───────────────────

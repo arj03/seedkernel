@@ -12,7 +12,7 @@
 // Imports:
 //   invoke_handler                — called when a handler matches
 
-import { decode, MAX_ENVELOPE_BYTES } from "./envelope";
+import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope";
 
 @external("env", "invoke_handler")
 declare function invokeHandler(
@@ -20,8 +20,7 @@ declare function invokeHandler(
   schemaPtr: i32,
   schemaLen: i32,
   payloadPtr: i32,
-  payloadLen: i32,
-  ctx: i32
+  payloadLen: i32
 ): void;
 
 class Entry {
@@ -53,9 +52,21 @@ function findIndex(schemaId: Uint8Array): i32 {
   return -1;
 }
 
-function findEntry(schemaId: Uint8Array): Entry | null {
-  const idx = findIndex(schemaId);
-  return idx >= 0 ? handlers[idx] : null;
+/** Zero-copy variant of findIndex that compares the stored schema_id against
+ *  raw bytes at `schemaPtr`. Used by `dispatch` so the hot path doesn't have
+ *  to allocate a Uint8Array for every inbound envelope. */
+function findIndexAtPtr(schemaPtr: i32, schemaLen: i32): i32 {
+  for (let i = 0; i < handlers.length; i++) {
+    const sid = handlers[i].schemaId;
+    if (sid.length == schemaLen) {
+      let eq = true;
+      for (let j = 0; j < schemaLen; j++) {
+        if (sid[j] != load<u8>(schemaPtr + j)) { eq = false; break; }
+      }
+      if (eq) return i;
+    }
+  }
+  return -1;
 }
 
 function readBytes(ptr: i32, len: i32): Uint8Array {
@@ -113,19 +124,36 @@ export function handler_count(): i32 {
   return handlers.length;
 }
 
-export function dispatch(bytesPtr: i32, bytesLen: i32, ctx: i32): void {
+export function dispatch(bytesPtr: i32, bytesLen: i32): void {
   if (bytesLen > MAX_ENVELOPE_BYTES) return;
-  const bytes = readBytes(bytesPtr, bytesLen);
-  const env = decode(bytes);
-  if (env == null) return;
-  const entry = findEntry(env.schemaId);
-  if (entry == null) return;
+  // Zero-copy envelope parsing: read directly from the host-staged buffer at
+  // bytesPtr. The buffer is stable for the duration of this call (the host
+  // dealloc's only after dispatch returns), so we can pass pointers into it
+  // straight through to invoke_handler without making a kernel-side copy.
+  if (bytesLen < 4) return;
+
+  const magic: u16 = ((load<u8>(bytesPtr) as u16) << 8) | (load<u8>(bytesPtr + 1) as u16);
+  if (magic != MAGIC) return;
+
+  const version = load<u8>(bytesPtr + 2);
+  if (version != CURRENT_VERSION) return;
+
+  const schemaLen = load<u8>(bytesPtr + 3) as i32;
+  if (schemaLen == 0) return; // zero-length schema_id is reserved/invalid (§2)
+  if (4 + schemaLen > bytesLen) return;
+
+  const schemaPtr = bytesPtr + 4;
+  const payloadPtr = schemaPtr + schemaLen;
+  const payloadLen = bytesLen - 4 - schemaLen;
+
+  const idx = findIndexAtPtr(schemaPtr, schemaLen);
+  if (idx < 0) return;
+
   invokeHandler(
-    entry.handlerId,
-    env.schemaId.dataStart as i32,
-    env.schemaId.length,
-    env.payload.dataStart as i32,
-    env.payload.length,
-    ctx
+    handlers[idx].handlerId,
+    schemaPtr,
+    schemaLen,
+    payloadPtr,
+    payloadLen
   );
 }

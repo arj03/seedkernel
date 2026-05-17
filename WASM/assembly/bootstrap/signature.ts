@@ -196,8 +196,10 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   // inner dispatch.
   if (signerStack.length >= MAX_SIGNATURE_DEPTH) return 0;
   const payload = readBytes(payloadPtr, payloadLen);
-  // 2 (algo) + 2 (signer_len) + 2 (sig_len) = 6 minimum before any var bytes.
-  if (payload.length < 6) return 0;
+  // Need at least 4 bytes to read algo_id (2) + signer_len (2); the variable
+  // signer / sig_len / sig / inner regions are bound-checked individually
+  // below.
+  if (payload.length < 4) return 0;
 
   let o: i32 = 0;
   const algoId = readU16BE(payload, o); o += 2;
@@ -231,7 +233,11 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   if (isGenesis) {
     if (sigLen != expectedSigLen) return 0; // Ed25519 sigs are always exactly 64 bytes
   } else {
-    if (sigLen > expectedSigLen) return 0; // other suites may use variable-length sigs up to max
+    // Non-genesis suites may use variable-length sigs up to max. Reject
+    // sigLen <= 0 explicitly — a well-behaved suite would refuse a zero-length
+    // signature anyway, but the kernel-side guard means a malformed suite
+    // cannot let one slip through to suite.verify.
+    if (sigLen <= 0 || sigLen > expectedSigLen) return 0;
   }
   if (o + sigLen > payload.length) return 0;
   const sigOffset = o;
