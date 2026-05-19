@@ -16,38 +16,24 @@ Every binding is three orthogonal pieces: the **name** is the kernel's opaque di
 - Cryptographic algorithms are pluggable; the kernel can survive a post-quantum transition without a protocol rewrite.
 - The kernel compiles to WebAssembly so it runs anywhere.
 
-**Layering model:**
-
-```
-┌─────────────────────────────────────────┐
-│  App modules (chat, …)                  │  ← anything goes here
-├─────────────────────────────────────────┤
-│  Installer (+ deployer's policy)        │  ← binds names to bytes
-├─────────────────────────────────────────┤
-│  Signature                              │  ← identifies the author
-├─────────────────────────────────────────┤
-│  Kernel (envelope + dispatch by name)   │  ← one routing decision
-└─────────────────────────────────────────┘
-```
-
-No layer has a hard dependency on the layer above or below it. You could replace the signature module with a different identity scheme, or run a deployment with no installer at all (handlers wired directly by the host). The onion describes a typical composition, not a required one.
+**Layering.** The reference composition stacks app modules → installer (optional) → signature → kernel. No layer has a hard dependency on the layers above or below; the onion describes a typical composition, not a required one. See §5 for the diagrammed model.
 
 ---
 
 ## 1.1 Concepts at a glance
 
-A reader's-digest mental model before the wire details:
+A reader's-digest mental model; full details follow in §2–§10.
 
-- **Envelope.** 4-byte header + opaque `name` + opaque `payload`. The kernel's only routing decision is `handlers[name]`.
-- **Name.** Opaque dispatch key. By convention `hash("seedkernel.bootstrap.v1:" + canonical)` for bootstrap handlers and free-form for app handlers — the policy (§7.4) decides what counts as a valid name for an install.
-- **Handler.** A WASM module that exchanges bytes with the host through a fixed **scratch** offset in its own memory — no allocators across the boundary.
-- **Signing is a wrapper, not a header field.** A signed message is an outer envelope (`name = signature`) whose payload is `(algo_id, signer, sig, inner_envelope)`. The signature handler verifies, pushes the signer, and re-dispatches the inner envelope.
-- **Author** = top signer of the current dispatch. Read by handlers via `kernel.call(signature.signer, …)`.
-- **Installer.** Holds `installations[name] → (author, bytes_hash, declared_caps, parent)` and accepts signed install messages. It calls a deployer-supplied **policy callback** to decide whether to honor an install; on approval it calls `SetHandler(name, instance)`.
-- **Policy callback.** The only place "who is allowed to do what" is decided. The reference policy: *first install at a name — deployer chooses; subsequent install — same author plus parent points at current bytes_hash.*
-- **Capability.** A declared property of an installation — which bridges this handler may reach. Stored alongside the binding in the installer's records, checked by bridges at I/O time.
-- **Bridges** are `SetHandler`-installed handlers bound to one capability; they are the only code that performs real I/O.
-- **Bootstrap.** Host wires the kernel, the signature module, and (optionally) the installer with its policy callback. After that, growth happens by signed install messages.
+- **Envelope** — `magic | version | name_len | name | payload` (§2). The kernel's only routing decision is `handlers[name]`.
+- **Name** — opaque dispatch key; convention `hash("seedkernel.bootstrap.v1:" + canonical)` for bootstrap handlers, free-form for apps under the policy's discretion.
+- **Handler** — a WASM module that exchanges bytes with the host through a fixed scratch offset in its own memory (§4).
+- **Signing is a wrapper, not a header field.** A signed message is an outer envelope with `name = signature` whose payload carries `(algo_id, signer, sig, inner_envelope)` (§6.3).
+- **Author** — top signer of the current dispatch, read via `kernel.call(signature.signer, …)` (§6.5).
+- **Installer** — holds install records, accepts signed install messages, runs a deployer-supplied policy callback on each (§7).
+- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses first installer at a name; subsequent installs require same author + parent (§7.4).
+- **Capability** — a declared property of an installation, checked by bridges at I/O time (§8).
+- **Bridges** — `SetHandler`-installed handlers bound to one capability; the only code that performs real I/O (§9).
+- **Bootstrap** — host wires kernel, signature, and (optionally) installer; growth then happens via signed installs (§10).
 
 ```
 incoming bytes
@@ -148,7 +134,7 @@ kernel.SetHandler(name, handler)
 
 `SetHandler` is the only way handlers enter or leave the kernel's table. There is no message kind for installation, no privileged "register" path, and no protected-vs-unprotected distinction — every entry in the table arrived via the same call. Handlers installed by `SetHandler` have **no installer record**: they are invisible to the installer's tables (§7) and, in particular, the capability index (§8). The host is responsible for whatever attribution and policy it cares about; the kernel just stores the function pointer.
 
-The capability consequence is structural: because `SetHandler`-installed handlers have no entry in the installer's records, every capability lookup against them returns the empty set, and every bridge check against them fails. This is the reason signature and any other bootstrap handler can never reach an I/O bridge — not a rule stated in any module's code, but a fact that falls out of the API surface. The installer (§7) is the only path that *populates* the capability index, and it does so for the WASM handlers it installs.
+Because `SetHandler`-installed handlers have no installer record, they also have no capability entries; see §8.3 for why this means bootstrap handlers cannot reach any I/O bridge.
 
 `SetHandler` is internal to the host process — it is a direct method call, never reachable from inbound messages or WASM handlers. The host controls access through its own authentication (process-level permissions, operator console, HSM, or whatever is appropriate for the deployment). The kernel does not define an access control policy for `SetHandler`; that is the host's responsibility.
 
@@ -196,13 +182,22 @@ The host exposes these under the import module `"kernel"`. These are the **only*
 | `call` | `(i32, i32, i32, i32) → i32` | `(name_ptr, name_len, payload_ptr, payload_len) → response_len` — synchronous dispatch to the handler registered for the given name. The four pointers are into the **caller's own memory** (anywhere the caller likes). The response is written into the caller's scratch region; the return value is the response length, or `-1` on error (no handler registered, call depth exceeded, response too large for caller's scratch). See §4.4. |
 | `caller` | `(i32) → i32` | `(out_ptr) → total_len` — writes the caller stack at `out_ptr` in push order: `[count u8] [name1_len u8][name1 bytes] ... [nameK_len u8][nameK bytes]`. Outermost first, immediate caller last. Empty stack returns `[0x00]` (single byte, count=0) — the handler was reached by direct envelope dispatch rather than through `kernel.call`. The stack tracks `kernel.call` lineage only; signature-wrapper re-dispatch starts a fresh context (its lineage is the signer stack, §6.5). Count is bounded by `MAX_CALL_DEPTH`. Bridges read the last entry for capability checks (§8.2); other handlers may inspect the full stack for audit / logging. Treating non-top frames as authoritative invites confused-deputy mistakes — capability checks MUST use the immediate caller only. |
 
-### 4.3 Sandboxing
+### 4.3 Safety & memory model
 
-- Handlers have **no** filesystem, network, or clock access.
-- Memory is bounded by what the handler's WASM module declares (and ultimately by the host engine's own memory limits); the kernel imposes no per-handler memory cap of its own.
-- A handler can only affect the outside world by `kernel.call` to other handlers. Bridges (handlers that perform real I/O) additionally require the calling handler to have declared the bridge's capability at install time (§7.2, §8). The default is no capabilities; every declaration is explicit at install time.
+What a handler **cannot** do:
+
+- Access the filesystem, network, or clock. The only outside-world reach is `kernel.call` to other handlers; bridges (handlers that perform real I/O) additionally require the caller to have declared the bridge's capability at install time (§7.2, §8). The default is no capabilities; every declaration is explicit.
+- Allocate memory across the boundary. There is no allocator contract — every cross-module byte lives in one handler's scratch and is copied by the host into another's. The host never holds a pointer into a handler's memory across a return, and never writes outside the scratch region.
+- Corrupt anything outside its own scratch and private memory. A buggy or malicious handler can scribble in itself but cannot touch the host, the kernel, or another handler.
+
+What a handler **must** internalize:
+
+- Memory is bounded by what the WASM module declares (and the host engine's own limits); the kernel imposes no per-handler cap.
+- A `kernel.call` overwrites your scratch with the callee's response. If you still need the input, copy it first (§4.4).
 
 > **Compute exhaustion is the host's problem.** WebAssembly engines on the JavaScript platform expose no native fuel/timeout mechanism, so this protocol does not specify one. Deployers concerned about runaway handlers should run dispatch in a Worker with a watchdog, or pre-validate handler bytecode in the installer's policy callback (forbid loops above a budget, recursion, etc.) before installing. The kernel exposes the call-depth bound (§4.4) but does not bound per-handler execution time.
+
+> **Note.** Signature suite modules (§6.6) are the one exception to the scratch-only memory model. A suite has multi-argument primitives that don't fit the single-buffer scratch model cleanly, so the suite contract uses an explicit `alloc` and pointer arguments. Suite authors are crypto specialists writing thin wrappers around existing libraries; the small extra ceremony is acceptable in that niche.
 
 ### 4.4 Synchronous cross-module calls (`kernel.call`)
 
@@ -236,19 +231,6 @@ The reference host auto-blocks the two bootstrap handlers `signature` and `insta
 
 The `signature` wrapper is on the blocklist but consumes no `seq`: it does not act under any signer's authority — it *establishes* the top signer — and its push/pop of the signer stack leaves no persistent state to replay. The two protections target different threats: `seq` cuts off wire replay of authorized mutations; the blocklist cuts off in-pipeline corruption of kernel state.
 
-### 4.5 Memory model
-
-There is no allocator contract and no pointer ownership to track. Every buffer that crosses a boundary lives in the scratch region of one module and is copied by the host into the scratch region of another (or to/from the transport). The host never holds a pointer into a handler's memory across a return into that handler, and never writes outside its scratch region.
-
-What this rules out:
-
-- No allocator to implement, no `alloc` export, no free, no recycling.
-- No pointer-lifetime mistakes — the only buffer the host touches is at a known fixed offset and gets fully overwritten on the next call.
-- No shared memory between modules; every cross-module byte is a host-mediated copy.
-- A buggy or malicious handler can corrupt only its own scratch and its own private memory. It cannot corrupt the host, another handler, or the kernel.
-
-The one rule a handler author has to internalize is the one in §4.4: a `kernel.call` overwrites your scratch with the response. If you still need the input, copy it first.
-> **Note.** Signature suite modules (§6.6) are the one exception to this contract. A suite has multi-argument primitives (`hash(data)`, `verify(pubkey, sig, data)`) that don't fit the single-buffer scratch model cleanly, so the suite contract uses an explicit `alloc` and pointer arguments. Suite authors are crypto specialists writing thin wrappers around existing libraries; the small extra ceremony is acceptable in that niche.
 ---
 
 ## 5. Layering and composition
@@ -495,11 +477,10 @@ It returns `true` to proceed with the install or `false` to drop. That is the fu
 Deployers wire whatever policy fits their environment. Some examples:
 
 - **Open registry.** `return true;` — anyone may install at any name. Useful for testing; obviously not appropriate for a production deployment with untrusted senders.
-- **Author-allowlist.** `return author ∈ approved_keys;` — a fixed set of keys may install anything anywhere.
 - **Reference policy.** `existing == null ? deployer_first_install(...) : (author == existing.author && existing.bytes_hash == parent);` — see §7.4.
 - **Content-hash allowlist.** `return bytes_hash ∈ approved_hashes;` — only pre-audited binaries.
-- **M-of-N quorum.** `return signature.all_signers().count(s => s ∈ approved_keys) ≥ M;` — requires reading the full signer stack rather than just the top signer.
-- **Capability-restricted authors.** `return (declared_caps ⊆ allowed_caps[author]);` — different signers may install handlers with different capability profiles.
+
+Other common patterns: fixed author allowlists, M-of-N quorums (requires reading the full signer stack via `signature.signer`), and capability-restricted authors (`declared_caps ⊆ allowed_caps[author]`).
 
 The callback may be arbitrarily expensive — the installer dispatches one install at a time and the policy decision is on the install hot path, but it is not on the message-dispatch hot path. A callback that consults an operator console or HSM is fine.
 
@@ -620,43 +601,13 @@ Inbound I/O (packets, UI events, timer ticks) re-enters the kernel via the norma
 
 Bootstrap is the host's job, not the kernel's. The host instantiates the kernel and the two modules, then composes the onion.
 
-```mermaid
-sequenceDiagram
-    participant Host as Host
-    participant K as Kernel
-    participant SIG as Signature Module
-    participant INS as Installer
-
-    Note over Host: === Layer 0: Kernel ===
-    Host->>K: new Kernel()
-
-    Note over Host: === Layer 1: Signature ===
-    Host->>SIG: new SignatureModule()
-    Note over Host: 1. Load genesis signature suite (verified by hash).
-    Host->>SIG: RegisterSuite(genesisSuite)  // algo 0x0000
-    Note over Host: 2. Set the signature wrapper handler AND the signer-query handler.
-    Host->>K: SetHandler(signatureName, sig.SignatureHandler)
-    Host->>K: SetHandler(signatureSignerName, sig.SignerQueryHandler)
-
-    Note over Host: === Layer 2: Installer (optional) ===
-    Host->>INS: new Installer(kernel)
-    Host->>INS: approveInstall = (name, author, bytesHash, wasm, caps, parent, existing) => ...
-    Note over Host: The reference policy (§7.4) is the default; deployers override.
-    Host->>K: SetHandler(installName, ins.Handler)
-    Host->>K: SetHandler(installerLookupName, ins.LookupQuery)
-    Host->>K: SetHandler(installerCapsOfName, ins.CapsOfQuery)
-    Note over Host: With no installer wired, the deployment is frozen — no message-driven installs.
-    Note over Host: With it wired but no approveInstall callback, every install is dropped.
-
-    Note over Host: === Layer 2.5: I/O bridges (optional, deployer-defined) ===
-    Host->>K: SetHandler(netSendName, host.NetSendBridge)
-    Host->>K: SetHandler(uiWriteName, host.UiWriteBridge)
-    Host->>K: SetHandler(fsReadName, host.FsReadBridge)
-    Note over Host: Bridges are native host code, not WASM. Each is bound to one capability.
-
-    Note over Host: === Layer 3: App modules (optional) ===
-    Note over Host: Chat (and any other app modules) are installed via signed install messages.
-```
+1. Instantiate the kernel.
+2. Load the genesis signature suite (verified by hash) into the signature module's suite registry.
+3. `SetHandler` for the `signature` wrapper and the `signature.signer` query handler.
+4. *(Optional — needed for message-driven installation.)* Instantiate the installer and wire `approveInstall(name, author, bytesHash, wasm, caps, parent, existing) => …`. With no installer wired, the deployment is frozen. With it wired but no callback, every install is dropped.
+5. `SetHandler` for `install`, `installer.lookup`, and `installer.caps_of`.
+6. *(Optional.)* `SetHandler` for I/O bridges (`net.send`, `ui.write`, `fs.read`, …). Bridges are native host code, each bound to one capability.
+7. *(Optional.)* App modules (chat, …) arrive after this point as signed install messages — no further host wiring needed.
 
 The kernel's role in this sequence is: store handlers and dispatch messages. Everything else — author identification, install records, policy gating, capability bookkeeping — is the host wiring modules together. Signature verification happens once at the `signature` entry point. The installer turns signed install messages into `SetHandler` calls and records each install's metadata so bridges can authorise their callers at I/O time. App modules above layer 2 are installed by sending signed messages addressed to the installer.
 
@@ -690,7 +641,7 @@ Measured in Node.js with `performance.now()` on an AMD Ryzen 7 PRO 7840U. The ke
 | Plain Ed25519 verify only | 810 ms (~81 µs/msg) |
 | **Overhead** | **~2.9%** |
 
-The Ed25519 verify dominates. The per-message sandbox tax pays for: host→kernel.wasm (parse envelope, find handler), kernel.wasm→host (invoke_handler callback), host→signature.wasm (parse signature wrapper), signature.wasm→host (ed25519_verify), host→kernel.wasm (dispatch inner), kernel.wasm→host (invoke_handler for inner handler), host→signature.wasm (pop_signer).
+The Ed25519 verify dominates. Each signed message crosses ~7 WASM boundaries and ~6 memory copies (envelope parse, signature wrapper parse, verify, re-dispatch of the inner envelope, inner handler invocation, signer pop); even so, the sandbox tax is ~2 µs/msg over the raw verify.
 
 Collapsing the previous version's trust + capability + install machinery into a single installer module (with capability data folded into install records) means fewer cross-module queries on the install hot path, but installation is not on the message hot path, so the overhead ratio for the steady-state pipeline is unchanged from the previous baseline.
 
@@ -730,27 +681,7 @@ To run it locally: build the WASM artifacts (`kernel.wasm`, the signature/instal
 
 A signed `chat.text` message arriving at a fully bootstrapped node, traced through every boundary. Assume `<keyA>` was used to install the chat handler at name `chat.text@keyA` (the canonical name the deployer's first-install policy approves under), so the chat handler is in the kernel's table and `installations[chat.text@keyA]` has the corresponding record. The message below is signed by `<keyA>`.
 
-**Wire bytes (outermost → innermost):**
-
-```
-outer envelope (the bytes that hit the kernel)
-  magic       = 5344
-  version     = 01
-  name_len    = 20
-  name        = hash("seedkernel.bootstrap.v1:signature")
-  payload     = signature wrapper:
-    algo_id     = 0000                              ← Ed25519+SHA-3-256 (genesis)
-    signer_len  = 0020                              ← u16 BE: 32 bytes
-    signer      = <keyA pubkey>
-    sig_len     = 0040
-    sig         = <Ed25519(inner_envelope, keyA_sk)>
-    inner_envelope:                                 ← raw bytes, signature covers these
-      magic     = 5344
-      version   = 01
-      name_len  = 20
-      name      = chat.text@keyA  (the name the installer recorded)
-      payload   = "hello, world"
-```
+**Message on the wire.** An outer signature envelope (per §6.3) carries `algo_id = 0x0000` (genesis), `signer = <keyA pubkey>`, `sig = Ed25519(inner_envelope, keyA_sk)`, and an inner envelope with `name = chat.text@keyA`, `payload = "hello, world"` (per §2). The signature covers the inner envelope's raw bytes.
 
 **Pipeline trace:**
 
