@@ -104,14 +104,6 @@ The 64 KB limit is a protocol constant, not a per-deployment configuration knob.
 
 **Install messages** (handled by the installer, §7) carry name, capability, and parent metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (kernel.wasm ~8 KB, bootstrap.wasm ~11 KB — see §11.2). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
 
-### 2.3 Maximum signature wrapping depth
-
-The signature module MUST reject any `signature` envelope when the signer stack already contains `MAX_SIGNATURE_DEPTH` entries. **`MAX_SIGNATURE_DEPTH` is a protocol constant equal to `4`.**
-
-**Rationale.** Each signature wrapper costs one verify (~95 µs for Ed25519 on a modern core). Per-wrapper overhead is ~140 bytes for Ed25519 (§2.2), so a 64 KB envelope can in principle nest ~475 wrappers. Without a cap, a single inbound message can force that many verifies (~45 ms CPU), turning a tiny attacker input into a CPU-amplification DoS. Capping depth at 4 supports realistic use cases (single-sig, hybrid Ed25519+PQ, key-rotation overlays, an attestation envelope) while keeping per-message verify cost bounded.
-
-This limit is enforced by the signature handler reading the current signer stack length before verifying — implementations do not need a separate counter. The 4-entry cap aligns with the authorization model in §6.5: the operative authorization is always the top signer, so deeper wrappers add no semantic value the kernel can use.
-
 ---
 
 ## 3. The kernel
@@ -162,6 +154,8 @@ The capability consequence is structural: because `SetHandler`-installed handler
 
 The same call the host uses during bootstrap (§10) remains available afterward for emergency replacement of any handler, including bootstrap handlers like `signature` and the installer itself. Message-driven installation lives in the installer (§7); the host-level `SetHandler` path is the emergency fallback.
 
+**Replacing installer-managed names.** When the host uses `SetHandler` to replace a handler that already has an installer record (§7.1), the kernel does not touch the record. Stale `installer.lookup` / `installer.caps_of` answers would then misauthorize the replacement at bridge checks — the old declared caps would still apply to brand-new bytes. The host MUST first call `installer.remove(name)` (§7.5) to clear the record and null the slot, then `SetHandler(name, newHandler)` to install the replacement. The replacement runs with no capability entries until the host explicitly wires them.
+
 ### 3.2 The installer (optional)
 
 Most deployments want to install new handlers by sending signed messages, not by direct host wiring. The system provides this through an **installer**: a host-side handler that turns signed install messages into `SetHandler` calls under a deployer-supplied policy. The installer is not part of the kernel — it is one more handler the host wires via `SetHandler` during bootstrap. Frozen-config deployments simply skip it and grow no further.
@@ -200,7 +194,7 @@ The host exposes these under the import module `"kernel"`. These are the **only*
 | Import name | WASM signature | Description |
 | --- | --- | --- |
 | `call` | `(i32, i32, i32, i32) → i32` | `(name_ptr, name_len, payload_ptr, payload_len) → response_len` — synchronous dispatch to the handler registered for the given name. The four pointers are into the **caller's own memory** (anywhere the caller likes). The response is written into the caller's scratch region; the return value is the response length, or `-1` on error (no handler registered, call depth exceeded, response too large for caller's scratch). See §4.4. |
-| `caller` | `(i32) → i32` | `(out_ptr) → name_len` — writes the name of the handler that invoked the current `kernel.call` into caller memory at `out_ptr` and returns its length. Returns `0` (writing nothing) when there is no parent frame — i.e. when the handler was reached by direct envelope dispatch rather than through `kernel.call`. The return is unambiguous because valid names are always at least 1 byte (§15). Primarily used by I/O bridges (§9) to identify the caller for capability checks. |
+| `caller` | `(i32) → i32` | `(out_ptr) → total_len` — writes the caller stack at `out_ptr` in push order: `[count u8] [name1_len u8][name1 bytes] ... [nameK_len u8][nameK bytes]`. Outermost first, immediate caller last. Empty stack returns `[0x00]` (single byte, count=0) — the handler was reached by direct envelope dispatch rather than through `kernel.call`. The stack tracks `kernel.call` lineage only; signature-wrapper re-dispatch starts a fresh context (its lineage is the signer stack, §6.5). Count is bounded by `MAX_CALL_DEPTH`. Bridges read the last entry for capability checks (§8.2); other handlers may inspect the full stack for audit / logging. Treating non-top frames as authoritative invites confused-deputy mistakes — capability checks MUST use the immediate caller only. |
 
 ### 4.3 Sandboxing
 
@@ -229,9 +223,14 @@ The host exposes these under the import module `"kernel"`. These are the **only*
 - **The caller's scratch is overwritten when the callee returns a non-empty response.** A handler that still needs its original input across a `kernel.call` must copy it into private memory before calling — assume the worst, since any response overwrites scratch unconditionally. When the callee returns no bytes (return value `0`), the caller's scratch is left untouched, so callers MUST NOT rely on `kernel.call` to clear scratch. If a handler holds secrets in scratch and needs them cleared regardless of callee behaviour, it must zero scratch itself.
 - If the callee's response exceeds the caller's scratch size, the host returns `-1` and writes nothing. Tune scratch size per handler if you expect large responses.
 
-**Mutating handlers are not callable via `kernel.call`.** Any handler that mutates kernel or installer state — i.e. that calls `kernel.SetHandler`, registers a signature suite, or modifies the installer's records — MUST cause `kernel.call` to return `-1` *before* the target handler is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers; without it, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent. These handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only queries (`signature.signer`, `installer.lookup`, `installer.caps_of`) remain freely callable.
+**Handlers blocked from `kernel.call`.** Two kinds of handler MUST cause `kernel.call` to return `-1` *before* the target is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers.
 
-The reference host auto-blocks the two bootstrap mutating handlers (`signature` and `install`). Deployer-added mutators MUST be marked blocked via `host.blockFromCall(handlerId)` immediately after `host.register`.
+1. **State mutators** — handlers that call `kernel.SetHandler`, modify the installer's records, or write to the suite registry. Without the block, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent.
+2. **The `signature` wrapper itself** — it does not mutate persistent state, but it pushes a new entry onto the signer stack and re-dispatches. Allowing it via `kernel.call` would let an arbitrary handler reframe the active signer mid-chain and break the "top signer = author" rule.
+
+Blocked handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only queries (`signature.signer`, `installer.lookup`, `installer.caps_of`) remain freely callable.
+
+The reference host auto-blocks the two bootstrap handlers `signature` and `install`. Deployer-added handlers in either class MUST be marked blocked via `host.blockFromCall(handlerId)` immediately after `host.register`.
 
 **Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(signer.algoId, signer.pubkey)]`. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-signer-per-handler and **persists across deny-listing or other policy changes** (tombstone-forever) — re-admitting a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
 
@@ -379,21 +378,23 @@ Unknown `algo_id`s drop because the suite was never registered (§6.4); only sui
 
 ### 6.4 Registering new algorithms
 
-New signature suites are installed via the normal installer path (§7). To register a new suite, send a signed install message whose target name is the conventional suite slot `hash("seedkernel.signature.suite." + algo_id_hex)` and whose WASM body implements the suite contract (§6.6). The signature module reads from these slots when looking up suites by `algo_id`, so an install at the right name is all that's required.
+Suite modules are not regular kernel handlers — their `verify` / `hash` exports take multi-pointer arguments (§6.6) that don't fit the scratch ABI used by `kernel.call`. Each suite instance lives instead in a **suite registry**, indexed by `algo_id` and held host-side on the signature module's behalf. The signature module reaches suite primitives through a host import that the host dispatches to the right instance.
+
+The genesis suite is seeded into this registry at bootstrap (§6.2, §10). To add another suite at runtime, send a signed install message targeting the conventional suite slot `hash("seedkernel.signature.suite." + algo_id_hex)`. The installer recognizes suite-slot names: it runs the same `approveInstall` policy callback as any other install, and on approval — instead of calling `SetHandler` — it asks the host to instantiate the WASM under the suite ABI and place the resulting instance in the registry under `algo_id`. The `(author, bytes_hash, declared_caps, parent)` record is still written to `installations[]` for audit and upgrade lineage; the kernel's handler table never holds a suite.
 
 The deployer's policy callback (§7.3) governs who may register suites — the same callback that governs every other install. There is no separate "trust for signature.register" path; "may this signer install at the suite slot for `algo_id N`?" is just a policy question. The reference policy's first-install/same-author rule (§7.4) applies: the first installer at a suite slot owns it and is the only author who can replace its WASM later.
 
 Once a new suite is registered, messages signed under it should be wrapped per §6.5: the new suite is the **innermost** signer (the operative authorizer); legacy-suite wrappers go on the outside.
 
-**Duplicate registration.** The reference policy's same-author requirement prevents a different signer from replacing a suite once installed. To rotate a suite, deployers allocate a new `algo_id` and install at the new slot. The genesis suite (`algo_id 0x0000`) is seeded by host-side `SetHandler` at bootstrap and cannot be replaced through the installer at all — the installer refuses replacement of slots seeded by `SetHandler` (§7.4). Emergency replacement of the genesis suite uses `SetHandler` directly, like any other host-side intervention.
+**Duplicate registration.** The reference policy's same-author requirement prevents a different signer from replacing a suite once installed. To rotate a suite, deployers allocate a new `algo_id` and install at the new slot. The genesis suite (`algo_id 0x0000`) is seeded into the registry by the host at bootstrap (§10) and cannot be replaced through the installer at all — the installer refuses to overwrite a registry entry it did not place there. Emergency replacement of the genesis suite is a direct host-side write to the registry, like any other host-side intervention.
 
-**Lazy validation.** The signature module does not verify that the bytes at a suite slot actually implement the suite contract at install time. If the bytes don't export `verify`, the first message signed under that `algo_id` fails verification and drops. This is intentional — schema/interface checking is the installer policy's job if a deployment cares (it can validate exports before approving), and the security-relevant path (verify failure → drop) is fail-safe regardless.
+**Lazy validation.** The signature module does not verify that suite bytes actually implement the suite contract at install time. If the bytes don't export `verify`, the first message signed under that `algo_id` fails verification and drops. This is intentional — schema/interface checking is the installer policy's job if a deployment cares (it can inspect the WASM exports before approving, see §7.3), and the security-relevant path (verify failure → drop) is fail-safe regardless.
 
 ### 6.5 Signer stack (signature module internals)
 
 The signature module maintains a **signer stack** — an internal list that tracks which keys have been verified during the current top-level dispatch. The kernel doesn't know it exists.
 
-**Lifecycle.** Every accepted `signature` wrapper pushes one entry, executes the inner dispatch synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline, capped at `MAX_SIGNATURE_DEPTH` (§2.3).
+**Lifecycle.** Every accepted `signature` wrapper pushes one entry, executes the inner dispatch synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline. The protocol does not fix a hard ceiling — depth is bounded by the 64 KB envelope cap (§2.2), which limits Ed25519 nesting to a few hundred wrappers at worst (~140 bytes per wrapper). Implementations on stack- or CPU-constrained hosts MAY impose their own lower cap; realistic deployments rarely need more than a handful (single-sig, hybrid Ed25519+PQ, key-rotation overlays, attestation envelopes).
 
 ```
 signature-envelope  (algo = Ed25519,  signer = A)        ← outer
@@ -411,7 +412,7 @@ stack while the actual message handler runs: [A, B]   (A pushed first, B on top)
 
 ### 6.6 Suite WASM contract
 
-A signature-suite module installed via the installer (§6.4) MUST export the following. This is the one place in the protocol where a handler exposes more than the standard scratch ABI (§4) — a suite has multi-argument primitives that don't fit a single-buffer model, so it provides an explicit allocator and pointer arguments instead.
+A signature-suite module placed in the suite registry (§6.4) MUST export the following. The host calls these exports directly — not via `kernel.call` — when the signature module requests verification through the host's suite-dispatch import. This is the one place in the protocol where a WASM module exposes more than the standard scratch ABI (§4): a suite has multi-argument primitives that don't fit a single-buffer model, so it provides an explicit allocator and pointer arguments instead.
 
 | Export name | WASM signature | Description |
 | --- | --- | --- |
@@ -463,7 +464,7 @@ install payload:
   wasm:          remainder
 ```
 
-A `caps_count` of `0` means the handler is pure computation — no bridge access of any kind. `cap_id` is opaque to the installer; by convention `hash("seedkernel.cap.v1:" + name)` using the genesis suite's hash. A `parent_len` of `0` means the install does not claim a predecessor — typical for the first version of a handler at a new name. When non-zero, `parent` is exactly the predecessor install's recorded `bytes_hash` — the genesis-suite hash (§6.2) of that earlier install's full payload (see §7.1 for what the hash covers) — and `parent_len` is the genesis suite's hash output length (32 bytes for the default SHA-3-256 suite). Senders typically obtain it from `installer.current_of` (§7.6), which returns the current `bytes_hash` in exactly the form to copy into `parent`; the reference policy's `existing.bytes_hash == parent` check is byte-for-byte equality on those hash bytes, so a mismatched length is a guaranteed drop.
+A `caps_count` of `0` means the handler is pure computation — no bridge access of any kind. `cap_id` is opaque to the installer; by convention `hash("seedkernel.cap.v1:" + name)` using the genesis suite's hash. A `parent_len` of `0` means the install does not claim a predecessor — typical for the first version of a handler at a new name. When non-zero, `parent` is exactly the predecessor install's recorded `bytes_hash` — the genesis-suite hash (§6.2) of that earlier install's full payload (see §7.1 for what the hash covers) — and `parent_len` is the genesis suite's hash output length (32 bytes for the default SHA-3-256 suite). Senders typically obtain it by reading the `bytes_hash` field from an `installer.lookup` response (§7.6); the reference policy's `existing.bytes_hash == parent` check is byte-for-byte equality on those hash bytes, so a mismatched length is a guaranteed drop.
 
 When invoked, the installer:
 
@@ -471,9 +472,9 @@ When invoked, the installer:
 2. Parses the payload. Drop on malformed.
 3. Computes `bytes_hash = genesis_hash(install_payload)` — the hash of the entire install payload, every byte from `seq` through the end of `wasm`. See §7.1 for the rationale (full content commitment, unique per signed install).
 4. Consumes the `seq` and updates the per-`(algoId, pubkey)` high-water mark. Replays (`seq <= last_seen`) drop here, before any further state mutation.
-5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, declared_caps, parent, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
-6. Instantiates the WASM module against the host's handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`.
-7. Writes the install record to `installations[name]`.
+5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, wasm, declared_caps, parent, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
+6. For names matching the suite-slot convention (§6.4), instantiates the WASM under the suite ABI (§6.6) and places it in the suite registry under the encoded `algo_id` — `SetHandler` is **not** called. Otherwise instantiates against the standard handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`.
+7. Writes the install record to `installations[name]` (for both paths).
 
 The order is deliberate: cheap parse checks first; replay protection before the policy callback (so a denied policy doesn't leave a polluted seq table); the policy callback runs against the *resolved* state (with `bytes_hash` already computed and any existing record fetched), so the policy never has to do that work itself.
 
@@ -484,6 +485,7 @@ The callback is the entire authorization story. It receives everything relevant:
 - `name` — the name the install is targeting
 - `author` — `(algo_id, pubkey)` of the top signer
 - `bytes_hash` — the content hash of the WASM about to be installed
+- `wasm` — the raw WASM bytes. Pre-approved binaries match against `bytes_hash` cheaply; inspection-based policies (e.g. structural validation, instruction-set filtering, export-table checks for suites) get the bytes directly without re-hashing.
 - `declared_caps` — the capabilities the handler claims it needs
 - `parent` — the predecessor this install claims (empty if none)
 - `existing_record_or_null` — the current installation at `name`, if any
@@ -531,7 +533,7 @@ The reference policy is one specific way of saying "trust the original author." 
 
 There is no separate revocation cascade. Revocation is something the policy expresses, plus a small mechanism the installer exposes for undoing previous installs.
 
-**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). It clears `installations[name]` and calls `SetHandler(name, null)`. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
+**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). For ordinary handler installs it clears `installations[name]` and calls `SetHandler(name, null)`. For suite-slot names (§6.4) it clears `installations[name]` and removes the corresponding entry from the suite registry — the kernel handler table is not touched (the slot was never in it). The genesis suite is never installer-managed (its registry entry was placed by the host, not by an install), so `installer.remove` on the genesis slot is a no-op; removing the genesis suite requires a direct host-side write to the registry. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
 
 **Message-driven revocation.** A deployer who wants signed messages to be able to revoke installs adds a `revoke` handler that:
 
@@ -541,15 +543,22 @@ There is no separate revocation cascade. Revocation is something the policy expr
 
 **Post-revocation behaviour.** Removing an install clears the slot. Anyone may then re-install at the same name under rule 1 of the reference policy, or the deployer's policy can maintain a deny-list to prevent specific bytes_hashes or specific authors from reclaiming. The kernel doesn't enforce permanence; the policy callback does, if a deployment wants permanence.
 
+**Compromised key recovery.** Under the strict reference policy a compromised key can keep installing new versions of its handlers indefinitely — `author == existing.author` still matches. The protocol does not bake in a single recovery model; *who* may override the original author is a deployment policy question. Three deployer-side responses exist, and most production deployments will want at least one:
+
+- **Deny-list in `approveInstall`.** Refuse installs where `author` is in a deployment-maintained revoked set. The set is out-of-band state, distributed by whatever channel the deployment trusts (operator console, gossip, signed update from a higher authority). This stops new installs but does not by itself remove the compromised handler that is already in place.
+- **Host-side `installer.remove`.** The operator clears the compromised handler directly. Pair with a deny-list so the same key cannot re-install immediately afterward.
+- **A deployer-defined `revoke` handler** as described above, signed by a higher authority (operator key, M-of-N quorum). On approval it calls `installer.remove`.
+
+The replay-protection counter (§4.4) persists across denial, so re-admitting a previously-revoked key never lets pre-revocation messages replay.
+
 ### 7.6 Query handlers
 
 The installer exposes read-only queries via `kernel.call`:
 
 | Name | Payload | Response |
 | --- | --- | --- |
-| `installer.lookup` | `[name_len u8][name ..]` | `[0]` if not installed, else `[1] [algo_id u16][pubkey_len u16][pubkey ..] [hash_len u8][bytes_hash ..] [parent_len u8] [parent_hash ..]` (`parent_len = 0` means no parent) |
+| `installer.lookup` | `[name_len u8][name ..]` | `[0]` if not installed, else `[1] [algo_id u16][pubkey_len u16][pubkey ..] [hash_len u8][bytes_hash ..] [parent_len u8] [parent_hash ..]` (`parent_len = 0` means no parent). Clients constructing upgrade installs read `bytes_hash` from this response to fill in their `parent`. |
 | `installer.caps_of` | `[name_len u8][name ..]` | `[count u8] [cap_id_len u8][cap_id ..]*` — declared caps; `[0]` for unknown or `SetHandler`-installed slots |
-| `installer.current_of` | `[name_len u8][name ..]` | `[hash_len u8][bytes_hash ..]` — the current bytes_hash, used by clients constructing upgrade installs to fill in `parent`; `[0]` for unknown |
 
 These are the standard surface bridges and app modules use to read installer state. The mutating handler (`install`) is on the `kernel.call` blocklist (§4.4); the queries above are not.
 
@@ -570,13 +579,15 @@ A handler that wants additional caps later must reinstall (under the reference p
 Every bridge begins with the same preamble:
 
 ```
-caller_name = kernel.caller()
+stack = kernel.caller()              # [count u8] [len1 u8][name1] ... [lenK u8][nameK]
+if stack.count == 0: return -1       # reached by direct envelope dispatch, not by kernel.call
+caller_name = stack.last_entry       # the immediate caller, last in push order
 caller_caps = kernel.call(installer.caps_of, caller_name)
 if my_cap_id ∉ caller_caps: return -1
 # ...perform I/O, or enqueue request and return correlation id for async...
 ```
 
-**`kernel.caller()` is not an author.** It returns the *name* of the handler that invoked the current `kernel.call`, not a key. A bridge whose policy depends on the **author** (rather than on which handler was called) MUST additionally consult `signature.signer`. The two answer different questions: `kernel.caller` answers "which handler is asking me to do this?" and `signature.signer` answers "whose signed message kicked off this chain?". Most bridges only need the former, since capabilities are attached to handlers (via the install record's `declared_caps`), not to keys directly.
+**`kernel.caller` is not an author.** It returns *names* of handlers in the `kernel.call` chain, not keys. A bridge whose policy depends on the **author** (rather than on which handler was called) MUST additionally consult `signature.signer`. The two answer different questions: `kernel.caller` answers "which handler is asking me to do this?" and `signature.signer` answers "whose signed message kicked off this chain?". Most bridges only need the former, since capabilities are attached to handlers (via the install record's `declared_caps`), not to keys directly. The deeper entries in the caller stack are for audit / logging — the capability check above MUST use the immediate (last) caller only.
 
 ### 8.3 Structural sandbox invariant
 
@@ -629,12 +640,11 @@ sequenceDiagram
 
     Note over Host: === Layer 2: Installer (optional) ===
     Host->>INS: new Installer(kernel)
-    Host->>INS: approveInstall = (name, author, bytesHash, caps, parent, existing) => ...
+    Host->>INS: approveInstall = (name, author, bytesHash, wasm, caps, parent, existing) => ...
     Note over Host: The reference policy (§7.4) is the default; deployers override.
     Host->>K: SetHandler(installName, ins.Handler)
     Host->>K: SetHandler(installerLookupName, ins.LookupQuery)
     Host->>K: SetHandler(installerCapsOfName, ins.CapsOfQuery)
-    Host->>K: SetHandler(installerCurrentOfName, ins.CurrentOfQuery)
     Note over Host: With no installer wired, the deployment is frozen — no message-driven installs.
     Note over Host: With it wired but no approveInstall callback, every install is dropped.
 
@@ -747,7 +757,7 @@ outer envelope (the bytes that hit the kernel)
 1. **Host receives bytes** from the transport, copies them into kernel memory, calls `kernel.dispatch(ptr, len)`.
 2. **Kernel `dispatch`**: `len ≤ 65536` ✓; parse succeeds with `magic=SD`, `version=01`. Look up `handlers[<signature name>]` → found (installed by `SetHandler` at bootstrap). Call `invoke_handler(...)`.
 3. **Host `invoke_handler`** routes to the signature handler, copies the payload into signature module memory, calls `signature.handle_signature(ptr, len)`.
-4. **Signature handler**: depth = 0 < 4 ✓. Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Call `ed25519_verify(pubkey, sig, inner_envelope_bytes)` (host import → libsodium). Verify returns 1. **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
+4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Call `ed25519_verify(pubkey, sig, inner_envelope_bytes)` (host import → libsodium). Verify returns 1. **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
 5. **Host re-enters the kernel** with the inner bytes: `kernel.dispatch(innerPtr, innerLen)`.
 6. **Kernel `dispatch`** (recursive): parse succeeds, look up `handlers[chat.text@keyA]` → found (installed earlier by the installer). Call `invoke_handler(...)`.
 7. **Host `invoke_handler`** routes to keyA's chat handler WASM instance. Copy payload `"hello, world"` into the chat module's scratch region. Call `chat.handle(12)`.
@@ -757,7 +767,7 @@ outer envelope (the bytes that hit the kernel)
 
 If the chat handler had wanted to know *who sent this*, it would have called `kernel.call(signature.signer, [])` between steps 7 and 8 and received `[01] [00 00] [00 20] [<keyA pubkey>]` — count=1, algo_id=0, pubkey_len=32 (u16 BE), 32 pubkey bytes.
 
-If the chat handler had wanted to log via a `ui.write` bridge, it would have called `kernel.call(ui.write, payload)`. The `ui.write` bridge would then call `kernel.caller()` to get `chat.text@keyA`, then `kernel.call(installer.caps_of, chat.text@keyA)` to get the declared caps for that name, check that `ui ∈ caps`, and only then perform the I/O.
+If the chat handler had wanted to log via a `ui.write` bridge, it would have called `kernel.call(ui.write, payload)`. The `ui.write` bridge would then call `kernel.caller()` to read the caller stack — a single entry `[01] [20] [chat.text@keyA]` here — pick the last name (`chat.text@keyA`), then `kernel.call(installer.caps_of, chat.text@keyA)` to get the declared caps for that name, check that `ui ∈ caps`, and only then perform the I/O.
 
 That's the entire pipeline. Every step is a synchronous call across one of three boundaries: kernel/host, signature/host, or app-handler/host. Nothing else is moving.
 
@@ -778,7 +788,6 @@ All limits and reserved values in one place. Multi-byte integers are big-endian 
 | `MAX_ENVELOPE_BYTES` | `65536` | Kernel dispatch + encode | Hard cap on the outermost envelope (§2.2). |
 | `MIN_NAME_LEN` | `1` | Envelope decode | `name_len = 0` is invalid. |
 | `MAX_NAME_LEN` | `255` | Envelope encode | One-byte length prefix. |
-| `MAX_SIGNATURE_DEPTH` | `4` | Signature handler | Max nested `signature` wrappers per inbound message (§2.3). |
 | `MAX_CALL_DEPTH` | `8` (default) | `kernel.call` host import | Re-entrant call cap; host configurable. |
 | `DEFAULT_SCRATCH_SIZE` | `131072` (128 KB) | Handler instantiation | Per-handler scratch region; host configurable. |
 | `GENESIS_ALGO_ID` | `0x0000` | Signature module | Reserved for the genesis suite (§6.2). |
