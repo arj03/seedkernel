@@ -13,21 +13,11 @@
 // Optional — deployments that don't want message-driven installation simply
 // skip registerInstaller and the deployment is frozen.
 
-import { readU32BE, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
+import { nameKey, readU32BE, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
 
-function nameKey(name: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < name.length; i++) s += name[i].toString(16).padStart(2, "0");
-  return s;
-}
-
-const signerKeyCache = new WeakMap<Uint8Array, string>();
 function signerKey(algoId: number, pubKey: Uint8Array): string {
-  const cached = signerKeyCache.get(pubKey);
-  if (cached !== undefined) return cached;
   let s = `${algoId}:`;
   for (let i = 0; i < pubKey.length; i++) s += pubKey[i].toString(16).padStart(2, "0");
-  signerKeyCache.set(pubKey, s);
   return s;
 }
 

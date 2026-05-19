@@ -105,7 +105,7 @@ interface WasmHandlerRef {
   exports: WebAssembly.Exports;
 }
 
-function nameKey(name: Uint8Array): string {
+export function nameKey(name: Uint8Array): string {
   let s = "";
   for (let i = 0; i < name.length; i++) s += name[i].toString(16).padStart(2, "0");
   return s;
