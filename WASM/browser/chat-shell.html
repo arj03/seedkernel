@@ -41,15 +41,17 @@
 </header>
 
 <section id="about" class="about" hidden>
-  A signed-install bootstrap for end-to-end-encrypted chat. The shell owns only
-  the kernel, the signature module, the installer, a WebRTC transport, and a
-  sandboxed iframe; the chat app itself arrives as a signed WASM artifact
-  carrying its own UI. See <strong>README §7</strong> for the install model
-  and <strong>§12</strong> for the chat-shell walk-through.
+  A signed-install bootstrap. The shell owns only the kernel, signature
+  module, installer, WebRTC transport, and a sandboxed iframe. Apps arrive as
+  signed WASM artifacts carrying their own UI; they can be loaded locally,
+  exchanged peer-to-peer over the chat channel, and re-shared transitively —
+  the author's signature on each install rides through every hop unchanged.
+  See <strong>README §7</strong> for the install model.
 </section>
 
 <nav class="tabs" role="tablist">
-  <button id="tab-app" class="active" type="button" role="tab">Chat</button>
+  <button id="tab-app" class="active" type="button" role="tab">App</button>
+  <button id="tab-apps" type="button" role="tab">Apps</button>
   <button id="tab-invite" type="button" role="tab">Invite</button>
   <button id="tab-accept" type="button" role="tab">Accept</button>
   <button id="tab-relay" type="button" role="tab">Network</button>
@@ -57,18 +59,12 @@
 
 <main>
 
-  <!-- ─── Chat ─────────────────────────────────────────────────────── -->
+  <!-- ─── Active app ───────────────────────────────────────────────── -->
   <div id="panel-app" class="panel" role="tabpanel">
     <div class="app-toolbar">
-      <label class="field field-inline">
-        <span class="field-label-sm">App:</span>
-        <select id="app-version">
-          <option value="v1">v1 — text only</option>
-          <option value="v2" selected>v2 — text + image + nick</option>
-        </select>
-      </label>
-      <button id="install-btn" class="icon" type="button" disabled>Install</button>
-      <span id="app-status">no app installed</span>
+      <span id="app-status">no app loaded</span>
+      <span class="spacer"></span>
+      <button id="open-apps-btn" class="icon" type="button">Manage apps</button>
     </div>
 
     <div id="call-bar" class="idle">
@@ -80,17 +76,70 @@
 
     <div id="video-tiles" class="hidden"></div>
 
-    <!-- allow-forms lets the v1/v2 UIs use a normal <form> element for the
-         text input. We still preventDefault() in the submit handler so no
-         actual navigation happens; the null sandbox origin contains anything
-         the form could attempt regardless. -->
+    <div id="app-empty" class="empty-state">
+      No app is loaded. Open the <strong>Apps</strong> tab to install one — drag a
+      <code>.wasm</code> file in, or accept an offer from a peer.
+    </div>
+
+    <!-- allow-forms lets app UIs use a normal <form> element for the input.
+         We still preventDefault() in the submit handler so no actual
+         navigation happens; the null sandbox origin contains anything the
+         form could attempt regardless. -->
     <iframe id="app-frame" sandbox="allow-scripts allow-forms" class="hidden"
-                    title="Chat application UI"></iframe>
+                    title="Application UI"></iframe>
 
     <details class="diagnostics">
       <summary>Diagnostics</summary>
       <div id="shell-log"></div>
     </details>
+  </div>
+
+  <!-- ─── Apps registry ────────────────────────────────────────────── -->
+  <div id="panel-apps" class="panel hidden" role="tabpanel">
+    <p class="lead-hint">Apps are signed WASM blobs. Drop one in to install it
+      locally, or wait for a peer to offer one. Updates from an author you've
+      already trusted install automatically; everything else asks first.</p>
+
+    <div id="apps-notice" class="apps-notice" hidden role="status" aria-live="polite"></div>
+
+    <section class="step">
+      <header class="step-head">
+        <span class="step-pip">+</span>
+        <h3 class="step-title">Add an app</h3>
+      </header>
+      <div class="step-body">
+        <div id="dropzone" class="dropzone" tabindex="0" role="button"
+                          aria-label="Drop a .wasm file or click to choose">
+          <div class="dropzone-inner">
+            <strong>Drop a <code>.wasm</code> here</strong>
+            <span class="hint subtle">or click to choose a file</span>
+          </div>
+          <input id="app-file" type="file" accept=".wasm,application/wasm" hidden />
+        </div>
+      </div>
+    </section>
+
+    <section class="step" id="offers-section" hidden>
+      <header class="step-head">
+        <span class="step-pip">!</span>
+        <h3 class="step-title">Offers waiting</h3>
+      </header>
+      <div class="step-body">
+        <ul id="offer-list" class="app-list"></ul>
+      </div>
+    </section>
+
+    <section class="step">
+      <header class="step-head">
+        <span class="step-pip">★</span>
+        <h3 class="step-title">Installed</h3>
+      </header>
+      <div class="step-body">
+        <ul id="app-list" class="app-list">
+          <li class="empty-row">No apps installed yet.</li>
+        </ul>
+      </div>
+    </section>
   </div>
 
   <!-- ─── Invite ───────────────────────────────────────────────────── -->
