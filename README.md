@@ -4,15 +4,7 @@
 
 A minimal runtime where **everything is a message**. The kernel does one thing: parse an envelope and dispatch it to a handler registered under a **name**. Signing, authorization, capability gating, installation, and application logic are **modules** — layers that compose around the kernel like an onion. The system bootstraps from one trusted key (or no key at all, if that's what you want) into arbitrarily complex behaviour without the kernel knowing what any of it means.
 
-The whole system pivots on three orthogonal concepts:
-
-| Role | What it answers | Where it lives |
-|------|----------------|----------------|
-| **Name** | Which handler should this message reach? | A key in the kernel's routing table. Opaque bytes. The kernel has no further opinion. |
-| **Bytes** | What runs when a message reaches that name? | A WASM instance the kernel holds at that key. |
-| **Author** | Who set up this binding? | A field in the installer's records. Used by policy and audit. Invisible to the kernel. |
-
-The kernel is `handlers[name] → wasm_instance` plus dispatch. The signature module identifies authors. The installer module binds names to bytes under a deployer-supplied **policy** that decides who may install what. Everything else is built from those pieces.
+Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key; the **bytes** are the WASM instance the kernel holds at that key; the **author** is the signer who installed it — a field in the installer's records, invisible to the kernel. The kernel is `handlers[name] → wasm_instance` plus dispatch; the signature module identifies authors; the installer binds names to bytes under a deployer-supplied **policy** that decides who may install what.
 
 **Design principles:**
 
@@ -521,6 +513,8 @@ The reference installer ships with a default policy that is easy to explain and 
    ```
    return author == existing.author && existing.bytes_hash == parent
    ```
+
+   The strict `parent == existing.bytes_hash` form is the reference choice, not a protocol requirement. Every install flows through `approveInstall`, so a deployer who wants to permit gaps — accepting any ancestor in the name's lineage so a node that missed an intermediate install can still upgrade, or skipping the parent check entirely — encodes that in the callback. The lineage stays signed-and-auditable either way; the policy decides how tight the parent claim has to be.
 
 These two rules give you everything you'd usually want without any extra machinery:
 
