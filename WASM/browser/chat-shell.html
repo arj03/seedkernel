@@ -41,10 +41,11 @@
 </header>
 
 <section id="about" class="about" hidden>
-  A trust + install bootstrap for end-to-end-encrypted chat. The shell owns only
-  the kernel, the install handler, the WebRTC transport, and a sandboxed iframe;
-  the chat app itself arrives as a signed WASM artifact carrying its own UI.
-  See <strong>README §3.2</strong> for the one-artifact / one-policy property.
+  A signed-install bootstrap for end-to-end-encrypted chat. The shell owns only
+  the kernel, the signature module, the installer, a WebRTC transport, and a
+  sandboxed iframe; the chat app itself arrives as a signed WASM artifact
+  carrying its own UI. See <strong>README §7</strong> for the install model
+  and <strong>§12</strong> for the chat-shell walk-through.
 </section>
 
 <nav class="tabs" role="tablist">

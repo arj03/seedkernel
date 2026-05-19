@@ -3,11 +3,11 @@
 // Every handler that wants to receive signed envelopes, look up the signer,
 // and forward an event to another schema ends up writing the same five things:
 //   - a scratch + private memory layout
-//   - a configure() entry point that lets the host plant the schema_ids
-//     the WASM needs to call into (the WASM has no way to compute SHA-3
-//     itself; the host bakes them in once at install time)
+//   - a configure() entry point that lets the host plant the names the WASM
+//     needs to call into (the WASM has no way to compute SHA-3 itself; the
+//     host bakes them in once at install time)
 //   - a kernel.call to `signature.signer` to get the message's signer
-//   - a kernel.call to a route schema_id that delivers the event onward
+//   - a kernel.call to a route name that delivers the event onward
 //   - careful staging in private memory so kernel.call's scratch overwrite
 //     doesn't clobber the input or the in-progress outbound buffer
 //
@@ -23,8 +23,8 @@
 // them.
 //
 // Memory layout note: the helper reserves the first `PRIV_USER_OFF` bytes
-// of private memory for its own bookkeeping (route schema_id and signer
-// schema_id). Apps may use everything from `PRIV_USER_OFF` onward.
+// of private memory for its own bookkeeping (route name and signer name).
+// Apps may use everything from `PRIV_USER_OFF` onward.
 
 @external("kernel", "call")
 declare function kernelCall(
@@ -56,8 +56,8 @@ export function init(scratch: i32, priv: i32): void {
 /** WASM handler `configure(input_len)` export. The host invokes this once
  *  via `KernelHost.callDynamicExport` after install with payload:
  *      [route_schema_len u8][route_schema ..][signer_schema_len u8][signer_schema ..]
- *  The route schema_id is the host bridge that `forwardToHost` will call
- *  into; the signer schema_id is `signature.signer` (so the helper can
+ *  The route name is the host bridge that `forwardToHost` will call into;
+ *  the signer name is `signature.signer` (so the helper can
  *  query the current message's signer stack).
  *
  *  Apps re-export this directly:
@@ -78,7 +78,7 @@ export function configure(input_len: i32): void {
   signerLen = sLen;
 }
 
-/** True once both schema_ids have been planted by configure(). Apps should
+/** True once both names have been planted by configure(). Apps should
  *  early-return from handle() until this is true. */
 export function isConfigured(): bool {
   return routeLen > 0 && signerLen > 0;

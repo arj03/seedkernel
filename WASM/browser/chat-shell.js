@@ -77,16 +77,18 @@ shellPrint("Loading kernel + bootstrap WASM...", "sys");
 const host = await loadKernelHost(
   "../build/kernel.wasm", "../build/bootstrap.wasm", sodium);
 
-// ─── bootstrap: signature, trust, install ──────────────────────────────
-const signatureId       = host.deriveId("seedkernel.bootstrap.v1:signature");
-const signatureSignerId = host.deriveId("seedkernel.bootstrap.v1:signature.signer");
-const trustGrantId      = host.deriveId("seedkernel.bootstrap.v1:trust.grant");
-const installId         = host.deriveId("seedkernel.bootstrap.v1:install");
+// ─── bootstrap: signature wrapper + installer ──────────────────────────
+const signatureName       = host.deriveBootstrapName("signature");
+const signatureSignerName = host.deriveBootstrapName("signature.signer");
+const installName         = host.deriveBootstrapName("install");
+const lookupName          = host.deriveBootstrapName("installer.lookup");
+const capsOfName          = host.deriveBootstrapName("installer.caps_of");
 
-host.registerSignature(signatureId, signatureSignerId);
-host.registerTrustGrant(trustGrantId);
-host.registerInstallHandler(installId);
-// FIXME: this is just a demo
+host.registerSignature(signatureName);
+host.registerSignerQuery(signatureSignerName);   // chat apps query the signer
+host.registerInstaller(installName, lookupName, capsOfName);
+// FIXME: this is just a demo — allow any install. A real deployment would
+// run referencePolicy(host, firstInstallPolicy) (README §7.4).
 host.setApproveInstall(() => true);
 
 // ─── per-tab Ed25519 identity ──────────────────────────────────────────
@@ -109,7 +111,6 @@ if (stored) {
 }
 const myPkHex = bytesToHex(myKeys.publicKey);
 
-host.trustGrant(0, myKeys.publicKey, installId);
 shellPrint(`I am ${myPkHex.slice(0, 8)}`, "sys");
 
 // ─── DTLS-fingerprint identity assertion (RFC 8827 §5.6.4) ─────────────
@@ -183,18 +184,18 @@ function verifySdpIdentity(sdpString, pk, sig) {
 
 // Peek the signer pubkey from a §6.3 signature envelope without invoking the
 // kernel — used to enforce signer==entry.pk on every dc frame.
-// Outer: MAGIC(2) | version(1) | schema_id_len(1) | schema_id | payload
-// Payload (signature schema): algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
+// Outer: MAGIC(2) | version(1) | name_len(1) | name | payload
+// Payload (signature name): algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
 function peekEnvelopeSigner(bytes) {
   if (bytes.length < 4) return null;
   if (bytes[0] !== 0x53 || bytes[1] !== 0x44) return null;
-  const sidLen = bytes[3];
-  if (sidLen !== signatureId.length) return null;
-  if (bytes.length < 4 + sidLen) return null;
-  for (let i = 0; i < sidLen; i++) {
-    if (bytes[4 + i] !== signatureId[i]) return null;
+  const nameLen = bytes[3];
+  if (nameLen !== signatureName.length) return null;
+  if (bytes.length < 4 + nameLen) return null;
+  for (let i = 0; i < nameLen; i++) {
+    if (bytes[4 + i] !== signatureName[i]) return null;
   }
-  let o = 4 + sidLen;
+  let o = 4 + nameLen;
   if (bytes.length < o + 4) return null;
   o += 2; // skip algo
   const signerLen = (bytes[o] << 8) | bytes[o + 1]; o += 2;
@@ -246,19 +247,19 @@ function updatePeerPill() {
   peerPill.classList.toggle("ok", open > 0);
 }
 
-// ─── chat schema_ids ───────────────────────────────────────────────────
+// ─── chat names ────────────────────────────────────────────────────────
 //
-// chatId is the wire-level schema every peer dispatches messages at, so
-// it MUST be globally derivable — peers compute it from the same name
-// and find each other's chat handler. Scoping it would break interop.
+// chatName is the wire-level name every peer dispatches messages at, so
+// it MUST be globally derivable — peers compute it from the same canonical
+// string and find each other's chat handler. Scoping it would break interop.
 //
-// chatUiId is the local-only bridge from chat WASM → this shell's iframe;
-// no remote peer ever addresses it. We scope it to my pubkey (README §5)
-// so a future co-installed app cannot compute it and impersonate UI
-// renders. Combined with the caller-check on the bridge below, this
-// gives the UI two independent locks.
-const chatId   = host.deriveId("seedkernel.v1:chat");
-const chatUiId = host.deriveScopedId("seedkernel.v1:chat.ui", myKeys.publicKey);
+// chatUiName is the local-only bridge from chat WASM → this shell's iframe;
+// no remote peer ever addresses it. We scope it to my pubkey (§5.1) so a
+// future co-installed app cannot compute it and impersonate UI renders.
+// Combined with the caller-check on the bridge below, this gives the UI
+// two independent locks.
+const chatName   = host.deriveBootstrapName("chat");
+const chatUiName = host.deriveScopedName("chat.ui", myKeys.publicKey);
 
 // ─── chat.ui bridge → iframe ───────────────────────────────────────────
 //
@@ -291,17 +292,17 @@ function deliverSys(text) {
 }
 
 function callerIsChat() {
-  // host.currentCaller is the schema_id of the WASM that invoked us via
+  // host.currentCaller is the name of the WASM that invoked us via
   // kernel.call, or null at top-level dispatch. Only the chat handler may
   // drive this UI bridge; anything else (an envelope dispatched directly
-  // at chatUiId, or a future co-installed handler) is dropped silently.
+  // at chatUiName, or a future co-installed handler) is dropped silently.
   const c = host.currentCaller;
-  if (!c || c.length !== chatId.length) return false;
-  for (let i = 0; i < c.length; i++) if (c[i] !== chatId[i]) return false;
+  if (!c || c.length !== chatName.length) return false;
+  for (let i = 0; i < c.length; i++) if (c[i] !== chatName[i]) return false;
   return true;
 }
 
-host.register(chatUiId, (_sid, payload) => {
+host.register(chatUiName, (_n, payload) => {
   if (!callerIsChat()) return null;
   // Copy out — the underlying buffer is tied to scratch and may be reused.
   deliverRender(new Uint8Array(payload));
@@ -310,7 +311,7 @@ host.register(chatUiId, (_sid, payload) => {
 
 // ─── install + iframe mount ────────────────────────────────────────────
 //
-// Each install bumps a per-signer monotonic seq (§4.4); the install handler
+// Each install bumps a per-signer monotonic seq (§4.4); the installer
 // drops anything seq <= last_seen. Tracked in sessionStorage so a reload
 // inside the same tab doesn't rewind the counter and let an attacker replay
 // a captured install message.
@@ -322,12 +323,12 @@ function nextSeq() {
 }
 
 function encodeConfigPayload() {
-  const buf = new Uint8Array(1 + chatUiId.length + 1 + signatureSignerId.length);
+  const buf = new Uint8Array(1 + chatUiName.length + 1 + signatureSignerName.length);
   let o = 0;
-  buf[o++] = chatUiId.length;
-  buf.set(chatUiId, o); o += chatUiId.length;
-  buf[o++] = signatureSignerId.length;
-  buf.set(signatureSignerId, o); o += signatureSignerId.length;
+  buf[o++] = chatUiName.length;
+  buf.set(chatUiName, o); o += chatUiName.length;
+  buf[o++] = signatureSignerName.length;
+  buf.set(signatureSignerName, o); o += signatureSignerName.length;
   return buf;
 }
 
@@ -339,20 +340,27 @@ async function installChatApp(version) {
     const wasmBytes = new Uint8Array(
       await fetch(`../build/chat-app-${version}.wasm`).then(r => r.arrayBuffer()));
 
-    // Send the signed install message. The install handler verifies the
-    // signature, trust-checks our pubkey for the install schema, validates
-    // the seq, runs approveInstall, and installs the WASM at chatId.
+    // Send the signed install message. The installer verifies the signature,
+    // validates the seq (§4.4), runs approveInstall, and installs the WASM
+    // at chatName.
     //
-    // We declare [chatUiId] as the chat handler's caps so capability.of_handler
-    // and the host's cap index record what this WASM is allowed to call
-    // into. The bridge's caller-check is the load-bearing enforcement; this
+    // We declare [chatUiName] as the chat handler's caps so installer.caps_of
+    // and the host's cap index record what this WASM is allowed to call into.
+    // The bridge's caller-check is the load-bearing enforcement; this
     // declaration is the audit trail that goes with it.
+    //
+    // If a chat handler is already installed (v1 → v2 upgrade), pass its
+    // current bytes_hash as the parent so the install record carries a
+    // signed lineage chain (§7.4). The demo's allow-all approveInstall
+    // doesn't require it, but real policies (referencePolicy) do.
+    const existing = host.lookupInstall(chatName);
+    const parent = existing ? existing.bytesHash : null;
     const installPayload = host.encodeInstallPayload(
-      nextSeq(), [chatUiId], chatId, wasmBytes);
+      nextSeq(), chatName, [chatUiName], parent, wasmBytes);
     host.dispatch(host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installId, installPayload));
+      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installName, installPayload));
 
-    if (!host.isRegistered(chatId)) {
+    if (!host.isRegistered(chatName)) {
       shellPrint(`Install of ${version} failed.`, "err");
       appStatus.textContent = "install failed";
       return;
@@ -361,7 +369,7 @@ async function installChatApp(version) {
 
     // One-shot configuration — this is the new clean primitive that
     // replaces the previous 0xff-tag synthetic envelope.
-    host.callDynamicExport(chatId, "configure", encodeConfigPayload());
+    host.callDynamicExport(chatName, "configure", encodeConfigPayload());
 
     // Pull the bundled UI out of the WASMs "ui" custom section. Update
     // is atomic — same artifact carried compute and presentation.
@@ -430,7 +438,7 @@ window.addEventListener("message", (ev) => {
     payload[0] = msg.chatType & 0xff;
     payload.set(body, 1);
     const wire = host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatId, payload);
+      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatName, payload);
     broadcastWire(wire);
     host.dispatch(wire);              // local echo
     if (msg.chatType === 0x02) {
@@ -476,7 +484,7 @@ function bindDataChannel(entry, dc, pkHex) {
       payload[0] = 0x02;
       payload.set(lastSentNickBody, 1);
       const wire = host.wrapAndEncode(
-        myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatId, payload);
+        myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatName, payload);
       try { dc.send(wire); } catch {}
     }
   });

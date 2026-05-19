@@ -1,30 +1,24 @@
-// Host driver that loads kernel.wasm + bootstrap.wasm and wires them together.
+// Host driver that loads kernel.wasm + bootstrap.wasm (signature module) and
+// wires them together.
 //
 // The host is the orchestrator:
 //   - Provides libsodium Ed25519 + SHA-3-256 to bootstrap.wasm
-//   - Routes invoke_handler callbacks from kernel.wasm to bootstrap.wasm handlers
-//     or host-side JS handlers
+//   - Routes invoke_handler callbacks from kernel.wasm to bootstrap.wasm's
+//     signature handler or to host-side JS handlers
 //   - Drives the signature push/pop lifecycle (§6.5):
 //       1. kernel invokes HANDLER_SIGNATURE
 //       2. host calls bootstrap.handle_signature() → returns 1 if verified
 //       3. host reads inner bytes from bootstrap memory, dispatches through kernel
 //       4. host calls bootstrap.pop_signer() after inner dispatch returns
-//   - Manages pluggable algorithm suite WASM modules (§6.1)
-//   - Maintains the handler→declared-caps index used by capability.of_handler
-//     and bridge caller-cap checks (README §8)
-//   - Provides kernel.call and kernel.caller imports to dynamic handlers (§4.2, §4.4)
-//   - Exposes the primitives the optional install handler (README §3.2)
-//     consumes: installWasmHandler, isTrustedByCurrentSigners, currentTopSigner,
-//     and a trust-revocation listener registry. The install handler itself
-//     lives in install-handler.ts.
-
-// No environment-specific imports here. The host runs anywhere with a
-// WebAssembly engine: the caller supplies the kernel/bootstrap WASM bytes,
-// and an initialized libsodium instance for ed25519 + SHA-3-256. Node and
-// browser entry points (host/node.ts, host/browser.ts) wire the I/O.
+//   - Holds the suite registry for pluggable algorithm suites (§6.4) and
+//     dispatches suite_verify imports from bootstrap.wasm to the right suite
+//   - Provides kernel.call / kernel.caller imports to dynamic handlers (§4.2)
+//   - Exposes primitives the Installer (host/installer.ts) consumes:
+//     instantiating WASM handlers + setHandler, registering suite instances,
+//     genesis hashing, top-signer access
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
-import { InstallHandler } from "./install-handler.js";
+import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
 
 type Sodium = typeof import("libsodium-wrappers");
 
@@ -39,26 +33,10 @@ export interface Signer {
 }
 
 export type Handler = (
-  schemaId: Uint8Array,
+  name: Uint8Array,
   payload: Uint8Array,
   host: KernelHost
 ) => Uint8Array | void | null;
-
-/** Install-approval callback (README §3.2). Called by the install handler
- *  after the trust prefilter accepts. Receives the target schema_id, the
- *  declared capabilities, the top signer, and the genesis-suite hash of
- *  the WASM bytes being installed. The hash lets the operator distinguish
- *  "this is the binary we audited" from "this is some other binary signed
- *  by the same key" without having to re-hash the bytes themselves.
- *  Return true to install, false to drop. The deployer wires this to
- *  whatever policy fits — interactive prompt, M-of-N quorum, allowlist,
- *  HSM, etc. With no callback wired, every install is dropped. */
-export type ApproveInstall = (
-  schemaId: Uint8Array,
-  declaredCaps: readonly Uint8Array[],
-  signer: Signer,
-  wasmHash: Uint8Array,
-) => boolean;
 
 // ─── kernel.wasm exports ─────────────────────────────────────────────────
 
@@ -66,20 +44,19 @@ interface KernelExports {
   memory: WebAssembly.Memory;
   alloc(size: number): number;
   dealloc(ptr: number): void;
-  set_handler(schemaPtr: number, schemaLen: number, handlerId: number): void;
-  remove_handler(schemaPtr: number, schemaLen: number): number;
-  is_registered(schemaPtr: number, schemaLen: number): number;
+  set_handler(namePtr: number, nameLen: number, handlerId: number): void;
+  remove_handler(namePtr: number, nameLen: number): number;
+  is_registered(namePtr: number, nameLen: number): number;
   handler_count(): number;
   dispatch(bytesPtr: number, bytesLen: number): void;
 }
 
-// ─── bootstrap.wasm exports ──────────────────────────────────────────────
+// ─── bootstrap.wasm exports (signature module only) ──────────────────────
 
 interface BootstrapExports {
   memory: WebAssembly.Memory;
   alloc(size: number): number;
   dealloc(ptr: number): void;
-  // Signature handler — returns 1 if verified (signer pushed, inner bytes ready)
   handle_signature(payloadPtr: number, payloadLen: number): number;
   get_inner_ptr(): number;
   get_inner_len(): number;
@@ -87,31 +64,6 @@ interface BootstrapExports {
   get_signer_count(): number;
   read_signer(index: number, outAlgoPtr: number, outPubPtr: number, outPubMaxLen: number): number;
   signer_pubkey_len(index: number): number;
-  // Trust handler
-  handle_trust_grant(payloadPtr: number, payloadLen: number): void;
-  set_trust_grant_id(ptr: number, len: number): void;
-  // Signature register handler (§6.4)
-  handle_signature_register(payloadPtr: number, payloadLen: number): void;
-  set_sig_register_id(ptr: number, len: number): void;
-  // Trust table
-  is_trusted(
-    algoId: number,
-    pubPtr: number, pubLen: number,
-    schemaPtr: number, schemaLen: number
-  ): number;
-  is_trusted_by_current_signers(schemaPtr: number, schemaLen: number): number;
-  trust_grant(
-    algoId: number,
-    pubPtr: number, pubLen: number,
-    schemaPtr: number, schemaLen: number,
-    granterAlgoId: number,
-    granterPubPtr: number, granterPubLen: number
-  ): number;
-  trust_revoke(
-    algoId: number,
-    pubPtr: number, pubLen: number,
-    schemaPtr: number, schemaLen: number
-  ): void;
 }
 
 // ─── pluggable suite WASM contract (README §6.6) ─────────────────────────
@@ -122,9 +74,12 @@ interface SuiteInstance {
   dealloc(ptr: number): void;
   verify(pubPtr: number, pubLen: number, sigPtr: number, sigLen: number, dataPtr: number, dataLen: number): number;
   hash(dataPtr: number, dataLen: number, outPtr: number): number;
+  // Sizes declared at registration; the host validates pubkey/sig lengths on
+  // each verify call so the signature module can stay metadata-free.
+  pubkeyLen: number;
+  sigMaxLen: number;
   // Reused buffers in the suite's linear memory. Allocated once at registration
-  // (pub/sig sized from suite metadata) and grown on demand for data, so each
-  // verify is a copy + call instead of three alloc/copy/dealloc round-trips.
+  // and grown on demand for data.
   pubScratch: number;
   sigScratch: number;
   dataScratch: number;
@@ -133,34 +88,30 @@ interface SuiteInstance {
 
 // ─── handler routing ─────────────────────────────────────────────────────
 
-const HANDLER_SIGNATURE             = -1;
-const HANDLER_TRUST_GRANT           = -2;
-const HANDLER_SIGNATURE_SIGNER      = -3;
-const HANDLER_SIGNATURE_REGISTER    = -4;
-const HANDLER_CAPABILITY_OF_HANDLER = -5;
+const HANDLER_SIGNATURE        = -1;
+const HANDLER_SIGNATURE_SIGNER = -2;
 
 const MAX_CALL_DEPTH = 8;
 
-// Default scratch size mirrored by the host — handlers must reserve at
-// least this much I/O space at their `scratch` offset (README §4.1).
+// Default scratch size mirrored by the host — handlers must reserve at least
+// this much I/O space at their `scratch` offset (README §4.1).
 const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
 interface WasmHandlerRef {
   memory: WebAssembly.Memory;
-  scratch: number;       // byte offset read from the handler's `scratch` global export
-  scratchSize: number;   // bytes the host promises not to write past
+  scratch: number;
+  scratchSize: number;
   handle: (input_len: number) => number;
   exports: WebAssembly.Exports;
 }
 
-function schemaKey(schemaId: Uint8Array): string {
+function nameKey(name: Uint8Array): string {
   let s = "";
-  for (let i = 0; i < schemaId.length; i++) s += schemaId[i].toString(16).padStart(2, "0");
+  for (let i = 0; i < name.length; i++) s += name[i].toString(16).padStart(2, "0");
   return s;
 }
 
-/** Write a u32 in big-endian order at out[offset..offset+4]. Shared by the
- *  payload-encoding helpers that prepend a §4.4 replay-protection seq. */
+/** Write a u32 in big-endian order at out[offset..offset+4]. */
 export function writeU32BE(out: Uint8Array, offset: number, value: number): void {
   out[offset]     = (value >>> 24) & 0xff;
   out[offset + 1] = (value >>> 16) & 0xff;
@@ -168,8 +119,7 @@ export function writeU32BE(out: Uint8Array, offset: number, value: number): void
   out[offset + 3] =  value         & 0xff;
 }
 
-/** Read a u32 in big-endian order from buf[offset..offset+4]. Mirror of
- *  writeU32BE; used by the install handler to consume the §4.4 seq prefix. */
+/** Read a u32 in big-endian order from buf[offset..offset+4]. */
 export function readU32BE(buf: Uint8Array, offset: number): number {
   return ((buf[offset] << 24) | (buf[offset + 1] << 16) |
           (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
@@ -181,44 +131,33 @@ export class KernelHost {
   private sodium!: Sodium;
   private handlers = new Map<number, Handler>();
   private wasmHandlers = new Map<number, WasmHandlerRef>();
-  private schemaToHandlerId = new Map<string, number>();
-  private handlerIdToSchema = new Map<number, Uint8Array>();
-  // Per-handler capability index: schemaKey → caps declared at install time.
-  // Populated by installWasmHandler (called from the install handler);
-  // never populated by setHandler entries.
-  private handlerCapIndex = new Map<string, Uint8Array[]>();
+  private nameToHandlerId = new Map<string, number>();
+  private handlerIdToName = new Map<number, Uint8Array>();
   private suiteRegistry = new Map<number, SuiteInstance>();
   private nextHandlerId = 1;
   private callDepth = 0;
-  // Call-chain tracking for kernel.caller (§4.2): top = direct caller's schema_id.
+  // Call-chain tracking for kernel.caller (§4.2). Outermost is first, immediate
+  // caller is last (push order).
   private callerStack: (Uint8Array | null)[] = [];
-  // Trust-revocation listeners fired by _onTrustRevoked (README §7.3). The
-  // install handler wires its RevokeInstallsBy in via addOnRevoked.
-  private revokeListeners: Array<(algoId: number, pubKey: Uint8Array, schemaId: Uint8Array) => void> = [];
-  // Handler IDs that kernel.call must refuse (README §4.4). Bootstrap
-  // mutating handlers (signature wrapper, trust.grant, signature.register)
-  // are blocked by their fixed sentinel IDs; the install handler's positive
-  // ID is added when registerInstallHandler runs.
-  private blockedFromCall = new Set<number>([
-    HANDLER_SIGNATURE,
-    HANDLER_TRUST_GRANT,
-    HANDLER_SIGNATURE_REGISTER,
-  ]);
-  // schema_id used to build outer signature envelopes in wrap(). Set by
+  // Handler IDs that kernel.call must refuse (README §4.4). The signature
+  // wrapper is blocked by its sentinel; the installer's positive ID is added
+  // when registerInstaller runs. Deployer-added mutators register via
+  // blockFromCall.
+  private blockedFromCall = new Set<number>([HANDLER_SIGNATURE]);
+  // Name used to build outer signature envelopes in wrap(). Set by
   // registerSignature; null until then.
-  private _signatureId: Uint8Array | null = null;
-  // The single install handler instance, if registerInstallHandler was called.
-  // Held so setApproveInstall can delegate to it.
-  private _installHandler: InstallHandler | null = null;
+  private _signatureName: Uint8Array | null = null;
+  // The installer instance, if registerInstaller was called.
+  private _installer: Installer | null = null;
 
   private constructor() {}
 
-  /** Instantiate the kernel + bootstrap modules from in-memory bytes.
-   *  The caller is responsible for sourcing the bytes (fs / fetch / inline)
-   *  and for `await sodium.ready` before invoking — keeping this entry point
-   *  free of Node- or browser-specific I/O is what lets the same host run
-   *  in Node, browsers, Deno, Bun, workers, etc. The thin entry points in
-   *  `node.ts` / `browser.ts` package the loading dance for each platform. */
+  /** Instantiate the kernel + bootstrap modules from in-memory bytes. The
+   *  caller supplies the bytes and an initialized libsodium for Ed25519 +
+   *  SHA-3-256 — keeping the entry point free of Node- or browser-specific
+   *  I/O is what lets the same host run in Node, browsers, Deno, Bun, etc.
+   *  The thin entry points in `node.ts` / `browser.ts` package the loading
+   *  dance for each platform. */
   static async load(
     kernelBytes: BufferSource,
     bootstrapBytes: BufferSource,
@@ -232,12 +171,12 @@ export class KernelHost {
       env: {
         invoke_handler: (
           handlerId: number,
-          schemaPtr: number,
-          schemaLen: number,
+          namePtr: number,
+          nameLen: number,
           payloadPtr: number,
           payloadLen: number
         ) => {
-          host._onInvokeHandler(handlerId, schemaPtr, schemaLen, payloadPtr, payloadLen);
+          host._onInvokeHandler(handlerId, namePtr, nameLen, payloadPtr, payloadLen);
         },
         abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
           throw new Error(`kernel.wasm abort at ${line}:${col}`);
@@ -249,27 +188,11 @@ export class KernelHost {
     const kernelResult = await WebAssembly.instantiate(kernelBytes, kernelImports);
     host.kernelExports = kernelResult.instance.exports as unknown as KernelExports;
 
-    // ── load bootstrap.wasm ───────────────────────────────────────────
+    // ── load bootstrap.wasm (signature module) ────────────────────────
     const bootstrapImports: WebAssembly.Imports = {
       env: {
         ed25519_verify: (pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number => {
           return host._ed25519Verify(pubPtr, sigPtr, dataPtr, dataLen);
-        },
-        on_trust_revoked: (
-          algoId: number,
-          pubPtr: number, pubLen: number,
-          schemaPtr: number, schemaLen: number
-        ) => {
-          host._onTrustRevoked(algoId, pubPtr, pubLen, schemaPtr, schemaLen);
-        },
-        // Pluggable suite host imports (§6.1). Called by bootstrap.wasm when a
-        // non-genesis algorithm suite is registered or used.
-        suite_register: (
-          algoId: number,
-          pubkeyLen: number, sigMaxLen: number, hashLen: number,
-          wasmPtr: number, wasmLen: number
-        ): number => {
-          return host._suiteRegister(algoId, pubkeyLen, sigMaxLen, hashLen, wasmPtr, wasmLen);
         },
         suite_verify: (
           algoId: number,
@@ -306,19 +229,12 @@ export class KernelHost {
 
   // ─── bootstrap memory helpers ────────────────────────────────────────
 
-  private writeToBootstrap(data: Uint8Array): number {
-    const ptr = this.bootstrapExports.alloc(data.length);
-    new Uint8Array(this.bootstrapExports.memory.buffer, ptr, data.length).set(data);
-    return ptr;
-  }
-
   private readFromBootstrap(ptr: number, len: number): Uint8Array {
     return new Uint8Array(this.bootstrapExports.memory.buffer, ptr, len).slice();
   }
 
   /** Allocate in bootstrap memory and copy len bytes from kernel memory at
-   *  srcPtr → bootstrap[ret..ret+len]. Skips the JS intermediate buffer that
-   *  the readFrom/writeTo combo used to allocate per call. Caller deallocates. */
+   *  srcPtr → bootstrap[ret..ret+len]. Caller deallocates. */
   private _copyKernelToBootstrap(srcPtr: number, len: number): number {
     const dstPtr = this.bootstrapExports.alloc(len);
     new Uint8Array(this.bootstrapExports.memory.buffer, dstPtr, len)
@@ -334,24 +250,15 @@ export class KernelHost {
     return dstPtr;
   }
 
-  /** Pass a schema_id into one of bootstrap.wasm's `set_*_id` exports —
-   *  alloc, copy, call, dealloc. Used by the registerSignature/TrustGrant/
-   *  SignatureRegister entry points. */
-  private _setBootstrapId(setter: (ptr: number, len: number) => void, id: Uint8Array): void {
-    const ptr = this.writeToBootstrap(id);
-    try { setter(ptr, id.length); }
-    finally { this.bootstrapExports.dealloc(ptr); }
-  }
-
-  /** When a schema_id is being rebound to a new handlerId, drop the old
-   *  handler's host-side state. Kernel-side replacement is done separately
-   *  by the kernel.wasm set_handler call. */
-  private _displaceHandlerAtSchema(key: string, newId: number): void {
-    const oldId = this.schemaToHandlerId.get(key);
+  /** When a name is being rebound to a new handlerId, drop the old handler's
+   *  host-side state. Kernel-side replacement is done separately by the
+   *  kernel.wasm set_handler call. */
+  private _displaceHandlerAtName(key: string, newId: number): void {
+    const oldId = this.nameToHandlerId.get(key);
     if (oldId !== undefined && oldId !== newId) {
       this.wasmHandlers.delete(oldId);
       this.handlers.delete(oldId);
-      this.handlerIdToSchema.delete(oldId);
+      this.handlerIdToName.delete(oldId);
       this.blockedFromCall.delete(oldId);
     }
   }
@@ -361,21 +268,15 @@ export class KernelHost {
   /** Called by kernel.wasm when a handler matches (§3). */
   private _onInvokeHandler(
     handlerId: number,
-    schemaPtr: number,
-    schemaLen: number,
+    namePtr: number,
+    nameLen: number,
     payloadPtr: number,
     payloadLen: number
   ): void {
     if (handlerId === HANDLER_SIGNATURE) {
-      // Copy payload directly from kernel to bootstrap memory — skip the JS
-      // intermediate slice. alloc happens on the destination first, then a
-      // single TypedArray.set covers the byte transfer (browser/V8 ≈ memcpy).
       const payPtr = this._copyKernelToBootstrap(payloadPtr, payloadLen);
       let verified = 0;
       try {
-        // Catch any throw out of bootstrap.wasm (e.g. heap OOM under flood)
-        // and treat it as "verify failed" rather than letting it unwind out
-        // of the dispatch path and crash the host.
         try { verified = this.bootstrapExports.handle_signature(payPtr, payloadLen); }
         catch { verified = 0; }
       } finally {
@@ -391,9 +292,6 @@ export class KernelHost {
         const innerLen = this.bootstrapExports.get_inner_len();
         const innerPtr = this.bootstrapExports.get_inner_ptr();
         kPtr = this._copyBootstrapToKernel(innerPtr, innerLen);
-        // A throw out of the inner dispatch (recursive handle_signature OOM,
-        // a buggy WASM handler, etc.) is dropped here so the outer pipeline
-        // still pops the signer cleanly.
         try { this.kernelExports.dispatch(kPtr, innerLen); }
         catch { /* drop — pop_signer in finally restores the stack */ }
       } finally {
@@ -403,37 +301,11 @@ export class KernelHost {
       return;
     }
 
-    if (handlerId === HANDLER_TRUST_GRANT) {
-      // handle_trust_grant checks trust internally (signer stack + trust table).
-      const payPtr = this._copyKernelToBootstrap(payloadPtr, payloadLen);
-      try {
-        // Drop on any throw out of bootstrap.
-        try { this.bootstrapExports.handle_trust_grant(payPtr, payloadLen); }
-        catch { /* drop */ }
-      } finally {
-        this.bootstrapExports.dealloc(payPtr);
-      }
-      return;
-    }
-
-    if (handlerId === HANDLER_SIGNATURE_REGISTER) {
-      // handle_signature_register checks trust internally (§6.4).
-      const payPtr = this._copyKernelToBootstrap(payloadPtr, payloadLen);
-      try {
-        // Drop on any throw out of bootstrap.
-        try { this.bootstrapExports.handle_signature_register(payPtr, payloadLen); }
-        catch { /* drop */ }
-      } finally {
-        this.bootstrapExports.dealloc(payPtr);
-      }
-      return;
-    }
-
     // Dynamic WASM handler or host-JS handler — response is dropped for
     // inbound dispatch. kernel.call is the path that surfaces responses.
-    const schemaId = this.readFromKernel(schemaPtr, schemaLen);
+    const name = this.readFromKernel(namePtr, nameLen);
     const payload = this.readFromKernel(payloadPtr, payloadLen);
-    this._invokeHandlerGetResponse(handlerId, schemaId, payload);
+    this._invokeHandlerGetResponse(handlerId, name, payload);
   }
 
   /** Core invocation used both by inbound dispatch (response dropped) and by
@@ -441,22 +313,17 @@ export class KernelHost {
    *  bytes, or null if no response / no handler. */
   private _invokeHandlerGetResponse(
     handlerId: number,
-    schemaId: Uint8Array,
+    name: Uint8Array,
     payload: Uint8Array
   ): Uint8Array | null {
     if (handlerId === HANDLER_SIGNATURE_SIGNER) {
       return this._serializeSignerStack();
     }
-
-    if (handlerId === HANDLER_CAPABILITY_OF_HANDLER) {
-      return this._handleCapabilityOfHandler(payload);
-    }
-
     const wasm = this.wasmHandlers.get(handlerId);
     if (wasm) {
       // Scratch-region contract (README §4): write input at the handler's
       // scratch offset, call handle(input_len), read response from the
-      // same offset. No allocator involved.
+      // same offset.
       if (payload.length > wasm.scratchSize) return null;
       new Uint8Array(wasm.memory.buffer, wasm.scratch, payload.length).set(payload);
       let responseLen: number;
@@ -467,11 +334,10 @@ export class KernelHost {
     }
     const handler = this.handlers.get(handlerId);
     if (handler) {
-      // Treat a JS handler the same as a WASM handler: an exception aborts
-      // the call but must not unwind through dispatch and corrupt the
-      // signer stack or kernel state above it.
+      // An exception aborts the call but must not unwind through dispatch
+      // and corrupt the signer stack or kernel state above it.
       try {
-        const r = handler(schemaId, payload, this);
+        const r = handler(name, payload, this);
         return r instanceof Uint8Array ? r : null;
       } catch {
         return null;
@@ -480,252 +346,10 @@ export class KernelHost {
     return null;
   }
 
-  /** capability.of_handler query handler (README §8.2).
-   *  Payload: [schema_id_len u8][schema_id ..]
-   *  Response: [count u8][cap_id_len u8][cap_id ..]* */
-  private _handleCapabilityOfHandler(payload: Uint8Array): Uint8Array {
-    if (payload.length < 1) return new Uint8Array([0]);
-    const sidLen = payload[0];
-    if (payload.length < 1 + sidLen) return new Uint8Array([0]);
-    const schemaId = payload.slice(1, 1 + sidLen);
-    const caps = this.handlerCapIndex.get(schemaKey(schemaId));
-    if (!caps) return new Uint8Array([0]);
-    let size = 1;
-    for (const cap of caps) size += 1 + cap.length;
-    const out = new Uint8Array(size);
-    let o = 0;
-    out[o++] = caps.length;
-    for (const cap of caps) {
-      out[o++] = cap.length;
-      out.set(cap, o);
-      o += cap.length;
-    }
-    return out;
-  }
-
-  /** Instantiate a dynamic WASM handler and install it via SetHandler.
-   *  Used by the install handler (README §3.2 step 5–7) to do the WASM-side
-   *  work that no module on its own can do (instantiating WASM is a host
-   *  capability). The install handler is responsible for the trust prefilter,
-   *  approveInstall callback, replacement policy, and recording installer
-   *  attribution; this method just turns "here are the bytes" into "the
-   *  module is now wired to the kernel and the cap index has the right row".
-   *
-   *  When `installer` is supplied, this method also auto-grants the installer
-   *  trust on `targetSchemaId` with `granter = installer` (self-granted) so
-   *  the §7.3 revocation cascade can reach the install: revoking any trust
-   *  entry of the installer walks the granter chain and fires
-   *  `onTrustRevoked(installer, targetSchemaId)`, which the install handler's
-   *  `RevokeInstallsBy` consumes to remove the kernel slot. Without this
-   *  link, revoking `(installer, installSchemaId)` would cascade to nothing
-   *  (the install handler's attribution table is keyed by target_schema_id,
-   *  not install schema), contradicting README §7.3 ("de-registers
-   *  everything"). The grant is idempotent — if the installer already has a
-   *  trust entry on `targetSchemaId` (e.g. an explicit root-seed grant), the
-   *  add is a no-op and the existing chain is preserved.
-   *
-   *  Returns true on success, false on any failure (instantiation error,
-   *  missing exports, scratch out of range). */
-  installWasmHandler(
-    targetSchemaId: Uint8Array,
-    declaredCaps: readonly Uint8Array[],
-    wasmBytes: Uint8Array,
-    installer?: Signer,
-  ): boolean {
-    if (targetSchemaId.length === 0) return false;
-    if (wasmBytes.length === 0) return false;
-
-    const handlerId = this.nextHandlerId++;
-    // Use a ref-wrapper so kernel.caller can access the handler's memory after
-    // the instance is created (memory isn't available until after instantiation).
-    const memRef = { memory: null as WebAssembly.Memory | null };
-    let instance: WebAssembly.Instance;
-    try {
-      const mod = new WebAssembly.Module(wasmBytes as BufferSource);
-      const imports: WebAssembly.Imports = {
-        kernel: {
-          call: (schPtr: number, schLen: number, plPtr: number, plLen: number): number =>
-            this._kernelCallFromHandler(handlerId, schPtr, schLen, plPtr, plLen),
-          caller: (outPtr: number): number => {
-            if (!memRef.memory || this.callerStack.length === 0) return 0;
-            const callerSchemaId = this.callerStack[this.callerStack.length - 1];
-            if (!callerSchemaId) return 0;
-            new Uint8Array(memRef.memory.buffer, outPtr, callerSchemaId.length).set(callerSchemaId);
-            return callerSchemaId.length;
-          },
-        },
-        env: {
-          abort: (_m: number, _f: number, l: number, c: number) => {
-            throw new Error(`dynamic handler abort at ${l}:${c}`);
-          },
-          seed: () => Date.now(),
-          trace: () => {},
-        },
-      };
-      instance = new WebAssembly.Instance(mod, imports);
-    } catch {
-      return false;
-    }
-    const exps = instance.exports as {
-      memory?: WebAssembly.Memory;
-      scratch?: WebAssembly.Global;
-      handle?: (input_len: number) => number;
-    };
-    if (!exps.memory || !(exps.scratch instanceof WebAssembly.Global) || typeof exps.handle !== "function") return false;
-    memRef.memory = exps.memory; // wire kernel.caller after instantiation
-    const scratchOffset = exps.scratch.value as number;
-    if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) return false;
-
-    // SetHandler is unconditional at the kernel level — replace whatever is
-    // there. The install handler's replacement policy is applied before this
-    // method is called.
-    const kPtr = this.writeToKernel(targetSchemaId);
-    try {
-      this.kernelExports.set_handler(kPtr, targetSchemaId.length, handlerId);
-    } finally {
-      this.kernelExports.dealloc(kPtr);
-    }
-
-    const targetKey = schemaKey(targetSchemaId);
-    this._displaceHandlerAtSchema(targetKey, handlerId);
-
-    this.wasmHandlers.set(handlerId, {
-      memory: exps.memory,
-      scratch: scratchOffset,
-      scratchSize: DEFAULT_SCRATCH_SIZE,
-      handle: exps.handle,
-      exports: instance.exports,
-    });
-
-    this.schemaToHandlerId.set(targetKey, handlerId);
-    this.handlerIdToSchema.set(handlerId, targetSchemaId.slice());
-    this.handlerCapIndex.set(targetKey, declaredCaps.map((c) => c.slice()));
-
-    // Auto-grant installer trust on targetSchemaId, granter = installer, so
-    // the §7.3 cascade can find this install when the installer's trust is
-    // revoked. Idempotent: trustGrant rejects duplicates and we ignore the
-    // result. See the method-level comment for the rationale.
-    if (installer) {
-      this.trustGrant(installer.algoId, installer.publicKey, targetSchemaId, installer);
-    }
-
-    return true;
-  }
-
-  /** Check whether the top signer on the bootstrap signer stack is trusted
-   *  for the given schema_id. Used by the install handler (README §3.2 step 2)
-   *  and by any other handler that gates on signer-side trust. */
-  isTrustedByCurrentSigners(schemaId: Uint8Array): boolean {
-    const ptr = this.writeToBootstrap(schemaId);
-    try {
-      return this.bootstrapExports.is_trusted_by_current_signers(ptr, schemaId.length) === 1;
-    } finally {
-      this.bootstrapExports.dealloc(ptr);
-    }
-  }
-
-  /** Top-of-stack signer, or null if the signer stack is empty. */
-  get currentTopSigner(): Signer | null {
-    const s = this._readTopSigner();
-    if (!s) return null;
-    return { algoId: s.algoId, publicKey: s.pubKey };
-  }
-
-  /** Subscribe to trust-revocation events (README §7.3 OnRevoked cascade).
-   *  The install handler wires its RevokeInstallsBy in via this hook so that
-   *  revoking a key removes the handlers that key installed. Listeners run
-   *  in registration order; exceptions are swallowed so one buggy listener
-   *  doesn't block the rest of the cascade.
-   *
-   *  The install handler's RevokeInstallsBy *removes the kernel handler 
-   *  synchronously*, which clears the matching capability-index row inline. 
-   *  Listeners registered after registerInstallHandler will therefore see 
-   *  the post-removal state when they query (e.g. `getHandlerDeclaredCaps` 
-   *  returns []). If a listener needs to query state about the handler 
-   *  being torn down - for instance to record audit metadata before it
-   *  disappears - register it BEFORE registerInstallHandler. */
-  addOnRevoked(callback: (algoId: number, pubKey: Uint8Array, schemaId: Uint8Array) => void): void {
-    this.revokeListeners.push(callback);
-  }
-
-  /** Read signer at index, sizing the pubkey buffer to the suite's actual
-   *  pubkey length so post-quantum keys are not truncated. Returns null on
-   *  out-of-range index. */
-  private _readSignerAt(index: number): { algoId: number; pubKey: Uint8Array } | null {
-    const required = this.bootstrapExports.signer_pubkey_len(index);
-    if (required < 0) return null;
-    if (required === 0) return null;
-    const algoBuf = this.bootstrapExports.alloc(2);
-    const pubBuf  = this.bootstrapExports.alloc(required);
-    try {
-      const pubLen = this.bootstrapExports.read_signer(index, algoBuf, pubBuf, required);
-      if (pubLen < 0) return null;
-      const mem = new DataView(this.bootstrapExports.memory.buffer);
-      const algoId = (mem.getUint8(algoBuf) << 8) | mem.getUint8(algoBuf + 1);
-      return { algoId, pubKey: this.readFromBootstrap(pubBuf, pubLen) };
-    } finally {
-      this.bootstrapExports.dealloc(algoBuf);
-      this.bootstrapExports.dealloc(pubBuf);
-    }
-  }
-
-  /** Read the top-of-stack signer from bootstrap.wasm. Returns null if the
-   *  signer stack is empty (unsigned message path). */
-  private _readTopSigner(): { algoId: number; pubKey: Uint8Array } | null {
-    const count = this.bootstrapExports.get_signer_count();
-    if (count === 0) return null;
-    return this._readSignerAt(count - 1);
-  }
-
-  /** Host import provided to dynamic handlers as `kernel.call` (README §4.4).
-   *  Looks up the target handler, invokes it synchronously, and writes the
-   *  response back into the caller's scratch region. Returns the response
-   *  length, 0 if no response, or -1 on error (no handler / depth exceeded /
-   *  response too large). The caller's scratch is overwritten unconditionally. */
-  private _kernelCallFromHandler(
-    callerHandlerId: number,
-    schemaPtr: number, schemaLen: number,
-    payloadPtr: number, payloadLen: number
-  ): number {
-    if (this.callDepth >= MAX_CALL_DEPTH) return -1;
-    const caller = this.wasmHandlers.get(callerHandlerId);
-    if (!caller) return -1;
-    const schemaId = new Uint8Array(caller.memory.buffer, schemaPtr, schemaLen).slice();
-    const payload = new Uint8Array(caller.memory.buffer, payloadPtr, payloadLen).slice();
-    const targetId = this.schemaToHandlerId.get(schemaKey(schemaId));
-    if (targetId === undefined) return -1;
-    // Bootstrap mutating handlers (signature wrapper, trust.grant,
-    // signature.register, install) run only at top-level dispatch where
-    // the signature wrapper has already been verified. Allowing them via
-    // kernel.call would let an in-handler call mutate trust/signature/install
-    // state under the current signer's authority without that signer's intent
-    // (README §4.4). Return -1 so the failure is observable.
-    if (this.blockedFromCall.has(targetId)) return -1;
-
-    // Push caller schema onto the stack so kernel.caller works in the target.
-    const callerSchemaId = this.handlerIdToSchema.get(callerHandlerId) ?? null;
-    this.callerStack.push(callerSchemaId);
-
-    this.callDepth++;
-    let response: Uint8Array | null = null;
-    try { response = this._invokeHandlerGetResponse(targetId, schemaId, payload); }
-    finally {
-      this.callDepth--;
-      this.callerStack.pop();
-    }
-    if (!response) return 0;
-    if (response.length > caller.scratchSize) return -1;
-    new Uint8Array(caller.memory.buffer, caller.scratch, response.length).set(response);
-    return response.length;
-  }
-
   /** Serialize the current signer stack as
    *  `[count u8][algo_id u16 BE][pubkey_len u16 BE][pubkey ..]*` — the format
-   *  the `signature.signer` handler returns to callers of kernel.call (§6.5).
-   *
-   *  pubkey_len is u16 BE so post-quantum suites with multi-kilobyte public
-   *  keys (ML-DSA-87 = 2592 bytes) fit without truncation. The count byte
-   *  remains u8 since MAX_SIGNATURE_DEPTH = 4. */
+   *  the `signature.signer` query handler returns (§6.5). pubkey_len is u16
+   *  BE so post-quantum suites with multi-kilobyte public keys fit. */
   private _serializeSignerStack(): Uint8Array {
     const count = this.bootstrapExports.get_signer_count();
     if (count === 0) return new Uint8Array([0]);
@@ -751,6 +375,175 @@ export class KernelHost {
     return out;
   }
 
+  /** Serialize the current callerStack into the `[count u8] [len1 u8][name1] ...`
+   *  format the kernel.caller import returns (§4.2). Empty stack returns the
+   *  single byte [0x00]. Used by both the WASM import and host-JS bridges
+   *  that want the full chain. */
+  private _serializeCallerStack(): Uint8Array {
+    const entries: Uint8Array[] = [];
+    let size = 1;
+    for (const n of this.callerStack) {
+      if (!n) continue;
+      entries.push(n);
+      size += 1 + n.length;
+    }
+    const out = new Uint8Array(size);
+    let o = 0;
+    out[o++] = entries.length;
+    for (const n of entries) {
+      out[o++] = n.length;
+      out.set(n, o);
+      o += n.length;
+    }
+    return out;
+  }
+
+  /** Instantiate a dynamic WASM handler and install it via SetHandler. Called
+   *  by the Installer (README §7.2 step 7) — the installer is responsible for
+   *  authoring records; this method just turns "here are the bytes" into "the
+   *  module is now wired to the kernel". Returns true on success, false on any
+   *  failure (instantiation error, missing exports, scratch out of range). */
+  _installWasmHandler(targetName: Uint8Array, wasmBytes: Uint8Array): boolean {
+    if (targetName.length === 0) return false;
+    if (wasmBytes.length === 0) return false;
+
+    const handlerId = this.nextHandlerId++;
+    let instance: WebAssembly.Instance;
+    try {
+      const mod = new WebAssembly.Module(wasmBytes as BufferSource);
+      const imports: WebAssembly.Imports = {
+        kernel: {
+          call: (nPtr: number, nLen: number, plPtr: number, plLen: number): number =>
+            this._kernelCallFromHandler(handlerId, nPtr, nLen, plPtr, plLen),
+          caller: (outPtr: number): number => this._kernelCallerFromHandler(handlerId, outPtr),
+        },
+        env: {
+          abort: (_m: number, _f: number, l: number, c: number) => {
+            throw new Error(`dynamic handler abort at ${l}:${c}`);
+          },
+          seed: () => Date.now(),
+          trace: () => {},
+        },
+      };
+      instance = new WebAssembly.Instance(mod, imports);
+    } catch {
+      return false;
+    }
+    const exps = instance.exports as {
+      memory?: WebAssembly.Memory;
+      scratch?: WebAssembly.Global;
+      handle?: (input_len: number) => number;
+    };
+    if (!exps.memory || !(exps.scratch instanceof WebAssembly.Global) || typeof exps.handle !== "function") return false;
+    const scratchOffset = exps.scratch.value as number;
+    if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) return false;
+
+    // SetHandler is unconditional at the kernel level — replace whatever is
+    // there. The installer's replacement policy was applied before this
+    // method was called.
+    const kPtr = this.writeToKernel(targetName);
+    try {
+      this.kernelExports.set_handler(kPtr, targetName.length, handlerId);
+    } finally {
+      this.kernelExports.dealloc(kPtr);
+    }
+
+    const targetKey = nameKey(targetName);
+    this._displaceHandlerAtName(targetKey, handlerId);
+
+    this.wasmHandlers.set(handlerId, {
+      memory: exps.memory,
+      scratch: scratchOffset,
+      scratchSize: DEFAULT_SCRATCH_SIZE,
+      handle: exps.handle,
+      exports: instance.exports,
+    });
+
+    this.nameToHandlerId.set(targetKey, handlerId);
+    this.handlerIdToName.set(handlerId, targetName.slice());
+
+    return true;
+  }
+
+  /** Top-of-stack signer, or null if the signer stack is empty. */
+  get currentTopSigner(): Signer | null {
+    const s = this._readTopSigner();
+    if (!s) return null;
+    return { algoId: s.algoId, publicKey: s.pubKey };
+  }
+
+  /** Read signer at index, sizing the pubkey buffer to the suite's actual
+   *  pubkey length so post-quantum keys are not truncated. */
+  private _readSignerAt(index: number): { algoId: number; pubKey: Uint8Array } | null {
+    const required = this.bootstrapExports.signer_pubkey_len(index);
+    if (required < 0) return null;
+    if (required === 0) return null;
+    const algoBuf = this.bootstrapExports.alloc(2);
+    const pubBuf  = this.bootstrapExports.alloc(required);
+    try {
+      const pubLen = this.bootstrapExports.read_signer(index, algoBuf, pubBuf, required);
+      if (pubLen < 0) return null;
+      const mem = new DataView(this.bootstrapExports.memory.buffer);
+      const algoId = (mem.getUint8(algoBuf) << 8) | mem.getUint8(algoBuf + 1);
+      return { algoId, pubKey: this.readFromBootstrap(pubBuf, pubLen) };
+    } finally {
+      this.bootstrapExports.dealloc(algoBuf);
+      this.bootstrapExports.dealloc(pubBuf);
+    }
+  }
+
+  /** Read the top-of-stack signer from bootstrap.wasm. */
+  private _readTopSigner(): { algoId: number; pubKey: Uint8Array } | null {
+    const count = this.bootstrapExports.get_signer_count();
+    if (count === 0) return null;
+    return this._readSignerAt(count - 1);
+  }
+
+  /** Host import provided to dynamic handlers as `kernel.call` (README §4.4). */
+  private _kernelCallFromHandler(
+    callerHandlerId: number,
+    namePtr: number, nameLen: number,
+    payloadPtr: number, payloadLen: number
+  ): number {
+    if (this.callDepth >= MAX_CALL_DEPTH) return -1;
+    const caller = this.wasmHandlers.get(callerHandlerId);
+    if (!caller) return -1;
+    const name = new Uint8Array(caller.memory.buffer, namePtr, nameLen).slice();
+    const payload = new Uint8Array(caller.memory.buffer, payloadPtr, payloadLen).slice();
+    const targetId = this.nameToHandlerId.get(nameKey(name));
+    if (targetId === undefined) return -1;
+    if (this.blockedFromCall.has(targetId)) return -1;
+
+    // Push caller name onto the stack so kernel.caller works in the target.
+    const callerName = this.handlerIdToName.get(callerHandlerId) ?? null;
+    this.callerStack.push(callerName);
+
+    this.callDepth++;
+    let response: Uint8Array | null = null;
+    try { response = this._invokeHandlerGetResponse(targetId, name, payload); }
+    finally {
+      this.callDepth--;
+      this.callerStack.pop();
+    }
+    if (!response) return 0;
+    if (response.length > caller.scratchSize) return -1;
+    new Uint8Array(caller.memory.buffer, caller.scratch, response.length).set(response);
+    return response.length;
+  }
+
+  /** Host import provided to dynamic handlers as `kernel.caller` (§4.2).
+   *  Writes the full caller stack at outPtr in `[count u8] [len1][name1] ...`
+   *  format and returns the total bytes written. Empty stack writes the
+   *  single byte [0x00] and returns 1. */
+  private _kernelCallerFromHandler(callerHandlerId: number, outPtr: number): number {
+    const caller = this.wasmHandlers.get(callerHandlerId);
+    if (!caller) return 0;
+    const bytes = this._serializeCallerStack();
+    if (outPtr + bytes.length > caller.memory.buffer.byteLength) return 0;
+    new Uint8Array(caller.memory.buffer, outPtr, bytes.length).set(bytes);
+    return bytes.length;
+  }
+
   /** Ed25519 verify — reads from bootstrap.wasm memory, calls libsodium. */
   private _ed25519Verify(pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number {
     try {
@@ -762,49 +555,28 @@ export class KernelHost {
     } catch { return 0; }
   }
 
-  /** Revocation callback — called by bootstrap.wasm during the trust cascade
-   *  (README §7.3). Each registered listener (notably the install handler's
-   *  RevokeInstallsBy) decides whether to act on this (algoId, pubKey, schemaId).
-   *  Listener exceptions are swallowed so one buggy listener can't block the
-   *  rest of the cascade. */
-  private _onTrustRevoked(
-    algoId: number,
-    pubPtr: number, pubLen: number,
-    schemaPtr: number, schemaLen: number
-  ): void {
-    const schemaId = this.readFromBootstrap(schemaPtr, schemaLen);
-    const pubKey   = this.readFromBootstrap(pubPtr, pubLen);
-    for (const cb of this.revokeListeners) {
-      try { cb(algoId, pubKey, schemaId); } catch { /* swallow */ }
-    }
-  }
-
   /** Clear host-side index entries for a handler the kernel just removed. */
-  private _dropHostMaps(schemaId: Uint8Array): void {
-    const key = schemaKey(schemaId);
-    const hid = this.schemaToHandlerId.get(key);
+  private _dropHostMaps(name: Uint8Array): void {
+    const key = nameKey(name);
+    const hid = this.nameToHandlerId.get(key);
     if (hid !== undefined) {
       this.wasmHandlers.delete(hid);
       this.handlers.delete(hid);
-      this.handlerIdToSchema.delete(hid);
+      this.handlerIdToName.delete(hid);
       this.blockedFromCall.delete(hid);
     }
-    this.schemaToHandlerId.delete(key);
-    this.handlerCapIndex.delete(key);
+    this.nameToHandlerId.delete(key);
   }
 
-  /** Load and instantiate a pluggable algorithm suite WASM module (§6.1).
-   *  Called from bootstrap.wasm via the suite_register host import. */
-  private _suiteRegister(
+  /** Install a pluggable algorithm suite into the host registry (§6.4).
+   *  Called by the Installer when an install lands on a suite-slot name. */
+  _registerSuite(
     algoId: number,
-    pubkeyLen: number, sigMaxLen: number, _hashLen: number,
-    wasmPtr: number, wasmLen: number
-  ): number {
-    // Defense in depth: bootstrap.wasm already checks hasSuiteMeta before
-    // calling here. Refuse a duplicate so the two registries cannot diverge
-    // even if a future caller bypasses bootstrap's check.
-    if (this.suiteRegistry.has(algoId)) return 0;
-    const wasmBytes = this.readFromBootstrap(wasmPtr, wasmLen);
+    pubkeyLen: number,
+    sigMaxLen: number,
+    wasmBytes: Uint8Array,
+  ): boolean {
+    if (this.suiteRegistry.has(algoId)) return false;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);
       const suiteImports: WebAssembly.Imports = {
@@ -822,10 +594,8 @@ export class KernelHost {
         verify?: (pubPtr: number, pubLen: number, sigPtr: number, sigLen: number, dataPtr: number, dataLen: number) => number;
         hash?: (dataPtr: number, dataLen: number, outPtr: number) => number;
       };
-      if (!exps.memory || typeof exps.alloc !== "function" || typeof exps.verify !== "function") return 0;
+      if (!exps.memory || typeof exps.alloc !== "function" || typeof exps.verify !== "function") return false;
       const alloc = exps.alloc;
-      // Pre-allocate the per-call buffers once; the data buffer starts small
-      // and grows on demand in _suiteVerify (most signed envelopes are <1 KB).
       const INITIAL_DATA_SCRATCH = 4096;
       this.suiteRegistry.set(algoId, {
         memory: exps.memory,
@@ -833,20 +603,27 @@ export class KernelHost {
         dealloc: exps.dealloc ?? (() => {}),
         verify: exps.verify,
         hash: exps.hash ?? ((_dp: number, _dl: number, _op: number) => 0),
+        pubkeyLen,
+        sigMaxLen,
         pubScratch:  alloc(pubkeyLen),
         sigScratch:  alloc(sigMaxLen),
         dataScratch: alloc(INITIAL_DATA_SCRATCH),
         dataScratchSize: INITIAL_DATA_SCRATCH,
       });
-      return 1;
+      return true;
     } catch {
-      return 0;
+      return false;
     }
   }
 
-  /** Call a registered suite's verify function (§6.6).
-   *  Called from bootstrap.wasm via the suite_verify host import.
-   *  All pointers are into bootstrap.wasm's linear memory. */
+  /** Remove a suite registry entry. Called by Installer.remove(). */
+  _unregisterSuite(algoId: number): boolean {
+    return this.suiteRegistry.delete(algoId);
+  }
+
+  /** Call a registered suite's verify function (§6.6). Validates sizes
+   *  against the suite's declared metadata; an unknown algoId or a size
+   *  mismatch returns 0. Pointers are into bootstrap.wasm's memory. */
   private _suiteVerify(
     algoId: number,
     pubPtr: number, pubLen: number,
@@ -855,15 +632,13 @@ export class KernelHost {
   ): number {
     const suite = this.suiteRegistry.get(algoId);
     if (!suite) return 0;
-    // Grow the data scratch on demand (pub/sig are sized by suite metadata
-    // at registration so they're already big enough for any valid input).
+    if (pubLen !== suite.pubkeyLen) return 0;
+    if (sigLen <= 0 || sigLen > suite.sigMaxLen) return 0;
     if (dataLen > suite.dataScratchSize) {
       try { suite.dealloc(suite.dataScratch); } catch { /* swallow */ }
       suite.dataScratch = suite.alloc(dataLen);
       suite.dataScratchSize = dataLen;
     }
-    // Copy directly from bootstrap memory into the suite's scratch — skip
-    // the host-side intermediate Uint8Arrays.
     const bootMem = new Uint8Array(this.bootstrapExports.memory.buffer);
     const sMem    = new Uint8Array(suite.memory.buffer);
     sMem.set(bootMem.subarray(pubPtr,  pubPtr  + pubLen),  suite.pubScratch);
@@ -882,21 +657,36 @@ export class KernelHost {
 
   // ─── public API ──────────────────────────────────────────────────────
 
-  /** The schema_id of the handler that initiated the current kernel.call chain,
-   *  or null when the current handler was invoked directly from the pipeline.
-   *  This is the host-side equivalent of the kernel.caller WASM import (§4.2),
-   *  available to host-JS bridge handlers that cannot declare WASM imports. */
+  /** The name of the handler that initiated the current kernel.call, or null
+   *  when the current handler was invoked directly from the pipeline. Host-side
+   *  equivalent of the kernel.caller WASM import (§4.2) — returns the
+   *  immediate caller (last entry of the chain). */
   get currentCaller(): Uint8Array | null {
     if (this.callerStack.length === 0) return null;
     return this.callerStack[this.callerStack.length - 1] ?? null;
   }
 
+  /** Read the entire caller stack — outermost first, immediate caller last
+   *  (§4.2). Useful for audit logging in host-side bridges; capability checks
+   *  MUST use the immediate caller only (i.e. `currentCaller`). */
+  get currentCallerStack(): readonly Uint8Array[] {
+    const out: Uint8Array[] = [];
+    for (const n of this.callerStack) if (n) out.push(n);
+    return out;
+  }
+
   /** Return the capability IDs declared at install time by the handler
-   *  registered under schemaId, or an empty array for unknown / bootstrap handlers.
-   *  Bridge handlers use this together with currentCaller to enforce the §9
-   *  caller-capability check without needing a kernel.call to capability.of_handler. */
-  getHandlerDeclaredCaps(schemaId: Uint8Array): readonly Uint8Array[] {
-    return this.handlerCapIndex.get(schemaKey(schemaId)) ?? [];
+   *  registered under `name`, or [] for unknown / SetHandler-installed
+   *  slots (§8.3). Convenience wrapper for the equivalent kernel.call to
+   *  `installer.caps_of`. */
+  getHandlerDeclaredCaps(name: Uint8Array): readonly Uint8Array[] {
+    return this._installer ? this._installer.capsOf(name) : [];
+  }
+
+  /** Read-only access to the install record at `name`, or null. Convenience
+   *  wrapper for `installer.lookup`. */
+  lookupInstall(name: Uint8Array): InstallRecord | null {
+    return this._installer ? this._installer.lookup(name) : null;
   }
 
   /** Read the current signer stack from bootstrap.wasm (§6.5). */
@@ -912,164 +702,144 @@ export class KernelHost {
     return result;
   }
 
-  /** Host-level handler management (README §3.1). Installs or replaces a handler
-   *  unconditionally. Used for bootstrap handlers — installer attribution and
-   *  capability index entries are not created for setHandler installs, so they
-   *  are immune to revocation cascades by construction (§8.3). */
-  setHandler(schemaId: Uint8Array, handlerId: number): void {
-    const ptr = this.writeToKernel(schemaId);
-    try { this.kernelExports.set_handler(ptr, schemaId.length, handlerId); }
+  /** Host-level handler management (README §3.1). Installs or replaces a
+   *  handler unconditionally. SetHandler-installed handlers are immune to
+   *  installer state by construction (§8.3) — any matching install record
+   *  is cleared as a side effect. */
+  setHandler(name: Uint8Array, handlerId: number): void {
+    const ptr = this.writeToKernel(name);
+    try { this.kernelExports.set_handler(ptr, name.length, handlerId); }
     finally { this.kernelExports.dealloc(ptr); }
-    const key = schemaKey(schemaId);
-    this._displaceHandlerAtSchema(key, handlerId);
-    this.schemaToHandlerId.set(key, handlerId);
-    this.handlerIdToSchema.set(handlerId, schemaId.slice());
-    // setHandler entries are bootstrap-only by construction (§3.1) — they
-    // declare no caps, so capability.of_handler returns [0x00] for them.
-    // Drop any stale cap-index entry left over from a prior dynamic install
-    // at this schema and clear any matching install-handler attribution row
-    // so a later revocation of the original installer cannot yank this
-    // operator-installed handler.
-    this.handlerCapIndex.delete(key);
-    if (this._installHandler) this._installHandler.clearAttribution(schemaId);
+    const key = nameKey(name);
+    this._displaceHandlerAtName(key, handlerId);
+    this.nameToHandlerId.set(key, handlerId);
+    this.handlerIdToName.set(handlerId, name.slice());
+    // SetHandler entries are bootstrap-only by construction (§3.1) — clear
+    // any stale install record at this slot so a future lookup / caps_of
+    // can't return stale data for brand-new bytes (§3.1 "Replacing installer-
+    // managed names").
+    if (this._installer) this._installer._onKernelSlotMutated(name);
   }
 
   /** Remove a handler installed via setHandler (null handler case in §3.1). */
-  removeHandler(schemaId: Uint8Array): boolean {
-    const ptr = this.writeToKernel(schemaId);
+  removeHandler(name: Uint8Array): boolean {
+    const ptr = this.writeToKernel(name);
     try {
-      const ok = this.kernelExports.remove_handler(ptr, schemaId.length) === 1;
+      const ok = this.kernelExports.remove_handler(ptr, name.length) === 1;
       if (ok) {
-        this._dropHostMaps(schemaId);
-        if (this._installHandler) this._installHandler.clearAttribution(schemaId);
+        this._dropHostMaps(name);
+        if (this._installer) this._installer._onKernelSlotMutated(name);
       }
       return ok;
     } finally { this.kernelExports.dealloc(ptr); }
   }
 
-  /** Register the signature wrapper handler and the signature.signer query
-   *  handler (§6.5). Both must be registered for WASM handlers that query
-   *  the signer stack via kernel.call to work correctly. */
-  registerSignature(signatureId: Uint8Array, signerQueryId: Uint8Array): void {
-    this.setHandler(signatureId, HANDLER_SIGNATURE);
-    this.setHandler(signerQueryId, HANDLER_SIGNATURE_SIGNER);
-    // Stash a copy so wrap() can use it as the outer schema_id (§6.3).
-    this._signatureId = signatureId.slice();
+  /** Register the signature wrapper handler (§6.5). Required for any signed
+   *  message to dispatch. */
+  registerSignature(signatureName: Uint8Array): void {
+    this.setHandler(signatureName, HANDLER_SIGNATURE);
+    this._signatureName = signatureName.slice();
   }
 
-  /** Register the trust.grant handler — routes to bootstrap.wasm.
-   *  Uses setHandler (§3.1, §8) and stores the schema_id in bootstrap.wasm for trust checking. */
-  registerTrustGrant(trustGrantId: Uint8Array): void {
-    this.setHandler(trustGrantId, HANDLER_TRUST_GRANT);
-    this._setBootstrapId(this.bootstrapExports.set_trust_grant_id, trustGrantId);
-  }
-
-  /** Register the signature.register handler — routes to bootstrap.wasm (§6.4).
-   *  Stores the schema_id in bootstrap.wasm so it can check signer trust before
-   *  accepting a new algorithm suite. */
-  registerSignatureRegister(sigRegId: Uint8Array): void {
-    this.setHandler(sigRegId, HANDLER_SIGNATURE_REGISTER);
-    this._setBootstrapId(this.bootstrapExports.set_sig_register_id, sigRegId);
-  }
-
-  /** Register the capability.of_handler query handler (README §8.2).
-   *  Used by I/O bridges to look up the declared capabilities of their caller. */
-  registerCapabilityOfHandler(capOfHandlerId: Uint8Array): void {
-    this.setHandler(capOfHandlerId, HANDLER_CAPABILITY_OF_HANDLER);
+  /** Register the `signature.signer` query handler (§6.5). Any handler that
+   *  wants to read the current signer stack via `kernel.call(signerQueryName, …)`
+   *  needs this wired. Optional — the wrapper works without it; only apps
+   *  that introspect the author of a dispatch require it. */
+  registerSignerQuery(signerQueryName: Uint8Array): void {
+    this.setHandler(signerQueryName, HANDLER_SIGNATURE_SIGNER);
   }
 
   /** Mark a handler as forbidden from `kernel.call` (README §4.4). Use this
    *  for any deployer-added handler that calls `kernel.SetHandler` internally
-   *  — `bootstrap.replace` (§10.1) being the canonical example — so an
-   *  in-handler `kernel.call` cannot mutate kernel state under the current
-   *  signer's authority without that signer's explicit intent. The bootstrap
-   *  mutating handlers (signature wrapper, trust.grant, signature.register,
-   *  install) are blocked by construction; this method extends that protection
-   *  to handlers the deployer wires post-bootstrap. Idempotent.
-   *
-   *  Removing the handler (via removeHandler or by being overwritten via
-   *  setHandler) clears the block as a side effect — re-marking the new
-   *  handler is the deployer's responsibility. */
+   *  or that re-dispatches under a new author. The bootstrap signature wrapper
+   *  is blocked by construction; the installer is blocked when registerInstaller
+   *  runs. Idempotent. */
   blockFromCall(handlerId: number): void {
     this.blockedFromCall.add(handlerId);
   }
 
-  /** Register the install handler (README §3.2). Optional — without it, the
-   *  deployment is frozen and no message-driven installs are possible. Wires
-   *  a fresh InstallHandler at installSchemaId, blocks it from kernel.call,
-   *  and subscribes its RevokeInstallsBy to the trust cascade. Returns the
-   *  InstallHandler instance for further configuration (e.g. setApproveInstall). */
-  registerInstallHandler(installSchemaId: Uint8Array): InstallHandler {
-    const ih = new InstallHandler(this, installSchemaId);
-    const id = this.register(installSchemaId, ih.handler);
+  /** Register the Installer (README §7). Wires the install message handler,
+   *  the installer.lookup query, and the installer.caps_of query. Without
+   *  calling this, the deployment is frozen — no message-driven installs.
+   *  Returns the Installer instance for further configuration. */
+  registerInstaller(
+    installName: Uint8Array,
+    lookupName: Uint8Array,
+    capsOfName: Uint8Array,
+  ): Installer {
+    const ih = new Installer(this, installName);
+    const id = this.register(installName, ih.handler);
     this.blockFromCall(id);
-    this.addOnRevoked((algo, pk, sid) => ih.revokeInstallsBy(algo, pk, sid));
-    this._installHandler = ih;
+    this.register(lookupName, ih.lookupHandler);
+    this.register(capsOfName, ih.capsOfHandler);
+    this._installer = ih;
     return ih;
   }
 
-  /** Convenience: wire the install-approval callback on the install handler
-   *  registered via registerInstallHandler. Throws if no install handler has
-   *  been registered yet. */
+  /** Convenience: wire the install-approval callback on the installer. Throws
+   *  if registerInstaller has not been called. */
   setApproveInstall(callback: ApproveInstall | null): void {
-    if (!this._installHandler) {
-      throw new Error("setApproveInstall: registerInstallHandler must be called first");
+    if (!this._installer) {
+      throw new Error("setApproveInstall: registerInstaller must be called first");
     }
-    this._installHandler.setApproveInstall(callback);
+    this._installer.setApproveInstall(callback);
   }
 
-  /** Build an install payload (README §3.2):
-   *    [seq u32 BE][caps_count u8][caps...][target_schema_len u8][target_schema][wasm]
-   *  Pass an empty caps array for pure-computation handlers (caps_count = 0).
+  /** Build an install payload (README §7.2):
+   *    [seq u32 BE]
+   *    [name_len u8][name ..]
+   *    [caps_count u8][caps...]    each cap = [cap_id_len u8][cap_id ..]
+   *    [parent_len u8][parent ..]  parent_len = 0 means no claimed predecessor
+   *    [wasm]
    *
-   *  `seq` is the §4.4 replay-protection sequence number for the signer
-   *  (the key that will wrap this payload). The install handler tracks the
-   *  high-water mark per (algoId, pubKey) and drops any payload with
-   *  seq <= last_seen — including a wire-byte-identical replay of an
-   *  install whose handler was later removed. */
+   *  `seq` is the §4.4 replay-protection sequence number for the signer.
+   *  Pass an empty caps array for pure-computation handlers. */
   encodeInstallPayload(
     seq: number,
+    name: Uint8Array,
     caps: Uint8Array[],
-    targetSchemaId: Uint8Array,
+    parent: Uint8Array | null,
     wasmBytes: Uint8Array,
   ): Uint8Array {
-    if (targetSchemaId.length === 0 || targetSchemaId.length > 255)
-      throw new Error("encodeInstallPayload: target schema_id length must be 1..255");
+    if (name.length === 0 || name.length > 255)
+      throw new Error("encodeInstallPayload: name length must be 1..255");
     if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
       throw new Error("encodeInstallPayload: seq must fit in u32");
-    // caps_count and each cap_id_len are u8 on the wire (§3.2). Without these
-    // guards a caller passing > 255 caps or a > 255-byte cap_id would silently
-    // produce a truncated, mis-parseable payload.
     if (caps.length > 255)
       throw new Error("encodeInstallPayload: caps count must be 0..255");
     for (const cap of caps) {
       if (cap.length > 255)
         throw new Error("encodeInstallPayload: each cap_id length must be 0..255");
     }
-    let headerLen = 4;     // seq u32 BE
-    headerLen += 1;        // caps_count byte
+    const parentLen = parent ? parent.length : 0;
+    if (parentLen > 255)
+      throw new Error("encodeInstallPayload: parent length must be 0..255");
+    let headerLen = 4;                   // seq
+    headerLen += 1 + name.length;        // name_len + name
+    headerLen += 1;                      // caps_count
     for (const cap of caps) headerLen += 1 + cap.length;
-    headerLen += 1 + targetSchemaId.length; // target_schema_len + target_schema
+    headerLen += 1 + parentLen;          // parent_len + parent
     const out = new Uint8Array(headerLen + wasmBytes.length);
     let o = 0;
     writeU32BE(out, o, seq); o += 4;
+    out[o++] = name.length;
+    out.set(name, o); o += name.length;
     out[o++] = caps.length;
     for (const cap of caps) {
       out[o++] = cap.length;
       out.set(cap, o);
       o += cap.length;
     }
-    out[o++] = targetSchemaId.length;
-    out.set(targetSchemaId, o); o += targetSchemaId.length;
+    out[o++] = parentLen;
+    if (parent) { out.set(parent, o); o += parentLen; }
     out.set(wasmBytes, o);
     return out;
   }
 
   /** Test helper: read a byte range from a dynamic WASM handler's memory by
-   *  schema_id. Returns null if no dynamic handler is registered under that
-   *  schema. */
-  readDynamicHandlerMemory(schemaId: Uint8Array, ptr: number, len: number): Uint8Array | null {
-    const hid = this.schemaToHandlerId.get(schemaKey(schemaId));
+   *  name. */
+  readDynamicHandlerMemory(name: Uint8Array, ptr: number, len: number): Uint8Array | null {
+    const hid = this.nameToHandlerId.get(nameKey(name));
     if (hid === undefined) return null;
     const wasm = this.wasmHandlers.get(hid);
     if (!wasm) return null;
@@ -1077,8 +847,8 @@ export class KernelHost {
   }
 
   /** Test helper: call an arbitrary `(): i32` export on a dynamic WASM handler. */
-  callDynamicHandlerI32(schemaId: Uint8Array, exportName: string): number | null {
-    const hid = this.schemaToHandlerId.get(schemaKey(schemaId));
+  callDynamicHandlerI32(name: Uint8Array, exportName: string): number | null {
+    const hid = this.nameToHandlerId.get(nameKey(name));
     if (hid === undefined) return null;
     const wasm = this.wasmHandlers.get(hid);
     if (!wasm) return null;
@@ -1087,21 +857,14 @@ export class KernelHost {
     return (fn as () => number)();
   }
 
-  /** Call a named `(input_len: i32) => i32` (or void) export on a dynamic
-   *  WASM handler, staging `payload` in scratch first. The pattern mirrors
-   *  the kernel's `handle` invocation so deployers can drive one-shot
-   *  configuration calls (or any other auxiliary export) without dispatching
-   *  a synthetic envelope through the kernel.
-   *
-   *  Returns the export's i32 return value, or null if the handler is not
-   *  registered, the export does not exist, or `payload` exceeds the
-   *  handler's scratch region. Void-returning exports yield `undefined`. */
+  /** Call a named export on a dynamic WASM handler, staging `payload` in
+   *  scratch first. Returns the export's i32 return value or null on failure. */
   callDynamicExport(
-    schemaId: Uint8Array,
+    name: Uint8Array,
     exportName: string,
     payload: Uint8Array,
   ): number | null | undefined {
-    const hid = this.schemaToHandlerId.get(schemaKey(schemaId));
+    const hid = this.nameToHandlerId.get(nameKey(name));
     if (hid === undefined) return null;
     const wasm = this.wasmHandlers.get(hid);
     if (!wasm) return null;
@@ -1112,34 +875,26 @@ export class KernelHost {
     return (fn as (n: number) => number)(payload.length);
   }
 
-  /** Register a host-side handler. Returns the assigned id. Unconditionally
-   *  replaces whatever is at this schema_id (kernel-level setHandler is
-   *  unconditional, README §3.1). Host-installed handlers have no installer
-   *  attribution and are immune to revocation cascades. */
-  register(schemaId: Uint8Array, handler: Handler): number {
+  /** Register a host-side handler. Returns the assigned id. */
+  register(name: Uint8Array, handler: Handler): number {
     const id = this.nextHandlerId++;
-    const ptr = this.writeToKernel(schemaId);
-    try { this.kernelExports.set_handler(ptr, schemaId.length, id); }
+    const ptr = this.writeToKernel(name);
+    try { this.kernelExports.set_handler(ptr, name.length, id); }
     finally { this.kernelExports.dealloc(ptr); }
 
-    const key = schemaKey(schemaId);
-    this._displaceHandlerAtSchema(key, id);
+    const key = nameKey(name);
+    this._displaceHandlerAtName(key, id);
 
     this.handlers.set(id, handler);
-    this.schemaToHandlerId.set(key, id);
-    this.handlerIdToSchema.set(id, schemaId.slice());
-    // Host-installed JS handlers have no declared caps — drop any stale
-    // cap-index entry left from a previous dynamic install at this slot, and
-    // clear any matching install-handler attribution so a later revocation
-    // cascade of the original installer cannot yank this host handler.
-    this.handlerCapIndex.delete(key);
-    if (this._installHandler) this._installHandler.clearAttribution(schemaId);
+    this.nameToHandlerId.set(key, id);
+    this.handlerIdToName.set(id, name.slice());
+    if (this._installer) this._installer._onKernelSlotMutated(name);
     return id;
   }
 
-  isRegistered(schemaId: Uint8Array): boolean {
-    const ptr = this.writeToKernel(schemaId);
-    try { return this.kernelExports.is_registered(ptr, schemaId.length) === 1; }
+  isRegistered(name: Uint8Array): boolean {
+    const ptr = this.writeToKernel(name);
+    try { return this.kernelExports.is_registered(ptr, name.length) === 1; }
     finally { this.kernelExports.dealloc(ptr); }
   }
 
@@ -1149,14 +904,7 @@ export class KernelHost {
 
   /** Feed raw envelope bytes into the pipeline. */
   dispatch(bytes: Uint8Array): void {
-    // Pre-validate the §2.2 cap before allocating anything in kernel memory.
-    // The kernel's own dispatch checks this too, but only after we've grown
-    // its linear memory by `bytes.length` to copy the input - a flood of
-    // oversize buffers would permanently bloat the WASM page count even
-    // though every individual allocation is dealloc'd on return.
     if (bytes.length > MAX_ENVELOPE_BYTES) return;
-    // Drop on any throw out of the kernel pipeline - a single bad
-    // message must not bring down the host loop.
     const ptr = this.writeToKernel(bytes);
     try {
       try { this.kernelExports.dispatch(ptr, bytes.length); }
@@ -1164,139 +912,63 @@ export class KernelHost {
     } finally { this.kernelExports.dealloc(ptr); }
   }
 
-  /** Check trust — delegates to bootstrap.wasm. */
-  isTrusted(algoId: number, publicKey: Uint8Array, schemaId: Uint8Array): boolean {
-    const pubPtr    = this.writeToBootstrap(publicKey);
-    const schemaPtr = this.writeToBootstrap(schemaId);
-    try {
-      return this.bootstrapExports.is_trusted(algoId, pubPtr, publicKey.length,
-                                           schemaPtr, schemaId.length) === 1;
-    } finally {
-      this.bootstrapExports.dealloc(pubPtr);
-      this.bootstrapExports.dealloc(schemaPtr);
-    }
+  /** Direct host-side access to the installer (read-only). Most code should
+   *  go through the convenience wrappers (`lookupInstall`, `getHandlerDeclaredCaps`)
+   *  or kernel.call to the lookup/caps_of names. */
+  get installer(): Installer | null {
+    return this._installer;
   }
 
-  /** Grant trust — delegates to bootstrap.wasm. */
-  trustGrant(
-    algoId: number,
-    publicKey: Uint8Array,
-    schemaId: Uint8Array,
-    granter?: { algoId: number; publicKey: Uint8Array }
-  ): boolean {
-    const pubPtr    = this.writeToBootstrap(publicKey);
-    const schemaPtr = this.writeToBootstrap(schemaId);
-    let granterPubPtr = 0;
-    try {
-      if (granter) {
-        granterPubPtr = this.writeToBootstrap(granter.publicKey);
-        return this.bootstrapExports.trust_grant(
-          algoId, pubPtr, publicKey.length, schemaPtr, schemaId.length,
-          granter.algoId, granterPubPtr, granter.publicKey.length
-        ) === 1;
-      }
-      return this.bootstrapExports.trust_grant(
-        algoId, pubPtr, publicKey.length, schemaPtr, schemaId.length,
-        -1, 0, 0
-      ) === 1;
-    } finally {
-      this.bootstrapExports.dealloc(pubPtr);
-      this.bootstrapExports.dealloc(schemaPtr);
-      if (granterPubPtr) this.bootstrapExports.dealloc(granterPubPtr);
-    }
+  /** Derive a bootstrap name: SHA-3-256("seedkernel.bootstrap.v1:" + canonical).
+   *  Use this for bootstrap handler names per §5.1. */
+  deriveBootstrapName(canonical: string): Uint8Array {
+    return this.sodium.crypto_hash_sha3256(
+      new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical),
+    );
   }
 
-  /** Revoke trust — delegates to bootstrap.wasm (cascades internally). */
-  trustRevoke(algoId: number, publicKey: Uint8Array, schemaId: Uint8Array): void {
-    const pubPtr    = this.writeToBootstrap(publicKey);
-    const schemaPtr = this.writeToBootstrap(schemaId);
-    try { this.bootstrapExports.trust_revoke(algoId, pubPtr, publicKey.length, schemaPtr, schemaId.length); }
-    finally { this.bootstrapExports.dealloc(pubPtr); this.bootstrapExports.dealloc(schemaPtr); }
+  /** Hash the raw bytes of `data` with the genesis suite (SHA-3-256). Used
+   *  by the installer to compute install record hashes and exposed so
+   *  deployers can compute the same hash off-line for allowlists. */
+  genesisHash(data: Uint8Array): Uint8Array {
+    return this.sodium.crypto_hash_sha3256(data);
   }
 
-  /** Derive a bootstrap schema_id: SHA-3-256(name). Use this for bootstrap
-   *  schemas only (signature, trust.grant, …); app handlers must use
-   *  deriveScopedId so the id incorporates the installer pubkey (README §5).
-   *  Computed host-side directly via the genesis suite hash — there is no
-   *  security boundary that requires the hash to live in bootstrap.wasm,
-   *  and the round-trip cost (4 boundary crossings to compute one digest)
-   *  was pure overhead. */
-  deriveId(name: string): Uint8Array {
-    return this.sodium.crypto_hash_sha3256(new TextEncoder().encode(name));
-  }
-
-  /** Genesis-suite hash (SHA-3-256) of arbitrary bytes. Used by the install
-   *  handler to derive the wasm_hash passed to approveInstall, and available
-   *  to deployers who want to compute the same hash off-line for allowlists. */
-  genesisHash(bytes: Uint8Array): Uint8Array {
-    return this.sodium.crypto_hash_sha3256(bytes);
-  }
-
-  /** Derive an installer-scoped schema_id: SHA-3-256(name || installer_pubkey).
-   *  Required form for app handlers per README §5 — two different keys for
-   *  the same canonical name produce different schema_ids, so installs cannot
-   *  collide by accident. Consumers must know the installer's pubkey to reach
-   *  the handler. */
-  deriveScopedId(name: string, installerPubKey: Uint8Array): Uint8Array {
-    const nameBytes = new TextEncoder().encode(name);
-    const buf = new Uint8Array(nameBytes.length + installerPubKey.length);
+  /** Derive a deterministic name as `SHA-3-256(canonical || installer_pubkey)`.
+   *  Useful for deployer policies that want author-scoped names so two parties
+   *  can each hold their own `chat` without conflict (§5.1). The kernel is
+   *  indifferent to derivation — this is just a convenience. */
+  deriveScopedName(canonical: string, authorPubKey: Uint8Array): Uint8Array {
+    const nameBytes = new TextEncoder().encode(canonical);
+    const buf = new Uint8Array(nameBytes.length + authorPubKey.length);
     buf.set(nameBytes, 0);
-    buf.set(installerPubKey, nameBytes.length);
+    buf.set(authorPubKey, nameBytes.length);
     return this.sodium.crypto_hash_sha3256(buf);
   }
 
   /** Encode an envelope (README §2). Pure binary layout — no security boundary
    *  on the encoder side, so it lives in the host. The kernel still enforces
    *  the §2.2 64 KB limit on decode. */
-  encodeEnvelope(version: number, schemaId: Uint8Array, payload: Uint8Array): Uint8Array {
-    if (schemaId.length === 0 || schemaId.length > 255) throw new Error("encodeEnvelope: schema_id length must be 1..255");
-    const total = 4 + schemaId.length + payload.length;
+  encodeEnvelope(version: number, name: Uint8Array, payload: Uint8Array): Uint8Array {
+    if (name.length === 0 || name.length > 255) throw new Error("encodeEnvelope: name length must be 1..255");
+    const total = 4 + name.length + payload.length;
     if (total > MAX_ENVELOPE_BYTES) throw new Error("encodeEnvelope: envelope exceeds 64 KB");
     const out = new Uint8Array(total);
     out[0] = (MAGIC >> 8) & 0xff;
     out[1] = MAGIC & 0xff;
     out[2] = version;
-    out[3] = schemaId.length;
-    out.set(schemaId, 4);
-    out.set(payload, 4 + schemaId.length);
-    return out;
-  }
-
-  /** Build a trust.grant payload (README §7.2). Pure binary layout — the
-   *  authorization gate is in handle_trust_grant, not here.
-   *  Layout: seq u32 BE | action u8 | algo u16 | pubkey_len u16 | pubkey | schema_id_len u8 | schema_id
-   *
-   *  `seq` is the §4.4 replay-protection sequence number for the *signer*
-   *  (the key that will wrap this payload, not the key being granted/revoked).
-   *  Each signer's seq must strictly increase across every trust.grant
-   *  message they produce; the handler tracks the high-water mark per
-   *  (algoId, pubKey) and drops any payload with seq <= last_seen. */
-  encodeGrant(seq: number, revoke: boolean, algoId: number, pubKey: Uint8Array, schemaId: Uint8Array): Uint8Array {
-    if (pubKey.length === 0 || pubKey.length > 0xffff) throw new Error("encodeGrant: pubkey length must be 1..65535");
-    if (schemaId.length === 0 || schemaId.length > 0xff) throw new Error("encodeGrant: schema_id length must be 1..255");
-    if (seq < 0 || seq > 0xffffffff) throw new Error("encodeGrant: seq must fit in u32");
-    const out = new Uint8Array(4 + 1 + 2 + 2 + pubKey.length + 1 + schemaId.length);
-    let o = 0;
-    writeU32BE(out, o, seq); o += 4;
-    out[o++] = revoke ? 1 : 0;
-    out[o++] = (algoId >> 8) & 0xff;
-    out[o++] = algoId & 0xff;
-    out[o++] = (pubKey.length >> 8) & 0xff;
-    out[o++] = pubKey.length & 0xff;
-    out.set(pubKey, o); o += pubKey.length;
-    out[o++] = schemaId.length;
-    out.set(schemaId, o);
+    out[3] = name.length;
+    out.set(name, 4);
+    out.set(payload, 4 + name.length);
     return out;
   }
 
   /** Sign + wrap an inner envelope in a signature envelope (README §6.3).
-   *  Sender-side, genesis suite (Ed25519+SHA-3-256) only — pure host code,
-   *  no bootstrap.wasm round-trip. Throws if the resulting envelope would
-   *  exceed 65,536 bytes (§2.2) or if registerSignature has not been called. */
+   *  Sender-side, genesis suite (Ed25519+SHA-3-256). Throws if the resulting
+   *  envelope would exceed 65,536 bytes or if registerSignature has not been
+   *  called. */
   wrap(privateKey: Uint8Array, publicKey: Uint8Array, innerBytes: Uint8Array): Uint8Array {
-    if (!this._signatureId) throw new Error("wrap: registerSignature has not been called");
-    // Genesis suite (Ed25519) requires exact key sizes. A short sk would cause
-    // libsodium to read past the buffer and sign whatever happened to be there.
+    if (!this._signatureName) throw new Error("wrap: registerSignature has not been called");
     if (privateKey.length !== GENESIS_SECRET_KEY_LEN) {
       throw new Error(`wrap: privateKey must be ${GENESIS_SECRET_KEY_LEN} bytes (Ed25519), got ${privateKey.length}`);
     }
@@ -1304,13 +976,8 @@ export class KernelHost {
       throw new Error(`wrap: publicKey must be ${GENESIS_PUBKEY_LEN} bytes (Ed25519), got ${publicKey.length}`);
     }
 
-    // §6.3 wrapper payload: algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
     const wrapperPayloadLen = 2 + 2 + GENESIS_PUBKEY_LEN + 2 + GENESIS_SIGNATURE_LEN + innerBytes.length;
-    // Project the final envelope size and bail before signing — Ed25519 over
-    // a multi-KB inner is cheap but not free, and on the failure path the
-    // signature is just thrown away. Matches the §2.2 cap encodeEnvelope
-    // enforces at the end.
-    const projectedTotal = 4 + this._signatureId.length + wrapperPayloadLen;
+    const projectedTotal = 4 + this._signatureName.length + wrapperPayloadLen;
     if (projectedTotal > MAX_ENVELOPE_BYTES) {
       throw new Error("wrap: envelope exceeds 64 KB");
     }
@@ -1327,16 +994,16 @@ export class KernelHost {
     wrapperPayload.set(sig, o); o += GENESIS_SIGNATURE_LEN;
     wrapperPayload.set(innerBytes, o);
 
-    return this.encodeEnvelope(CURRENT_VERSION, this._signatureId, wrapperPayload);
+    return this.encodeEnvelope(CURRENT_VERSION, this._signatureName, wrapperPayload);
   }
 
   /** Convenience: encode an inner envelope then wrap + sign it. */
   wrapAndEncode(
     privateKey: Uint8Array, publicKey: Uint8Array,
     version: number,
-    schemaId: Uint8Array, payload: Uint8Array
+    name: Uint8Array, payload: Uint8Array
   ): Uint8Array {
-    const innerBytes = this.encodeEnvelope(version, schemaId, payload);
+    const innerBytes = this.encodeEnvelope(version, name, payload);
     return this.wrap(privateKey, publicKey, innerBytes);
   }
 }

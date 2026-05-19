@@ -650,12 +650,13 @@ Collapsing the previous version's trust + capability + install machinery into a 
 | Component | Size |
 |---|---|
 | kernel.wasm | 6 KB |
-| bootstrap.wasm (signature + trust table) | 12 KB |
-| host/*.js (host orchestration) | 69 KB |
-| libsodium.wasm (Ed25519 + SHA-3-256, default genesis suite) | ~350 KB |
-| **Total deployment with default genesis suite** | **~380 KB** |
+| bootstrap.wasm (signature) | 6 KB |
+| host/*.js (host orchestration + installer) | 53 KB |
+| libsodium.wasm (Ed25519 + SHA-3-256) | 217 KB |
+| libsodium-wrappers.mjs + libsodium-core.mjs | 134 KB |
+| **Total deployment with default genesis suite** | **~415 KB** |
 
-The kernel and signature/installer modules are pure protocol logic — no cryptographic code — and together come to ~18 KB of WASM. The `host/*.js` host layer orchestrates both WASM modules, wires bootstrap, and provides the `kernel.call` import. libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6. A future post-quantum suite installed at a new suite slot (§6.4) would be a larger module because it bundles its own algorithm implementation.
+The kernel and signature modules are pure protocol logic — no cryptographic code — and together come to ~12 KB of WASM. The `host/*.js` layer is the runtime around them: it loads the modules, routes `invoke_handler` callbacks, drives the signature push/pop lifecycle, provides the `kernel.call` / `kernel.caller` imports plus the crypto imports backing `suite_verify`, and contains the installer (install records, policy callback, `lookup` / `caps_of` queries — §7). libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6. A future post-quantum suite installed at a new suite slot (§6.4) would be a larger module because it bundles its own algorithm implementation.
 
 ---
 

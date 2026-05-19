@@ -1,5 +1,5 @@
 // Envelope codec wire format (README §2):
-//   magic(2) + version(1) + schema_id_len(1) + schema_id + payload
+//   magic(2) + version(1) + name_len(1) + name + payload
 
 export const MAGIC: u16 = 0x5344; // "SD"
 export const CURRENT_VERSION: u8 = 0x01;
@@ -9,12 +9,12 @@ export const MAX_ENVELOPE_BYTES: i32 = 65536;
 
 export class Envelope {
   version: u8;
-  schemaId: Uint8Array;
+  name: Uint8Array;
   payload: Uint8Array;
 
-  constructor(version: u8, schemaId: Uint8Array, payload: Uint8Array) {
+  constructor(version: u8, name: Uint8Array, payload: Uint8Array) {
     this.version = version;
-    this.schemaId = schemaId;
+    this.name = name;
     this.payload = payload;
   }
 }
@@ -28,11 +28,11 @@ export function decode(bytes: Uint8Array): Envelope | null {
   const version = bytes[2];
   if (version != CURRENT_VERSION) return null;
 
-  const schemaLen = bytes[3] as i32;
-  if (schemaLen == 0) return null; // zero-length schema_id is reserved/invalid (§2)
-  if (4 + schemaLen > bytes.length) return null;
+  const nameLen = bytes[3] as i32;
+  if (nameLen == 0) return null; // zero-length name is reserved/invalid (§2)
+  if (4 + nameLen > bytes.length) return null;
 
-  const schemaId = bytes.subarray(4, 4 + schemaLen);
-  const payload = bytes.subarray(4 + schemaLen);
-  return new Envelope(version, schemaId, payload);
+  const name = bytes.subarray(4, 4 + nameLen);
+  const payload = bytes.subarray(4 + nameLen);
+  return new Envelope(version, name, payload);
 }
