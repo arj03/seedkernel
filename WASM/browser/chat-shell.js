@@ -23,8 +23,6 @@ const myAnswerArea = document.getElementById("my-answer");
 const copyAnswerBtn = document.getElementById("copy-answer");
 const myOfferBox = document.getElementById("my-offer-box");
 const myAnswerBox = document.getElementById("my-answer-box");
-const installV1Btn = document.getElementById("install-v1");
-const installV2Btn = document.getElementById("install-v2");
 const installBtn  = document.getElementById("install-btn");
 const appVersionSel = document.getElementById("app-version");
 const appStatus = document.getElementById("app-status");
@@ -402,12 +400,8 @@ async function installChatApp(version) {
   }
 }
 
-installV1Btn.addEventListener("click", () => installChatApp("v1"));
-installV2Btn.addEventListener("click", () => installChatApp("v2"));
 installBtn.addEventListener("click", () => installChatApp(appVersionSel.value));
 installBtn.disabled = false;
-installV1Btn.disabled = false;
-installV2Btn.disabled = false;
 
 // Auto-install v2 on load so the shell drops the user straight into a working
 // chat. v1 is selectable to demo the atomic in-place upgrade (and ships with
