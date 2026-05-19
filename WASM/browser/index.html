@@ -47,23 +47,16 @@ async function runBenchmark() {
   print("Loading WASM modules...");
   const mk = await loadKernelHost("../build/kernel.wasm", "../build/bootstrap.wasm", sodium);
 
-  // Wire the bootstrap handlers and grant root trust. Mirrors the standard
-  // sequence in tests/run.mjs (README §10).
-  const signatureId       = mk.deriveId("seedkernel.bootstrap.v1:signature");
-  const signatureSignerId = mk.deriveId("seedkernel.bootstrap.v1:signature.signer");
-  const trustGrantId      = mk.deriveId("seedkernel.bootstrap.v1:trust.grant");
-  const sigRegisterId     = mk.deriveId("seedkernel.bootstrap.v1:signature.register");
-  mk.registerSignature(signatureId, signatureSignerId);
-  mk.registerTrustGrant(trustGrantId);
-  mk.registerSignatureRegister(sigRegisterId);
+  // Bootstrap: just the signature wrapper (README §10). The benchmark
+  // registers its receiver host-side via mk.register, so no installer is
+  // needed — host-side handlers carry no install record, see §3.1.
+  mk.registerSignature(mk.deriveBootstrapName("signature"));
 
   const { publicKey: rootPk, privateKey: rootSk } = sodium.crypto_sign_keypair();
-  mk.trustGrant(0x0000, rootPk, trustGrantId);
-
-  const chatTextId = mk.deriveId("seedkernel.v1:chat.text");
+  const chatTextName = mk.deriveBootstrapName("chat.text");
 
   let handlerCalls = 0;
-  mk.register(chatTextId, () => { handlerCalls++; });
+  mk.register(chatTextName, () => { handlerCalls++; });
 
   print(`Building ${N.toLocaleString()} signed envelopes...`);
   const wireMessages = new Array(N);
@@ -72,7 +65,7 @@ async function runBenchmark() {
 
   for (let i = 0; i < N; i++) {
     const payloadBytes = new TextEncoder().encode(`message #${i}: hello world benchmark payload data`);
-    wireMessages[i] = mk.wrapAndEncode(rootSk, rootPk, CURRENT_VERSION, chatTextId, payloadBytes);
+    wireMessages[i] = mk.wrapAndEncode(rootSk, rootPk, CURRENT_VERSION, chatTextName, payloadBytes);
     payloads[i] = payloadBytes;
     signatures[i] = sodium.crypto_sign_detached(payloadBytes, rootSk);
   }
@@ -122,9 +115,9 @@ btn.textContent = "Run benchmark";
 btn.addEventListener("click", runBenchmark);
 print("Ready. Click the button to start.\n", "dim");
 print("Distribution: kernel-host.js + kernel.wasm + bootstrap.wasm", "dim");
-print("All protocol logic (envelope format, signature, trust.grant,", "dim");
-print("schema ID derivation) lives in WASM. The JS host is pure glue:", "dim");
-print("load modules, bridge memories, route callbacks, provide libsodium.", "dim");
+print("Protocol logic (envelope format, signature wrapper, signer stack)", "dim");
+print("lives in WASM. The JS host is pure glue: load modules, bridge", "dim");
+print("memories, route callbacks, provide libsodium.", "dim");
 
 </script>
 </body>

@@ -9,10 +9,7 @@ import { KernelHost } from "./kernel-host.js";
 type Sodium = typeof import("libsodium-wrappers");
 
 /** Fetch the two WASM modules, await sodium readiness, and instantiate a
- *  KernelHost. Pass URLs as strings or URL objects relative to the page.
- *  WebAssembly.instantiateStreaming is preferred for the kernel/bootstrap
- *  modules, but falling back to arrayBuffer() keeps this working when the
- *  server doesn't serve `application/wasm` correctly. */
+ *  KernelHost. Pass URLs as strings or URL objects relative to the page. */
 export async function loadKernelHost(
   kernelUrl: string | URL,
   bootstrapUrl: string | URL,
@@ -33,8 +30,17 @@ export {
   GENESIS_SIGNATURE_LEN,
   GENESIS_SECRET_KEY_LEN,
 } from "./kernel-host.js";
-export type { Handler, Signer, ApproveInstall } from "./kernel-host.js";
-export { InstallHandler } from "./install-handler.js";
+export type { Handler, Signer } from "./kernel-host.js";
+export {
+  Installer,
+  referencePolicy,
+} from "./installer.js";
+export type {
+  ApproveInstall,
+  FirstInstallPolicy,
+  InstallRecord,
+  SuiteSlot,
+} from "./installer.js";
 export {
   MAGIC,
   CURRENT_VERSION,

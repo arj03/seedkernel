@@ -43,8 +43,8 @@ export function handle(input_len: i32): i32 {
   const fwdLen = input_len - 1 - schLen;
 
   // kernel.call will overwrite our scratch with the response. Stage the
-  // schema_id and forward payload in private memory first; pass pointers
-  // into private memory to kernel.call (any caller-memory location works).
+  // name and forward payload in private memory first; pass pointers into
+  // private memory to kernel.call (any caller-memory location works).
   const stagedSch = _private + 0x10000; // 64 KB into private buffer
   const stagedFwd = stagedSch + schLen;
   memory.copy(stagedSch, scratch + 1, schLen);

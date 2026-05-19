@@ -23,14 +23,34 @@ const myAnswerArea = document.getElementById("my-answer");
 const copyAnswerBtn = document.getElementById("copy-answer");
 const myOfferBox = document.getElementById("my-offer-box");
 const myAnswerBox = document.getElementById("my-answer-box");
-const installV1Btn = document.getElementById("install-v1");
-const installV2Btn = document.getElementById("install-v2");
-const installBtn  = document.getElementById("install-btn");
-const appVersionSel = document.getElementById("app-version");
 const appStatus = document.getElementById("app-status");
 const frame = document.getElementById("app-frame");
+const appEmpty = document.getElementById("app-empty");
 const aboutBtn = document.getElementById("about-toggle");
 const aboutPanel = document.getElementById("about");
+const dropzone = document.getElementById("dropzone");
+const appFileInput = document.getElementById("app-file");
+const appListEl = document.getElementById("app-list");
+const offerListEl = document.getElementById("offer-list");
+const offersSection = document.getElementById("offers-section");
+const openAppsBtn = document.getElementById("open-apps-btn");
+const appsNotice = document.getElementById("apps-notice");
+let appsNoticeTimer = null;
+
+// Surface a message on the Apps panel. Diagnostics still gets the full text
+// via shellPrint; this is the part the user actually sees when they're not
+// looking at the App-tab diagnostics drawer.
+function showAppsNotice(text, kind = "err") {
+  appsNotice.textContent = text;
+  appsNotice.classList.remove("err", "ok");
+  if (kind === "err" || kind === "ok") appsNotice.classList.add(kind);
+  appsNotice.hidden = false;
+  if (appsNoticeTimer) clearTimeout(appsNoticeTimer);
+  appsNoticeTimer = setTimeout(() => { appsNotice.hidden = true; }, 6000);
+  // Make sure the panel is visible — if the user dropped a file from the
+  // Chat tab via the toolbar shortcut, surface the result where they'll see it.
+  showTab("apps");
+}
 
 // top-bar status elements
 const relayPill = document.getElementById("relay-pill");
@@ -43,6 +63,7 @@ const tabs = {
   relay:  { btn: document.getElementById("tab-relay"),  panel: document.getElementById("panel-relay")  },
   invite: { btn: document.getElementById("tab-invite"), panel: document.getElementById("panel-invite") },
   accept: { btn: document.getElementById("tab-accept"), panel: document.getElementById("panel-accept") },
+  apps:   { btn: document.getElementById("tab-apps"),   panel: document.getElementById("panel-apps")   },
   app:    { btn: document.getElementById("tab-app"),    panel: document.getElementById("panel-app")    },
 };
 function showTab(name) {
@@ -77,17 +98,42 @@ shellPrint("Loading kernel + bootstrap WASM...", "sys");
 const host = await loadKernelHost(
   "../build/kernel.wasm", "../build/bootstrap.wasm", sodium);
 
-// ─── bootstrap: signature, trust, install ──────────────────────────────
-const signatureId       = host.deriveId("seedkernel.bootstrap.v1:signature");
-const signatureSignerId = host.deriveId("seedkernel.bootstrap.v1:signature.signer");
-const trustGrantId      = host.deriveId("seedkernel.bootstrap.v1:trust.grant");
-const installId         = host.deriveId("seedkernel.bootstrap.v1:install");
+// ─── bootstrap: signature wrapper + installer ──────────────────────────
+const signatureName       = host.deriveBootstrapName("signature");
+const signatureSignerName = host.deriveBootstrapName("signature.signer");
+const installName         = host.deriveBootstrapName("install");
+const lookupName          = host.deriveBootstrapName("installer.lookup");
+const capsOfName          = host.deriveBootstrapName("installer.caps_of");
 
-host.registerSignature(signatureId, signatureSignerId);
-host.registerTrustGrant(trustGrantId);
-host.registerInstallHandler(installId);
-// FIXME: this is just a demo
-host.setApproveInstall(() => true);
+host.registerSignature(signatureName);
+host.registerSignerQuery(signatureSignerName);   // apps query the signer
+host.registerInstaller(installName, lookupName, capsOfName);
+
+// ── install-approval policy ────────────────────────────────────────────
+//
+// Updates from an author we already trust (= we already hold an install
+// record under this name with the same author key) are auto-approved as long
+// as the parent chain matches — that is exactly the "trust updates from the
+// same author" guarantee. First installs require explicit user consent; the
+// UI gates them by adding the install's bytes_hash to `pendingApprovals`
+// before dispatching the signed envelope. Anything else is dropped.
+const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
+
+host.setApproveInstall((name, author, bytesHash, _wasm, _caps, parent, existing) => {
+  const hex = bytesToHex(bytesHash);
+  if (existing) {
+    if (existing.author.algoId !== author.algoId) return false;
+    if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
+    if (!parent || !bytesEqual(existing.bytesHash, parent)) return false;
+    pendingApprovals.delete(hex);   // consume even if not strictly needed
+    return true;
+  }
+  if (pendingApprovals.has(hex)) {
+    pendingApprovals.delete(hex);
+    return true;
+  }
+  return false;
+});
 
 // ─── per-tab Ed25519 identity ──────────────────────────────────────────
 let myKeys;
@@ -109,7 +155,6 @@ if (stored) {
 }
 const myPkHex = bytesToHex(myKeys.publicKey);
 
-host.trustGrant(0, myKeys.publicKey, installId);
 shellPrint(`I am ${myPkHex.slice(0, 8)}`, "sys");
 
 // ─── DTLS-fingerprint identity assertion (RFC 8827 §5.6.4) ─────────────
@@ -183,18 +228,18 @@ function verifySdpIdentity(sdpString, pk, sig) {
 
 // Peek the signer pubkey from a §6.3 signature envelope without invoking the
 // kernel — used to enforce signer==entry.pk on every dc frame.
-// Outer: MAGIC(2) | version(1) | schema_id_len(1) | schema_id | payload
-// Payload (signature schema): algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
+// Outer: MAGIC(2) | version(1) | name_len(1) | name | payload
+// Payload (signature name): algo u16 | signer_len u16 | signer | sig_len u16 | sig | inner
 function peekEnvelopeSigner(bytes) {
   if (bytes.length < 4) return null;
   if (bytes[0] !== 0x53 || bytes[1] !== 0x44) return null;
-  const sidLen = bytes[3];
-  if (sidLen !== signatureId.length) return null;
-  if (bytes.length < 4 + sidLen) return null;
-  for (let i = 0; i < sidLen; i++) {
-    if (bytes[4 + i] !== signatureId[i]) return null;
+  const nameLen = bytes[3];
+  if (nameLen !== signatureName.length) return null;
+  if (bytes.length < 4 + nameLen) return null;
+  for (let i = 0; i < nameLen; i++) {
+    if (bytes[4 + i] !== signatureName[i]) return null;
   }
-  let o = 4 + sidLen;
+  let o = 4 + nameLen;
   if (bytes.length < o + 4) return null;
   o += 2; // skip algo
   const signerLen = (bytes[o] << 8) | bytes[o + 1]; o += 2;
@@ -246,26 +291,56 @@ function updatePeerPill() {
   peerPill.classList.toggle("ok", open > 0);
 }
 
-// ─── chat schema_ids ───────────────────────────────────────────────────
+// ─── app registry ──────────────────────────────────────────────────────
 //
-// chatId is the wire-level schema every peer dispatches messages at, so
-// it MUST be globally derivable — peers compute it from the same name
-// and find each other's chat handler. Scoping it would break interop.
+// An "app" is a signed install envelope (signature wrapper around an inner
+// install envelope §7.2) that carries a WASM payload with two embedded
+// custom sections: "app_meta" (a JSON manifest — id, name, version) and
+// "ui" (HTML rendered in the sandboxed iframe).
 //
-// chatUiId is the local-only bridge from chat WASM → this shell's iframe;
-// no remote peer ever addresses it. We scope it to my pubkey (README §5)
-// so a future co-installed app cannot compute it and impersonate UI
-// renders. Combined with the caller-check on the bridge below, this
-// gives the UI two independent locks.
-const chatId   = host.deriveId("seedkernel.v1:chat");
-const chatUiId = host.deriveScopedId("seedkernel.v1:chat.ui", myKeys.publicKey);
+// Each app installs under a kernel name derived from its `id`:
+//     handlerName  = SHA-3-256("seedkernel.bootstrap.v1:app:" + id)
+//     uiBridgeName = SHA-3-256("app:" + id + ".ui" + myPubKey)        (scoped)
+//
+// `handlerName` is globally derivable so two peers running the same app id
+// route messages to the same name. `uiBridgeName` is scoped to this peer's
+// pubkey: it is a local-only bridge from app WASM → this shell's iframe and
+// must not be reachable by an envelope another peer constructs.
+//
+// `installedApps` keeps the per-app state we need to re-mount the UI, send
+// updates, and re-broadcast the sealed bytes transitively (`sealedBytes` is
+// the original signature-wrapped install envelope — author's signature intact
+// — and is what every "Offer" hands to a peer).
+//
+// The local user authors installs they originate by signing with `myKeys`.
+// Apps received via Offer keep the original author's signature: we never
+// re-sign install content, we only wrap it in our own outer `app.offer`
+// envelope to satisfy the dc per-frame signer check.
+const installedApps = new Map();   // id → AppRecord
+let activeAppId = null;
 
-// ─── chat.ui bridge → iframe ───────────────────────────────────────────
+// Per-signer monotonic seq for installs we author (§4.4). Bumped on every
+// own-signed install we dispatch.
+let installSeq = parseInt(sessionStorage.getItem("apps.installSeq") || "0", 10);
+function nextSeq() {
+  installSeq++;
+  sessionStorage.setItem("apps.installSeq", String(installSeq));
+  return installSeq;
+}
+
+function appHandlerName(id) {
+  return host.deriveBootstrapName("app:" + id);
+}
+function appUiBridgeName(id) {
+  return host.deriveScopedName("app:" + id + ".ui", myKeys.publicKey);
+}
+
+// ── iframe bridge ──────────────────────────────────────────────────────
 //
-// The chat WASM has no DOM access; it forwards rendered events here via
-// kernel.call. We forward them to the currently-mounted iframe via
-// postMessage. Renders that arrive before the iframe says "ready" are
-// queued so an upgrade-in-flight doesn't drop the first peer message.
+// The active app's WASM forwards render events to its uiBridgeName via
+// kernel.call. We forward those to the iframe via postMessage. Renders that
+// arrive before the iframe says "ready" are queued so a hot-swap doesn't
+// drop the first message.
 let iframeReady = false;
 const renderQueue = [];
 
@@ -275,7 +350,6 @@ function deliverRender(payload) {
   } else {
     renderQueue.push(payload);
   }
-  // Surface unread on a tab that's not "app".
   for (const [k, t] of Object.entries(tabs)) {
     if (k !== "app" && t.btn.classList.contains("active")) {
       tabs.app.btn.classList.add("unread");
@@ -290,122 +364,687 @@ function deliverSys(text) {
   }
 }
 
-function callerIsChat() {
-  // host.currentCaller is the schema_id of the WASM that invoked us via
-  // kernel.call, or null at top-level dispatch. Only the chat handler may
-  // drive this UI bridge; anything else (an envelope dispatched directly
-  // at chatUiId, or a future co-installed handler) is dropped silently.
-  const c = host.currentCaller;
-  if (!c || c.length !== chatId.length) return false;
-  for (let i = 0; i < c.length; i++) if (c[i] !== chatId[i]) return false;
-  return true;
+function registerUiBridge(appId) {
+  const uiName = appUiBridgeName(appId);
+  const handlerName = appHandlerName(appId);
+  host.register(uiName, (_n, payload) => {
+    // Only the active app's handler may drive the UI bridge. The
+    // caller-check defends against a co-installed app calling another app's
+    // bridge — kernel.caller (§4.2) returns the immediate caller; we
+    // compare against the expected handler name for this bridge.
+    if (appId !== activeAppId) return null;
+    const c = host.currentCaller;
+    if (!c || c.length !== handlerName.length) return null;
+    for (let i = 0; i < c.length; i++) if (c[i] !== handlerName[i]) return null;
+    deliverRender(new Uint8Array(payload));
+    return null;
+  });
 }
 
-host.register(chatUiId, (_sid, payload) => {
-  if (!callerIsChat()) return null;
-  // Copy out — the underlying buffer is tied to scratch and may be reused.
-  deliverRender(new Uint8Array(payload));
-  return null;
-});
-
-// ─── install + iframe mount ────────────────────────────────────────────
-//
-// Each install bumps a per-signer monotonic seq (§4.4); the install handler
-// drops anything seq <= last_seen. Tracked in sessionStorage so a reload
-// inside the same tab doesn't rewind the counter and let an attacker replay
-// a captured install message.
-let installSeq = parseInt(sessionStorage.getItem("chat.installSeq") || "0", 10);
-function nextSeq() {
-  installSeq++;
-  sessionStorage.setItem("chat.installSeq", String(installSeq));
-  return installSeq;
-}
-
-function encodeConfigPayload() {
-  const buf = new Uint8Array(1 + chatUiId.length + 1 + signatureSignerId.length);
+function encodeConfigPayload(uiName) {
+  const buf = new Uint8Array(1 + uiName.length + 1 + signatureSignerName.length);
   let o = 0;
-  buf[o++] = chatUiId.length;
-  buf.set(chatUiId, o); o += chatUiId.length;
-  buf[o++] = signatureSignerId.length;
-  buf.set(signatureSignerId, o); o += signatureSignerId.length;
+  buf[o++] = uiName.length;
+  buf.set(uiName, o); o += uiName.length;
+  buf[o++] = signatureSignerName.length;
+  buf.set(signatureSignerName, o); o += signatureSignerName.length;
   return buf;
 }
 
-async function installChatApp(version) {
-  installBtn.disabled = true;
-  appStatus.textContent = `installing ${version}...`;
-  shellPrint(`Fetching chat-app-${version}.wasm...`, "sys");
+// ── parsing the wasm artifact ──────────────────────────────────────────
+async function readWasmSections(wasmBytes) {
+  const mod = await WebAssembly.compile(wasmBytes);
+  const ui = WebAssembly.Module.customSections(mod, "ui");
+  const meta = WebAssembly.Module.customSections(mod, "app_meta");
+  let parsedMeta = null;
+  if (meta.length > 0) {
+    try { parsedMeta = JSON.parse(new TextDecoder().decode(new Uint8Array(meta[0]))); }
+    catch { parsedMeta = null; }
+  }
+  const uiHtml = ui.length > 0 ? new TextDecoder().decode(new Uint8Array(ui[0])) : null;
+  return { meta: parsedMeta, uiHtml };
+}
+
+function promptMeta(defaultId) {
+  // Fallback when a dropped .wasm has no app_meta section.
+  const id = prompt("App id (lowercase, no spaces — used as the kernel name):", defaultId);
+  if (!id) return null;
+  const trimmed = id.trim();
+  if (!/^[a-z0-9._-]+$/i.test(trimmed)) {
+    const msg = "App id must be alphanumeric / . _ -";
+    shellPrint(msg, "err");
+    showAppsNotice(msg, "err");
+    return null;
+  }
+  const name = prompt("Display name:", trimmed) || trimmed;
+  const version = prompt("Version label:", "v1") || "v1";
+  return { id: trimmed, name, version };
+}
+
+// ── kernel envelope parsing helpers ────────────────────────────────────
+//
+// We use these to peek inside a sealed install (the signature wrapper around
+// an install envelope) without going through kernel dispatch — needed so the
+// Apps UI can surface author + meta before the user accepts an install.
+function parseEnvelope(bytes) {
+  if (bytes.length < 4) return null;
+  if (bytes[0] !== 0x53 || bytes[1] !== 0x44) return null;
+  const version = bytes[2];
+  const nameLen = bytes[3];
+  if (nameLen === 0 || bytes.length < 4 + nameLen) return null;
+  const name = bytes.subarray(4, 4 + nameLen);
+  const payload = bytes.subarray(4 + nameLen);
+  return { version, name, payload };
+}
+
+function parseSignatureWrapperPayload(payload) {
+  if (payload.length < 6) return null;
+  let o = 0;
+  const algo = (payload[o] << 8) | payload[o + 1]; o += 2;
+  const signerLen = (payload[o] << 8) | payload[o + 1]; o += 2;
+  if (payload.length < o + signerLen + 2) return null;
+  const signer = payload.subarray(o, o + signerLen); o += signerLen;
+  const sigLen = (payload[o] << 8) | payload[o + 1]; o += 2;
+  if (payload.length < o + sigLen) return null;
+  const sig = payload.subarray(o, o + sigLen); o += sigLen;
+  const inner = payload.subarray(o);
+  return { algo, signer, sig, inner };
+}
+
+function parseInstallPayload(payload) {
+  if (payload.length < 5) return null;
+  let o = 0;
+  const seq = ((payload[o] << 24) | (payload[o + 1] << 16) |
+               (payload[o + 2] << 8) | payload[o + 3]) >>> 0;
+  o += 4;
+  const nameLen = payload[o++];
+  if (nameLen === 0 || payload.length < o + nameLen) return null;
+  const name = payload.subarray(o, o + nameLen); o += nameLen;
+  if (payload.length < o + 1) return null;
+  const capsCount = payload[o++];
+  const caps = [];
+  for (let i = 0; i < capsCount; i++) {
+    if (payload.length < o + 1) return null;
+    const capLen = payload[o++];
+    if (payload.length < o + capLen) return null;
+    caps.push(payload.subarray(o, o + capLen)); o += capLen;
+  }
+  if (payload.length < o + 1) return null;
+  const parentLen = payload[o++];
+  if (payload.length < o + parentLen) return null;
+  const parent = parentLen > 0 ? payload.subarray(o, o + parentLen) : null;
+  o += parentLen;
+  const wasm = payload.subarray(o);
+  if (wasm.length === 0) return null;
+  return { seq, name, caps, parent, wasm };
+}
+
+function unwrapSealed(sealedBytes) {
+  const outer = parseEnvelope(sealedBytes);
+  if (!outer || !bytesEqual(outer.name, signatureName)) return null;
+  const wrapper = parseSignatureWrapperPayload(outer.payload);
+  if (!wrapper) return null;
+  const inner = parseEnvelope(wrapper.inner);
+  if (!inner || !bytesEqual(inner.name, installName)) return null;
+  const install = parseInstallPayload(inner.payload);
+  if (!install) return null;
+  return {
+    authorPk: wrapper.signer,
+    authorAlgo: wrapper.algo,
+    installPayload: inner.payload,
+    bytesHash: host.genesisHash(inner.payload),
+    install,
+  };
+}
+
+// ── installing an app (local-authored) ─────────────────────────────────
+async function buildSealedInstall(meta, wasmBytes, parent) {
+  const handlerName = appHandlerName(meta.id);
+  const uiName = appUiBridgeName(meta.id);
+  const installPayload = host.encodeInstallPayload(
+    nextSeq(), handlerName, [uiName], parent, wasmBytes);
+  return host.wrapAndEncode(
+    myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installName, installPayload);
+}
+
+// Dispatch a sealed install we already trust (the bytesHash has been added to
+// pendingApprovals if needed). Returns the AppRecord on success.
+async function applySealedInstall(sealedBytes) {
+  const peeked = unwrapSealed(sealedBytes);
+  if (!peeked) throw new Error("not a valid sealed install");
+  const { meta, uiHtml } = await readWasmSections(peeked.install.wasm);
+  // If the WASM carries no manifest at all we cannot derive an id. Sealed
+  // installs always come from a path that already chose an id (either the
+  // author embedded it or the local user supplied one before sealing); a
+  // missing manifest here means a malformed bundle.
+  if (!meta || !meta.id) throw new Error("install has no app_meta");
+
+  const handlerName = appHandlerName(meta.id);
+  // Make sure the bridge is wired before the WASM tries to call into it on
+  // its first configure / message. Idempotent — re-registering replaces.
+  registerUiBridge(meta.id);
+
+  host.dispatch(sealedBytes);
+  if (!host.isRegistered(handlerName)) {
+    throw new Error("installer rejected the install");
+  }
+
+  // One-shot configure (§3.2 helper contract) — tell the WASM the names of
+  // its UI bridge and the signer-query handler.
+  host.callDynamicExport(handlerName, "configure",
+    encodeConfigPayload(appUiBridgeName(meta.id)));
+
+  const record = {
+    id: meta.id,
+    name: meta.name || meta.id,
+    version: meta.version || "",
+    description: meta.description || "",
+    authorPk: peeked.authorPk.slice(),
+    authorAlgo: peeked.authorAlgo,
+    bytesHash: peeked.bytesHash,
+    // Content hash of just the WASM payload. Stable across re-signings /
+    // re-seqs by different authors, so two peers offering the same compiled
+    // artifact display the same hash. `bytesHash` (above) covers the full
+    // install payload — author seq, parent, caps — and so changes per
+    // install message.
+    wasmHash: host.genesisHash(peeked.install.wasm),
+    sealedBytes: sealedBytes.slice(),
+    handlerName,
+    uiHtml,
+  };
+  installedApps.set(meta.id, record);
+  // Persist sealed bytes across reloads so transitive offers / updates keep
+  // working without re-receiving them.
+  persistInstalledApps();
+  renderAppList();
+  return record;
+}
+
+// Add an app from raw WASM bytes by signing the install with the local key
+// (the local user becomes the author).
+async function addAppFromWasm(wasmBytes, fallbackId) {
+  let { meta } = await readWasmSections(wasmBytes);
+  if (!meta || !meta.id) {
+    meta = promptMeta(fallbackId);
+    if (!meta) return;
+    // Re-embed the meta into the wasm so the sealed bundle carries it.
+    wasmBytes = embedAppMeta(wasmBytes, meta);
+  }
+  const handlerName = appHandlerName(meta.id);
+  const existing = host.lookupInstall(handlerName);
+  // If we're updating something WE authored, chain the parent. Updates to
+  // an app authored by someone else are not supported from this path —
+  // those arrive via Offer from the original author.
+  if (existing) {
+    if (existing.author.algoId !== 0 ||
+        !bytesEqual(existing.author.publicKey, myKeys.publicKey)) {
+      const authorHex = bytesToHex(existing.author.publicKey).slice(0, 8);
+      const msg =
+        `Cannot install "${meta.id}": already installed and authored by ` +
+        `${authorHex}, not you. Updates have to come from that author ` +
+        `(e.g. via an Offer). Remove the existing app first if you want ` +
+        `to author a different one under the same id.`;
+      shellPrint(msg, "err");
+      showAppsNotice(msg, "err");
+      return;
+    }
+  }
+  const parent = existing ? existing.bytesHash : null;
+  const sealedBytes = await buildSealedInstall(meta, wasmBytes, parent);
+  const peeked = unwrapSealed(sealedBytes);
+  if (!peeked) throw new Error("internal: just-built sealed install did not parse");
+
+  pendingApprovals.add(bytesToHex(peeked.bytesHash));
   try {
-    const wasmBytes = new Uint8Array(
-      await fetch(`../build/chat-app-${version}.wasm`).then(r => r.arrayBuffer()));
-
-    // Send the signed install message. The install handler verifies the
-    // signature, trust-checks our pubkey for the install schema, validates
-    // the seq, runs approveInstall, and installs the WASM at chatId.
-    //
-    // We declare [chatUiId] as the chat handler's caps so capability.of_handler
-    // and the host's cap index record what this WASM is allowed to call
-    // into. The bridge's caller-check is the load-bearing enforcement; this
-    // declaration is the audit trail that goes with it.
-    const installPayload = host.encodeInstallPayload(
-      nextSeq(), [chatUiId], chatId, wasmBytes);
-    host.dispatch(host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installId, installPayload));
-
-    if (!host.isRegistered(chatId)) {
-      shellPrint(`Install of ${version} failed.`, "err");
-      appStatus.textContent = "install failed";
-      return;
-    }
-    shellPrint(`chat-app-${version} installed.`, "sys");
-
-    // One-shot configuration — this is the new clean primitive that
-    // replaces the previous 0xff-tag synthetic envelope.
-    host.callDynamicExport(chatId, "configure", encodeConfigPayload());
-
-    // Pull the bundled UI out of the WASMs "ui" custom section. Update
-    // is atomic — same artifact carried compute and presentation.
-    const mod = await WebAssembly.compile(wasmBytes);
-    const sections = WebAssembly.Module.customSections(mod, "ui");
-    if (sections.length === 0) {
-      shellPrint("WASM has no embedded UI section.", "err");
-      return;
-    }
-    const uiHtml = new TextDecoder().decode(new Uint8Array(sections[0]));
-
-    // Reset the iframe state and mount the new UI. The "ready" handshake
-    // below will flush any queued renders.
-    iframeReady = false;
-    renderQueue.length = 0;
-    frame.classList.remove("hidden");
-    if (frame.dataset.blobUrl) URL.revokeObjectURL(frame.dataset.blobUrl);
-    const uiBlob = new Blob([uiHtml], { type: "text/html" });
-    const uiUrl  = URL.createObjectURL(uiBlob);
-    frame.dataset.blobUrl = uiUrl;
-    frame.src = uiUrl;
-    appStatus.textContent = `${version} running`;
-    appVersionSel.value = version;
-    showTab("app");
+    const record = await applySealedInstall(sealedBytes);
+    shellPrint(`Installed ${record.name} ${record.version}`, "sys");
+    setActiveApp(record.id);
   } catch (err) {
+    pendingApprovals.delete(bytesToHex(peeked.bytesHash));
     shellPrint(`Install failed: ${err.message}`, "err");
-    appStatus.textContent = "install failed";
-  } finally {
-    installBtn.disabled = false;
+    showAppsNotice(`Install failed: ${err.message}`, "err");
   }
 }
 
-installV1Btn.addEventListener("click", () => installChatApp("v1"));
-installV2Btn.addEventListener("click", () => installChatApp("v2"));
-installBtn.addEventListener("click", () => installChatApp(appVersionSel.value));
-installBtn.disabled = false;
-installV1Btn.disabled = false;
-installV2Btn.disabled = false;
+// Embed an app_meta JSON custom section into a wasm buffer. Mirror of
+// scripts/embed-meta.mjs so the shell can produce a fully self-describing
+// bundle when the user supplies metadata for a meta-less .wasm.
+function embedAppMeta(wasmBytes, meta) {
+  const json = new TextEncoder().encode(JSON.stringify(meta));
+  const nameUtf = new TextEncoder().encode("app_meta");
+  const leb = (n) => {
+    const out = [];
+    do { let b = n & 0x7f; n >>>= 7; if (n !== 0) b |= 0x80; out.push(b); } while (n !== 0);
+    return new Uint8Array(out);
+  };
+  const inner = (() => {
+    const nl = leb(nameUtf.length);
+    const buf = new Uint8Array(nl.length + nameUtf.length + json.length);
+    let o = 0;
+    buf.set(nl, o); o += nl.length;
+    buf.set(nameUtf, o); o += nameUtf.length;
+    buf.set(json, o);
+    return buf;
+  })();
+  const sz = leb(inner.length);
+  const section = new Uint8Array(1 + sz.length + inner.length);
+  section[0] = 0x00;
+  section.set(sz, 1);
+  section.set(inner, 1 + sz.length);
+  const out = new Uint8Array(wasmBytes.length + section.length);
+  out.set(wasmBytes, 0);
+  out.set(section, wasmBytes.length);
+  return out;
+}
 
-// Auto-install v2 on load so the shell drops the user straight into a working
-// chat. v1 is selectable to demo the atomic in-place upgrade (and ships with
-// a distinct cyberpunk-themed UI so the swap is visible at a glance).
-appVersionSel.value = "v2";
-installChatApp("v2");
+// ── persistence ────────────────────────────────────────────────────────
+// Sealed bytes are the only piece of app state we need to rebuild — the
+// install record on the installer side, the handler in the kernel, and the
+// uiHtml all derive from them. We keep them in sessionStorage so a reload
+// within the same tab keeps the user's app set and lets transitive offers
+// continue to work.
+function persistInstalledApps() {
+  try {
+    const arr = [];
+    for (const rec of installedApps.values()) {
+      arr.push(Array.from(rec.sealedBytes));
+    }
+    sessionStorage.setItem("apps.sealed", JSON.stringify(arr));
+    if (activeAppId) sessionStorage.setItem("apps.active", activeAppId);
+    else sessionStorage.removeItem("apps.active");
+  } catch {}
+}
+
+async function restoreInstalledApps() {
+  let arr;
+  try { arr = JSON.parse(sessionStorage.getItem("apps.sealed") || "[]"); }
+  catch { return; }
+  if (!Array.isArray(arr)) return;
+  for (const raw of arr) {
+    try {
+      // Restored installs were already approved in a prior tab session —
+      // wave them through the approveInstall gate the same way an update
+      // would be: by adding their bytesHash to pendingApprovals.
+      const sealed = new Uint8Array(raw);
+      const peeked = unwrapSealed(sealed);
+      if (!peeked) continue;
+      pendingApprovals.add(bytesToHex(peeked.bytesHash));
+      await applySealedInstall(sealed);
+    } catch (err) {
+      shellPrint(`Could not restore an app: ${err.message}`, "err");
+    }
+  }
+  const saved = sessionStorage.getItem("apps.active");
+  if (saved && installedApps.has(saved)) setActiveApp(saved);
+}
+
+// ── active-app iframe mount ────────────────────────────────────────────
+function setActiveApp(id) {
+  const rec = installedApps.get(id);
+  if (!rec) return;
+  if (!rec.uiHtml) {
+    shellPrint(`${rec.name} has no UI; cannot mount.`, "err");
+    return;
+  }
+  activeAppId = id;
+  iframeReady = false;
+  renderQueue.length = 0;
+  if (frame.dataset.blobUrl) URL.revokeObjectURL(frame.dataset.blobUrl);
+  const uiBlob = new Blob([rec.uiHtml], { type: "text/html" });
+  const uiUrl  = URL.createObjectURL(uiBlob);
+  frame.dataset.blobUrl = uiUrl;
+  frame.src = uiUrl;
+  frame.classList.remove("hidden");
+  appEmpty.classList.add("hidden");
+  appStatus.textContent = `${rec.name} ${rec.version}`.trim();
+  persistInstalledApps();
+  renderAppList();
+}
+
+function unmountActiveApp() {
+  activeAppId = null;
+  iframeReady = false;
+  renderQueue.length = 0;
+  frame.src = "about:blank";
+  if (frame.dataset.blobUrl) {
+    URL.revokeObjectURL(frame.dataset.blobUrl);
+    delete frame.dataset.blobUrl;
+  }
+  frame.classList.add("hidden");
+  appEmpty.classList.remove("hidden");
+  appStatus.textContent = "no app loaded";
+  persistInstalledApps();
+}
+
+// ── peer-to-peer app offers ────────────────────────────────────────────
+//
+// An offer is a sealed install envelope forwarded over a data channel. Any
+// peer who holds the sealed bytes can forward them (transitive offer) —
+// the original author's signature on the inner install is preserved by the
+// wrapper, so the recipient still authenticates against the author.
+//
+// The wire format: the sender wraps the sealed bytes inside their own
+// signature envelope under the bootstrap name `app.offer`. The outer
+// signature on the wrapper is required only because the dc per-frame check
+// (bindDataChannel below) requires every binary frame to be signed by the
+// channel owner. The inner sealed bytes are the load-bearing object.
+const appOfferName = host.deriveBootstrapName("app.offer");
+const pendingOffers = new Map();   // bytesHashHex → { sealedBytes, peeked, fromPkHex }
+
+host.register(appOfferName, (_n, payload) => {
+  // Defer processing: we cannot dispatch from inside a host handler (the
+  // kernel is single-threaded re-entrantly), and a first-install needs an
+  // async user prompt anyway.
+  const sealed = new Uint8Array(payload);
+  const fromSigner = host.currentTopSigner;
+  const fromPkHex = fromSigner ? bytesToHex(fromSigner.publicKey) : "?";
+  queueMicrotask(() => handleOffer(sealed, fromPkHex));
+  return null;
+});
+
+async function handleOffer(sealedBytes, fromPkHex) {
+  const peeked = unwrapSealed(sealedBytes);
+  if (!peeked) return;
+  const { install, authorPk, bytesHash } = peeked;
+
+  let meta = null;
+  try { meta = (await readWasmSections(install.wasm)).meta; } catch {}
+  if (!meta || !meta.id) {
+    shellPrint(`Offer from ${fromPkHex.slice(0, 8)} dropped: bundle has no app_meta`, "err");
+    return;
+  }
+  const handlerName = appHandlerName(meta.id);
+  const existing = host.lookupInstall(handlerName);
+
+  // Auto-install path: the author + parent chain match an app we already
+  // trust. The reference policy in setApproveInstall verifies the same
+  // facts, so dispatching is safe — no extra approval needed.
+  if (existing &&
+      existing.author.algoId === peeked.authorAlgo &&
+      bytesEqual(existing.author.publicKey, authorPk) &&
+      install.parent && bytesEqual(existing.bytesHash, install.parent)) {
+    try {
+      const rec = await applySealedInstall(sealedBytes);
+      shellPrint(
+        `Auto-updated ${rec.name} → ${rec.version} ` +
+        `(from ${fromPkHex.slice(0, 8)}, signed by ${bytesToHex(authorPk).slice(0, 8)})`, "sys");
+      // If this was the active app, re-mount the new UI.
+      if (activeAppId === rec.id) setActiveApp(rec.id);
+    } catch (err) {
+      shellPrint(`Auto-update failed: ${err.message}`, "err");
+    }
+    return;
+  }
+
+  // Hand the user the decision. We don't dispatch yet — installation only
+  // happens after they click Install in the offer row.
+  const hex = bytesToHex(bytesHash);
+  if (pendingOffers.has(hex)) return;   // duplicate
+  pendingOffers.set(hex, {
+    sealedBytes: sealedBytes.slice(),
+    peeked: { ...peeked, meta },
+    wasmHash: host.genesisHash(peeked.install.wasm),
+    fromPkHex,
+  });
+  renderOfferList();
+  tabs.apps.btn.classList.add("unread");
+  shellPrint(
+    `${fromPkHex.slice(0, 8)} offers app "${meta.name || meta.id}" — see the Apps tab.`, "sys");
+}
+
+async function acceptOffer(bytesHashHex) {
+  const offer = pendingOffers.get(bytesHashHex);
+  if (!offer) return;
+  pendingApprovals.add(bytesHashHex);
+  try {
+    const rec = await applySealedInstall(offer.sealedBytes);
+    pendingOffers.delete(bytesHashHex);
+    renderOfferList();
+    shellPrint(`Installed ${rec.name} ${rec.version} from offer.`, "sys");
+    setActiveApp(rec.id);
+  } catch (err) {
+    pendingApprovals.delete(bytesHashHex);
+    shellPrint(`Install from offer failed: ${err.message}`, "err");
+    showAppsNotice(`Install from offer failed: ${err.message}`, "err");
+  }
+}
+
+function dismissOffer(bytesHashHex) {
+  pendingOffers.delete(bytesHashHex);
+  renderOfferList();
+}
+
+// Broadcast the stored sealed bytes for `id` to every open peer. Anyone who
+// receives this can forward it to others — that's transitivity for free.
+function offerApp(id) {
+  const rec = installedApps.get(id);
+  if (!rec) return;
+  const offerWire = host.wrapAndEncode(
+    myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, appOfferName, rec.sealedBytes);
+  const n = broadcastWire(offerWire);
+  shellPrint(
+    n > 0
+      ? `Offered ${rec.name} ${rec.version} to ${n} peer${n === 1 ? "" : "s"}.`
+      : `No connected peers to offer ${rec.name} to.`,
+    n > 0 ? "sys" : "err");
+}
+
+// ── apps panel UI ──────────────────────────────────────────────────────
+function renderAppList() {
+  appListEl.innerHTML = "";
+  if (installedApps.size === 0) {
+    const li = document.createElement("li");
+    li.className = "empty-row";
+    li.textContent = "No apps installed yet.";
+    appListEl.appendChild(li);
+    return;
+  }
+  for (const rec of installedApps.values()) {
+    appListEl.appendChild(buildAppRow(rec));
+  }
+}
+
+function buildAppRow(rec) {
+  const li = document.createElement("li");
+  li.className = "app-row";
+  if (rec.id === activeAppId) li.classList.add("active");
+
+  const head = document.createElement("div");
+  head.className = "app-row-head";
+  const nm = document.createElement("span");
+  nm.className = "app-row-name";
+  nm.textContent = rec.name;
+  head.appendChild(nm);
+  if (rec.version) {
+    const v = document.createElement("span");
+    v.className = "app-row-version";
+    v.textContent = rec.version;
+    head.appendChild(v);
+  }
+  li.appendChild(head);
+
+  if (rec.description) {
+    const d = document.createElement("div");
+    d.className = "app-row-desc";
+    d.textContent = rec.description;
+    li.appendChild(d);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "app-row-meta";
+  const authorHex = bytesToHex(rec.authorPk);
+  const isMine = bytesEqual(rec.authorPk, myKeys.publicKey);
+  meta.innerHTML =
+    `<b>id</b> ${rec.id} · <b>author</b> ${authorHex.slice(0, 8)}` +
+    (isMine ? " (you)" : "") +
+    ` · <b>wasm</b> ${bytesToHex(rec.wasmHash).slice(0, 12)}`;
+  li.appendChild(meta);
+
+  const btns = document.createElement("div");
+  btns.className = "app-row-buttons";
+  if (rec.uiHtml) {
+    const openBtn = document.createElement("button");
+    openBtn.className = "icon primary";
+    openBtn.textContent = rec.id === activeAppId ? "Active" : "Open";
+    openBtn.disabled = rec.id === activeAppId;
+    openBtn.addEventListener("click", () => {
+      setActiveApp(rec.id);
+      showTab("app");
+    });
+    btns.appendChild(openBtn);
+  }
+  if (isMine) {
+    const updateBtn = document.createElement("button");
+    updateBtn.className = "icon";
+    updateBtn.textContent = "Update…";
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = ".wasm,application/wasm";
+    fileInput.addEventListener("change", async () => {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      fileInput.value = "";
+      await addAppFromWasm(bytes, rec.id);
+    });
+    updateBtn.addEventListener("click", () => fileInput.click());
+    btns.appendChild(updateBtn);
+    btns.appendChild(fileInput);
+  }
+  const offerBtn = document.createElement("button");
+  offerBtn.className = "icon";
+  offerBtn.textContent = "Offer to peers";
+  offerBtn.addEventListener("click", () => offerApp(rec.id));
+  btns.appendChild(offerBtn);
+
+  const removeBtn = document.createElement("button");
+  removeBtn.className = "icon danger";
+  removeBtn.textContent = "Remove";
+  removeBtn.addEventListener("click", () => removeApp(rec.id));
+  btns.appendChild(removeBtn);
+
+  li.appendChild(btns);
+  return li;
+}
+
+function removeApp(id) {
+  const rec = installedApps.get(id);
+  if (!rec) return;
+  if (!confirm(`Remove ${rec.name} ${rec.version}? The kernel handler will be uninstalled.`)) return;
+  if (host.installer) host.installer.remove(rec.handlerName);
+  installedApps.delete(id);
+  if (activeAppId === id) unmountActiveApp();
+  persistInstalledApps();
+  renderAppList();
+}
+
+function renderOfferList() {
+  offerListEl.innerHTML = "";
+  if (pendingOffers.size === 0) {
+    offersSection.hidden = true;
+    return;
+  }
+  offersSection.hidden = false;
+  for (const [hex, offer] of pendingOffers) {
+    offerListEl.appendChild(buildOfferRow(hex, offer));
+  }
+}
+
+function buildOfferRow(hex, offer) {
+  const meta = offer.peeked.meta;
+  const li = document.createElement("li");
+  li.className = "app-row offer-row";
+  const head = document.createElement("div");
+  head.className = "app-row-head";
+  const nm = document.createElement("span");
+  nm.className = "app-row-name";
+  nm.textContent = meta.name || meta.id;
+  head.appendChild(nm);
+  if (meta.version) {
+    const v = document.createElement("span");
+    v.className = "app-row-version";
+    v.textContent = meta.version;
+    head.appendChild(v);
+  }
+  li.appendChild(head);
+  if (meta.description) {
+    const d = document.createElement("div");
+    d.className = "app-row-desc";
+    d.textContent = meta.description;
+    li.appendChild(d);
+  }
+  const m = document.createElement("div");
+  m.className = "app-row-meta";
+  m.innerHTML =
+    `<b>id</b> ${meta.id} · <b>author</b> ${bytesToHex(offer.peeked.authorPk).slice(0, 8)}` +
+    ` · <b>from</b> ${offer.fromPkHex.slice(0, 8)}` +
+    ` · <b>wasm</b> ${bytesToHex(offer.wasmHash).slice(0, 12)}`;
+  li.appendChild(m);
+  const btns = document.createElement("div");
+  btns.className = "app-row-buttons";
+  const ok = document.createElement("button");
+  ok.className = "icon primary";
+  ok.textContent = "Install";
+  ok.addEventListener("click", () => acceptOffer(hex));
+  const no = document.createElement("button");
+  no.className = "icon";
+  no.textContent = "Dismiss";
+  no.addEventListener("click", () => dismissOffer(hex));
+  btns.appendChild(ok);
+  btns.appendChild(no);
+  li.appendChild(btns);
+  return li;
+}
+
+// ── drag-drop + file picker plumbing ───────────────────────────────────
+async function loadDroppedFile(file) {
+  if (!file) return;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  // The filename's stem is the only signal we have for an id when the
+  // bundle is meta-less; the prompt fallback uses it as a default.
+  const stem = (file.name || "app").replace(/\.wasm$/i, "");
+  await addAppFromWasm(bytes, stem);
+}
+
+dropzone.addEventListener("click", () => appFileInput.click());
+dropzone.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    appFileInput.click();
+  }
+});
+appFileInput.addEventListener("change", async () => {
+  const f = appFileInput.files && appFileInput.files[0];
+  appFileInput.value = "";
+  if (f) await loadDroppedFile(f);
+});
+;["dragenter", "dragover"].forEach((ev) =>
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropzone.classList.add("dragover");
+  }));
+;["dragleave", "drop"].forEach((ev) =>
+  dropzone.addEventListener(ev, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (ev !== "drop") dropzone.classList.remove("dragover");
+  }));
+dropzone.addEventListener("drop", async (e) => {
+  dropzone.classList.remove("dragover");
+  const dt = e.dataTransfer;
+  if (!dt || !dt.files || dt.files.length === 0) return;
+  for (const f of dt.files) await loadDroppedFile(f);
+});
+openAppsBtn.addEventListener("click", () => showTab("apps"));
+
+renderAppList();
+renderOfferList();
+// Pull back anything we installed earlier in this session before any peer
+// link comes up — so once peers connect, transitive Offer works straight
+// away with the saved sealed bytes.
+restoreInstalledApps().catch((err) =>
+  shellPrint(`Restore failed: ${err.message}`, "err"));
 
 // ─── iframe protocol: handshake + outgoing messages ────────────────────
 window.addEventListener("message", (ev) => {
@@ -425,16 +1064,23 @@ window.addEventListener("message", (ev) => {
   }
 
   if (msg.type === "send" && typeof msg.chatType === "number" && msg.body) {
+    if (!activeAppId) return;
     const body = msg.body instanceof Uint8Array ? msg.body : new Uint8Array(msg.body);
     const payload = new Uint8Array(1 + body.length);
     payload[0] = msg.chatType & 0xff;
     payload.set(body, 1);
     const wire = host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatId, payload);
+      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION,
+      appHandlerName(activeAppId), payload);
     broadcastWire(wire);
     host.dispatch(wire);              // local echo
     if (msg.chatType === 0x02) {
-      lastSentNickBody = body;   // cache for re-broadcast on new DC open
+      // Sticky "presence" replay: nick announcements are cached and
+      // re-broadcast on every newly-opened dc so peers joining mid-session
+      // pick up our identity without us having to send it again. The chat
+      // app uses chatType=0x02 for this; other apps that don't use the
+      // same convention simply never set the cache.
+      lastSentNickBody = { appId: activeAppId, body };
     }
   }
 });
@@ -471,12 +1117,14 @@ function bindDataChannel(entry, dc, pkHex) {
     shellPrint(`P2P link to ${pkHex.slice(0, 8)} open`, "sys");
     deliverSys(`P2P link to ${pkHex.slice(0, 8)} open`);
     updatePeerPill();
-    if (lastSentNickBody) {
-      const payload = new Uint8Array(1 + lastSentNickBody.length);
+    if (lastSentNickBody && installedApps.has(lastSentNickBody.appId)) {
+      const body = lastSentNickBody.body;
+      const payload = new Uint8Array(1 + body.length);
       payload[0] = 0x02;
-      payload.set(lastSentNickBody, 1);
+      payload.set(body, 1);
       const wire = host.wrapAndEncode(
-        myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, chatId, payload);
+        myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION,
+        appHandlerName(lastSentNickBody.appId), payload);
       try { dc.send(wire); } catch {}
     }
   });
