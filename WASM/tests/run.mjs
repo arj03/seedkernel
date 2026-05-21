@@ -168,6 +168,48 @@ async function testSizeLimitEnforced() {
   console.log("  OK\n");
 }
 
+// ─── Test: Signature wrapping depth cap (§2.3) ──────────────────────────
+
+async function testSignatureDepthCap() {
+  console.log("Test: Signature wrapping depth capped at MAX_SIGNATURE_DEPTH=4 (§2.3)");
+
+  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const signatureName = host.deriveBootstrapName("signature");
+  host.registerSignature(signatureName);
+
+  const chatTextName = host.deriveBootstrapName("chat.text");
+  let received = 0;
+  host.register(chatTextName, () => { received++; });
+
+  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+
+  // Build N nested signature wrappers around the same chat.text envelope and
+  // dispatch the outermost. wrap() takes raw inner bytes, so we just feed the
+  // previous wrap's output back in.
+  const wrapN = (n, innerBytes) => {
+    let bytes = innerBytes;
+    for (let i = 0; i < n; i++) bytes = host.wrap(sk, pk, bytes);
+    return bytes;
+  };
+  const inner = host.encodeEnvelope(CURRENT_VERSION, chatTextName,
+    new TextEncoder().encode("hi"));
+
+  // 4 wrappers: signer stack reaches [s4,s3,s2,s1] = length 4 at the innermost
+  // verify; that verify checks length < 4 (currently 3) before pushing, so it
+  // is accepted. Inner handler must run.
+  received = 0;
+  host.dispatch(wrapN(4, inner));
+  assertEqual(received, 1, "4-deep wrap reaches handler");
+
+  // 5 wrappers: the innermost verify sees signer stack length 4 ≥ 4 and drops
+  // before any verify work. Inner handler must NOT run.
+  received = 0;
+  host.dispatch(wrapN(5, inner));
+  assertEqual(received, 0, "5-deep wrap dropped at innermost wrapper");
+
+  console.log("  OK\n");
+}
+
 // ─── Test: SetHandler-seeded slot is not overlaid ────────────────────────
 
 async function testRefuseOverlayBootstrapSlot() {
@@ -729,6 +771,7 @@ async function testPerf10k() {
 await testFullLifecycle();
 await testInvalidSignatureDropped();
 await testSizeLimitEnforced();
+await testSignatureDepthCap();
 await testRefuseOverlayBootstrapSlot();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();

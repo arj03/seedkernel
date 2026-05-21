@@ -90,6 +90,14 @@ The 64 KB limit is a protocol constant, not a per-deployment configuration knob.
 
 **Install messages** (handled by the installer, §7) carry name, capability, and parent metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (kernel.wasm ~8 KB, bootstrap.wasm ~11 KB — see §11.2). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
 
+### 2.3 Maximum signature wrapping depth
+
+The signature module MUST reject any `signature` envelope when the signer stack already contains `MAX_SIGNATURE_DEPTH` entries. **`MAX_SIGNATURE_DEPTH` is a protocol constant equal to `4`.**
+
+**Rationale.** Each signature wrapper costs one verify (~95 µs for Ed25519 on a modern core). Per-wrapper overhead is ~140 bytes for Ed25519 (§2.2), so a 64 KB envelope can in principle nest ~475 wrappers. Without a cap, a single inbound message can force that many verifies (~45 ms CPU), turning a tiny attacker input into a CPU-amplification DoS against the single-threaded dispatch loop. Capping depth at 4 supports realistic use cases (single-sig, hybrid Ed25519+PQ, key-rotation overlays, an attestation envelope) while keeping per-message verify cost bounded.
+
+This limit is enforced by the signature handler reading the current signer stack length before verifying — implementations do not need a separate counter. The 4-entry cap aligns with the authorization model in §6.5: the operative authorization is always the top signer, so deeper wrappers add no semantic value the kernel can use.
+
 ---
 
 ## 3. The kernel
@@ -376,7 +384,7 @@ Once a new suite is registered, messages signed under it should be wrapped per �
 
 The signature module maintains a **signer stack** — an internal list that tracks which keys have been verified during the current top-level dispatch. The kernel doesn't know it exists.
 
-**Lifecycle.** Every accepted `signature` wrapper pushes one entry, executes the inner dispatch synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline. The protocol does not fix a hard ceiling — depth is bounded by the 64 KB envelope cap (§2.2), which limits Ed25519 nesting to a few hundred wrappers at worst (~140 bytes per wrapper). Implementations on stack- or CPU-constrained hosts MAY impose their own lower cap; realistic deployments rarely need more than a handful (single-sig, hybrid Ed25519+PQ, key-rotation overlays, attestation envelopes).
+**Lifecycle.** Every accepted `signature` wrapper pushes one entry, executes the inner dispatch synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline, capped at `MAX_SIGNATURE_DEPTH` (§2.3).
 
 ```
 signature-envelope  (algo = Ed25519,  signer = A)        ← outer
@@ -721,6 +729,7 @@ All limits and reserved values in one place. Multi-byte integers are big-endian 
 | `MIN_NAME_LEN` | `1` | Envelope decode | `name_len = 0` is invalid. |
 | `MAX_NAME_LEN` | `255` | Envelope encode | One-byte length prefix. |
 | `MAX_CALL_DEPTH` | `8` (default) | `kernel.call` host import | Re-entrant call cap; host configurable. |
+| `MAX_SIGNATURE_DEPTH` | `4` | Signature handler | Max nested `signature` wrappers per inbound message (§2.3). |
 | `DEFAULT_SCRATCH_SIZE` | `131072` (128 KB) | Handler instantiation | Per-handler scratch region; host configurable. |
 | `GENESIS_ALGO_ID` | `0x0000` | Signature module | Reserved for the genesis suite (§6.2). |
 

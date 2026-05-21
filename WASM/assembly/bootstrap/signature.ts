@@ -32,6 +32,11 @@ export const GENESIS_ALGO_ID: u16 = 0x0000;
 export const GENESIS_PUBKEY_LEN: i32 = 32;
 export const GENESIS_SIG_LEN: i32 = 64;
 
+// Max nested `signature` wrappers per inbound message (README §2.3). Bounds
+// the per-message verify cost so a single 64 KB envelope cannot force hundreds
+// of crypto verifications on the single-threaded dispatch loop.
+export const MAX_SIGNATURE_DEPTH: i32 = 4;
+
 // ─── memory helpers ──────────────────────────────────────────────────────
 
 function readBytes(ptr: i32, len: i32): Uint8Array {
@@ -117,6 +122,10 @@ export function get_inner_ptr(): i32 { return _innerBuffer.dataStart as i32; }
 export function get_inner_len(): i32 { return _innerBuffer.length; }
 
 export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
+  // README §2.3: reject before doing any verify work if the stack is full.
+  // Cheap, no parsing required, kills the wrapper-nesting amplification vector.
+  if (signerStack.length >= MAX_SIGNATURE_DEPTH) return 0;
+
   const payload = readBytes(payloadPtr, payloadLen);
   // Need at least 4 bytes to read algo_id (2) + signer_len (2); the variable
   // signer / sig_len / sig / inner regions are bound-checked individually
