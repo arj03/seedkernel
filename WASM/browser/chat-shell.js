@@ -10,7 +10,9 @@ const RTC_CONFIG = { iceServers: [{ urls: [
 
 const shellLog = document.getElementById("shell-log");
 const relayUrlInput = document.getElementById("relay-url");
+const relayRoomInput = document.getElementById("relay-room");
 const relayConnectBtn = document.getElementById("connect-relay");
+const relayNewRoomBtn = document.getElementById("new-room");
 const relayStatus = document.getElementById("relay-status");
 const makeOfferBtn = document.getElementById("make-offer");
 const copyLinkBtn = document.getElementById("copy-link");
@@ -1620,23 +1622,54 @@ if (navigator.connection && typeof navigator.connection.addEventListener === "fu
     () => restartIceForAll("Network changed"));
 }
 
+// Room names mirror the relay-side validation (see scripts/relay.mjs):
+// URL-safe identifier characters, length 1..128. Empty input is allowed
+// and means "use the default room".
+const ROOM_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const DEFAULT_ROOM = "global";
+
+// Splice the chosen room onto the base relay URL as a path component. The
+// relay reads the first path segment as the room name; if the user typed
+// a URL that already contains a path we keep it (lets them paste a full
+// `ws://host:8080/my-room` URL in just the URL field if they prefer).
+function buildRelayUrl(base, room) {
+  // Trim any trailing slash on the base, then append `/<encoded room>`.
+  // If `base` already ends with a non-empty path we leave it alone — the
+  // user typed an explicit URL.
+  let u;
+  try { u = new URL(base); } catch { return null; }
+  if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
+  const hasPath = u.pathname && u.pathname !== "/";
+  if (!hasPath && room) u.pathname = "/" + encodeURIComponent(room);
+  return u.toString();
+}
+
 function connectRelay() {
-  const url = relayUrlInput.value.trim();
-  if (!url) { shellPrint("Enter a relay URL.", "err"); return; }
+  const base = relayUrlInput.value.trim();
+  if (!base) { shellPrint("Enter a relay URL.", "err"); return; }
+  const room = relayRoomInput.value.trim();
+  if (room && !ROOM_NAME_RE.test(room)) {
+    shellPrint("Room name must match [A-Za-z0-9._-] (up to 128 chars).", "err");
+    return;
+  }
+  const url = buildRelayUrl(base, room);
+  if (!url) { shellPrint("Relay URL must be ws:// or wss://.", "err"); return; }
   if (ws) { try { ws.close(); } catch {} }
-  shellPrint(`Connecting to ${url}...`, "sys");
+  const label = room || DEFAULT_ROOM;
+  shellPrint(`Connecting to ${url} (room: ${label})...`, "sys");
   relayStatus.textContent = "connecting...";
-  setRelayPill("connecting", "connecting");
+  setRelayPill("connecting", `room ${label}`);
   relayConnectBtn.disabled = true;
   ws = new WebSocket(url);
   ws.addEventListener("open", () => {
-    shellPrint("Relay connected — waiting for peers.", "sys");
-    relayStatus.textContent = `connected (${url})`;
-    setRelayPill("ok", "relay");
-    // Remember the working URL so a reload picks the relay back up
-    // automatically (see the auto-reconnect below). Saved on success only,
-    // so a typo doesn't get retried forever.
-    sessionStorage.setItem("chat.relayUrl", url);
+    shellPrint(`Relay connected — room ${label}, waiting for peers.`, "sys");
+    relayStatus.textContent = `connected · room ${label}`;
+    setRelayPill("ok", `room ${label}`);
+    // Remember the working URL + room so a reload picks the relay back up
+    // automatically. Saved on success only, so a typo doesn't get retried
+    // forever.
+    sessionStorage.setItem("chat.relayUrl", base);
+    sessionStorage.setItem("chat.relayRoom", room);
     signalRelay({ type: "hello", from: myPkHex });
   });
   ws.addEventListener("message", (ev) => {
@@ -1662,6 +1695,21 @@ relayConnectBtn.addEventListener("click", connectRelay);
 relayUrlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); connectRelay(); }
 });
+relayRoomInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); connectRelay(); }
+});
+
+// Generate a short random room name. 64 bits of entropy — plenty to keep
+// a private room private without making the string a pain to share. We
+// stick to lowercase hex so it round-trips through case-insensitive copy
+// paths (URLs, chat clients) without surprises.
+relayNewRoomBtn.addEventListener("click", () => {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  relayRoomInput.value = bytesToHex(bytes);
+  relayRoomInput.focus();
+  relayRoomInput.select();
+});
 
 // Default relay URL: same host the page is loaded from (so phones loading
 // the shell off a desktop's LAN IP get the right pre-fill out of the box).
@@ -1677,12 +1725,10 @@ function defaultRelayUrl() {
 // what lets our broadcast hello reach peers and tear down their zombie
 // entries for our previous tab.
 const savedRelayUrl = sessionStorage.getItem("chat.relayUrl");
-if (savedRelayUrl) {
-  relayUrlInput.value = savedRelayUrl;
-  connectRelay();
-} else {
-  relayUrlInput.value = defaultRelayUrl();
-}
+const savedRelayRoom = sessionStorage.getItem("chat.relayRoom");
+relayUrlInput.value = savedRelayUrl || defaultRelayUrl();
+if (savedRelayRoom) relayRoomInput.value = savedRelayRoom;
+if (savedRelayUrl) connectRelay();
 
 // ─── manual SDP exchange ───────────────────────────────────────────────
 function waitForIceGatheringComplete(pc) {

@@ -6,11 +6,20 @@
 // active tabs has an open DataChannel, this process can be killed without
 // disrupting the chat — it only matters for adding new peers.
 //
+// Clients pick a "room" by connecting to ws://host:port/<room>. Broadcasts
+// are scoped to the room: a frame from a client in room "alpha" reaches
+// only other clients in "alpha". A bare ws://host:port/ lands the client
+// in the default room "global", so older clients keep working unchanged.
+// Rooms exist for as long as anyone is in them; they are not authenticated
+// — knowing the room name is the only credential, so callers who want
+// privacy should pick a name with enough entropy that nobody else will
+// guess it (e.g. 16+ random bytes hex).
+//
 // The relay is intentionally dumb: every frame from one client is forwarded
-// verbatim to every other connected client. Signaling messages carry `from`
-// / `to` peer-id fields so clients can filter; the relay itself does not
-// inspect them. SeedKernel signatures and trust are still verified end-to-end
-// inside each peer's kernel pipeline.
+// verbatim to every other connected client in the same room. Signaling
+// messages carry `from` / `to` peer-id fields so clients can filter; the
+// relay itself does not inspect them. SeedKernel signatures and trust are
+// still verified end-to-end inside each peer's kernel pipeline.
 //
 // No third-party dependencies: hand-rolled RFC 6455 framing in ~150 lines.
 //
@@ -61,13 +70,61 @@ const MAX_FRAME_PAYLOAD = 64 * 1024;
 // frames.
 const MAX_SOCKET_BACKLOG = 256 * 1024;
 
-// ─── server ──────────────────────────────────────────────────────────────
+// ─── rooms ───────────────────────────────────────────────────────────────
+//
+// Rooms are looked up by name in a single Map<string, Set<sock>>. A socket
+// joins exactly one room for its lifetime; teardown removes it from that
+// room and drops the room entry when it goes empty so the table doesn't
+// grow without bound.
+//
+// Room names are restricted to URL-safe characters and a length cap so the
+// upgrade path can never be used to allocate giant strings or smuggle
+// control characters into log lines.
+const DEFAULT_ROOM = "global";
+const MAX_ROOM_NAME = 128;
+const ROOM_NAME_RE = /^[A-Za-z0-9._-]+$/;
 
-const clients = new Set();
+const rooms = new Map();
+
+function joinRoom(name, sock) {
+  let set = rooms.get(name);
+  if (!set) { set = new Set(); rooms.set(name, set); }
+  set.add(sock);
+  return set;
+}
+
+function leaveRoom(name, sock) {
+  const set = rooms.get(name);
+  if (!set) return 0;
+  set.delete(sock);
+  if (set.size === 0) rooms.delete(name);
+  return set.size;
+}
+
+// Pull the room name out of the upgrade request's path. Accepts:
+//   /            → DEFAULT_ROOM
+//   /foo         → "foo"
+//   /foo?bar=1   → "foo"  (query string ignored)
+// Returns null when the path is present but malformed (too long, illegal
+// characters) so the caller can 400 the upgrade.
+function roomFromRequest(req) {
+  const url = typeof req.url === "string" ? req.url : "/";
+  // Strip query / fragment, then the leading slash.
+  const path = url.split(/[?#]/, 1)[0];
+  const raw = path.startsWith("/") ? path.slice(1) : path;
+  if (raw === "") return DEFAULT_ROOM;
+  if (raw.length > MAX_ROOM_NAME) return null;
+  let decoded;
+  try { decoded = decodeURIComponent(raw); } catch { return null; }
+  if (!ROOM_NAME_RE.test(decoded)) return null;
+  return decoded;
+}
+
+// ─── server ──────────────────────────────────────────────────────────────
 
 const server = createServer((_req, res) => {
   res.writeHead(426, { "Content-Type": "text/plain" });
-  res.end("WebSocket relay — connect with ws://\n");
+  res.end("WebSocket relay — connect with ws://<host>:<port>/<room>\n");
 });
 
 server.on("upgrade", (req, sock) => {
@@ -89,6 +146,14 @@ server.on("upgrade", (req, sock) => {
     return;
   }
 
+  const room = roomFromRequest(req);
+  if (room === null) {
+    sock.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+    sock.destroy();
+    console.log(`! rejected upgrade: bad room in path ${req.url}`);
+    return;
+  }
+
   const accept = createHash("sha1").update(key + GUID).digest("base64");
   sock.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -97,8 +162,9 @@ server.on("upgrade", (req, sock) => {
     `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
 
-  clients.add(sock);
-  console.log(`+ client (${clients.size} connected)`);
+  const roomSet = joinRoom(room, sock);
+  sock._relayRoom = room;
+  console.log(`+ client room=${room} (${roomSet.size} in room, ${rooms.size} rooms)`);
 
   // Chunk buffer: a list of incoming Buffers + the total bytes pending.
   // We only Buffer.concat when we have at least enough bytes to parse the
@@ -221,7 +287,11 @@ server.on("upgrade", (req, sock) => {
     }
     if (opcode === 0x1 || opcode === 0x2) {                   // text/binary
       const out = encodeFrame(opcode, payload);
-      for (const other of clients) {
+      // Broadcasts stay inside the sender's room. A client in room "alpha"
+      // never sees frames from room "beta"; the relay does no other routing.
+      const peers = rooms.get(sock._relayRoom);
+      if (!peers) return;
+      for (const other of peers) {
         if (other === sock) continue;
         if (!other.writable) continue;
         // V2 backpressure: skip clients with a fat outbound queue rather
@@ -239,9 +309,14 @@ server.on("upgrade", (req, sock) => {
     sock.destroy();
   }
 
+  let dropped = false;
   const drop = () => {
-    if (clients.delete(sock)) {
-      console.log(`- client (${clients.size} connected)`);
+    if (dropped) return;
+    dropped = true;
+    const r = sock._relayRoom;
+    if (r !== undefined) {
+      const remaining = leaveRoom(r, sock);
+      console.log(`- client room=${r} (${remaining} in room, ${rooms.size} rooms)`);
     }
   };
   sock.on("close", drop);
@@ -269,9 +344,10 @@ function encodeFrame(opcode, payload) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`SeedKernel chat relay listening on ws://${HOST}:${PORT}`);
+  console.log(`SeedKernel chat relay listening on ws://${HOST}:${PORT}/<room>`);
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
+  console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = "${DEFAULT_ROOM}"`);
   if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
     console.log(`  ⚠  bound to ${HOST} — exposed to the network`);
   }

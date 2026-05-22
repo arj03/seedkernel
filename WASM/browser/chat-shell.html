@@ -223,10 +223,18 @@
       Relay URL
       <input id="relay-url" type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck="false" />
     </label>
+    <label class="field">
+      Room
+      <input id="relay-room" type="text" inputmode="text" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="global" />
+    </label>
     <div class="row">
       <button id="connect-relay" class="primary" type="button">Connect</button>
+      <button id="new-room" type="button">Random</button>
       <span id="relay-status" class="sys relay-status">not connected</span>
     </div>
+    <p class="hint">Pick a room name and share it with the peers you want to meet — only clients
+      in the same room see each other. Leave empty for the default <code>global</code> room
+      (allowed chars: <code>A-Z a-z 0-9 . _ -</code>).</p>
     <p class="hint">Start a relay locally with <code>node scripts/relay.mjs</code>, or point at a
       public one your group trusts.</p>
   </div>
