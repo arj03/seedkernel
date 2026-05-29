@@ -178,11 +178,16 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   if (valid == 0) return 0;
 
   const pubKey = payload.slice(signerOffset, signerOffset + signerLen);
-  signerStack.push(new Signer(algoId, pubKey));
 
   // Store a copy in the module-level buffer so get_inner_ptr() stays valid
   // after this function returns (payload is a local and would otherwise be freed).
+  // This MUST happen before the signer is pushed: both slices allocate and can
+  // therefore abort/throw on OOM. The host's drop path (handle_signature
+  // returning 0, or throwing) does NOT pop, so a signer pushed before a later
+  // throw would leak onto the stack and mis-attribute the next message. Keeping
+  // the push as the last fallible operation makes "pushed" ⟺ "returned 1".
   _innerBuffer = payload.slice(innerOffset);
+  signerStack.push(new Signer(algoId, pubKey));
 
   return 1;
 }
