@@ -1,5 +1,11 @@
 // Envelope codec wire format (README §2):
 //   magic(2) + version(1) + name_len(1) + name + payload
+//
+// `decode` / `Envelope` are the readable reference codec for the format and the
+// "Envelope.Decode" step in the README §3 flowchart. The kernel's hot path
+// (`dispatch` in index.ts) re-implements the same parse inline and zero-copy
+// for speed and does NOT call `decode` (so it is tree-shaken from the kernel
+// binary); the two are kept in lockstep so this stays a faithful spec reference.
 
 export const MAGIC: u16 = 0x5344; // "SD"
 export const CURRENT_VERSION: u8 = 0x01;
