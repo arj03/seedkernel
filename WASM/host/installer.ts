@@ -5,7 +5,8 @@
 //
 // Owns:
 //   - install records keyed by name (author, bytes_hash, declared caps, parent)
-//   - per-(algoId, pubkey) seq high-water counters (§4.4 replay protection)
+//   - canonical-pubkey-keyed seq high-water counters, kept in a table SEPARATE
+//     from the install records so removal can't rewind them (§4.4, §7.1)
 //   - the suite-slot map (which install names route to the suite registry
 //     instead of the kernel handler table — §6.4)
 //   - the deployer-supplied policy callback (§7.3)
@@ -15,8 +16,15 @@
 
 import { nameKey, readU32BE, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
 
-function signerKey(algoId: number, pubKey: Uint8Array): string {
-  let s = `${algoId}:`;
+// Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
+// algo_id is an unauthenticated outer field of the signature wrapper (README
+// §6.3); keying replay state by it would let an attacker flip algo_id to land a
+// captured message in a fresh `last_seen == 0` namespace and replay it once per
+// suite that verifies the same key (§4.4, §6.4 rotation). The signature layer
+// rejects non-canonical / small-order keys before they reach here, so equal key
+// bytes mean the same identity.
+function signerKey(pubKey: Uint8Array): string {
+  let s = "";
   for (let i = 0; i < pubKey.length; i++) s += pubKey[i].toString(16).padStart(2, "0");
   return s;
 }
@@ -25,6 +33,11 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+function capListContains(list: readonly Uint8Array[], cap: Uint8Array): boolean {
+  for (const c of list) if (bytesEqual(c, cap)) return true;
+  return false;
 }
 
 /** A single install record (README §7.1). */
@@ -72,38 +85,75 @@ export type FirstInstallPolicy = (
   declaredCaps: readonly Uint8Array[],
 ) => boolean;
 
-/** The reference policy (README §7.4):
- *  - First install at a name → defer to `firstInstall`.
- *  - Subsequent install → author must match existing.author AND
- *    parent must equal existing.bytes_hash.
- *  - If no record exists but the kernel slot is occupied, the slot was seeded
- *    via host-side SetHandler (a bootstrap entry). Refuse.
+/** Capability-acknowledgement hook for the reference policy (README §7.4
+ *  rule 3). Invoked ONLY when an install adds or broadens capabilities beyond
+ *  what the current record already holds — every cap on a first install counts
+ *  as added. Receives the exact set of newly-requested caps so an operator /
+ *  user can review them. Return true to let the broadened install proceed,
+ *  false to drop it. */
+export type AcknowledgeCaps = (
+  name: Uint8Array,
+  author: Signer,
+  addedCaps: readonly Uint8Array[],
+) => boolean;
+
+/** The reference policy (README §7.4). Three rules — two for WHO may bind a
+ *  name, one for WHAT capabilities an install may acquire:
+ *   1. First install at a name → defer to `firstInstall`. (If no record exists
+ *      but the kernel slot is occupied, the slot was SetHandler-seeded — a
+ *      bootstrap entry — so refuse.)
+ *   2. Subsequent install → author must match existing.author AND parent must
+ *      equal existing.bytes_hash.
+ *   3. Capability acknowledgement: capabilities may shrink freely, but any cap
+ *      not already held (every cap on a first install, or a broadened cap on an
+ *      upgrade) is an escalation and is dropped unless `acknowledgeCaps`
+ *      approves it. A caps-free install has nothing to escalate and is
+ *      auto-accepted once rules 1–2 pass. When no `acknowledgeCaps` hook is
+ *      wired the policy denies every escalation — capabilities are never
+ *      granted silently. Pass a hook that always returns true only for trusted
+ *      local testing.
  *
  *  Returns an ApproveInstall the deployer can hand to setApproveInstall. */
 export function referencePolicy(
   host: KernelHost,
   firstInstall: FirstInstallPolicy,
+  acknowledgeCaps?: AcknowledgeCaps,
 ): ApproveInstall {
+  const ack: AcknowledgeCaps = acknowledgeCaps ?? (() => false);
   return (name, author, bytesHash, _wasm, declaredCaps, parent, existing) => {
+    // Rules 1–2: decide who may bind the name, and capture the caps the
+    // current record (if any) already holds.
+    let existingCaps: readonly Uint8Array[];
     if (existing == null) {
       // Refuse to overlay a SetHandler-seeded slot.
       if (host.isRegistered(name)) return false;
-      return firstInstall(name, author, bytesHash, declaredCaps);
+      if (!firstInstall(name, author, bytesHash, declaredCaps)) return false;
+      existingCaps = [];
+    } else {
+      if (existing.author.algoId !== author.algoId) return false;
+      if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
+      if (parent == null) return false;
+      if (!bytesEqual(existing.bytesHash, parent)) return false;
+      existingCaps = existing.declaredCaps;
     }
-    if (existing.author.algoId !== author.algoId) return false;
-    if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
-    if (parent == null) return false;
-    if (!bytesEqual(existing.bytesHash, parent)) return false;
-    return true;
+
+    // Rule 3: any requested cap not already held is an escalation that needs
+    // acknowledgement. No additions (caps-free or a subset) → auto-accept.
+    const added = declaredCaps.filter((c) => !capListContains(existingCaps, c));
+    if (added.length === 0) return true;
+    return ack(name, author, added);
   };
 }
 
 export class Installer {
   // name → install record. README §7.1.
   private installations = new Map<string, InstallRecord>();
-  // Per-(signer) seq high-water mark for the §4.4 replay prefix. Persists
-  // across removal (tombstone-forever) so re-installing after a remove cannot
-  // rewind the sequence.
+  // Canonical-pubkey-keyed seq high-water mark for the §4.4 replay prefix.
+  // Kept DELIBERATELY SEPARATE from `installations` (README §7.1): remove()
+  // clears the record but must NOT touch this map, so the high-water mark is
+  // tombstone-forever and re-installing after a remove cannot rewind the
+  // sequence. (It also has to live apart structurally — the `install` handler
+  // is SetHandler-seeded and has no install record to hang a counter on.)
   //
   // LIMITATION: in-memory only — tombstone-forever holds for the lifetime of
   // this host instance, not across process / page restarts. A persistent
@@ -236,7 +286,7 @@ export class Installer {
   /** Returns true if `seq` is fresh for this signer (strictly greater than
    *  the last seq accepted from them) and updates the high-water mark. */
   private _consumeSeq(signer: Signer, seq: number): boolean {
-    const k = signerKey(signer.algoId, signer.publicKey);
+    const k = signerKey(signer.publicKey);
     const last = this.lastSeen.get(k);
     if (last !== undefined && seq <= last) return false;
     this.lastSeen.set(k, seq);

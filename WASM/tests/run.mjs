@@ -388,6 +388,70 @@ async function testReferencePolicyUpgradeRules() {
   console.log("  OK\n");
 }
 
+// ─── Test: reference policy capability acknowledgement (§7.4 rule 3) ─────
+
+async function testReferencePolicyCapAcknowledgement() {
+  console.log("Test: reference policy gates capability grants on acknowledgement (§7.4 rule 3)");
+
+  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const signatureName = host.deriveBootstrapName("signature");
+  const installName   = host.deriveBootstrapName("install");
+  const lookupName    = host.deriveBootstrapName("installer.lookup");
+  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
+  host.registerSignature(signatureName);
+  host.registerInstaller(installName, lookupName, capsOfName);
+
+  // Acknowledgement hook records what it was asked and answers per `ackAnswer`.
+  let ackAdded = null;
+  let ackAnswer = false;
+  host.setApproveInstall(referencePolicy(host, () => true, (_name, _author, added) => {
+    ackAdded = added.map((c) => [...c]);
+    return ackAnswer;
+  }));
+
+  const seq = makeSeq();
+  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const netCap = host.deriveBootstrapName("cap.net");
+  const fsCap  = host.deriveBootstrapName("cap.fs");
+
+  // 1. Caps-free first install → accepted with no ack prompt.
+  const pureName = host.deriveBootstrapName("test.pure");
+  ackAdded = null;
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), pureName, [], null, forwarderBytes));
+  assert(host.isRegistered(pureName), "caps-free first install accepted");
+  assert(ackAdded === null, "no ack prompt for caps-free install");
+
+  // 2. First install requesting a cap → ack denies → dropped.
+  const capName = host.deriveBootstrapName("test.capped");
+  ackAnswer = false; ackAdded = null;
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], null, forwarderBytes));
+  assert(!host.isRegistered(capName), "cap-requesting install dropped when ack denies");
+  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw the requested cap");
+
+  // 3. Same install, ack approves → accepted, cap recorded.
+  ackAnswer = true; ackAdded = null;
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], null, forwarderBytes));
+  assert(host.isRegistered(capName), "cap-requesting install accepted when ack approves");
+  const rec1 = host.lookupInstall(capName);
+  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "one cap recorded");
+
+  // 4. Same-author upgrade keeping the SAME cap → auto-accepted, no ack prompt.
+  ackAdded = null;
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], rec1.bytesHash, forwarderBytes));
+  assert(host.isRegistered(capName), "same-cap upgrade accepted");
+  assert(ackAdded === null, "no ack prompt when caps unchanged on upgrade");
+  const rec2 = host.lookupInstall(capName);
+
+  // 5. Same-author upgrade BROADENING caps (add fs) → needs ack; denied → dropped.
+  ackAnswer = false; ackAdded = null;
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap, fsCap], rec2.bytesHash, forwarderBytes));
+  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw only the newly-added cap");
+  assertEqual(ackAdded[0], [...fsCap], "added cap is fs, not the already-held net");
+  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "broadening dropped — caps unchanged");
+
+  console.log("  OK\n");
+}
+
 // ─── Test: install replay rejected by seq (§4.4) ────────────────────────
 
 async function testInstallReplayRejected() {
@@ -777,6 +841,7 @@ await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
 await testReferencePolicyUpgradeRules();
+await testReferencePolicyCapAcknowledgement();
 await testInstallReplayRejected();
 await testInstallerLookupQuery();
 await testInstallerCapsOf();

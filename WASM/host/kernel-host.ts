@@ -544,13 +544,26 @@ export class KernelHost {
     return bytes.length;
   }
 
-  /** Ed25519 verify — reads from bootstrap.wasm memory, calls libsodium. */
+  /** Ed25519 verify — reads from bootstrap.wasm memory, calls libsodium.
+   *
+   *  Since the raw public-key bytes become the signer's identity (and the
+   *  canonical replay key, §4.4), the key MUST be validated before use:
+   *  reject non-canonical or small-order encodings so the same logical key
+   *  cannot present two distinct byte forms (README §6.3). libsodium's
+   *  `crypto_sign_verify_detached` already rejects small-order / non-canonical
+   *  public keys internally; we additionally gate on `crypto_core_ed25519_is_
+   *  valid_point` when the wrapper build exposes it, to make the guarantee
+   *  explicit and independent of the verify path. */
   private _ed25519Verify(pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number {
     try {
       const mem  = this.bootstrapExports.memory.buffer;
       const pub  = new Uint8Array(mem, pubPtr,  32);
       const sig  = new Uint8Array(mem, sigPtr,  64);
       const data = new Uint8Array(mem, dataPtr, dataLen);
+      const isValidPoint = (this.sodium as unknown as {
+        crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
+      }).crypto_core_ed25519_is_valid_point;
+      if (typeof isValidPoint === "function" && !isValidPoint(pub.slice())) return 0;
       return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0;
     } catch { return 0; }
   }

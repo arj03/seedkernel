@@ -38,6 +38,7 @@ export {
 export type {
   ApproveInstall,
   FirstInstallPolicy,
+  AcknowledgeCaps,
   InstallRecord,
   SuiteSlot,
 } from "./installer.js";

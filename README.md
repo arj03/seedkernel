@@ -16,7 +16,7 @@ Every binding is three orthogonal pieces: the **name** is the kernel's opaque di
 - Cryptographic algorithms are pluggable; the kernel can survive a post-quantum transition without a protocol rewrite.
 - The kernel compiles to WebAssembly so it runs anywhere.
 
-**Layering.** The reference composition stacks app modules → installer (optional) → signature → kernel. No layer has a hard dependency on the layers above or below; the onion describes a typical composition, not a required one. See §5 for the diagrammed model.
+The reference composition stacks app modules → installer (optional) → signature → kernel; §5 diagrams it.
 
 ---
 
@@ -30,7 +30,7 @@ A reader's-digest mental model; full details follow in §2–§10.
 - **Signing is a wrapper, not a header field.** A signed message is an outer envelope with `name = signature` whose payload carries `(algo_id, signer, sig, inner_envelope)` (§6.3).
 - **Author** — top signer of the current dispatch, read via `kernel.call(signature.signer, …)` (§6.5).
 - **Installer** — holds install records, accepts signed install messages, runs a deployer-supplied policy callback on each (§7).
-- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses first installer at a name; subsequent installs require same author + parent (§7.4).
+- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses first installer at a name; subsequent installs require same author + parent; any capability grant or broadening needs explicit acknowledgement (§7.4).
 - **Capability** — a declared property of an installation, checked by bridges at I/O time (§8).
 - **Bridges** — `SetHandler`-installed handlers bound to one capability; the only code that performs real I/O (§9).
 - **Bootstrap** — host wires kernel, signature, and (optionally) installer; growth then happens via signed installs (§10).
@@ -88,7 +88,7 @@ This limit applies to the **outermost** envelope on the wire. For signature wrap
 
 The 64 KB limit is a protocol constant, not a per-deployment configuration knob. Keeping it fixed avoids interoperability splits where one node accepts messages another rejects.
 
-**Install messages** (handled by the installer, §7) carry name, capability, and parent metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (kernel.wasm ~8 KB, bootstrap.wasm ~11 KB — see §11.2). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
+**Install messages** (handled by the installer, §7) carry name, capability, and parent metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
 
 ### 2.3 Maximum signature wrapping depth
 
@@ -203,7 +203,7 @@ What a handler **must** internalize:
 - Memory is bounded by what the WASM module declares (and the host engine's own limits); the kernel imposes no per-handler cap.
 - A `kernel.call` overwrites your scratch with the callee's response. If you still need the input, copy it first (§4.4).
 
-> **Compute exhaustion is the host's problem.** WebAssembly engines on the JavaScript platform expose no native fuel/timeout mechanism, so this protocol does not specify one. Deployers concerned about runaway handlers should run dispatch in a Worker with a watchdog, or pre-validate handler bytecode in the installer's policy callback (forbid loops above a budget, recursion, etc.) before installing. The kernel exposes the call-depth bound (§4.4) but does not bound per-handler execution time.
+> **Compute and memory exhaustion are the host's problem.** WebAssembly engines on the JavaScript platform expose no native fuel/timeout mechanism, so this protocol does not specify one. The depth caps (§2.3, §4.4) and the 64 KB envelope limit (§2.2) bound the verify-amplification and recursion vectors, but a single installed handler can still infinite-loop or declare a huge linear memory and OOM the single-threaded host — and a permissive registry (§7.4) multiplies that across many installs. Deployers concerned about runaway handlers should run dispatch in a Worker with a watchdog (for compute) and pre-validate handler bytecode in the installer's policy callback (cap declared memory, forbid unbounded loops/recursion, etc.) before installing. The kernel exposes the call-depth bound (§4.4) but does not bound per-handler execution time or memory footprint.
 
 > **Note.** Signature suite modules (§6.6) are the one exception to the scratch-only memory model. A suite has multi-argument primitives that don't fit the single-buffer scratch model cleanly, so the suite contract uses an explicit `alloc` and pointer arguments. Suite authors are crypto specialists writing thin wrappers around existing libraries; the small extra ceremony is acceptable in that niche.
 
@@ -235,17 +235,17 @@ Blocked handlers run only at top-level dispatch, where the signature wrapper has
 
 The reference host auto-blocks the two bootstrap handlers `signature` and `install`. Deployer-added handlers in either class MUST be marked blocked via `host.blockFromCall(handlerId)` immediately after `host.register`.
 
-**Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(signer.algoId, signer.pubkey)]`. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-signer-per-handler and **persists across deny-listing or other policy changes** (tombstone-forever) — re-admitting a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
+**Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(handler, signer.pubkey)]`. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-key-per-handler, lives in a persistent table that is **not** part of any install record (§7.1), and **persists across deny-listing, removal, or other policy changes** (tombstone-forever) — re-admitting (or `installer.remove` + re-installing) a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
 
 The `signature` wrapper is on the blocklist but consumes no `seq`: it does not act under any signer's authority — it *establishes* the top signer — and its push/pop of the signer stack leaves no persistent state to replay. The two protections target different threats: `seq` cuts off wire replay of authorized mutations; the blocklist cuts off in-pipeline corruption of kernel state.
 
-**Application handlers: replay protection is opt-in.** The protocol mandates `seq` only for handlers that mutate kernel-managed state (the installer and any deployer-added equivalent). Ordinary app handlers (chat, ...) are not on the blocklist, do not consume `seq` by default, and a signed envelope replayed verbatim onto the wire will re-verify and re-dispatch byte-identically — anyone who has ever seen the bytes can resend them. Whether that matters is application-specific: idempotent handlers (e.g. appending a chat line to a display log, where seeing the same message twice is a UX nit rather than a security failure) can ignore replays; handlers whose payload causes a meaningful state change (transferring an asset, casting a vote, flipping a switch, charging an account) MUST defend themselves. The mechanism is the same one this section prescribes for mutators — a `seq` field consumed before the action with a per-`(signer.algoId, signer.pubkey)` high-water mark — but the app chooses the field placement in its payload, the storage backing the counter, and whether related handlers share a high-water map or keep independent ones. Apps that need stronger guarantees than monotonic `seq` (e.g. exactly-once semantics across a network partition, or freshness windows) layer their own nonce / timestamp / challenge-response scheme on top; the kernel exposes no clock and offers no help here.
+**Application handlers: replay protection is opt-in.** The protocol mandates `seq` only for handlers that mutate kernel-managed state (the installer and any deployer-added equivalent). Ordinary app handlers (chat, ...) are not on the blocklist, do not consume `seq` by default, and a signed envelope replayed verbatim onto the wire will re-verify and re-dispatch byte-identically — anyone who has ever seen the bytes can resend them. Whether that matters is application-specific: idempotent handlers (e.g. appending a chat line to a display log, where seeing the same message twice is a UX nit rather than a security failure) can ignore replays; handlers whose payload causes a meaningful state change (transferring an asset, casting a vote, flipping a switch, charging an account) MUST defend themselves. The mechanism is the same one this section prescribes for mutators — a `seq` field consumed before the action with a per-`(handler, signer.pubkey)` high-water mark keyed by the canonical public key — but the app chooses the field placement in its payload, the storage backing the counter, and whether related handlers share a high-water map or keep independent ones. Apps that need stronger guarantees than monotonic `seq` (e.g. exactly-once semantics across a network partition, or freshness windows) layer their own nonce / timestamp / challenge-response scheme on top; the kernel exposes no clock and offers no help here.
 
 ---
 
 ## 5. Layering and composition
 
-Modules form an onion. Each layer wraps the layers above it and depends only on the layers below.
+Modules form an onion: each layer wraps the layers above it and depends only on the layers below (§1). No layer has a hard dependency on the layers around it — the onion is a typical composition, not a required one.
 
 ```
 ┌──────────────────────────────────┐
@@ -347,6 +347,8 @@ The inner envelope is a complete envelope — including its own magic, version, 
 
 The signature is computed over `inner_envelope` — the raw bytes of the inner envelope, including its own framing. Re-enveloping (relaying) is lossless: the inner bytes don't change, so the signature remains valid.
 
+**The outer `algo_id` and `signer` fields are not themselves covered by the signature.** Flipping `algo_id` on a captured message normally just causes verification to fail under the wrong suite (fail-safe), and `signer` is the key the suite verifies against, so a wrong value cannot verify. The one place this matters is replay state: it MUST NOT be namespaced by `algo_id` (§4.4), or an attacker who flips the unsigned `algo_id` could replay a message once per suite that happens to verify the same key (§6.4 rotation). Because identity is raw key bytes, the suite MUST also validate the public key — rejecting non-canonical or small-order encodings — before pushing it onto the signer stack, so that the same logical key cannot present two distinct byte encodings.
+
 After verification, the inner envelope re-enters the pipeline and dispatches normally. The signature module registers a single handler for `signature`; that handler's verify-time flow is:
 
 ```mermaid
@@ -372,7 +374,7 @@ Unknown `algo_id`s drop because the suite was never registered (§6.4); only sui
 
 Suite modules are not regular kernel handlers — their `verify` / `hash` exports take multi-pointer arguments (§6.6) that don't fit the scratch ABI used by `kernel.call`. Each suite instance lives instead in a **suite registry**, indexed by `algo_id` and held host-side on the signature module's behalf. The signature module reaches suite primitives through a host import that the host dispatches to the right instance.
 
-The genesis suite is seeded into this registry at bootstrap (§6.2, §10). To add another suite at runtime, send a signed install message targeting the conventional suite slot `hash("seedkernel.signature.suite." + algo_id_hex)`. The installer recognizes suite-slot names: it runs the same `approveInstall` policy callback as any other install, and on approval — instead of calling `SetHandler` — it asks the host to instantiate the WASM under the suite ABI and place the resulting instance in the registry under `algo_id`. The `(author, bytes_hash, declared_caps, parent)` record is still written to `installations[]` for audit and upgrade lineage; the kernel's handler table never holds a suite.
+The genesis suite is seeded into this registry at bootstrap (§6.2, §10). To add another suite at runtime, send a signed install message targeting the conventional suite slot `hash("seedkernel.signature.suite.v1:" + algo_id_hex)`. The installer recognizes suite-slot names: it runs the same `approveInstall` policy callback as any other install, and on approval — instead of calling `SetHandler` — it asks the host to instantiate the WASM under the suite ABI and place the resulting instance in the registry under `algo_id`. The `(author, bytes_hash, declared_caps, parent)` record is still written to `installations[]` for audit and upgrade lineage; the kernel's handler table never holds a suite.
 
 The deployer's policy callback (§7.3) governs who may register suites — the same callback that governs every other install. There is no separate "trust for signature.register" path; "may this signer install at the suite slot for `algo_id N`?" is just a policy question. The reference policy's first-install/same-author rule (§7.4) applies: the first installer at a suite slot owns it and is the only author who can replace its WASM later.
 
@@ -424,7 +426,7 @@ The installer accepts signed install messages, runs a deployer-supplied policy c
 
 ### 7.1 Install records
 
-The installer maintains one table:
+The installer maintains two tables. The first is the install records:
 
 ```
 installations[name] → {
@@ -432,9 +434,16 @@ installations[name] → {
   bytes_hash:     content hash of this install (the entire install payload)
   declared_caps:  list of cap_ids the handler may reach via bridges
   parent:         bytes_hash this install claims to supersede (empty if none)
-  seq_high_water: per-(algoId, pubkey) replay protection counters
 }
 ```
+
+The second is a **replay high-water table that is deliberately separate from the install records**:
+
+```
+seq_high_water[(handler, signer.pubkey)] → u32   // canonical-pubkey-keyed; see §4.4
+```
+
+It lives apart because the §4.4 replay counter must be **tombstone-forever**: `installer.remove` (§7.5) clears `installations[name]`, but it MUST NOT touch `seq_high_water`, or removing and re-admitting the same key would rewind `seq` to zero and let pre-removal wire messages replay. The separation is also structurally necessary — the `install` handler is `SetHandler`-seeded and so has *no* row in `installations[]` (it is invisible to the installer's own tables), so the installer's own replay counter cannot live in a per-name install record in the first place.
 
 `bytes_hash` is the genesis-suite hash (§6.2) of the **entire install payload** — `seq`, `name`, declared caps, claimed parent, and the WASM body. The installer computes it directly from the inbound bytes; sender claims are never trusted. Hashing the whole payload makes `bytes_hash` a unique identifier for that specific signed install message: two republishes of the same content at different `seq` values produce distinct hashes, so a `parent` claim always points at exactly one historical wire message rather than at "any of N messages with the same content." Because `parent` is itself inside the hashed region, each version's `bytes_hash` transitively commits to its predecessor, and a name's current `bytes_hash` is in effect a Merkle root over its entire lineage. `parent` is metadata — the installer records it but does not require the parent bytes_hash to currently be installed (lineage chains are auditable from the bytes, not enforced at install time). The chain is singly-linked: only the immediate predecessor is recorded, so the deeper history is reconstructed by walking past install messages, not from the current record alone.
 
@@ -463,7 +472,7 @@ When invoked, the installer:
 1. Reads the top signer (the *author* of this install). If the stack is empty, drop — installs must be signed.
 2. Parses the payload. Drop on malformed.
 3. Computes `bytes_hash = genesis_hash(install_payload)` — the hash of the entire install payload, every byte from `seq` through the end of `wasm`. See §7.1 for the rationale (full content commitment, unique per signed install).
-4. Consumes the `seq` and updates the per-`(algoId, pubkey)` high-water mark. Replays (`seq <= last_seen`) drop here, before any further state mutation.
+4. Consumes the `seq` and updates the `seq_high_water[(install, signer.pubkey)]` mark in the separate replay table (§7.1, §4.4) — never in the install record. Replays (`seq <= last_seen`) drop here, before any further state mutation.
 5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, wasm, declared_caps, parent, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
 6. For names matching the suite-slot convention (§6.4), instantiates the WASM under the suite ABI (§6.6) and places it in the suite registry under the encoded `algo_id` — `SetHandler` is **not** called. Otherwise instantiates against the standard handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`.
 7. Writes the install record to `installations[name]` (for both paths).
@@ -486,8 +495,8 @@ It returns `true` to proceed with the install or `false` to drop. That is the fu
 
 Deployers wire whatever policy fits their environment. Some examples:
 
-- **Open registry.** `return true;` — anyone may install at any name. Useful for testing; obviously not appropriate for a production deployment with untrusted senders.
-- **Reference policy.** `existing == null ? deployer_first_install(...) : (author == existing.author && existing.bytes_hash == parent);` — see §7.4.
+- **Open registry.** `return true;` — anyone may install at any name *with any capabilities*. Because the install path is the same `host.dispatch` that handles remote peer frames (§12), this is remote installation of arbitrary WASM with arbitrary capability acquisition — effectively remote code execution with full I/O reach, not just a name-squatting risk. Useful only for local testing; never appropriate for a deployment exposed to untrusted senders.
+- **Reference policy.** `(existing == null ? deployer_first_install(...) : author == existing.author && existing.bytes_hash == parent) && caps_acknowledged(...)` — author/parent gate plus a capability-acknowledgement gate; see §7.4.
 - **Content-hash allowlist.** `return bytes_hash ∈ approved_hashes;` — only pre-audited binaries.
 
 Other common patterns: fixed author allowlists, M-of-N quorums (requires reading the full signer stack via `signature.signer`), and capability-restricted authors (`declared_caps ⊆ allowed_caps[author]`).
@@ -496,23 +505,29 @@ The callback may be arbitrarily expensive — the installer dispatches one insta
 
 ### 7.4 Default reference policy
 
-The reference installer ships with a default policy that is easy to explain and behaves well under casual use. Two rules:
+The reference installer ships with a default policy that is easy to explain. It is **not** a bare "trust the original author" rule, because that alone is not least-privilege: it would let a handler declare any capabilities on first install and silently broaden them on every upgrade. The default therefore has three rules — two for *who* may bind a name, one for *what capabilities* an install may acquire:
 
-1. **First install at a name:** the deployer's choice. The reference implementation exposes a `firstInstallPolicy(name, author, bytes_hash, declared_caps)` sub-callback that the deployer wires. Common values are:
+1. **First install at a name:** the deployer's choice. The reference implementation exposes a `firstInstallPolicy(name, author, bytes_hash, declared_caps)` sub-callback that the deployer wires. `declared_caps` is passed in precisely so this decision is capability-aware (rule 3). Common values are:
    - An author allowlist (closed registry — only specified keys may claim new names).
    - A naming-convention check (e.g. names must be of the form `hash(canonical || author_pubkey)`, structurally proving the author claimed the name for themselves).
-   - `return true` (open registry).
-2. **Subsequent install at the same name:** the install must be signed by the existing author and must claim the current `bytes_hash` as its parent. In code:
+   - `return true` (open registry). **Read the warning in §7.3 before using this** — combined with the fact that the same `host.dispatch` path carries remote peer frames and `install` messages (§12), an unconditional first-install policy is not merely name-squatting: it is remote installation of arbitrary WASM that can declare *any* capability, i.e. remote code execution with full I/O reach.
+2. **Subsequent install at the same name:** the install must be signed by the existing author and must claim the current `bytes_hash` as its parent:
    ```
-   return author == existing.author && existing.bytes_hash == parent
+   author == existing.author && existing.bytes_hash == parent
    ```
 
    The strict `parent == existing.bytes_hash` form is the reference choice, not a protocol requirement. Every install flows through `approveInstall`, so a deployer who wants to permit gaps — accepting any ancestor in the name's lineage so a node that missed an intermediate install can still upgrade, or skipping the parent check entirely — encodes that in the callback. The lineage stays signed-and-auditable either way; the policy decides how tight the parent claim has to be.
+3. **Capability acknowledgement (both paths).** Passing rules 1–2 establishes *who* may bind the name; it does not by itself grant *capabilities*. The reference policy treats any capability grant as requiring explicit acknowledgement:
+   - An install that declares **no capabilities** (`caps_count == 0`, §7.2) is pure computation and is auto-accepted once rule 1 or 2 passes — there is nothing to escalate.
+   - An install whose `declared_caps` is a subset of the existing record's `declared_caps` (same author re-publishing or narrowing) is auto-accepted — capabilities only ever shrink.
+   - An install that **adds or broadens** a capability — a first install requesting any cap, or an upgrade whose `declared_caps` is not a subset of `existing.declared_caps` — is held for an explicit operator/user acknowledgement (the reference wiring exposes an `acknowledgeCaps(name, author, added_caps)` hook) and is dropped if not acknowledged. This is what closes the silent-escalation gap: a handler installed with `caps=[]` cannot upgrade itself to `caps=[net, fs]` just by being the same author with the right parent.
 
-These two rules give you everything you'd usually want without any extra machinery:
+   A deployment that prefers maximal caution can require acknowledgement of *every* update, not only capability-broadening ones; the hook sees enough to make that choice. The point of the default is that capability changes are never silent.
+
+These rules give you everything you'd usually want without any extra machinery:
 
 - **Squat-resistant.** Once an author has bound a name, no one else can take it over — their install fails rule 2.
-- **Upgrades just work.** The author installs a new version, sets `parent = current_bytes_hash`, signs with the same key. All conditions are met; the binding updates in place.
+- **Upgrades just work.** The author installs a new version, sets `parent = current_bytes_hash`, signs with the same key. If the new version keeps the same capabilities (or fewer), the binding updates in place with no further interaction; an upgrade that broadens capabilities additionally needs the acknowledgement from rule 3 before it lands.
 - **Lineage is verifiable.** The chain of `parent → previous bytes_hash` across a name's history is a singly-linked, signed hash chain. Given the full series of install messages, anyone can walk it from the current version back to genesis. A node that never saw an intermediate install lacks the bytes_hash of that link and cannot bridge past the gap on its own — it sees only the current record's immediate parent.
 - **Forks are explicit and non-hostile.** Anyone may install their own fork at a *different* name with `parent = your_bytes_hash`. The chain shows the relationship; no one had to assert anything special.
 - **Delegation is just an upgrade.** To hand a name over, the current author installs a new version whose handler treats some other key as the relevant authority going forward, and (optionally) the installer records the new author. The kernel doesn't care; the install record is the source of truth.
@@ -524,7 +539,7 @@ The reference policy is one specific way of saying "trust the original author." 
 
 There is no separate revocation cascade. Revocation is something the policy expresses, plus a small mechanism the installer exposes for undoing previous installs.
 
-**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). For ordinary handler installs it clears `installations[name]` and calls `SetHandler(name, null)`. For suite-slot names (§6.4) it clears `installations[name]` and removes the corresponding entry from the suite registry — the kernel handler table is not touched (the slot was never in it). The genesis suite is never installer-managed (its registry entry was placed by the host, not by an install), so `installer.remove` on the genesis slot is a no-op; removing the genesis suite requires a direct host-side write to the registry. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
+**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). For ordinary handler installs it clears `installations[name]` and calls `SetHandler(name, null)`. It does **not** clear the `seq_high_water` table (§7.1): the replay high-water marks are tombstone-forever (§4.4), so re-installing at the same name later cannot rewind a signer's sequence. For suite-slot names (§6.4) it clears `installations[name]` and removes the corresponding entry from the suite registry — the kernel handler table is not touched (the slot was never in it). The genesis suite is never installer-managed (its registry entry was placed by the host, not by an install), so `installer.remove` on the genesis slot is a no-op; removing the genesis suite requires a direct host-side write to the registry. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
 
 **Message-driven revocation.** A deployer who wants signed messages to be able to revoke installs adds a `revoke` handler that:
 
@@ -563,7 +578,7 @@ Capabilities are a property of *installed handlers*. The installer records them 
 
 `declared_caps` rides along with every install (§7.2). It is set once when the policy callback approves and cleared when the install is removed. The policy is the only place where "should this handler be allowed to claim these caps?" is decided — the same callback that decides "should this install be honored at all?" sees the cap list and can refuse on that basis.
 
-A handler that wants additional caps later must reinstall (under the reference policy, that means: the same author signs a new install at the same name with the larger cap list, claiming the current bytes_hash as a parent). The policy callback gets to refuse the upgrade if the new caps are too broad.
+A handler that wants additional caps later must reinstall (under the reference policy, that means: the same author signs a new install at the same name with the larger cap list, claiming the current bytes_hash as a parent). The reference policy does not grant the broadened caps silently — a same-author, correct-parent upgrade that *adds or broadens* a capability is held for explicit acknowledgement before it lands (§7.4 rule 3), while an install that requests no new caps applies automatically.
 
 ### 8.2 Bridge check pattern
 
@@ -579,6 +594,8 @@ if my_cap_id ∉ caller_caps: return -1
 ```
 
 **`kernel.caller` is not an author.** It returns *names* of handlers in the `kernel.call` chain, not keys. A bridge whose policy depends on the **author** (rather than on which handler was called) MUST additionally consult `signature.signer`. The two answer different questions: `kernel.caller` answers "which handler is asking me to do this?" and `signature.signer` answers "whose signed message kicked off this chain?". Most bridges only need the former, since capabilities are attached to handlers (via the install record's `declared_caps`), not to keys directly. The deeper entries in the caller stack are for audit / logging — the capability check above MUST use the immediate (last) caller only.
+
+**Whether the input was signed is orthogonal to whether the bridge fires.** Signing is opt-in per message (§2.1) and the bridge check is caller-*name*-based, not signer-based. So an *unsigned* envelope dispatched directly to a capable handler will drive that handler's bridge I/O with an empty signer stack — nothing in the kernel, installer, or bridge layer requires the triggering envelope to have been signed. An app author MUST NOT assume "my handler only ever runs on signed input." If a handler's behaviour depends on the caller's identity (not just on holding a capability), it MUST consult `signature.signer` itself and refuse when the stack is empty or the signer is not authorized. The chat demo gets this for free only because its inbound frames are signed and the signer is pinned to the DTLS channel (§12); the core protocol does not enforce it. See §14.
 
 ### 8.3 Structural sandbox invariant
 
@@ -721,11 +738,31 @@ That's the entire pipeline. Every step is a synchronous call across one of three
 
 ---
 
-## 14. Background
+## 14. Security considerations
+
+The security properties are introduced where they arise (§2.3, §3.1, §4.4, §6.5, §8.3, §9); this section collects the trust assumptions and the load-bearing invariants in one place so an implementer or auditor can see the whole model at once.
+
+**Trust boundary / TCB.** The host *is* the trusted computing base. Anyone with access to `SetHandler` (§3.1) owns everything: they can replace the signature module, the installer, or any bridge, with no signed message required (§10.1). The kernel enforces no access control on `SetHandler` — guarding it is the host's job (process permissions, operator console, HSM). Everything above the host is sandboxed WASM that can only reach the outside world through capability-gated bridges.
+
+**The one cryptographic root constant.** The genesis suite's WASM hash (§6.2) is the single trust anchor baked into bootstrap. Every derived `name` and `cap_id` is computed with the genesis suite's hash (§5.1), so swapping the genesis suite re-derives the entire namespace. Pick it once per deployment.
+
+**Authentication, not confidentiality.** Kernel envelopes are *signed, not encrypted*. The protocol provides message authentication and integrity (via the signature wrapper, §6.3) and replay resistance for mutators (§4.4) — it provides **no** confidentiality. In the reference demo, confidentiality comes entirely from the DTLS layer underneath WebRTC (§12); any non-DTLS transport, or at-rest storage of envelopes, has none unless a deployment adds an encryption module (which composes as another wrapper, §2.1).
+
+**Replay protection is mandatory for mutators, opt-in for apps.** Handlers that mutate kernel-managed state (`install`, suite registration, any deployer-added equivalent) MUST consume a `seq` and enforce a tombstone-forever, canonical-pubkey-keyed high-water mark (§4.4). Ordinary app handlers do not get this automatically: a signed app envelope replayed verbatim re-verifies and re-dispatches, so any handler whose payload causes a meaningful state change MUST add its own `seq` defence (§4.4).
+
+**Signing is opt-in, so capability authority ≠ message authenticity.** A capability check (§8.2) asks "which handler is calling me," not "was the triggering message signed." An unsigned envelope routed to a capable handler still drives that handler's bridge I/O. Handlers whose policy depends on *who* signed MUST consult `signature.signer` and refuse an empty/unauthorized stack themselves; nothing below them enforces it.
+
+**Structural sandbox.** Bootstrap handlers seeded via `SetHandler` have no install record and therefore no capability entries, so `installer.caps_of` returns empty for them and every bridge check against them fails (§8.3). A compromised bootstrap handler still cannot open a socket — not by a rule in its code, but because it has no cap to match.
+
+**Residual: compute and memory.** The protocol bounds verify-amplification (signature depth §2.3, 64 KB envelopes §2.2) and recursion (call depth §4.4) but does not bound a single handler's CPU time or linear-memory footprint (§4.3). A permissive registry multiplies the exposure. Deployers exposed to untrusted installs should run dispatch under a Worker watchdog and pre-validate handler bytecode (memory caps, loop/recursion limits) in the policy callback.
+
+---
+
+## 15. Background
 
 This project was inspired by the [8k-demo](https://github.com/ssbc/8k-demo) P2P project built on top of secure scuttlebutt running in the browser. The goal was to strip it down to the bare essentials and make the core as small as possible, moving functionality into modules to be distributed in whatever fashion.
 
-## 15. Protocol constants
+## 16. Protocol constants
 
 All limits and reserved values in one place. Multi-byte integers are big-endian throughout the protocol.
 
