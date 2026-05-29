@@ -73,6 +73,10 @@ interface SuiteInstance {
   alloc(size: number): number;
   dealloc(ptr: number): void;
   verify(pubPtr: number, pubLen: number, sigPtr: number, sigLen: number, dataPtr: number, dataLen: number): number;
+  // Optional suite export (README §6.6). The reference host derives ids via its
+  // bundled libsodium and never calls this, but it is captured so SuiteInstance
+  // mirrors the full suite contract — a host that routed id derivation through
+  // the suite would call it here. Do not remove as "dead": it documents the ABI.
   hash(dataPtr: number, dataLen: number, outPtr: number): number;
   // Sizes declared at registration; the host validates pubkey/sig lengths on
   // each verify call so the signature module can stay metadata-free.
@@ -275,6 +279,14 @@ export class KernelHost {
   ): void {
     if (handlerId === HANDLER_SIGNATURE) {
       const payPtr = this._copyKernelToBootstrap(payloadPtr, payloadLen);
+      // Snapshot the signer-stack depth so the drop path can undo a signer that
+      // handle_signature pushed but then failed to commit (e.g. an allocation
+      // threw after the push). The reference signature module pushes as its last
+      // step, but the host must not depend on that: a leaked signer would
+      // mis-attribute the next top-level message to a key that never signed it,
+      // and accumulated leaks would fill MAX_SIGNATURE_DEPTH and wedge all
+      // signed traffic.
+      const signerCountBefore = this.bootstrapExports.get_signer_count();
       let verified = 0;
       try {
         try { verified = this.bootstrapExports.handle_signature(payPtr, payloadLen); }
@@ -282,7 +294,12 @@ export class KernelHost {
       } finally {
         this.bootstrapExports.dealloc(payPtr);
       }
-      if (!verified) return;
+      if (!verified) {
+        while (this.bootstrapExports.get_signer_count() > signerCountBefore) {
+          this.bootstrapExports.pop_signer();
+        }
+        return;
+      }
 
       // From here on the signer is on the bootstrap stack. Any throw before
       // pop_signer runs would leak the signer and let an unrelated later
@@ -508,8 +525,19 @@ export class KernelHost {
     if (this.callDepth >= MAX_CALL_DEPTH) return -1;
     const caller = this.wasmHandlers.get(callerHandlerId);
     if (!caller) return -1;
-    const name = new Uint8Array(caller.memory.buffer, namePtr, nameLen).slice();
-    const payload = new Uint8Array(caller.memory.buffer, payloadPtr, payloadLen).slice();
+    // The four pointers come straight from the calling handler and may be out
+    // of range (bad offset, negative length, run past the end of memory).
+    // README §4.4 says kernel.call returns -1 on such errors; a thrown
+    // RangeError here would instead unwind and abort the caller's entire
+    // handle(), denying it the chance to observe the failed call and continue.
+    let name: Uint8Array;
+    let payload: Uint8Array;
+    try {
+      name = new Uint8Array(caller.memory.buffer, namePtr, nameLen).slice();
+      payload = new Uint8Array(caller.memory.buffer, payloadPtr, payloadLen).slice();
+    } catch {
+      return -1;
+    }
     const targetId = this.nameToHandlerId.get(nameKey(name));
     if (targetId === undefined) return -1;
     if (this.blockedFromCall.has(targetId)) return -1;
@@ -648,8 +676,14 @@ export class KernelHost {
     if (pubLen !== suite.pubkeyLen) return 0;
     if (sigLen <= 0 || sigLen > suite.sigMaxLen) return 0;
     if (dataLen > suite.dataScratchSize) {
+      // Allocate the larger buffer BEFORE freeing the old one. If alloc throws
+      // (OOM in the suite's memory), the suite's scratch state stays intact —
+      // freeing first would leave `dataScratch` dangling at the old (now freed)
+      // pointer while `dataScratchSize` still claimed the old capacity, so the
+      // next verify would write through a freed pointer.
+      const newScratch = suite.alloc(dataLen);
       try { suite.dealloc(suite.dataScratch); } catch { /* swallow */ }
-      suite.dataScratch = suite.alloc(dataLen);
+      suite.dataScratch = newScratch;
       suite.dataScratchSize = dataLen;
     }
     const bootMem = new Uint8Array(this.bootstrapExports.memory.buffer);
