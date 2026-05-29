@@ -275,22 +275,27 @@ server.on("upgrade", (req, sock) => {
       }
       consumeBytes(totalFrame);
 
-      handleFrame(opcode, payload);
+      // handleFrame returns false when it has torn the socket down (close
+      // opcode, or an invalid frame) — stop draining so we don't keep parsing
+      // and broadcasting buffered frames off a socket we just ended/destroyed.
+      if (!handleFrame(opcode, payload)) return;
     }
   });
 
+  // Returns true to keep draining buffered frames, false once the socket has
+  // been torn down (close opcode or invalid frame) so the caller stops.
   function handleFrame(opcode, payload) {
-    if (opcode === 0x8) { sock.end(); return; }              // close
+    if (opcode === 0x8) { sock.end(); return false; }        // close
     if (opcode === 0x9) {                                     // ping → pong
       try { sock.write(encodeFrame(0xA, payload)); } catch {}
-      return;
+      return true;
     }
     if (opcode === 0x1 || opcode === 0x2) {                   // text/binary
       const out = encodeFrame(opcode, payload);
       // Broadcasts stay inside the sender's room. A client in room "alpha"
       // never sees frames from room "beta"; the relay does no other routing.
       const peers = rooms.get(sock._relayRoom);
-      if (!peers) return;
+      if (!peers) return true;
       for (const other of peers) {
         if (other === sock) continue;
         if (!other.writable) continue;
@@ -301,12 +306,13 @@ server.on("upgrade", (req, sock) => {
         if (other.writableLength > MAX_SOCKET_BACKLOG) continue;
         try { other.write(out); } catch { /* swallow */ }
       }
-      return;
+      return true;
     }
     // Continuation (0x0) and reserved opcodes (3-7, B-F) are not valid
     // here given FIN=1 was already enforced. Drop the connection.
     console.log(`! dropped: invalid opcode 0x${opcode.toString(16)}`);
     sock.destroy();
+    return false;
   }
 
   let dropped = false;
