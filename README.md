@@ -682,12 +682,14 @@ Collapsing the previous version's trust + capability + install machinery into a 
 |---|---|
 | kernel.wasm | 6 KB |
 | bootstrap.wasm (signature) | 6 KB |
-| host/*.js (host orchestration + installer) | 53 KB |
+| host/*.js — minified (`build/host-min`; ~7 KB gzipped) | 36 KB |
 | libsodium.wasm (Ed25519 + SHA-3-256) | 217 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 134 KB |
-| **Total deployment with default genesis suite** | **~415 KB** |
+| **Total deployment with default genesis suite** | **~399 KB** |
 
 The kernel and signature modules are pure protocol logic — no cryptographic code — and together come to ~12 KB of WASM. The `host/*.js` layer is the runtime around them: it loads the modules, routes `invoke_handler` callbacks, drives the signature push/pop lifecycle, provides the `kernel.call` / `kernel.caller` imports plus the crypto imports backing `suite_verify`, and contains the installer (install records, policy callback, `lookup` / `caps_of` queries — §7). libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6. A future post-quantum suite installed at a new suite slot (§6.4) would be a larger module because it bundles its own algorithm implementation.
+
+`npm run build` emits the host twice: the readable `build/host` (57 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (36 KB, ~7 KB gzipped) for shipping. Over half the gzipped host was doc comments, so a small dependency-free comment stripper (`scripts/minify.mjs`, with every emitted file gated through `node --check`) nearly halves the wire size — no bundler, no new dependencies. The host figure in the table above is the shipped, minified build.
 
 ---
 
