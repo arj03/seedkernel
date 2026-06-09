@@ -12,25 +12,64 @@
       "types": "./build/host/browser.d.ts",
       "default": "./build/host/browser.js"
     },
+    "./net": {
+      "types": "./build/host/transport.d.ts",
+      "default": "./build/host/transport.js"
+    },
+    "./net-node": {
+      "types": "./build/host/net-node.d.ts",
+      "default": "./build/host/net-node.js"
+    },
+    "./ws": {
+      "types": "./build/host/ws.d.ts",
+      "default": "./build/host/ws.js"
+    },
+    "./fs": {
+      "types": "./build/host/fs.d.ts",
+      "default": "./build/host/fs.js"
+    },
+    "./fs-node": {
+      "types": "./build/host/fs-node.d.ts",
+      "default": "./build/host/fs-node.js"
+    },
+    "./safe-js": {
+      "types": "./build/host/safe-js.d.ts",
+      "default": "./build/host/safe-js.js"
+    },
+    "./cap-bridge": {
+      "types": "./build/host/cap-bridge.d.ts",
+      "default": "./build/host/cap-bridge.js"
+    },
+    "./shell": {
+      "types": "./build/host/main.d.ts",
+      "default": "./build/host/main.js"
+    },
+    "./bundle": {
+      "types": "./build/host/bundle.d.ts",
+      "default": "./build/host/bundle.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
     "build:kernel": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target release",
     "build:bootstrap": "asc assembly/bootstrap/index.ts --config asconfig.bootstrap.json --target release",
     "build:forwarder": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release",
+    "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release && node scripts/inline-ws.mjs",
     "build:chat-app-v1": "asc assembly/chat-app-v1/index.ts --config asconfig.chat-app-v1.json --target release && node scripts/embed-ui.mjs build/chat-app-v1.wasm assembly/chat-app-v1/ui.html build/chat-app-v1.wasm && node scripts/embed-meta.mjs build/chat-app-v1.wasm build/chat-app-v1.wasm \"{\\\"id\\\":\\\"chat\\\",\\\"name\\\":\\\"Chat\\\",\\\"version\\\":\\\"v1\\\",\\\"description\\\":\\\"text only\\\"}\"",
     "build:chat-app-v2": "asc assembly/chat-app-v2/index.ts --config asconfig.chat-app-v2.json --target release && node scripts/embed-ui.mjs build/chat-app-v2.wasm assembly/chat-app-v2/ui.html build/chat-app-v2.wasm && node scripts/embed-meta.mjs build/chat-app-v2.wasm build/chat-app-v2.wasm \"{\\\"id\\\":\\\"chat\\\",\\\"name\\\":\\\"Chat\\\",\\\"version\\\":\\\"v2\\\",\\\"description\\\":\\\"text + image + nick\\\"}\"",
     "build:host": "tsc -p host",
     "build:host:min": "node scripts/minify.mjs",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
-    "build": "npm run build:kernel && npm run build:bootstrap && npm run build:forwarder && npm run build:host && npm run build:host:min",
+    "build": "npm run build:kernel && npm run build:bootstrap && npm run build:forwarder && npm run build:ws && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:chat-app-v1 && npm run build:chat-app-v2 && npm run build:browser-sodium",
     "build:debug": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target debug && asc assembly/bootstrap/index.ts --config asconfig.bootstrap.json --target debug",
     "chat:relay": "node scripts/relay.mjs",
+    "shell": "node build/host/main.js",
     "test": "npm run build && node tests/run.mjs"
   },
   "dependencies": {
-    "libsodium-wrappers": "0.8.3"
+    "libsodium-wrappers-sumo": "0.8.4",
+    "quickjs-emscripten": "^0.32.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

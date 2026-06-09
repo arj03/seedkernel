@@ -34,6 +34,7 @@ A reader's-digest mental model; full details follow in §2–§10.
 - **Capability** — a declared property of an installation, checked by bridges at I/O time (§8).
 - **Bridges** — `SetHandler`-installed handlers bound to one capability; the only code that performs real I/O (§9).
 - **Bootstrap** — host wires kernel, signature, and (optionally) installer; growth then happens via signed installs (§10).
+- **Runtime / shell** — the deployable artifact: kernel + signature + installer under a policy, plus raw-byte capability backends (`crypto`, `net`, `fs`, `clock`) and a zero-authority JS confinement host. It loads a **signed bundle** and *becomes* that app — chat (§12) and [seed store](https://github.com/arj03/seedstore) are two (see "The runtime as an app host," after §12).
 
 ```
 incoming bytes
@@ -710,6 +711,37 @@ The wire is DTLS underneath: WebRTC data channels run over DTLS (Datagram Transp
 The shell never sees plaintext message content beyond what the iframe chooses to render: the chat handler runs inside the kernel, talks to its UI through a scoped `chat.ui` bridge name (declared as a capability at install time, §8), and the iframe is `sandbox="allow-scripts allow-forms"` with no same-origin access to the shell.
 
 To run it locally: build the WASM artifacts (`kernel.wasm`, the signature/installer module, and the chat app modules) into `WASM/build/`, then serve `WASM/browser/` over HTTPS (the bundled `localhost+1.pem` / `localhost+1-key.pem` are mkcert certs for `localhost`) and open `chat-shell.html` in two browsers to chat between them.
+
+---
+
+## The runtime as an app host: capabilities, the shell, and signed bundles
+
+Chat (§12) is a browser shell wired by hand. The same onion ships as a **general runtime artifact** — the *shell* — that any app rides on as **signed content**. The shell knows nothing about chat or storage; it offers a fixed, generic surface, verifies a bundle against a policy, and *becomes* whatever the bundle is. [seed store](https://github.com/arj03/seedstore) is the worked example: a full peer-to-peer storage node is the shell plus a signed seed store bundle, with no storage-specific code in the runtime.
+
+**Raw-byte capabilities.** Beyond the per-install caps that bridges check at I/O time (§8), the runtime provides the capability *backends* an app's confined logic actually drives. They are deliberately structureless — bytes in, bytes out — so the kernel never learns what an app means by them:
+
+- `crypto.*` — the bundled sumo libsodium: hash (BLAKE2b), `sign`/`verify` (Ed25519, as the node identity), the raw `stream_xor` (xchacha20), `random` (`host/cap-bridge.ts`, backed by `loadSodium`).
+- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `requestMany` (scatter-gather fan-out — the one concurrency a confined guest can't do itself), and `peers`.
+- `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`has`/`size`/`list`/`delete`/`stat`. An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
+- `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
+
+Anything with *structure* is a **no-capability module** that transforms bytes: WebSocket framing is `ws.wasm` (`./ws`), Reed–Solomon is seed store's `codec.wasm` — both pure transforms the host drives, never something the kernel knows.
+
+**The cap-bridge.** An app's confined logic reaches all of the above through a single seam, `host.call(op, bytes) → bytes` — the capability counterpart to a WASM handler's `kernel.call`. `host/cap-bridge.ts` (`./cap-bridge`) services that seam from the primitives above and *only* those: `HASH`, `STREAM_XOR`, `SIGN`, `VERIFY`, `IDENTITY`, `RANDOM`, `NET_SEND`/`NET_REQUEST_MANY`/`NET_PEERS`, `FS_GET`/`PUT`/`HAS`/`LIST`/`DELETE`/`STAT`/`SIZE`, `MODULE_CALL`, `CLOCK`. Every op is application-neutral; the bridge has no idea it is hosting storage.
+
+**Zero-authority JS realms.** Logic that is inherently async or awkward to express as a *synchronous* WASM handler runs as confined JS in a QuickJS-compiled-to-WASM realm (`host/safe-js.ts`, `./safe-js`). A fresh realm has only the ECMAScript intrinsics — it cannot even *name* `fs`/`net`/`process`/`fetch` — and reaches the outside only through the one injected `host.call` seam. Two builds: `createSafeRealm` (Asyncify — a host call looks synchronous to the guest while the host round-trips) for async orchestration, and `createSyncSafeRealm` (the smaller non-Asyncify build) for handlers that must run to completion without yielding — e.g. answering an incoming request *while* an async realm on the same node is parked mid-`await` (two async realms share Asyncify's module-global state and can't overlap; a sync realm, a separate instance, can). This is the §2.1-style confinement primitive, generalised: "run zero-authority guest JS over a cap seam," the sibling of "run a WASM handler under caps."
+
+**Signed bundles + policy.** An app is delivered as a **bundle** (`host/bundle.ts`, `./bundle`): a manifest `{ app, version, modules[{ name, file, hash, install, kernelName }], guest{ file, hash }, ops, caps, config }` signed by the app author as `[authorPk 32][sig 64][utf8 json]`, alongside each module's WASM, its author-signed install envelope, and the guest JS. The shell verifies the manifest signature, requires the author to be in its **policy** (`host/policy.ts` parses an `allowed-keys.json` `{ authors[], modules?[], caps?[] }` into the §7.4 reference policy — a closed author set + module-hash allowlist + cap allowlist), integrity-checks each module against its declared content hash, dispatches the pre-signed installs (the installer re-checks author + hash), and integrity-checks the guest. Only then does it run the guest over a `cap-bridge`, fronted by the generic op preamble and the manifest's `config` as an injected `const APP = {…}`.
+
+**The shell (`host/main.ts`, `./shell`).** `boot(opts)` assembles all of the above and returns a `Shell` (`loadBundle`, `runGuest`, `serveAsHolder`, `installFromEnvelope`); a CLI wraps it:
+
+```sh
+node build/host/main.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
+     --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
+     --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get mid:key --out file]
+```
+
+A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`) **and** serves its *request* side from a confined realm (`serveAsHolder` routes `transport.onRequest` to the guest). The shell is application-neutral, so a `bun build --compile` of `host/main-bun.ts` (kernel + bootstrap embedded) is a single-file binary that can host any signed app. seed store's WASM README has a complete storage walkthrough.
 
 ---
 

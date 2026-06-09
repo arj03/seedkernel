@@ -10,5 +10,6 @@
     "outDir": "../build/host",
     "rootDir": "."
   },
-  "include": ["**/*.ts"]
+  "include": ["**/*.ts"],
+  "exclude": ["main-bun.ts", "wasm-bun.ts"]
 }

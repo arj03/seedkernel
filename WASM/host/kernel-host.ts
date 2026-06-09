@@ -20,7 +20,7 @@
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
 
-type Sodium = typeof import("libsodium-wrappers");
+type Sodium = typeof import("libsodium-wrappers-sumo");
 
 export const GENESIS_ALGO_ID        = 0x0000;
 export const GENESIS_PUBKEY_LEN     = 32;
@@ -153,6 +153,16 @@ export class KernelHost {
   private _signatureName: Uint8Array | null = null;
   // The installer instance, if registerInstaller was called.
   private _installer: Installer | null = null;
+  // Public keys that have already passed crypto_core_ed25519_is_valid_point
+  // (§6.3). That check is a full elliptic-curve operation — as costly as the
+  // signature verify itself — and a key's validity is a fixed property of its
+  // bytes, so we run it once per distinct signer and cache the result instead
+  // of repeating it on every message. Only *valid* keys are cached; invalid
+  // ones are re-checked (and rejected) each time, so an attacker cannot grow
+  // this set with garbage. Bounded to cap memory: a flood of distinct valid
+  // keys evicts oldest-first (FIFO via Set insertion order).
+  private validatedPubkeys = new Set<string>();
+  private static readonly MAX_VALIDATED_PUBKEYS = 4096;
 
   private constructor() {}
 
@@ -588,12 +598,30 @@ export class KernelHost {
       const pub  = new Uint8Array(mem, pubPtr,  32);
       const sig  = new Uint8Array(mem, sigPtr,  64);
       const data = new Uint8Array(mem, dataPtr, dataLen);
-      const isValidPoint = (this.sodium as unknown as {
-        crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
-      }).crypto_core_ed25519_is_valid_point;
-      if (typeof isValidPoint === "function" && !isValidPoint(pub.slice())) return 0;
+      if (!this._pubkeyIsValidPoint(pub)) return 0;
       return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0;
     } catch { return 0; }
+  }
+
+  /** Gate on crypto_core_ed25519_is_valid_point (canonical encoding +
+   *  prime-order subgroup), memoizing the result per distinct key. Builds that
+   *  don't expose the symbol (the kernel-only libsodium build) return true and
+   *  rely on the equivalent rejection crypto_sign_verify_detached performs
+   *  internally — matching the pre-sumo behavior. */
+  private _pubkeyIsValidPoint(pub: Uint8Array): boolean {
+    const isValidPoint = (this.sodium as unknown as {
+      crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
+    }).crypto_core_ed25519_is_valid_point;
+    if (typeof isValidPoint !== "function") return true;
+    const key = nameKey(pub);
+    if (this.validatedPubkeys.has(key)) return true;
+    if (!isValidPoint(pub)) return false;
+    if (this.validatedPubkeys.size >= KernelHost.MAX_VALIDATED_PUBKEYS) {
+      const oldest = this.validatedPubkeys.values().next().value;
+      if (oldest !== undefined) this.validatedPubkeys.delete(oldest);
+    }
+    this.validatedPubkeys.add(key);
+    return true;
   }
 
   /** Clear host-side index entries for a handler the kernel just removed. */
@@ -920,6 +948,18 @@ export class KernelHost {
     if (payload.length > wasm.scratchSize) return null;
     new Uint8Array(wasm.memory.buffer, wasm.scratch, payload.length).set(payload);
     return (fn as (n: number) => number)(payload.length);
+  }
+
+  /** Invoke an installed handler by name with `payload`, returning its response
+   *  bytes (the standard `handle` scratch ABI), or null if the name is unbound
+   *  or the handler produced no response. The generic "call a module" primitive
+   *  an app cap-bridge uses to reach installed WASM (e.g. a codec or reputation
+   *  handler) without the kernel knowing what they are — the host counterpart of
+   *  a WASM handler's `kernel.call(name, payload)`. */
+  callHandler(name: Uint8Array, payload: Uint8Array): Uint8Array | null {
+    const hid = this.nameToHandlerId.get(nameKey(name));
+    if (hid === undefined) return null;
+    return this._invokeHandlerGetResponse(hid, name, payload);
   }
 
   /** Register a host-side handler. Returns the assigned id. */
