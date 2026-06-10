@@ -13,6 +13,8 @@
 //   control req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
 //   bulk block.data = [2 kind][block_id 32][ciphertext ...]   (unsigned, §3)
 
+import { writeU32BE, readU32BE } from "./util.js";
+
 export type PeerId = string; // hex of the peer's kernel public key
 
 const KIND_REQ = 0;
@@ -102,8 +104,7 @@ export class Transport {
     const corr = this.corr++;
     const frame = new Uint8Array(1 + 4 + 1 + payload.length);
     frame[0] = KIND_REQ;
-    frame[1] = (corr >>> 24) & 255; frame[2] = (corr >>> 16) & 255;
-    frame[3] = (corr >>> 8) & 255; frame[4] = corr & 255;
+    writeU32BE(frame, 1, corr);
     frame[5] = type & 255;
     frame.set(payload, 6);
     return new Promise<Uint8Array>((resolve, reject) => {
@@ -161,7 +162,7 @@ export class Transport {
       this.bulkHandler(from, frame.slice(1, 33), frame.slice(33));
       return;
     }
-    const corr = ((frame[1] << 24) | (frame[2] << 16) | (frame[3] << 8) | frame[4]) >>> 0;
+    const corr = readU32BE(frame, 1);
     if (kind === KIND_RES) {
       const p = this.pending.get(corr);
       if (!p) return;
@@ -194,8 +195,7 @@ export class Transport {
     const body = resp ?? new Uint8Array(0);
     const frame = new Uint8Array(6 + body.length);
     frame[0] = KIND_RES;
-    frame[1] = (corr >>> 24) & 255; frame[2] = (corr >>> 16) & 255;
-    frame[3] = (corr >>> 8) & 255; frame[4] = corr & 255;
+    writeU32BE(frame, 1, corr);
     frame[5] = type & 255;
     frame.set(body, 6);
     this.net.send(this.peerId, from, frame);

@@ -29,7 +29,7 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 import type { Network, PeerId } from "./net.js";
 import { PeerLink, bytesCompare, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { WsParser, encodeFrame, wsAcceptKey, wsClientKey, WS_OPCODES } from "./ws/ws-codec.js";
-import { toHex, fromHex, writeU32BE, readU32BE } from "./util.js";
+import { toHex, fromHex, writeU32BE, readU32BE, ByteQueue } from "./util.js";
 
 const MAX_TCP_MESSAGE = 16 * 1024 * 1024; // matches the WS frame cap
 const MAX_WS_HANDSHAKE = 16 * 1024;       // an HTTP upgrade request is tiny
@@ -66,6 +66,7 @@ export class NodeNetwork implements Network {
   private readonly connecting = new Map<PeerId, PeerLink>(); // outbound, pre-auth
   private readonly inbound = new Set<PeerLink>();            // accepted, pre-auth
   private readonly addrs = new Map<PeerId, PeerAddr>();      // how to reach a peer
+  private readonly authWaiters = new Set<() => void>();      // ready() callers
 
   private tcpServer: TcpServer | null = null;
   private wsServer: TcpServer | null = null;
@@ -137,15 +138,20 @@ export class NodeNetwork implements Network {
   }
 
   /** Dial every known peer address and resolve once each is authenticated (or
-   *  the deadline passes — links also form lazily on first send). */
+   *  the deadline passes — links also form lazily on first send). Resolution is
+   *  event-driven off promote(), not polled, so an all-up cohort resolves the
+   *  moment its last handshake lands. */
   async ready(timeoutMs = 5000): Promise<void> {
     const targets = [...this.addrs.keys()].filter((p) => p !== this.ownId);
     for (const p of targets) if (!this.links.has(p)) this.dial(p);
-    const deadline = Date.now() + timeoutMs;
-    while (!targets.every((p) => this.links.has(p))) {
-      if (Date.now() > deadline) return;
-      await new Promise((r) => setTimeout(r, 10));
-    }
+    const allUp = (): boolean => targets.every((p) => this.links.has(p));
+    if (allUp()) return;
+    await new Promise<void>((resolve) => {
+      const done = (): void => { clearTimeout(timer); this.authWaiters.delete(check); resolve(); };
+      const check = (): void => { if (allUp()) done(); };
+      const timer = setTimeout(done, timeoutMs);
+      this.authWaiters.add(check);
+    });
   }
 
   /** Tear down every connection and listener. */
@@ -201,9 +207,10 @@ export class NodeNetwork implements Network {
       // ends agree on, so exactly one survives.
       if (this.canonicalKeep(link)) { existing.close(); this.links.set(peerId, link); }
       else { link.close(); }
-      return;
+    } else {
+      this.links.set(peerId, link);
     }
-    this.links.set(peerId, link);
+    for (const w of [...this.authWaiters]) w();
   }
 
   private canonicalKeep(link: PeerLink): boolean {
@@ -237,7 +244,7 @@ export class NodeNetwork implements Network {
 class TcpChannel implements RawChannel {
   private onMsg: ((bytes: Uint8Array) => void) | null = null;
   private onCls: (() => void) | null = null;
-  private buf = new Uint8Array(0);
+  private readonly q = new ByteQueue();
   private dead = false;
 
   constructor(private readonly socket: Socket) {
@@ -271,124 +278,56 @@ class TcpChannel implements RawChannel {
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
-    const merged = new Uint8Array(this.buf.length + chunk.length);
-    merged.set(this.buf, 0); merged.set(chunk, this.buf.length);
-    this.buf = merged;
-    while (this.buf.length >= 4) {
-      const len = readU32BE(this.buf, 0);
+    this.q.push(chunk);
+    for (;;) {
+      const head = this.q.peek(4);
+      if (!head) break;
+      const len = readU32BE(head, 0);
       if (len > MAX_TCP_MESSAGE) { this.fail(); return; }
-      if (this.buf.length < 4 + len) break;
-      const msg = this.buf.slice(4, 4 + len);
-      this.buf = this.buf.slice(4 + len);
-      this.onMsg?.(msg);
+      if (this.q.length < 4 + len) break;
+      this.q.drop(4);
+      this.onMsg?.(this.q.take(len)!);
     }
   }
 }
 
-// ── RawChannel: a WebSocket connection the *server* accepted over raw TCP. ─────
-// We run the RFC 6455 opening handshake ourselves — read the HTTP upgrade
-// request, reply 101 with the computed accept — then frame/deframe. No node:http
-// and no Bun-native server, so Node and Bun share one path.
-class WsServerChannel implements RawChannel {
+// ── RawChannel: WebSocket over raw TCP (RFC 6455 framing in ws.wasm) ──────────
+// One base drives both directions of the connection; the subclasses differ only
+// in who speaks first in the HTTP opening handshake and in masking (client→
+// server frames are masked, server→client unmasked). No node:http and no
+// Bun-native server, so Node and Bun share one path.
+abstract class WsChannelBase implements RawChannel {
   private onMsg: ((bytes: Uint8Array) => void) | null = null;
   private onCls: (() => void) | null = null;
-  private readonly parser = new WsParser(true); // client frames are masked
+  private readonly parser: WsParser;
   private open = false;
   private dead = false;
   private handshake = new Uint8Array(0);
+  // PeerLink emits its HELLO the moment the link is created — before the
+  // opening handshake has finished — so frames queue until the channel opens.
   private readonly pending: Uint8Array[] = [];
+  protected socket!: Socket;
 
-  constructor(private readonly socket: Socket) {
+  constructor(expectMasked: boolean) {
+    this.parser = new WsParser(expectMasked);
+  }
+
+  /** Wire up socket events; the subclass calls this from its constructor. */
+  protected attach(socket: Socket): void {
+    this.socket = socket;
     socket.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
     socket.on("close", () => this.fail());
     socket.on("error", () => this.fail());
   }
 
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
-    // PeerLink emits its HELLO the moment the link is accepted — before the
-    // client's upgrade request has even arrived — so queue until the handshake
-    // opens the channel, then flush (mirrors WsClientChannel).
-    if (!this.open) { this.pending.push(bytes); return; }
-    this.socket.write(encodeFrame(WS_OPCODES.OP_BINARY, bytes, null));
-  }
-  onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
+  /** The frame mask: 4 CSPRNG bytes on the client side (RFC 6455 §5.3 requires
+   *  it to be unpredictable), null on the server side (unmasked). */
+  protected abstract mask(): Uint8Array | null;
 
-  // Failure teardown: destroy + notify (see TcpChannel.fail for why onClose
-  // must fire here).
-  private fail(): void { if (this.dead) return; this.dead = true; this.socket.destroy(); this.onCls?.(); }
-
-  private onData(chunk: Uint8Array): void {
-    if (this.dead) return;
-    if (!this.open) {
-      const merged = new Uint8Array(this.handshake.length + chunk.length);
-      merged.set(this.handshake, 0); merged.set(chunk, this.handshake.length);
-      this.handshake = merged;
-      const sep = indexOfCRLFCRLF(this.handshake);
-      if (sep < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
-      const header = new TextDecoder().decode(this.handshake.subarray(0, sep));
-      const key = headerValue(header, "sec-websocket-key");
-      if (!key) { this.fail(); return; }
-      this.socket.write(
-        "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n\r\n`,
-      );
-      this.open = true;
-      for (const b of this.pending) this.socket.write(encodeFrame(WS_OPCODES.OP_BINARY, b, null));
-      this.pending.length = 0;
-      const rest = this.handshake.subarray(sep + 4);
-      this.handshake = new Uint8Array(0);
-      if (rest.length) this.feedFrames(rest);
-      return;
-    }
-    this.feedFrames(chunk);
-  }
-
-  private feedFrames(chunk: Uint8Array): void {
-    let frames;
-    try { frames = this.parser.push(chunk); }
-    catch { this.fail(); return; }
-    for (const f of frames) {
-      if (f.opcode === WS_OPCODES.OP_BINARY) this.onMsg?.(f.payload);
-      else if (f.opcode === WS_OPCODES.OP_PING) this.socket.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, null));
-      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
-    }
-  }
-}
-
-// ── RawChannel: a WebSocket connection we *dial out* (node-side client) ───────
-// The browser uses platform WebSocket; this exists so a Node peer can reach a
-// node's WS endpoint (and so the WS path is exercised end-to-end in tests).
-class WsClientChannel implements RawChannel {
-  private onMsg: ((bytes: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
-  private readonly parser = new WsParser(false); // server frames are unmasked
-  private readonly socket: Socket;
-  private open = false;
-  private dead = false;
-  private handshake = new Uint8Array(0);
-  private readonly expectAccept: string;
-  private readonly pending: Uint8Array[] = [];
-  private readonly sodium: TransportCrypto;
-
-  constructor(host: string, port: number, sodium: TransportCrypto) {
-    this.sodium = sodium;
-    const { key, expectAccept } = wsClientKey(sodium.randombytes_buf(16));
-    this.expectAccept = expectAccept;
-    this.socket = tcpConnect(port, host, () => {
-      this.socket.write(
-        `GET / HTTP/1.1\r\nHost: ${host}:${port}\r\n` +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
-      );
-    });
-    this.socket.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
-    this.socket.on("close", () => this.fail());
-    this.socket.on("error", () => this.fail());
-  }
+  /** Drive the HTTP opening handshake from the bytes buffered so far. Returns
+   *  the byte length of the consumed handshake head once the channel is open,
+   *  or -1 to wait for more bytes; throws to fail the channel. */
+  protected abstract tryHandshake(buf: Uint8Array): number;
 
   send(bytes: Uint8Array): void {
     if (this.dead) return;
@@ -399,9 +338,6 @@ class WsClientChannel implements RawChannel {
   onClose(cb: () => void): void { this.onCls = cb; }
   close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
 
-  // RFC 6455 §5.3 requires the mask to be unpredictable; sodium's CSPRNG is
-  // already in hand, so use it rather than Math.random.
-  private mask(): Uint8Array { return this.sodium.randombytes_buf(4); }
   // Failure teardown: destroy + notify (see TcpChannel.fail for why onClose
   // must fire here).
   private fail(): void { if (this.dead) return; this.dead = true; this.socket.destroy(); this.onCls?.(); }
@@ -412,18 +348,16 @@ class WsClientChannel implements RawChannel {
       const merged = new Uint8Array(this.handshake.length + chunk.length);
       merged.set(this.handshake, 0); merged.set(chunk, this.handshake.length);
       this.handshake = merged;
-      const sep = indexOfCRLFCRLF(this.handshake);
-      // wait for the rest of the HTTP response, but never hoard unbounded bytes
-      if (sep < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
-      const header = new TextDecoder().decode(this.handshake.subarray(0, sep));
-      if (!/HTTP\/1\.1 101/.test(header) || !header.toLowerCase().includes(`sec-websocket-accept: ${this.expectAccept.toLowerCase()}`)) {
-        this.fail(); return;
-      }
+      let consumed: number;
+      try { consumed = this.tryHandshake(this.handshake); }
+      catch { this.fail(); return; }
+      // wait for the rest of the head, but never hoard unbounded bytes
+      if (consumed < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
       this.open = true;
-      const rest = this.handshake.subarray(sep + 4);
-      this.handshake = new Uint8Array(0);
       for (const b of this.pending) this.socket.write(encodeFrame(WS_OPCODES.OP_BINARY, b, this.mask()));
       this.pending.length = 0;
+      const rest = this.handshake.subarray(consumed);
+      this.handshake = new Uint8Array(0);
       if (rest.length) this.feedFrames(rest);
       return;
     }
@@ -439,6 +373,63 @@ class WsClientChannel implements RawChannel {
       else if (f.opcode === WS_OPCODES.OP_PING) this.socket.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, this.mask()));
       else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
     }
+  }
+}
+
+// The connection the *server* accepted: read the client's HTTP upgrade request,
+// reply 101 with the computed accept, then expect masked frames.
+class WsServerChannel extends WsChannelBase {
+  constructor(socket: Socket) {
+    super(true); // client frames are masked
+    this.attach(socket);
+  }
+
+  protected mask(): Uint8Array | null { return null; }
+
+  protected tryHandshake(buf: Uint8Array): number {
+    const sep = indexOfCRLFCRLF(buf);
+    if (sep < 0) return -1;
+    const header = new TextDecoder().decode(buf.subarray(0, sep));
+    const key = headerValue(header, "sec-websocket-key");
+    if (!key) throw new Error("ws: missing Sec-WebSocket-Key");
+    this.socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${wsAcceptKey(key)}\r\n\r\n`,
+    );
+    return sep + 4;
+  }
+}
+
+// The connection we *dial out* (node-side client). The browser uses platform
+// WebSocket; this exists so a Node peer can reach a node's WS endpoint (and so
+// the WS path is exercised end-to-end in tests).
+class WsClientChannel extends WsChannelBase {
+  private readonly expectAccept: string;
+
+  constructor(host: string, port: number, private readonly sodium: TransportCrypto) {
+    super(false); // server frames are unmasked
+    const { key, expectAccept } = wsClientKey(sodium.randombytes_buf(16));
+    this.expectAccept = expectAccept;
+    this.attach(tcpConnect(port, host, () => {
+      this.socket.write(
+        `GET / HTTP/1.1\r\nHost: ${host}:${port}\r\n` +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+      );
+    }));
+  }
+
+  protected mask(): Uint8Array { return this.sodium.randombytes_buf(4); }
+
+  protected tryHandshake(buf: Uint8Array): number {
+    const sep = indexOfCRLFCRLF(buf);
+    if (sep < 0) return -1;
+    const header = new TextDecoder().decode(buf.subarray(0, sep));
+    if (!/HTTP\/1\.1 101/.test(header) || !header.toLowerCase().includes(`sec-websocket-accept: ${this.expectAccept.toLowerCase()}`)) {
+      throw new Error("ws: upgrade refused");
+    }
+    return sep + 4;
   }
 }
 

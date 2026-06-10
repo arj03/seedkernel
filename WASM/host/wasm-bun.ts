@@ -2,13 +2,16 @@
 // the Bun "file" loader, so `bun build --compile` embeds their bytes *inside* the
 // executable; each import resolves to a path that fs.readFile serves from the
 // virtual bundle at runtime (and from disk during `bun run`). This is the one
-// piece the shared node loader can't provide — `with { type: "file" }` is a Bun
-// loader and Node would reject it at parse time (so this file is excluded from
-// the tsc host build).
+// piece the shared node loader can't provide. The file is excluded from the
+// *emit* build (Node must never load it) but typechecked by tsconfig.check.json;
+// only the two asset imports themselves are suppressed — tsc cannot resolve a
+// .wasm specifier into the generated build dir.
 
 import { readFile } from "node:fs/promises";
 
+// @ts-expect-error Bun asset import — resolves to a path string at runtime
 import kernelPath from "../build/kernel.wasm" with { type: "file" };
+// @ts-expect-error Bun asset import — resolves to a path string at runtime
 import bootstrapPath from "../build/bootstrap.wasm" with { type: "file" };
 
 import type { KernelWasm } from "./main.js";

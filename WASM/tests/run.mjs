@@ -28,7 +28,7 @@ const {
 const { NodeNetwork } = await imp("build/host/net-node.js");
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
 const { CAP, createCapBridge } = await imp("build/host/cap-bridge.js");
-const { sha1, base64Encode, wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
+const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm, createSyncSafeRealm } = await imp("build/host/safe-js.js");
@@ -1020,9 +1020,8 @@ async function testCapBridge() {
 async function testWsFraming() {
   console.log("Test: WebSocket framing primitives (RFC 6455) — the no-cap ws module");
 
-  assertEqual(toHex(sha1(new TextEncoder().encode("abc"))), "a9993e364706816aba3e25717850c26c9cd0d89d", "SHA-1 known vector");
-  assertEqual(base64Encode(new Uint8Array([102, 111, 111])), "Zm9v", "base64 known vector");
-  // RFC 6455 §1.3 worked example.
+  // RFC 6455 §1.3 worked example — exercises the WASM SHA-1 + base64 end-to-end
+  // (the only SHA-1/base64 in the runtime; the former JS copy is deleted).
   assertEqual(wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "WS accept known vector");
 
   // Encode a masked client frame, parse it back through the server parser,

@@ -736,9 +736,9 @@ Anything with *structure* is a **no-capability module** that transforms bytes: W
 **The shell (`host/main.ts`, `./shell`).** `boot(opts)` assembles all of the above and returns a `Shell` (`loadBundle`, `runGuest`, `serveAsHolder`, `installFromEnvelope`); a CLI wraps it:
 
 ```sh
-node build/host/main.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
+node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
-     --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get mid:key --out file]
+     --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
 ```
 
 A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`) **and** serves its *request* side from a confined realm (`serveAsHolder` routes `transport.onRequest` to the guest). The shell is application-neutral, so a `bun build --compile` of `host/main-bun.ts` (kernel + bootstrap embedded) is a single-file binary that can host any signed app. seed store's WASM README has a complete storage walkthrough.

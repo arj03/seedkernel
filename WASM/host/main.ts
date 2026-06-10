@@ -6,7 +6,7 @@
 // confinement host, held ready to be wired to an app's declared caps once the
 // app cap ABI lands (step 6); the kernel itself stays application-neutral.
 //
-//   node build/host/main.js --policy ./allowed-keys.json --dir ./data \
+//   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 --install ./codec.install,./reputation.install
 //
 // The Bun standalone (main-bun.ts) embeds kernel+bootstrap so
@@ -26,7 +26,7 @@ import { Transport, type Network, type PeerId } from "./net.js";
 import { createCapBridge, capPreamble, type CapSodium } from "./cap-bridge.js";
 import { createSafeRealm, createSyncSafeRealm, type SafeRealm, type SyncSafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { NodeFs } from "./fs-node.js";
-import { toHex, fromHex, readU32BE, concatBytes } from "./util.js";
+import { toHex, fromHex, concatBytes } from "./util.js";
 
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
 type Identity = { publicKey: Uint8Array; privateKey: Uint8Array };
@@ -316,15 +316,18 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   // One-shot client ops through the loaded guest — "the shell runs the app" as
   // the *initiator* (the runtime split). The request (holder) side is
   // served below once we start listening (step 8), from the same confined guest.
+  // The shell stays application-neutral: arguments cross as raw bytes (hex
+  // tokens joined by ':') and responses come back as raw bytes — any structure
+  // in them belongs to the app, so the shell prints hex and never decodes.
   if (args["bundle"] && args["put"]) {
     const data = new Uint8Array(readFileSync(str(args, "put")!));
     const r = await shell.runGuest("put", data);
-    console.log(`  PUT ok: ${readU32BE(r, 33)} chunk(s)${r[32] === 1 ? " (replicated)" : ""}`);
-    console.log(`    --get ${toHex(r.slice(0, 32))}:${toHex(r.slice(37, 69))}`);
+    console.log(`  PUT ok: ${r.length} B response`);
+    console.log(`    ${toHex(r)}`);
   }
   if (args["bundle"] && args["get"]) {
-    const [mid, key] = str(args, "get")!.split(":");
-    const data = await shell.runGuest("get", concatBytes([fromHex(mid), fromHex(key)]));
+    const arg = concatBytes(str(args, "get")!.split(":").map(fromHex));
+    const data = await shell.runGuest("get", arg);
     const outFile = str(args, "out");
     if (outFile) { writeFileSync(outFile, data); console.log(`  GET ok: ${data.length} B → ${outFile}`); }
     else process.stdout.write(data);
@@ -347,10 +350,3 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   process.on("SIGINT", () => { shell.close(); process.exit(0); });
 }
 
-// Auto-run only when invoked directly as the Node CLI (build/host/main.js). The
-// Bun standalone entry (main-bun.ts) imports main() and calls it with the
-// embedded-core loader, so it must not double-run here.
-const entry = process.argv[1] ?? "";
-if (/[\\/]main\.(ts|js)$/.test(entry)) {
-  main().catch((e) => { console.error(e); process.exit(1); });
-}

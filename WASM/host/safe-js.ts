@@ -130,26 +130,55 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : (u8.slice().buffer as ArrayBuffer);
 }
 
-export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
-  const mod = await getModule();
-  const ctx: QuickJSAsyncContext = mod.newContext();
+// ── pieces shared by the async and sync factories ────────────────────────────
 
+/** Heap cap + the optional per-call wall-clock deadline. Returns the hook each
+ *  `call()` uses to re-arm the deadline. */
+function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): () => void {
   ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? 64 * 1024 * 1024);
-
-  // Per-call wall-clock deadline (opt-in). Reset at the top of each `call()`.
   let deadline = Infinity;
   if (opts.deadlineMs !== undefined) {
     ctx.runtime.setInterruptHandler(() => Date.now() > deadline);
   }
+  return () => { if (opts.deadlineMs !== undefined) deadline = Date.now() + opts.deadlineMs; };
+}
+
+/** Stage the entrypoint argument as the realm global `__arg` (copy boundary). */
+function stageArg(ctx: QuickJSContext, payload: Uint8Array): void {
+  const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
+  ctx.setProp(ctx.global, "__arg", argHandle);
+  argHandle.dispose();
+}
+
+/** Copy an op payload out of WASM memory (the buffer may move under us). */
+function copyPayload(ctx: QuickJSContext, payloadHandle: QuickJSHandle): Uint8Array {
+  const lt = ctx.getArrayBuffer(payloadHandle);
+  const payload = lt.value.slice();
+  lt.dispose();
+  return payload;
+}
+
+/** Take ownership of a result handle and copy its bytes out (copy boundary). */
+function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
+  const lt = ctx.getArrayBuffer(handle);
+  const out = lt.value.slice();
+  lt.dispose();
+  handle.dispose();
+  return out;
+}
+
+const invokeSrc = (entry: string): string => `__invoke(${JSON.stringify(entry)}, __arg)`;
+
+export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
+  const mod = await getModule();
+  const ctx: QuickJSAsyncContext = mod.newContext();
+  const armDeadline = configureRealm(ctx, opts);
 
   // The single seam: an Asyncified host function. QuickJS calls it synchronously;
   // its stack unwinds while we await the bridge, then resumes with the result.
   const hostCall = ctx.newAsyncifiedFunction("__host_call", async (opHandle, payloadHandle) => {
     const op = ctx.getNumber(opHandle);
-    const lt = ctx.getArrayBuffer(payloadHandle);
-    const payload = lt.value.slice(); // copy out of WASM memory before it moves
-    lt.dispose();
-    const result = await opts.bridge(op, payload);
+    const result = await opts.bridge(op, copyPayload(ctx, payloadHandle));
     return ctx.newArrayBuffer(toArrayBuffer(result));
   });
   ctx.setProp(ctx.global, "__host_call", hostCall);
@@ -167,11 +196,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   let chain: Promise<unknown> = Promise.resolve();
 
   const callOnce = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
-    if (opts.deadlineMs !== undefined) deadline = Date.now() + opts.deadlineMs;
-
-    const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
-    ctx.setProp(ctx.global, "__arg", argHandle);
-    argHandle.dispose();
+    armDeadline();
+    stageArg(ctx, payload);
 
     // evalCodeAsync drives the Asyncify suspensions for every host call that is
     // synchronously reachable inside the expression. The result is either the
@@ -180,19 +206,14 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // pumped — hence resolvePromise → executePendingJobs → await, in that order
     // (awaiting before the pump would deadlock).
     const evalResult = ctx.unwrapResult(
-      await ctx.evalCodeAsync(`__invoke(${JSON.stringify(entry)}, __arg)`, "safe-js-invoke.js"),
+      await ctx.evalCodeAsync(invokeSrc(entry), "safe-js-invoke.js"),
     );
     const settledNative = ctx.resolvePromise(evalResult);
     ctx.runtime.executePendingJobs();
     const settled = await settledNative;
     evalResult.dispose();
 
-    const valueHandle = ctx.unwrapResult(settled);
-    const lt = ctx.getArrayBuffer(valueHandle);
-    const out = lt.value.slice();
-    lt.dispose();
-    valueHandle.dispose();
-    return out;
+    return takeBytes(ctx, ctx.unwrapResult(settled));
   };
 
   return {
@@ -225,22 +246,13 @@ function getSyncModule(): Promise<QuickJSWASMModule> {
 export async function createSyncSafeRealm(opts: SafeRealmOptions): Promise<SyncSafeRealm> {
   const mod = await getSyncModule();
   const ctx: QuickJSContext = mod.newContext();
-
-  ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? 64 * 1024 * 1024);
-
-  let deadline = Infinity;
-  if (opts.deadlineMs !== undefined) {
-    ctx.runtime.setInterruptHandler(() => Date.now() > deadline);
-  }
+  const armDeadline = configureRealm(ctx, opts);
 
   // The single seam — a plain host function. QuickJS calls it synchronously and
   // gets the result bytes back immediately; there is no stack unwind.
   const hostCall = ctx.newFunction("__host_call", (opHandle, payloadHandle) => {
     const op = ctx.getNumber(opHandle);
-    const lt = ctx.getArrayBuffer(payloadHandle);
-    const payload = lt.value.slice(); // copy out of WASM memory before it moves
-    lt.dispose();
-    const result = opts.bridge(op, payload);
+    const result = opts.bridge(op, copyPayload(ctx, payloadHandle));
     if (result && typeof (result as Promise<Uint8Array>).then === "function") {
       throw new Error("sync safe-js: bridge returned a Promise — a sync realm cannot host an async op (e.g. net)");
     }
@@ -256,23 +268,12 @@ export async function createSyncSafeRealm(opts: SafeRealmOptions): Promise<SyncS
 
   return {
     call(entry: string, payload: Uint8Array): Uint8Array {
-      if (opts.deadlineMs !== undefined) deadline = Date.now() + opts.deadlineMs;
-
-      const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
-      ctx.setProp(ctx.global, "__arg", argHandle);
-      argHandle.dispose();
-
+      armDeadline();
+      stageArg(ctx, payload);
       // A sync entrypoint returns bytes directly; __invoke yields the ArrayBuffer.
       // (An async entrypoint would return a guest promise here, which a sync realm
       // cannot settle — getArrayBuffer would then throw, by design.)
-      const evalResult = ctx.unwrapResult(
-        ctx.evalCode(`__invoke(${JSON.stringify(entry)}, __arg)`, "safe-js-invoke.js"),
-      );
-      const lt = ctx.getArrayBuffer(evalResult);
-      const out = lt.value.slice();
-      lt.dispose();
-      evalResult.dispose();
-      return out;
+      return takeBytes(ctx, ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js")));
     },
     dispose(): void {
       ctx.dispose();

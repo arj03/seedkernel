@@ -19,6 +19,7 @@
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
+import { writeU32BE } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -115,19 +116,9 @@ export function nameKey(name: Uint8Array): string {
   return s;
 }
 
-/** Write a u32 in big-endian order at out[offset..offset+4]. */
-export function writeU32BE(out: Uint8Array, offset: number, value: number): void {
-  out[offset]     = (value >>> 24) & 0xff;
-  out[offset + 1] = (value >>> 16) & 0xff;
-  out[offset + 2] = (value >>>  8) & 0xff;
-  out[offset + 3] =  value         & 0xff;
-}
-
-/** Read a u32 in big-endian order from buf[offset..offset+4]. */
-export function readU32BE(buf: Uint8Array, offset: number): number {
-  return ((buf[offset] << 24) | (buf[offset + 1] << 16) |
-          (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
-}
+// The u32-BE codec lives in util.ts; re-exported here because this module is
+// where downstream consumers historically imported it from.
+export { writeU32BE, readU32BE } from "./util.js";
 
 export class KernelHost {
   private kernelExports!: KernelExports;

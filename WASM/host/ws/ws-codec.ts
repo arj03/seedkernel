@@ -9,7 +9,7 @@
 // host object keeps the residual buffer).
 
 import { WS_WASM_B64 } from "./ws-wasm.js";
-import { concatBytes } from "../util.js";
+import { concatBytes, readU32BE, ByteQueue } from "../util.js";
 
 const OP_ENCODE = 1, OP_DECODE_ONE = 2, OP_ACCEPT = 3, OP_BASE64 = 4;
 
@@ -61,9 +61,6 @@ function write(m: WsMod, bytes: Uint8Array): number {
 }
 function read(m: WsMod, len: number): Uint8Array {
   return new Uint8Array(m.exp.memory.buffer, m.scratch, len).slice();
-}
-function readU32BE(b: Uint8Array, o: number): number {
-  return ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
 }
 
 const enc = new TextEncoder();
@@ -118,7 +115,7 @@ export function wsClientKey(rand16: Uint8Array): { key: string; expectAccept: st
  *  here, bounded by the same cap as a single frame; control frames may interleave
  *  mid-fragmentation per RFC 6455 §5.4. */
 export class WsParser {
-  private buf = new Uint8Array(0);
+  private readonly q = new ByteQueue();
   // In-flight fragmented message: the first fragment's opcode (-1 = none) and
   // the accumulated fragment payloads.
   private fragOpcode = -1;
@@ -128,27 +125,26 @@ export class WsParser {
 
   push(chunk: Uint8Array): WsFrame[] {
     const m = ws();
-    const merged = new Uint8Array(this.buf.length + chunk.length);
-    merged.set(this.buf, 0); merged.set(chunk, this.buf.length);
-    this.buf = merged;
+    this.q.push(chunk);
     const out: WsFrame[] = [];
-    while (this.buf.length >= 2) {
-      const view = this.buf.length <= SCRATCH_MAX ? this.buf : this.buf.subarray(0, SCRATCH_MAX);
-      const req = new Uint8Array(2 + view.length);
-      req[0] = OP_DECODE_ONE; req[1] = this.expectMasked ? 1 : 0; req.set(view, 2);
+    for (;;) {
+      // Wait for one complete frame before staging it for the module, so a big
+      // frame arriving in many chunks is copied once, not once per chunk.
+      const total = this.frameLength();
+      if (total < 0) break;
+      if (total > SCRATCH_MAX) throw new Error("ws: oversize frame");
+      if (this.q.length < total) break;
+      const frame = this.q.take(total)!;
+      const req = new Uint8Array(2 + frame.length);
+      req[0] = OP_DECODE_ONE; req[1] = this.expectMasked ? 1 : 0; req.set(frame, 2);
       const r = read(m, m.exp.handle(write(m, req)));
-      const status = r[0];
-      if (status === 0) {
-        if (this.buf.length >= SCRATCH_MAX) throw new Error("ws: oversize frame");
-        break;
-      }
-      if (status === 2) throw new Error("ws: protocol error");
+      // The module saw exactly one whole frame; anything but "frame" (1) is a
+      // protocol violation (bad mask direction, fragmented control, bad length).
+      if (r[0] !== 1) throw new Error("ws: protocol error");
       const fin = (r[1] & 0x80) !== 0;
       const opcode = r[1] & 0x0f;
-      const consumed = readU32BE(r, 2);
       const payloadLen = readU32BE(r, 6);
       const payload = r.slice(10, 10 + payloadLen);
-      this.buf = this.buf.slice(consumed);
 
       if (opcode === OP_CONT) {
         // continuation of an in-flight fragmented message
@@ -177,5 +173,29 @@ export class WsParser {
       }
     }
     return out;
+  }
+
+  /** Total byte length of the next frame, read from the (unvalidated) header —
+   *  or -1 if too few bytes are buffered to know yet. All real validation stays
+   *  in ws.wasm; this only sizes the wait. */
+  private frameLength(): number {
+    const h = this.q.peek(2);
+    if (!h) return -1;
+    const masked = (h[1] & 0x80) !== 0;
+    const len7 = h[1] & 0x7f;
+    let headerLen = 2, payloadLen = len7;
+    if (len7 === 126) {
+      const e = this.q.peek(4);
+      if (!e) return -1;
+      headerLen = 4;
+      payloadLen = (e[2] << 8) | e[3];
+    } else if (len7 === 127) {
+      const e = this.q.peek(10);
+      if (!e) return -1;
+      if (readU32BE(e, 2) !== 0) throw new Error("ws: oversize frame"); // > 4 GiB
+      headerLen = 10;
+      payloadLen = readU32BE(e, 6);
+    }
+    return headerLen + (masked ? 4 : 0) + payloadLen;
   }
 }

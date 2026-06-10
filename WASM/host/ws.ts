@@ -7,4 +7,3 @@
 // directly for its socket pump; this barrel is the surface for any other consumer
 // (e.g. RFC 6455 conformance tests).
 export * from "./ws/ws-codec.js";
-export * from "./ws/sha1.js";
