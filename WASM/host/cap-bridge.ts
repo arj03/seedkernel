@@ -83,7 +83,19 @@ export interface CapBridgeDeps {
   fs?: Fs;
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
+  /** The op numbers this guest's signed manifest declares (its `ops` catalog).
+   *  When present, any op outside the set is refused — capability enforcement
+   *  at the bridge (README §8.2). Omitted = unrestricted (a host-side caller
+   *  like seedstore's Tier-2 coordinator, which holds the primitives anyway). */
+  allowedOps?: Iterable<number>;
 }
+
+// Host-side allocation bounds for guest-controlled sizes. The realm's own
+// 64 MiB memory limit does not cover host allocations the guest requests, so
+// the bridge caps them itself (a confined guest must not be able to size a
+// host buffer past these).
+const MAX_RANDOM_BYTES = 1 << 20;     // 1 MiB per CAP_RANDOM call
+const MAX_REQUEST_MANY_PEERS = 1024;  // fan-out width per CAP_NET_REQUEST_MANY
 
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
@@ -108,12 +120,16 @@ function u64be(value: number): Uint8Array {
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
   const { sodium, identity, callHandler, transport } = deps;
   const now = deps.now ?? (() => Date.now());
+  const allowed = deps.allowedOps ? new Set(deps.allowedOps) : null;
   const fs = (): Fs => {
     if (!deps.fs) throw new Error("cap-bridge: fs.* used but no fs backend wired");
     return deps.fs;
   };
 
   return (op: number, payload: Uint8Array): Uint8Array | Promise<Uint8Array> => {
+    if (allowed && !allowed.has(op)) {
+      throw new Error("cap-bridge: op " + op + " not declared by the bundle manifest");
+    }
     switch (op) {
       // ── crypto primitives ────────────────────────────────────────────────
       case CAP.HASH:
@@ -132,8 +148,11 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
       }
       case CAP.IDENTITY:
         return identity.publicKey.slice();
-      case CAP.RANDOM:
-        return sodium.randombytes_buf(readU32BE(payload, 0));
+      case CAP.RANDOM: {
+        const n = readU32BE(payload, 0);
+        if (n > MAX_RANDOM_BYTES) throw new Error("cap-bridge: RANDOM size over cap");
+        return sodium.randombytes_buf(n);
+      }
 
       // ── net (the only async ops — a real round trip → a Promise) ──────────
       case CAP.NET_SEND: {
@@ -147,6 +166,12 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
       case CAP.NET_REQUEST_MANY: {
         const type = payload[0];
         const count = readU32BE(payload, 1);
+        // `count` is guest-controlled: it must be backed by actual peer bytes in
+        // the payload (no driving an unbounded host loop with a bare number) and
+        // stay under the fan-out cap.
+        if (count > MAX_REQUEST_MANY_PEERS || 5 + count * 32 + 4 > payload.length) {
+          throw new Error("cap-bridge: NET_REQUEST_MANY count invalid");
+        }
         const peers: PeerId[] = [];
         let o = 5;
         for (let i = 0; i < count; i++) { peers.push(toHex(payload.slice(o, o + 32))); o += 32; }

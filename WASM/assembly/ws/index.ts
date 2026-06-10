@@ -17,12 +17,19 @@
 //   OP_ENCODE     (1) args [opcode u8][maskFlag u8][mask 4?][payload]  → frame
 //   OP_DECODE_ONE (2) args [expectMasked u8][buf ...]
 //        → [status u8] then, if status==1:
-//          [opcode u8][consumed u32 BE][payloadLen u32 BE][payload ...]
+//          [fin<<7 | opcode u8][consumed u32 BE][payloadLen u32 BE][payload ...]
 //          status 0 = need more bytes; status 2 = protocol error
+//        Fragmented data frames (FIN=0, opcode 0/1/2) are reported with the fin
+//        bit clear; the host reassembles the message. A fragmented *control*
+//        frame is a protocol error (RFC 6455 §5.4/§5.5).
 //   OP_ACCEPT     (3) args [key bytes]   → base64(sha1(key ‖ GUID)) bytes (28)
 //   OP_BASE64     (4) args [bytes]       → base64(bytes)
 
-const SCRATCH_SIZE: i32 = 4 << 20;             // 4 MB — one WS frame, generous (§27)
+// One WS frame must fit the scratch region. Sized so the largest TCP transport
+// message (MAX_TCP_MESSAGE, 16 MB, net-node.ts) also fits in a single WS frame
+// plus header/mask overhead — the two transports must cap identically, or a
+// message that succeeds over TCP would tear down a WS link.
+const SCRATCH_SIZE: i32 = (16 << 20) + (1 << 12); // 16 MB + 4 KB overhead slack
 const MAX_FRAME_PAYLOAD: i32 = SCRATCH_SIZE - 16;
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
 
@@ -187,8 +194,9 @@ function opDecodeOne(input_len: i32): i32 {
   if (bufLen < 2) { store<u8>(scratch, 0); return 1; }
   const b0 = load<u8>(bufPtr) as i32;
   const b1 = load<u8>(bufPtr + 1) as i32;
-  if ((b0 & 0x80) == 0) { store<u8>(scratch, 2); return 1; }       // fragmented (FIN=0)
+  const fin = (b0 & 0x80) != 0;
   const opcode = b0 & 0x0f;
+  if (!fin && opcode >= 8) { store<u8>(scratch, 2); return 1; }    // fragmented control frame
   const masked = (b1 & 0x80) != 0;
   if (masked != expectMasked) { store<u8>(scratch, 2); return 1; } // bad mask direction
 
@@ -223,7 +231,7 @@ function opDecodeOne(input_len: i32): i32 {
   memory.copy(scratch + 10, payloadSrc, payloadLen); // memmove-safe
 
   store<u8>(scratch, 1);                 // status = frame
-  store<u8>(scratch + 1, opcode as u8);
+  store<u8>(scratch + 1, ((fin ? 0x80 : 0) | opcode) as u8);
   storeBE(scratch + 2, totalFrame);      // consumed
   storeBE(scratch + 6, payloadLen);      // payloadLen
   if (masked) {

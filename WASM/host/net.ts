@@ -67,6 +67,10 @@ export type RequestHandler = (from: PeerId, type: number, payload: Uint8Array) =
 export type BulkHandler = (from: PeerId, blockId: Uint8Array, bytes: Uint8Array) => void;
 
 interface Pending {
+  /** The peer the request went to — a response only resolves if it arrives from
+   *  this peer, so an authenticated-but-malicious cohort member cannot spoof a
+   *  response on behalf of another peer by guessing the correlation counter. */
+  to: PeerId;
   resolve: (payload: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -107,7 +111,7 @@ export class Transport {
         this.pending.delete(corr);
         reject(new Error(`net.send: timeout to ${to.slice(0, 8)} (type ${type})`));
       }, this.timeoutMs);
-      this.pending.set(corr, { resolve, reject, timer });
+      this.pending.set(corr, { to, resolve, reject, timer });
       this.net.send(this.peerId, to, frame);
     });
   }
@@ -161,6 +165,9 @@ export class Transport {
     if (kind === KIND_RES) {
       const p = this.pending.get(corr);
       if (!p) return;
+      // Bind the response to the request's target: a frame from anyone else is
+      // dropped (the real response can still arrive before the timeout).
+      if (p.to !== from) return;
       clearTimeout(p.timer);
       this.pending.delete(corr);
       p.resolve(frame.slice(6));

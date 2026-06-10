@@ -222,10 +222,13 @@ export class NodeNetwork implements Network {
 
   private forget(link: PeerLink): void {
     this.inbound.delete(link);
-    if (link.peerId) {
-      if (this.connecting.get(link.peerId) === link) this.connecting.delete(link.peerId);
-      if (this.links.get(link.peerId) === link) this.links.delete(link.peerId);
-    }
+    // Scan by value rather than keying off link.peerId: an outbound dial is
+    // registered in `connecting` under the *target* peerId before the peer's
+    // HELLO ever arrives (link.peerId is still ""), so a dial that dies pre-
+    // handshake (ECONNREFUSED, expectPeerId mismatch) must still be removed —
+    // otherwise send() returns the dead link forever and never redials.
+    for (const [pid, l] of this.connecting) if (l === link) this.connecting.delete(pid);
+    for (const [pid, l] of this.links) if (l === link) this.links.delete(pid);
   }
 }
 
@@ -254,19 +257,26 @@ class TcpChannel implements RawChannel {
   onClose(cb: () => void): void { this.onCls = cb; }
   close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
 
+  /** Failure teardown: destroy the socket AND notify onClose. close() (the
+   *  deliberate path) sets `dead` first, so a fail() that follows it stays
+   *  silent — but an error/'close' event on a live channel must always reach
+   *  onClose, or the owning PeerLink is never forgotten from the routing maps
+   *  and the peer is blackholed until restart. */
   private fail(): void {
     if (this.dead) return;
     this.dead = true;
+    this.socket.destroy();
     this.onCls?.();
   }
 
   private onData(chunk: Uint8Array): void {
+    if (this.dead) return;
     const merged = new Uint8Array(this.buf.length + chunk.length);
     merged.set(this.buf, 0); merged.set(chunk, this.buf.length);
     this.buf = merged;
     while (this.buf.length >= 4) {
       const len = readU32BE(this.buf, 0);
-      if (len > MAX_TCP_MESSAGE) { this.close(); this.fail(); return; }
+      if (len > MAX_TCP_MESSAGE) { this.fail(); return; }
       if (this.buf.length < 4 + len) break;
       const msg = this.buf.slice(4, 4 + len);
       this.buf = this.buf.slice(4 + len);
@@ -306,7 +316,9 @@ class WsServerChannel implements RawChannel {
   onClose(cb: () => void): void { this.onCls = cb; }
   close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
 
-  private fail(): void { if (this.dead) return; this.dead = true; this.onCls?.(); }
+  // Failure teardown: destroy + notify (see TcpChannel.fail for why onClose
+  // must fire here).
+  private fail(): void { if (this.dead) return; this.dead = true; this.socket.destroy(); this.onCls?.(); }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -315,10 +327,10 @@ class WsServerChannel implements RawChannel {
       merged.set(this.handshake, 0); merged.set(chunk, this.handshake.length);
       this.handshake = merged;
       const sep = indexOfCRLFCRLF(this.handshake);
-      if (sep < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) { this.close(); this.fail(); } return; }
+      if (sep < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
       const header = new TextDecoder().decode(this.handshake.subarray(0, sep));
       const key = headerValue(header, "sec-websocket-key");
-      if (!key) { this.close(); this.fail(); return; }
+      if (!key) { this.fail(); return; }
       this.socket.write(
         "HTTP/1.1 101 Switching Protocols\r\n" +
         "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -338,11 +350,11 @@ class WsServerChannel implements RawChannel {
   private feedFrames(chunk: Uint8Array): void {
     let frames;
     try { frames = this.parser.push(chunk); }
-    catch { this.close(); this.fail(); return; }
+    catch { this.fail(); return; }
     for (const f of frames) {
       if (f.opcode === WS_OPCODES.OP_BINARY) this.onMsg?.(f.payload);
       else if (f.opcode === WS_OPCODES.OP_PING) this.socket.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, null));
-      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.close(); this.fail(); return; }
+      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
     }
   }
 }
@@ -360,8 +372,10 @@ class WsClientChannel implements RawChannel {
   private handshake = new Uint8Array(0);
   private readonly expectAccept: string;
   private readonly pending: Uint8Array[] = [];
+  private readonly sodium: TransportCrypto;
 
   constructor(host: string, port: number, sodium: TransportCrypto) {
+    this.sodium = sodium;
     const { key, expectAccept } = wsClientKey(sodium.randombytes_buf(16));
     this.expectAccept = expectAccept;
     this.socket = tcpConnect(port, host, () => {
@@ -385,12 +399,12 @@ class WsClientChannel implements RawChannel {
   onClose(cb: () => void): void { this.onCls = cb; }
   close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
 
-  private mask(): Uint8Array {
-    const m = new Uint8Array(4);
-    for (let i = 0; i < 4; i++) m[i] = (Math.random() * 256) & 255;
-    return m;
-  }
-  private fail(): void { if (this.dead) return; this.dead = true; this.onCls?.(); }
+  // RFC 6455 §5.3 requires the mask to be unpredictable; sodium's CSPRNG is
+  // already in hand, so use it rather than Math.random.
+  private mask(): Uint8Array { return this.sodium.randombytes_buf(4); }
+  // Failure teardown: destroy + notify (see TcpChannel.fail for why onClose
+  // must fire here).
+  private fail(): void { if (this.dead) return; this.dead = true; this.socket.destroy(); this.onCls?.(); }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -399,10 +413,11 @@ class WsClientChannel implements RawChannel {
       merged.set(this.handshake, 0); merged.set(chunk, this.handshake.length);
       this.handshake = merged;
       const sep = indexOfCRLFCRLF(this.handshake);
-      if (sep < 0) return; // wait for the rest of the HTTP response
+      // wait for the rest of the HTTP response, but never hoard unbounded bytes
+      if (sep < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
       const header = new TextDecoder().decode(this.handshake.subarray(0, sep));
       if (!/HTTP\/1\.1 101/.test(header) || !header.toLowerCase().includes(`sec-websocket-accept: ${this.expectAccept.toLowerCase()}`)) {
-        this.close(); this.fail(); return;
+        this.fail(); return;
       }
       this.open = true;
       const rest = this.handshake.subarray(sep + 4);
@@ -418,11 +433,11 @@ class WsClientChannel implements RawChannel {
   private feedFrames(chunk: Uint8Array): void {
     let frames;
     try { frames = this.parser.push(chunk); }
-    catch { this.close(); this.fail(); return; }
+    catch { this.fail(); return; }
     for (const f of frames) {
       if (f.opcode === WS_OPCODES.OP_BINARY) this.onMsg?.(f.payload);
       else if (f.opcode === WS_OPCODES.OP_PING) this.socket.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, this.mask()));
-      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.close(); this.fail(); return; }
+      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
     }
   }
 }

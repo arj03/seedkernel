@@ -9,16 +9,18 @@
 // host object keeps the residual buffer).
 
 import { WS_WASM_B64 } from "./ws-wasm.js";
+import { concatBytes } from "../util.js";
 
 const OP_ENCODE = 1, OP_DECODE_ONE = 2, OP_ACCEPT = 3, OP_BASE64 = 4;
 
 export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 export const OP_BINARY = 0x2;
-const OP_CLOSE = 0x8, OP_PING = 0x9, OP_PONG = 0xa;
+const OP_CONT = 0x0, OP_CLOSE = 0x8, OP_PING = 0x9, OP_PONG = 0xa;
 export const WS_OPCODES = { OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } as const;
 
-// Must match SCRATCH_SIZE - 16 in assembly/ws/index.ts.
-const SCRATCH_MAX = (4 << 20) - 16;
+// Must match SCRATCH_SIZE / SCRATCH_SIZE - 16 in assembly/ws/index.ts.
+const SCRATCH_SIZE = (16 << 20) + (1 << 12);
+const SCRATCH_MAX = SCRATCH_SIZE - 16;
 
 interface WsExports {
   memory: WebAssembly.Memory;
@@ -51,6 +53,9 @@ function ws(): WsMod {
 }
 
 function write(m: WsMod, bytes: Uint8Array): number {
+  // Bound against the module's scratch *region*, not just the end of linear
+  // memory — an overrun would silently corrupt the shared singleton instance.
+  if (bytes.length > SCRATCH_SIZE) throw new Error("ws: request exceeds scratch");
   new Uint8Array(m.exp.memory.buffer, m.scratch, bytes.length).set(bytes);
   return bytes.length;
 }
@@ -72,6 +77,7 @@ export interface WsFrame { opcode: number; payload: Uint8Array; }
 export function encodeFrame(opcode: number, payload: Uint8Array, mask: Uint8Array | null): Uint8Array {
   const m = ws();
   const maskLen = mask ? 4 : 0;
+  if (payload.length > SCRATCH_MAX) throw new Error("ws: payload exceeds frame cap");
   const req = new Uint8Array(3 + maskLen + payload.length);
   req[0] = OP_ENCODE; req[1] = opcode & 0x0f; req[2] = mask ? 1 : 0;
   if (mask) req.set(mask.subarray(0, 4), 3);
@@ -107,9 +113,17 @@ export function wsClientKey(rand16: Uint8Array): { key: string; expectAccept: st
  *  a server feeds client bytes (must be masked); a client feeds server bytes
  *  (must be unmasked). Holds the residual buffer host-side and parses one frame
  *  at a time through the stateless module; throws on a protocol violation so the
- *  channel tears down. */
+ *  channel tears down. Fragmented data messages (FIN=0 + continuation frames —
+ *  e.g. a browser's platform WebSocket splitting a large send()) are reassembled
+ *  here, bounded by the same cap as a single frame; control frames may interleave
+ *  mid-fragmentation per RFC 6455 §5.4. */
 export class WsParser {
   private buf = new Uint8Array(0);
+  // In-flight fragmented message: the first fragment's opcode (-1 = none) and
+  // the accumulated fragment payloads.
+  private fragOpcode = -1;
+  private frags: Uint8Array[] = [];
+  private fragBytes = 0;
   constructor(private readonly expectMasked: boolean) {}
 
   push(chunk: Uint8Array): WsFrame[] {
@@ -129,11 +143,38 @@ export class WsParser {
         break;
       }
       if (status === 2) throw new Error("ws: protocol error");
-      const opcode = r[1];
+      const fin = (r[1] & 0x80) !== 0;
+      const opcode = r[1] & 0x0f;
       const consumed = readU32BE(r, 2);
       const payloadLen = readU32BE(r, 6);
-      out.push({ opcode, payload: r.slice(10, 10 + payloadLen) });
+      const payload = r.slice(10, 10 + payloadLen);
       this.buf = this.buf.slice(consumed);
+
+      if (opcode === OP_CONT) {
+        // continuation of an in-flight fragmented message
+        if (this.fragOpcode < 0) throw new Error("ws: protocol error");
+        this.fragBytes += payload.length;
+        if (this.fragBytes > SCRATCH_MAX) throw new Error("ws: oversize frame");
+        this.frags.push(payload);
+        if (fin) {
+          const whole = concatBytes(this.frags);
+          const first = this.fragOpcode;
+          this.fragOpcode = -1; this.frags = []; this.fragBytes = 0;
+          out.push({ opcode: first, payload: whole });
+        }
+      } else if (!fin) {
+        // first fragment of a data message (the module rejects fragmented
+        // control frames before we get here)
+        if (this.fragOpcode >= 0) throw new Error("ws: protocol error");
+        this.fragOpcode = opcode;
+        this.frags = [payload];
+        this.fragBytes = payload.length;
+      } else {
+        // unfragmented frame; a *data* frame may not preempt an in-flight
+        // fragmented message, but control frames interleave freely (§5.4)
+        if (opcode < 0x8 && this.fragOpcode >= 0) throw new Error("ws: protocol error");
+        out.push({ opcode, payload });
+      }
     }
     return out;
   }

@@ -901,6 +901,9 @@ async function testFs() {
     try { fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects a path-traversal key on put");
     assertEqual(fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
+    threw = false;
+    try { fs.put("..", new Uint8Array([0])); } catch { threw = true; }
+    assert(threw, "NodeFs rejects the bare '..' key");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1412,6 +1415,184 @@ async function testSyncSafeRealm() {
   console.log("  OK\n");
 }
 
+// ─── Test: PR-review hardening — cap enforcement, guarded callHandler, ───
+// ─── sender-bound responses, WS fragmentation, redial after failure ──────
+
+async function testCapBridgeEnforcement() {
+  console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
+
+  const id = generateKeyPair();
+  const stubTransport = { request: async () => new Uint8Array(), requestMany: async () => [] };
+  const mk = (allowedOps) => createCapBridge({
+    sodium, identity: id, callHandler: () => null,
+    transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
+  });
+  const U = (...xs) => new Uint8Array(xs);
+
+  // declared-op filtering: only ops in the manifest catalog resolve
+  const restricted = mk([CAP.HASH]);
+  assertEqual((await restricted(CAP.HASH, U(1, 2))).length, 32, "a declared op (HASH) works");
+  let threw = false;
+  try { await restricted(CAP.SIGN, U(1)); } catch { threw = true; }
+  assert(threw, "an undeclared op (SIGN) is refused by the bridge");
+  threw = false;
+  try { await restricted(CAP.FS_DELETE, U(120)); } catch { threw = true; }
+  assert(threw, "an undeclared op (FS_DELETE) is refused by the bridge");
+
+  // guest-controlled allocation caps (no allowedOps → unrestricted host caller)
+  const open = mk(undefined);
+  assertEqual((await open(CAP.RANDOM, U(0, 0, 4, 0))).length, 1024, "RANDOM under the cap works");
+  threw = false;
+  try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
+  assert(threw, "RANDOM over the cap is refused");
+  threw = false;
+  try { await open(CAP.NET_REQUEST_MANY, U(7, 0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
+  assert(threw, "NET_REQUEST_MANY with a count not backed by payload bytes is refused");
+
+  console.log("  OK\n");
+}
+
+async function testCallHandlerGuards() {
+  console.log("Test: KernelHost.callHandler applies the call-router guards (§4.4)");
+
+  const { host, installName } = await makeHost();
+  // The installer is blockedFromCall — kernel.call refuses it, so the host-side
+  // by-name path must too (a confined guest reaches this via CAP_MODULE_CALL).
+  assert(host.callHandler(installName, new Uint8Array([1])) === null,
+    "callHandler refuses a blocked handler (installer)");
+  const sigName = host.deriveBootstrapName("signature");
+  assert(host.callHandler(sigName, new Uint8Array([1])) === null,
+    "callHandler refuses the signature wrapper");
+
+  // A normal handler still works, and sees an *empty* immediate caller — not a
+  // stale frame from some outer dispatch (the §8.2 confused-deputy check).
+  let sawCaller = "unset";
+  const echoName = host.deriveBootstrapName("test.echo2");
+  host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
+  const r = host.callHandler(echoName, new Uint8Array([5]));
+  assertEqual([...r], [5], "callHandler still reaches a normal handler");
+  assert(sawCaller === null, "the target sees no installed caller (anonymous frame)");
+
+  console.log("  OK\n");
+}
+
+async function testTransportResponseBinding() {
+  console.log("Test: a transport response only resolves from the peer it was sent to");
+
+  const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
+  const A = toHex(a.publicKey), B = toHex(b.publicKey), C = toHex(c.publicKey);
+  const net = new LoopbackNetwork();
+  const ta = new Transport(A, net, 200);
+  const tb = new Transport(B, net, 200);
+  const tc = new Transport(C, net, 200);
+  tb.onRequest(() => new Uint8Array([42]));
+
+  try {
+    const reqP = ta.request(B, 7, new Uint8Array());
+    // C (an authenticated cohort member in real life) races a spoofed response
+    // with the predictable first correlation id. It must be ignored.
+    net.send(C, A, Uint8Array.from([1, 0, 0, 0, 1, 7, 99]));
+    const resp = await reqP;
+    assertEqual([...resp], [42], "the real peer's response resolves, not the spoof");
+  } finally {
+    ta.close(); tb.close(); tc.close();
+  }
+
+  console.log("  OK\n");
+}
+
+async function testWsFragmentation() {
+  console.log("Test: WS fragmented messages reassemble (FIN=0 + continuation frames)");
+
+  const mask = new Uint8Array([9, 8, 7, 6]);
+  const p1 = new Uint8Array([1, 2, 3]), p2 = new Uint8Array([4, 5]), p3 = new Uint8Array([6]);
+  // encodeFrame always emits FIN=1; craft fragments by clearing the FIN bit.
+  const first = encodeFrame(WS_OPCODES.OP_BINARY, p1, mask); first[0] &= 0x7f;
+  const middle = encodeFrame(0x0, p2, mask); middle[0] &= 0x7f; // continuation, FIN=0
+  const ping = encodeFrame(WS_OPCODES.OP_PING, new Uint8Array([0xaa]), mask); // may interleave (§5.4)
+  const last = encodeFrame(0x0, p3, mask); // continuation, FIN=1
+
+  const parser = new WsParser(true);
+  const frames = [
+    ...parser.push(first), ...parser.push(middle),
+    ...parser.push(ping), ...parser.push(last),
+  ];
+  assertEqual(frames.length, 2, "the ping + one reassembled message");
+  assertEqual(frames[0].opcode, WS_OPCODES.OP_PING, "interleaved control frame passes through");
+  assertEqual(frames[1].opcode, WS_OPCODES.OP_BINARY, "reassembled message keeps the first opcode");
+  assertEqual([...frames[1].payload], [1, 2, 3, 4, 5, 6], "fragment payloads concatenate in order");
+
+  // A continuation with nothing in flight is a protocol error → channel teardown.
+  const parser2 = new WsParser(true);
+  let threw = false;
+  try { parser2.push(encodeFrame(0x0, p2, mask)); } catch { threw = true; }
+  assert(threw, "an orphan continuation frame is a protocol error");
+
+  // A fragmented control frame is a protocol error (RFC 6455 §5.5).
+  const parser3 = new WsParser(true);
+  const badPing = encodeFrame(WS_OPCODES.OP_PING, new Uint8Array([1]), mask); badPing[0] &= 0x7f;
+  threw = false;
+  try { parser3.push(badPing); } catch { threw = true; }
+  assert(threw, "a fragmented control frame is a protocol error");
+
+  console.log("  OK\n");
+}
+
+async function testRedialAfterFailedDial() {
+  console.log("Test: a failed dial is forgotten — the peer is reachable once it comes back");
+
+  const idS = generateKeyPair(), idB = generateKeyPair();
+  // Reserve a port, then free it so the first dial hits ECONNREFUSED.
+  const probe = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port: 0 } });
+  await probe.start();
+  const port = probe.port;
+  probe.close();
+  await sleep(50);
+
+  const netB = new NodeNetwork({ identity: idB, sodium });
+  netB.register(toHex(idB.publicKey), () => {});
+  let netS = null;
+  try {
+    netB.addPeerAddr(toHex(idS.publicKey), { host: "127.0.0.1", port, transport: "tcp" });
+    netB.send(toHex(idB.publicKey), toHex(idS.publicKey), new Uint8Array([1]));
+    await sleep(200); // the dial fails; the stale connecting entry must be cleaned up
+
+    netS = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port } });
+    await netS.start();
+    let received = 0;
+    netS.register(toHex(idS.publicKey), () => { received++; });
+    netB.send(toHex(idB.publicKey), toHex(idS.publicKey), new Uint8Array([2]));
+    await sleep(300);
+    assertEqual(received, 1, "send() redials after the peer comes back (no permanent blackhole)");
+  } finally {
+    if (netS) netS.close();
+    netB.close();
+  }
+
+  console.log("  OK\n");
+}
+
+async function testSafeRealmSerialization() {
+  console.log("Test: concurrent call()s on one safe-js realm serialize (no __arg clobber)");
+
+  const realm = await createSafeRealm({
+    source: `register("echo", (a) => host.call(1, a));`,
+    bridge: async (_op, p) => { await sleep(10); return p; },
+  });
+  try {
+    const [r1, r2] = await Promise.all([
+      realm.call("echo", new Uint8Array([1])),
+      realm.call("echo", new Uint8Array([2])),
+    ]);
+    assertEqual([...r1], [1], "first concurrent call returns its own bytes");
+    assertEqual([...r2], [2], "second concurrent call returns its own bytes");
+  } finally {
+    realm.dispose();
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1442,6 +1623,12 @@ await testWsFraming();
 await testChannelPinning();
 await testSafeJs();
 await testSyncSafeRealm();
+await testCapBridgeEnforcement();
+await testCallHandlerGuards();
+await testTransportResponseBinding();
+await testWsFragmentation();
+await testRedialAfterFailedDial();
+await testSafeRealmSerialization();
 await testPerf10k();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

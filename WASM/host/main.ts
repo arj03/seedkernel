@@ -132,7 +132,9 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   };
   // One cap-bridge shape for both realms — kernel primitives only. The async
   // realm awaits net; the sync holder realm only ever calls the synchronous ops.
-  const buildBridge = (): SafeRealmBridge => createCapBridge({
+  // The bundle's signed manifest declares its op catalog; the bridge refuses
+  // everything outside it, so a guest only ever holds the caps it declared.
+  const buildBridge = (b: LoadedBundle): SafeRealmBridge => createCapBridge({
     // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
     // bridge's minimal crypto surface (its crypto_generichash types the key as
     // required) — narrow it, the same cast seedstore's loadSodium does.
@@ -140,6 +142,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     identity: opts.identity,
     callHandler: (name, p) => host.callHandler(name, p),
     transport, peers: () => [...peers], fs, now: () => Date.now(),
+    allowedOps: Object.values(b.manifest.ops ?? {}),
   });
   // The guest source as signed content, fronted by the generic op preamble and
   // the bundle's app constants (`const APP = …`) — the same two blocks seedstore's
@@ -154,13 +157,13 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     loadBundle(dir) { return (loaded = loadBundle(host, sodium, policy, dir)); },
     async runGuest(entry, payload) {
       const b = requireLoaded();
-      if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge() });
+      if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
       return realm.call(entry, payload);
     },
     async serveAsHolder() {
       const b = requireLoaded();
       if (holderRealm) return;
-      const hr = holderRealm = await createSyncSafeRealm({ source: guestFullSource(b), bridge: buildBridge() });
+      const hr = holderRealm = await createSyncSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
       // arg = [type u8][payload]; the guest's `handle` returns the response bytes
       // synchronously (admission / store / fetch are local fs + crypto only).
       transport.onRequest((_from, type, payload) => {

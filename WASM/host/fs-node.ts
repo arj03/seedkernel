@@ -12,10 +12,11 @@ import { join } from "node:path";
 import type { Fs, FsStat } from "./fs.js";
 
 // An opaque key becomes a filename verbatim, so it must be a safe, flat name:
-// no separators, no `..`, nothing that could escape the directory. seedstore's
-// keys (hex block-ids + a short suffix) satisfy this; anything else is rejected
-// rather than silently mangled.
-const SAFE_KEY = /^[A-Za-z0-9._-]+$/;
+// no separators, no `.`/`..`, nothing that could escape the directory.
+// seedstore's keys (hex block-ids + a short suffix) satisfy this; anything else
+// is rejected rather than silently mangled. The lookahead excludes the bare
+// dot names, which are directory references, not files.
+const SAFE_KEY = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
 export class NodeFs implements Fs {
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }

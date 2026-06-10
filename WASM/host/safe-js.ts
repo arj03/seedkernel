@@ -161,34 +161,45 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   ctx.unwrapResult(await ctx.evalCodeAsync(PREAMBLE, "safe-js-preamble.js")).dispose();
   ctx.unwrapResult(await ctx.evalCodeAsync(opts.source, "safe-js-guest.js")).dispose();
 
+  // Calls are serialized per realm: a call() parks mid-await on every host
+  // bridge (Asyncify suspends the one shared VM), so a second concurrent call()
+  // would clobber the shared `__arg` global and re-enter the suspended VM.
+  let chain: Promise<unknown> = Promise.resolve();
+
+  const callOnce = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
+    if (opts.deadlineMs !== undefined) deadline = Date.now() + opts.deadlineMs;
+
+    const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
+    ctx.setProp(ctx.global, "__arg", argHandle);
+    argHandle.dispose();
+
+    // evalCodeAsync drives the Asyncify suspensions for every host call that is
+    // synchronously reachable inside the expression. The result is either the
+    // bytes directly (sync entrypoint) or a guest promise (async entrypoint);
+    // resolvePromise normalizes both, but it only settles once the job queue is
+    // pumped — hence resolvePromise → executePendingJobs → await, in that order
+    // (awaiting before the pump would deadlock).
+    const evalResult = ctx.unwrapResult(
+      await ctx.evalCodeAsync(`__invoke(${JSON.stringify(entry)}, __arg)`, "safe-js-invoke.js"),
+    );
+    const settledNative = ctx.resolvePromise(evalResult);
+    ctx.runtime.executePendingJobs();
+    const settled = await settledNative;
+    evalResult.dispose();
+
+    const valueHandle = ctx.unwrapResult(settled);
+    const lt = ctx.getArrayBuffer(valueHandle);
+    const out = lt.value.slice();
+    lt.dispose();
+    valueHandle.dispose();
+    return out;
+  };
+
   return {
-    async call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
-      if (opts.deadlineMs !== undefined) deadline = Date.now() + opts.deadlineMs;
-
-      const argHandle = ctx.newArrayBuffer(toArrayBuffer(payload));
-      ctx.setProp(ctx.global, "__arg", argHandle);
-      argHandle.dispose();
-
-      // evalCodeAsync drives the Asyncify suspensions for every host call that is
-      // synchronously reachable inside the expression. The result is either the
-      // bytes directly (sync entrypoint) or a guest promise (async entrypoint);
-      // resolvePromise normalizes both, but it only settles once the job queue is
-      // pumped — hence resolvePromise → executePendingJobs → await, in that order
-      // (awaiting before the pump would deadlock).
-      const evalResult = ctx.unwrapResult(
-        await ctx.evalCodeAsync(`__invoke(${JSON.stringify(entry)}, __arg)`, "safe-js-invoke.js"),
-      );
-      const settledNative = ctx.resolvePromise(evalResult);
-      ctx.runtime.executePendingJobs();
-      const settled = await settledNative;
-      evalResult.dispose();
-
-      const valueHandle = ctx.unwrapResult(settled);
-      const lt = ctx.getArrayBuffer(valueHandle);
-      const out = lt.value.slice();
-      lt.dispose();
-      valueHandle.dispose();
-      return out;
+    call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
+      const run = chain.then(() => callOnce(entry, payload));
+      chain = run.catch(() => {}); // a failed call must not poison the queue
+      return run;
     },
     dispose(): void {
       ctx.dispose();

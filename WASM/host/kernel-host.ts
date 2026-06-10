@@ -959,7 +959,21 @@ export class KernelHost {
   callHandler(name: Uint8Array, payload: Uint8Array): Uint8Array | null {
     const hid = this.nameToHandlerId.get(nameKey(name));
     if (hid === undefined) return null;
-    return this._invokeHandlerGetResponse(hid, name, payload);
+    // Same guards as the kernel.call router (§4.4): a handler the router would
+    // refuse (signature wrapper, installer, deployer-blocked mutators) must not
+    // become reachable by name through this host-side path either.
+    if (this.blockedFromCall.has(hid)) return null;
+    if (this.callDepth >= MAX_CALL_DEPTH) return null;
+    // Push an anonymous caller frame so the target (and any bridge doing the
+    // §8.2 capability check) sees "no installed caller" rather than a stale
+    // frame from an outer dispatch — the host/guest caller has no kernel name.
+    this.callerStack.push(null);
+    this.callDepth++;
+    try { return this._invokeHandlerGetResponse(hid, name, payload); }
+    finally {
+      this.callDepth--;
+      this.callerStack.pop();
+    }
   }
 
   /** Register a host-side handler. Returns the assigned id. */
