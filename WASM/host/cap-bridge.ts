@@ -51,6 +51,34 @@ export function capPreamble(): string {
   return Object.entries(CAP).map(([k, v]) => `const CAP_${k} = ${v};`).join("\n") + "\n";
 }
 
+/** Capability *domains* — named groups of ops. A bundle's signed manifest declares
+ *  the domains its guest needs (its `caps`), and the shell expands them to the
+ *  concrete op set it enforces (`allowedOps`) and to which backends it wires. This
+ *  is the coarse, human-auditable capability vocabulary: "this app reaches net + fs",
+ *  not a list of 18 op numbers. `ops` documents the ABI; `caps` is the grant. */
+export const CAP_DOMAINS = {
+  crypto: [CAP.HASH, CAP.STREAM_XOR, CAP.SIGN, CAP.VERIFY, CAP.IDENTITY, CAP.RANDOM],
+  net:    [CAP.NET_SEND, CAP.NET_REQUEST_MANY, CAP.NET_PEERS],
+  fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_HAS, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
+  module: [CAP.MODULE_CALL],
+  clock:  [CAP.CLOCK],
+} as const;
+
+export type CapDomain = keyof typeof CAP_DOMAINS;
+
+/** Expand declared capability domains to the concrete op numbers a bridge allows.
+ *  Throws on an unknown domain so a typo in a manifest fails loudly rather than
+ *  silently granting nothing (or, worse, everything). */
+export function opsForCaps(domains: Iterable<string>): number[] {
+  const out: number[] = [];
+  for (const d of domains) {
+    const ops = (CAP_DOMAINS as Record<string, readonly number[]>)[d];
+    if (!ops) throw new Error(`cap-bridge: unknown capability domain "${d}"`);
+    out.push(...ops);
+  }
+  return out;
+}
+
 /** The libsodium surface the crypto ops use — structural so any sumo build
  *  (the kernel's bundled `libsodium-wrappers-sumo`) satisfies it. */
 export interface CapSodium {

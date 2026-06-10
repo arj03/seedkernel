@@ -39,9 +39,13 @@ export interface BundleManifest {
   modules: BundleModule[];
   /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex. */
   guest: { file: string; hash: string };
-  /** Op catalog — the guest's `host.call(op)` seam (name → number). */
+  /** Op catalog — the guest's `host.call(op)` seam (name → number). Documents the
+   *  ABI the guest was built against; the shell enforces via `caps`, not this. */
   ops: Record<string, number>;
-  /** Capability ids (hex) the bundle requires from the runtime. */
+  /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
+   *  "module" | "clock") the bundle's guest is granted. The shell expands these to
+   *  the concrete allowed op set and wires only the matching backends — so this is
+   *  the enforced capability declaration, not just documentation. */
   caps: string[];
   /** App-specific constants the guest needs as injected globals (e.g. storage
    *  k/m/blockSize + the codec/reputation kernel names). Opaque to the runtime —

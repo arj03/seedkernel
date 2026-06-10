@@ -23,7 +23,7 @@ import { parsePolicy, buildApproveInstall, type ShellPolicy } from "./policy.js"
 import { verifyManifest, contentMatches, type BundleManifest } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
 import { Transport, type Network, type PeerId } from "./net.js";
-import { createCapBridge, capPreamble, type CapSodium } from "./cap-bridge.js";
+import { createCapBridge, capPreamble, opsForCaps, type CapSodium } from "./cap-bridge.js";
 import { createSafeRealm, createSyncSafeRealm, type SafeRealm, type SyncSafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { NodeFs } from "./fs-node.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
@@ -53,6 +53,13 @@ export interface ShellOptions extends KernelWasm {
   peers?: PeerId[];
   /** net.send timeout in ms (how long before a peer is treated unreachable). */
   timeoutMs?: number;
+  /** Operator-supplied app config, merged *over* the bundle manifest's `config`
+   *  into the guest's `const APP = …`. This is where per-node operator policy
+   *  lives — e.g. a storage node's `quota` byte budget — as opposed to the
+   *  author-signed manifest, which carries only content-structural constants
+   *  (k/m/blockSize…). Opaque to the runtime: the shell merges two maps and never
+   *  inspects a key, so it stays application-neutral. */
+  config?: Record<string, string | number>;
 }
 
 export interface LoadedBundle {
@@ -132,23 +139,35 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   };
   // One cap-bridge shape for both realms — kernel primitives only. The async
   // realm awaits net; the sync holder realm only ever calls the synchronous ops.
-  // The bundle's signed manifest declares its op catalog; the bridge refuses
-  // everything outside it, so a guest only ever holds the caps it declared.
-  const buildBridge = (b: LoadedBundle): SafeRealmBridge => createCapBridge({
-    // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
-    // bridge's minimal crypto surface (its crypto_generichash types the key as
-    // required) — narrow it, the same cast seedstore's loadSodium does.
-    sodium: sodium as unknown as CapSodium,
-    identity: opts.identity,
-    callHandler: (name, p) => host.callHandler(name, p),
-    transport, peers: () => [...peers], fs, now: () => Date.now(),
-    allowedOps: Object.values(b.manifest.ops ?? {}),
-  });
-  // The guest source as signed content, fronted by the generic op preamble and
-  // the bundle's app constants (`const APP = …`) — the same two blocks seedstore's
-  // Tier-2 coordinator injects. Both realms load the byte-identical program.
+  // The bundle's signed manifest declares the capability *domains* it needs
+  // (`caps`); the shell expands those to the concrete op set the bridge enforces
+  // and wires only the matching backends, so a guest holds exactly what it
+  // declared — nothing outside its caps resolves (`ops` only documents the ABI).
+  const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
+    const caps = new Set(b.manifest.caps ?? []);
+    return createCapBridge({
+      // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
+      // bridge's minimal crypto surface (its crypto_generichash types the key as
+      // required) — narrow it, the same cast seedstore's loadSodium does.
+      sodium: sodium as unknown as CapSodium,
+      identity: opts.identity,
+      callHandler: (name, p) => host.callHandler(name, p),
+      transport, peers: () => [...peers],
+      fs: caps.has("fs") ? fs : undefined,   // only hand over the fs backend if declared
+      now: () => Date.now(),
+      allowedOps: opsForCaps(caps),
+    });
+  };
+  // The guest source as signed content, fronted by the generic op preamble and the
+  // app constants (`const APP = …`). The author's manifest `config` carries the
+  // content-structural constants; the operator's `opts.config` merges over it (and
+  // wins) for per-node policy like a storage quota. The shell treats both as opaque
+  // — the same two blocks seedstore's Tier-2 coordinator injects. Both realms load
+  // the byte-identical program.
   const guestFullSource = (b: LoadedBundle): string =>
-    capPreamble() + `const APP = ${JSON.stringify(b.manifest.config ?? {})};\n` + b.guestSource;
+    capPreamble()
+    + `const APP = ${JSON.stringify({ ...(b.manifest.config ?? {}), ...(opts.config ?? {}) })};\n`
+    + b.guestSource;
 
   return {
     host, net, transport, fs, sodium, policy, peers,
@@ -274,11 +293,18 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   const identity = loadIdentity(sodium, keyPath);
   const { kernelBytes, bootstrapBytes } = await loadWasm();
 
+  // Operator-supplied app config (e.g. a storage node's quota), merged over the
+  // bundle's author-signed config. Opaque JSON the shell forwards into `const APP`.
+  const appConfig = args["app-config"]
+    ? JSON.parse(readFileSync(str(args, "app-config")!, "utf8")) as Record<string, string | number>
+    : undefined;
+
   const shell = await boot({
     kernelBytes, bootstrapBytes, policyJson, dir, identity,
     listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
     wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
     timeoutMs: args["timeout"] ? Number(str(args, "timeout")) : undefined,
+    config: appConfig,
   });
   const nodeNet = shell.net as NodeNetwork;
 

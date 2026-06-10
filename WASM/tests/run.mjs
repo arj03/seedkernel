@@ -27,7 +27,7 @@ const {
 // where they live, rather than only from a downstream consumer.
 const { NodeNetwork } = await imp("build/host/net-node.js");
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
-const { CAP, createCapBridge } = await imp("build/host/cap-bridge.js");
+const { CAP, createCapBridge, opsForCaps } = await imp("build/host/cap-bridge.js");
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
@@ -1447,6 +1447,18 @@ async function testCapBridgeEnforcement() {
   threw = false;
   try { await open(CAP.NET_REQUEST_MANY, U(7, 0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "NET_REQUEST_MANY with a count not backed by payload bytes is refused");
+
+  // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
+  // op set the bridge enforces (the "wire the caps" path). A guest that declared
+  // only "crypto" hashes fine but cannot touch fs, and a typo'd domain fails loudly.
+  const cryptoOnly = mk(opsForCaps(["crypto"]));
+  assertEqual((await cryptoOnly(CAP.HASH, U(1, 2))).length, 32, "a declared domain (crypto) grants its ops");
+  threw = false;
+  try { await cryptoOnly(CAP.FS_HAS, U(120)); } catch { threw = true; }
+  assert(threw, "an op outside the declared domains (fs) is refused");
+  threw = false;
+  try { opsForCaps(["crypto", "nope"]); } catch { threw = true; }
+  assert(threw, "an unknown capability domain throws (a manifest typo fails loudly)");
 
   console.log("  OK\n");
 }
