@@ -719,7 +719,7 @@ To run it locally: build the WASM artifacts (`kernel.wasm`, the signature/instal
 
 ## 13. The runtime as an app host: capabilities, the shell, and signed bundles
 
-Chat (§12) is a browser shell wired by hand. The same onion ships as a **general runtime artifact** — the *shell* — that any app rides on as **signed content**. The shell knows nothing about chat or storage; it offers a fixed, generic surface, verifies a bundle against a policy, and *becomes* whatever the bundle is. [seed store](https://github.com/arj03/seedstore) is the worked example: a full peer-to-peer storage node is the shell plus a signed seed store bundle, with no storage-specific code in the runtime.
+Chat (§12) is a browser shell wired by hand. The same onion ships as a **general runtime artifact** — the *shell* — that any app rides on as **signed content**. The shell knows nothing about chat or storage; it offers a fixed, generic surface, verifies a bundle against a policy, and *becomes* whatever the bundle is. [seed store](https://github.com/arj03/seedstore) is the worked example: a full peer-to-peer storage node is the shell plus a signed bundle, with no storage-specific code in the runtime.
 
 Two capability vocabularies coexist from here on, and keeping them apart matters:
 
@@ -737,7 +737,7 @@ Beyond the per-install caps that bridges check at I/O time (§8), the runtime pr
 - `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`has`/`size`/`list`/`delete`/`stat`. An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
 - `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
 
-Anything with *structure* is a **no-capability module** that transforms bytes: WebSocket framing is `ws.wasm` (`./ws`), Reed–Solomon is seed store's `codec.wasm` — both pure transforms the host drives, never something the kernel knows.
+Anything with *structure* is a **no-capability module** that transforms bytes: WebSocket framing is `ws.wasm` (`./ws`), Reed–Solomon erasure coding is an app's `codec.wasm` — both pure transforms the host drives, never something the kernel knows.
 
 ### 13.2 The cap-bridge: the guest op ABI
 

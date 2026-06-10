@@ -14,7 +14,7 @@
 // call and is restored when the promise settles. So guest JS runs unchanged, with
 // no host-driven step loop. The same `quickjs.wasm` is hosted by JSC here
 // (Node/Bun) and by WAMR in the native engine later — one artifact for both
-// runtimes (the runtime split). seedstore builds its Tier-2 confinement on top
+// runtimes (the runtime split). An app builds its own guest confinement on top
 // of this generic primitive (README §13.3).
 //
 // A second factory, `createSyncSafeRealm`, runs the *non-Asyncify* QuickJS build:

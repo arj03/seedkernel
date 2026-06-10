@@ -148,7 +148,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     return createCapBridge({
       // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
       // bridge's minimal crypto surface (its crypto_generichash types the key as
-      // required) — narrow it, the same cast seedstore's loadSodium does.
+      // required) — narrow it with a cast; the bundled sumo build satisfies the
+      // surface at runtime.
       sodium: sodium as unknown as CapSodium,
       identity: opts.identity,
       callHandler: (name, p) => host.callHandler(name, p),
@@ -161,9 +162,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // The guest source as signed content, fronted by the generic op preamble and the
   // app constants (`const APP = …`). The author's manifest `config` carries the
   // content-structural constants; the operator's `opts.config` merges over it (and
-  // wins) for per-node policy like a storage quota. The shell treats both as opaque
-  // — the same two blocks seedstore's Tier-2 coordinator injects. Both realms load
-  // the byte-identical program.
+  // wins) for per-node policy like a storage quota. The shell treats both as opaque.
+  // Both realms load the byte-identical program.
   const guestFullSource = (b: LoadedBundle): string =>
     capPreamble()
     + `const APP = ${JSON.stringify({ ...(b.manifest.config ?? {}), ...(opts.config ?? {}) })};\n`

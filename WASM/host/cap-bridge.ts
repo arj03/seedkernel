@@ -10,9 +10,9 @@
 //
 // This is what lets the seedkernel shell run an arbitrary signed guest: it
 // constructs a cap-bridge from kernel primitives it already holds (README
-// §13.2). seedstore's Tier-2 coordinator constructs the identical
-// bridge, so a file orchestrated through the confined guest is byte-compatible
-// with the host-side reference path.
+// §13.2). A host-side caller that holds the same primitives constructs the
+// identical bridge, so output orchestrated through the confined guest is
+// byte-compatible with a host-side reference path.
 
 import type { Fs } from "./fs.js";
 import type { PeerId } from "./net.js";
@@ -116,8 +116,8 @@ export interface CapBridgeDeps {
   /** The allowed op set, expanded from the manifest's declared cap domains
    *  (README §13.2, `opsForCaps` — not from `ops`, which is documentation-only).
    *  When present, any op outside the set is refused — the guest analogue of the
-   *  §8.2 bridge check. Omitted = unrestricted (a host-side caller like
-   *  seedstore's Tier-2 coordinator, which holds the primitives anyway). */
+   *  §8.2 bridge check. Omitted = unrestricted (a trusted host-side caller that
+   *  holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
 
