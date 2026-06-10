@@ -10,8 +10,15 @@
 // messages (TCP gets message framing from a length prefix; WebSocket already has
 // message boundaries). Three short message types ride the channel:
 //   HELLO = pubkey(32) ‖ nonce(32)         sent by both ends immediately
-//   AUTH  = sign(DOMAIN ‖ peer_nonce)(64)  proves possession of the privkey
+//   AUTH  = sign(transcript)(64)           binds both pubkeys + both nonces
 //   FRAME = the opaque Network frame        only after both ends authenticate
+//
+// AUTH signs the whole transcript — DOMAIN ‖ the two (pubkey ‖ nonce) pairs in a
+// canonical order — not just the peer's nonce. Signing the nonce alone would make a
+// node a signing oracle: an attacker could relay a victim's outstanding nonce as its
+// own HELLO, collect the node's signature, and replay it on another connection to
+// impersonate the node. Binding both identities and both nonces ties every signature
+// to the single exchange that produced it, so a harvested one verifies nowhere else.
 
 import { toHex } from "./util.js";
 
@@ -22,7 +29,7 @@ export interface Identity {
 }
 
 /** The narrow libsodium surface the channel handshake needs: sign/verify the
- *  nonce challenge and a CSPRNG for nonces. Any libsodium build satisfies it
+ *  handshake transcript and a CSPRNG for nonces. Any libsodium build satisfies it
  *  structurally, so the transport need not depend on a specific sodium type. */
 export interface TransportCrypto {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
@@ -40,7 +47,7 @@ export interface RawChannel {
 
 const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
 const PK_LEN = 32, NONCE_LEN = 32, SIG_LEN = 64;
-const DOMAIN = new TextEncoder().encode("seedstore-channel-id-v1\0");
+const DOMAIN = new TextEncoder().encode("seedkernel-channel-id-v1\0");
 // Cap on frames buffered while the handshake completes. Sends past it drop the
 // oldest — a peer that never authenticates cannot make us hoard memory.
 const MAX_QUEUE = 256;
@@ -70,6 +77,7 @@ export class PeerLink {
   private readonly sodium: TransportCrypto;
   private readonly myNonce: Uint8Array;
   private readonly queue: Uint8Array[] = [];
+  private peerNonce: Uint8Array | null = null;
   private closed = false;
 
   constructor(opts: PeerLinkOptions) {
@@ -112,11 +120,22 @@ export class PeerLink {
     this.ch.send(this.tag(MSG_HELLO, hello));
   }
 
-  private signFor(nonce: Uint8Array): Uint8Array {
-    const msg = new Uint8Array(DOMAIN.length + nonce.length);
+  /** The bytes both ends sign and verify: DOMAIN followed by each side's
+   *  (pubkey ‖ nonce) block, the two ordered by their bytes so both ends derive an
+   *  identical transcript regardless of who dialed. Requires peerPubkey/peerNonce. */
+  private transcript(): Uint8Array {
+    const mine = new Uint8Array(PK_LEN + NONCE_LEN);
+    mine.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
+    mine.set(this.myNonce, PK_LEN);
+    const theirs = new Uint8Array(PK_LEN + NONCE_LEN);
+    theirs.set(this.peerPubkey!, 0);
+    theirs.set(this.peerNonce!, PK_LEN);
+    const [lo, hi] = bytesCompare(mine, theirs) <= 0 ? [mine, theirs] : [theirs, mine];
+    const msg = new Uint8Array(DOMAIN.length + lo.length + hi.length);
     msg.set(DOMAIN, 0);
-    msg.set(nonce, DOMAIN.length);
-    return this.sodium.crypto_sign_detached(msg, this.opts.identity.privateKey);
+    msg.set(lo, DOMAIN.length);
+    msg.set(hi, DOMAIN.length + lo.length);
+    return msg;
   }
 
   private onMessage(m: Uint8Array): void {
@@ -135,18 +154,18 @@ export class PeerLink {
     const peerId = toHex(pubkey);
     if (this.opts.expectPeerId && peerId !== this.opts.expectPeerId) { this.close(); return; }
     this.peerPubkey = pubkey;
+    this.peerNonce = peerNonce;
     this.peerId = peerId;
-    // Answer the peer's challenge: sign the nonce it chose.
-    this.ch.send(this.tag(MSG_AUTH, this.signFor(peerNonce)));
+    // Authenticate over the full transcript — both pubkeys, both nonces — so this
+    // signature is bound to this exchange and cannot be replayed on another.
+    const sig = this.sodium.crypto_sign_detached(this.transcript(), this.opts.identity.privateKey);
+    this.ch.send(this.tag(MSG_AUTH, sig));
   }
 
   private onAuth(sig: Uint8Array): void {
-    if (this.authed || !this.peerPubkey || sig.length < SIG_LEN) { this.close(); return; }
-    const msg = new Uint8Array(DOMAIN.length + this.myNonce.length);
-    msg.set(DOMAIN, 0);
-    msg.set(this.myNonce, DOMAIN.length);
+    if (this.authed || !this.peerPubkey || !this.peerNonce || sig.length < SIG_LEN) { this.close(); return; }
     let ok = false;
-    try { ok = this.sodium.crypto_sign_verify_detached(sig.slice(0, SIG_LEN), msg, this.peerPubkey); }
+    try { ok = this.sodium.crypto_sign_verify_detached(sig.slice(0, SIG_LEN), this.transcript(), this.peerPubkey); }
     catch { ok = false; }
     if (!ok) { this.close(); return; }
     this.authed = true;

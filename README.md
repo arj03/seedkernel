@@ -857,11 +857,18 @@ Three link-layer messages, each tagged with a leading type byte:
 
 ```
 HELLO = [0x01][pubkey: 32][nonce: 32]    sent by both ends immediately
-AUTH  = [0x02][sig: 64]                  sig = Ed25519(DOMAIN ‖ peer_nonce)
+AUTH  = [0x02][sig: 64]                  sig = Ed25519(transcript) — see below
 FRAME = [0x03][network frame ..]         accepted only after AUTH verifies
 ```
 
-`DOMAIN` is the constant `"seedstore-channel-id-v1\0"` — domain separation so a handshake signature cannot double as any other protocol's signature over the same bytes. (The seedstore-prefixed name is wire compatibility with deployed seedstore nodes; renaming it is a handshake version bump.) An outbound dial pins `expectPeerId`: if the far end's HELLO presents a different key, the link closes — no silent re-pointing. Frames sent before authentication completes are queued, capped at `MAX_QUEUE = 256` with oldest-dropped, so a peer that never authenticates cannot make a node hoard memory.
+AUTH signs the whole **transcript**, not just a nonce:
+
+```
+transcript = DOMAIN ‖ lo ‖ hi
+             {lo, hi} = the two `pubkey ‖ nonce` pairs (mine, the peer's) sorted by bytes
+```
+
+Both ends derive the *same* transcript — the two `pubkey ‖ nonce` pairs ordered canonically, so dialer and accepter agree regardless of who opened the socket — each signs it with its own key, and each verifies the peer's AUTH against it. Because the signature commits to **both identities and both nonces**, a signature collected on one connection — including from a node deliberately used as a signing oracle — names the wrong peer on any other connection and fails to verify. This is what closes the impersonation hole a nonce-only AUTH would have (sign the victim's outstanding nonce, replay it elsewhere as the victim); see §15. `DOMAIN` is the constant `"seedkernel-channel-id-v1\0"` — domain separation so a handshake signature cannot double as any other protocol's signature over the same bytes; renaming it is a handshake version bump. An outbound dial pins `expectPeerId`: if the far end's HELLO presents a different key, the link closes — no silent re-pointing. Frames sent before authentication completes are queued, capped at `MAX_QUEUE = 256` with oldest-dropped, so a peer that never authenticates cannot make a node hoard memory.
 
 Above the link, `Transport` (`host/net.ts`) runs typed request/response plus a bulk plane:
 
@@ -874,7 +881,7 @@ bulk        = [0x02][block_id: 32][bytes ..]     unsigned; the receiver verifies
 
 A response resolves only if it arrives from the peer the request went to, so an authenticated-but-malicious cohort member cannot answer on another peer's behalf by guessing the correlation counter. `requestMany` is host-side scatter-gather over this — the one concurrency a confined guest cannot do itself — returning one `{peer, ok, bytes}` entry per input peer: partial results, never a rejection.
 
-**What the handshake gives — and what it doesn't.** It authenticates that the far end held the claimed private key at handshake time, and attributes every subsequent frame on that channel to that key. It does **not** encrypt — frames are plaintext on the wire (§15) — and it establishes no session key: post-handshake frames are bound to the identity only by the channel itself. There is also a known structural weakness: the AUTH signature covers `DOMAIN ‖ nonce` only — not the signer's own pubkey, the intended peer, or the channel — and a node signs the nonce from any HELLO it receives, before that peer has authenticated. Any party able to connect to a node can therefore use it as a *signing oracle*: present the victim's outstanding nonce as one's own HELLO nonce, collect `sign(DOMAIN ‖ nonce)`, and replay it on another connection to impersonate the victim. The binding is sound against passive misattribution and misconfiguration, **not** against an active attacker who can reach the node being impersonated. Deployments that need channel authentication against active network attackers MUST either run `PeerLink` inside an encrypted, mutually-authenticated tunnel (TLS, Noise) or strengthen AUTH to sign the full transcript — both pubkeys and both nonces — under a new `DOMAIN` version. See §15.
+**What the handshake gives — and what it doesn't.** Because AUTH signs the full transcript, it authenticates that the far end held the claimed private key *for this exchange*: the signature is bound to the exact pair of identities and nonces that produced it, so it cannot be harvested on one connection and replayed on another, and a node used as a signing oracle yields nothing reusable. Every subsequent frame on the channel is attributed to that authenticated key. What it does **not** do is establish a session key, and it does **not** encrypt — frames are plaintext on the wire (§15), and post-handshake frames are bound to the identity only by the channel itself, with no per-frame MAC. So the binding is sound against impersonation and misattribution, but an active attacker who can hijack or inject into the live TCP stream *after* authentication can still read and forge frames. Deployments that need confidentiality, or integrity against an in-path attacker on the established channel, MUST run `PeerLink` inside an encrypted, mutually-authenticated tunnel (TLS, Noise). See §15.
 
 ### 13.7 The shell
 
@@ -927,7 +934,7 @@ The security properties are introduced where they arise (§2.3, §3.1, §4.4, §
 
 **Authentication, not confidentiality.** Kernel envelopes are *signed, not encrypted*. The protocol provides message authentication and integrity (via the signature wrapper, §6.3) and replay resistance for mutators (§4.4) — it provides **no** confidentiality. In the reference demo, confidentiality comes entirely from the DTLS layer underneath WebRTC (§12); any non-DTLS transport, or at-rest storage of envelopes, has none unless a deployment adds an encryption module (which composes as another wrapper, §2.1). The node↔node transport (§13.6) is exactly such a non-DTLS transport: the handshake authenticates, but every frame after it — kernel envelopes, control requests, bulk blocks — travels in plaintext.
 
-**The channel handshake is not an AKE.** §13.6's AUTH signature covers `DOMAIN ‖ nonce` only, and a node signs any nonce presented in a HELLO, so anyone who can connect to a node can harvest a signature that impersonates it on another connection (the signing-oracle attack, §13.6). Frame attribution on a `PeerLink` is therefore trustworthy only while the impersonated node is unreachable to the attacker — a weak assumption on open networks. Until AUTH binds the full transcript (both pubkeys, both nonces), treat the §13.6 identity binding as hardening rather than authentication, and put TLS/Noise underneath when the threat model includes active network attackers.
+**The channel handshake authenticates, but is not an AKE.** §13.6's AUTH signature covers the full transcript — both pubkeys and both nonces, canonically ordered — so a node that is induced to sign (the signing-oracle setup) produces a signature bound to *that* exchange's identities, useless for impersonating it on any other connection. Frame attribution on a `PeerLink` is therefore sound against impersonation and misattribution. What the handshake still does **not** provide is a session key: it proves who the far end was at handshake time, but the frames that follow are neither encrypted nor individually authenticated (§13.6), so an attacker who can hijack or inject into the live TCP stream after authentication can still read and forge frames. When the threat model includes active in-path network attackers, run `PeerLink` inside an encrypted, mutually-authenticated tunnel (TLS, Noise).
 
 **Bundle freshness.** A manifest has no `seq` and no lineage (§13.4): an older signed bundle directory re-loads in full, guest included — a downgrade the format does not detect. This is acceptable while bundles are operator-supplied local input (the operator is the TCB), but a wire-delivery path must add a monotonicity rule — e.g. monotonic version per `(author, app)` — before accepting bundles from peers.
 
@@ -975,7 +982,7 @@ These belong to the reference runtime (§13), not the kernel protocol — a diff
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§13.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§13.4) | Ed25519 detached signature over the JSON bytes. |
 | Link message tags | `HELLO 0x01`, `AUTH 0x02`, `FRAME 0x03` | `PeerLink` (§13.6) | Handshake + frame plane. |
-| `DOMAIN` | `"seedstore-channel-id-v1\0"` | AUTH signature (§13.6) | Domain-separation prefix; renaming is a handshake version bump. |
+| `DOMAIN` | `"seedkernel-channel-id-v1\0"` | AUTH signature (§13.6) | Domain-separation prefix for the signed transcript; renaming is a handshake version bump. |
 | `MAX_QUEUE` | `256` | `PeerLink` (§13.6) | Frames buffered pre-auth; oldest dropped. |
 | Transport frame kinds | `req 0x00`, `res 0x01`, `bulk 0x02` | `Transport` (§13.6) | Control + bulk planes. |
 | Default request timeout | `2000` ms | shell boot (§13.7) | Response deadline before a peer counts as unreachable (`--timeout`). |
