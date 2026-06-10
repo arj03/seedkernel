@@ -1,4 +1,4 @@
-// The real Network (README §16) for a server node — node↔node over TCP and
+// The real Network (README §13.6) for a server node — node↔node over TCP and
 // browser↔node over WebSocket. It satisfies the same Network interface the
 // Transport/cohort/coordinator drive, so nothing above it changes; only the
 // fabric underneath is new.

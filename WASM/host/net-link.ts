@@ -1,4 +1,4 @@
-// Channel identity binding (README §16). A real socket carries no trustworthy
+// Channel identity binding (README §13.6). A real socket carries no trustworthy
 // "from" field, so before a connection is allowed to deliver frames it runs a
 // mutual challenge/response that proves each end holds the kernel private key
 // for the public key it claims. From then on every frame is attributed to that
@@ -15,7 +15,7 @@
 
 import { toHex } from "./util.js";
 
-/** A peer identity — a kernel ed25519 keypair (README §2, §16). */
+/** A peer identity — the node's kernel ed25519 keypair (README §13.6). */
 export interface Identity {
   publicKey: Uint8Array;
   privateKey: Uint8Array;

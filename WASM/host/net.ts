@@ -1,17 +1,17 @@
-// net.send transport (README §16) + a request/response layer over it.
+// net.send transport (README §13.6) + a request/response layer over it.
 //
 // net.send is "addressed unicast to a peer over its data channel" and is async
 // by nature — it returns a correlation id and the host later delivers the
-// response (§16). This module provides:
+// response (§13.6). This module provides:
 //   - Network:   the delivery fabric. LoopbackNetwork wires nodes in-process
 //                for tests; a WebRTC/data-channel or TCP implementation (see
 //                net-node.ts) satisfies the same interface in a real deployment.
 //   - Transport: per-node request/response keyed by correlation id, plus the
-//                bulk one-way frame path for content-addressed blocks (§3).
+//                bulk one-way frame path for content-addressed blocks (§13.6).
 //
 // Frames on the wire:
 //   control req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
-//   bulk block.data = [2 kind][block_id 32][ciphertext ...]   (unsigned, §3)
+//   bulk block.data = [2 kind][block_id 32][ciphertext ...]   (unsigned, §13.6)
 
 import { writeU32BE, readU32BE } from "./util.js";
 
@@ -31,7 +31,7 @@ export interface Network {
 
 /** In-process network for tests and single-process multi-node demos. Delivery
  *  is asynchronous (a microtask) to mirror a real data channel. A peer can be
- *  taken offline to model churn (§8): frames to or from it are dropped, so the
+ *  taken offline to model churn: frames to or from it are dropped, so the
  *  sender's request rejects and the cohort tips it toward Suspected/Lost. */
 export class LoopbackNetwork implements Network {
   private sinks = new Map<PeerId, (from: PeerId, frame: Uint8Array) => void>();
@@ -89,7 +89,7 @@ export class Transport {
     readonly peerId: PeerId,
     private readonly net: Network,
     /** How long to wait for a response before treating the peer as unreachable
-     *  (§8). Small in tests; a deployment tunes it against real latency. */
+     *  (§13.6). Small in tests; a deployment tunes it against real latency. */
     private readonly timeoutMs = 200,
   ) {
     this.net.register(peerId, (from, frame) => this.onFrame(from, frame));
@@ -140,7 +140,7 @@ export class Transport {
   }
 
   /** Push a content-addressed block over the bulk plane — unsigned, the
-   *  receiver verifies genesis_hash(bytes) == block_id itself (§3). */
+   *  receiver verifies genesis_hash(bytes) == block_id itself (§13.6). */
   sendBulk(to: PeerId, blockId: Uint8Array, bytes: Uint8Array): void {
     const frame = new Uint8Array(1 + 32 + bytes.length);
     frame[0] = KIND_BULK;

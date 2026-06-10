@@ -14,8 +14,8 @@
 // call and is restored when the promise settles. So guest JS runs unchanged, with
 // no host-driven step loop. The same `quickjs.wasm` is hosted by JSC here
 // (Node/Bun) and by WAMR in the native engine later — one artifact for both
-// runtimes (the runtime split). seedstore builds its Tier-2 confinement
-// (README §2.1) on top of this generic primitive.
+// runtimes (the runtime split). seedstore builds its Tier-2 confinement on top
+// of this generic primitive (README §13.3).
 //
 // A second factory, `createSyncSafeRealm`, runs the *non-Asyncify* QuickJS build:
 // same ABI, but `host.call` resolves synchronously with no stack unwind. It exists
@@ -53,7 +53,7 @@ export interface SafeRealmOptions {
   memoryLimitBytes?: number;
   /** Optional wall-clock budget per `call()` (ms). Coarse: it counts time spent
    *  awaiting host bridges too, so size it generously. The fine-grained CPU
-   *  watchdog stays a host Worker concern (see BUN.md §2.1). */
+   *  watchdog stays a host Worker concern (README §4.3). */
   deadlineMs?: number;
 }
 

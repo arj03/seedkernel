@@ -1,10 +1,10 @@
-// seedkernel-shell — the generic runtime entry (the runtime split).
+// seedkernel-shell — the generic runtime entry (README §13).
 // It boots the kernel under an install policy and serves; it knows nothing about
 // storage or any other app. Everything an app needs arrives as signed installs
 // that must clear the --policy gate. The runtime offers raw-byte capabilities —
 // crypto (the bundled sumo), fs.* on --dir, net.* on --listen — and the safe-js
-// confinement host, held ready to be wired to an app's declared caps once the
-// app cap ABI lands (step 6); the kernel itself stays application-neutral.
+// confinement host, wired to a bundle's declared cap domains when one loads
+// (§13.4); the kernel itself stays application-neutral.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 --install ./codec.install,./reputation.install
@@ -42,7 +42,7 @@ export interface ShellOptions extends KernelWasm {
   policyJson: string;
   /** Directory backing the fs.* capability. */
   dir: string;
-  /** This node's kernel keypair (§2). */
+  /** This node's kernel keypair (README §13.6). */
   identity: Identity;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
@@ -88,14 +88,14 @@ export interface Shell {
   loadBundle(dir: string): LoadedBundle;
   /** Run a loaded bundle's guest entrypoint (e.g. put/get/repair) through a
    *  generic cap-bridge over the kernel's primitives. Load a bundle first. This
-   *  is "the shell runs the app" (the runtime split). */
+   *  is "the shell runs the app" (README §13.7). */
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   /** Serve the app's request side: build a *synchronous* confined realm from the
    *  loaded guest and route incoming transport requests to its `handle`
    *  entrypoint. The sync realm answers from local fs + crypto without yielding,
    *  so it can respond while the async `runGuest` realm is parked mid-await — this
-   *  is how the runtime becomes a holder with no app-specific host code (PLAN-
-   *  runtime-split.md, step 8). Idempotent; load a bundle first. */
+   *  is how the runtime becomes a holder with no app-specific host code
+   *  (README §13.7). Idempotent; load a bundle first. */
   serveAsHolder(): Promise<void>;
   close(): void;
 }
@@ -340,8 +340,8 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
     }
   }
   // One-shot client ops through the loaded guest — "the shell runs the app" as
-  // the *initiator* (the runtime split). The request (holder) side is
-  // served below once we start listening (step 8), from the same confined guest.
+  // the *initiator* (README §13.7). The request (holder) side is
+  // served below once we start listening, from the same confined guest.
   // The shell stays application-neutral: arguments cross as raw bytes (hex
   // tokens joined by ':') and responses come back as raw bytes — any structure
   // in them belongs to the app, so the shell prints hex and never decodes.
@@ -360,14 +360,14 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   }
 
   if (args["relay"]) {
-    console.warn(`  relay  ${str(args, "relay")}: relay client not yet wired (step 5 follow-up) — ignored`);
+    console.warn(`  relay  ${str(args, "relay")}: relay client not yet wired — ignored`);
   }
 
   const serving = !!(nodeNet.port || nodeNet.wsPort);
   if (!serving) { shell.close(); return; }
   // A serving node with an app loaded also *holds* for the cohort: route incoming
   // requests to the app's confined request side (HAVE/OFFER/STORE/FETCH for
-  // storage), with no app-specific host code in the runtime (step 8).
+  // storage), with no app-specific host code in the runtime (README §13.7).
   if (args["bundle"]) {
     await shell.serveAsHolder();
     console.log("  holder serving the app's request side from the confined guest");

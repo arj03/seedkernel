@@ -1,10 +1,10 @@
-// The app bundle format (the runtime split). A bundle is *signed
+// The app bundle format (README §13.4). A bundle is *signed
 // content* the generic shell loads from a file: a set of WASM handler modules, a
 // zero-authority guest program, and a signed manifest declaring the op catalog +
 // the capabilities the bundle needs. The shell verifies the manifest signature,
 // governs it against its policy (author + module hashes), and installs the
 // modules; the manifest's `ops`/`caps` describe the seam the app's guest is wired
-// over — honored by the generic cap bridge in step 7.
+// over — honored by the generic cap bridge (README §13.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
 // (its build-bundle script). On disk a bundle is a directory:

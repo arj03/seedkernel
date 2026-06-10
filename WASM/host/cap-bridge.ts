@@ -9,8 +9,8 @@
 // nonce convention — is the guest's business, built on top of these primitives.
 //
 // This is what lets the seedkernel shell run an arbitrary signed guest: it
-// constructs a cap-bridge from kernel primitives it already holds (PLAN-runtime-
-// split.md, step 7). seedstore's Tier-2 coordinator constructs the identical
+// constructs a cap-bridge from kernel primitives it already holds (README
+// §13.2). seedstore's Tier-2 coordinator constructs the identical
 // bridge, so a file orchestrated through the confined guest is byte-compatible
 // with the host-side reference path.
 
@@ -100,7 +100,9 @@ export interface CapTransport {
 /** Everything a cap-bridge needs — all kernel primitives, zero app knowledge. */
 export interface CapBridgeDeps {
   sodium: CapSodium;
-  /** This node's kernel keypair (§2): SIGN signs as it, IDENTITY returns its pk. */
+  /** This node's kernel keypair (README §13.1): SIGN signs as it, IDENTITY
+   *  returns its pk — so a `crypto`-domain guest holds a signing oracle under
+   *  this key (README §15). */
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
   /** Reach an installed WASM handler by name (KernelHost.callHandler). */
   callHandler: (name: Uint8Array, payload: Uint8Array) => Uint8Array | null;
@@ -111,10 +113,11 @@ export interface CapBridgeDeps {
   fs?: Fs;
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
-  /** The op numbers this guest's signed manifest declares (its `ops` catalog).
-   *  When present, any op outside the set is refused — capability enforcement
-   *  at the bridge (README §8.2). Omitted = unrestricted (a host-side caller
-   *  like seedstore's Tier-2 coordinator, which holds the primitives anyway). */
+  /** The allowed op set, expanded from the manifest's declared cap domains
+   *  (README §13.2, `opsForCaps` — not from `ops`, which is documentation-only).
+   *  When present, any op outside the set is refused — the guest analogue of the
+   *  §8.2 bridge check. Omitted = unrestricted (a host-side caller like
+   *  seedstore's Tier-2 coordinator, which holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
 

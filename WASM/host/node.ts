@@ -8,7 +8,7 @@ import { KernelHost } from "./kernel-host.js";
 
 // The runtime bundles the sumo build so apps that need symbols beyond the
 // kernel's own Ed25519 + SHA-3 (e.g. seedstore's crypto_stream_xchacha20_xor)
-// reuse one libsodium rather than shipping a second (README §16). A *static*
+// reuse one libsodium rather than shipping a second (README §13.1). A *static*
 // import (not createRequire) so `bun build --compile` bundles the package into
 // the standalone shell binary — a dynamic require resolves to nothing there. The
 // default export is the wrapper object; cast it to the module-namespace type the
@@ -36,7 +36,7 @@ export async function ensureSodium(): Promise<void> {
 
 /** Load and ready the bundled sumo libsodium and return the shared instance.
  *  Apps (and the host) reuse this one instance rather than each importing their
- *  own copy of the crypto library (README §16). */
+ *  own copy of the crypto library (README §13.1). */
 export async function loadSodium(): Promise<typeof sodium> {
   await sodium.ready;
   return sodium;
