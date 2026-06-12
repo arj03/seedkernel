@@ -426,7 +426,11 @@ class WsClientChannel extends WsChannelBase {
     const sep = indexOfCRLFCRLF(buf);
     if (sep < 0) return -1;
     const header = new TextDecoder().decode(buf.subarray(0, sep));
-    if (!/HTTP\/1\.1 101/.test(header) || !header.toLowerCase().includes(`sec-websocket-accept: ${this.expectAccept.toLowerCase()}`)) {
+    // Sec-WebSocket-Accept is base64 (case-significant), so extract the exact
+    // header value and compare byte-for-byte rather than via a lowercased
+    // substring match — robust to header whitespace and avoids case folding the
+    // base64 on both sides.
+    if (!/HTTP\/1\.1 101/.test(header) || headerValue(header, "sec-websocket-accept") !== this.expectAccept) {
       throw new Error("ws: upgrade refused");
     }
     return sep + 4;
@@ -442,7 +446,8 @@ function indexOfCRLFCRLF(b: Uint8Array): number {
 
 /** Case-insensitively pull a header value out of an HTTP request head. */
 function headerValue(head: string, name: string): string | null {
-  const re = new RegExp(`^${name}:[ \\t]*(.+?)[ \\t]*$`, "im");
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}:[ \\t]*(.+?)[ \\t]*$`, "im");
   const m = re.exec(head);
   return m ? m[1] : null;
 }

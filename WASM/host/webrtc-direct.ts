@@ -234,6 +234,11 @@ export class WebRtcDirectListener {
     } catch (e) {
       dlog("flow failed:", (e as Error)?.message ?? e);
       this.flows.delete(`${rinfo.address}:${rinfo.port}`);
+      // dtls.start()/sctp.start() may have spun up timers and event subscribers
+      // before throwing; stop them (same order as close()) so a failed flow
+      // doesn't leak. conn.close() can't free the shared UDP socket.
+      try { void flow.sctp.stop(); } catch { /* ignore */ }
+      try { void flow.dtls.stop(); } catch { /* ignore */ }
       try { flow.conn.close(); } catch { /* ignore */ }
     }
   }

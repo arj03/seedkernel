@@ -19,7 +19,7 @@
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
-import { writeU32BE } from "./util.js";
+import { toHex, writeU32BE } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -111,9 +111,7 @@ interface WasmHandlerRef {
 }
 
 export function nameKey(name: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < name.length; i++) s += name[i].toString(16).padStart(2, "0");
-  return s;
+  return toHex(name);
 }
 
 // The u32-BE codec lives in util.ts; re-exported here because this module is

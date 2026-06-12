@@ -1,9 +1,11 @@
 // Small byte helpers shared across the runtime host. No dependencies.
 
+const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+
 export function toHex(b: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, "0");
-  return s;
+  const out = new Array<string>(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = HEX_BYTE[b[i]];
+  return out.join("");
 }
 
 export function fromHex(hex: string): Uint8Array {
