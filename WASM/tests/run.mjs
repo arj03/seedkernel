@@ -1604,6 +1604,278 @@ async function testSafeRealmSerialization() {
   console.log("  OK\n");
 }
 
+// ─── Test: RtcChannel drives PeerLink over a data channel (net-rtc) ──────
+//
+// WebRTC as a first-class Network: an RTCDataChannel is wrapped as a RawChannel
+// and the unchanged PeerLink runs its identity handshake over it. We exercise the
+// genuinely new code — RtcChannel, including its pre-open send buffering — with a
+// fake whole-message channel pair (no real ICE), driving a full mutual handshake
+// and a post-auth frame. RtcNetwork's signaling/perfect-negotiation needs a real
+// RTCPeerConnection (browser or node-datachannel) and is exercised there.
+
+async function testRtcNetwork() {
+  console.log("Test: net-rtc — RtcChannel + PeerLink handshake over a (fake) data channel");
+  const { RtcChannel } = await imp("build/host/net-rtc.js");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // A minimal RTCDataChannel stand-in: an ordered whole-message binary pipe with
+  // controllable open timing, wired to its twin. Delivery is async (a microtask)
+  // to mirror a real channel; send() ships an ArrayBuffer, as binaryType
+  // "arraybuffer" does on the wire.
+  function fakeChannelPair() {
+    const mk = () => ({
+      binaryType: "blob",
+      readyState: "connecting",
+      _l: { message: [], open: [], close: [], error: [] },
+      _twin: null,
+      addEventListener(t, cb) { (this._l[t] ??= []).push(cb); },
+      send(bytes) {
+        const buf = bytes.slice().buffer; // copy → fresh ArrayBuffer, like the wire
+        const twin = this._twin;
+        queueMicrotask(() => { for (const cb of twin._l.message) cb({ data: buf }); });
+      },
+      close() { this.readyState = "closed"; for (const cb of this._l.close) cb(); },
+      _open() { this.readyState = "open"; for (const cb of this._l.open) cb(); },
+    });
+    const a = mk(), b = mk();
+    a._twin = b; b._twin = a;
+    return [a, b];
+  }
+
+  const idA = generateKeyPair(), idB = generateKeyPair();
+  const [dcA, dcB] = fakeChannelPair();
+
+  // Construct both PeerLinks BEFORE the channels open: each emits its HELLO
+  // immediately, which must queue inside RtcChannel until "open" (the pre-open
+  // buffering path — the one thing RtcChannel adds over a raw pipe).
+  let authA = null, authB = null;
+  const framesB = [];
+  const linkA = new PeerLink({
+    channel: new RtcChannel(dcA), identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
+    onAuth: (pid) => { authA = pid; }, onFrame: () => {}, onClose: () => {},
+  });
+  const linkB = new PeerLink({
+    channel: new RtcChannel(dcB), identity: idB, sodium, weDialed: false, expectPeerId: toHex(idA.publicKey),
+    onAuth: (pid) => { authB = pid; }, onFrame: (_p, f) => framesB.push(f), onClose: () => {},
+  });
+
+  try {
+    // Nothing crosses while both ends are still "connecting".
+    await sleep(10);
+    assert(authA === null && authB === null, "no auth while channels are unopened (HELLO is buffered, not lost)");
+
+    // Open both ends: buffered HELLOs flush and the mutual challenge completes.
+    dcA._open(); dcB._open();
+    await sleep(20);
+    assertEqual(authA, toHex(idB.publicKey), "A authenticated B over the data channel");
+    assertEqual(authB, toHex(idA.publicKey), "B authenticated A over the data channel");
+
+    // A post-auth Network frame round-trips, attributed to the authenticated id.
+    linkA.send(new Uint8Array([9, 8, 7]));
+    await sleep(20);
+    assert(framesB.length === 1 && bytesEqual(framesB[0], new Uint8Array([9, 8, 7])),
+      "a frame sent after auth is delivered to the peer");
+
+    // A wrong-key expectation must refuse: B presents idB, but we expect a random id.
+    const [dcC, dcD] = fakeChannelPair();
+    let authC = null;
+    const linkC = new PeerLink({
+      channel: new RtcChannel(dcC), identity: idA, sodium, weDialed: true, expectPeerId: toHex(generateKeyPair().publicKey),
+      onAuth: (pid) => { authC = pid; }, onFrame: () => {}, onClose: () => {},
+    });
+    const linkD = new PeerLink({
+      channel: new RtcChannel(dcD), identity: idB, sodium, weDialed: false, expectPeerId: toHex(idA.publicKey),
+      onAuth: () => {}, onFrame: () => {}, onClose: () => {},
+    });
+    dcC._open(); dcD._open();
+    await sleep(20);
+    assert(authC === null, "a channel to a mismatched identity never authenticates");
+    linkC.close(); linkD.close();
+  } finally {
+    linkA.close(); linkB.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: two werift RtcNetworks connect over REAL WebRTC (net-rtc-node) ────
+//
+// The companion to testRtcNetwork: where that drives RtcChannel over a fake pipe,
+// this stands up two *real* RtcNetworks on a werift-backed peerConnectionFactory
+// and lets them complete a genuine ICE → DTLS → SCTP bring-up, then PeerLink's
+// identity handshake, then a Transport request/response — all over an actual data
+// channel. The relay is replaced by an in-process Signaling pair (a 2-party room
+// that forwards each JSON message to the other side, as the relay would), so the
+// test has no network dependency beyond loopback. This is the console side of the
+// browser↔console-through-NAT story: the same stack a browser tab runs, off-browser.
+
+function signalingPair() {
+  // Two endpoints that forward to each other. JSON round-tripping each message
+  // mirrors the relay wire (and proves the sdp/candidate objects RtcNetwork emits
+  // are plain and serialisable). Delivery is deferred, like a real socket.
+  let aCb = () => {}, bCb = () => {};
+  const post = (cb, msg) => { const m = JSON.parse(JSON.stringify(msg)); queueMicrotask(() => cb(m)); };
+  const a = { send: (m) => post(bCb, m), onMessage: (cb) => { aCb = cb; }, close() {} };
+  const b = { send: (m) => post(aCb, m), onMessage: (cb) => { bCb = cb; }, close() {} };
+  return [a, b];
+}
+
+async function testWeriftRtcNetwork() {
+  console.log("Test: net-rtc-node — two werift RtcNetworks connect over real WebRTC (ICE/DTLS/SCTP)");
+  const { RtcNetwork } = await imp("build/host/net-rtc.js");
+  const { weriftPeerConnectionFactory } = await imp("build/host/net-rtc-node.js");
+
+  const idA = generateKeyPair(), idB = generateKeyPair();
+  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
+  const [sigA, sigB] = signalingPair();
+  // Loopback host candidate so two peers on one machine connect with no STUN.
+  const pcFactory = weriftPeerConnectionFactory({ iceAdditionalHostAddresses: ["127.0.0.1"] });
+
+  const netA = new RtcNetwork({ identity: idA, sodium, signaling: sigA, peerConnectionFactory: pcFactory });
+  const netB = new RtcNetwork({ identity: idB, sodium, signaling: sigB, peerConnectionFactory: pcFactory });
+
+  // Generous timeout: werift's pure-JS DTLS/SCTP bring-up is slower than native.
+  const ta = new Transport(aId, netA, 4000);
+  const tb = new Transport(bId, netB, 4000);
+  tb.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
+
+  try {
+    netA.join(); netB.join(); // announce into the room → the WebRTC dance begins
+
+    const t0 = Date.now();
+    while ((!netA.linkedPeers().includes(bId) || !netB.linkedPeers().includes(aId)) && Date.now() - t0 < 15000) {
+      await sleep(100);
+    }
+    assert(netA.linkedPeers().includes(bId), "A holds an authenticated link to B over real WebRTC");
+    assert(netB.linkedPeers().includes(aId), "B holds an authenticated link to A over real WebRTC");
+
+    // A real request crosses the data channel and the typed response comes back.
+    const res = await ta.request(bId, 7, new Uint8Array([3, 4]));
+    assert(bytesEqual(res, new Uint8Array([7, 3, 4])), "request/response round-trips over the werift data channel");
+  } finally {
+    ta.close(); tb.close();
+    netA.close(); netB.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: WebRTC-Direct — relay-less browser→console with PeerLink (spike 2) ─
+//
+// The whole point of spike 2: a connection from a dial token alone — host + port +
+// the console's cert hash — with NO signaling relay and NO answer coming back. The
+// console is an ICE-lite agent on one UDP port (hand-rolled STUN demux driving
+// werift DTLS/SCTP, host/webrtc-direct.ts); the dialer fabricates the console's
+// answer locally from the certhash. We then run the unchanged PeerLink identity
+// handshake over the opened data channel and round-trip a frame — proving the
+// direct link is a first-class, authenticated seedstore link, not just a pipe.
+
+async function testWebRtcDirect() {
+  console.log("Test: webrtc-direct — relay-less dial-token link + PeerLink identity (spike 2)");
+  const { WebRtcDirectListener, dialWebRtcDirect, makeCertKeys, certhashFromKeys, weriftChannelToRaw } =
+    await imp("build/host/webrtc-direct.js");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  const keys = await makeCertKeys();
+  const certhash = certhashFromKeys(keys);
+  const serverId = generateKeyPair(), clientId = generateKeyPair();
+  const serverPub = toHex(serverId.publicKey);
+
+  // The console: each opened data channel runs a PeerLink (we accepted it).
+  let serverAuthed = null;
+  const serverFrames = [];
+  const listener = new WebRtcDirectListener({
+    keys, host: "127.0.0.1", port: 0,
+    onChannel: (dc) => {
+      new PeerLink({
+        channel: weriftChannelToRaw(dc), identity: serverId, sodium, weDialed: false,
+        onAuth: (pid) => { serverAuthed = pid; },
+        onFrame: (_pid, f) => serverFrames.push(f), onClose: () => {},
+      });
+    },
+  });
+  await listener.listen();
+  const { host, port } = listener.address();
+
+  let clientLink = null;
+  try {
+    // Dial with the token only — no relay, no answer-back.
+    const { channel, opened, close } = await dialWebRtcDirect({ host, port, certhash, timeoutMs: 15000 });
+    let clientAuthed = null;
+    // Wrap immediately (subscribes onMessage) so the console's HELLO is not missed,
+    // then let the channel finish opening.
+    clientLink = new PeerLink({
+      channel: weriftChannelToRaw(channel), identity: clientId, sodium, weDialed: true, expectPeerId: serverPub,
+      onAuth: (pid) => { clientAuthed = pid; }, onFrame: () => {}, onClose: () => {},
+    });
+    await opened;
+
+    // Wait for the mutual PeerLink handshake to complete over the direct channel.
+    const t0 = Date.now();
+    while ((!serverAuthed || !clientAuthed) && Date.now() - t0 < 5000) await sleep(50);
+    assertEqual(clientAuthed, serverPub, "dialer authenticated the console over the direct channel");
+    assertEqual(serverAuthed, toHex(clientId.publicKey), "console authenticated the dialer (in-channel AUTH, certhash untrusted)");
+
+    // A post-auth frame crosses the relay-less link.
+    clientLink.send(new Uint8Array([4, 2]));
+    const t1 = Date.now();
+    while (serverFrames.length === 0 && Date.now() - t1 < 3000) await sleep(50);
+    assert(serverFrames.length === 1 && bytesEqual(serverFrames[0], new Uint8Array([4, 2])),
+      "a frame crosses the WebRTC-Direct link after auth");
+
+    close();
+  } finally {
+    clientLink?.close();
+    listener.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: WebRtcDirectNetwork — a Network over relay-less WebRTC-Direct ──────
+//
+// WebRtcDirectListener+dial give a raw authenticated channel; WebRtcDirectNetwork
+// wraps those PeerLinks behind the same `Network` interface NodeNetwork/RtcNetwork
+// expose, so the Transport (and StorageNode above it) ride on top untouched. One
+// node listens (publishing a token), the other dials it — then a typed Transport
+// request/response crosses the relay-less link, proving a console serveDirect node
+// is a first-class storage-network peer, not just an echo pipe.
+
+async function testWebRtcDirectNetwork() {
+  console.log("Test: WebRtcDirectNetwork — a Network over relay-less WebRTC-Direct (spike 2)");
+  const { WebRtcDirectNetwork, makeCertKeys } = await imp("build/host/webrtc-direct.js");
+
+  const idS = generateKeyPair(), idC = generateKeyPair();
+  const sId = toHex(idS.publicKey), cId = toHex(idC.publicKey);
+  const keys = await makeCertKeys();
+
+  const netS = new WebRtcDirectNetwork({ identity: idS, sodium, keys, listen: { host: "127.0.0.1" } });
+  const netC = new WebRtcDirectNetwork({ identity: idC, sodium }); // dial-only
+
+  const tS = new Transport(sId, netS, 4000);
+  const tC = new Transport(cId, netC, 4000);
+  tS.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
+
+  try {
+    await netS.listen();
+    const peer = await netC.dial(netS.token("127.0.0.1"));
+    assertEqual(peer, sId, "dial resolved the server's authenticated id");
+    assert(netC.linkedPeers().includes(sId), "client holds a routable link to the server");
+
+    // The accepted side authenticates around the same time; wait for it.
+    const t0 = Date.now();
+    while (!netS.linkedPeers().includes(cId) && Date.now() - t0 < 3000) await sleep(50);
+    assert(netS.linkedPeers().includes(cId), "server holds the reverse link (the channel is bidirectional)");
+
+    const res = await tC.request(sId, 9, new Uint8Array([1, 2, 3]));
+    assert(bytesEqual(res, new Uint8Array([9, 1, 2, 3])), "Transport request/response over WebRtcDirectNetwork");
+  } finally {
+    tS.close(); tC.close(); netS.close(); netC.close();
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1632,6 +1904,10 @@ await testShellBoot();
 await testBundle();
 await testWsFraming();
 await testChannelPinning();
+await testRtcNetwork();
+await testWeriftRtcNetwork();
+await testWebRtcDirect();
+await testWebRtcDirectNetwork();
 await testSafeJs();
 await testSyncSafeRealm();
 await testCapBridgeEnforcement();

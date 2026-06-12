@@ -20,6 +20,30 @@
       "types": "./build/host/net-node.d.ts",
       "default": "./build/host/net-node.js"
     },
+    "./net-rtc": {
+      "types": "./build/host/net-rtc.d.ts",
+      "default": "./build/host/net-rtc.js"
+    },
+    "./net-link": {
+      "types": "./build/host/net-link.d.ts",
+      "default": "./build/host/net-link.js"
+    },
+    "./net-rtc-node": {
+      "types": "./build/host/net-rtc-node.d.ts",
+      "default": "./build/host/net-rtc-node.js"
+    },
+    "./webrtc-direct": {
+      "types": "./build/host/webrtc-direct.d.ts",
+      "default": "./build/host/webrtc-direct.js"
+    },
+    "./webrtc-direct-sdp": {
+      "types": "./build/host/webrtc-direct-sdp.d.ts",
+      "default": "./build/host/webrtc-direct-sdp.js"
+    },
+    "./webrtc-direct-browser": {
+      "types": "./build/host/webrtc-direct-browser.d.ts",
+      "default": "./build/host/webrtc-direct-browser.js"
+    },
     "./ws": {
       "types": "./build/host/ws.d.ts",
       "default": "./build/host/ws.js"
@@ -69,7 +93,8 @@
   },
   "dependencies": {
     "libsodium-wrappers-sumo": "0.8.4",
-    "quickjs-emscripten": "^0.32.0"
+    "quickjs-emscripten": "^0.32.0",
+    "werift": "^0.23.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
