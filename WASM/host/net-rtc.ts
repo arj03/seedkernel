@@ -20,12 +20,15 @@
 // authenticates and never delivers a byte.
 //
 // This module is browser-native (it uses the platform RTCPeerConnection /
-// RTCDataChannel / WebSocket). A Node peer joins the same mesh by swapping those
-// three for node-datachannel's equivalents behind the same RtcChannel / Signaling
-// — everything above the channel is untouched, the same "swap the channel, keep
-// the stack" move net-node.ts documents for the engine build. The browser globals
-// are referenced only inside RtcNetwork / relaySignaling, never at module scope,
-// so importing this module under Node (e.g. to unit-test RtcChannel) is safe.
+// RTCDataChannel / WebSocket). A Node/Bun console peer joins the same mesh by
+// passing a werift-backed `peerConnectionFactory` (./net-rtc-node
+// `weriftPeerConnectionFactory`) behind the same RtcChannel / Signaling —
+// everything above the channel is untouched, the same "swap the connection, keep
+// the stack" move net-node.ts documents for the engine build. (werift, pure-TS, is
+// used rather than the native node-datachannel, which segfaults under Bun.) The
+// browser globals are referenced only inside RtcNetwork / relaySignaling, never at
+// module scope, so importing this module under Node (e.g. to unit-test RtcChannel)
+// is safe.
 
 import type { Network, PeerId } from "./net.js";
 import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
