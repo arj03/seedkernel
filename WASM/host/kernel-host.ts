@@ -19,8 +19,9 @@
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
+import { toHex, writeU32BE } from "./util.js";
 
-type Sodium = typeof import("libsodium-wrappers");
+type Sodium = typeof import("libsodium-wrappers-sumo");
 
 export const GENESIS_ALGO_ID        = 0x0000;
 export const GENESIS_PUBKEY_LEN     = 32;
@@ -110,24 +111,12 @@ interface WasmHandlerRef {
 }
 
 export function nameKey(name: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < name.length; i++) s += name[i].toString(16).padStart(2, "0");
-  return s;
+  return toHex(name);
 }
 
-/** Write a u32 in big-endian order at out[offset..offset+4]. */
-export function writeU32BE(out: Uint8Array, offset: number, value: number): void {
-  out[offset]     = (value >>> 24) & 0xff;
-  out[offset + 1] = (value >>> 16) & 0xff;
-  out[offset + 2] = (value >>>  8) & 0xff;
-  out[offset + 3] =  value         & 0xff;
-}
-
-/** Read a u32 in big-endian order from buf[offset..offset+4]. */
-export function readU32BE(buf: Uint8Array, offset: number): number {
-  return ((buf[offset] << 24) | (buf[offset + 1] << 16) |
-          (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
-}
+// The u32-BE codec lives in util.ts; re-exported here because this module is
+// where downstream consumers historically imported it from.
+export { writeU32BE, readU32BE } from "./util.js";
 
 export class KernelHost {
   private kernelExports!: KernelExports;
@@ -153,6 +142,16 @@ export class KernelHost {
   private _signatureName: Uint8Array | null = null;
   // The installer instance, if registerInstaller was called.
   private _installer: Installer | null = null;
+  // Public keys that have already passed crypto_core_ed25519_is_valid_point
+  // (§6.3). That check is a full elliptic-curve operation — as costly as the
+  // signature verify itself — and a key's validity is a fixed property of its
+  // bytes, so we run it once per distinct signer and cache the result instead
+  // of repeating it on every message. Only *valid* keys are cached; invalid
+  // ones are re-checked (and rejected) each time, so an attacker cannot grow
+  // this set with garbage. Bounded to cap memory: a flood of distinct valid
+  // keys evicts oldest-first (FIFO via Set insertion order).
+  private validatedPubkeys = new Set<string>();
+  private static readonly MAX_VALIDATED_PUBKEYS = 4096;
 
   private constructor() {}
 
@@ -588,12 +587,30 @@ export class KernelHost {
       const pub  = new Uint8Array(mem, pubPtr,  32);
       const sig  = new Uint8Array(mem, sigPtr,  64);
       const data = new Uint8Array(mem, dataPtr, dataLen);
-      const isValidPoint = (this.sodium as unknown as {
-        crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
-      }).crypto_core_ed25519_is_valid_point;
-      if (typeof isValidPoint === "function" && !isValidPoint(pub.slice())) return 0;
+      if (!this._pubkeyIsValidPoint(pub)) return 0;
       return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0;
     } catch { return 0; }
+  }
+
+  /** Gate on crypto_core_ed25519_is_valid_point (canonical encoding +
+   *  prime-order subgroup), memoizing the result per distinct key. Builds that
+   *  don't expose the symbol (the kernel-only libsodium build) return true and
+   *  rely on the equivalent rejection crypto_sign_verify_detached performs
+   *  internally — matching the pre-sumo behavior. */
+  private _pubkeyIsValidPoint(pub: Uint8Array): boolean {
+    const isValidPoint = (this.sodium as unknown as {
+      crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
+    }).crypto_core_ed25519_is_valid_point;
+    if (typeof isValidPoint !== "function") return true;
+    const key = nameKey(pub);
+    if (this.validatedPubkeys.has(key)) return true;
+    if (!isValidPoint(pub)) return false;
+    if (this.validatedPubkeys.size >= KernelHost.MAX_VALIDATED_PUBKEYS) {
+      const oldest = this.validatedPubkeys.values().next().value;
+      if (oldest !== undefined) this.validatedPubkeys.delete(oldest);
+    }
+    this.validatedPubkeys.add(key);
+    return true;
   }
 
   /** Clear host-side index entries for a handler the kernel just removed. */
@@ -920,6 +937,32 @@ export class KernelHost {
     if (payload.length > wasm.scratchSize) return null;
     new Uint8Array(wasm.memory.buffer, wasm.scratch, payload.length).set(payload);
     return (fn as (n: number) => number)(payload.length);
+  }
+
+  /** Invoke an installed handler by name with `payload`, returning its response
+   *  bytes (the standard `handle` scratch ABI), or null if the name is unbound
+   *  or the handler produced no response. The generic "call a module" primitive
+   *  an app cap-bridge uses to reach installed WASM (e.g. a codec or reputation
+   *  handler) without the kernel knowing what they are — the host counterpart of
+   *  a WASM handler's `kernel.call(name, payload)`. */
+  callHandler(name: Uint8Array, payload: Uint8Array): Uint8Array | null {
+    const hid = this.nameToHandlerId.get(nameKey(name));
+    if (hid === undefined) return null;
+    // Same guards as the kernel.call router (§4.4): a handler the router would
+    // refuse (signature wrapper, installer, deployer-blocked mutators) must not
+    // become reachable by name through this host-side path either.
+    if (this.blockedFromCall.has(hid)) return null;
+    if (this.callDepth >= MAX_CALL_DEPTH) return null;
+    // Push an anonymous caller frame so the target (and any bridge doing the
+    // §8.2 capability check) sees "no installed caller" rather than a stale
+    // frame from an outer dispatch — the host/guest caller has no kernel name.
+    this.callerStack.push(null);
+    this.callDepth++;
+    try { return this._invokeHandlerGetResponse(hid, name, payload); }
+    finally {
+      this.callDepth--;
+      this.callerStack.pop();
+    }
   }
 
   /** Register a host-side handler. Returns the assigned id. */

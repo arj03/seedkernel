@@ -15,6 +15,7 @@
 // skip registerInstaller and the deployment is frozen.
 
 import { nameKey, readU32BE, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
+import { toHex } from "./util.js";
 
 // Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
 // algo_id is an unauthenticated outer field of the signature wrapper (README
@@ -24,9 +25,7 @@ import { nameKey, readU32BE, type Handler, type KernelHost, type Signer } from "
 // rejects non-canonical / small-order keys before they reach here, so equal key
 // bytes mean the same identity.
 function signerKey(pubKey: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < pubKey.length; i++) s += pubKey[i].toString(16).padStart(2, "0");
-  return s;
+  return toHex(pubKey);
 }
 
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {

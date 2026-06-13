@@ -1,0 +1,24 @@
+{
+  "entries": ["assembly/ws/index.ts"],
+  "targets": {
+    "debug": {
+      "outFile": "build/ws.debug.wasm",
+      "textFile": "build/ws.debug.wat",
+      "sourceMap": true,
+      "debug": true,
+      "exportRuntime": true
+    },
+    "release": {
+      "outFile": "build/ws.wasm",
+      "textFile": "build/ws.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": false,
+      "noAssert": true,
+      "exportRuntime": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}

@@ -6,7 +6,7 @@
 
 import { KernelHost } from "./kernel-host.js";
 
-type Sodium = typeof import("libsodium-wrappers");
+type Sodium = typeof import("libsodium-wrappers-sumo");
 
 /** Fetch the two WASM modules, await sodium readiness, and instantiate a
  *  KernelHost. Pass URLs as strings or URL objects relative to the page. */
