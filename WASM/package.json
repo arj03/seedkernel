@@ -32,18 +32,6 @@
       "types": "./build/host/net-rtc-node.d.ts",
       "default": "./build/host/net-rtc-node.js"
     },
-    "./webrtc-direct": {
-      "types": "./build/host/webrtc-direct.d.ts",
-      "default": "./build/host/webrtc-direct.js"
-    },
-    "./webrtc-direct-sdp": {
-      "types": "./build/host/webrtc-direct-sdp.d.ts",
-      "default": "./build/host/webrtc-direct-sdp.js"
-    },
-    "./webrtc-direct-browser": {
-      "types": "./build/host/webrtc-direct-browser.d.ts",
-      "default": "./build/host/webrtc-direct-browser.js"
-    },
     "./ws": {
       "types": "./build/host/ws.d.ts",
       "default": "./build/host/ws.js"

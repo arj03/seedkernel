@@ -1760,122 +1760,6 @@ async function testWeriftRtcNetwork() {
   console.log("  OK\n");
 }
 
-// ─── Test: WebRTC-Direct — relay-less browser→console with PeerLink (spike 2) ─
-//
-// The whole point of spike 2: a connection from a dial token alone — host + port +
-// the console's cert hash — with NO signaling relay and NO answer coming back. The
-// console is an ICE-lite agent on one UDP port (hand-rolled STUN demux driving
-// werift DTLS/SCTP, host/webrtc-direct.ts); the dialer fabricates the console's
-// answer locally from the certhash. We then run the unchanged PeerLink identity
-// handshake over the opened data channel and round-trip a frame — proving the
-// direct link is a first-class, authenticated seedstore link, not just a pipe.
-
-async function testWebRtcDirect() {
-  console.log("Test: webrtc-direct — relay-less dial-token link + PeerLink identity (spike 2)");
-  const { WebRtcDirectListener, dialWebRtcDirect, makeCertKeys, certhashFromKeys, weriftChannelToRaw } =
-    await imp("build/host/webrtc-direct.js");
-  const { PeerLink } = await imp("build/host/net-link.js");
-
-  const keys = await makeCertKeys();
-  const certhash = certhashFromKeys(keys);
-  const serverId = generateKeyPair(), clientId = generateKeyPair();
-  const serverPub = toHex(serverId.publicKey);
-
-  // The console: each opened data channel runs a PeerLink (we accepted it).
-  let serverAuthed = null;
-  const serverFrames = [];
-  const listener = new WebRtcDirectListener({
-    keys, host: "127.0.0.1", port: 0,
-    onChannel: (dc) => {
-      new PeerLink({
-        channel: weriftChannelToRaw(dc), identity: serverId, sodium, weDialed: false,
-        onAuth: (pid) => { serverAuthed = pid; },
-        onFrame: (_pid, f) => serverFrames.push(f), onClose: () => {},
-      });
-    },
-  });
-  await listener.listen();
-  const { host, port } = listener.address();
-
-  let clientLink = null;
-  try {
-    // Dial with the token only — no relay, no answer-back.
-    const { channel, opened, close } = await dialWebRtcDirect({ host, port, certhash, timeoutMs: 15000 });
-    let clientAuthed = null;
-    // Wrap immediately (subscribes onMessage) so the console's HELLO is not missed,
-    // then let the channel finish opening.
-    clientLink = new PeerLink({
-      channel: weriftChannelToRaw(channel), identity: clientId, sodium, weDialed: true, expectPeerId: serverPub,
-      onAuth: (pid) => { clientAuthed = pid; }, onFrame: () => {}, onClose: () => {},
-    });
-    await opened;
-
-    // Wait for the mutual PeerLink handshake to complete over the direct channel.
-    const t0 = Date.now();
-    while ((!serverAuthed || !clientAuthed) && Date.now() - t0 < 5000) await sleep(50);
-    assertEqual(clientAuthed, serverPub, "dialer authenticated the console over the direct channel");
-    assertEqual(serverAuthed, toHex(clientId.publicKey), "console authenticated the dialer (in-channel AUTH, certhash untrusted)");
-
-    // A post-auth frame crosses the relay-less link.
-    clientLink.send(new Uint8Array([4, 2]));
-    const t1 = Date.now();
-    while (serverFrames.length === 0 && Date.now() - t1 < 3000) await sleep(50);
-    assert(serverFrames.length === 1 && bytesEqual(serverFrames[0], new Uint8Array([4, 2])),
-      "a frame crosses the WebRTC-Direct link after auth");
-
-    close();
-  } finally {
-    clientLink?.close();
-    listener.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: WebRtcDirectNetwork — a Network over relay-less WebRTC-Direct ──────
-//
-// WebRtcDirectListener+dial give a raw authenticated channel; WebRtcDirectNetwork
-// wraps those PeerLinks behind the same `Network` interface NodeNetwork/RtcNetwork
-// expose, so the Transport (and StorageNode above it) ride on top untouched. One
-// node listens (publishing a token), the other dials it — then a typed Transport
-// request/response crosses the relay-less link, proving a console serveDirect node
-// is a first-class storage-network peer, not just an echo pipe.
-
-async function testWebRtcDirectNetwork() {
-  console.log("Test: WebRtcDirectNetwork — a Network over relay-less WebRTC-Direct (spike 2)");
-  const { WebRtcDirectNetwork, makeCertKeys } = await imp("build/host/webrtc-direct.js");
-
-  const idS = generateKeyPair(), idC = generateKeyPair();
-  const sId = toHex(idS.publicKey), cId = toHex(idC.publicKey);
-  const keys = await makeCertKeys();
-
-  const netS = new WebRtcDirectNetwork({ identity: idS, sodium, keys, listen: { host: "127.0.0.1" } });
-  const netC = new WebRtcDirectNetwork({ identity: idC, sodium }); // dial-only
-
-  const tS = new Transport(sId, netS, 4000);
-  const tC = new Transport(cId, netC, 4000);
-  tS.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
-
-  try {
-    await netS.listen();
-    const peer = await netC.dial(netS.token("127.0.0.1"));
-    assertEqual(peer, sId, "dial resolved the server's authenticated id");
-    assert(netC.linkedPeers().includes(sId), "client holds a routable link to the server");
-
-    // The accepted side authenticates around the same time; wait for it.
-    const t0 = Date.now();
-    while (!netS.linkedPeers().includes(cId) && Date.now() - t0 < 3000) await sleep(50);
-    assert(netS.linkedPeers().includes(cId), "server holds the reverse link (the channel is bidirectional)");
-
-    const res = await tC.request(sId, 9, new Uint8Array([1, 2, 3]));
-    assert(bytesEqual(res, new Uint8Array([9, 1, 2, 3])), "Transport request/response over WebRtcDirectNetwork");
-  } finally {
-    tS.close(); tC.close(); netS.close(); netC.close();
-  }
-
-  console.log("  OK\n");
-}
-
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1906,8 +1790,6 @@ await testWsFraming();
 await testChannelPinning();
 await testRtcNetwork();
 await testWeriftRtcNetwork();
-await testWebRtcDirect();
-await testWebRtcDirectNetwork();
 await testSafeJs();
 await testSyncSafeRealm();
 await testCapBridgeEnforcement();
