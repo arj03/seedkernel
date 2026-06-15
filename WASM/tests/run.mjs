@@ -1698,6 +1698,98 @@ async function testRtcNetwork() {
   console.log("  OK\n");
 }
 
+// ─── Test: RtcNetwork media tracks + ICE restart (net-rtc) ──────────────────
+//
+// addLocalTrack / removeLocalTracks / onTrack and the ICE-restart recovery
+// (restartAllIce, plus restartIce on a "disconnected" connectionstatechange)
+// all act on the peer's RTCPeerConnection, so a fake pc lets us assert the
+// mechanics deterministically without standing up real ICE. We create one peer
+// entry by feeding the signaling a `hello`, drive it to "connected", then check
+// that tracks are published/removed, remote tracks surface via onTrack, and ICE
+// restarts fire on demand and on a transient drop.
+
+async function testRtcNetworkMedia() {
+  console.log("Test: net-rtc — media tracks + ICE restart over a fake RTCPeerConnection");
+  const { RtcNetwork } = await imp("build/host/net-rtc.js");
+
+  // A minimal RTCPeerConnection stand-in: records track/ICE calls and can emit
+  // the events RtcNetwork listens for. createDataChannel hands back an inert dc
+  // (RtcChannel wraps it and buffers a HELLO that never flushes — harmless).
+  function fakePc() {
+    const l = {};
+    return {
+      connectionState: "new",
+      signalingState: "stable",
+      localDescription: null,
+      remoteDescription: null,
+      addedTracks: [],
+      removedSenders: [],
+      restartIceCount: 0,
+      addEventListener(t, cb) { (l[t] ??= []).push(cb); },
+      _emit(t, ev) { for (const cb of (l[t] || [])) cb(ev || {}); },
+      createDataChannel() {
+        return { binaryType: "blob", readyState: "connecting", addEventListener() {}, send() {}, close() {} };
+      },
+      addTrack(track, stream) { const s = { track, stream }; this.addedTracks.push(s); return s; },
+      removeTrack(sender) { this.removedSenders.push(sender); },
+      restartIce() { this.restartIceCount++; },
+      async setLocalDescription() {},
+      async setRemoteDescription() {},
+      async addIceCandidate() {},
+      close() { this.connectionState = "closed"; },
+    };
+  }
+
+  const id = generateKeyPair();
+  const peerId = toHex(generateKeyPair().publicKey);
+  let pc = null, sigCb = null;
+  const onTrackCalls = [];
+
+  const net = new RtcNetwork({
+    identity: id,
+    sodium,
+    signaling: { send() {}, onMessage(cb) { sigCb = cb; }, close() {} },
+    peerConnectionFactory: () => { pc = fakePc(); return pc; },
+    onTrack: (pid, track) => onTrackCalls.push({ pid, track }),
+  });
+
+  // A `hello` from a peer creates its entry (and its pc via the factory).
+  sigCb({ type: "hello", from: peerId });
+  await sleep(5);
+  assert(pc !== null, "a hello creates a peer connection via the factory");
+
+  // Bring the link to "connected" — tracks are only published to connected peers.
+  pc.connectionState = "connected";
+  pc._emit("connectionstatechange");
+
+  // Publishing two local tracks adds both to the connected peer, once each.
+  const t1 = { kind: "audio" }, t2 = { kind: "video" }, stream = { id: "local" };
+  net.addLocalTrack(t1, stream);
+  net.addLocalTrack(t2, stream);
+  assert(pc.addedTracks.length === 2, "both local tracks are added to the connected peer");
+  assert(pc.addedTracks[0].track === t1 && pc.addedTracks[1].track === t2, "the exact tracks are published");
+
+  // A remote track surfaces through onTrack, attributed to the authenticated id.
+  const remoteTrack = { kind: "video" };
+  pc._emit("track", { track: remoteTrack });
+  assert(onTrackCalls.length === 1 && onTrackCalls[0].pid === peerId && onTrackCalls[0].track === remoteTrack,
+    "a remote track is delivered to onTrack with the peer id");
+
+  // restartAllIce kicks every peer; a transient "disconnected" also self-heals.
+  net.restartAllIce();
+  assert(pc.restartIceCount === 1, "restartAllIce restarts ICE on each peer");
+  pc.connectionState = "disconnected";
+  pc._emit("connectionstatechange");
+  assert(pc.restartIceCount === 2, "a 'disconnected' connection restarts ICE rather than tearing down");
+
+  // Hanging up removes exactly the senders we added.
+  net.removeLocalTracks();
+  assert(pc.removedSenders.length === 2, "removeLocalTracks removes every sender it added");
+
+  net.close();
+  console.log("  OK\n");
+}
+
 // ─── Test: two werift RtcNetworks connect over REAL WebRTC (net-rtc-node) ────
 //
 // The companion to testRtcNetwork: where that drives RtcChannel over a fake pipe,
@@ -1789,6 +1881,7 @@ await testBundle();
 await testWsFraming();
 await testChannelPinning();
 await testRtcNetwork();
+await testRtcNetworkMedia();
 await testWeriftRtcNetwork();
 await testSafeJs();
 await testSyncSafeRealm();

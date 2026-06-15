@@ -121,6 +121,11 @@ export interface RtcNetworkOptions {
    *  to mirror the live mesh into a StorageNode's cohort (addPeer/removePeer). */
   onPeerUp?: (peerId: PeerId) => void;
   onPeerDown?: (peerId: PeerId) => void;
+  /** A remote media track arrived from a peer. Audio/video calls ride the same
+   *  RTCPeerConnection as the data channel, so an app that wants live media (the
+   *  chat demo's call feature) supplies this and attaches the track to a per-peer
+   *  tile; an app that only moves bytes omits it and never negotiates media. */
+  onTrack?: (peerId: PeerId, track: MediaStreamTrack) => void;
 }
 
 // Cap on speculative (unauthenticated) peer entries the relay can force us to
@@ -136,6 +141,7 @@ interface PeerEntry {
   polite: boolean;
   makingOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
+  callSenders: RTCRtpSender[] | null;  // local media tracks added to this pc, for hangup
 }
 
 export class RtcNetwork implements Network {
@@ -147,6 +153,9 @@ export class RtcNetwork implements Network {
   private sink: ((from: PeerId, frame: Uint8Array) => void) | null = null;
   private readonly links = new Map<PeerId, PeerLink>();  // authenticated, routable
   private readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-auth)
+  // Local media tracks to publish to every peer (now and as new ones connect).
+  // Empty unless the app started a call via addLocalTrack().
+  private readonly localTracks: { track: MediaStreamTrack; stream: MediaStream }[] = [];
 
   constructor(opts: RtcNetworkOptions) {
     this.opts = opts;
@@ -179,6 +188,50 @@ export class RtcNetwork implements Network {
   /** The peers we currently hold an authenticated link to (for broadcast / UI). */
   linkedPeers(): PeerId[] { return [...this.links.keys()]; }
 
+  // ── live media (audio/video) ──────────────────────────────────────────────────
+  // Calls ride the same RTCPeerConnections as the data channel. addTrack triggers
+  // negotiationneeded, and the offer it produces flows through the same perfect-
+  // negotiation path the data channel uses — no separate signaling.
+
+  /** Publish a local track to every connected peer, and to any peer that connects
+   *  later (the track set is remembered until removeLocalTracks()). Idempotent per
+   *  (peer, track), so adding audio then video is two safe calls. */
+  addLocalTrack(track: MediaStreamTrack, stream: MediaStream): void {
+    this.localTracks.push({ track, stream });
+    for (const e of this.peers.values()) this.addLocalTracksTo(e);
+  }
+
+  /** Stop publishing media (hang up): remove every track we added and forget the
+   *  set, so future peers get no media. Renegotiation happens automatically. */
+  removeLocalTracks(): void {
+    this.localTracks.length = 0;
+    for (const e of this.peers.values()) {
+      if (!e.callSenders) continue;
+      for (const sender of e.callSenders) { try { e.pc.removeTrack(sender); } catch { /* already gone */ } }
+      e.callSenders = null;
+    }
+  }
+
+  // Add any not-yet-published local tracks to one connected peer. Skips peers that
+  // are not yet "connected" (a track added mid-handshake fights perfect negotiation);
+  // the connectionstatechange handler calls back here when they reach "connected".
+  private addLocalTracksTo(e: PeerEntry): void {
+    if (this.localTracks.length === 0 || e.pc.connectionState !== "connected") return;
+    if (!e.callSenders) e.callSenders = [];
+    for (const { track, stream } of this.localTracks) {
+      if (e.callSenders.some((s) => s.track === track)) continue; // already on this pc
+      try { e.callSenders.push(e.pc.addTrack(track, stream)); } catch { /* ignore */ }
+    }
+  }
+
+  /** Kick an ICE restart on every peer. Call on a network-change event (the browser
+   *  going online, an interface flip) so recovery starts at once instead of waiting
+   *  out ICE keepalive timeouts. Each restart's offer rides the signaling channel —
+   *  so the relay must still be reachable for this to complete. */
+  restartAllIce(): void {
+    for (const e of this.peers.values()) { try { e.pc.restartIce(); } catch { /* ignore */ } }
+  }
+
   /** Tear down every connection, link, and the signaling channel. */
   close(): void {
     for (const l of this.links.values()) l.close();
@@ -194,7 +247,7 @@ export class RtcNetwork implements Network {
     if (existing) return existing;
     const makePc = this.opts.peerConnectionFactory ?? ((cfg?: RTCConfiguration) => new RTCPeerConnection(cfg));
     const pc = makePc(this.opts.rtcConfig);
-    const e: PeerEntry = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] };
+    const e: PeerEntry = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [], callSenders: null };
     this.peers.set(peerId, e);
 
     pc.addEventListener("icecandidate", (ev) => {
@@ -212,8 +265,24 @@ export class RtcNetwork implements Network {
     });
     // The polite side receives the channel the impolite side opened.
     pc.addEventListener("datachannel", (ev) => this.bindLink(peerId, e, ev.channel, /*weDialed*/ false));
+    // A remote track means the peer is sending us media; hand it to the app.
+    pc.addEventListener("track", (ev) => this.opts.onTrack?.(peerId, ev.track));
     pc.addEventListener("connectionstatechange", () => {
-      if (pc.connectionState === "failed" || pc.connectionState === "closed") this.forget(peerId);
+      const s = pc.connectionState;
+      if (s === "connected") {
+        // Publish any in-progress call tracks to a peer that just finished its
+        // handshake. Doing it here (not at ensurePeer time) keeps clear of the
+        // perfect-negotiation window — the renegotiation offer rides cleanly.
+        this.addLocalTracksTo(e);
+      } else if (s === "disconnected") {
+        // A transient path failure (network blip, NAT rebind). restartIce()
+        // schedules negotiationneeded with fresh ICE credentials; the existing
+        // handler ships the offer over signaling and the link recovers without
+        // a full teardown. Only "failed"/"closed" are terminal.
+        try { pc.restartIce(); } catch { /* nothing to restart */ }
+      } else if (s === "failed" || s === "closed") {
+        this.forget(peerId);
+      }
     });
     return e;
   }

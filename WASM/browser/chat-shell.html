@@ -52,8 +52,6 @@
 <nav class="tabs" role="tablist">
   <button id="tab-app" class="active" type="button" role="tab">App</button>
   <button id="tab-apps" type="button" role="tab">Apps</button>
-  <button id="tab-invite" type="button" role="tab">Invite</button>
-  <button id="tab-accept" type="button" role="tab">Accept</button>
   <button id="tab-relay" type="button" role="tab">Network</button>
 </nav>
 
@@ -138,78 +136,6 @@
         <ul id="app-list" class="app-list">
           <li class="empty-row">No apps installed yet.</li>
         </ul>
-      </div>
-    </section>
-  </div>
-
-  <!-- ─── Invite ───────────────────────────────────────────────────── -->
-  <div id="panel-invite" class="panel hidden" role="tabpanel">
-    <p class="lead-hint">A two-step handshake. You send a link, they send a short reply, you connect.
-      Use the <strong>Network</strong> tab instead if you'd rather connect through a relay.</p>
-
-    <section class="step">
-      <header class="step-head">
-        <span class="step-pip">1</span>
-        <h3 class="step-title">Send them an invite</h3>
-      </header>
-      <div class="step-body">
-        <div class="output" id="my-offer-box" aria-live="polite">
-          <textarea id="my-offer" readonly placeholder="No invite yet — press Generate."></textarea>
-        </div>
-        <div class="row">
-          <button id="make-offer" class="primary" type="button">Generate invite</button>
-          <button id="copy-link" type="button" disabled>Copy link</button>
-          <span class="hint subtle">Valid for a few minutes. Keep this tab open until you paste their answer below.</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="step">
-      <header class="step-head">
-        <span class="step-pip">2</span>
-        <h3 class="step-title">Paste their reply, then connect</h3>
-      </header>
-      <div class="step-body">
-        <textarea id="their-answer" placeholder="Paste their answer here..."></textarea>
-        <div class="row">
-          <button id="apply-answer" class="primary" type="button">Connect</button>
-          <span class="hint subtle">They get this when they press <em>Generate answer</em> on the Accept tab.</span>
-        </div>
-      </div>
-    </section>
-  </div>
-
-  <!-- ─── Accept ───────────────────────────────────────────────────── -->
-  <div id="panel-accept" class="panel hidden" role="tabpanel">
-    <p class="lead-hint">Someone sent you an invite. Reply with an answer and they'll connect to you.
-      Opening an invite link auto-fills step 1.</p>
-
-    <section class="step">
-      <header class="step-head">
-        <span class="step-pip">1</span>
-        <h3 class="step-title">Paste the invite you got</h3>
-      </header>
-      <div class="step-body">
-        <textarea id="their-offer" placeholder="Paste an invite blob or link..."></textarea>
-        <div class="row">
-          <button id="make-answer" class="primary" type="button">Generate answer</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="step">
-      <header class="step-head">
-        <span class="step-pip">2</span>
-        <h3 class="step-title">Send the answer back</h3>
-      </header>
-      <div class="step-body">
-        <div class="output" id="my-answer-box" aria-live="polite">
-          <textarea id="my-answer" readonly placeholder="No answer yet — generate one first."></textarea>
-        </div>
-        <div class="row">
-          <button id="copy-answer" class="primary" type="button" disabled>Copy answer</button>
-          <span class="hint subtle">Send it over the same channel they invited you on (chat app, email, …).</span>
-        </div>
       </div>
     </section>
   </div>
