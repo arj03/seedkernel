@@ -23,22 +23,53 @@
 //
 // No third-party dependencies: hand-rolled RFC 6455 framing in ~150 lines.
 //
-// Run: node scripts/relay.mjs [port] [--host HOST] [--allow-origin ORIGIN]
+// Run: node scripts/relay.mjs [port] [options]
+//   --host HOST            interface to bind (default 127.0.0.1)
+//   --allow-origin ORIGIN  add an allowed Origin (repeatable)
+//   --max-conns N          total concurrent sockets        (env RELAY_MAX_CONNS)
+//   --max-rooms N          total concurrent rooms          (env RELAY_MAX_ROOMS)
+//   --max-per-room N       sockets per room                (env RELAY_MAX_PER_ROOM)
+//   --max-per-ip N         sockets per client address      (env RELAY_MAX_PER_IP)
+//   --heartbeat-secs N     ping/reap interval, 0=off       (env RELAY_HEARTBEAT_SECS)
+//   --trust-proxy          read client IP from X-Forwarded-For (env RELAY_TRUST_PROXY=1)
 
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 
 // ─── CLI parsing ─────────────────────────────────────────────────────────
 
+// Parse a non-negative number, falling back to `d` on anything malformed.
+const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
+
 const args = process.argv.slice(2);
 let PORT = 8080;
 let HOST = "127.0.0.1";
 const ALLOWED_ORIGINS = new Set();
+
+// ─── resource limits ───────────────────────────────────────────────────────
+//
+// Independent caps that bound the relay's footprint against both accidental
+// fan-out and deliberate exhaustion. Defaults are generous for signaling (a
+// rendezvous group is small and short-lived) but finite. Env vars seed the
+// defaults; matching CLI flags override them.
+let MAX_CONNECTIONS    = num(process.env.RELAY_MAX_CONNS,        1024);
+let MAX_ROOMS          = num(process.env.RELAY_MAX_ROOMS,         512);
+let MAX_CONNS_PER_ROOM = num(process.env.RELAY_MAX_PER_ROOM,       64);
+let MAX_CONNS_PER_IP   = num(process.env.RELAY_MAX_PER_IP,         64);
+let HEARTBEAT_MS       = num(process.env.RELAY_HEARTBEAT_SECS,     30) * 1000;
+let TRUST_PROXY        = process.env.RELAY_TRUST_PROXY === "1";
+
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === "--host") { HOST = args[++i] ?? HOST; }
   else if (a === "--allow-origin") { ALLOWED_ORIGINS.add(args[++i] ?? ""); }
   else if (a === "--port") { PORT = Number(args[++i]) || PORT; }
+  else if (a === "--max-conns") { MAX_CONNECTIONS = num(args[++i], MAX_CONNECTIONS); }
+  else if (a === "--max-rooms") { MAX_ROOMS = num(args[++i], MAX_ROOMS); }
+  else if (a === "--max-per-room") { MAX_CONNS_PER_ROOM = num(args[++i], MAX_CONNS_PER_ROOM); }
+  else if (a === "--max-per-ip") { MAX_CONNS_PER_IP = num(args[++i], MAX_CONNS_PER_IP); }
+  else if (a === "--heartbeat-secs") { HEARTBEAT_MS = num(args[++i], HEARTBEAT_MS / 1000) * 1000; }
+  else if (a === "--trust-proxy") { TRUST_PROXY = true; }
   else if (/^\d+$/.test(a)) { PORT = Number(a); }
 }
 // Defaults: localhost over http/https on common dev ports. file:// pages
@@ -120,6 +151,38 @@ function roomFromRequest(req) {
   return decoded;
 }
 
+// ─── connection tracking ───────────────────────────────────────────────────
+//
+// `sockets` is every live upgraded socket. A socket already lives in exactly
+// one room, but the flat set gives the heartbeat sweep (below) and the global
+// connection cap an O(1) view without walking every room. `ipCounts` is the
+// per-client-address tally backing the per-IP cap; entries are deleted at zero
+// so the map only ever holds currently-connected addresses.
+const sockets = new Set();
+const ipCounts = new Map();
+
+// Client address for the per-IP cap. Behind a reverse proxy every connection
+// arrives from the proxy, so honour X-Forwarded-For only when the operator
+// opted in with --trust-proxy — otherwise a client could forge the header to
+// dodge the cap.
+function clientIp(req, sock) {
+  if (TRUST_PROXY) {
+    const xff = req.headers["x-forwarded-for"];
+    if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0].trim();
+  }
+  return sock.remoteAddress ?? "unknown";
+}
+
+// Refuse an upgrade with a short HTTP error and tear the socket down. Used for
+// the resource-limit rejections before we ever switch protocols.
+function refuse(sock, code, reason, note) {
+  try {
+    sock.write(`HTTP/1.1 ${code} ${reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+  } catch { /* socket already gone */ }
+  sock.destroy();
+  console.log(`! refused upgrade: ${note}`);
+}
+
 // ─── server ──────────────────────────────────────────────────────────────
 
 const server = createServer((_req, res) => {
@@ -154,6 +217,29 @@ server.on("upgrade", (req, sock) => {
     return;
   }
 
+  // ─── resource limits ──────────────────────────────────────────────────
+  // Refuse before switching protocols so a rejected client never consumes a
+  // room slot or a frame buffer. Caps are independent; the first one tripped
+  // wins. Counts are released in drop() when the socket closes.
+  const ip = clientIp(req, sock);
+  if (sockets.size >= MAX_CONNECTIONS) {
+    refuse(sock, 503, "Service Unavailable", `at capacity (${sockets.size} conns)`);
+    return;
+  }
+  if ((ipCounts.get(ip) ?? 0) >= MAX_CONNS_PER_IP) {
+    refuse(sock, 429, "Too Many Requests", `per-ip cap (${ip})`);
+    return;
+  }
+  const existingRoom = rooms.get(room);
+  if (!existingRoom && rooms.size >= MAX_ROOMS) {
+    refuse(sock, 429, "Too Many Requests", `room table full (${rooms.size} rooms)`);
+    return;
+  }
+  if (existingRoom && existingRoom.size >= MAX_CONNS_PER_ROOM) {
+    refuse(sock, 429, "Too Many Requests", `room ${room} full (${existingRoom.size})`);
+    return;
+  }
+
   const accept = createHash("sha1").update(key + GUID).digest("base64");
   sock.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -164,7 +250,11 @@ server.on("upgrade", (req, sock) => {
 
   const roomSet = joinRoom(room, sock);
   sock._relayRoom = room;
-  console.log(`+ client room=${room} (${roomSet.size} in room, ${rooms.size} rooms)`);
+  sock._relayIp = ip;
+  sock._relayAlive = true;                // cleared each heartbeat, set on pong
+  sockets.add(sock);
+  ipCounts.set(ip, (ipCounts.get(ip) ?? 0) + 1);
+  console.log(`+ client room=${room} (${roomSet.size} in room, ${rooms.size} rooms, ${sockets.size} total)`);
 
   // Chunk buffer: a list of incoming Buffers + the total bytes pending.
   // We only Buffer.concat when we have at least enough bytes to parse the
@@ -290,6 +380,7 @@ server.on("upgrade", (req, sock) => {
       try { sock.write(encodeFrame(0xA, payload)); } catch {}
       return true;
     }
+    if (opcode === 0xA) { sock._relayAlive = true; return true; }  // pong → still alive
     if (opcode === 0x1 || opcode === 0x2) {                   // text/binary
       const out = encodeFrame(opcode, payload);
       // Broadcasts stay inside the sender's room. A client in room "alpha"
@@ -319,10 +410,16 @@ server.on("upgrade", (req, sock) => {
   const drop = () => {
     if (dropped) return;
     dropped = true;
+    sockets.delete(sock);
+    const ipKey = sock._relayIp;
+    if (ipKey !== undefined) {
+      const n = (ipCounts.get(ipKey) ?? 0) - 1;
+      if (n > 0) ipCounts.set(ipKey, n); else ipCounts.delete(ipKey);
+    }
     const r = sock._relayRoom;
     if (r !== undefined) {
       const remaining = leaveRoom(r, sock);
-      console.log(`- client room=${r} (${remaining} in room, ${rooms.size} rooms)`);
+      console.log(`- client room=${r} (${remaining} in room, ${rooms.size} rooms, ${sockets.size} total)`);
     }
   };
   sock.on("close", drop);
@@ -349,11 +446,33 @@ function encodeFrame(opcode, payload) {
   return Buffer.concat([header, payload]);
 }
 
+// ─── heartbeat / dead-socket reaping ──────────────────────────────────────
+//
+// NAT and firewall timeouts — the very thing this relay exists to punch
+// through — leave half-open sockets that never emit 'close', so without a
+// liveness probe a dropped peer would hold its room/IP slot forever. Each
+// interval we ping every socket; any socket that did not answer the previous
+// ping with a pong (opcode 0xA, which sets _relayAlive back to true) is
+// presumed dead and destroyed, firing its normal drop() cleanup.
+if (HEARTBEAT_MS > 0) {
+  const PING = encodeFrame(0x9, Buffer.alloc(0));
+  const beat = setInterval(() => {
+    for (const sock of sockets) {
+      if (sock._relayAlive === false) { sock.destroy(); continue; }
+      sock._relayAlive = false;
+      try { sock.write(PING); } catch { /* swallow; reaped next sweep */ }
+    }
+  }, HEARTBEAT_MS);
+  beat.unref();  // a pending ping timer alone shouldn't keep the process alive
+}
+
 server.listen(PORT, HOST, () => {
   console.log(`SeedKernel chat relay listening on ws://${HOST}:${PORT}/<room>`);
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
   console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = "${DEFAULT_ROOM}"`);
+  console.log(`  limits: ${MAX_CONNECTIONS} conns, ${MAX_ROOMS} rooms, ${MAX_CONNS_PER_ROOM}/room, ${MAX_CONNS_PER_IP}/ip${TRUST_PROXY ? " (X-Forwarded-For trusted)" : ""}`);
+  console.log(`  heartbeat: ${HEARTBEAT_MS > 0 ? `${HEARTBEAT_MS / 1000}s ping/reap` : "disabled"}`);
   if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
     console.log(`  ⚠  bound to ${HOST} — exposed to the network`);
   }
