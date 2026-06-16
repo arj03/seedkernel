@@ -34,6 +34,22 @@ import {
   type QuickJSContext,
   type QuickJSHandle,
 } from "quickjs-emscripten";
+// Use the actively-maintained quickjs-ng builds rather than quickjs-emscripten's
+// default (original-Bellard) variant. Both the Asyncify and non-Asyncify (sync)
+// flavours exist, so the dual-realm split below is unaffected.
+//
+// These variant packages are CJS, so under `nodenext` TypeScript types their
+// default export as the module namespace, whereas the runtime default import is
+// the variant object itself (verified). Cast to each factory's own parameter
+// type to bridge that interop gap.
+import ngReleaseAsyncMod from "@jitl/quickjs-ng-wasmfile-release-asyncify";
+import ngReleaseSyncMod from "@jitl/quickjs-ng-wasmfile-release-sync";
+const ngReleaseAsync = ngReleaseAsyncMod as unknown as NonNullable<
+  Parameters<typeof newQuickJSAsyncWASMModule>[0]
+>;
+const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
+  Parameters<typeof newQuickJSWASMModule>[0]
+>;
 
 /** The one capability seam. `op` selects a host capability (net / store / crypto
  *  / clock / rand, mapped by the host); `payload`/return are opaque bytes, exactly
@@ -121,7 +137,7 @@ globalThis.__invoke = (name, argBuf) => {
 let modulePromise: Promise<QuickJSAsyncWASMModule> | undefined;
 /** The Asyncify QuickJS WASM module is loaded once and shared by all realms. */
 function getModule(): Promise<QuickJSAsyncWASMModule> {
-  return (modulePromise ??= newQuickJSAsyncWASMModule());
+  return (modulePromise ??= newQuickJSAsyncWASMModule(ngReleaseAsync));
 }
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
@@ -232,7 +248,7 @@ let syncModulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The synchronous (non-Asyncify) QuickJS WASM module — the smaller ~491 KB
  *  build, loaded once and shared by all sync realms. */
 function getSyncModule(): Promise<QuickJSWASMModule> {
-  return (syncModulePromise ??= newQuickJSWASMModule());
+  return (syncModulePromise ??= newQuickJSWASMModule(ngReleaseSync));
 }
 
 /** A synchronous safe-js realm. Same airtight ABI and copy boundary as
