@@ -38,8 +38,10 @@ export interface KernelWasm {
 }
 
 export interface ShellOptions extends KernelWasm {
-  /** allowed-keys.json contents (see policy.ts). */
-  policyJson: string;
+  /** allowed-keys.json contents (see policy.ts). Omit ⇒ a deny-all policy (no
+   *  authors), so the node boots and serves but accepts no installs — handy for
+   *  just bringing a node online (e.g. to test connectivity). */
+  policyJson?: string;
   /** Directory backing the fs.* capability. */
   dir: string;
   /** This node's kernel keypair (README §13.6). */
@@ -112,7 +114,10 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     host.deriveBootstrapName("installer.lookup"),
     host.deriveBootstrapName("installer.caps_of"),
   );
-  const policy = parsePolicy(opts.policyJson);
+  // Omitted policy ⇒ deny-all (empty author set): the node boots and serves but
+  // nothing installs. A *provided* file is still parsed strictly (≥1 author) so a
+  // typo'd allowed-keys.json fails loudly rather than silently widening trust.
+  const policy = opts.policyJson ? parsePolicy(opts.policyJson) : { authors: [] };
   host.setApproveInstall(buildApproveInstall(host, policy));
 
   // Capability backends — all application-neutral primitives. The cap-bridge
@@ -280,12 +285,9 @@ function loadIdentity(sodium: Sodium, keyPath: string): Identity {
 export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmNode): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
+  // --policy is optional: omit it for a deny-all node (boots + serves, no installs).
   const policyPath = str(args, "policy");
-  if (!policyPath) {
-    console.error("seedkernel-shell: --policy <allowed-keys.json> is required");
-    process.exit(2);
-  }
-  const policyJson = readFileSync(policyPath, "utf8");
+  const policyJson = policyPath ? readFileSync(policyPath, "utf8") : undefined;
   const dir = str(args, "dir", "./seedkernel-data")!;
   const keyPath = str(args, "key", "./seedkernel.key")!;
 
@@ -320,7 +322,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   }
 
   console.log(`seedkernel-shell ${toHex(identity.publicKey)}`);
-  console.log(`  policy ${policyPath}`);
+  console.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
   console.log(`  store  ${dir} (fs.* backend)`);
   console.log(`  cohort ${shell.peers.size} peer(s)`);
   if (nodeNet.port) console.log(`  tcp    listening on :${nodeNet.port}`);
