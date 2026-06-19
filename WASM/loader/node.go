@@ -32,8 +32,8 @@ func installEngineHost(qc *qjs.Context, el *eventLoop, sd *libsodium, dir string
 // already holds polyfills + sodium + fs: the __net socket primitive, the shared net
 // route bundle (Transport / NodeNetworkCore / makeNetwork), the cap-bridge, the node
 // setup glue, and the guest realm's async-net completion callbacks. Split out from
-// installEngineHost so the full node entry (main.go) — which installs sodium + fs
-// during its kernel boot — can add this layer without re-exposing them.
+// installEngineHost as the networking layer proper — installEngineHost layers it over
+// the polyfills + sodium + fs it installs first.
 func installEngineNet(qc *qjs.Context, el *eventLoop) error {
 	installPolyfills(qc) // idempotent; the net-route bundle needs TextEncoder/TextDecoder
 	exposeNet(qc, el)

@@ -436,16 +436,15 @@ func main() {
 		}
 	}
 
-	// fs backend + the engine net / cap-bridge layer over the booted realm. boot()
-	// already exposed sodium + the kernel bridge; this adds __net + the shared route
-	// bundle + the cap-bridge + the node-setup glue, all driven by the one loop.
-	if err := exposeFs(qc, a.dataDir); err != nil {
-		fatal("fs", err)
-		return
-	}
+	// The engine host realm over the booted kernel: fs backend + __net + the shared
+	// route bundle + the cap-bridge + the node-setup glue, all driven by the one loop.
+	// This is the same installEngineHost the net/holder tests assemble, so main and the
+	// tests share one wiring path (a divergence in either is caught by the other). boot()
+	// already exposed sodium + the kernel bridge; installEngineHost re-runs polyfills +
+	// sodium idempotently.
 	el := newEventLoop(qc)
-	if err := installEngineNet(qc, el); err != nil {
-		fatal("net", err)
+	if err := installEngineHost(qc, el, sd, a.dataDir); err != nil {
+		fatal("host", err)
 		return
 	}
 	wireModuleCall()

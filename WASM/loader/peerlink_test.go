@@ -19,7 +19,8 @@ import (
 
 // netNode builds the minimal JS host stack a networking test needs: libsodium in
 // its own wazero runtime, a QuickJS realm with the event loop, polyfills, sodium,
-// the Go socket primitive, and the shared net-link bundle.
+// the Go socket primitive, and the shared net-route bundle (which exports PeerLink) —
+// the same net bundle production loads, so this test exercises no test-only wiring.
 func netNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
 	t.Helper()
 	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
@@ -35,10 +36,10 @@ func netNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
 	installPolyfills(qc)
 	exposeSodium(qc, sd)
 	exposeNet(qc, el)
-	if _, err := qc.Eval("host-netlink.gen.js", qjs.Code(hostNetLinkJS)); err != nil {
+	if _, err := qc.Eval("host-netroute.gen.js", qjs.Code(hostNetRouteJS)); err != nil {
 		rt.Close()
 		wrt.Close(ctx)
-		t.Fatal("eval net-link bundle:", err)
+		t.Fatal("eval net-route bundle:", err)
 	}
 	if err := installWsCodec(qc); err != nil { // netConnectWS/netListenWS + the ws.wasm codec
 		rt.Close()
