@@ -40,6 +40,9 @@ func installEngineNet(qc *qjs.Context, el *eventLoop) error {
 	if _, err := qc.Eval("host-netroute.gen.js", qjs.Code(hostNetRouteJS)); err != nil {
 		return fmt.Errorf("net route bundle: %w", err)
 	}
+	if err := installWsCodec(qc); err != nil { // WS codec over __net raw + __ws (ws.wasm)
+		return err
+	}
 	installNetwork(qc)
 	exposeCapBridge(qc)
 	if _, err := qc.Eval("engine-node.js", qjs.Code(engineNodeJS)); err != nil {

@@ -18,10 +18,11 @@ import (
 // request/response over a real loopback socket — the dial/accept/promote/deliver
 // path and the correlation/timeout layer, none of it logic in Go.
 //
-// Only the WebSocket transport is exercised here — it is the sole ws.go coverage in
-// `go test`. The TCP twin of this exact flow is covered by asyncnet_test (makeNetwork
-// + Transport + a confined guest over a real TCP socket) and end-to-end against real
-// node/bun nodes by scripts/loader-interop.sh.
+// Only the WebSocket transport is exercised here — it drives the full WS path: the
+// raw Go byte stream (sock.go connectRaw/listenRaw), the shared net-frame WsChannel,
+// and the RFC 6455 framing in ws.wasm (via __ws). The TCP twin of this exact flow is
+// covered by asyncnet_test (makeNetwork + Transport + a confined guest over a real
+// TCP socket) and end-to-end against real node/bun nodes by scripts/loader-interop.sh.
 
 func netRouteNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
 	t.Helper()
@@ -42,6 +43,11 @@ func netRouteNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
 		rt.Close()
 		wrt.Close(ctx)
 		t.Fatal("eval route bundle:", err)
+	}
+	if err := installWsCodec(qc); err != nil { // WS codec (ws.wasm via __ws) for the ws transport
+		rt.Close()
+		wrt.Close(ctx)
+		t.Fatal("ws codec:", err)
 	}
 	installNetwork(qc)
 	return el, qc, func() { rt.Close(); wrt.Close(ctx) }

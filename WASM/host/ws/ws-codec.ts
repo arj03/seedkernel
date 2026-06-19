@@ -1,14 +1,19 @@
-// Host driver for the no-cap ws.wasm (RFC 6455 framing + handshake). It presents
-// the same API the former pure-JS ws-frame.ts did — wsAcceptKey / wsClientKey /
-// encodeFrame / WsParser / WS_OPCODES — but every byte transform now runs inside
-// the WASM module (the runtime split). The module is instantiated
-// lazily on first use (sync compile from inlined bytes), so a pure node↔node
-// deployment that never speaks WebSocket — and the browser, which uses the
-// platform WebSocket — never compile it. The host owns the socket and the RNG
-// and pumps bytes through; the module holds no per-connection state (the WsParser
-// host object keeps the residual buffer).
+// Backend-agnostic driver for the no-cap ws.wasm (RFC 6455 framing + handshake).
+// It presents the same API the former pure-JS ws-frame.ts did — wsAcceptKey /
+// wsClientKey / encodeFrame / WsParser / WS_OPCODES — but every byte transform
+// runs inside the WASM module (the runtime split). This file no longer knows HOW
+// the module is reached: a target installs a `handle(req) -> resp` backend via
+// setWsHandle. Node/browser install a WebAssembly backend (ws-wasm-backend.ts);
+// the Go loader installs one backed by ws.wasm over wazero (__ws). Either way the
+// codec is the *same* ws.wasm, so framing is byte-identical across targets.
+//
+// The 4-op request/response ABI (see assembly/ws/index.ts):
+//   request  = [op u8] [args ...]   staged at the module's `scratch` offset
+//   response = [bytes ...]          (empty = error)
+// The backend owns the scratch staging; here we only build requests and read the
+// returned bytes. The host keeps the residual receive buffer (the WsParser),
+// since the module holds no per-connection state.
 
-import { WS_WASM_B64 } from "./ws-wasm.js";
 import { concatBytes, readU32BE, ByteQueue } from "../util.js";
 
 const OP_ENCODE = 1, OP_DECODE_ONE = 2, OP_ACCEPT = 3, OP_BASE64 = 4;
@@ -22,45 +27,19 @@ export const WS_OPCODES = { OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } as const;
 const SCRATCH_SIZE = (16 << 20) + (1 << 12);
 const SCRATCH_MAX = SCRATCH_SIZE - 16;
 
-interface WsExports {
-  memory: WebAssembly.Memory;
-  scratch: WebAssembly.Global;
-  handle(input_len: number): number;
-}
-interface WsMod { exp: WsExports; scratch: number; }
+/** The pluggable codec backend: stage `req` for ws.wasm, run handle(), return the
+ *  response bytes (empty on a module-reported error). */
+export type WsHandle = (req: Uint8Array) => Uint8Array;
 
-let mod: WsMod | null = null;
+let wsHandle: WsHandle | null = null;
 
-function b64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
+/** Install the ws.wasm backend. A target MUST call this before any WS framing
+ *  (node/browser via ws-wasm-backend.ts; the Go loader via the __ws shim). */
+export function setWsHandle(handle: WsHandle): void { wsHandle = handle; }
 
-function ws(): WsMod {
-  if (mod) return mod;
-  const inst = new WebAssembly.Instance(new WebAssembly.Module(b64ToBytes(WS_WASM_B64) as BufferSource), {
-    env: {
-      abort: () => { throw new Error("ws.wasm abort"); },
-      seed: () => Date.now(),
-      trace: () => {},
-    },
-  });
-  const exp = inst.exports as unknown as WsExports;
-  mod = { exp, scratch: exp.scratch.value as number };
-  return mod;
-}
-
-function write(m: WsMod, bytes: Uint8Array): number {
-  // Bound against the module's scratch *region*, not just the end of linear
-  // memory — an overrun would silently corrupt the shared singleton instance.
-  if (bytes.length > SCRATCH_SIZE) throw new Error("ws: request exceeds scratch");
-  new Uint8Array(m.exp.memory.buffer, m.scratch, bytes.length).set(bytes);
-  return bytes.length;
-}
-function read(m: WsMod, len: number): Uint8Array {
-  return new Uint8Array(m.exp.memory.buffer, m.scratch, len).slice();
+function call(req: Uint8Array): Uint8Array {
+  if (!wsHandle) throw new Error("ws: no codec backend installed (call setWsHandle)");
+  return wsHandle(req);
 }
 
 const enc = new TextEncoder();
@@ -72,37 +51,34 @@ export interface WsFrame { opcode: number; payload: Uint8Array; }
  *  server→client; the 4-byte mask, when present, is supplied by the caller so the
  *  module stays free of any RNG dependency. */
 export function encodeFrame(opcode: number, payload: Uint8Array, mask: Uint8Array | null): Uint8Array {
-  const m = ws();
   const maskLen = mask ? 4 : 0;
   if (payload.length > SCRATCH_MAX) throw new Error("ws: payload exceeds frame cap");
   const req = new Uint8Array(3 + maskLen + payload.length);
   req[0] = OP_ENCODE; req[1] = opcode & 0x0f; req[2] = mask ? 1 : 0;
   if (mask) req.set(mask.subarray(0, 4), 3);
   req.set(payload, 3 + maskLen);
-  const len = m.exp.handle(write(m, req));
-  if (len <= 0) throw new Error("ws: encode failed");
-  return read(m, len);
+  const out = call(req);
+  if (out.length === 0) throw new Error("ws: encode failed");
+  return out;
 }
 
 /** server accept value for a client's Sec-WebSocket-Key (RFC 6455 §4.2.2). */
 export function wsAcceptKey(secWebSocketKey: string): string {
-  const m = ws();
   const key = enc.encode(secWebSocketKey);
   const req = new Uint8Array(1 + key.length);
   req[0] = OP_ACCEPT; req.set(key, 1);
-  const len = m.exp.handle(write(m, req));
-  if (len <= 0) throw new Error("ws: accept failed");
-  return dec.decode(read(m, len));
+  const out = call(req);
+  if (out.length === 0) throw new Error("ws: accept failed");
+  return dec.decode(out);
 }
 
 /** A fresh client Sec-WebSocket-Key plus the accept value it must hear back. */
 export function wsClientKey(rand16: Uint8Array): { key: string; expectAccept: string } {
-  const m = ws();
   const req = new Uint8Array(1 + 16);
   req[0] = OP_BASE64; req.set(rand16.subarray(0, 16), 1);
-  const len = m.exp.handle(write(m, req));
-  if (len <= 0) throw new Error("ws: base64 failed");
-  const key = dec.decode(read(m, len));
+  const out = call(req);
+  if (out.length === 0) throw new Error("ws: base64 failed");
+  const key = dec.decode(out);
   return { key, expectAccept: wsAcceptKey(key) };
 }
 
@@ -124,7 +100,6 @@ export class WsParser {
   constructor(private readonly expectMasked: boolean) {}
 
   push(chunk: Uint8Array): WsFrame[] {
-    const m = ws();
     this.q.push(chunk);
     const out: WsFrame[] = [];
     for (;;) {
@@ -137,7 +112,7 @@ export class WsParser {
       const frame = this.q.take(total)!;
       const req = new Uint8Array(2 + frame.length);
       req[0] = OP_DECODE_ONE; req[1] = this.expectMasked ? 1 : 0; req.set(frame, 2);
-      const r = read(m, m.exp.handle(write(m, req)));
+      const r = call(req);
       // The module saw exactly one whole frame; anything but "frame" (1) is a
       // protocol violation (bad mask direction, fragmented control, bad length).
       if (r[0] !== 1) throw new Error("ws: protocol error");

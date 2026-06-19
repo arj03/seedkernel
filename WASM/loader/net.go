@@ -191,3 +191,125 @@ func (c *tcpChannel) readLoop() {
 		}
 	}
 }
+
+// ── rawSockChannel: a raw byte duplex over a TCP socket (no framing) ───────────
+//
+// The transport under the JS WebSocket codec (net-frame.ts), which does its own
+// RFC 6455 framing. Unlike tcpChannel it neither length-prefixes sends nor
+// reassembles reads: send writes bytes verbatim, and each socket read is delivered
+// as-is (a chunk, not a whole message). Dial/teardown semantics mirror tcpChannel,
+// including buffering pre-connect sends so the WS client can write its upgrade
+// request the moment the channel is created.
+type rawSockChannel struct {
+	onMsg   func([]byte)
+	onClose func()
+
+	mu      sync.Mutex
+	conn    net.Conn
+	pending [][]byte // sends issued before the background dial connected
+	open    bool
+	dead    bool
+}
+
+// newRawChannelDial returns a raw byte channel that connects in the background;
+// the caller can write immediately and the bytes flush once connected.
+func newRawChannelDial(addr string, onMsg func([]byte), onClose func()) *rawSockChannel {
+	c := &rawSockChannel{onMsg: onMsg, onClose: onClose}
+	go func() {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			c.fail()
+			return
+		}
+		c.mu.Lock()
+		if c.dead { // closed before the dial landed
+			c.mu.Unlock()
+			conn.Close()
+			return
+		}
+		c.conn = conn
+		c.open = true
+		pending := c.pending
+		c.pending = nil
+		c.mu.Unlock()
+		for _, b := range pending {
+			c.writeRaw(b)
+		}
+		c.readLoop()
+	}()
+	return c
+}
+
+func (c *rawSockChannel) send(bytes []byte) {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return
+	}
+	if !c.open {
+		c.pending = append(c.pending, append([]byte(nil), bytes...))
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	c.writeRaw(bytes)
+}
+
+func (c *rawSockChannel) writeRaw(bytes []byte) {
+	c.mu.Lock()
+	conn, dead := c.conn, c.dead
+	c.mu.Unlock()
+	if dead || conn == nil {
+		return
+	}
+	if _, err := conn.Write(bytes); err != nil {
+		c.fail()
+	}
+}
+
+// close is the deliberate teardown (no onClose); see tcpChannel.close.
+func (c *rawSockChannel) close() {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return
+	}
+	c.dead = true
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+func (c *rawSockChannel) fail() {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return
+	}
+	c.dead = true
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+	c.onClose()
+}
+
+func (c *rawSockChannel) readLoop() {
+	chunk := make([]byte, 64<<10)
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	for {
+		n, err := conn.Read(chunk)
+		if n > 0 {
+			c.onMsg(append([]byte(nil), chunk[:n]...))
+		}
+		if err != nil {
+			c.fail()
+			return
+		}
+	}
+}

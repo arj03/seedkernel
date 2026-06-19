@@ -41,25 +41,25 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 
-	connect := func(ws bool) *qjs.Value {
+	connect := func(raw bool) *qjs.Value {
 		return fn(func(t *qjs.This) (*qjs.Value, error) {
 			addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
-			return t.Context().NewInt64(n.dial(addr, ws)), nil
+			return t.Context().NewInt64(n.dial(addr, raw)), nil
 		})
 	}
-	listen := func(ws bool) *qjs.Value {
+	listen := func(raw bool) *qjs.Value {
 		return fn(func(t *qjs.This) (*qjs.Value, error) {
-			bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()), ws)
+			bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()), raw)
 			if err != nil {
 				return t.Context().NewInt32(-1), nil
 			}
 			return t.Context().NewInt32(int32(bound)), nil
 		})
 	}
-	o.SetPropertyStr("connect", connect(false))   // node↔node, length-framed TCP
-	o.SetPropertyStr("connectWS", connect(true))  // node dialing a WS endpoint
-	o.SetPropertyStr("listen", listen(false))     // accept node↔node TCP
-	o.SetPropertyStr("listenWS", listen(true))    // accept browser↔node WebSocket
+	o.SetPropertyStr("connect", connect(false))    // node↔node, length-framed TCP
+	o.SetPropertyStr("connectRaw", connect(true))  // raw byte stream (under the JS WS codec)
+	o.SetPropertyStr("listen", listen(false))      // accept node↔node TCP
+	o.SetPropertyStr("listenRaw", listen(true))    // accept raw byte streams (browser↔node WS)
 	o.SetPropertyStr("send", fn(func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
@@ -100,15 +100,17 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
-// dial opens an outbound channel (TCP, or WS when ws). Both connect in the
-// background and buffer pre-connect sends, so JS can makeRawChannel(id) and
-// PeerLink can sendHello() immediately; the JS channel is registered (synchronously,
-// in the same JS turn) before the loop ever processes a delivered frame.
-func (n *netHost) dial(addr string, ws bool) int64 {
+// dial opens an outbound channel: length-framed TCP, or a raw byte stream when raw
+// (the transport under the JS WebSocket codec). Both connect in the background and
+// buffer pre-connect sends, so JS can wrap the id and PeerLink can sendHello() (or
+// the WS client can write its upgrade request) immediately; the JS channel is
+// registered (synchronously, in the same JS turn) before the loop ever processes a
+// delivered frame.
+func (n *netHost) dial(addr string, raw bool) int64 {
 	id := n.alloc()
 	var ch rawChannel
-	if ws {
-		ch = newWSChannelDial(addr, n.onMsg(id), n.onClose(id))
+	if raw {
+		ch = newRawChannelDial(addr, n.onMsg(id), n.onClose(id))
 	} else {
 		ch = newTCPChannelDial(addr, n.onMsg(id), n.onClose(id))
 	}
@@ -118,11 +120,11 @@ func (n *netHost) dial(addr string, ws bool) int64 {
 	return id
 }
 
-// listen accepts inbound channels (TCP, or WS when ws). The read/handshake
-// goroutine is started only from inside the posted task, AFTER __netAccept has
-// created the JS channel — otherwise the read goroutine could deliver a frame
-// before JS has a channel to route it to.
-func (n *netHost) listen(host string, port int, ws bool) (int, error) {
+// listen accepts inbound channels (length-framed TCP, or raw byte streams when
+// raw). The read goroutine is started only from inside the posted task, AFTER
+// __netAccept has created the JS channel — otherwise the read goroutine could
+// deliver a frame before JS has a channel to route it to.
+func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
@@ -135,7 +137,7 @@ func (n *netHost) listen(host string, port int, ws bool) (int, error) {
 				return
 			}
 			id := n.alloc()
-			ch, start := n.wrapInbound(id, conn, ws)
+			ch, start := n.wrapInbound(id, conn, raw)
 			n.mu.Lock()
 			n.chans[id] = ch
 			n.mu.Unlock()
@@ -149,12 +151,12 @@ func (n *netHost) listen(host string, port int, ws bool) (int, error) {
 	return bound, nil
 }
 
-// wrapInbound builds a channel for an accepted socket but defers its read/handshake
-// goroutine to the returned start(), so the loop registers the JS channel first.
-func (n *netHost) wrapInbound(id int64, conn net.Conn, ws bool) (rawChannel, func()) {
-	if ws {
-		w := &wsChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), client: false, conn: conn, parser: newWSParser(true)}
-		return w, func() { go w.runServer() }
+// wrapInbound builds a channel for an accepted socket but defers its read goroutine
+// to the returned start(), so the loop registers the JS channel first.
+func (n *netHost) wrapInbound(id int64, conn net.Conn, raw bool) (rawChannel, func()) {
+	if raw {
+		rc := &rawSockChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), conn: conn, open: true}
+		return rc, func() { go rc.readLoop() }
 	}
 	tc := &tcpChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), conn: conn, open: true}
 	return tc, func() { go tc.readLoop() }
@@ -199,8 +201,10 @@ const netShimJS = `
 (function () {
   const N = __net;
   const chans = new Map();     // id -> { deliver, closed }
-  const listeners = new Map(); // bound port -> onAccept(channel)
+  const listeners = new Map(); // bound port -> accept(id)
 
+  // A whole-message RawChannel (TCP, length-framed in Go): the routing core's
+  // PeerLink drives this directly.
   function makeRawChannel(id) {
     let onMsg = () => {}, onClose = () => {};
     chans.set(id, {
@@ -215,23 +219,39 @@ const netShimJS = `
     };
   }
 
+  // A raw byte duplex (no framing): the transport under the JS WebSocket codec
+  // (net-frame.ts WsClientChannel/WsServerChannel), which frames on top.
+  function makeRawStream(id) {
+    let onData = () => {}, onClose = () => {};
+    chans.set(id, {
+      deliver: (bytes) => onData(bytes),
+      closed: () => { chans.delete(id); onClose(); },
+    });
+    return {
+      write: (bytes) => N.send(id, bytes),
+      onData: (cb) => { onData = cb; },
+      onClose: (cb) => { onClose = cb; },
+      close: () => N.close(id),
+    };
+  }
+
   globalThis.netConnect = (host, port) => makeRawChannel(N.connect(host, port));
-  globalThis.netConnectWS = (host, port) => makeRawChannel(N.connectWS(host, port));
+  globalThis.netConnectRaw = (host, port) => makeRawStream(N.connectRaw(host, port));
   globalThis.netListen = (host, port, onAccept) => {
     const bound = N.listen(host, port);
     if (bound < 0) throw new Error("netListen: bind failed");
-    listeners.set(bound, onAccept);
+    listeners.set(bound, (id) => onAccept(makeRawChannel(id)));
     return bound;
   };
-  globalThis.netListenWS = (host, port, onAccept) => {
-    const bound = N.listenWS(host, port);
-    if (bound < 0) throw new Error("netListenWS: bind failed");
-    listeners.set(bound, onAccept);
+  globalThis.netListenRaw = (host, port, onAccept) => {
+    const bound = N.listenRaw(host, port);
+    if (bound < 0) throw new Error("netListenRaw: bind failed");
+    listeners.set(bound, (id) => onAccept(makeRawStream(id)));
     return bound;
   };
   globalThis.__netDeliver = (id, bytes) => { const c = chans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
   globalThis.__netClosed = (id) => { const c = chans.get(id); if (c) c.closed(); };
-  globalThis.__netAccept = (port, id) => { const f = listeners.get(port); if (f) f(makeRawChannel(id)); };
+  globalThis.__netAccept = (port, id) => { const a = listeners.get(port); if (a) a(id); };
 })();
 `
 

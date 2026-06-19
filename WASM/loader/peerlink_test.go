@@ -40,13 +40,19 @@ func netNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
 		wrt.Close(ctx)
 		t.Fatal("eval net-link bundle:", err)
 	}
+	if err := installWsCodec(qc); err != nil { // netConnectWS/netListenWS + the ws.wasm codec
+		rt.Close()
+		wrt.Close(ctx)
+		t.Fatal("ws codec:", err)
+	}
 	return el, qc, func() { rt.Close(); wrt.Close(ctx) }
 }
 
-// The handshake runs identically over TCP and over WebSocket — the Go socket
-// primitive presents the same RawChannel for both, so the shared PeerLink is
-// transport-agnostic. WS additionally exercises the RFC 6455 handshake, masking
-// direction, and framing in ws.go.
+// The handshake runs identically over TCP and over WebSocket — the WS path wraps
+// the same raw Go byte stream in the shared net-frame WsChannel, presenting the
+// same RawChannel, so the shared PeerLink is transport-agnostic. WS additionally
+// exercises the RFC 6455 handshake, masking direction, and framing (ws.wasm via
+// __ws).
 func TestPeerLinkHandshakeOverTCP(t *testing.T) { runHandshake(t, "netConnect", "netListen") }
 func TestPeerLinkHandshakeOverWebSocket(t *testing.T) {
 	runHandshake(t, "netConnectWS", "netListenWS")
