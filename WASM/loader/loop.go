@@ -135,36 +135,9 @@ func (el *eventLoop) awaitNetCall(callID int64, timeout time.Duration) ([]byte, 
 	el.netBlocking[callID] = o
 	defer delete(el.netBlocking, callID)
 	deadline := time.Now().Add(timeout)
+	hostPump := func() { el.c.Pump() } // host realm only — the guest stays suspended
 	for !o.done {
-		// Fire host-realm timers that are due (e.g. the Transport request timeout),
-		// pumping the host realm after each so its promise reactions run.
-		for len(el.timers) > 0 && !el.timers[0].deadline.After(time.Now()) {
-			t := heap.Pop(&el.timers).(*jsTimer)
-			delete(el.byID, t.id)
-			el.callJS(t.cb)
-			t.cb.Free()
-			el.c.Pump()
-			if o.done {
-				return el.netResult(o)
-			}
-		}
-		d := time.Until(deadline)
-		if len(el.timers) > 0 {
-			if td := time.Until(el.timers[0].deadline); td < d {
-				d = td
-			}
-		}
-		if d < 0 {
-			d = 0
-		}
-		tmr := time.NewTimer(d)
-		select {
-		case task := <-el.tasks:
-			task()
-			el.c.Pump()
-		case <-tmr.C:
-		}
-		tmr.Stop()
+		el.step(deadline, hostPump, func() bool { return o.done })
 		if !o.done && !time.Now().Before(deadline) {
 			return nil, errors.New("net call: timed out")
 		}
@@ -228,59 +201,79 @@ func (el *eventLoop) callJS(cb *qjs.Value) {
 	}
 }
 
-// fireDueTimers runs every timer whose deadline has passed, pumping jobs after
-// each so its promise reactions advance before the next timer.
-func (el *eventLoop) fireDueTimers() {
-	for len(el.timers) > 0 {
-		t := el.timers[0]
-		if t.deadline.After(time.Now()) {
-			return
-		}
-		heap.Pop(&el.timers)
+// step drives one turn of the loop and returns. It fires every timer that is due
+// (pumping after each), drains ready microtasks, then — if `until` is still unmet —
+// blocks until a posted task arrives, the next timer comes due, or `deadline` passes,
+// whichever is first, and processes it. `pump` selects which realms advance after a
+// delivered task/timer: the whole loop (pumpAll) for run(), or just the host realm
+// when a guest is suspended mid-call (awaitNetCall). A zero `deadline` means "no
+// deadline" — block only on tasks/timers. `until` is checked between sub-steps so a
+// caller's exit condition (el.stopped, a settled net call) short-circuits promptly.
+func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
+	// Fire every due timer, pumping after each so its reactions run before the next.
+	for len(el.timers) > 0 && !el.timers[0].deadline.After(time.Now()) {
+		t := heap.Pop(&el.timers).(*jsTimer)
 		delete(el.byID, t.id)
 		el.callJS(t.cb)
 		t.cb.Free()
-		el.pumpAll()
-		if el.stopped {
+		pump()
+		if until() {
 			return
+		}
+	}
+	// Drain any ready microtasks before blocking on I/O — e.g. a settled __settle from a
+	// fully-synchronous guest entrypoint — so we don't wait for an event that won't come.
+	pump()
+	if until() {
+		return
+	}
+	// Block until a posted task, the next timer, or the deadline — whichever is first.
+	var wait <-chan time.Time
+	d, hasWait := time.Duration(0), false
+	if !deadline.IsZero() {
+		d, hasWait = time.Until(deadline), true
+	}
+	if len(el.timers) > 0 {
+		if td := time.Until(el.timers[0].deadline); !hasWait || td < d {
+			d, hasWait = td, true
+		}
+	}
+	if hasWait {
+		if d < 0 {
+			d = 0
+		}
+		tmr := time.NewTimer(d)
+		defer tmr.Stop()
+		wait = tmr.C
+	}
+	select {
+	case task := <-el.tasks:
+		task()
+		pump()
+	case <-wait:
+		// The wait fired (deadline or next timer). select picks at random when a task is
+		// also ready, so drain whatever is queued before returning — otherwise a result
+		// that raced the deadline would sit unprocessed and awaitNetCall would report a
+		// false timeout.
+		for {
+			select {
+			case task := <-el.tasks:
+				task()
+				pump()
+			default:
+				return
+			}
 		}
 	}
 }
 
-// run drives the loop on the current goroutine until stopped: fire due timers,
-// then block until the next timer or a posted task, deliver it, pump, repeat.
+// run drives the loop on the current goroutine until stopped, one step() per turn.
+// It pumps every realm (pumpAll) so a net result settling on the host realm can resume
+// a guest sharing this loop. awaitIn and runUntilSignal set up an exit signal that
+// flips el.stopped, then drive the loop through here.
 func (el *eventLoop) run() {
 	for !el.stopped {
-		el.fireDueTimers()
-		if el.stopped {
-			return
-		}
-		// Drain any ready microtasks (e.g. a settled __settle from a fully-synchronous
-		// guest entrypoint, whose net calls all blocked in awaitNetCall) before blocking
-		// on I/O — otherwise the loop would wait for a task/timer that never comes.
-		el.pumpAll()
-		if el.stopped {
-			return
-		}
-		var wait <-chan time.Time
-		var tmr *time.Timer
-		if len(el.timers) > 0 {
-			d := time.Until(el.timers[0].deadline)
-			if d < 0 {
-				d = 0
-			}
-			tmr = time.NewTimer(d)
-			wait = tmr.C
-		}
-		select {
-		case task := <-el.tasks:
-			task()
-			el.pumpAll()
-		case <-wait:
-		}
-		if tmr != nil {
-			tmr.Stop()
-		}
+		el.step(time.Time{}, el.pumpAll, func() bool { return el.stopped })
 	}
 }
 
