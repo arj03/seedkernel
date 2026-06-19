@@ -903,7 +903,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
      --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
 ```
 
-A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §13.3 realm) **and** serves its *request* side from a confined realm (`serveAsHolder` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral, so a `bun build --compile` of `host/main-bun.ts` (kernel + bootstrap embedded) is a single-file binary that can host any signed app. seed store's WASM README has a complete storage walkthrough.
+A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §13.3 realm) **and** serves its *request* side from a confined realm (`serveAsHolder` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§13.9). seed store's WASM README has a complete storage walkthrough.
 
 ### 13.9 The Go/native shell — the primary non-browser deployment
 

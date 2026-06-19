@@ -1,5 +1,5 @@
-// Node CLI entry for the seedkernel-shell — the explicit twin of main-bun.ts,
-// so main.ts stays a pure library module with no argv-sniffing auto-run guard.
+// Node CLI entry for the seedkernel-shell, kept separate from main.ts so that
+// stays a pure library module with no argv-sniffing auto-run guard.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000
