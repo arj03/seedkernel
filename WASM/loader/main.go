@@ -1,0 +1,716 @@
+// seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive
+// as signed bundles (README §13) — nothing application-specific lives here. Host
+// orchestration (installer §7, bundle verification §13) is JavaScript run inside
+// QuickJS (host.js); this Go layer is only the bridge: it loads the genesis wasm,
+// supplies the genesis crypto (Ed25519 + SHA-3), runs the signature shuttle (the
+// one piece needing raw wasm-memory access), and exposes byte-level primitives to
+// the QuickJS realm. Pure Go / no cgo (QuickJS is the quickjs-ng wasm driven by
+// the in-repo qjs bridge over wazero) → one static cross-compiled binary.
+package main
+
+import (
+	"context"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"seedloader/qjs"
+
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+)
+
+//go:embed wasm/kernel.wasm
+var kernelWasm []byte
+
+//go:embed wasm/bootstrap.wasm
+var bootWasm []byte
+
+//go:embed host.js
+var hostJS string
+
+// ───────────────────────── shell core (bridge) ─────────────────────────
+
+type handler struct {
+	mod     api.Module
+	fn      api.Function
+	scratch uint32
+}
+
+type signer struct {
+	algo int
+	pk   []byte
+}
+
+var (
+	ctx     = context.Background()
+	rt      wazero.Runtime
+	kn, bs  api.Module
+	qc      *qjs.Context
+	qrt     *qjs.Runtime
+	wasmH   = map[string]handler{}             // name → wasm app handler
+	natH    = map[string]func([]byte) []byte{} // name → native host service
+	scrOf   = map[api.Module]uint32{}          // wasm handler module → scratch offset
+	blocked = map[string]bool{}                // names refused via kernel.call (§4.4)
+	nextID  = int32(10)
+)
+
+func rd(m api.Memory, p, n uint32) []byte { x, _ := m.Read(p, n); return append([]byte(nil), x...) }
+
+func wr(m api.Module, data []byte) uint32 {
+	r, _ := m.ExportedFunction("alloc").Call(ctx, uint64(len(data)))
+	m.Memory().Write(uint32(r[0]), data)
+	return uint32(r[0])
+}
+
+func name(canonical string) []byte {
+	return sd.hashSha3256([]byte("seedkernel.bootstrap.v1:" + canonical))
+}
+
+func setHandler(n []byte, id int32) {
+	p := wr(kn, n)
+	kn.ExportedFunction("set_handler").Call(ctx, uint64(p), uint64(len(n)), uint64(uint32(id)))
+	kn.ExportedFunction("dealloc").Call(ctx, uint64(p))
+}
+
+func load(wasm []byte, modName string) api.Module {
+	cm, _ := rt.CompileModule(ctx, wasm)
+	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(modName))
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+// run invokes an installed handler (wasm or native) by name (README §4 scratch ABI).
+func run(n, payload []byte) []byte {
+	if h, ok := wasmH[string(n)]; ok {
+		h.mod.Memory().Write(h.scratch, payload)
+		r, _ := h.fn.Call(ctx, uint64(len(payload)))
+		if int32(r[0]) <= 0 {
+			return nil
+		}
+		return rd(h.mod.Memory(), h.scratch, uint32(int32(r[0])))
+	}
+	if fn, ok := natH[string(n)]; ok {
+		return fn(payload)
+	}
+	return nil
+}
+
+// env.invoke_handler — kernel matched a name (README §3). id -1 = signature wrapper.
+func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
+	if int32(hid) == -1 { // verify → re-dispatch inner envelope → pop signer (§6.5)
+		bp := wr(bs, rd(km.Memory(), pP, pL))
+		ok, _ := bs.ExportedFunction("handle_signature").Call(ctx, uint64(bp), uint64(pL))
+		bs.ExportedFunction("dealloc").Call(ctx, uint64(bp))
+		if uint32(ok[0]) == 0 {
+			return
+		}
+		ip, _ := bs.ExportedFunction("get_inner_ptr").Call(ctx)
+		il, _ := bs.ExportedFunction("get_inner_len").Call(ctx)
+		inner := rd(bs.Memory(), uint32(ip[0]), uint32(il[0]))
+		kp := wr(kn, inner)
+		kn.ExportedFunction("dispatch").Call(ctx, uint64(kp), uint64(len(inner)))
+		kn.ExportedFunction("dealloc").Call(ctx, uint64(kp))
+		bs.ExportedFunction("pop_signer").Call(ctx)
+		return
+	}
+	run(rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL)) // inbound: response dropped
+}
+
+// kernel.call — one handler reaches another (README §4.4).
+func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
+	n := rd(caller.Memory(), nP, nL)
+	if blocked[string(n)] {
+		return ^uint32(0)
+	}
+	resp := run(n, rd(caller.Memory(), pP, pL))
+	if resp == nil {
+		return 0
+	}
+	caller.Memory().Write(scrOf[caller], resp)
+	return uint32(len(resp))
+}
+
+// env.ed25519_verify — the genesis suite primitive (README §6.2). Routed to
+// libsodium so the genesis verify is the same binary as the browser.
+func edVerify(_ context.Context, m api.Module, pubP, sigP, dataP, dataL uint32) uint32 {
+	if sd.verifyDetached(rd(m.Memory(), sigP, 64), rd(m.Memory(), dataP, dataL), rd(m.Memory(), pubP, 32)) {
+		return 1
+	}
+	return 0
+}
+
+// topSigner reads the innermost verified signer from bootstrap.wasm (§6.5).
+func topSigner() (signer, bool) {
+	c, _ := bs.ExportedFunction("get_signer_count").Call(ctx)
+	if uint32(c[0]) == 0 {
+		return signer{}, false
+	}
+	idx := uint64(uint32(c[0]) - 1)
+	pl, _ := bs.ExportedFunction("signer_pubkey_len").Call(ctx, idx)
+	if int32(pl[0]) <= 0 {
+		return signer{}, false
+	}
+	ab, _ := bs.ExportedFunction("alloc").Call(ctx, 2)
+	pb, _ := bs.ExportedFunction("alloc").Call(ctx, pl[0])
+	bs.ExportedFunction("read_signer").Call(ctx, idx, ab[0], pb[0], pl[0])
+	a := rd(bs.Memory(), uint32(ab[0]), 2)
+	return signer{int(a[0])<<8 | int(a[1]), rd(bs.Memory(), uint32(pb[0]), uint32(pl[0]))}, true
+}
+
+// installWasm instantiates handler bytes and binds them to the raw name `n`.
+// Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §7).
+func installWasm(n, wasm []byte) bool {
+	cm, err := rt.CompileModule(ctx, wasm)
+	if err != nil {
+		return false
+	}
+	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", nextID)))
+	if err != nil {
+		return false
+	}
+	g, fn := m.ExportedGlobal("scratch"), m.ExportedFunction("handle")
+	if g == nil || fn == nil {
+		return false
+	}
+	s := uint32(g.Get())
+	wasmH[string(n)] = handler{m, fn, s}
+	scrOf[m] = s
+	setHandler(n, nextID)
+	nextID++
+	return true
+}
+
+// boot wires the wasm host imports, instantiates kernel + signature, and stands
+// up the QuickJS realm running host.js (installer + bundle verification).
+func boot() {
+	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
+	sd = bootSodium(rt) // crypto primitive; env.ed25519_verify routes to it below
+	env := rt.NewHostModuleBuilder("env")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
+	env.NewFunctionBuilder().WithFunc(invoke).Export("invoke_handler")
+	env.NewFunctionBuilder().WithFunc(edVerify).Export("ed25519_verify")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32, uint32, uint32, uint32) uint32 {
+		return 0
+	}).Export("suite_verify")
+	env.Instantiate(ctx)
+	k := rt.NewHostModuleBuilder("kernel")
+	k.NewFunctionBuilder().WithFunc(kcall).Export("call")
+	k.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32) uint32 { return 0 }).Export("caller")
+	k.Instantiate(ctx)
+	kn = load(kernelWasm, "kernelmod")
+	bs = load(bootWasm, "bootstrap")
+	setHandler(name("signature"), -1)
+
+	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
+	var err error
+	if qrt, err = qjs.New(); err != nil {
+		panic(fmt.Sprintf("qjs.New: %v", err))
+	}
+	qc = qrt.Context()
+	b := qc.NewObject()
+	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
+	b.SetPropertyStr("installWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
+		nm, _ := qjs.JsTypedArrayToGo(t.Args()[0])
+		wb, _ := qjs.JsTypedArrayToGo(t.Args()[1])
+		return t.Context().NewBool(installWasm(nm, wb)), nil
+	}))
+	b.SetPropertyStr("topSigner", fn(func(t *qjs.This) (*qjs.Value, error) {
+		s, ok := topSigner()
+		if !ok {
+			return t.Context().NewArrayBuffer(nil), nil
+		}
+		return t.Context().NewArrayBuffer(append([]byte{byte(s.algo >> 8), byte(s.algo)}, s.pk...)), nil
+	}))
+	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
+		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
+		return t.Context().NewString(string(d)), nil
+	}))
+	qc.Global().SetPropertyStr("bridge", b)
+	exposeSodium(qc, sd) // installs `sodium` (libsodium-wrappers shape) into the realm
+	if _, err := qc.Eval("host.js", qjs.Code(hostJS)); err != nil {
+		panic(err)
+	}
+
+	// The install handler (§7.2) delegates to JS onInstall; blocked from kernel.call.
+	registerNative("install", func(payload []byte) []byte {
+		onInstall := qc.Global().GetPropertyStr("onInstall")
+		qc.Invoke(onInstall, qc.Global(), qc.NewArrayBuffer(payload))
+		return nil
+	})
+	blocked[string(name("install"))] = true
+}
+
+// dispatch feeds raw envelope bytes into the pipeline (README §3).
+func dispatch(b []byte) {
+	p := wr(kn, b)
+	kn.ExportedFunction("dispatch").Call(ctx, uint64(p), uint64(len(b)))
+	kn.ExportedFunction("dealloc").Call(ctx, uint64(p))
+}
+
+func registerNative(canonical string, fn func([]byte) []byte) {
+	natH[string(name(canonical))] = fn
+	setHandler(name(canonical), nextID)
+	nextID++
+}
+
+// loadedBundle is the slim descriptor of a verified bundle the node needs to run
+// its guest: the declared cap domains, the manifest config (author-signed
+// structural constants), and the verified guest source.
+type loadedBundle struct {
+	app, version string
+	caps         []string
+	config       json.RawMessage // manifest `config` object (merged under operator config)
+	guestSource  string
+}
+
+// loaded is the bundle the node is running (set by loadBundle), nil until one loads.
+var loaded *loadedBundle
+
+// loadBundle loads a signed app bundle directory (README §13.4): JS verifies the
+// manifest signature + module/guest content hashes, then Go dispatches each
+// pre-signed install envelope (the installer re-checks author + replay). On success
+// it records the verified guest source + caps + config in `loaded` for the node.
+func loadBundle(dir string) string {
+	menv, err := os.ReadFile(filepath.Join(dir, "manifest.bundle"))
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	goFiles := map[string][]byte{}
+	jsFiles := qc.NewObject()
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		fb, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		goFiles[e.Name()] = fb
+		jsFiles.SetPropertyStr(e.Name(), qc.NewArrayBuffer(fb))
+	}
+	res, err := qc.Invoke(qc.Global().GetPropertyStr("verifyBundle"), qc.Global(), qc.NewArrayBuffer(menv), jsFiles)
+	if err != nil {
+		return "ERROR(invoke): " + err.Error()
+	}
+	out := res.String()
+	if strings.HasPrefix(out, "ERROR") {
+		return out
+	}
+	var m struct {
+		App, Version string
+		Caps         []string
+		Guest        string
+		Config       json.RawMessage
+		Modules      []struct{ Name, Install, KernelName string }
+	}
+	if err := json.Unmarshal([]byte(out), &m); err != nil {
+		return "ERROR(json): " + err.Error()
+	}
+	var installed []string
+	for _, mod := range m.Modules {
+		dispatch(goFiles[mod.Install]) // → installer (JS onInstall) → installWasm
+		kn, _ := hex.DecodeString(mod.KernelName)
+		if _, ok := wasmH[string(kn)]; ok {
+			installed = append(installed, mod.Name)
+		}
+	}
+	loaded = &loadedBundle{
+		app: m.App, version: m.Version, caps: m.Caps,
+		config: m.Config, guestSource: string(goFiles[m.Guest]),
+	}
+	return fmt.Sprintf("%s v%s  installed=%v", m.App, m.Version, installed)
+}
+
+// applyPolicy installs the shell's install policy (host/policy.ts shape) into the
+// JS realm; "" leaves the permissive default. parsePolicy throws on malformed input,
+// which surfaces here as an error (a typo fails the boot loudly, not silently).
+func applyPolicy(json string) error {
+	if strings.TrimSpace(json) == "" {
+		return nil
+	}
+	_, err := qc.Invoke(qc.Global().GetPropertyStr("setPolicy"), qc.Global(), qc.NewString(json))
+	return err
+}
+
+// wireModuleCall exposes __moduleCall(name, payload) to the realm: the cap-bridge's
+// MODULE_CALL backend, routing an installed handler call to Go's run() (the wasm app
+// modules: codec, reputation). null when the handler is absent or returns nothing.
+func wireModuleCall() {
+	qc.Global().SetPropertyStr("__moduleCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		nm, err := qjs.JsTypedArrayToGo(t.Args()[0])
+		if err != nil {
+			return t.Context().NewNull(), nil
+		}
+		pl, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		if err != nil {
+			return t.Context().NewNull(), nil
+		}
+		resp := run(nm, pl)
+		if resp == nil {
+			return t.Context().NewNull(), nil
+		}
+		return t.Context().NewArrayBuffer(resp), nil
+	}))
+}
+
+// ───────────────────────── entry ─────────────────────────
+
+// cliArgs is the loader's CLI surface (mirrors host/main.ts). The bundle dir is a
+// positional arg (default: the seedstore bundle) or --bundle.
+type cliArgs struct {
+	bundleDir, dataDir, policyPath, keyPath string
+	listen, wsListen, peers                 string
+	put, get, out, appConfig                string
+	timeoutMs                               int
+}
+
+func parseCLI() cliArgs {
+	a := cliArgs{bundleDir: "../../../seedstore/WASM/bundle", dataDir: "./data", keyPath: "./seedkernel.key", timeoutMs: 2000}
+	f := os.Args[1:]
+	val := func(i *int) string {
+		*i++
+		if *i < len(f) {
+			return f[*i]
+		}
+		return ""
+	}
+	for i := 0; i < len(f); i++ {
+		switch f[i] {
+		case "--policy":
+			a.policyPath = val(&i)
+		case "--dir":
+			a.dataDir = val(&i)
+		case "--key":
+			a.keyPath = val(&i)
+		case "--listen":
+			a.listen = val(&i)
+		case "--ws-listen":
+			a.wsListen = val(&i)
+		case "--peers":
+			a.peers = val(&i)
+		case "--put":
+			a.put = val(&i)
+		case "--get":
+			a.get = val(&i)
+		case "--out":
+			a.out = val(&i)
+		case "--app-config":
+			a.appConfig = val(&i)
+		case "--bundle":
+			a.bundleDir = val(&i)
+		case "--timeout":
+			if n, err := strconv.Atoi(val(&i)); err == nil {
+				a.timeoutMs = n
+			}
+		default:
+			if !strings.HasPrefix(f[i], "--") {
+				a.bundleDir = f[i]
+			}
+		}
+	}
+	return a
+}
+
+func main() {
+	a := parseCLI()
+	boot()
+
+	// Install policy (optional; absent ⇒ the permissive caps-free default).
+	if a.policyPath != "" {
+		pj, err := os.ReadFile(a.policyPath)
+		if err != nil {
+			fatal("policy", err)
+			return
+		}
+		if err := applyPolicy(string(pj)); err != nil {
+			fatal("policy", err)
+			return
+		}
+	}
+
+	// fs backend + the engine net / cap-bridge layer over the booted realm. boot()
+	// already exposed sodium + the kernel bridge; this adds __net + the shared route
+	// bundle + the cap-bridge + the node-setup glue, all driven by the one loop.
+	if err := exposeFs(qc, a.dataDir); err != nil {
+		fatal("fs", err)
+		return
+	}
+	el := newEventLoop(qc)
+	if err := installEngineNet(qc, el); err != nil {
+		fatal("net", err)
+		return
+	}
+	wireModuleCall()
+
+	// Identity (load --key or mint + persist) → the network + transport over it.
+	skHex, err := loadOrMintKey(a.keyPath)
+	if err != nil {
+		fatal("key", err)
+		return
+	}
+	pkVal, err := qc.Eval("<identity>", qjs.Code(fmt.Sprintf(`__setIdentity(%q)`, skHex)))
+	if err != nil {
+		fatal("identity", err)
+		return
+	}
+	pkHex := pkVal.String()
+
+	listenJS, err := jsAddr(a.listen)
+	if err != nil {
+		fatal("listen", err)
+		return
+	}
+	wsListenJS, err := jsAddr(a.wsListen)
+	if err != nil {
+		fatal("ws-listen", err)
+		return
+	}
+	if _, _, _, err := el.await(fmt.Sprintf(`__startNode(%s, %s, %d)`, listenJS, wsListenJS, a.timeoutMs), 8*time.Second); err != nil {
+		fatal("network start", err)
+		return
+	}
+	portBytes, err := qjs.JsTypedArrayToGo(mustEval(`__nodePorts()`))
+	if err != nil {
+		fatal("ports", err)
+		return
+	}
+	tcpPort := int(portBytes[0])<<8 | int(portBytes[1])
+	wsPort := int(portBytes[2])<<8 | int(portBytes[3])
+
+	// Cohort peers (--peers: pk@host:port,…) the guest may reach via net.peers.
+	peerSpecs := splitList(a.peers)
+	for _, spec := range peerSpecs {
+		if _, err := qc.Eval("<peer>", qjs.Code(fmt.Sprintf(`__addPeer(%q)`, spec))); err != nil {
+			fatal("peer "+spec, err)
+			return
+		}
+	}
+	if len(peerSpecs) > 0 {
+		if _, _, _, err := el.await(`__nodeReady()`, 8*time.Second); err != nil {
+			fatal("cohort ready", err)
+			return
+		}
+	}
+
+	fmt.Printf("seedkernel-loader %s\n", pkHex)
+	fmt.Printf("  policy %s\n", orNone(a.policyPath))
+	fmt.Printf("  store  %s (fs.* backend)\n", a.dataDir)
+	fmt.Printf("  cohort %d peer(s)\n", len(peerSpecs))
+	if tcpPort != 0 {
+		fmt.Printf("  tcp    listening on :%d\n", tcpPort)
+	}
+	if wsPort != 0 {
+		fmt.Printf("  ws     listening on :%d\n", wsPort)
+	}
+
+	// The signed bundle: verify + install its modules, capture its guest.
+	fmt.Println("  bundle " + loadBundle(a.bundleDir))
+
+	var g *guestRealm
+	if loaded != nil {
+		// Build the cap funnel for the bundle's declared domains, then the confined
+		// guest from its verified source + the merged APP config (manifest ∪ operator).
+		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s)`, jsStrArray(loaded.caps)))); err != nil {
+			fatal("cap-bridge", err)
+			return
+		}
+		appJSON, err := mergeConfig(loaded.config, a.appConfig)
+		if err != nil {
+			fatal("app-config", err)
+			return
+		}
+		if g, err = newGuestRealm(el, appJSON, loaded.guestSource); err != nil {
+			fatal("guest", err)
+			return
+		}
+		defer g.close()
+
+		// One-shot client ops through the loaded guest — "the shell runs the app" as
+		// the initiator (README §13.7). Arguments/results cross as raw bytes.
+		if a.put != "" {
+			data, err := os.ReadFile(a.put)
+			if err != nil {
+				fatal("put", err)
+				return
+			}
+			r, err := g.runGuest("put", data)
+			if err != nil {
+				fatal("put", err)
+				return
+			}
+			fmt.Printf("  PUT ok: %d B response\n    %s\n", len(r), hex.EncodeToString(r))
+		}
+		if a.get != "" {
+			arg, err := decodeGetArg(a.get)
+			if err != nil {
+				fatal("get", err)
+				return
+			}
+			data, err := g.runGuest("get", arg)
+			if err != nil {
+				fatal("get", err)
+				return
+			}
+			if a.out != "" {
+				if err := os.WriteFile(a.out, data, 0o644); err != nil {
+					fatal("out", err)
+					return
+				}
+				fmt.Printf("  GET ok: %d B → %s\n", len(data), a.out)
+			} else {
+				os.Stdout.Write(data)
+			}
+		}
+	}
+
+	serving := tcpPort != 0 || wsPort != 0
+	if !serving {
+		return
+	}
+	// A serving node with an app loaded also holds for the cohort: route incoming
+	// requests to the guest's confined `handle` — no app-specific host code (§13.7).
+	if g != nil {
+		wireHolder(qc, g)
+		fmt.Println("  holder serving the app's request side from the confined guest")
+	}
+	fmt.Println("serving — Ctrl-C to stop")
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() { <-sig; os.Exit(0) }()
+	el.stopped = false
+	el.run()
+}
+
+// ── CLI helpers ──────────────────────────────────────────────────────────────
+
+func fatal(stage string, err error) { fmt.Println("ERROR: " + stage + ": " + err.Error()) }
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none — installs disabled)"
+	}
+	return s
+}
+
+// mustEval evaluates a side-effect-free JS expression that cannot fail in practice
+// (a glue function the loader itself installed); a failure is a loader bug, so panic.
+func mustEval(code string) *qjs.Value {
+	v, err := qc.Eval("<eval>", qjs.Code(code))
+	if err != nil {
+		panic(fmt.Sprintf("eval %q: %v", code, err))
+	}
+	return v
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// jsAddr renders a host:port flag as the `{ host, port }` JS literal makeNetwork
+// wants (empty ⇒ `undefined`, i.e. not listening on that transport).
+func jsAddr(s string) (string, error) {
+	if strings.TrimSpace(s) == "" {
+		return "undefined", nil
+	}
+	i := strings.LastIndex(s, ":")
+	if i < 0 {
+		return "", fmt.Errorf("expected host:port, got %q", s)
+	}
+	host := s[:i]
+	if host == "" {
+		host = "0.0.0.0"
+	}
+	port, err := strconv.Atoi(s[i+1:])
+	if err != nil || port < 0 {
+		return "", fmt.Errorf("bad port in %q", s)
+	}
+	return fmt.Sprintf(`{ host: %q, port: %d }`, host, port), nil
+}
+
+// jsStrArray renders a string slice as a JS array literal (`[]` when empty, so an
+// undeclared-caps bundle grants no ops rather than `null`).
+func jsStrArray(ss []string) string {
+	if len(ss) == 0 {
+		return "[]"
+	}
+	b, _ := json.Marshal(ss)
+	return string(b)
+}
+
+// loadOrMintKey returns the node's 64-byte ed25519 secret key as hex: read from
+// keyPath if present, else minted via libsodium (byte-identical to a browser/Bun
+// node's keypair) and persisted. The public key is its 32-byte tail.
+func loadOrMintKey(keyPath string) (string, error) {
+	if b, err := os.ReadFile(keyPath); err == nil {
+		skHex := strings.TrimSpace(string(b))
+		if len(skHex) != 128 {
+			return "", fmt.Errorf("--key must hold a 64-byte secret key (hex), got %d chars", len(skHex))
+		}
+		return skHex, nil
+	}
+	v, err := qc.Eval("<mint>", qjs.Code(
+		`(function(){ const kp = sodium.crypto_sign_keypair(); return Array.from(kp.privateKey, b => b.toString(16).padStart(2,"0")).join(""); })()`,
+	))
+	if err != nil {
+		return "", err
+	}
+	skHex := v.String()
+	if err := os.WriteFile(keyPath, []byte(skHex), 0o600); err != nil {
+		return "", err
+	}
+	return skHex, nil
+}
+
+// mergeConfig builds the guest's APP JSON: the manifest's author-signed config with
+// the operator's --app-config (a JSON file) merged over it (operator wins).
+func mergeConfig(manifest json.RawMessage, appConfigPath string) (string, error) {
+	merged := map[string]any{}
+	if len(manifest) > 0 {
+		if err := json.Unmarshal(manifest, &merged); err != nil {
+			return "", fmt.Errorf("manifest config: %w", err)
+		}
+	}
+	if appConfigPath != "" {
+		b, err := os.ReadFile(appConfigPath)
+		if err != nil {
+			return "", err
+		}
+		op := map[string]any{}
+		if err := json.Unmarshal(b, &op); err != nil {
+			return "", fmt.Errorf("app-config: %w", err)
+		}
+		for k, v := range op {
+			merged[k] = v
+		}
+	}
+	out, err := json.Marshal(merged)
+	return string(out), err
+}
+
+// decodeGetArg parses a --get argument: colon-joined hex tokens, concatenated into
+// the raw bytes the guest's get entrypoint expects (the shell never decodes meaning).
+func decodeGetArg(s string) ([]byte, error) {
+	var out []byte
+	for _, tok := range strings.Split(s, ":") {
+		b, err := hex.DecodeString(tok)
+		if err != nil {
+			return nil, fmt.Errorf("--get token %q: %w", tok, err)
+		}
+		out = append(out, b...)
+	}
+	return out, nil
+}

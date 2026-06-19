@@ -2,7 +2,7 @@
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so its wire codec
 // is pure byte transformation — exactly the shape of a no-cap WASM handler like
-// `codec` (PLAN-runtime-split.md). It imports nothing but the AS runtime: no
+// `codec`. It imports nothing but the AS runtime: no
 // kernel.call, no fs, no net. The host owns the socket and the RNG and pumps
 // bytes through this module; this module only frames/deframes and computes the
 // handshake accept (sha1 + base64), holding no per-connection state — the host

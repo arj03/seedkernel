@@ -1,6 +1,6 @@
 // Builds browser/libsodium.wasm + browser/libsodium-core.mjs +
 // browser/libsodium-wrappers.mjs from the upstream libsodium-wrappers-sumo
-// package — the one libsodium the runtime depends on (PLAN-runtime-split.md §3).
+// package — the one libsodium the runtime depends on.
 //
 // Why: the npm dist embeds the WASM as a base64 string inside the JS. We strip
 // that string out and ship the raw .wasm so the browser fetches it directly
