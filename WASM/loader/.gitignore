@@ -1,0 +1,7 @@
+# Generated host JS bundles — the shared TS (net-route / net-link / cap-bridge),
+# bundled for //go:embed. Regenerate from WASM/: `npm run build:loader`.
+*.gen.js
+
+# Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
+/seedloader
+/seedloader.exe

@@ -72,6 +72,7 @@
     "build:host": "tsc -p host && tsc -p host/tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
     "build:loader-bundles": "node scripts/bundle-loader.mjs loader/host-netlink.gen.js \"PeerLink,bytesCompare,toHex,fromHex\" build/host/util.js build/host/net-link.js && node scripts/bundle-loader.mjs loader/host-netroute.gen.js \"NodeNetworkCore,Transport,parsePeerSpec,toHex,fromHex\" build/host/util.js build/host/net.js build/host/net-link.js build/host/net-route.js && node scripts/bundle-loader.mjs loader/host-capbridge.gen.js \"createCapBridge,capPreamble,opsForCaps,CAP,CAP_DOMAINS,toHex,fromHex,concatBytes\" build/host/util.js build/host/cap-bridge.js",
+    "build:loader": "npm run build:host && npm run build:loader-bundles",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build": "npm run build:kernel && npm run build:bootstrap && npm run build:forwarder && npm run build:ws && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:chat-app-v1 && npm run build:chat-app-v2 && npm run build:browser-sodium",
