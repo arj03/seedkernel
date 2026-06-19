@@ -82,16 +82,39 @@ func newTCPChannelDial(addr string, onMsg func([]byte), onClose func()) *tcpChan
 			return
 		}
 		c.conn = conn
-		c.open = true
+		c.mu.Unlock()
+		c.flushPending() // drain pre-connect sends in order, then open direct writes
+		c.readLoop()
+	}()
+	return c
+}
+
+// flushPending drains the pre-connect buffer in send order, then opens the
+// direct-write path. open stays false until pending is empty under the lock, so a
+// concurrent send() keeps buffering (it never writes) while this goroutine flushes —
+// making the dial goroutine the sole writer right up to the handoff. That ordering
+// guarantee is the point: a later frame must not overtake an earlier buffered one
+// (PeerLink needs its HELLO to land first). Writes stay off the lock so a stuck
+// conn.Write still can't block close().
+func (c *tcpChannel) flushPending() {
+	for {
+		c.mu.Lock()
+		if c.dead {
+			c.mu.Unlock()
+			return
+		}
 		pending := c.pending
 		c.pending = nil
+		if len(pending) == 0 {
+			c.open = true // pending drained under the lock: future sends write directly
+			c.mu.Unlock()
+			return
+		}
 		c.mu.Unlock()
 		for _, b := range pending {
 			c.writeFrame(b)
 		}
-		c.readLoop()
-	}()
-	return c
+	}
 }
 
 func (c *tcpChannel) send(bytes []byte) {
@@ -228,16 +251,35 @@ func newRawChannelDial(addr string, onMsg func([]byte), onClose func()) *rawSock
 			return
 		}
 		c.conn = conn
-		c.open = true
+		c.mu.Unlock()
+		c.flushPending() // drain pre-connect writes in order, then open direct writes
+		c.readLoop()
+	}()
+	return c
+}
+
+// flushPending drains the pre-connect buffer in order, then opens the direct-write
+// path — same gate-before-open ordering as tcpChannel.flushPending, so the buffered
+// WS upgrade request can't be overtaken by a later frame.
+func (c *rawSockChannel) flushPending() {
+	for {
+		c.mu.Lock()
+		if c.dead {
+			c.mu.Unlock()
+			return
+		}
 		pending := c.pending
 		c.pending = nil
+		if len(pending) == 0 {
+			c.open = true // pending drained under the lock: future sends write directly
+			c.mu.Unlock()
+			return
+		}
 		c.mu.Unlock()
 		for _, b := range pending {
 			c.writeRaw(b)
 		}
-		c.readLoop()
-	}()
-	return c
+	}
 }
 
 func (c *rawSockChannel) send(bytes []byte) {

@@ -61,28 +61,26 @@ const capBridgeGlueJS = `
 
   // Direct synchronous invocation helper (Go passes an ArrayBuffer; the bridge wants
   // a Uint8Array). Returns the bytes for a sync op, or the Promise for an async (net)
-  // op — the guest realm's __host_call handles the async case. A sync result is
-  // copied (.slice()) before Go reads it: JsTypedArrayToGo frees the backing buffer,
-  // and several ops return shared singletons (ONE/ZERO/NONE) that must survive.
-  globalThis.__callBridge = (op, ab) => {
-    const r = __capBridge(op, new Uint8Array(ab));
-    return (r && typeof r.then === "function") ? r : r.slice();
-  };
+  // op — the guest realm's __host_call handles the async case. The sync result is
+  // returned as-is: JsTypedArrayToGo copies on read and leaves the source intact, so
+  // shared singletons (ONE/ZERO/NONE) survive without a defensive .slice() here.
+  globalThis.__callBridge = (op, ab) => __capBridge(op, new Uint8Array(ab));
 
-  // The guest realm's seam target. A sync op returns its bytes (copied); a net op
-  // returns null and later calls __netDone(callId)/__netFail(callId) (Go fns wired by
+  // The guest realm's seam target. A sync op returns its bytes; a net op returns null
+  // and later calls __netDone(callId)/__netFail(callId) (Go fns wired by
   // installEngineNet) when the Transport promise settles — which loop.resolveCall hands
-  // to the guest's blocked host.call (awaitNetCall).
+  // to the guest's blocked host.call (awaitNetCall). __netDone reads via
+  // JsTypedArrayToGo (view-aware, copies), so the settled value passes straight through.
   globalThis.__hostBridgeCall = (op, ab, callId) => {
     const r = __capBridge(op, new Uint8Array(ab));
     if (r && typeof r.then === "function") {
       r.then(
-        (b) => __netDone(callId, (b instanceof Uint8Array ? b : new Uint8Array(b)).slice().buffer),
+        (b) => __netDone(callId, b instanceof Uint8Array ? b : new Uint8Array(b)),
         (e) => __netFail(callId, String(e && e.message || e)),
       );
       return null;
     }
-    return r.slice();
+    return r;
   };
 })();
 `

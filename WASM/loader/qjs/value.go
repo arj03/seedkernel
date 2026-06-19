@@ -347,7 +347,14 @@ func (c *Context) Pump() error {
 	return err
 }
 
-// JsTypedArrayToGo returns the bytes backing a TypedArray/DataView/ArrayBuffer.
+// JsTypedArrayToGo returns the bytes of a TypedArray/DataView/ArrayBuffer as an
+// independent Go copy. The source is left fully intact: it is NOT detached or
+// neutered, so the same value (a shared singleton, a retained Uint8Array, a node
+// key signed against many peers) can be read any number of times. For views it
+// returns only the view's window (byteOffset..byteOffset+byteLength). Callers never
+// need a defensive .slice() before handing a typed array across this seam — the copy
+// happens here, by default. (The underlying toByteArray copies out of the live buffer
+// and frees only QuickJS's bookkeeping cell, never the buffer itself.)
 func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	if input.isByteArray() {
 		return input.toByteArray(), nil

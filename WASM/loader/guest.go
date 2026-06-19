@@ -157,14 +157,13 @@ func (g *guestRealm) close() {
 // single seam, plus register/__invoke for entrypoint dispatch. Pure JS, no authority.
 // host.call is synchronous for every op — sync ops return their bytes directly, and a
 // net op blocks in Go (__host_call → loop.awaitNetCall) until its round-trip settles,
-// so the guest never has to await net. It passes a *copy* to __host_call because the
-// engine bridge frees the buffer it reads.
+// so the guest never has to await net. __host_call reads the payload via
+// JsTypedArrayToGo (view-aware, copies on read), so the buffer is handed across as-is.
 const guestPreambleJS = `
 "use strict";
 globalThis.host = {
   call(op, bytes) {
-    const u8 = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
-    return new Uint8Array(__host_call(op, u8.slice().buffer));
+    return new Uint8Array(__host_call(op, bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes));
   },
 };
 globalThis.__entries = Object.create(null);

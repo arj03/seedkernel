@@ -99,9 +99,9 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
   const env = new Uint8Array(manifestEnvBuf);
   if (env.length < 96) return "ERROR: manifest too short";
   const author = env.slice(0, 32), sig = env.slice(32, 96), json = env.slice(96);
-  // NB: sodium.* neuters typed-array args (Go reads via JsTypedArrayToGo) — pass
-  // copies so `author`/`json` survive for parsing below.
-  if (!sodium.crypto_sign_verify_detached(sig.slice(), json.slice(), author.slice())) return "ERROR: bad manifest signature";
+  // sodium.* reads its args via JsTypedArrayToGo, which copies and leaves the source
+  // intact, so `author`/`json` survive for the policy check + parsing below.
+  if (!sodium.crypto_sign_verify_detached(sig, json, author)) return "ERROR: bad manifest signature";
   if (policy && !policy.authors.has(hex(author))) return "ERROR: manifest author not in policy"; // §13.4 bundle governance
   let s = "";
   for (let i = 0; i < json.length; i++) s += String.fromCharCode(json[i]); // manifest is ASCII

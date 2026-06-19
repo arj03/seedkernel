@@ -65,9 +65,9 @@ func TestCapBridgeOps(t *testing.T) {
 		return b
 	}
 
-	// The node pubkey, read once via .slice() (JsTypedArrayToGo neuters its arg, so a
-	// copy keeps __id.publicKey intact for the bridge's own use).
-	pk := jsBytes(t, qc, `__id.publicKey.slice()`)
+	// The node pubkey. JsTypedArrayToGo copies on read and leaves __id.publicKey intact
+	// for the bridge's own use, so it can be read directly.
+	pk := jsBytes(t, qc, `__id.publicKey`)
 
 	// CAP.HASH (1): 32-byte generic hash, must equal sodium.crypto_generichash.
 	h := callBytes(1, []byte("hello seedkernel"))
