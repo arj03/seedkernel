@@ -13,3 +13,6 @@
 # Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
 /seedloader
 /seedloader.exe
+
+# Local dev wrapper that runs the Go toolchain through WSL — machine-specific setup.
+/gorun.sh
