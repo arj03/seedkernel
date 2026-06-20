@@ -360,6 +360,7 @@ func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
 		c.rt.freeAt(codePtr)
 	}
 	c.rt.freeAt(filePtr)
+	c.rt.freeAt(optPtr) // the option cell QJS_CreateEvalOption malloc'd; QJS_Eval does not free it
 	return c.normalize(res)
 }
 
@@ -386,6 +387,12 @@ func (c *Context) Pump() error {
 // happens here, by default. (The underlying toByteArray copies out of the live buffer
 // and frees only QuickJS's bookkeeping cell, never the buffer itself.)
 func JsTypedArrayToGo(input *Value) ([]byte, error) {
+	// Reject non-objects up front: GetPropertyStr("buffer") below would throw a
+	// TypeError on null/undefined/a primitive and leave the exception flag set,
+	// poisoning the next unrelated JS call (and a nil *Value would panic here).
+	if input == nil || !input.IsObject() {
+		return nil, errors.New("qjs: expected a typed array or ArrayBuffer")
+	}
 	if input.isByteArray() {
 		return input.toByteArray(), nil
 	}
