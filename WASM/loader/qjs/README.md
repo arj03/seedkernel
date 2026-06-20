@@ -22,7 +22,7 @@ wazero version and shedding unused complexity, not MiB.
   driven over wazero — the Go build never compiles C.
 
 To rebuild the blob, go to the upstream tag: it builds the shim against quickjs-ng
-(a git submodule there) with emscripten. We vendor only the finished `qjs.wasm`, not
+(a git submodule there) with wasi-sdk. We vendor only the finished `qjs.wasm`, not
 the C sources — the `QJS_*` surface the Go bridge depends on is documented below.
 
 Upstream: https://github.com/fastschema/qjs (MIT) · https://github.com/quickjs-ng/quickjs (MIT)
