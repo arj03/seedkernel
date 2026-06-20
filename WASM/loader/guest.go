@@ -158,10 +158,9 @@ func (g *guestRealm) runGuest(entry string, payload []byte) ([]byte, error) {
 // fs + crypto (no net), so it returns bytes without yielding. Called re-entrantly
 // from the host realm's transport.onRequest (wireHolder).
 func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
-	arg := make([]byte, 1+len(payload))
-	arg[0] = typ
-	copy(arg[1:], payload)
-	argv := g.qc.NewArrayBuffer(arg)
+	// Stage [type][payload] straight into one wasm buffer instead of building a
+	// concatenated Go slice first and copying it in again (two passes over payload).
+	argv := g.qc.NewArrayBufferParts([]byte{typ}, payload)
 	defer argv.Free() // Invoke borrows its args; free the per-request ArrayBuffer
 	res, err := g.qc.Invoke(g.invoke, g.qc.NewUndefined(), g.handleName, argv)
 	if err != nil {

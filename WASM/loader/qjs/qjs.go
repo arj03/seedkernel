@@ -259,16 +259,6 @@ func (r *Runtime) writeCStr(s string) uint64 {
 	return ptr
 }
 
-// writeBytes allocates a copy of b in wasm memory and returns (ptr, len).
-func (r *Runtime) writeBytes(b []byte) (uint64, uint64) {
-	if len(b) == 0 {
-		return 0, 0
-	}
-	ptr := r.mallocN(len(b))
-	r.mem.Write(uint32(ptr), b)
-	return ptr, uint64(len(b))
-}
-
 // unpackPtr reads the 8-byte (addr<<32 | size) cell at packedPtr.
 func (r *Runtime) unpackPtr(packedPtr uint64) (addr, size uint32) {
 	if packedPtr == 0 {

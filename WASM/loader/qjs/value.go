@@ -1,9 +1,6 @@
 package qjs
 
-import (
-	"encoding/binary"
-	"errors"
-)
+import "errors"
 
 // Context is a QuickJS execution context bound to a Runtime.
 type Context struct {
@@ -110,11 +107,33 @@ func (c *Context) NewString(s string) *Value {
 
 // NewArrayBuffer creates a JS ArrayBuffer copy of b.
 func (c *Context) NewArrayBuffer(b []byte) *Value {
-	ptr, n := c.rt.writeBytes(b)
-	if ptr != 0 {
-		defer c.rt.freeAt(ptr)
+	return c.NewArrayBufferParts(b)
+}
+
+// NewArrayBufferParts creates a JS ArrayBuffer holding the concatenation of parts.
+// It stages them directly into one wasm buffer rather than building a concatenated
+// Go slice and copying that in — saving a full pass over the payload (and a Go heap
+// alloc) when a small header is prepended (e.g. serveHandle's [type][payload]). The
+// single-copy staging mirrors the host codec's scratch discipline; the subsequent
+// QJS_NewArrayBufferCopy still makes the engine-owned copy as before.
+func (c *Context) NewArrayBufferParts(parts ...[]byte) *Value {
+	total := 0
+	for _, p := range parts {
+		total += len(p)
 	}
-	return c.callV("QJS_NewArrayBufferCopy", c.handle, ptr, n)
+	if total == 0 {
+		return c.callV("QJS_NewArrayBufferCopy", c.handle, 0, 0)
+	}
+	ptr := c.rt.mallocN(total)
+	defer c.rt.freeAt(ptr)
+	off := uint32(ptr)
+	for _, p := range parts {
+		if len(p) > 0 {
+			c.rt.mem.Write(off, p)
+			off += uint32(len(p))
+		}
+	}
+	return c.callV("QJS_NewArrayBufferCopy", c.handle, ptr, uint64(total))
 }
 
 func (c *Context) NewArray() *Array {
@@ -317,17 +336,17 @@ func (v *Value) invokeJS(name string, args ...*Value) (*Value, error) {
 	return v.c.normalize(res)
 }
 
-// marshalArgs writes the JSValue args contiguously into wasm memory.
+// marshalArgs writes the JSValue args contiguously into wasm memory. The 8-byte
+// words go straight into the malloc'd region (WriteUint64Le), skipping the Go-side
+// staging slice the old path built and then copied in — this runs on every Invoke.
 func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	if len(args) == 0 {
 		return 0, 0
 	}
-	buf := make([]byte, 8*len(args))
+	ptr := c.rt.mallocN(8 * len(args))
 	for i, a := range args {
-		binary.LittleEndian.PutUint64(buf[i*8:], a.raw)
+		c.rt.mem.WriteUint64Le(uint32(ptr)+uint32(i*8), a.raw)
 	}
-	ptr := c.rt.mallocN(len(buf))
-	c.rt.mem.Write(uint32(ptr), buf)
 	return uint64(len(args)), ptr
 }
 
