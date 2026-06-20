@@ -149,6 +149,7 @@ func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
 
 func (g *guestRealm) close() {
 	if g.rt != nil {
+		g.host.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 		g.rt.Close()
 	}
 }

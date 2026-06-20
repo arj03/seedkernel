@@ -91,6 +91,18 @@ func newEventLoop(c *qjs.Context) *eventLoop {
 // needs no separate loop — just its job queue drained.
 func (el *eventLoop) addContext(c *qjs.Context) { el.extra = append(el.extra, c) }
 
+// removeContext drops a context registered with addContext, so pumpAll stops
+// touching it once its realm is closed (guestRealm.close). Safe to call with a
+// context that was never added — it's a no-op. Runs on the loop goroutine.
+func (el *eventLoop) removeContext(c *qjs.Context) {
+	for i, x := range el.extra {
+		if x == c {
+			el.extra = append(el.extra[:i], el.extra[i+1:]...)
+			return
+		}
+	}
+}
+
 // pumpAll drains the job queue of el.c and every registered extra context. A host
 // job that schedules a guest job (e.g. resolving the guest entrypoint's promise) is
 // pumped first (el.c) so that guest job runs in the same round.
