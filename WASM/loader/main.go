@@ -268,8 +268,9 @@ func boot() {
 
 	// The install handler (§7.2) delegates to JS onInstall; blocked from kernel.call.
 	registerNative("install", func(payload []byte) []byte {
-		onInstall := qc.Global().GetPropertyStr("onInstall")
-		qc.Invoke(onInstall, qc.Global(), qc.NewArrayBuffer(payload))
+		if res, _ := invokeFree("onInstall", qc.NewArrayBuffer(payload)); res != nil {
+			res.Free()
+		}
 		return nil
 	})
 	blocked[string(name("install"))] = true
@@ -287,6 +288,21 @@ func registerNative(canonical string, fn func([]byte) []byte) {
 	natH[string(n)] = fn
 	setHandler(n, nextID)
 	nextID++
+}
+
+// invokeFree calls the named global function as global.name(args...), then frees the
+// resolved function value and every arg — QJS_Call only borrows them — and returns the
+// result for the caller to consume and Free. It centralizes the loader's one-shot host
+// calls so none leaks a QuickJS handle. The cached Global() is the `this` and is never
+// freed; on error the returned value is nil (normalize already freed it).
+func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
+	fn := qc.Global().GetPropertyStr(fnName)
+	res, err := qc.Invoke(fn, qc.Global(), args...)
+	fn.Free()
+	for _, a := range args {
+		a.Free()
+	}
+	return res, err
 }
 
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
@@ -322,11 +338,12 @@ func loadBundle(dir string) string {
 		goFiles[e.Name()] = fb
 		jsFiles.SetPropertyStr(e.Name(), qc.NewArrayBuffer(fb))
 	}
-	res, err := qc.Invoke(qc.Global().GetPropertyStr("verifyBundle"), qc.Global(), qc.NewArrayBuffer(menv), jsFiles)
+	res, err := invokeFree("verifyBundle", qc.NewArrayBuffer(menv), jsFiles)
 	if err != nil {
 		return "ERROR(invoke): " + err.Error()
 	}
 	out := res.String()
+	res.Free()
 	if strings.HasPrefix(out, "ERROR") {
 		return out
 	}
@@ -362,7 +379,10 @@ func applyPolicy(json string) error {
 	if strings.TrimSpace(json) == "" {
 		return nil
 	}
-	_, err := qc.Invoke(qc.Global().GetPropertyStr("setPolicy"), qc.Global(), qc.NewString(json))
+	res, err := invokeFree("setPolicy", qc.NewString(json))
+	if res != nil {
+		res.Free()
+	}
 	return err
 }
 

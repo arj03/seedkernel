@@ -120,10 +120,13 @@ func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, e
 // hostCapPreamble asks the host realm for capPreamble() — the `const CAP_X = n;`
 // block the guest is written against, so guest and bridge can never drift.
 func hostCapPreamble(hostQc *qjs.Context) string {
-	v, err := hostQc.Invoke(hostQc.Global().GetPropertyStr("capPreamble"), hostQc.NewUndefined())
+	fn := hostQc.Global().GetPropertyStr("capPreamble")
+	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
+	fn.Free()
 	if err != nil {
 		panic(fmt.Sprintf("capPreamble: %v", err))
 	}
+	defer v.Free()
 	return v.String()
 }
 
@@ -161,10 +164,16 @@ func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
 }
 
 func (g *guestRealm) close() {
-	if g.rt != nil {
-		g.host.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
-		g.rt.Close()
+	if g.rt == nil {
+		return
 	}
+	g.host.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
+	// hostBridgeCall is a HOST-realm ref; it outlives the guest runtime, so rt.Close()
+	// (which only tears down the guest realm) won't reclaim it — free it explicitly. The
+	// cached guest-realm values (invoke/handleName) die with rt.Close(), so leave those.
+	g.hostBridgeCall.Free()
+	g.rt.Close()
+	g.rt = nil
 }
 
 // guestPreambleJS is the guest-side ABI (safe-js.ts PREAMBLE): host.call over the

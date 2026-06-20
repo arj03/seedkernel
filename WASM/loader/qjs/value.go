@@ -10,6 +10,12 @@ type Context struct {
 	rt     *Runtime
 	handle uint64 // JSContext*
 	global *Value
+	// Cached intrinsics, resolved on first use and retained for the realm's life (freed
+	// with the runtime). isByteArray/classTag run on every JS→Go bulk transfer, so
+	// re-walking the prototype chain for Object.prototype.toString and re-looking-up the
+	// ArrayBuffer constructor on each call was needless churn on a hot path.
+	objToString *Value // Object.prototype.toString, for classTag
+	abCtor      *Value // the ArrayBuffer constructor, for isByteArray's instanceof
 }
 
 // Value wraps a NaN-boxed JSValue (uint64) plus its context.
@@ -189,20 +195,33 @@ func (v *Value) isByteArray() bool {
 	}
 	// instanceof first (same-realm, the common case); the class-tag fallback catches a
 	// cross-realm ArrayBuffer, for which instanceof against this realm's ctor fails.
-	return v.isGlobalInstanceOf("ArrayBuffer") || v.classTag() == "[object ArrayBuffer]"
+	if ctor := v.c.arrayBufferCtor(); ctor != nil &&
+		v.boolCall("QJS_IsInstanceOf", v.c.handle, v.raw, ctor.raw) {
+		return true
+	}
+	return v.classTag() == "[object ArrayBuffer]"
+}
+
+// arrayBufferCtor returns the realm's ArrayBuffer constructor, cached after first use.
+// nil if the realm has no ArrayBuffer global (never in practice — it's a standard
+// intrinsic), in which case isByteArray falls back to the class tag.
+func (c *Context) arrayBufferCtor() *Value {
+	if c.abCtor == nil {
+		ctor := c.Global().GetPropertyStr("ArrayBuffer")
+		if ctor.IsUndefined() {
+			ctor.Free()
+			return nil
+		}
+		c.abCtor = ctor
+	}
+	return c.abCtor
 }
 
 // classTag returns v's brand via Object.prototype.toString.call(v) — e.g.
 // "[object ArrayBuffer]", "[object Uint8Array]". Unlike String() it ignores the value's
 // own toString, so it is O(1) regardless of contents (see isByteArray).
 func (v *Value) classTag() string {
-	obj := v.c.Global().GetPropertyStr("Object")
-	defer obj.Free()
-	proto := obj.GetPropertyStr("prototype")
-	defer proto.Free()
-	toString := proto.GetPropertyStr("toString")
-	defer toString.Free()
-	r, err := v.c.Invoke(toString, v) // Object.prototype.toString.call(v)
+	r, err := v.c.Invoke(v.c.objectToString(), v) // Object.prototype.toString.call(v)
 	if err != nil {
 		return ""
 	}
@@ -210,13 +229,16 @@ func (v *Value) classTag() string {
 	return r.String()
 }
 
-func (v *Value) isGlobalInstanceOf(name string) bool {
-	ctor := v.c.Global().GetPropertyStr(name)
-	defer ctor.Free()
-	if ctor.IsUndefined() {
-		return false
+// objectToString returns Object.prototype.toString, cached after first use.
+func (c *Context) objectToString() *Value {
+	if c.objToString == nil {
+		obj := c.Global().GetPropertyStr("Object")
+		defer obj.Free()
+		proto := obj.GetPropertyStr("prototype")
+		defer proto.Free()
+		c.objToString = proto.GetPropertyStr("toString")
 	}
-	return v.boolCall("QJS_IsInstanceOf", v.c.handle, v.raw, ctor.raw)
+	return c.objToString
 }
 
 // toByteArray returns a copy of the ArrayBuffer's bytes, leaving the source intact.
@@ -258,10 +280,8 @@ func (v *Value) exception() error {
 }
 
 func (c *Context) hasException() bool {
-	return c.value(c.rt.call("JS_HasException", c.handle)).boolRaw()
+	return int32(c.rt.call("JS_HasException", c.handle)) != 0
 }
-
-func (v *Value) boolRaw() bool { return int32(v.raw) != 0 }
 
 func (c *Context) exception() error {
 	val := c.callV("JS_GetException", c.handle)

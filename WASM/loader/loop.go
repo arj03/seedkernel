@@ -278,18 +278,23 @@ func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
 		task()
 		pump()
 	case <-wait:
-		// The wait fired (deadline or next timer). select picks at random when a task is
-		// also ready, so drain whatever is queued before returning — otherwise a result
-		// that raced the deadline would sit unprocessed and awaitNetCall would report a
-		// false timeout.
-		for {
-			select {
-			case task := <-el.tasks:
-				task()
-				pump()
-			default:
-				return
-			}
+	}
+	// Drain whatever else is already queued before returning, pumping after each. Two
+	// reasons: a burst of posted socket frames is delivered in this one turn rather than
+	// one per step() (each turn otherwise re-scans timers and rebuilds the select); and a
+	// result that raced <-wait (select picks at random when a task is also ready) is
+	// processed now instead of sitting until the next turn, which would make awaitNetCall
+	// report a false timeout. until() short-circuits so a satisfied caller exits promptly.
+	for {
+		if until() {
+			return
+		}
+		select {
+		case task := <-el.tasks:
+			task()
+			pump()
+		default:
+			return
 		}
 	}
 }
@@ -362,6 +367,11 @@ func (el *eventLoop) ensureSettle(c *qjs.Context) {
 	el.settleInstalled[c] = true
 }
 
+// awaitIn is NOT re-entrant: el.onSettle is a single shared slot, and the defer below
+// resets it to nil (not a saved previous value), so a nested awaitIn would orphan the
+// outer await's result sink. The loader never nests it — only one await is in flight at
+// a time, and a guest's net call blocks via netBlocking/awaitNetCall (which does not
+// touch onSettle), not via a second awaitIn.
 func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1
 	el.ensureSettle(c)

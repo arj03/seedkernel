@@ -2,8 +2,15 @@ package main
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"testing"
 )
+
+func randBytes(n int) []byte {
+	b := make([]byte, n)
+	crand.Read(b)
+	return b
+}
 
 // Unit tests for the WS wire codec primitive — the embedded ws.wasm driven over
 // wazero (__ws). The RFC 6455 handshake/framing on top is the shared host JS

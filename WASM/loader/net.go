@@ -12,7 +12,6 @@
 package main
 
 import (
-	crand "crypto/rand"
 	"net"
 	"sync"
 	"time"
@@ -31,12 +30,6 @@ func putU32BE(b []byte, off int, v uint32) {
 
 func getU32BE(b []byte, off int) uint32 {
 	return uint32(b[off])<<24 | uint32(b[off+1])<<16 | uint32(b[off+2])<<8 | uint32(b[off+3])
-}
-
-func randBytes(n int) []byte {
-	b := make([]byte, n)
-	crand.Read(b)
-	return b
 }
 
 // ───────────────────────── RawChannel: a whole-message duplex ─────────────────
