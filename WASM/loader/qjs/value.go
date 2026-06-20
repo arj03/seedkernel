@@ -78,8 +78,8 @@ func (c *Context) Global() *Value {
 	return c.global
 }
 
-func (c *Context) NewObject() *Value { return c.callV("JS_NewObject", c.handle) }
-func (c *Context) NewNull() *Value   { return c.callV("JS_NewNull") }
+func (c *Context) NewObject() *Value    { return c.callV("JS_NewObject", c.handle) }
+func (c *Context) NewNull() *Value      { return c.callV("JS_NewNull") }
 func (c *Context) NewUndefined() *Value { return c.callV("JS_NewUndefined") }
 
 func (c *Context) NewBool(b bool) *Value {
@@ -90,7 +90,9 @@ func (c *Context) NewBool(b bool) *Value {
 	return c.callV("QJS_NewBool", c.handle, n)
 }
 
-func (c *Context) NewInt32(v int32) *Value { return c.callV("QJS_NewInt32", c.handle, uint64(uint32(v))) }
+func (c *Context) NewInt32(v int32) *Value {
+	return c.callV("QJS_NewInt32", c.handle, uint64(uint32(v)))
+}
 func (c *Context) NewInt64(v int64) *Value { return c.callV("QJS_NewInt64", c.handle, uint64(v)) }
 
 func (c *Context) NewString(s string) *Value {

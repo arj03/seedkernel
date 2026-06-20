@@ -70,10 +70,10 @@ type jsTimer struct {
 // timerHeap is a min-heap of pending timers ordered by deadline.
 type timerHeap []*jsTimer
 
-func (h timerHeap) Len() int            { return len(h) }
-func (h timerHeap) Less(i, j int) bool  { return h[i].deadline.Before(h[j].deadline) }
-func (h timerHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
-func (h *timerHeap) Push(x any)         { t := x.(*jsTimer); t.index = len(*h); *h = append(*h, t) }
+func (h timerHeap) Len() int           { return len(h) }
+func (h timerHeap) Less(i, j int) bool { return h[i].deadline.Before(h[j].deadline) }
+func (h timerHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index = i; h[j].index = j }
+func (h *timerHeap) Push(x any)        { t := x.(*jsTimer); t.index = len(*h); *h = append(*h, t) }
 func (h *timerHeap) Pop() any {
 	old := *h
 	n := len(old)

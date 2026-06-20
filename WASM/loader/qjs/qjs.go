@@ -300,9 +300,9 @@ func (r *Runtime) readPackedString(packedPtr uint64) string {
 		return ""
 	}
 	buf, _ := r.mem.Read(addr, size)
-	s := string(buf)                                       // copy out before freeing
+	s := string(buf)                                      // copy out before freeing
 	r.call("JS_FreeCString", r.ctxt.handle, uint64(addr)) // drop the JSString ref ToCString took
-	r.freeAt(packedPtr)                                    // free the malloc'd packed cell
+	r.freeAt(packedPtr)                                   // free the malloc'd packed cell
 	return s
 }
 

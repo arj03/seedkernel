@@ -32,8 +32,10 @@ type guestRealm struct {
 	hostQc         *qjs.Context
 	rt             *qjs.Runtime
 	qc             *qjs.Context
-	host           *eventLoop  // the shared host loop (drives both realms)
-	hostBridgeCall *qjs.Value  // retained host-realm __hostBridgeCall
+	host           *eventLoop // the shared host loop (drives both realms)
+	hostBridgeCall *qjs.Value // retained host-realm __hostBridgeCall
+	invoke         *qjs.Value // retained guest-realm __invoke (holder hot path)
+	handleName     *qjs.Value // retained "handle" entry name for serveHandle
 }
 
 // newGuestRealm builds a confined realm running guestSource, fronted by the cap op
@@ -68,11 +70,17 @@ func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, e
 			return nil, err
 		}
 		callID := host.nextCallID()
+		// pv is the only refcounted arg (op/callID are immediates); Invoke borrows it,
+		// so free it once the call returns. Without this every guest host.call leaked a
+		// host-realm ArrayBuffer.
+		pv := hostQc.NewArrayBuffer(payload)
 		res, err := hostQc.Invoke(g.hostBridgeCall, hostQc.NewUndefined(),
-			hostQc.NewInt32(op), hostQc.NewArrayBuffer(payload), hostQc.NewInt64(callID))
+			hostQc.NewInt32(op), pv, hostQc.NewInt64(callID))
+		pv.Free()
 		if err != nil {
 			return nil, err
 		}
+		defer res.Free() // the bridge's own-ref result (sync bytes, or the JS_NULL immediate)
 		if res.IsNull() {
 			// A net op: the host realm's Transport returned a Promise, so the bytes
 			// aren't ready yet. Block here, pumping the host realm until it settles, and
@@ -101,6 +109,11 @@ func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, e
 		rt.Close()
 		return nil, fmt.Errorf("guest source: %w", err)
 	}
+	// Retain the entrypoint dispatcher + its "handle" name once: serveHandle runs per
+	// inbound request, so re-resolving (and freeing) them each call is needless churn.
+	// Both are guest-realm values, freed when rt.Close() tears down the realm.
+	g.invoke = g.qc.Global().GetPropertyStr("__invoke")
+	g.handleName = g.qc.NewString("handle")
 	return g, nil
 }
 
@@ -137,13 +150,13 @@ func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
 	arg := make([]byte, 1+len(payload))
 	arg[0] = typ
 	copy(arg[1:], payload)
-	res, err := g.qc.Invoke(
-		g.qc.Global().GetPropertyStr("__invoke"),
-		g.qc.NewUndefined(), g.qc.NewString("handle"), g.qc.NewArrayBuffer(arg),
-	)
+	argv := g.qc.NewArrayBuffer(arg)
+	defer argv.Free() // Invoke borrows its args; free the per-request ArrayBuffer
+	res, err := g.qc.Invoke(g.invoke, g.qc.NewUndefined(), g.handleName, argv)
 	if err != nil {
 		return nil, err
 	}
+	defer res.Free()                 // own-ref result; the copy below happens before this runs
 	return qjs.JsTypedArrayToGo(res) // sync handle → ArrayBuffer (not a Promise)
 }
 

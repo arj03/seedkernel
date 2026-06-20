@@ -62,10 +62,10 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 			return t.Context().NewInt32(int32(bound)), nil
 		})
 	}
-	o.SetPropertyStr("connect", connect(false))    // node↔node, length-framed TCP
-	o.SetPropertyStr("connectRaw", connect(true))  // raw byte stream (under the JS WS codec)
-	o.SetPropertyStr("listen", listen(false))      // accept node↔node TCP
-	o.SetPropertyStr("listenRaw", listen(true))    // accept raw byte streams (browser↔node WS)
+	o.SetPropertyStr("connect", connect(false))   // node↔node, length-framed TCP
+	o.SetPropertyStr("connectRaw", connect(true)) // raw byte stream (under the JS WS codec)
+	o.SetPropertyStr("listen", listen(false))     // accept node↔node TCP
+	o.SetPropertyStr("listenRaw", listen(true))   // accept raw byte streams (browser↔node WS)
 	o.SetPropertyStr("send", fn(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return nil, nil
