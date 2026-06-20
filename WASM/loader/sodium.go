@@ -1,11 +1,18 @@
 // sodium.go — the Go target's crypto *primitive*: the same browser/libsodium.wasm,
-// driven over wazero. Not Go-native crypto. The point is interop: a Go node's
-// sealed boxes / xchacha20 blocks / ed25519→
-// curve25519 conversions must be byte-identical to a Bun node's, which only the
-// exact same libsodium binary guarantees. This file is the FFI seam over the
-// emscripten ABI (malloc / copy-in / call / copy-out) plus a `sodium` object into
-// the QuickJS realm carrying libsodium-wrappers method names — so the shared host
-// JS (and, later, cap-bridge.ts) calls `sodium.*` unchanged.
+// driven over wazero. Mostly not Go-native crypto. The point is interop: a Go node's
+// sealed boxes / ed25519→curve25519 conversions / xchacha20 blocks must be
+// byte-identical to a Bun node's, which only the exact same libsodium binary
+// guarantees. This file is the FFI seam over the emscripten ABI (malloc / copy-in /
+// call / copy-out) plus a `sodium` object into the QuickJS realm carrying
+// libsodium-wrappers method names — so the shared host JS (and, later, cap-bridge.ts)
+// calls `sodium.*` unchanged.
+//
+// The one exception is genericHash (BLAKE2b-256, the content-address block-id hash):
+// it runs on native Go (golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is fully
+// standardized, so native output is byte-identical to libsodium's (pinned by a KAT in
+// TestSodiumGenericHash) — but it's on the storage data path (every block hashed on
+// PUT, verified on bulk receive, §13.6) and it's the one primitive wazero runs the
+// wasm materially slower than V8, so native (~600 vs ~390 MB/s) is the clear win.
 package main
 
 import (
@@ -20,6 +27,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"golang.org/x/crypto/blake2b"
 )
 
 //go:embed wasm/libsodium.wasm
@@ -196,15 +204,15 @@ func (s *libsodium) hashSha3256(msg []byte) []byte {
 	return s.read(out, 32)
 }
 
+// genericHash is native Go BLAKE2b (not libsodium) — see the file header. Byte-identical
+// to crypto_generichash for the unkeyed case, which is all this build uses.
 func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	in, out := s.copyIn(msg), s.malloc(outLen)
-	defer s.free(in)
-	defer s.free(out)
-	lo, hi := lenArgs(len(msg))
-	s.call("crypto_generichash", uint64(out), uint64(outLen), uint64(in), lo, hi, 0, 0)
-	return s.read(out, outLen)
+	h, err := blake2b.New(outLen, nil)
+	if err != nil {
+		panic(fmt.Sprintf("blake2b.New(%d): %v", outLen, err))
+	}
+	h.Write(msg)
+	return h.Sum(nil)
 }
 
 func (s *libsodium) streamXor(msg, nonce, key []byte) []byte {

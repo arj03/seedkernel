@@ -39,13 +39,27 @@ func TestSodiumSha3256(t *testing.T) {
 	}
 }
 
-// crypto_generichash (no key, 32-byte out) is plain BLAKE2b-256.
+// genericHash (no key, 32-byte out) is plain BLAKE2b-256, and runs on native Go rather
+// than libsodium (sodium.go header). Since it's the content-address block-id hash, a Go
+// node and a Bun node MUST agree on it — so beyond the x/crypto cross-check, pin it to
+// known-answer vectors captured from the libsodium.wasm this build embeds. If native Go
+// ever diverged from that exact binary, these fail rather than silently forking storage.
 func TestSodiumGenericHash(t *testing.T) {
 	s := newSodium(t)
 	for _, msg := range [][]byte{nil, []byte("hello"), bytes.Repeat([]byte{1}, 333)} {
 		got, want := s.genericHash(32, msg), blake2b.Sum256(msg)
 		if !bytes.Equal(got, want[:]) {
 			t.Fatalf("generichash(%q): got %x want %x", msg, got, want)
+		}
+	}
+	// KAT: libsodium crypto_generichash(32, msg) for "" and "abc" (also the standard
+	// BLAKE2b-256 vectors). Locks native Go to the embedded binary's output.
+	for _, kat := range []struct{ msg, hex string }{
+		{"", "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8"},
+		{"abc", "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"},
+	} {
+		if g := hex.EncodeToString(s.genericHash(32, []byte(kat.msg))); g != kat.hex {
+			t.Fatalf("blake2b256(%q) = %s, want %s (native vs libsodium drift?)", kat.msg, g, kat.hex)
 		}
 	}
 }
