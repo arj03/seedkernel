@@ -12,7 +12,7 @@
 
 import type { Network, PeerId } from "./net.js";
 import { PeerLink, bytesCompare, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
-import { toHex, fromHex } from "./util.js";
+import { toHex } from "./util.js";
 
 export interface PeerAddr {
   host: string;
@@ -120,7 +120,10 @@ export class NodeNetworkCore implements Network {
    *  moment its last handshake lands. */
   async ready(timeoutMs = 5000): Promise<void> {
     const targets = [...this.addrs.keys()].filter((p) => p !== this.ownId);
-    for (const p of targets) if (!this.links.has(p)) this.dial(p);
+    // Skip peers already dialing (in `connecting`) as well as connected ones —
+    // a second dial would orphan the in-flight PeerLink and open a redundant
+    // socket, and the double-self-dial defeats canonicalKeep's tie-break.
+    for (const p of targets) if (!this.links.has(p) && !this.connecting.has(p)) this.dial(p);
     const allUp = (): boolean => targets.every((p) => this.links.has(p));
     if (allUp()) return;
     await new Promise<void>((resolve) => {
@@ -225,6 +228,7 @@ export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: 
   const host = hostPort.slice(0, colon);
   const port = Number(hostPort.slice(colon + 1));
   if (!Number.isInteger(port) || port <= 0) throw new Error(`bad peer port: ${spec}`);
-  fromHex(peerId); // validate the pubkey is real hex by round-tripping (throws on garbage)
+  // The length+charset check above already guarantees 64 valid hex chars, so no
+  // round-trip decode is needed to confirm the pubkey is real hex.
   return { peerId, addr: { host, port, transport } };
 }
