@@ -43,6 +43,13 @@ type eventLoop struct {
 	// in netBlocking[id] when the host realm's Transport promise settles.
 	callSeq     int64
 	netBlocking map[int64]*netOutcome
+
+	// awaitIn installs one persistent __settle per context (tracked here) that routes
+	// into the in-flight await's onSettle, instead of creating — and leaking, since the
+	// callback registry has no unregister — a fresh JS function (and retaining its result
+	// payload) on every await.
+	settleInstalled map[*qjs.Context]bool
+	onSettle        func(kind int, bytes []byte, msg string)
 }
 
 // netOutcome is the landing slot for a synchronously-blocked net call's result.
@@ -80,7 +87,7 @@ func (h *timerHeap) Pop() any {
 // newEventLoop binds a loop to a QuickJS context and installs the browser-like
 // async surface (setTimeout/clearTimeout/queueMicrotask) the shared JS expects.
 func newEventLoop(c *qjs.Context) *eventLoop {
-	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), netBlocking: map[int64]*netOutcome{}}
+	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), netBlocking: map[int64]*netOutcome{}, settleInstalled: map[*qjs.Context]bool{}}
 	el.install()
 	return el
 }
@@ -95,6 +102,7 @@ func (el *eventLoop) addContext(c *qjs.Context) { el.extra = append(el.extra, c)
 // touching it once its realm is closed (guestRealm.close). Safe to call with a
 // context that was never added — it's a no-op. Runs on the loop goroutine.
 func (el *eventLoop) removeContext(c *qjs.Context) {
+	delete(el.settleInstalled, c) // its __settle dies with the realm's runtime
 	for i, x := range el.extra {
 		if x == c {
 			el.extra = append(el.extra[:i], el.extra[i+1:]...)
@@ -196,6 +204,13 @@ func (el *eventLoop) install() {
 		}
 		return nil, nil
 	}))
+	// __signal flips the loop's stop flag; runUntilSignal-driven flows call it from JS.
+	// Installed once (it carries no per-call state) so repeated runUntilSignal calls
+	// don't register a fresh callback each time.
+	g.SetPropertyStr("__signal", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
+		el.stopped = true
+		return nil, nil
+	}))
 	// queueMicrotask isn't a quickjs-ng global; polyfill over a settled promise
 	// (its reaction is a job, drained by Pump).
 	if _, err := el.c.Eval("<loop-setup>", qjs.Code(`globalThis.queueMicrotask = (f) => { Promise.resolve().then(f); };`)); err != nil {
@@ -294,10 +309,6 @@ func (el *eventLoop) run() {
 // Used to drive event-driven flows (a PeerLink handshake, the serve loop) that
 // don't reduce to a single awaitable promise.
 func (el *eventLoop) runUntilSignal(kick string, timeout time.Duration) error {
-	el.c.Global().SetPropertyStr("__signal", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		el.stopped = true
-		return nil, nil
-	}))
 	el.stopped = false
 	if _, err := el.c.Eval("<kick>", qjs.Code(kick)); err != nil {
 		return err
@@ -322,22 +333,43 @@ func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, va
 // bounds the wait as a safety net. c may be the host realm (a serve op) or a guest
 // realm (runGuest) — either way the whole loop is driven, so a guest awaiting net is
 // resumed by the host realm's socket I/O.
-func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
-	kind = -1
-	settle := c.Function(func(t *qjs.This) (*qjs.Value, error) {
+// ensureSettle lazily installs context c's persistent __settle resolver — the JS hook
+// awaitIn's wrapped promise calls. It routes into el.onSettle (the in-flight await's
+// result sink), so each await reuses one callback instead of registering a fresh one;
+// a settle that fires with no await in flight (a late promise after a timeout) is
+// ignored. The entry is dropped in removeContext when a guest realm closes.
+func (el *eventLoop) ensureSettle(c *qjs.Context) {
+	if el.settleInstalled[c] {
+		return
+	}
+	c.Global().SetPropertyStr("__settle", c.Function(func(t *qjs.This) (*qjs.Value, error) {
+		if el.onSettle == nil {
+			return nil, nil
+		}
 		a := t.Args()
-		kind = int(a[0].Int64())
+		var bytes []byte
+		var msg string
 		if len(a) >= 2 {
 			if b, e := qjs.JsTypedArrayToGo(a[1]); e == nil {
-				value = b
+				bytes = b
 			} else {
 				msg = a[1].String()
 			}
 		}
-		el.stopped = true
+		el.onSettle(int(a[0].Int64()), bytes, msg)
 		return nil, nil
-	})
-	c.Global().SetPropertyStr("__settle", settle)
+	}))
+	el.settleInstalled[c] = true
+}
+
+func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
+	kind = -1
+	el.ensureSettle(c)
+	el.onSettle = func(k int, bytes []byte, m string) {
+		kind, value, msg = k, bytes, m
+		el.stopped = true
+	}
+	defer func() { el.onSettle = nil }() // release the in-flight result (and its payload)
 
 	// The kick must NOT evaluate to a promise: QJS_Eval js_std_await()s a promise
 	// result, which blocks this goroutine inside the wasm call — and then the Go

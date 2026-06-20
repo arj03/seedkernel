@@ -83,6 +83,16 @@ func (r *registry) get(id uint64) goFunc {
 	return fn
 }
 
+// CallbackCount returns the number of registered Go callbacks. The registry has no
+// unregister (a function proxy lives for its context), so this is exposed for leak
+// diagnostics: a count that climbs with work signals callbacks created per-call
+// instead of reused (see the loader's persistent __settle / __signal).
+func (r *Runtime) CallbackCount() int {
+	r.reg.mu.RLock()
+	defer r.reg.mu.RUnlock()
+	return len(r.reg.m)
+}
+
 // New instantiates a fresh QuickJS runtime + context.
 func New() (rt *Runtime, err error) {
 	ctx := context.Background()
@@ -205,6 +215,10 @@ func (r *Runtime) Close() {
 // the function is void). Panics on a wasm trap — the loader treats engine faults
 // as fatal, same as the rest of main.go.
 func (r *Runtime) call(name string, args ...uint64) uint64 {
+	// Resolve per call, NOT cached: wazero's api.Function lazily allocates and then
+	// reuses a per-instance execution stack, so a single cached instance corrupts under
+	// re-entrancy (a host import calling back into JS→wasm) — the bridge is re-entrant,
+	// so a fresh instance per call is what keeps nested calls independent.
 	fn := r.mod.ExportedFunction(name)
 	if fn == nil {
 		panic(fmt.Errorf("qjs: missing wasm export %q", name))
