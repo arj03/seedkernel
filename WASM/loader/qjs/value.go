@@ -171,11 +171,41 @@ func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
 func (v *Value) IsError() bool     { return v.boolCall("QJS_IsError", v.c.handle, v.raw) }
 
 // isByteArray reports whether the value is an ArrayBuffer.
+// isByteArray reports whether v is an ArrayBuffer (a bare buffer toByteArray can read
+// directly). A typed-array/DataView view is NOT one — JsTypedArrayToGo reads those via
+// their .buffer — so this returns false for them.
+//
+// The brand check must use classTag (Object.prototype.toString.call), NOT v.String():
+// String() is the value's *own* toString, which for a TypedArray is Array's join — it
+// serializes every element to a comma-joined string. Probing a 64 KB Uint8Array's type
+// that way built a ~200 KB string per call and made every JS→Go bulk transfer (fs.put,
+// __net.send, the storage block plane) O(payload) with a huge constant — ~12 ms for a
+// 64 KB block, vs ~80 µs the other direction. The class tag is O(1) and contents-blind.
 func (v *Value) isByteArray() bool {
 	if !v.IsObject() {
-		return v.String() == "[object ArrayBuffer]"
+		return false // a primitive is never an ArrayBuffer
 	}
-	return v.isGlobalInstanceOf("ArrayBuffer") || v.String() == "[object ArrayBuffer]"
+	// instanceof first (same-realm, the common case); the class-tag fallback catches a
+	// cross-realm ArrayBuffer, for which instanceof against this realm's ctor fails.
+	return v.isGlobalInstanceOf("ArrayBuffer") || v.classTag() == "[object ArrayBuffer]"
+}
+
+// classTag returns v's brand via Object.prototype.toString.call(v) — e.g.
+// "[object ArrayBuffer]", "[object Uint8Array]". Unlike String() it ignores the value's
+// own toString, so it is O(1) regardless of contents (see isByteArray).
+func (v *Value) classTag() string {
+	obj := v.c.Global().GetPropertyStr("Object")
+	defer obj.Free()
+	proto := obj.GetPropertyStr("prototype")
+	defer proto.Free()
+	toString := proto.GetPropertyStr("toString")
+	defer toString.Free()
+	r, err := v.c.Invoke(toString, v) // Object.prototype.toString.call(v)
+	if err != nil {
+		return ""
+	}
+	defer r.Free()
+	return r.String()
 }
 
 func (v *Value) isGlobalInstanceOf(name string) bool {
