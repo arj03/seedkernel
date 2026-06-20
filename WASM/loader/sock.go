@@ -82,8 +82,20 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		if len(t.Args()) < 1 {
 			return nil, nil
 		}
-		if ch := n.get(t.Args()[0].Int64()); ch != nil {
+		// A deliberate close() sets dead WITHOUT firing onClose (net.go: the owner asked
+		// for it), and the readLoop error chasing it short-circuits in fail() on dead — so
+		// the onClose registry-drop (below) never runs for a locally-initiated close. Drop
+		// the entry here instead, or every local close (net-link.ts closes on each rejected
+		// handshake, net-route.ts on a duplicate-dial resolution) leaks its n.chans slot
+		// without bound — an attacker-triggerable memory exhaustion. The JS shim mirrors
+		// this by deleting from its own chans Map in close(). This deletes without firing
+		// onClose, preserving the deliberate-close semantic (fail() is already short-circuited).
+		id := t.Args()[0].Int64()
+		if ch := n.get(id); ch != nil {
 			ch.close()
+			n.mu.Lock()
+			delete(n.chans, id)
+			n.mu.Unlock()
 		}
 		return nil, nil
 	}))
@@ -232,7 +244,9 @@ const netShimJS = `
       send: (bytes) => N.send(id, bytes),
       onMessage: (cb) => { onMsg = cb; },
       onClose: (cb) => { onClose = cb; },
-      close: () => N.close(id),
+      // A deliberate close never fires __netClosed (Go closes silently), so drop our own
+      // map entry here too — otherwise every local close leaks a chans entry unbounded.
+      close: () => { N.close(id); chans.delete(id); },
     };
   }
 
@@ -248,7 +262,7 @@ const netShimJS = `
       write: (bytes) => N.send(id, bytes),
       onData: (cb) => { onData = cb; },
       onClose: (cb) => { onClose = cb; },
-      close: () => N.close(id),
+      close: () => { N.close(id); chans.delete(id); }, // see makeRawChannel: drop on deliberate close
     };
   }
 
