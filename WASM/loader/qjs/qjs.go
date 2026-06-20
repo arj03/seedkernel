@@ -88,14 +88,23 @@ func (r *registry) get(id uint64) goFunc {
 
 // New instantiates a fresh QuickJS runtime + context.
 func New() (rt *Runtime, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			rt, err = nil, fmt.Errorf("qjs.New: %v", r)
-		}
-	}()
-
 	ctx := context.Background()
 	rt = &Runtime{ctx: ctx, reg: newRegistry()}
+
+	// On any failure — a panic or an error return — after the wazero runtime is
+	// created but before the module is live, close it so a failed New leaks nothing
+	// (the runtime holds this instance's compiled machine code).
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("qjs.New: %v", r)
+		}
+		if err != nil {
+			if rt != nil && rt.wrt != nil {
+				rt.wrt.Close(ctx)
+			}
+			rt = nil
+		}
+	}()
 	// A shared compilation cache makes the per-runtime CompileModule cheap when
 	// several runtimes are created (e.g. across tests); a CompiledModule is bound
 	// to the runtime that compiled it, so each runtime must compile its own.
@@ -176,13 +185,21 @@ func sharedCache() wazero.CompilationCache {
 // Context returns the runtime's JS execution context.
 func (r *Runtime) Context() *Context { return r.ctxt }
 
-// Close tears down the engine.
+// Close tears down the engine. It closes both the module instance and the wazero
+// runtime that compiled it — the runtime holds this instance's compiled machine
+// code, so closing only the module would leak it (matters when many runtimes are
+// created and dropped, e.g. across tests). The compilation cache is process-wide
+// (sharedCache) and is intentionally left open.
 func (r *Runtime) Close() {
 	if r == nil || r.mod == nil {
 		return
 	}
 	r.mod.Close(r.ctx)
 	r.mod = nil
+	if r.wrt != nil {
+		r.wrt.Close(r.ctx)
+		r.wrt = nil
+	}
 }
 
 // ── low-level engine plumbing ─────────────────────────────────────────────────
@@ -247,8 +264,18 @@ func (r *Runtime) unpackPtr(packedPtr uint64) (addr, size uint32) {
 	return uint32(v >> 32), uint32(v)
 }
 
-// readPackedString reads a NUL-terminated string described by a packed pointer
-// and frees only the packed cell (matching fastschema's String() discipline).
+// readPackedString reads a string described by a packed pointer (addr<<32 | size)
+// and releases both the string and the packed cell. size is the JS_ToCString result's
+// strlen — it excludes the NUL terminator — so the read is exact (no trailing \x00).
+//
+// addr is NOT a malloc block: it points into a refcounted JSString whose ref count
+// QJS_ToCString (via JS_ToCString) incremented. The only correct release is
+// JS_FreeCString, which recovers the JSString header from addr and drops that ref — a
+// plain free(addr) would corrupt the heap. (Contrast QJS_GetArrayBuffer's addr, which
+// is live ArrayBuffer storage that must NOT be freed — see toByteArray.) Without this
+// call every JS→Go string read leaked a JSString; fastschema had the same bug. We pass
+// r.ctxt because the bridge is one-context-per-runtime and every QJS_ToCString here ran
+// in that context.
 func (r *Runtime) readPackedString(packedPtr uint64) string {
 	if packedPtr == 0 {
 		return ""
@@ -259,8 +286,9 @@ func (r *Runtime) readPackedString(packedPtr uint64) string {
 		return ""
 	}
 	buf, _ := r.mem.Read(addr, size)
-	s := string(buf) // copy out before freeing
-	r.freeAt(packedPtr)
+	s := string(buf)                                       // copy out before freeing
+	r.call("JS_FreeCString", r.ctxt.handle, uint64(addr)) // drop the JSString ref ToCString took
+	r.freeAt(packedPtr)                                    // free the malloc'd packed cell
 	return s
 }
 
