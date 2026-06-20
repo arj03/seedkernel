@@ -133,6 +133,15 @@ func (c *tcpChannel) send(bytes []byte) {
 }
 
 func (c *tcpChannel) writeFrame(bytes []byte) {
+	// Reject an over-cap frame here rather than letting uint32(len(bytes)) silently wrap
+	// (a >4 GiB message would write a truncated length and desync the peer) or shipping a
+	// 16 MiB–4 GiB frame the receiver is hardcoded to reject. The read side treats an
+	// over-cap length as fatal (readLoop), so mirror it: fail the channel locally instead
+	// of provoking the peer to drop the link.
+	if len(bytes) > maxTCPMessage {
+		c.fail()
+		return
+	}
 	out := make([]byte, 4+len(bytes))
 	putU32BE(out, 0, uint32(len(bytes)))
 	copy(out[4:], bytes)
@@ -191,21 +200,30 @@ func (c *tcpChannel) readLoop() {
 		n, err := conn.Read(chunk)
 		if n > 0 {
 			buf = append(buf, chunk[:n]...)
+			// Consume whole frames by advancing an offset, then shift the unread tail
+			// back to the front of the SAME backing array. Reslicing buf forward
+			// (buf = buf[4+ln:]) instead walks the slice toward the end of its array, so
+			// each Read's append keeps reallocating a fresh 64 KiB-class buffer and
+			// copying the sliver across — needless churn on a high-throughput link.
+			off := 0
 			for {
-				if len(buf) < 4 {
+				if len(buf)-off < 4 {
 					break
 				}
-				ln := getU32BE(buf, 0)
+				ln := getU32BE(buf, off)
 				if ln > maxTCPMessage {
 					c.fail()
 					return
 				}
-				if uint32(len(buf)) < 4+ln {
+				if uint32(len(buf)-off) < 4+ln {
 					break
 				}
-				msg := append([]byte(nil), buf[4:4+ln]...)
-				buf = buf[4+ln:]
+				msg := append([]byte(nil), buf[off+4:off+4+int(ln)]...)
+				off += int(4 + ln)
 				c.onMsg(msg)
+			}
+			if off > 0 {
+				buf = append(buf[:0], buf[off:]...) // overlap-safe compaction (memmove)
 			}
 		}
 		if err != nil {
