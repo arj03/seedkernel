@@ -23,9 +23,12 @@ export const OP_BINARY = 0x2;
 const OP_CONT = 0x0, OP_CLOSE = 0x8, OP_PING = 0x9, OP_PONG = 0xa;
 export const WS_OPCODES = { OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } as const;
 
-// Must match SCRATCH_SIZE / SCRATCH_SIZE - 16 in assembly/ws/index.ts.
-const SCRATCH_SIZE = (16 << 20) + (1 << 12);
-const SCRATCH_MAX = SCRATCH_SIZE - 16;
+// The ws.wasm scratch caps — the single TS source of truth (ws-wasm-backend.ts imports
+// these). Must match SCRATCH_SIZE / MAX_FRAME_PAYLOAD in assembly/ws/index.ts, which
+// allocates the module's actual scratch heap (a separate AS compilation unit that can't
+// import from here — the one copy we can't fold in).
+export const SCRATCH_SIZE = (16 << 20) + (1 << 12);
+export const SCRATCH_MAX = SCRATCH_SIZE - 16;
 
 /** The pluggable codec backend: stage `req` for ws.wasm, run handle(), return the
  *  response bytes (empty on a module-reported error). */

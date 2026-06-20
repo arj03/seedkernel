@@ -22,10 +22,12 @@ import (
 	"seedloader/qjs"
 )
 
-// netCallTimeout is a safety bound on a synchronously-blocked net host.call: the
-// host-realm Transport settles every request via its own (shorter) per-request
+// netCallTimeout is the outer safety bound on a synchronously-blocked net host.call:
+// the host-realm Transport settles every request via its own (shorter) per-request
 // timeout, so this only fires if that machinery wedges. Generous so it never clips a
-// legitimately slow cohort round-trip.
+// legitimately slow cohort round-trip. When the call runs under an awaitIn budget
+// (runGuest), awaitNetCall caps at whichever of the two deadlines is sooner, so this
+// is a ceiling, not the effective bound.
 const netCallTimeout = 120 * time.Second
 
 type guestRealm struct {
@@ -81,6 +83,12 @@ func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, e
 			return nil, err
 		}
 		defer res.Free() // the bridge's own-ref result (sync bytes, or the JS_NULL immediate)
+		// CONTRACT: null from __hostBridgeCall is RESERVED for an async (net) op whose
+		// Transport promise hasn't settled. Every sync op (crypto/fs/clock/module) returns
+		// its bytes here. A future sync op that returned null/undefined would be mistaken
+		// for a net op and hang on awaitNetCall for the full budget — so such ops must
+		// always return bytes (capbridge.go's MODULE_CALL maps an empty handler reply to
+		// NONE, never null, precisely to keep this invariant).
 		if res.IsNull() {
 			// A net op: the host realm's Transport returned a Promise, so the bytes
 			// aren't ready yet. Block here, pumping the host realm until it settles, and

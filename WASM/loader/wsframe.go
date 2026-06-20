@@ -44,7 +44,16 @@ type wsCodec struct {
 	mu      sync.Mutex
 }
 
-var wsc *wsCodec // lazily instantiated on first __ws.handle
+var (
+	wsc     *wsCodec  // lazily instantiated on first __ws.handle
+	wscOnce sync.Once // serializes that init so parallel go-test realms can't race the global
+)
+
+// wsCodecInstance returns the process-wide ws.wasm codec, booting it once on first use.
+func wsCodecInstance() *wsCodec {
+	wscOnce.Do(func() { wsc = bootWsCodec() })
+	return wsc
+}
 
 // bootWsCodec instantiates the embedded ws.wasm in a dedicated wazero runtime. It
 // imports only env.abort (AS's 4-arg abort); the start runs heap.alloc(scratch).
@@ -100,10 +109,7 @@ func exposeWs(qc *qjs.Context) {
 		if err != nil {
 			return t.Context().NewArrayBuffer(nil), nil
 		}
-		if wsc == nil {
-			wsc = bootWsCodec()
-		}
-		return t.Context().NewArrayBuffer(wsc.call(req)), nil
+		return t.Context().NewArrayBuffer(wsCodecInstance().call(req)), nil
 	}))
 	qc.Global().SetPropertyStr("__ws", o)
 }

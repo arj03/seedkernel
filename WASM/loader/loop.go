@@ -50,6 +50,20 @@ type eventLoop struct {
 	// payload) on every await.
 	settleInstalled map[*qjs.Context]bool
 	onSettle        func(kind int, bytes []byte, msg string)
+
+	// netDeadline, when non-zero, caps a synchronously-blocked net call (awaitNetCall)
+	// at the in-flight outer await's deadline, so a guest's sync net host.call cannot
+	// outlast the budget runGuest handed awaitIn. Set by awaitIn around its run.
+	netDeadline time.Time
+
+	// runGen tags each bounded run (awaitIn / runUntilSignal). A safety timer captures
+	// the gen it was armed under; if it fires late — after the run completed and a new
+	// one began — its queued stop is ignored, so a stale timeout can't abort the next run.
+	runGen int64
+
+	// stepTimer is one reusable wait timer for step(); reused via Reset instead of a
+	// fresh time.NewTimer per turn, which was per-frame GC churn in awaitNetCall's pump.
+	stepTimer *time.Timer
 }
 
 // netOutcome is the landing slot for a synchronously-blocked net call's result.
@@ -155,6 +169,13 @@ func (el *eventLoop) awaitNetCall(callID int64, timeout time.Duration) ([]byte, 
 	el.netBlocking[callID] = o
 	defer delete(el.netBlocking, callID)
 	deadline := time.Now().Add(timeout)
+	// Compose with the outer await's budget: a sync guest's host.call runs inside
+	// awaitIn's blocking Eval (before awaitIn's own safety timer is even armed), so
+	// netCallTimeout — not the budget runGuest passed — would otherwise be the only
+	// bound. Honor whichever deadline is sooner so the budget is a real upper bound.
+	if !el.netDeadline.IsZero() && el.netDeadline.Before(deadline) {
+		deadline = el.netDeadline
+	}
 	hostPump := func() { el.c.Pump() } // host realm only — the guest stays suspended
 	for !o.done {
 		el.step(deadline, hostPump, func() bool { return o.done })
@@ -221,6 +242,20 @@ func (el *eventLoop) install() {
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
 func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 
+// armTimer (re)arms the loop's single reusable wait timer for duration d and returns
+// its channel. step() runs only on the loop goroutine and never re-entrantly, so one
+// shared timer is safe; reusing it via Reset avoids a fresh time.NewTimer allocation
+// every turn (per-frame GC churn in awaitNetCall's tight pump loop). Go 1.23+ timer
+// semantics make Stop/Reset safe without the drain dance.
+func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
+	if el.stepTimer == nil {
+		el.stepTimer = time.NewTimer(d)
+	} else {
+		el.stepTimer.Reset(d)
+	}
+	return el.stepTimer.C
+}
+
 // callJS invokes a retained JS callback with no arguments (timer / deferred work).
 func (el *eventLoop) callJS(cb *qjs.Value) {
 	if _, err := el.c.Invoke(cb, el.c.NewUndefined()); err != nil {
@@ -269,15 +304,16 @@ func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
 		if d < 0 {
 			d = 0
 		}
-		tmr := time.NewTimer(d)
-		defer tmr.Stop()
-		wait = tmr.C
+		wait = el.armTimer(d)
 	}
 	select {
 	case task := <-el.tasks:
 		task()
 		pump()
 	case <-wait:
+	}
+	if hasWait {
+		el.stepTimer.Stop() // disarm (Go 1.23+ needs no drain); reused next turn via Reset
 	}
 	// Drain whatever else is already queued before returning, pumping after each. Two
 	// reasons: a burst of posted socket frames is delivered in this one turn rather than
@@ -319,7 +355,18 @@ func (el *eventLoop) runUntilSignal(kick string, timeout time.Duration) error {
 		return err
 	}
 	if !el.stopped && timeout > 0 {
-		safety := time.AfterFunc(timeout, func() { el.post(func() { el.stopped = true }) })
+		el.runGen++
+		gen := el.runGen
+		// Tag the stop with this run's gen: a late fire (Stop can't unschedule an
+		// already-fired AfterFunc, so its closure may sit queued in el.tasks) is ignored
+		// once a newer run has bumped runGen, instead of aborting that run.
+		safety := time.AfterFunc(timeout, func() {
+			el.post(func() {
+				if el.runGen == gen {
+					el.stopped = true
+				}
+			})
+		})
 		defer safety.Stop()
 	}
 	el.run()
@@ -390,13 +437,24 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 		`(v) => __settle(0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
 		`(e) => __settle(1, String(e && e.message || e))); })();`
 	el.stopped = false
+	if timeout > 0 {
+		// Arm the net budget BEFORE the eval: a sync guest entrypoint's net host.call
+		// blocks inside this Eval (awaitNetCall), which reads netDeadline to cap itself
+		// at this same budget rather than the looser netCallTimeout.
+		el.netDeadline = time.Now().Add(timeout)
+		defer func() { el.netDeadline = time.Time{} }()
+	}
 	if _, err = c.Eval("<await>", qjs.Code(wrap)); err != nil {
 		return
 	}
 	if !el.stopped && timeout > 0 {
+		el.runGen++
+		gen := el.runGen
+		// gen-guarded so a late fire (Stop can't unschedule an already-fired AfterFunc)
+		// can't flag a timeout on a later await that reused this loop — see runUntilSignal.
 		safety := time.AfterFunc(timeout, func() {
 			el.post(func() {
-				if !el.stopped {
+				if el.runGen == gen && !el.stopped {
 					kind, msg, el.stopped = 2, "await: timed out", true
 				}
 			})

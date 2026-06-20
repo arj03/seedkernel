@@ -204,9 +204,16 @@ func (s *libsodium) hashSha3256(msg []byte) []byte {
 	return s.read(out, 32)
 }
 
-// genericHash is native Go BLAKE2b (not libsodium) — see the file header. Byte-identical
-// to crypto_generichash for the unkeyed case, which is all this build uses.
+// genericHash is native Go BLAKE2b (not libsodium) — see the file header. This build
+// only ever computes the UNKEYED, 32-byte digest (the content-address block-id), which
+// is KAT-pinned byte-identical to libsodium. Reject any other length loudly: 1–15
+// diverges from libsodium's BYTES_MIN, and 0/>64 would panic inside blake2b.New — a
+// quietly-wrong, consensus-affecting hash is worse than a hard failure. (Keyed hashing
+// is rejected at the JS seam, where the key would otherwise be silently dropped.)
 func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
+	if outLen != 32 {
+		panic(fmt.Sprintf("genericHash: native blake2b is 32-byte-only in this build, got %d", outLen))
+	}
 	h, err := blake2b.New(outLen, nil)
 	if err != nil {
 		panic(fmt.Sprintf("blake2b.New(%d): %v", outLen, err))
@@ -341,6 +348,14 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		return ab(t, s.hashSha3256(arg(t, 0))), nil
 	}))
 	o.SetPropertyStr("crypto_generichash", fn(func(t *qjs.This) (*qjs.Value, error) {
+		// libsodium-wrappers is crypto_generichash(hashLength, message, key?). The native
+		// blake2b shim computes only the UNKEYED hash, so a key arg would be SILENTLY
+		// dropped — a plain hash where libsodium computes a MAC. Reject it loudly instead.
+		if len(t.Args()) > 2 && !t.Args()[2].IsNull() && !t.Args()[2].IsUndefined() {
+			if k, _ := qjs.JsTypedArrayToGo(t.Args()[2]); len(k) > 0 {
+				return nil, fmt.Errorf("crypto_generichash: keyed hashing not supported by the native blake2b shim")
+			}
+		}
 		return ab(t, s.genericHash(int(t.Args()[0].Int32()), arg(t, 1))), nil
 	}))
 	o.SetPropertyStr("crypto_stream_xchacha20_xor", fn(func(t *qjs.This) (*qjs.Value, error) {

@@ -149,7 +149,10 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		return t.Context().NewBool(fs.has(str(t, 0))), nil
 	}))
 	o.SetPropertyStr("size", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewInt32(int32(fs.size(str(t, 0)))), nil
+		// NewInt64, not NewInt32: fs.size returns a 64-bit length, and a ≥2 GiB file
+		// would wrap to a negative int32 and read back as "missing" (-1). (-1 itself,
+		// the genuine miss, is unaffected.)
+		return t.Context().NewInt64(int64(fs.size(str(t, 0)))), nil
 	}))
 	o.SetPropertyStr("list", fn(func(t *qjs.This) (*qjs.Value, error) {
 		prefix := ""

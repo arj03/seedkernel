@@ -28,7 +28,8 @@
 // One WS frame must fit the scratch region. Sized so the largest TCP transport
 // message (MAX_TCP_MESSAGE, 16 MB, net-node.ts) also fits in a single WS frame
 // plus header/mask overhead — the two transports must cap identically, or a
-// message that succeeds over TCP would tear down a WS link.
+// message that succeeds over TCP would tear down a WS link. This is the canonical
+// scratch size; host/ws/ws-codec.ts mirrors it (SCRATCH_SIZE/SCRATCH_MAX) — bump both.
 const SCRATCH_SIZE: i32 = (16 << 20) + (1 << 12); // 16 MB + 4 KB overhead slack
 const MAX_FRAME_PAYLOAD: i32 = SCRATCH_SIZE - 16;
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)

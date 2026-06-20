@@ -39,6 +39,7 @@ var hostJS string
 
 type handler struct {
 	mod     api.Module
+	cmod    wazero.CompiledModule // retained so an upgrade can release the old compiled code
 	fn      api.Function
 	scratch uint32
 }
@@ -108,10 +109,19 @@ func run(n, payload []byte) []byte {
 	if h, ok := wasmH[string(n)]; ok {
 		h.mod.Memory().Write(h.scratch, payload)
 		r, err := h.fn.Call(ctx, uint64(len(payload)))
-		if err != nil || len(r) == 0 || int32(r[0]) <= 0 {
+		// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
+		// length is a failure. A 0-length result is a valid EMPTY response, not a
+		// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
+		// from "no handler / trap" (nil). rd() collapses 0 bytes back to nil, so read here.
+		if err != nil || len(r) == 0 || int32(r[0]) < 0 {
 			return nil
 		}
-		return rd(h.mod.Memory(), h.scratch, uint32(int32(r[0])))
+		out := make([]byte, int32(r[0]))
+		if len(out) > 0 {
+			b, _ := h.mod.Memory().Read(h.scratch, uint32(len(out)))
+			copy(out, b)
+		}
+		return out
 	}
 	if fn, ok := natH[string(n)]; ok {
 		return fn(payload)
@@ -150,11 +160,18 @@ func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	if blocked[string(n)] {
 		return ^uint32(0)
 	}
+	// scrOf is set only for modules installed as handlers (installWasm). A module that
+	// reaches kernel.call without one (kn/bs) has the zero-value offset, so writing the
+	// response would clobber its low memory — refuse rather than corrupt.
+	s, ok := scrOf[caller]
+	if !ok {
+		return 0
+	}
 	resp := run(n, rd(caller.Memory(), pP, pL))
 	if resp == nil {
 		return 0
 	}
-	caller.Memory().Write(scrOf[caller], resp)
+	caller.Memory().Write(s, resp)
 	return uint32(len(resp))
 }
 
@@ -200,15 +217,26 @@ func installWasm(n, wasm []byte) bool {
 	}
 	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", nextID)))
 	if err != nil {
+		_ = cm.Close(ctx) // instantiation failed — release the compiled code
 		return false
 	}
 	g, fn := m.ExportedGlobal("scratch"), m.ExportedFunction("handle")
 	if g == nil || fn == nil {
-		_ = m.Close(ctx) // not a handler module — don't leak the instance
+		_ = m.Close(ctx)  // not a handler module — don't leak the instance…
+		_ = cm.Close(ctx) // …or its compiled code
 		return false
 	}
 	s := uint32(g.Get())
-	wasmH[string(n)] = handler{m, fn, s}
+	// approve() permits a same-author/parent re-install (host.js), so this name may
+	// already hold a live handler. Close the previous instance + its compiled code and
+	// drop its scrOf key before replacing, or every upgrade leaks one wasm instance
+	// (linear memory + JITed code) and a stale scrOf entry for the process's life.
+	if old, ok := wasmH[string(n)]; ok {
+		_ = old.mod.Close(ctx)
+		_ = old.cmod.Close(ctx)
+		delete(scrOf, old.mod)
+	}
+	wasmH[string(n)] = handler{m, cm, fn, s}
 	scrOf[m] = s
 	setHandler(n, nextID)
 	nextID++

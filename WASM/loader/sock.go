@@ -24,9 +24,10 @@ type netHost struct {
 	qc  *qjs.Context
 	und *qjs.Value // a reusable `undefined` for the `this` of dispatcher calls
 
-	mu     sync.Mutex
-	chans  map[int64]rawChannel
-	nextID int64
+	mu        sync.Mutex
+	chans     map[int64]rawChannel
+	nextID    int64
+	listeners []net.Listener // bound listeners, closed on network teardown
 
 	// Retained JS dispatchers (host.js-side router into per-channel callbacks).
 	fnDeliver *qjs.Value
@@ -76,6 +77,10 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 				ch.send(b)
 			}
 		}
+		return nil, nil
+	}))
+	o.SetPropertyStr("closeListeners", fn(func(t *qjs.This) (*qjs.Value, error) {
+		n.closeListeners()
 		return nil, nil
 	}))
 	o.SetPropertyStr("close", fn(func(t *qjs.This) (*qjs.Value, error) {
@@ -154,11 +159,14 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 		return 0, err
 	}
 	bound := ln.Addr().(*net.TCPAddr).Port
+	n.mu.Lock()
+	n.listeners = append(n.listeners, ln) // retained so teardown can close it (and end the accept loop)
+	n.mu.Unlock()
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return
+				return // listener closed (closeListeners) or fatal accept error — exit the goroutine
 			}
 			id := n.alloc()
 			ch, start := n.wrapInbound(id, conn, raw)
@@ -172,6 +180,20 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 		}
 	}()
 	return bound, nil
+}
+
+// closeListeners closes every bound listener, which makes each accept goroutine's
+// ln.Accept() return an error and exit — releasing the listener fd and the goroutine.
+// Wired to makeNetwork's channels.close so a realm/network teardown (tests, any future
+// re-serve) doesn't leak a listener + accept goroutine until os.Exit.
+func (n *netHost) closeListeners() {
+	n.mu.Lock()
+	lns := n.listeners
+	n.listeners = nil
+	n.mu.Unlock()
+	for _, ln := range lns {
+		ln.Close()
+	}
 }
 
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
@@ -280,6 +302,7 @@ const netShimJS = `
     listeners.set(bound, (id) => onAccept(makeRawStream(id)));
     return bound;
   };
+  globalThis.netCloseListeners = () => N.closeListeners();
   globalThis.__netDeliver = (id, bytes) => { const c = chans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
   globalThis.__netClosed = (id) => { const c = chans.get(id); if (c) c.closed(); };
   globalThis.__netAccept = (port, id) => { const a = listeners.get(port); if (a) a(id); };
@@ -312,7 +335,7 @@ const engineNetworkJS = `
         if (ws) wsPort = netListenWS(ws.host, ws.port, onAccept);
         return Promise.resolve({ port, wsPort });
       },
-      close: () => {},
+      close: () => { netCloseListeners(); }, // close bound listeners + their accept goroutines on teardown
     };
     return new NodeNetworkCore({ identity, sodium, channels, listen, wsListen });
   };

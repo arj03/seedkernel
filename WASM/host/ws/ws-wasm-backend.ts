@@ -8,10 +8,7 @@
 // into QuickJS without dragging this file in.
 
 import { WS_WASM_B64 } from "./ws-wasm.js";
-import { setWsHandle } from "./ws-codec.js";
-
-// Must match SCRATCH_SIZE in assembly/ws/index.ts.
-const SCRATCH_SIZE = (16 << 20) + (1 << 12);
+import { setWsHandle, SCRATCH_SIZE } from "./ws-codec.js";
 
 interface WsExports {
   memory: WebAssembly.Memory;

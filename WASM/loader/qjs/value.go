@@ -34,6 +34,7 @@ type This struct {
 // Array is a thin JS array wrapper (only what the fs shim needs).
 type Array struct {
 	*Value
+	n int64 // next index; tracked so Push avoids a .length property round-trip per append
 }
 
 func (c *Context) value(raw uint64) *Value { return &Value{c: c, raw: raw} }
@@ -120,15 +121,11 @@ func (c *Context) NewArray() *Array {
 	return &Array{Value: c.callV("JS_NewArray", c.handle)}
 }
 
-// Push appends one element to the array.
+// Push appends one element to the array, tracking the index Go-side so it never has to
+// read .length back (a full JS property round-trip) on each append.
 func (a *Array) Push(v *Value) {
-	a.Value.c.rt.call("JS_SetPropertyUint32", a.Value.c.handle, a.Value.raw, uint64(a.length()), v.raw)
-}
-
-func (a *Array) length() int64 {
-	l := a.Value.GetPropertyStr("length")
-	defer l.Free()
-	return l.Int64()
+	a.Value.c.rt.call("JS_SetPropertyUint32", a.Value.c.handle, a.Value.raw, uint64(a.n), v.raw)
+	a.n++
 }
 
 // Function wraps a Go func as a JS function. The callback id is registered and
@@ -334,15 +331,15 @@ func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	return uint64(len(args)), ptr
 }
 
-// normalize converts a pending JS exception or Error result into a Go error.
+// normalize converts a pending JS exception into a Go error. A throw sets the context's
+// exception flag (and QJS_Call/QJS_Eval return JS_EXCEPTION), which hasException()
+// catches — that is the only failure signal. It deliberately does NOT treat an Error
+// *value* as a failure: a JS function may legitimately return (not throw) an Error as
+// data, and on the core Invoke/Eval path that must round-trip, not surface as an error.
 func (c *Context) normalize(v *Value) (*Value, error) {
 	if c.hasException() {
 		v.Free()
 		return nil, c.exception()
-	}
-	if v.IsError() {
-		defer v.Free()
-		return nil, v.exception()
 	}
 	return v, nil
 }
