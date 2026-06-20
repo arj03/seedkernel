@@ -35,9 +35,6 @@ import (
 var wasmBytes []byte
 
 const (
-	packedPtrSize    = 8
-	stringTerminator = 0
-
 	// eval flags (quickjs JS_EVAL_*): global scope + strict mode, matching the
 	// fastschema default used to eval the host shims.
 	evalTypeGlobal = 0
@@ -111,7 +108,7 @@ func New() (rt *Runtime, err error) {
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCompilationCache(sharedCache()))
 
 	if _, err := wasi.Instantiate(ctx, rt.wrt); err != nil {
-		return nil, fmt.Errorf("instantiate WASI: %w", err)
+		return rt, fmt.Errorf("instantiate WASI: %w", err)
 	}
 
 	// The single host import the wasm needs: the JS→Go callback dispatcher. The C
@@ -121,12 +118,12 @@ func New() (rt *Runtime, err error) {
 		WithFunc(rt.jsFunctionProxy).
 		Export("jsFunctionProxy").
 		Instantiate(ctx); err != nil {
-		return nil, fmt.Errorf("host module: %w", err)
+		return rt, fmt.Errorf("host module: %w", err)
 	}
 
 	code, err := rt.wrt.CompileModule(ctx, wasmBytes)
 	if err != nil {
-		return nil, fmt.Errorf("compile qjs.wasm: %w", err)
+		return rt, fmt.Errorf("compile qjs.wasm: %w", err)
 	}
 
 	rt.mod, err = rt.wrt.InstantiateModule(ctx, code, wazero.
@@ -136,7 +133,7 @@ func New() (rt *Runtime, err error) {
 		WithSysNanotime().
 		WithSysNanosleep())
 	if err != nil {
-		return nil, fmt.Errorf("instantiate module: %w", err)
+		return rt, fmt.Errorf("instantiate module: %w", err)
 	}
 
 	rt.malloc = rt.mod.ExportedFunction("malloc")
@@ -227,6 +224,9 @@ func (r *Runtime) mallocN(n int) uint64 {
 	if err != nil {
 		panic(fmt.Errorf("qjs: malloc: %w", err))
 	}
+	if res[0] == 0 {
+		panic(fmt.Errorf("qjs: malloc(%d) returned NULL (out of wasm memory)", n))
+	}
 	return res[0]
 }
 
@@ -296,22 +296,23 @@ func (r *Runtime) readPackedString(packedPtr uint64) string {
 // argv out as [fnID, ctxID, isAsync, promise, ...realArgs]; we dispatch fnID and
 // pass the real args (borrowed handles, valid only for the call — the loader's
 // callbacks read them synchronously and never retain them).
-func (r *Runtime) jsFunctionProxy(_ context.Context, mod api.Module, _ uint32, thisVal uint64, argc, argv uint32) (rs uint64) {
-	mem := mod.Memory()
-	args := make([]uint64, argc)
-	for i := uint32(0); i < argc; i++ {
-		v, _ := mem.ReadUint64Le(argv + i*8)
-		args[i] = v
-	}
+func (r *Runtime) jsFunctionProxy(_ context.Context, _ api.Module, _ uint32, thisVal uint64, argc, argv uint32) (rs uint64) {
 	c := r.ctxt
-	fn := r.reg.get(args[0])
-
+	// Registered before any arg processing so a panic below (a malformed argv, an
+	// out-of-range index, a panicking callback) surfaces as a catchable JS exception
+	// rather than an uncaught host-side wasm trap that would kill the node.
 	defer func() {
 		if rec := recover(); rec != nil {
 			rs = c.throwError(fmt.Errorf("%v", rec))
 		}
 	}()
 
+	args := make([]uint64, argc)
+	for i := uint32(0); i < argc; i++ {
+		v, _ := r.mem.ReadUint64Le(argv + i*8)
+		args[i] = v
+	}
+	fn := r.reg.get(args[0])
 	if fn == nil {
 		return c.throwError(fmt.Errorf("qjs: unknown callback id %d", args[0]))
 	}
