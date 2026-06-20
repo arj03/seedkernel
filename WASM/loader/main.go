@@ -1,11 +1,10 @@
-// seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive
-// as signed bundles (README §13) — nothing application-specific lives here. Host
-// orchestration (installer §7, bundle verification §13) is JavaScript run inside
-// QuickJS (host.js); this Go layer is only the bridge: it loads the genesis wasm,
-// supplies the genesis crypto (Ed25519 + SHA-3), runs the signature shuttle (the
-// one piece needing raw wasm-memory access), and exposes byte-level primitives to
-// the QuickJS realm. Pure Go / no cgo (QuickJS is the quickjs-ng wasm driven by
-// the in-repo qjs bridge over wazero) → one static cross-compiled binary.
+// seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive as
+// signed bundles (README §13) — nothing application-specific lives here. Host
+// orchestration (installer §7, bundle verification §13) is JavaScript in QuickJS
+// (host.js); this Go layer is only the bridge: loads the genesis wasm, supplies the
+// genesis crypto (Ed25519 + SHA-3), runs the signature shuttle (the one piece needing
+// raw wasm-memory access), and exposes byte primitives to the realm. Pure Go, no cgo
+// (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero bridge) → one static binary.
 package main
 
 import (
@@ -62,10 +61,24 @@ var (
 	nextID  = int32(10)
 )
 
+// wasmCall invokes a wasm export, returning nil if it's missing or the call failed —
+// so a missing ABI function degrades instead of panicking the host.
+func wasmCall(m api.Module, name string, args ...uint64) []uint64 {
+	if fn := m.ExportedFunction(name); fn != nil {
+		if r, err := fn.Call(ctx, args...); err == nil {
+			return r
+		}
+	}
+	return nil
+}
+
 func rd(m api.Memory, p, n uint32) []byte { x, _ := m.Read(p, n); return append([]byte(nil), x...) }
 
 func wr(m api.Module, data []byte) uint32 {
-	r, _ := m.ExportedFunction("alloc").Call(ctx, uint64(len(data)))
+	r := wasmCall(m, "alloc", uint64(len(data)))
+	if len(r) == 0 {
+		return 0
+	}
 	m.Memory().Write(uint32(r[0]), data)
 	return uint32(r[0])
 }
@@ -75,9 +88,10 @@ func name(canonical string) []byte {
 }
 
 func setHandler(n []byte, id int32) {
-	p := wr(kn, n)
-	kn.ExportedFunction("set_handler").Call(ctx, uint64(p), uint64(len(n)), uint64(uint32(id)))
-	kn.ExportedFunction("dealloc").Call(ctx, uint64(p))
+	if p := wr(kn, n); p != 0 {
+		wasmCall(kn, "set_handler", uint64(p), uint64(len(n)), uint64(uint32(id)))
+		wasmCall(kn, "dealloc", uint64(p))
+	}
 }
 
 func load(wasm []byte, modName string) api.Module {
@@ -93,8 +107,8 @@ func load(wasm []byte, modName string) api.Module {
 func run(n, payload []byte) []byte {
 	if h, ok := wasmH[string(n)]; ok {
 		h.mod.Memory().Write(h.scratch, payload)
-		r, _ := h.fn.Call(ctx, uint64(len(payload)))
-		if int32(r[0]) <= 0 {
+		r, err := h.fn.Call(ctx, uint64(len(payload)))
+		if err != nil || len(r) == 0 || int32(r[0]) <= 0 {
 			return nil
 		}
 		return rd(h.mod.Memory(), h.scratch, uint32(int32(r[0])))
@@ -108,19 +122,23 @@ func run(n, payload []byte) []byte {
 // env.invoke_handler — kernel matched a name (README §3). id -1 = signature wrapper.
 func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
 	if int32(hid) == -1 { // verify → re-dispatch inner envelope → pop signer (§6.5)
-		bp := wr(bs, rd(km.Memory(), pP, pL))
-		ok, _ := bs.ExportedFunction("handle_signature").Call(ctx, uint64(bp), uint64(pL))
-		bs.ExportedFunction("dealloc").Call(ctx, uint64(bp))
-		if uint32(ok[0]) == 0 {
+		payload := rd(km.Memory(), pP, pL)
+		bp := wr(bs, payload)
+		ok := wasmCall(bs, "handle_signature", uint64(bp), uint64(len(payload)))
+		wasmCall(bs, "dealloc", uint64(bp))
+		if len(ok) == 0 || uint32(ok[0]) == 0 {
 			return
 		}
-		ip, _ := bs.ExportedFunction("get_inner_ptr").Call(ctx)
-		il, _ := bs.ExportedFunction("get_inner_len").Call(ctx)
+		ip := wasmCall(bs, "get_inner_ptr")
+		il := wasmCall(bs, "get_inner_len")
+		if len(ip) == 0 || len(il) == 0 {
+			return
+		}
 		inner := rd(bs.Memory(), uint32(ip[0]), uint32(il[0]))
 		kp := wr(kn, inner)
-		kn.ExportedFunction("dispatch").Call(ctx, uint64(kp), uint64(len(inner)))
-		kn.ExportedFunction("dealloc").Call(ctx, uint64(kp))
-		bs.ExportedFunction("pop_signer").Call(ctx)
+		wasmCall(kn, "dispatch", uint64(kp), uint64(len(inner)))
+		wasmCall(kn, "dealloc", uint64(kp))
+		wasmCall(bs, "pop_signer")
 		return
 	}
 	run(rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL)) // inbound: response dropped
@@ -151,18 +169,24 @@ func edVerify(_ context.Context, m api.Module, pubP, sigP, dataP, dataL uint32) 
 
 // topSigner reads the innermost verified signer from bootstrap.wasm (§6.5).
 func topSigner() (signer, bool) {
-	c, _ := bs.ExportedFunction("get_signer_count").Call(ctx)
-	if uint32(c[0]) == 0 {
+	c := wasmCall(bs, "get_signer_count")
+	if len(c) == 0 || uint32(c[0]) == 0 {
 		return signer{}, false
 	}
 	idx := uint64(uint32(c[0]) - 1)
-	pl, _ := bs.ExportedFunction("signer_pubkey_len").Call(ctx, idx)
-	if int32(pl[0]) <= 0 {
+	pl := wasmCall(bs, "signer_pubkey_len", idx)
+	if len(pl) == 0 || int32(pl[0]) <= 0 {
 		return signer{}, false
 	}
-	ab, _ := bs.ExportedFunction("alloc").Call(ctx, 2)
-	pb, _ := bs.ExportedFunction("alloc").Call(ctx, pl[0])
-	bs.ExportedFunction("read_signer").Call(ctx, idx, ab[0], pb[0], pl[0])
+	ab := wasmCall(bs, "alloc", 2)
+	pb := wasmCall(bs, "alloc", pl[0])
+	if len(ab) == 0 || len(pb) == 0 {
+		return signer{}, false
+	}
+	defer wasmCall(bs, "dealloc", ab[0]) // free the scratch allocs read below
+	defer wasmCall(bs, "dealloc", pb[0])
+
+	wasmCall(bs, "read_signer", idx, ab[0], pb[0], pl[0])
 	a := rd(bs.Memory(), uint32(ab[0]), 2)
 	return signer{int(a[0])<<8 | int(a[1]), rd(bs.Memory(), uint32(pb[0]), uint32(pl[0]))}, true
 }
@@ -180,6 +204,7 @@ func installWasm(n, wasm []byte) bool {
 	}
 	g, fn := m.ExportedGlobal("scratch"), m.ExportedFunction("handle")
 	if g == nil || fn == nil {
+		_ = m.Close(ctx) // not a handler module — don't leak the instance
 		return false
 	}
 	s := uint32(g.Get())
@@ -253,13 +278,14 @@ func boot() {
 // dispatch feeds raw envelope bytes into the pipeline (README §3).
 func dispatch(b []byte) {
 	p := wr(kn, b)
-	kn.ExportedFunction("dispatch").Call(ctx, uint64(p), uint64(len(b)))
-	kn.ExportedFunction("dealloc").Call(ctx, uint64(p))
+	wasmCall(kn, "dispatch", uint64(p), uint64(len(b)))
+	wasmCall(kn, "dealloc", uint64(p))
 }
 
 func registerNative(canonical string, fn func([]byte) []byte) {
-	natH[string(name(canonical))] = fn
-	setHandler(name(canonical), nextID)
+	n := name(canonical)
+	natH[string(n)] = fn
+	setHandler(n, nextID)
 	nextID++
 }
 
@@ -317,8 +343,8 @@ func loadBundle(dir string) string {
 	var installed []string
 	for _, mod := range m.Modules {
 		dispatch(goFiles[mod.Install]) // → installer (JS onInstall) → installWasm
-		kn, _ := hex.DecodeString(mod.KernelName)
-		if _, ok := wasmH[string(kn)]; ok {
+		kName, _ := hex.DecodeString(mod.KernelName)
+		if _, ok := wasmH[string(kName)]; ok {
 			installed = append(installed, mod.Name)
 		}
 	}
@@ -436,12 +462,10 @@ func main() {
 		}
 	}
 
-	// The engine host realm over the booted kernel: fs backend + __net + the shared
-	// route bundle + the cap-bridge + the node-setup glue, all driven by the one loop.
-	// This is the same installEngineHost the net/holder tests assemble, so main and the
-	// tests share one wiring path (a divergence in either is caught by the other). boot()
-	// already exposed sodium + the kernel bridge; installEngineHost re-runs polyfills +
-	// sodium idempotently.
+	// The engine host realm over the booted kernel: fs backend + __net + the shared route
+	// bundle + cap-bridge + node-setup glue, all driven by one loop. Same installEngineHost
+	// the net/holder tests assemble, so main and the tests share one wiring path. boot()
+	// already exposed sodium + the kernel bridge; installEngineHost re-runs them idempotently.
 	el := newEventLoop(qc)
 	if err := installEngineHost(qc, el, sd, a.dataDir); err != nil {
 		fatal("host", err)
