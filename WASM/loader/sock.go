@@ -43,12 +43,18 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 
 	connect := func(raw bool) *qjs.Value {
 		return fn(func(t *qjs.This) (*qjs.Value, error) {
+			if len(t.Args()) < 2 {
+				return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
+			}
 			addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
 			return t.Context().NewInt64(n.dial(addr, raw)), nil
 		})
 	}
 	listen := func(raw bool) *qjs.Value {
 		return fn(func(t *qjs.This) (*qjs.Value, error) {
+			if len(t.Args()) < 2 {
+				return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
+			}
 			bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()), raw)
 			if err != nil {
 				return t.Context().NewInt32(-1), nil
@@ -61,6 +67,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	o.SetPropertyStr("listen", listen(false))      // accept node↔node TCP
 	o.SetPropertyStr("listenRaw", listen(true))    // accept raw byte streams (browser↔node WS)
 	o.SetPropertyStr("send", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 2 {
+			return nil, nil
+		}
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
 			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
@@ -70,6 +79,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		return nil, nil
 	}))
 	o.SetPropertyStr("close", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 1 {
+			return nil, nil
+		}
 		if ch := n.get(t.Args()[0].Int64()); ch != nil {
 			ch.close()
 		}
@@ -141,9 +153,8 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 			n.mu.Lock()
 			n.chans[id] = ch
 			n.mu.Unlock()
-			cid := id
 			n.el.post(func() {
-				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(cid))
+				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(id))
 				start() // safe now: the JS channel exists
 			})
 		}
@@ -174,10 +185,16 @@ func (n *netHost) onMsg(id int64) func([]byte) {
 func (n *netHost) onClose(id int64) func() {
 	return func() {
 		n.el.post(func() {
-			n.invoke(n.fnClosed, n.qc.NewInt64(id))
+			// Drop the channel before notifying JS. onClose only ever fires from the
+			// channel's fail() path, which has already closed the socket — so there is
+			// no fd to release here. Deleting up front means an N.close(id) issued from
+			// the JS onClose handler resolves to a clean no-op (get → nil) rather than
+			// re-closing a dead channel; it mirrors the JS shim, which deletes from its
+			// own map before invoking onClose.
 			n.mu.Lock()
 			delete(n.chans, id)
 			n.mu.Unlock()
+			n.invoke(n.fnClosed, n.qc.NewInt64(id))
 		})
 	}
 }
