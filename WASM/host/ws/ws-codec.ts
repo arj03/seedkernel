@@ -15,20 +15,19 @@
 // since the module holds no per-connection state.
 
 import { concatBytes, readU32BE, ByteQueue } from "../util.js";
+import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, MAX_FRAME_PAYLOAD } from "./ws-abi.js";
 
-const OP_ENCODE = 1, OP_DECODE_ONE = 2, OP_ACCEPT = 3, OP_BASE64 = 4;
+// The ws.wasm ABI ops and scratch caps live in ws-abi.ts, shared verbatim with
+// assembly/ws/index.ts (which compiles them into ws.wasm) so the two units can't
+// drift. Re-exported here under the names the rest of the host uses: SCRATCH_SIZE
+// (ws-wasm-backend.ts) and SCRATCH_MAX (the per-frame payload cap).
+export { WS_GUID, SCRATCH_SIZE } from "./ws-abi.js";
+export const SCRATCH_MAX = MAX_FRAME_PAYLOAD;
 
-export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+// WebSocket frame opcodes (host-only — distinct from the request ABI ops above).
 export const OP_BINARY = 0x2;
 const OP_CONT = 0x0, OP_CLOSE = 0x8, OP_PING = 0x9, OP_PONG = 0xa;
 export const WS_OPCODES = { OP_BINARY, OP_CLOSE, OP_PING, OP_PONG } as const;
-
-// The ws.wasm scratch caps — the single TS source of truth (ws-wasm-backend.ts imports
-// these). Must match SCRATCH_SIZE / MAX_FRAME_PAYLOAD in assembly/ws/index.ts, which
-// allocates the module's actual scratch heap (a separate AS compilation unit that can't
-// import from here — the one copy we can't fold in).
-export const SCRATCH_SIZE = (16 << 20) + (1 << 12);
-export const SCRATCH_MAX = SCRATCH_SIZE - 16;
 
 /** The pluggable codec backend: stage `req` for ws.wasm, run handle(), return the
  *  response bytes (empty on a module-reported error). */
