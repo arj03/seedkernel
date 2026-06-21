@@ -914,8 +914,9 @@ It is a **platform target, not a reimplementation.** All protocol and app logic 
 - **`kernel.wasm` + the genesis suite** — the same §3 / §6 modules every target runs.
 - **`libsodium.wasm`** — the *same* crypto blob as the browser/Node build, which is exactly what makes a Go node's sealed boxes, XChaCha20 blocks, and Ed25519→Curve25519 conversions byte-identical to a JS node's. Wire/crypto parity is free when it is literally the same code (§6.6).
 - **a prebuilt QuickJS** (quickjs-ng, `WASM/loader/qjs`) — so the shared host JS runs unmodified with no native JS-engine dependency. QuickJS is synchronous, so Go owns the event loop (timers, the JS job queue, socket delivery) and **blocks at the `host.call` boundary** for net — the non-Asyncify analogue of Bun's Asyncify-blocking host call. The confined guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`.
+- **`ws.wasm`** — the *same* RFC 6455 framing blob the browser/Node targets use (`host/ws/ws-wasm-backend.ts`), driven over wazero and exposed to QuickJS as `__ws`. WebSocket framing is a no-capability byte transform (§13.1), not host code, so it is the identical module on every target; the handshake/codec state machine stays shared host JS (`ws-codec.ts` + `net-frame.ts`) running in QuickJS over a raw Go socket. Instantiated lazily on first WS use, so a pure node↔node TCP deployment never pays for it.
 
-Go-native primitives back the capability seams: `os` for the §13.1 fs backend, `net` for the TCP socket (node↔node) and a Go WebSocket (RFC 6455) primitive, `crypto/rand` for entropy. WebRTC (§13.7) stays browser-only. The CLI mirrors §13.8 exactly:
+Go-native primitives back the capability seams: `os` for the §13.1 fs backend, `net` for the raw TCP socket — node↔node directly, and browser↔node under a WebSocket whose RFC 6455 framing is the shared `ws.wasm` above — and `crypto/rand` for entropy. WebRTC (§13.7) stays browser-only. The CLI mirrors §13.8 exactly:
 
 ```sh
 seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
