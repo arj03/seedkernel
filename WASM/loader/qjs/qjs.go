@@ -93,6 +93,14 @@ func (r *Runtime) CallbackCount() int {
 	return len(r.reg.m)
 }
 
+// MemorySize returns the runtime's current wasm linear-memory size in bytes — the
+// QuickJS heap floor. wasm memory only ever grows (it is never released back), so a
+// size that stays flat across steady-state work is the strongest available leak
+// signal: anything the engine fails to free eventually forces a grow. Exposed (like
+// CallbackCount) for leak diagnostics; must be read on the runtime's own goroutine,
+// as it observes live wasm state. See qjs/leak_test.go and the loader soak tests.
+func (r *Runtime) MemorySize() uint32 { return r.mem.Size() }
+
 // New instantiates a fresh QuickJS runtime + context.
 func New() (rt *Runtime, err error) {
 	ctx := context.Background()
