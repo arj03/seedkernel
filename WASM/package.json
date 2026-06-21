@@ -24,6 +24,10 @@
       "types": "./build/host/net-rtc.d.ts",
       "default": "./build/host/net-rtc.js"
     },
+    "./net-ws": {
+      "types": "./build/host/net-ws.d.ts",
+      "default": "./build/host/net-ws.js"
+    },
     "./net-link": {
       "types": "./build/host/net-link.d.ts",
       "default": "./build/host/net-link.js"
