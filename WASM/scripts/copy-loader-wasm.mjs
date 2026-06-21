@@ -1,9 +1,9 @@
 // Copy the WASM artifacts the Go loader embeds (//go:embed wasm/*.wasm) from
-// their canonical build outputs into loader/wasm/. All three are BUILT from
-// this repo's source, so they're gitignored under loader/wasm/ and produced
-// here by `npm run build:loader` — go:embed can't reach across packages to
-// ../build or ../browser, hence the copy. Only loader/qjs/qjs.wasm stays
-// committed (vendored upstream, not built here).
+// their canonical build outputs into ../native/wasm/ (the top-level Go module).
+// All three are BUILT from this repo's source, so they're gitignored under
+// native/wasm/ and produced here by `npm run build:loader` — go:embed can't reach
+// across the native/ module boundary to WASM/build or WASM/browser, hence the copy.
+// Only native/qjs/qjs.wasm stays committed (vendored upstream, not built here).
 
 import { copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
-const dst = resolve(root, "loader/wasm");
+const dst = resolve(root, "../native/wasm");
 mkdirSync(dst, { recursive: true });
 
 const copies = [
@@ -27,5 +27,5 @@ for (const [from, to] of copies) {
     throw new Error(`missing ${from} — run its build first (npm run build:loader builds these)`);
   }
   copyFileSync(src, resolve(dst, to));
-  console.log(`copied ${from} -> loader/wasm/${to}`);
+  console.log(`copied ${from} -> ../native/wasm/${to}`);
 }

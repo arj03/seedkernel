@@ -20,7 +20,7 @@ SK=/c/Users/ander/Documents/GitHub/seedkernel/WASM
 SS=/c/Users/ander/Documents/GitHub/seedstore/WASM
 BUNDLE="$SS/bundle"
 NODEMAIN="$SK/build/host/main-node.js"
-GOEXE="${1:-$SK/loader/seedloader.exe}"
+GOEXE="${1:-$SK/../native/seedloader.exe}"
 
 HOLDERS=6
 BASEPORT=47100

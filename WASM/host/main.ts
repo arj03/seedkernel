@@ -9,7 +9,7 @@
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 --install ./codec.install,./reputation.install
 //
-// For a self-contained non-browser binary, the Go/native target (WASM/loader,
+// For a self-contained non-browser binary, the Go/native target (native/,
 // README §13.9) embeds and runs this same shared host JS — no Node install needed.
 
 import { readFile } from "node:fs/promises";
