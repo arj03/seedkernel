@@ -1,0 +1,19 @@
+# Generated host JS bundles — the shared TS (net-route / net-link / cap-bridge),
+# bundled for //go:embed. Regenerate from WASM/: `npm run build:loader`.
+*.gen.js
+
+# WASM artifacts built from this repo's source and copied in by
+# `npm run build:loader` (kernel/bootstrap from assembly/, libsodium from the
+# upstream npm dist). qjs/qjs.wasm is NOT ignored — it's vendored upstream.
+/wasm/kernel.wasm
+/wasm/bootstrap.wasm
+/wasm/ws.wasm
+/wasm/libsodium.wasm
+
+# Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
+/seedloader
+/seedloader-linux-amd64
+/seedloader.exe
+
+# Local dev wrapper that runs the Go toolchain through WSL — machine-specific setup.
+/gorun.sh

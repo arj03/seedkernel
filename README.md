@@ -903,7 +903,32 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
      --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
 ```
 
-A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §13.3 realm) **and** serves its *request* side from a confined realm (`serveAsHolder` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral, so a `bun build --compile` of `host/main-bun.ts` (kernel + bootstrap embedded) is a single-file binary that can host any signed app. seed store's WASM README has a complete storage walkthrough.
+A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §13.3 realm) **and** serves its *request* side from a confined realm (`serveAsHolder` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§13.9). seed store's WASM README has a complete storage walkthrough.
+
+### 13.9 The Go/native shell — the primary non-browser deployment
+
+The §13.8 shell runs as JS on Node or Bun, but the **recommended** way to run a node outside the browser is the **Go/native target** (`native/`, a top-level Go module): a single self-contained, cgo-free binary — `seedloader` — with no Node, no Bun, and no separate JS engine to install on the box.
+
+It is a **platform target, not a reimplementation.** All protocol and app logic stays shared JS: the byte-identical cap-bridge (§13.2), the node↔node transport (§13.6 — the PeerLink handshake, the request/response + bulk Transport, the routing), bundle verification (§13.4), the policy file (§13.5), and the confined safe-js guest (§13.3) all run as *the same TypeScript* the other targets run — just hosted differently. Go supplies only the platform **primitives** the §1 table calls for; protocol is never re-derived in a second language (the rule from §1: *Go grows with primitives, never with logic*). Concretely the binary embeds and drives, over [wazero](https://wazero.io) (a pure-Go, cgo-free wasm runtime):
+
+- **`kernel.wasm` + the genesis suite** — the same §3 / §6 modules every target runs.
+- **`libsodium.wasm`** — the *same* crypto blob as the browser/Node build, which is exactly what makes a Go node's sealed boxes, XChaCha20 blocks, and Ed25519→Curve25519 conversions byte-identical to a JS node's. Wire/crypto parity is free when it is literally the same code (§6.6).
+- **a prebuilt QuickJS** (quickjs-ng, `native/qjs`) — so the shared host JS runs unmodified with no native JS-engine dependency. QuickJS is synchronous, so Go owns the event loop (timers, the JS job queue, socket delivery) and **blocks at the `host.call` boundary** for net — the non-Asyncify analogue of Bun's Asyncify-blocking host call. The confined guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`.
+- **`ws.wasm`** — the *same* RFC 6455 framing blob the browser/Node targets use (`host/ws/ws-wasm-backend.ts`), driven over wazero and exposed to QuickJS as `__ws`. WebSocket framing is a no-capability byte transform (§13.1), not host code, so it is the identical module on every target; the handshake/codec state machine stays shared host JS (`ws-codec.ts` + `net-frame.ts`) running in QuickJS over a raw Go socket. Instantiated lazily on first WS use, so a pure node↔node TCP deployment never pays for it.
+
+Go-native primitives back the capability seams: `os` for the §13.1 fs backend, `net` for the raw TCP socket — node↔node directly, and browser↔node under a WebSocket whose RFC 6455 framing is the shared `ws.wasm` above — and `crypto/rand` for entropy. WebRTC (§13.7) stays browser-only. The CLI mirrors §13.8 exactly:
+
+```sh
+seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
+     --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
+     --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
+```
+
+Because the wire and the bundles are shared, a Go node and a Node/Bun node interoperate directly in one cohort — `put` on either, `get` on the other, in both directions, against the same signed bundle and genesis (verified end-to-end for seed store by `WASM/scripts/loader-interop.sh`).
+
+**Size.** One file, ~7.5 MB stripped, cross-compiled to win/linux/mac with `GOOS`/`GOARCH` — nothing to install alongside it. The bulk is wazero's compiler backend (~4 MB) and the Go runtime (~2.4 MB); the protocol's own footprint stays tiny (§11.2). Against the JS shell — which needs a Node/Bun install plus the lazily-loaded ~1.5 MB QuickJS engines — the native binary trades a larger single artifact for zero external dependencies, the right shape for a server or an appliance.
+
+**Performance.** Because the Go target drives the *same* `libsodium.wasm` under wazero that the JS targets run under V8, crypto throughput tracks node closely — Ed25519 verify and XChaCha20 land within ~10% either way, and the Reed–Solomon codec runs a touch *faster* (≈330 / 394 vs ≈315 / 319 MB/s encode / decode). The one deliberate exception is the block-id hash (BLAKE2b-256), which runs on **native Go** (`golang.org/x/crypto/blake2b`, byte-identical to libsodium and KAT-pinned): it sits on the storage data path and is the single primitive wazero ran the wasm materially slower than V8, so native (~600 vs ~390 MB/s) is the clear win. Signed-envelope dispatch trails node by Go-side per-message overhead, not crypto. Reproduce with `go test -run x -bench . -benchmem ./...` from `native/`; the node baselines come from `WASM/tests/run.mjs` (`testPerf10k`) and seedstore's `WASM/tests/bench.mjs`.
 
 ---
 

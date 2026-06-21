@@ -24,6 +24,10 @@
       "types": "./build/host/net-rtc.d.ts",
       "default": "./build/host/net-rtc.js"
     },
+    "./net-ws": {
+      "types": "./build/host/net-ws.d.ts",
+      "default": "./build/host/net-ws.js"
+    },
     "./net-link": {
       "types": "./build/host/net-link.d.ts",
       "default": "./build/host/net-link.js"
@@ -71,6 +75,9 @@
     "build:chat-app-v2": "asc assembly/chat-app-v2/index.ts --config asconfig.chat-app-v2.json --target release && node scripts/embed-ui.mjs build/chat-app-v2.wasm assembly/chat-app-v2/ui.html build/chat-app-v2.wasm && node scripts/embed-meta.mjs build/chat-app-v2.wasm build/chat-app-v2.wasm \"{\\\"id\\\":\\\"chat\\\",\\\"name\\\":\\\"Chat\\\",\\\"version\\\":\\\"v2\\\",\\\"description\\\":\\\"text + image + nick\\\"}\"",
     "build:host": "tsc -p host && tsc -p host/tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
+    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-netroute.gen.js \"NodeNetworkCore,Transport,PeerLink,parsePeerSpec,toHex,fromHex\" build/host/util.js build/host/net.js build/host/net-link.js build/host/net-route.js && node scripts/bundle-loader.mjs ../native/host-ws.gen.js \"setWsHandle,WsServerChannel,WsClientChannel\" build/host/util.js build/host/ws/ws-codec.js build/host/net-frame.js && node scripts/bundle-loader.mjs ../native/host-capbridge.gen.js \"createCapBridge,capPreamble,opsForCaps,CAP,CAP_DOMAINS,toHex,fromHex,concatBytes\" build/host/util.js build/host/cap-bridge.js",
+    "build:loader-wasm": "npm run build:kernel && npm run build:bootstrap && npm run build:ws && npm run build:browser-sodium && node scripts/copy-loader-wasm.mjs",
+    "build:loader": "npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build": "npm run build:kernel && npm run build:bootstrap && npm run build:forwarder && npm run build:ws && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:chat-app-v1 && npm run build:chat-app-v2 && npm run build:browser-sodium",

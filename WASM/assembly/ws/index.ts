@@ -2,7 +2,7 @@
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so its wire codec
 // is pure byte transformation — exactly the shape of a no-cap WASM handler like
-// `codec` (PLAN-runtime-split.md). It imports nothing but the AS runtime: no
+// `codec`. It imports nothing but the AS runtime: no
 // kernel.call, no fs, no net. The host owns the socket and the RNG and pumps
 // bytes through this module; this module only frames/deframes and computes the
 // handshake accept (sha1 + base64), holding no per-connection state — the host
@@ -25,20 +25,17 @@
 //   OP_ACCEPT     (3) args [key bytes]   → base64(sha1(key ‖ GUID)) bytes (28)
 //   OP_BASE64     (4) args [bytes]       → base64(bytes)
 
-// One WS frame must fit the scratch region. Sized so the largest TCP transport
-// message (MAX_TCP_MESSAGE, 16 MB, net-node.ts) also fits in a single WS frame
-// plus header/mask overhead — the two transports must cap identically, or a
-// message that succeeds over TCP would tear down a WS link.
-const SCRATCH_SIZE: i32 = (16 << 20) + (1 << 12); // 16 MB + 4 KB overhead slack
-const MAX_FRAME_PAYLOAD: i32 = SCRATCH_SIZE - 16;
+// The ABI ops, handshake GUID, and scratch caps are shared verbatim with the
+// host driver via host/ws/ws-abi.ts (asc compiles it into this module; tsc reads
+// the same file from ws-codec.ts) so the two units can't drift. SCRATCH_SIZE is
+// sized so the largest TCP transport message (MAX_TCP_MESSAGE, 16 MB, net-node.ts)
+// also fits in a single WS frame plus header/mask overhead — the two transports
+// must cap identically, or a message that succeeds over TCP would tear down a WS
+// link. This module heap.allocs SCRATCH_SIZE below as the actual scratch heap.
+import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "../../host/ws/ws-abi";
+
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
 
-const OP_ENCODE: i32 = 1;
-const OP_DECODE_ONE: i32 = 2;
-const OP_ACCEPT: i32 = 3;
-const OP_BASE64: i32 = 4;
-
-const GUID: string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const B64: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 // priv layout (handshake only — small inputs)
@@ -248,11 +245,11 @@ function opDecodeOne(input_len: i32): i32 {
 /** base64(sha1(key ‖ GUID)) — the RFC 6455 server accept value. */
 function opAccept(input_len: i32): i32 {
   const keyLen = input_len - 1;
-  if (keyLen < 0 || keyLen + GUID.length > 4096) return 0;
+  if (keyLen < 0 || keyLen + WS_GUID.length > 4096) return 0;
   const msg = priv + PRIV_MSG_OFF;
   memory.copy(msg, scratch + 1, keyLen);
-  for (let i = 0; i < GUID.length; i++) store<u8>(msg + keyLen + i, GUID.charCodeAt(i) as u8);
-  const msgLen = keyLen + GUID.length;
+  for (let i = 0; i < WS_GUID.length; i++) store<u8>(msg + keyLen + i, WS_GUID.charCodeAt(i) as u8);
+  const msgLen = keyLen + WS_GUID.length;
   sha1(msg, msgLen, priv + PRIV_DIGEST_OFF, priv + PRIV_WORK_OFF);
   return base64(priv + PRIV_DIGEST_OFF, 20, scratch);
 }

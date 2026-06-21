@@ -11,5 +11,5 @@
     "rootDir": "."
   },
   "include": ["**/*.ts"],
-  "exclude": ["main-bun.ts", "wasm-bun.ts"]
+  "exclude": []
 }
