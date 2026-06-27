@@ -140,6 +140,16 @@ function getModule(): Promise<QuickJSAsyncWASMModule> {
   return (modulePromise ??= newQuickJSAsyncWASMModule(ngReleaseAsync));
 }
 
+// Asyncify's suspend/resume state is MODULE-global, and every async realm shares
+// the one module above — so a host call from one realm cannot overlap a host call
+// from ANOTHER realm without clobbering that shared state (the §2.1 caveat). One
+// process therefore serves at most one node, but the tests (and any host that runs
+// several realms in-process) stand up many. Serialize every async realm's call()
+// through one process-wide chain so their host calls never interleave. A call only
+// ever awaits net, which sync holder realms (a different module) answer without the
+// chain — so this never deadlocks. Sync realms are wholly unaffected.
+let asyncCallChain: Promise<unknown> = Promise.resolve();
+
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
     ? (u8.buffer as ArrayBuffer)
@@ -206,11 +216,6 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   ctx.unwrapResult(await ctx.evalCodeAsync(PREAMBLE, "safe-js-preamble.js")).dispose();
   ctx.unwrapResult(await ctx.evalCodeAsync(opts.source, "safe-js-guest.js")).dispose();
 
-  // Calls are serialized per realm: a call() parks mid-await on every host
-  // bridge (Asyncify suspends the one shared VM), so a second concurrent call()
-  // would clobber the shared `__arg` global and re-enter the suspended VM.
-  let chain: Promise<unknown> = Promise.resolve();
-
   const callOnce = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
     armDeadline();
     stageArg(ctx, payload);
@@ -234,8 +239,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
 
   return {
     call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
-      const run = chain.then(() => callOnce(entry, payload));
-      chain = run.catch(() => {}); // a failed call must not poison the queue
+      // Chain on the process-wide queue (see asyncCallChain): no two async realm
+      // calls — this realm's or any other's — may overlap host calls.
+      const run = asyncCallChain.then(() => callOnce(entry, payload));
+      asyncCallChain = run.catch(() => {}); // a failed call must not poison the queue
       return run;
     },
     dispose(): void {
