@@ -44,6 +44,12 @@ export const CAP = {
   FS_SIZE: 18,         // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
                        //   lets a policy layer rebuild a byte budget (quota) without
                        //   reading every value back. Appended (18) so 1–17 stay stable.
+  NET_SEND_MANY: 19,   // [count u32]{[peer 32][type u8][plen u32][payload]}
+                       //   -> [count u32]{[peer 32][ok u8][len u32][bytes]}
+                       //   Per-peer fan-out: a DISTINCT request per peer, concurrently
+                       //   (NET_REQUEST_MANY is the all-payloads-equal special case).
+                       //   The parallel transport primitive a sync guest drives one
+                       //   batched cap at a time. Appended (19) so 1–18 stay stable.
 } as const;
 
 /** The generated `const CAP_NAME = n;` block the guest is written against. */
@@ -58,7 +64,7 @@ export function capPreamble(): string {
  *  not a list of 18 op numbers. `ops` documents the ABI; `caps` is the grant. */
 export const CAP_DOMAINS = {
   crypto: [CAP.HASH, CAP.STREAM_XOR, CAP.SIGN, CAP.VERIFY, CAP.IDENTITY, CAP.RANDOM],
-  net:    [CAP.NET_SEND, CAP.NET_REQUEST_MANY, CAP.NET_PEERS],
+  net:    [CAP.NET_SEND, CAP.NET_REQUEST_MANY, CAP.NET_SEND_MANY, CAP.NET_PEERS],
   fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_HAS, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
   module: [CAP.MODULE_CALL],
   clock:  [CAP.CLOCK],
@@ -94,6 +100,10 @@ export interface CapTransport {
   request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array>;
   requestMany(
     peers: PeerId[], type: number, payload: Uint8Array,
+  ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]>;
+  /** Per-peer fan-out — a distinct request per peer (NET_SEND_MANY). */
+  sendMany(
+    requests: { peer: PeerId; type: number; payload: Uint8Array }[],
   ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]>;
 }
 
@@ -209,6 +219,38 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         const plen = readU32BE(payload, o); o += 4;
         const req = payload.slice(o, o + plen);
         return transport.requestMany(peers, type, req).then((results) => {
+          const head = new Uint8Array(4); writeU32BE(head, 0, results.length);
+          const parts: Uint8Array[] = [head];
+          for (const r of results) {
+            const h = new Uint8Array(32 + 1 + 4);
+            h.set(fromHex(r.peer), 0);
+            h[32] = r.ok ? 1 : 0;
+            writeU32BE(h, 33, r.ok ? r.bytes.length : 0);
+            parts.push(h);
+            if (r.ok) parts.push(r.bytes);
+          }
+          return concatBytes(parts);
+        });
+      }
+      case CAP.NET_SEND_MANY: {
+        const count = readU32BE(payload, 0);
+        if (count > MAX_REQUEST_MANY_PEERS) {
+          throw new Error("cap-bridge: NET_SEND_MANY count over cap");
+        }
+        // `count` is guest-controlled: every entry must be fully backed by payload
+        // bytes (no driving an unbounded host loop with a bare number), validated as
+        // the variable-length entries are walked.
+        const requests: { peer: PeerId; type: number; payload: Uint8Array }[] = [];
+        let o = 4;
+        for (let i = 0; i < count; i++) {
+          if (o + 37 > payload.length) throw new Error("cap-bridge: NET_SEND_MANY truncated entry");
+          const peer = toHex(payload.slice(o, o + 32));
+          const type = payload[o + 32];
+          const plen = readU32BE(payload, o + 33); o += 37;
+          if (o + plen > payload.length) throw new Error("cap-bridge: NET_SEND_MANY truncated payload");
+          requests.push({ peer, type, payload: payload.slice(o, o + plen) }); o += plen;
+        }
+        return transport.sendMany(requests).then((results) => {
           const head = new Uint8Array(4); writeU32BE(head, 0, results.length);
           const parts: Uint8Array[] = [head];
           for (const r of results) {

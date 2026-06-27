@@ -14,7 +14,7 @@ func bundleDir() string {
 	if d := os.Getenv("SEEDSTORE_BUNDLE"); d != "" {
 		return d
 	}
-	return "../../../seedstore/WASM/bundle"
+	return "../../seedstore/WASM/bundle"
 }
 
 // With the bundle author allow-listed, the closed policy still loads the bundle.
