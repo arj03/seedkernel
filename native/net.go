@@ -12,12 +12,32 @@
 package main
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
 )
 
 const maxTCPMessage = 16 << 20 // frame cap (matches the TS MAX_TCP_MESSAGE / WS cap)
+
+// tcpSocketBuffer is the send/receive socket buffer set on every TCP connection
+// (dialed and accepted). The request/response traffic pattern leaves idle gaps
+// between bursts, which stops the kernel's receive-buffer autotuning from ramping,
+// so over a high-RTT link a connection otherwise stalls near the OS default window
+// (~64 KiB → only a few MB/s at 27 ms RTT — the bandwidth-delay product is the cap,
+// not the link). A fixed generous buffer lifts that ceiling: 4 MiB covers a fast,
+// high-RTT link's BDP with headroom.
+const tcpSocketBuffer = 4 << 20
+
+// dialTCP dials with SO_RCVBUF/SO_SNDBUF set on the socket BEFORE connect (the
+// Dialer's Control hook runs on the raw fd pre-handshake), so the TCP window scale
+// advertised in the SYN is sized for the large buffer. Setting the buffer after the
+// connection is up is too late to widen the window scale, which otherwise caps a
+// high-RTT transfer near the OS-default window.
+func dialTCP(addr string) (net.Conn, error) {
+	d := net.Dialer{Timeout: 5 * time.Second, Control: controlSocketBuffers}
+	return d.DialContext(context.Background(), "tcp", addr)
+}
 
 // ───────────────────────── small byte helpers ─────────────────────────
 
@@ -63,7 +83,7 @@ type tcpChannel struct {
 func newTCPChannelDial(addr string, onMsg func([]byte), onClose func()) *tcpChannel {
 	c := &tcpChannel{onMsg: onMsg, onClose: onClose}
 	go func() {
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		conn, err := dialTCP(addr)
 		if err != nil {
 			c.fail()
 			return
@@ -250,7 +270,7 @@ type rawSockChannel struct {
 func newRawChannelDial(addr string, onMsg func([]byte), onClose func()) *rawSockChannel {
 	c := &rawSockChannel{onMsg: onMsg, onClose: onClose}
 	go func() {
-		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		conn, err := dialTCP(addr)
 		if err != nil {
 			c.fail()
 			return

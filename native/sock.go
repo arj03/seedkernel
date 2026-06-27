@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
@@ -154,7 +155,13 @@ func (n *netHost) dial(addr string, raw bool) int64 {
 // __netAccept has created the JS channel — otherwise the read goroutine could
 // deliver a frame before JS has a channel to route it to.
 func (n *netHost) listen(host string, port int, raw bool) (int, error) {
-	ln, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	// Control sets SO_RCVBUF/SO_SNDBUF on the listening socket BEFORE bind, so every
+	// accepted connection inherits the large buffer at the handshake and negotiates a
+	// big TCP window scale. Raising the buffer on an already-accepted socket (tuneTCP)
+	// is too late to fix the window scale — which is why a high-RTT receive (PUT into a
+	// holder) otherwise stays window-limited even with a large post-accept SO_RCVBUF.
+	lc := net.ListenConfig{Control: controlSocketBuffers}
+	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
 	}
@@ -199,6 +206,8 @@ func (n *netHost) closeListeners() {
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
 func (n *netHost) wrapInbound(id int64, conn net.Conn, raw bool) (rawChannel, func()) {
+	// Socket buffers are already set on the listener (pre-bind, via ListenConfig.Control)
+	// and inherited here, so the accepted connection's window scale is sized correctly.
 	if raw {
 		rc := &rawSockChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), conn: conn, open: true}
 		return rc, func() { go rc.readLoop() }
