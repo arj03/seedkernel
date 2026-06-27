@@ -26,7 +26,7 @@ func TestShellRunsSeedstoreBundle(t *testing.T) {
 
 	dir := os.Getenv("SEEDSTORE_BUNDLE")
 	if dir == "" {
-		dir = "../../../seedstore/WASM/bundle"
+		dir = "../../seedstore/WASM/bundle"
 	}
 	if status := loadBundle(dir); !strings.HasPrefix(status, "seedstore v1  installed=[codec reputation]") {
 		t.Fatalf("bundle load: %s", status)

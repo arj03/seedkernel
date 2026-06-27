@@ -44,7 +44,7 @@ func setupRS() {
 	ensureBooted()
 	dir := os.Getenv("SEEDSTORE_BUNDLE")
 	if dir == "" {
-		dir = "../../../seedstore/WASM/bundle"
+		dir = "../../seedstore/WASM/bundle"
 	}
 	if !strings.HasPrefix(loadBundle(dir), "seedstore v1") {
 		return // rsReady stays false → the benchmarks Skip

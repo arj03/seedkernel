@@ -937,6 +937,81 @@ async function testRequestMany() {
   console.log("  OK\n");
 }
 
+// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 19) ─────────
+//
+// The per-peer fan-out: a DISTINCT payload per peer, concurrently. This is the
+// primitive the sync storage guest drives for placement/gather (one batched cap
+// per round) instead of a host-side Promise.all.
+
+async function testSendMany() {
+  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 19)");
+
+  const u32 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+  const rd32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  const U = (...xs) => new Uint8Array(xs);
+
+  const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
+  const net = new LoopbackNetwork();
+  const ta = new Transport(toHex(a.publicKey), net, 40);
+  const tb = new Transport(toHex(b.publicKey), net, 40);
+  const tc = new Transport(toHex(c.publicKey), net, 40);
+  // Each peer echoes type + payload, so a distinct payload comes back distinctly.
+  tb.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
+  tc.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
+
+  try {
+    // 1) Transport.sendMany directly — distinct payloads, one per peer.
+    const dead = toHex(generateKeyPair().publicKey);
+    const results = await ta.sendMany([
+      { peer: toHex(b.publicKey), type: 7, payload: U(1, 1) },
+      { peer: toHex(c.publicKey), type: 7, payload: U(2, 2) },
+      { peer: dead, type: 7, payload: U(9) },
+    ]);
+    assertEqual(results.length, 3, "one result per request, order preserved");
+    assert(bytesEqual(results[0].bytes, U(7, 1, 1)), "peer b got ITS payload (distinct fan-out)");
+    assert(bytesEqual(results[1].bytes, U(7, 2, 2)), "peer c got ITS payload");
+    assert(!results[2].ok && results[2].bytes.length === 0, "the unreachable peer → ok:false, no bytes (partial)");
+
+    // 2) Same fan-out through the cap-bridge NET_SEND_MANY wire (what the guest sees).
+    const id = generateKeyPair();
+    const tBridge = new Transport(toHex(id.publicKey), net, 40);
+    const bridge = createCapBridge({
+      sodium, identity: id, callHandler: () => null,
+      transport: tBridge, peers: () => [], fs: new MemoryFs(),
+    });
+    const entry = (peerPk, type, payload) => concatBytes([peerPk, U(type), u32(payload.length), payload]);
+    const req = concatBytes([u32(2), entry(b.publicKey, 7, U(3, 3, 3)), entry(c.publicKey, 7, U(4))]);
+    const sendMany = bridge(CAP.NET_SEND_MANY, req);
+    assert(sendMany instanceof Promise, "CAP_NET_SEND_MANY returns a Promise (real round trips)");
+    const resp = await sendMany;
+    // Decode [count u32]{[peer 32][ok u8][len u32][bytes]}
+    assertEqual(rd32(resp, 0), 2, "response counts both peers");
+    let o = 4;
+    const decoded = [];
+    for (let i = 0; i < 2; i++) {
+      const peer = toHex(resp.slice(o, o + 32)); o += 32;
+      const ok = resp[o] === 1; o += 1;
+      const len = rd32(resp, o); o += 4;
+      decoded.push({ peer, ok, bytes: resp.slice(o, o + len) }); o += len;
+    }
+    assertEqual(decoded[0].peer, toHex(b.publicKey), "first response is peer b (order preserved)");
+    assert(bytesEqual(decoded[0].bytes, U(7, 3, 3, 3)), "peer b echoed its own payload through the bridge");
+    assert(bytesEqual(decoded[1].bytes, U(7, 4)), "peer c echoed its own payload through the bridge");
+    tBridge.close();
+
+    // 3) A guest-controlled count not backed by bytes is a clean throw, never an
+    //    unbounded host loop (the same defensive check NET_REQUEST_MANY makes).
+    let threw = false;
+    try { await bridge(CAP.NET_SEND_MANY, concatBytes([u32(2), entry(b.publicKey, 7, U(1))])); }
+    catch { threw = true; }
+    assert(threw, "NET_SEND_MANY with count past the backing bytes throws");
+  } finally {
+    ta.close(); tb.close(); tc.close();
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Test: cap-bridge generic primitives (step 7) ───────────────────────
 //
 // The capability counterpart to safe-js: a guest reaches only application-neutral
@@ -1421,7 +1496,7 @@ async function testCapBridgeEnforcement() {
   console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async () => new Uint8Array(), requestMany: async () => [] };
+  const stubTransport = { request: async () => new Uint8Array(), requestMany: async () => [], sendMany: async () => [] };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
@@ -1874,6 +1949,7 @@ await testBlockFromCall();
 await testWrapRejectsInvalidKeySizes();
 await testFs();
 await testRequestMany();
+await testSendMany();
 await testCapBridge();
 await testPolicy();
 await testShellBoot();

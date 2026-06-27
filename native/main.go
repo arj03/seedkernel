@@ -447,7 +447,7 @@ type cliArgs struct {
 }
 
 func parseCLI() cliArgs {
-	a := cliArgs{bundleDir: "../../../seedstore/WASM/bundle", dataDir: "./data", keyPath: "./seedkernel.key", timeoutMs: 2000}
+	a := cliArgs{bundleDir: "../../seedstore/WASM/bundle", dataDir: "./data", keyPath: "./seedkernel.key", timeoutMs: 2000}
 	f := os.Args[1:]
 	val := func(i *int) string {
 		*i++

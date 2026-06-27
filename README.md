@@ -736,7 +736,7 @@ The split exists because the guest is not a kernel handler: it has no name in th
 Beyond the per-install caps that bridges check at I/O time (§8), the runtime provides the capability *backends* an app's confined logic actually drives. They are deliberately structureless — bytes in, bytes out — so the kernel never learns what an app means by them:
 
 - `crypto.*` — the bundled sumo libsodium: hash (BLAKE2b), `sign`/`verify` (Ed25519, as the node identity), the raw `stream_xor` (xchacha20), `random` (`host/cap-bridge.ts`, backed by `loadSodium`).
-- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC data channels (`host/net-rtc.ts`, §13.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `requestMany` (scatter-gather fan-out — the one concurrency a confined guest can't do itself), and `peers`.
+- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC data channels (`host/net-rtc.ts`, §13.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `requestMany` and `sendMany` (host-side scatter-gather fan-out — the one concurrency a confined guest can't do itself; `requestMany` broadcasts one shared payload to many peers, `sendMany` is the general case of a distinct request per peer), and `peers`.
 - `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`has`/`size`/`list`/`delete`/`stat`. An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
 - `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
 
@@ -768,13 +768,14 @@ The op numbers are **stable wire identifiers**: the generated preamble injects t
 | 16 | `MODULE_CALL` | `[name_len u8][name][request ..]` | the installed handler's response bytes |
 | 17 | `CLOCK` | (empty) | now in unix ms (`u64`) |
 | 18 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
+| 19 | `NET_SEND_MANY` | `[count u32] {[peer 32][type u8][plen u32][payload ..]}` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
 
-The **capability domains** a manifest declares (§13.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of 18 numbers:
+The **capability domains** a manifest declares (§13.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of 19 numbers:
 
 | Domain | Ops |
 | --- | --- |
 | `crypto` | 1–6 (`HASH` … `RANDOM`) |
-| `net` | 7–9 (`NET_SEND`, `NET_REQUEST_MANY`, `NET_PEERS`) |
+| `net` | 7–9, 19 (`NET_SEND`, `NET_REQUEST_MANY`, `NET_PEERS`, `NET_SEND_MANY`) |
 | `fs` | 10–15, 18 (`FS_GET` … `FS_STAT`, `FS_SIZE`) |
 | `module` | 16 (`MODULE_CALL`) |
 | `clock` | 17 (`CLOCK`) |
@@ -884,13 +885,13 @@ bulk        = [0x02][block_id: 32][bytes ..]     unsigned; the receiver verifies
                                                  genesisHash(bytes) == block_id itself
 ```
 
-A response resolves only if it arrives from the peer the request went to, so an authenticated-but-malicious cohort member cannot answer on another peer's behalf by guessing the correlation counter. `requestMany` is host-side scatter-gather over this — the one concurrency a confined guest cannot do itself — returning one `{peer, ok, bytes}` entry per input peer: partial results, never a rejection.
+A response resolves only if it arrives from the peer the request went to, so an authenticated-but-malicious cohort member cannot answer on another peer's behalf by guessing the correlation counter. `requestMany` (one shared payload to many peers) and `sendMany` (its general case — a distinct request per peer) are host-side scatter-gather over this — the one concurrency a confined guest cannot do itself — each returning one `{peer, ok, bytes}` entry per input peer: partial results, never a rejection.
 
 **What the handshake gives — and what it doesn't.** Because AUTH signs the full transcript, it authenticates that the far end held the claimed private key *for this exchange*: the signature is bound to the exact pair of identities and nonces that produced it, so it cannot be harvested on one connection and replayed on another, and a node used as a signing oracle yields nothing reusable. Every subsequent frame on the channel is attributed to that authenticated key. What it does **not** do is establish a session key, and it does **not** encrypt — frames are plaintext on the wire (§15), and post-handshake frames are bound to the identity only by the channel itself, with no per-frame MAC. So the binding is sound against impersonation and misattribution, but an active attacker who can hijack or inject into the live TCP stream *after* authentication can still read and forge frames. Deployments that need confidentiality, or integrity against an in-path attacker on the established channel, MUST run `PeerLink` inside an encrypted, mutually-authenticated tunnel (TLS, Noise). See §15.
 
 ### 13.7 Browser↔console WebRTC
 
-§13.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `requestMany` / `peers` surface as the TCP and WebSocket transports.
+§13.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `requestMany` / `sendMany` / `peers` surface as the TCP and WebSocket transports.
 
 **`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; a relay (`scripts/relay.mjs`) is only the *signaling* rendezvous for the SDP/ICE exchange and can be killed once channels are open — there is no server in the data path. One ordered binary data channel per peer carries everything, and `Transport` (§13.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — the relay, a DHT, gossip, or even an existing `PeerLink` between two already-connected peers all satisfy it — and deliberately carries *no* SDP-fingerprint signature, because identity is proven in-channel: `PeerLink`'s HELLO/AUTH runs *inside* the data channel (§13.6), which is stronger than a one-shot SDP-fingerprint assertion at the signaling layer (the approach an earlier version of the chat shell used, now replaced by this path — §12). A MITM relay can splice SDP and bring DTLS up to itself but can never complete AUTH without the peer's private key, so the link never authenticates and never delivers a byte. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins the same mesh by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §13.6 move applied to WebRTC. werift (pure-TS) is used rather than the native `node-datachannel` because the latter segfaults under Bun.
 
@@ -1016,7 +1017,7 @@ These belong to the reference runtime (§13), not the kernel protocol — a diff
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| Cap op ids | `1`–`18` | cap-bridge (§13.2) | Stable wire identifiers; appended, never renumbered. |
+| Cap op ids | `1`–`19` | cap-bridge (§13.2) | Stable wire identifiers; appended, never renumbered. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§13.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§13.4) | Ed25519 detached signature over the JSON bytes. |
 | Link message tags | `HELLO 0x01`, `AUTH 0x02`, `FRAME 0x03` | `PeerLink` (§13.6) | Handshake + frame plane. |
