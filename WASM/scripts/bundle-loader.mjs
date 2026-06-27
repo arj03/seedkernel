@@ -22,6 +22,10 @@ for (const f of files) {
   let src = readFileSync(f, "utf8");
   src = src.replace(/^\s*import\s[^\n]*$/gm, "");                 // drop ESM imports
   src = src.replace(/^\/\/#\s*sourceMappingURL=.*$/gm, "");        // drop sourcemap refs
+  // Drop re-export lines (`export { A, B } from "./x.js";` or `export { A };`):
+  // the re-exported names are defined by another module included in this bundle,
+  // so the binding already exists — only the (QuickJS-invalid) export survives.
+  src = src.replace(/^\s*export\s*\{[^}]*\}\s*(?:from\s*['"][^'"]+['"])?\s*;?\s*$/gm, "");
   src = src.replace(/^export\s+(async\s+function|function|class|const|let|var)\b/gm, "$1"); // un-export decls
   body += `\n// ===== ${f} =====\n${src.trim()}\n`;
 }
