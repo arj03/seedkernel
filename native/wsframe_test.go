@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	crand "crypto/rand"
+	"encoding/binary"
 	"testing"
 )
 
@@ -47,7 +48,7 @@ func TestWsWasmFrameRoundTrip(t *testing.T) {
 	if len(r) < 10 || r[0] != 1 {
 		t.Fatalf("OP_DECODE_ONE status = %v", r)
 	}
-	plen := int(getU32BE(r, 6))
+	plen := int(binary.BigEndian.Uint32(r[6:]))
 	if got := r[10 : 10+plen]; !bytes.Equal(got, payload) {
 		t.Fatalf("decoded payload mismatch (%d bytes)", len(got))
 	}

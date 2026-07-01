@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"sync"
 	"time"
@@ -37,19 +38,6 @@ const tcpSocketBuffer = 4 << 20
 func dialTCP(addr string) (net.Conn, error) {
 	d := net.Dialer{Timeout: 5 * time.Second, Control: controlSocketBuffers}
 	return d.DialContext(context.Background(), "tcp", addr)
-}
-
-// ───────────────────────── small byte helpers ─────────────────────────
-
-func putU32BE(b []byte, off int, v uint32) {
-	b[off] = byte(v >> 24)
-	b[off+1] = byte(v >> 16)
-	b[off+2] = byte(v >> 8)
-	b[off+3] = byte(v)
-}
-
-func getU32BE(b []byte, off int) uint32 {
-	return uint32(b[off])<<24 | uint32(b[off+1])<<16 | uint32(b[off+2])<<8 | uint32(b[off+3])
 }
 
 // ───────────────────────── RawChannel: a whole-message duplex ─────────────────
@@ -243,7 +231,7 @@ func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
 		return
 	}
 	var hdr [4]byte
-	putU32BE(hdr[:], 0, uint32(len(bytes)))
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(bytes)))
 	conn, dead := c.socket()
 	if dead || conn == nil {
 		return
@@ -278,7 +266,7 @@ func (framedProto) readLoop(c *sockChannel) {
 				if len(buf)-off < 4 {
 					break
 				}
-				ln := getU32BE(buf, off)
+				ln := binary.BigEndian.Uint32(buf[off:])
 				if ln > maxTCPMessage {
 					c.fail()
 					return

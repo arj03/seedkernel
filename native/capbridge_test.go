@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/tetratelabs/wazero"
@@ -99,7 +100,7 @@ func TestCapBridgeOps(t *testing.T) {
 	key := []byte("blk")
 	value := []byte("a content-addressed block")
 	put := make([]byte, 4+len(key)+len(value)) // [klen u32][key][bytes]
-	putU32BE(put, 0, uint32(len(key)))
+	binary.BigEndian.PutUint32(put, uint32(len(key)))
 	copy(put[4:], key)
 	copy(put[4+len(key):], value)
 	callBytes(11, put)
