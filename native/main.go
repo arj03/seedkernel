@@ -62,6 +62,20 @@ var (
 	nextID  = int32(10)
 )
 
+// maxCallDepth caps kernel.call re-entrancy (README §11 MAX_CALL_DEPTH, §4.4).
+//
+// Note there is no cross-module *size* bound here: a handler exports only its scratch
+// offset (the `scratch` global), not its scratch size, and sizes vary per handler (the RS
+// codec's scratch holds multi-hundred-KB shards, far above the 128 KB default). So the host
+// can't enforce a fixed byte cap without breaking large-scratch handlers; it guards each
+// cross-module copy with the Memory().Write bool instead, which fails only if the data
+// overruns the target module's actual linear memory.
+const maxCallDepth = 8
+
+// kcallDepth bounds re-entrant kernel.call recursion (§4.4). Dispatch is single-threaded
+// (§4.2), so a plain package var needs no locking.
+var kcallDepth int
+
 // wasmCall invokes a wasm export, returning nil if it's missing or the call failed —
 // so a missing ABI function degrades instead of panicking the host.
 func wasmCall(m api.Module, name string, args ...uint64) []uint64 {
@@ -107,7 +121,12 @@ func load(wasm []byte, modName string) api.Module {
 // run invokes an installed handler (wasm or native) by name (README §4 scratch ABI).
 func run(n, payload []byte) []byte {
 	if h, ok := wasmH[string(n)]; ok {
-		h.mod.Memory().Write(h.scratch, payload)
+		// The payload must fit the target's memory at its scratch offset (§4.4). If it
+		// doesn't, Write leaves the region untouched — bail rather than run handle() on
+		// stale bytes with a bogus length.
+		if !h.mod.Memory().Write(h.scratch, payload) {
+			return nil
+		}
 		r, err := h.fn.Call(ctx, uint64(len(payload)))
 		// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
 		// length is a failure. A 0-length result is a valid EMPTY response, not a
@@ -139,6 +158,10 @@ func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
 		if len(ok) == 0 || uint32(ok[0]) == 0 {
 			return
 		}
+		// handle_signature pushed a signer (§6.5). Pop it on *every* exit path below —
+		// including the defensive get_inner_* early-return — or a stale signer leaks onto
+		// the stack and the next dispatched message runs under its authority (§6.5).
+		defer wasmCall(bs, "pop_signer")
 		ip := wasmCall(bs, "get_inner_ptr")
 		il := wasmCall(bs, "get_inner_len")
 		if len(ip) == 0 || len(il) == 0 {
@@ -148,13 +171,14 @@ func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
 		kp := wr(kn, inner)
 		wasmCall(kn, "dispatch", uint64(kp), uint64(len(inner)))
 		wasmCall(kn, "dealloc", uint64(kp))
-		wasmCall(bs, "pop_signer")
 		return
 	}
 	run(rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL)) // inbound: response dropped
 }
 
-// kernel.call — one handler reaches another (README §4.4).
+// kernel.call — one handler reaches another (README §4.4). Returns the response length,
+// or -1 (^uint32(0)) on every error: blocked name, no scratch, depth exceeded, missing
+// handler / trap, or a response too large for the caller's scratch.
 func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	n := rd(caller.Memory(), nP, nL)
 	if blocked[string(n)] {
@@ -165,13 +189,25 @@ func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	// response would clobber its low memory — refuse rather than corrupt.
 	s, ok := scrOf[caller]
 	if !ok {
-		return 0
+		return ^uint32(0)
 	}
+	// Bound re-entrant recursion (§4.4): two mutually-recursive handlers get a clean -1
+	// here instead of overflowing the Go stack and crashing the whole node.
+	if kcallDepth >= maxCallDepth {
+		return ^uint32(0)
+	}
+	kcallDepth++
+	defer func() { kcallDepth-- }()
+
 	resp := run(n, rd(caller.Memory(), pP, pL))
 	if resp == nil {
-		return 0
+		return ^uint32(0)
 	}
-	caller.Memory().Write(s, resp)
+	// The response must fit the caller's memory at its scratch offset; if it doesn't, write
+	// nothing and return -1 (§4.4) rather than hand back stale bytes under a valid length.
+	if !caller.Memory().Write(s, resp) {
+		return ^uint32(0)
+	}
 	return uint32(len(resp))
 }
 
@@ -258,7 +294,15 @@ func boot() {
 	env.Instantiate(ctx)
 	k := rt.NewHostModuleBuilder("kernel")
 	k.NewFunctionBuilder().WithFunc(kcall).Export("call")
-	k.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32) uint32 { return 0 }).Export("caller")
+	k.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, out uint32) uint32 {
+		// Caller stack is [count u8][len u8][name]… (§8.2); an empty stack is a single 0x00.
+		// Real caller tracking is future work — until then write the empty-stack marker so a
+		// handler that reads caller() gets a valid buffer, not an unwritten one.
+		if !m.Memory().Write(out, []byte{0}) {
+			return ^uint32(0)
+		}
+		return 1
+	}).Export("caller")
 	k.Instantiate(ctx)
 	kn = load(kernelWasm, "kernelmod")
 	bs = load(bootWasm, "bootstrap")
@@ -582,8 +626,15 @@ func main() {
 		fmt.Printf("  ws     listening on :%d\n", wsPort)
 	}
 
-	// The signed bundle: verify + install its modules, capture its guest.
-	fmt.Println("  bundle " + loadBundle(a.bundleDir))
+	// The signed bundle: verify + install its modules, capture its guest. Every invocation
+	// targets a bundle (there is always a --bundle / default dir), so a load error is fatal:
+	// the node has no app to run or serve. Exit non-zero rather than keep serving as a silent
+	// bundle-less relay, which would hide the failure from a driving script (§13.4).
+	bundleResult := loadBundle(a.bundleDir)
+	fmt.Println("  bundle " + bundleResult)
+	if strings.HasPrefix(bundleResult, "ERROR") {
+		os.Exit(1)
+	}
 
 	var g *guestRealm
 	if loaded != nil {
@@ -662,7 +713,13 @@ func main() {
 
 // ── CLI helpers ──────────────────────────────────────────────────────────────
 
-func fatal(stage string, err error) { fmt.Println("ERROR: " + stage + ": " + err.Error()) }
+// fatal reports a startup / one-shot failure and exits non-zero, so a script driving the
+// loader (--put/--get, policy load, identity, network start) sees it. Callers still `return`
+// after for readability; that return is unreachable but harmless.
+func fatal(stage string, err error) {
+	fmt.Println("ERROR: " + stage + ": " + err.Error())
+	os.Exit(1)
+}
 
 func orNone(s string) string {
 	if s == "" {
