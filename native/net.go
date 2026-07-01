@@ -60,19 +60,28 @@ func getU32BE(b []byte, off int) uint32 {
 //
 // onMsg ownership: the read loop hands its onMsg callback a freshly-allocated slice
 // that the callee owns — it is never reused by the reader, so the callee may retain it
-// without copying. Both implementations honor this (tcpChannel allocates per reassembled
-// frame, rawSockChannel per read), so the delivery boundary needs no defensive copy.
+// without copying. Both strategies honor this (framedProto allocates per reassembled
+// frame, rawProto per read), so the delivery boundary needs no defensive copy.
 type rawChannel interface {
 	send(bytes []byte)
 	close()
 }
 
-// ── tcpChannel: length-prefixed frames over a TCP socket ──────────────────────
+// ── sockChannel: the shared connection core (framed or raw) ────────────────────
+//
+// Both wire shapes are the same connection with a swappable strategy: length-framed
+// whole messages (net-link.ts RawChannel over TCP) and a raw byte duplex (the
+// transport under the JS WebSocket codec, which does its own RFC 6455 framing). The
+// subtle parts live here exactly once — the open/dead lifecycle, the pre-connect
+// `pending` buffer with its flush-before-open gate, and the close vs fail split.
+// Only how a single send reaches the wire (proto.writeMsg) and how received bytes
+// become onMsg deliveries (proto.readLoop) differ between the two.
 //
 // The connection may be supplied already-open (an accepted inbound socket) or dialed
 // lazily in the background (an outbound dial): until the dial completes, sends buffer
 // in `pending`, mirroring how a node:net socket queues writes issued before connect.
-type tcpChannel struct {
+type sockChannel struct {
+	proto   proto
 	onMsg   func([]byte)
 	onClose func()
 
@@ -83,10 +92,28 @@ type tcpChannel struct {
 	dead    bool
 }
 
-// newTCPChannelDial returns a channel that connects in the background (the dial
-// path): the caller can send immediately and the bytes flush once connected.
-func newTCPChannelDial(addr string, onMsg func([]byte), onClose func()) *tcpChannel {
-	c := &tcpChannel{onMsg: onMsg, onClose: onClose}
+// proto is the framed-vs-raw wire strategy. framedProto length-prefixes each message
+// and reassembles whole frames on read; rawProto writes bytes verbatim and delivers
+// each socket read as-is (a chunk, not a whole message). Both are zero-size, so the
+// interface values framingFor hands out box without allocating.
+type proto interface {
+	writeMsg(c *sockChannel, bytes []byte) // frame-and-write one send
+	readLoop(c *sockChannel)               // the read loop: socket bytes → onMsg
+}
+
+// framingFor maps sock.go's raw flag to the wire strategy: raw ⇒ bytes verbatim,
+// otherwise length-framed. The returned zero-size value costs no allocation.
+func framingFor(raw bool) proto {
+	if raw {
+		return rawProto{}
+	}
+	return framedProto{}
+}
+
+// newDialChannel returns a channel that connects in the background (the dial path):
+// the caller can send immediately and the bytes flush once connected.
+func newDialChannel(addr string, p proto, onMsg func([]byte), onClose func()) *sockChannel {
+	c := &sockChannel{proto: p, onMsg: onMsg, onClose: onClose}
 	go func() {
 		conn, err := dialTCP(addr)
 		if err != nil {
@@ -102,19 +129,26 @@ func newTCPChannelDial(addr string, onMsg func([]byte), onClose func()) *tcpChan
 		c.conn = conn
 		c.mu.Unlock()
 		c.flushPending() // drain pre-connect sends in order, then open direct writes
-		c.readLoop()
+		c.proto.readLoop(c)
 	}()
 	return c
+}
+
+// newInboundChannel wraps an already-open accepted socket: open from the start with
+// no pending buffer to drain. The caller starts proto.readLoop once the JS channel
+// is registered — see netHost.wrapInbound.
+func newInboundChannel(p proto, conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
+	return &sockChannel{proto: p, onMsg: onMsg, onClose: onClose, conn: conn, open: true}
 }
 
 // flushPending drains the pre-connect buffer in send order, then opens the
 // direct-write path. open stays false until pending is empty under the lock, so a
 // concurrent send() keeps buffering (it never writes) while this goroutine flushes —
 // making the dial goroutine the sole writer right up to the handoff. That ordering
-// guarantee is the point: a later frame must not overtake an earlier buffered one
-// (PeerLink needs its HELLO to land first). Writes stay off the lock so a stuck
-// conn.Write still can't block close().
-func (c *tcpChannel) flushPending() {
+// guarantee is the point: a later message must not overtake an earlier buffered one
+// (PeerLink needs its HELLO to land first; a WS client its upgrade request). Writes
+// stay off the lock so a stuck conn.Write still can't block close().
+func (c *sockChannel) flushPending() {
 	for {
 		c.mu.Lock()
 		if c.dead {
@@ -130,12 +164,12 @@ func (c *tcpChannel) flushPending() {
 		}
 		c.mu.Unlock()
 		for _, b := range pending {
-			c.writeFrame(b)
+			c.proto.writeMsg(c, b)
 		}
 	}
 }
 
-func (c *tcpChannel) send(bytes []byte) {
+func (c *sockChannel) send(bytes []byte) {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
@@ -147,10 +181,58 @@ func (c *tcpChannel) send(bytes []byte) {
 		return
 	}
 	c.mu.Unlock()
-	c.writeFrame(bytes)
+	c.proto.writeMsg(c, bytes)
 }
 
-func (c *tcpChannel) writeFrame(bytes []byte) {
+// socket snapshots the connection and dead flag under the lock — the guard every
+// write path takes before touching the fd (conn may still be nil mid-dial, or already
+// closed by close/fail). The read loop uses it too: it runs only after conn is set,
+// so it can ignore the dead flag.
+func (c *sockChannel) socket() (net.Conn, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn, c.dead
+}
+
+// close is the deliberate teardown: it does NOT fire onClose (the owner asked for
+// it). A fail() racing behind it stays silent because dead is already set — a
+// live-channel error, by contrast, must still reach onClose or the owning PeerLink
+// is never forgotten and the peer is blackholed.
+func (c *sockChannel) close() {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return
+	}
+	c.dead = true
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+// fail is the error teardown: it closes the socket and fires onClose so the owner
+// drops the channel. Idempotent against close() and a second fail() via the dead flag.
+func (c *sockChannel) fail() {
+	c.mu.Lock()
+	if c.dead {
+		c.mu.Unlock()
+		return
+	}
+	c.dead = true
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		conn.Close()
+	}
+	c.onClose()
+}
+
+// ── framedProto: length-prefixed frames — [len u32 BE][bytes] per message ──────
+type framedProto struct{}
+
+func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
 	// Reject an over-cap frame here rather than letting uint32(len(bytes)) silently wrap
 	// (a >4 GiB message would write a truncated length and desync the peer) or shipping a
 	// 16 MiB–4 GiB frame the receiver is hardcoded to reject. The read side treats an
@@ -162,10 +244,7 @@ func (c *tcpChannel) writeFrame(bytes []byte) {
 	}
 	var hdr [4]byte
 	putU32BE(hdr[:], 0, uint32(len(bytes)))
-	c.mu.Lock()
-	conn := c.conn
-	dead := c.dead
-	c.mu.Unlock()
+	conn, dead := c.socket()
 	if dead || conn == nil {
 		return
 	}
@@ -181,45 +260,10 @@ func (c *tcpChannel) writeFrame(bytes []byte) {
 	}
 }
 
-// close is the deliberate teardown: it does NOT fire onClose (the owner asked for
-// it). A fail() racing behind it stays silent because dead is already set — a
-// live-channel error, by contrast, must still reach onClose or the owning PeerLink
-// is never forgotten and the peer is blackholed.
-func (c *tcpChannel) close() {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	conn := c.conn
-	c.mu.Unlock()
-	if conn != nil {
-		conn.Close()
-	}
-}
-
-func (c *tcpChannel) fail() {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	conn := c.conn
-	c.mu.Unlock()
-	if conn != nil {
-		conn.Close()
-	}
-	c.onClose()
-}
-
-func (c *tcpChannel) readLoop() {
+func (framedProto) readLoop(c *sockChannel) {
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 64<<10)
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
+	conn, _ := c.socket()
 	for {
 		n, err := conn.Read(chunk)
 		if n > 0 {
@@ -257,92 +301,11 @@ func (c *tcpChannel) readLoop() {
 	}
 }
 
-// ── rawSockChannel: a raw byte duplex over a TCP socket (no framing) ───────────
-//
-// The transport under the JS WebSocket codec (net-frame.ts), which does its own
-// RFC 6455 framing. Unlike tcpChannel it neither length-prefixes sends nor
-// reassembles reads: send writes bytes verbatim, and each socket read is delivered
-// as-is (a chunk, not a whole message). Dial/teardown semantics mirror tcpChannel,
-// including buffering pre-connect sends so the WS client can write its upgrade
-// request the moment the channel is created.
-type rawSockChannel struct {
-	onMsg   func([]byte)
-	onClose func()
+// ── rawProto: a raw byte duplex — bytes pass through verbatim, no framing ───────
+type rawProto struct{}
 
-	mu      sync.Mutex
-	conn    net.Conn
-	pending [][]byte // sends issued before the background dial connected
-	open    bool
-	dead    bool
-}
-
-// newRawChannelDial returns a raw byte channel that connects in the background;
-// the caller can write immediately and the bytes flush once connected.
-func newRawChannelDial(addr string, onMsg func([]byte), onClose func()) *rawSockChannel {
-	c := &rawSockChannel{onMsg: onMsg, onClose: onClose}
-	go func() {
-		conn, err := dialTCP(addr)
-		if err != nil {
-			c.fail()
-			return
-		}
-		c.mu.Lock()
-		if c.dead { // closed before the dial landed
-			c.mu.Unlock()
-			conn.Close()
-			return
-		}
-		c.conn = conn
-		c.mu.Unlock()
-		c.flushPending() // drain pre-connect writes in order, then open direct writes
-		c.readLoop()
-	}()
-	return c
-}
-
-// flushPending drains the pre-connect buffer in order, then opens the direct-write
-// path — same gate-before-open ordering as tcpChannel.flushPending, so the buffered
-// WS upgrade request can't be overtaken by a later frame.
-func (c *rawSockChannel) flushPending() {
-	for {
-		c.mu.Lock()
-		if c.dead {
-			c.mu.Unlock()
-			return
-		}
-		pending := c.pending
-		c.pending = nil
-		if len(pending) == 0 {
-			c.open = true // pending drained under the lock: future sends write directly
-			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-		for _, b := range pending {
-			c.writeRaw(b)
-		}
-	}
-}
-
-func (c *rawSockChannel) send(bytes []byte) {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	if !c.open {
-		c.pending = append(c.pending, append([]byte(nil), bytes...))
-		c.mu.Unlock()
-		return
-	}
-	c.mu.Unlock()
-	c.writeRaw(bytes)
-}
-
-func (c *rawSockChannel) writeRaw(bytes []byte) {
-	c.mu.Lock()
-	conn, dead := c.conn, c.dead
-	c.mu.Unlock()
+func (rawProto) writeMsg(c *sockChannel, bytes []byte) {
+	conn, dead := c.socket()
 	if dead || conn == nil {
 		return
 	}
@@ -351,41 +314,9 @@ func (c *rawSockChannel) writeRaw(bytes []byte) {
 	}
 }
 
-// close is the deliberate teardown (no onClose); see tcpChannel.close.
-func (c *rawSockChannel) close() {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	conn := c.conn
-	c.mu.Unlock()
-	if conn != nil {
-		conn.Close()
-	}
-}
-
-func (c *rawSockChannel) fail() {
-	c.mu.Lock()
-	if c.dead {
-		c.mu.Unlock()
-		return
-	}
-	c.dead = true
-	conn := c.conn
-	c.mu.Unlock()
-	if conn != nil {
-		conn.Close()
-	}
-	c.onClose()
-}
-
-func (c *rawSockChannel) readLoop() {
+func (rawProto) readLoop(c *sockChannel) {
 	chunk := make([]byte, 64<<10)
-	c.mu.Lock()
-	conn := c.conn
-	c.mu.Unlock()
+	conn, _ := c.socket()
 	for {
 		n, err := conn.Read(chunk)
 		if n > 0 {

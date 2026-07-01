@@ -3,7 +3,7 @@
 // socket, frame whole messages over it, deliver them to JS, send, close. The
 // protocol on top — the PeerLink handshake, routing, request/response — runs as
 // the shared host JS (net-link.ts, net.ts, net-node.ts) over the RawChannel shape
-// this module hands it. It reuses tcpChannel (net.go) for the [len][bytes] framing.
+// this module hands it. It reuses sockChannel (net.go) for the [len][bytes] framing.
 //
 // Bytes cross the Go↔JS boundary only on the event-loop goroutine: socket reader
 // goroutines hand each message to el.post, which the loop delivers into JS via the
@@ -138,12 +138,7 @@ func (n *netHost) alloc() int64 {
 // delivered frame.
 func (n *netHost) dial(addr string, raw bool) int64 {
 	id := n.alloc()
-	var ch rawChannel
-	if raw {
-		ch = newRawChannelDial(addr, n.onMsg(id), n.onClose(id))
-	} else {
-		ch = newTCPChannelDial(addr, n.onMsg(id), n.onClose(id))
-	}
+	ch := newDialChannel(addr, framingFor(raw), n.onMsg(id), n.onClose(id))
 	n.mu.Lock()
 	n.chans[id] = ch
 	n.mu.Unlock()
@@ -208,12 +203,8 @@ func (n *netHost) closeListeners() {
 func (n *netHost) wrapInbound(id int64, conn net.Conn, raw bool) (rawChannel, func()) {
 	// Socket buffers are already set on the listener (pre-bind, via ListenConfig.Control)
 	// and inherited here, so the accepted connection's window scale is sized correctly.
-	if raw {
-		rc := &rawSockChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), conn: conn, open: true}
-		return rc, func() { go rc.readLoop() }
-	}
-	tc := &tcpChannel{onMsg: n.onMsg(id), onClose: n.onClose(id), conn: conn, open: true}
-	return tc, func() { go tc.readLoop() }
+	c := newInboundChannel(framingFor(raw), conn, n.onMsg(id), n.onClose(id))
+	return c, func() { go c.proto.readLoop(c) }
 }
 
 // onMsg/onClose run on a socket reader goroutine; they hand the work to the loop
