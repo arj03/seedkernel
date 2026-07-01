@@ -12,6 +12,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -507,48 +508,22 @@ type cliArgs struct {
 }
 
 func parseCLI() cliArgs {
-	a := cliArgs{bundleDir: "../../seedstore/WASM/bundle", dataDir: "./data", keyPath: "./seedkernel.key", timeoutMs: 2000}
-	f := os.Args[1:]
-	val := func(i *int) string {
-		*i++
-		if *i < len(f) {
-			return f[*i]
-		}
-		return ""
-	}
-	for i := 0; i < len(f); i++ {
-		switch f[i] {
-		case "--policy":
-			a.policyPath = val(&i)
-		case "--dir":
-			a.dataDir = val(&i)
-		case "--key":
-			a.keyPath = val(&i)
-		case "--listen":
-			a.listen = val(&i)
-		case "--ws-listen":
-			a.wsListen = val(&i)
-		case "--peers":
-			a.peers = val(&i)
-		case "--put":
-			a.put = val(&i)
-		case "--get":
-			a.get = val(&i)
-		case "--out":
-			a.out = val(&i)
-		case "--app-config":
-			a.appConfig = val(&i)
-		case "--bundle":
-			a.bundleDir = val(&i)
-		case "--timeout":
-			if n, err := strconv.Atoi(val(&i)); err == nil {
-				a.timeoutMs = n
-			}
-		default:
-			if !strings.HasPrefix(f[i], "--") {
-				a.bundleDir = f[i]
-			}
-		}
+	var a cliArgs
+	flag.StringVar(&a.bundleDir, "bundle", "../../seedstore/WASM/bundle", "bundle directory (also accepted as a positional argument)")
+	flag.StringVar(&a.dataDir, "dir", "./data", "data directory")
+	flag.StringVar(&a.keyPath, "key", "./seedkernel.key", "identity key file")
+	flag.StringVar(&a.policyPath, "policy", "", "policy JSON file (default: permissive, caps-free)")
+	flag.StringVar(&a.listen, "listen", "", "TCP listen address (host:port)")
+	flag.StringVar(&a.wsListen, "ws-listen", "", "WebSocket listen address (host:port)")
+	flag.StringVar(&a.peers, "peers", "", "cohort peers to dial (pk@host:port,…)")
+	flag.StringVar(&a.put, "put", "", "put a file, print its hash, and exit")
+	flag.StringVar(&a.get, "get", "", "get a hash and exit")
+	flag.StringVar(&a.out, "out", "", "output path for --get")
+	flag.StringVar(&a.appConfig, "app-config", "", "app config JSON")
+	flag.IntVar(&a.timeoutMs, "timeout", 2000, "network start timeout (ms)")
+	flag.Parse()
+	if flag.NArg() > 0 {
+		a.bundleDir = flag.Arg(0)
 	}
 	return a
 }
