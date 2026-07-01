@@ -69,6 +69,9 @@ globalThis.onInstall = function (payloadBuf) {
   const cc = p[o++];
   const caps = [];
   for (let i = 0; i < cc; i++) {
+    // Past-the-end check must come first: p[o] would be undefined, making
+    // o + cl NaN — and NaN > length is false, so the next check can't catch it.
+    if (o >= p.length) return;
     const cl = p[o++];
     if (o + cl > p.length) return;
     caps.push(p.slice(o, (o += cl)));

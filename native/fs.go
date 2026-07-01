@@ -253,7 +253,10 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		return t.Context().NewArrayBuffer(b), nil
 	}))
 	o.SetPropertyStr("put", fn(func(t *qjs.This) (*qjs.Value, error) {
-		b, _ := qjs.JsTypedArrayToGo(t.Args()[1])
+		b, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		if err != nil {
+			return nil, err // non-bytes arg throws, like NodeFs — not a silent empty write
+		}
 		if err := fs.put(str(t, 0), b); err != nil {
 			return nil, err // surfaces as a JS exception, like NodeFs writeFileSync
 		}

@@ -145,7 +145,12 @@ func run(n, payload []byte) []byte {
 		}
 		out := make([]byte, int32(r[0]))
 		if len(out) > 0 {
-			b, _ := h.mod.Memory().Read(h.scratch, uint32(len(out)))
+			// A returned length past the module's own memory is as bogus as an
+			// oversized payload above — fail rather than return zero-filled bytes.
+			b, ok := h.mod.Memory().Read(h.scratch, uint32(len(out)))
+			if !ok {
+				return nil
+			}
 			copy(out, b)
 		}
 		return out
@@ -568,6 +573,7 @@ func main() {
 		return
 	}
 	pkHex := pkVal.String()
+	pkVal.Free()
 
 	listenJS, err := jsAddr(a.listen)
 	if err != nil {
@@ -583,7 +589,9 @@ func main() {
 		fatal("network start", err)
 		return
 	}
-	portBytes, err := qjs.JsTypedArrayToGo(mustEval(`__nodePorts()`))
+	portsVal := mustEval(`__nodePorts()`)
+	portBytes, err := qjs.JsTypedArrayToGo(portsVal)
+	portsVal.Free()
 	if err != nil {
 		fatal("ports", err)
 		return
@@ -779,6 +787,11 @@ func loadOrMintKey(keyPath string) (string, error) {
 		if len(skHex) != 128 {
 			return "", fmt.Errorf("--key must hold a 64-byte secret key (hex), got %d chars", len(skHex))
 		}
+		// Validate here: the JS fromHex maps non-hex pairs to 0, so a corrupt key
+		// file would silently boot the node under a different identity.
+		if _, err := hex.DecodeString(skHex); err != nil {
+			return "", fmt.Errorf("--key %s: %w", keyPath, err)
+		}
 		return skHex, nil
 	}
 	v, err := qc.Eval("<mint>", qjs.Code(
@@ -788,6 +801,7 @@ func loadOrMintKey(keyPath string) (string, error) {
 		return "", err
 	}
 	skHex := v.String()
+	v.Free()
 	if err := os.WriteFile(keyPath, []byte(skHex), 0o600); err != nil {
 		return "", err
 	}
