@@ -23,7 +23,40 @@ import (
 // (hex block-ids + a short suffix) satisfy this.
 var fsKeyChars = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-func fsKeySafe(k string) bool { return k != "." && k != ".." && fsKeyChars.MatchString(k) }
+// fsReserved is the case-insensitive set of names Windows resolves to a device before
+// ever touching the filesystem: opening "CON"/"NUL"/"COM1"… (with or without an
+// extension) hits the console/null/serial device, not a file. Since a key becomes a
+// filename verbatim, a compromised guest could otherwise `put` to the console on a
+// Windows holder. Rejected on every OS so the key space — and thus which blocks a node
+// admits and advertises — is identical across Go and Bun nodes.
+var fsReserved = func() map[string]bool {
+	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
+	for i := 0; i <= 9; i++ { // COM0/LPT0 are reserved on current Windows too
+		m[fmt.Sprintf("COM%d", i)] = true
+		m[fmt.Sprintf("LPT%d", i)] = true
+	}
+	return m
+}()
+
+// fsReservedName reports whether k resolves to a Windows device. The stem before the
+// first '.' decides it, since Windows ignores the extension: "NUL.txt" is still NUL.
+func fsReservedName(k string) bool {
+	stem := k
+	if i := strings.IndexByte(stem, '.'); i >= 0 {
+		stem = stem[:i]
+	}
+	return fsReserved[strings.ToUpper(stem)]
+}
+
+func fsKeySafe(k string) bool {
+	return k != "." && k != ".." && fsKeyChars.MatchString(k) && !fsReservedName(k)
+}
+
+// fsTmpPrefix marks the scratch files put() writes before renaming onto a key. It
+// carries a '~', which fsKeyChars forbids, so a temp name can never collide with a real
+// key — and list()/scanUsed() skip it, so an in-flight or crash-orphaned temp is never
+// mistaken for a stored block.
+const fsTmpPrefix = "~put-"
 
 // fsMaxAvailable mirrors fs-node.ts's fallback (Number.MAX_SAFE_INTEGER): a large
 // sentinel for free space, since portable free-disk queries need a syscall per OS
@@ -53,6 +86,10 @@ func (f *nodeFs) scanUsed() (used int64) {
 	entries, _ := os.ReadDir(f.dir)
 	for _, e := range entries {
 		if e.IsDir() {
+			continue
+		}
+		if n := e.Name(); strings.HasPrefix(n, fsTmpPrefix) {
+			os.Remove(filepath.Join(f.dir, n)) // temp write orphaned by an earlier crash; reclaim it
 			continue
 		}
 		if fi, err := e.Info(); err == nil {
@@ -93,7 +130,26 @@ func (f *nodeFs) put(key string, b []byte) error {
 	if fi, err := os.Stat(p); err == nil {
 		old = fi.Size()
 	}
-	if err := os.WriteFile(p, b, 0o644); err != nil {
+	// Write atomically: land the bytes in a temp file, then rename onto the key. os.WriteFile
+	// truncates the key in place, so a crash mid-write would leave a short/corrupt block that
+	// has() still reports as held — the node advertises it, then fails the verification-fetch.
+	// Rename swaps the whole file in one step (atomic within a dir on POSIX; MoveFileEx with
+	// REPLACE_EXISTING on Windows), so a reader only ever sees the old or the complete new
+	// block. A crash can at worst orphan the temp file, which scanUsed reclaims at open. We
+	// skip fsync: the property needed is crash-atomicity of the visible block, not power-loss
+	// durability (a lost block is content-addressed and simply re-fetched), and an fsync per
+	// put would tax the storage hot path.
+	tmp, err := os.CreateTemp(f.dir, fsTmpPrefix+"*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if err := writeTemp(tmp, b); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, p); err != nil {
+		os.Remove(name)
 		return err
 	}
 	if old >= 0 {
@@ -102,6 +158,21 @@ func (f *nodeFs) put(key string, b []byte) error {
 		f.used += int64(len(b))
 	}
 	return nil
+}
+
+// writeTemp fills the freshly-created temp file, restores the 0o644 mode os.WriteFile
+// used before (CreateTemp opens 0o600), and closes it. Every error path closes the
+// handle first so the caller can remove the temp without leaking a descriptor.
+func writeTemp(tmp *os.File, b []byte) error {
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		return err
+	}
+	return tmp.Close()
 }
 
 func (f *nodeFs) size(key string) int {
@@ -128,7 +199,11 @@ func (f *nodeFs) list(prefix string) []string {
 		if e.IsDir() {
 			continue
 		}
-		if n := e.Name(); prefix == "" || strings.HasPrefix(n, prefix) {
+		n := e.Name()
+		if strings.HasPrefix(n, fsTmpPrefix) {
+			continue // an in-flight or crash-orphaned atomic-put temp, not a real key
+		}
+		if prefix == "" || strings.HasPrefix(n, prefix) {
 			out = append(out, n)
 		}
 	}

@@ -91,11 +91,18 @@ func rd(m api.Memory, p, n uint32) []byte { x, _ := m.Read(p, n); return append(
 
 func wr(m api.Module, data []byte) uint32 {
 	r := wasmCall(m, "alloc", uint64(len(data)))
-	if len(r) == 0 {
+	// alloc can fail two ways: the call itself faults (len(r)==0) or it returns a NULL
+	// pointer (r[0]==0) when the module is out of memory. Either is a 0 return here —
+	// writing at address 0 would scribble the module's low memory, and callers key off 0.
+	if len(r) == 0 || r[0] == 0 {
 		return 0
 	}
-	m.Memory().Write(uint32(r[0]), data)
-	return uint32(r[0])
+	p := uint32(r[0])
+	if !m.Memory().Write(p, data) {
+		wasmCall(m, "dealloc", uint64(p)) // hand the block back rather than leak it
+		return 0
+	}
+	return p
 }
 
 func name(canonical string) []byte {
@@ -153,6 +160,9 @@ func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
 	if int32(hid) == -1 { // verify → re-dispatch inner envelope → pop signer (§6.5)
 		payload := rd(km.Memory(), pP, pL)
 		bp := wr(bs, payload)
+		if bp == 0 { // alloc failed — don't run the verifier over a null pointer
+			return
+		}
 		ok := wasmCall(bs, "handle_signature", uint64(bp), uint64(len(payload)))
 		wasmCall(bs, "dealloc", uint64(bp))
 		if len(ok) == 0 || uint32(ok[0]) == 0 {
@@ -169,6 +179,9 @@ func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
 		}
 		inner := rd(bs.Memory(), uint32(ip[0]), uint32(il[0]))
 		kp := wr(kn, inner)
+		if kp == 0 { // alloc failed — the deferred pop_signer still unwinds §6.5 state
+			return
+		}
 		wasmCall(kn, "dispatch", uint64(kp), uint64(len(inner)))
 		wasmCall(kn, "dealloc", uint64(kp))
 		return
@@ -351,6 +364,9 @@ func boot() {
 // dispatch feeds raw envelope bytes into the pipeline (README §3).
 func dispatch(b []byte) {
 	p := wr(kn, b)
+	if p == 0 { // alloc failed — feeding a null pointer to the kernel would dispatch garbage
+		return
+	}
 	wasmCall(kn, "dispatch", uint64(p), uint64(len(b)))
 	wasmCall(kn, "dealloc", uint64(p))
 }

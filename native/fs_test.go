@@ -50,10 +50,13 @@ func TestNodeFsRoundTrip(t *testing.T) {
 }
 
 // Unsafe keys are rejected on write and never resolve on read/delete, so a guest
-// cannot escape the data directory or use a path separator.
+// cannot escape the data directory, use a path separator, or (on a Windows holder)
+// address a reserved device name like CON/NUL/COM1 — case- and extension-insensitively.
 func TestNodeFsRejectsUnsafeKeys(t *testing.T) {
 	fs, _ := newNodeFs(t.TempDir())
-	for _, k := range []string{"", ".", "..", "a/b", "../escape", `a\b`, "a b", "a\x00b"} {
+	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`, "a b", "a\x00b"}
+	unsafe = append(unsafe, "CON", "nul", "Aux", "COM1", "COM0", "LPT9", "con.txt", "NUL.tar.gz")
+	for _, k := range unsafe {
 		if err := fs.put(k, []byte("x")); err == nil {
 			t.Fatalf("put(%q) accepted an unsafe key", k)
 		}
