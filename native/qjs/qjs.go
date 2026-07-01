@@ -57,6 +57,7 @@ type Runtime struct {
 	qjs    uint64 // QJSRuntime*
 	ctxt   *Context
 	reg    *registry
+	fnPool map[string][]api.Function // per-name free list of resolved exports; see call
 }
 
 // registry maps callback ids to Go funcs for the env.jsFunctionProxy dispatcher.
@@ -104,7 +105,7 @@ func (r *Runtime) MemorySize() uint32 { return r.mem.Size() }
 // New instantiates a fresh QuickJS runtime + context.
 func New() (rt *Runtime, err error) {
 	ctx := context.Background()
-	rt = &Runtime{ctx: ctx, reg: newRegistry()}
+	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPool: map[string][]api.Function{}}
 
 	// On any failure — a panic or an error return — after the wazero runtime is
 	// created but before the module is live, close it so a failed New leaks nothing
@@ -223,15 +224,16 @@ func (r *Runtime) Close() {
 // the function is void). Panics on a wasm trap — the loader treats engine faults
 // as fatal, same as the rest of main.go.
 func (r *Runtime) call(name string, args ...uint64) uint64 {
-	// Resolve per call, NOT cached: wazero's api.Function lazily allocates and then
-	// reuses a per-instance execution stack, so a single cached instance corrupts under
-	// re-entrancy (a host import calling back into JS→wasm) — the bridge is re-entrant,
-	// so a fresh instance per call is what keeps nested calls independent.
-	fn := r.mod.ExportedFunction(name)
-	if fn == nil {
-		panic(fmt.Errorf("qjs: missing wasm export %q", name))
-	}
+	// wazero's api.Function lazily allocates and then reuses a per-instance execution
+	// stack, so a single cached instance corrupts under re-entrancy (a host import calling
+	// back into JS→wasm). Resolving fresh per call is correct but pays a map lookup + an
+	// allocation under every engine call. A per-name free list keeps the correctness — each
+	// in-flight (possibly nested) call pops its own instance and returns it after — while
+	// amortizing the resolve so a steady call reuses a pooled instance. Single-threaded
+	// (the Runtime drives from one goroutine), so the pool needs no locking.
+	fn := r.acquireFn(name)
 	res, err := fn.Call(r.ctx, args...)
+	r.releaseFn(name, fn)
 	if err != nil {
 		panic(fmt.Errorf("qjs: call %s: %w", name, err))
 	}
@@ -239,6 +241,27 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 		return 0
 	}
 	return res[0]
+}
+
+// acquireFn hands out a resolved export instance for name: a pooled one if free (so a
+// nested re-entrant call gets a distinct instance from the one in flight), else a freshly
+// resolved one on a miss.
+func (r *Runtime) acquireFn(name string) api.Function {
+	if pool := r.fnPool[name]; len(pool) > 0 {
+		fn := pool[len(pool)-1]
+		r.fnPool[name] = pool[:len(pool)-1]
+		return fn
+	}
+	fn := r.mod.ExportedFunction(name)
+	if fn == nil {
+		panic(fmt.Errorf("qjs: missing wasm export %q", name))
+	}
+	return fn
+}
+
+// releaseFn returns an instance to its free list for a later call to reuse.
+func (r *Runtime) releaseFn(name string, fn api.Function) {
+	r.fnPool[name] = append(r.fnPool[name], fn)
 }
 
 func (r *Runtime) mallocN(n int) uint64 {

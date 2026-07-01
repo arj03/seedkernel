@@ -57,6 +57,11 @@ func getU32BE(b []byte, off int) uint32 {
 // rawChannel delivers whole messages atomically (net-link.ts RawChannel). TCP gets
 // message boundaries from a length prefix; WS already has them. A channel owns one
 // socket and one read goroutine; send is safe from any goroutine.
+//
+// onMsg ownership: the read loop hands its onMsg callback a freshly-allocated slice
+// that the callee owns — it is never reused by the reader, so the callee may retain it
+// without copying. Both implementations honor this (tcpChannel allocates per reassembled
+// frame, rawSockChannel per read), so the delivery boundary needs no defensive copy.
 type rawChannel interface {
 	send(bytes []byte)
 	close()
@@ -155,9 +160,8 @@ func (c *tcpChannel) writeFrame(bytes []byte) {
 		c.fail()
 		return
 	}
-	out := make([]byte, 4+len(bytes))
-	putU32BE(out, 0, uint32(len(bytes)))
-	copy(out[4:], bytes)
+	var hdr [4]byte
+	putU32BE(hdr[:], 0, uint32(len(bytes)))
 	c.mu.Lock()
 	conn := c.conn
 	dead := c.dead
@@ -165,7 +169,14 @@ func (c *tcpChannel) writeFrame(bytes []byte) {
 	if dead || conn == nil {
 		return
 	}
-	if _, err := conn.Write(out); err != nil {
+	// net.Buffers ships the length prefix and the payload with one writev (a single
+	// syscall on a TCPConn), so we neither allocate a 4+len(bytes) frame nor copy the
+	// whole payload to prepend the header — the biggest saving on the 1 MiB upload path.
+	// A TCPConn's fd write lock makes each WriteTo atomic against concurrent sends, so
+	// frames on the same socket still can't interleave. WriteTo consumes the slice header
+	// it's given (advancing/niling entries), so hand it a fresh local; bytes is untouched.
+	iov := net.Buffers{hdr[:], bytes}
+	if _, err := iov.WriteTo(conn); err != nil {
 		c.fail()
 	}
 }

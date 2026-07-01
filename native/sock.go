@@ -220,8 +220,10 @@ func (n *netHost) wrapInbound(id int64, conn net.Conn, raw bool) (rawChannel, fu
 // goroutine, which owns all QuickJS access.
 func (n *netHost) onMsg(id int64) func([]byte) {
 	return func(b []byte) {
-		msg := append([]byte(nil), b...)
-		n.el.post(func() { n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(msg)) })
+		// b is freshly allocated and owned by us (rawChannel onMsg contract), so capture
+		// it directly instead of copying. Dropping that copy removes a full extra pass over
+		// every inbound byte — on a 1 MiB receive, one fewer 1 MiB copy before it reaches JS.
+		n.el.post(func() { n.invoke(n.fnDeliver, n.qc.NewInt64(id), n.qc.NewArrayBuffer(b)) })
 	}
 }
 

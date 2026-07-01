@@ -30,13 +30,36 @@ func fsKeySafe(k string) bool { return k != "." && k != ".." && fsKeyChars.Match
 // and the storage guest only needs a monotone budget signal, not an exact figure.
 const fsMaxAvailable = 1<<53 - 1
 
-type nodeFs struct{ dir string }
+// nodeFs is driven only from the single event-loop goroutine (all JS→Go fs calls land
+// there), so `used` needs no synchronization. It is the live total size of all regular
+// files, seeded by one scan at open and kept current by put/delete so stat() is O(1).
+type nodeFs struct {
+	dir  string
+	used int64
+}
 
 func newNodeFs(dir string) (*nodeFs, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &nodeFs{dir}, nil
+	f := &nodeFs{dir: dir}
+	f.used = f.scanUsed() // one O(N) walk at open; adjusted incrementally thereafter
+	return f, nil
+}
+
+// scanUsed sums the size of every regular file in the data dir — the one full walk, run
+// at open to seed the cached counter.
+func (f *nodeFs) scanUsed() (used int64) {
+	entries, _ := os.ReadDir(f.dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if fi, err := e.Info(); err == nil {
+			used += fi.Size()
+		}
+	}
+	return used
 }
 
 func (f *nodeFs) path(key string) (string, bool) {
@@ -63,7 +86,22 @@ func (f *nodeFs) put(key string, b []byte) error {
 	if !ok {
 		return fmt.Errorf("fs: unsafe key %q", key)
 	}
-	return os.WriteFile(p, b, 0o644)
+	// One stat of this single file (cheap, O(1)) to learn the old size, so `used` tracks
+	// the delta on an overwrite — far cheaper than the O(N) directory walk stat() used to
+	// do on every admission check. New key ⇒ old = -1 ⇒ the whole write counts.
+	old := int64(-1)
+	if fi, err := os.Stat(p); err == nil {
+		old = fi.Size()
+	}
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		return err
+	}
+	if old >= 0 {
+		f.used += int64(len(b)) - old
+	} else {
+		f.used += int64(len(b))
+	}
+	return nil
 }
 
 func (f *nodeFs) size(key string) int {
@@ -102,21 +140,22 @@ func (f *nodeFs) delete(key string) bool {
 	if !ok {
 		return false
 	}
-	return os.Remove(p) == nil
+	sz := int64(-1)
+	if fi, err := os.Stat(p); err == nil {
+		sz = fi.Size()
+	}
+	if os.Remove(p) != nil {
+		return false
+	}
+	if sz > 0 {
+		f.used -= sz
+	}
+	return true
 }
 
-func (f *nodeFs) stat() (used int64) {
-	entries, _ := os.ReadDir(f.dir)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if fi, err := e.Info(); err == nil {
-			used += fi.Size()
-		}
-	}
-	return used
-}
+// stat returns the cached used-bytes total (maintained by put/delete), avoiding the
+// O(N) directory walk the storage guest's per-offer admission check would otherwise pay.
+func (f *nodeFs) stat() int64 { return f.used }
 
 // exposeFs installs the `fs` object into the realm: Go byte primitives (ArrayBuffer
 // in / out) wrapped by a thin JS shim into the host/fs.ts `Fs` shape (Uint8Array,

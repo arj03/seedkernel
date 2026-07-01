@@ -149,3 +149,29 @@ func BenchmarkNodeFsOpenScan(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkNodeFsStat times the used-bytes admission query the storage guest runs per
+// block.offer. The cached counter (maintained by put/delete) makes it O(1) regardless of
+// directory size — the sweep should stay flat, in contrast to BenchmarkNodeFsOpenScan's
+// one-time O(N) open walk that seeds the counter.
+func BenchmarkNodeFsStat(b *testing.B) {
+	for _, n := range []int{1_000, 10_000} {
+		b.Run(fmt.Sprintf("files=%d", n), func(b *testing.B) {
+			fs, err := newNodeFs(b.TempDir())
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i := 0; i < n; i++ {
+				if err := fs.put(fmt.Sprintf("%064x.blk", i), []byte("x")); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ResetTimer()
+			for j := 0; j < b.N; j++ {
+				if fs.stat() != int64(n) { // n files of 1 byte each
+					b.Fatalf("stat used=%d, want %d", fs.stat(), n)
+				}
+			}
+		})
+	}
+}

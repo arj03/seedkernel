@@ -47,6 +47,25 @@ type libsodium struct {
 	// env.ed25519_verify from the main thread, so every op takes this lock. Held
 	// only for the duration of one op — never across a callback into JS or Go.
 	mu sync.Mutex
+
+	// Persistent scratch arena reused across ops (the README reference-host's "pre-allocate
+	// suite scratch once and reuse it"), replacing the 2–4 malloc/free pairs each op made.
+	// Every op is serialized by mu and needs only its own buffers live at once, so one
+	// grow-on-demand block with a per-op bump allocator suffices. Guarded by mu.
+	arena    uint32 // wasm ptr to the scratch block (0 until first grown)
+	arenaCap int    // its size in bytes; grows to the high-water op need, never shrinks
+	bump     int    // next free offset within the arena, rewound to 0 per op
+}
+
+// scratchAlign matches the wasm allocator's alignment, so a bump-allocated buffer sits
+// exactly where a malloc'd one would — keeping libsodium's memory layout identical.
+const scratchAlign = 16
+
+func alignUp(n int) int {
+	if n < 1 {
+		n = 1
+	}
+	return (n + scratchAlign - 1) &^ (scratchAlign - 1)
 }
 
 var sd *libsodium // the process-wide libsodium instance (genesis verify + sodium.*)
@@ -155,14 +174,36 @@ func (s *libsodium) malloc(n int) uint32 {
 
 func (s *libsodium) free(p uint32) { s.fns["free"].Call(ctx, uint64(p)) }
 
-// copyIn allocates a buffer holding b (min 1 byte so the pointer is non-null even
-// for an empty input) and returns its pointer. Free it with free.
-func (s *libsodium) copyIn(b []byte) uint32 {
-	n := len(b)
-	if n == 0 {
+// arenaReset ensures the scratch arena can hold total bytes (growing it once, up front,
+// before any per-op pointer is handed out) and rewinds the bump allocator. Call once at
+// the top of an op with the op's total need — Σ alignUp(each buffer) — then take/takeIn
+// the buffers. Growing only ever happens here, never mid-op, so pointers can't dangle.
+func (s *libsodium) arenaReset(total int) {
+	if total > s.arenaCap {
+		if s.arena != 0 {
+			s.free(s.arena)
+		}
+		s.arena = s.malloc(total)
+		s.arenaCap = total
+	}
+	s.bump = 0
+}
+
+// take sub-allocates n bytes (min 1, scratchAlign-aligned) from the arena at the current
+// bump. The op must have reserved room via arenaReset; take never grows.
+func (s *libsodium) take(n int) uint32 {
+	if n < 1 {
 		n = 1
 	}
-	p := s.malloc(n)
+	off := (s.bump + scratchAlign - 1) &^ (scratchAlign - 1)
+	s.bump = off + n
+	return s.arena + uint32(off)
+}
+
+// takeIn is take plus a copy of b into the sub-allocation (min 1 byte, so an empty input
+// still yields a valid non-null pointer, as the old copyIn did).
+func (s *libsodium) takeIn(b []byte) uint32 {
+	p := s.take(len(b))
 	if len(b) > 0 {
 		s.mem.Write(p, b)
 	}
@@ -196,9 +237,8 @@ func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 func (s *libsodium) hashSha3256(msg []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, out := s.copyIn(msg), s.malloc(32)
-	defer s.free(in)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(msg)) + alignUp(32))
+	in, out := s.takeIn(msg), s.take(32)
 	lo, hi := lenArgs(len(msg))
 	s.call("crypto_hash_sha3256", uint64(out), uint64(in), lo, hi)
 	return s.read(out, 32)
@@ -225,12 +265,9 @@ func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 func (s *libsodium) streamXor(msg, nonce, key []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, np, kp := s.copyIn(msg), s.copyIn(nonce), s.copyIn(key)
-	out := s.malloc(max(len(msg), 1))
-	defer s.free(in)
-	defer s.free(np)
-	defer s.free(kp)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(msg)) + alignUp(len(nonce)) + alignUp(len(key)) + alignUp(len(msg)))
+	in, np, kp := s.takeIn(msg), s.takeIn(nonce), s.takeIn(key)
+	out := s.take(len(msg))
 	lo, hi := lenArgs(len(msg))
 	s.call("crypto_stream_xchacha20_xor", uint64(out), uint64(in), lo, hi, uint64(np), uint64(kp))
 	return s.read(out, len(msg))
@@ -239,10 +276,8 @@ func (s *libsodium) streamXor(msg, nonce, key []byte) []byte {
 func (s *libsodium) signDetached(msg, sk []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, skp, sig := s.copyIn(msg), s.copyIn(sk), s.malloc(64)
-	defer s.free(in)
-	defer s.free(skp)
-	defer s.free(sig)
+	s.arenaReset(alignUp(len(msg)) + alignUp(len(sk)) + alignUp(64))
+	in, skp, sig := s.takeIn(msg), s.takeIn(sk), s.take(64)
 	lo, hi := lenArgs(len(msg))
 	s.call("crypto_sign_detached", uint64(sig), 0 /*siglen_p=NULL*/, uint64(in), lo, hi, uint64(skp))
 	return s.read(sig, 64)
@@ -251,10 +286,8 @@ func (s *libsodium) signDetached(msg, sk []byte) []byte {
 func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sp, in, pkp := s.copyIn(sig), s.copyIn(msg), s.copyIn(pk)
-	defer s.free(sp)
-	defer s.free(in)
-	defer s.free(pkp)
+	s.arenaReset(alignUp(len(sig)) + alignUp(len(msg)) + alignUp(len(pk)))
+	sp, in, pkp := s.takeIn(sig), s.takeIn(msg), s.takeIn(pk)
 	lo, hi := lenArgs(len(msg))
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
 }
@@ -262,9 +295,8 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 func (s *libsodium) signKeypair() (pk, sk []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pkp, skp := s.malloc(32), s.malloc(64)
-	defer s.free(pkp)
-	defer s.free(skp)
+	s.arenaReset(alignUp(32) + alignUp(64))
+	pkp, skp := s.take(32), s.take(64)
 	s.call("crypto_sign_keypair", uint64(pkp), uint64(skp))
 	return s.read(pkp, 32), s.read(skp, 64)
 }
@@ -272,10 +304,8 @@ func (s *libsodium) signKeypair() (pk, sk []byte) {
 func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pkp, skp, sp := s.malloc(32), s.malloc(64), s.copyIn(seed)
-	defer s.free(pkp)
-	defer s.free(skp)
-	defer s.free(sp)
+	s.arenaReset(alignUp(32) + alignUp(64) + alignUp(len(seed)))
+	pkp, skp, sp := s.take(32), s.take(64), s.takeIn(seed)
 	s.call("crypto_sign_seed_keypair", uint64(pkp), uint64(skp), uint64(sp))
 	return s.read(pkp, 32), s.read(skp, 64)
 }
@@ -283,9 +313,8 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 func (s *libsodium) edPkToCurve(edPk []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, out := s.copyIn(edPk), s.malloc(32)
-	defer s.free(in)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(edPk)) + alignUp(32))
+	in, out := s.takeIn(edPk), s.take(32)
 	s.call("crypto_sign_ed25519_pk_to_curve25519", uint64(out), uint64(in))
 	return s.read(out, 32)
 }
@@ -293,9 +322,8 @@ func (s *libsodium) edPkToCurve(edPk []byte) []byte {
 func (s *libsodium) edSkToCurve(edSk []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, out := s.copyIn(edSk), s.malloc(32)
-	defer s.free(in)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(edSk)) + alignUp(32))
+	in, out := s.takeIn(edSk), s.take(32)
 	s.call("crypto_sign_ed25519_sk_to_curve25519", uint64(out), uint64(in))
 	return s.read(out, 32)
 }
@@ -303,10 +331,8 @@ func (s *libsodium) edSkToCurve(edSk []byte) []byte {
 func (s *libsodium) boxSeal(msg, curvePk []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	in, pkp, out := s.copyIn(msg), s.copyIn(curvePk), s.malloc(len(msg)+sealBytes)
-	defer s.free(in)
-	defer s.free(pkp)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(msg)) + alignUp(len(curvePk)) + alignUp(len(msg)+sealBytes))
+	in, pkp, out := s.takeIn(msg), s.takeIn(curvePk), s.take(len(msg)+sealBytes)
 	lo, hi := lenArgs(len(msg))
 	s.call("crypto_box_seal", uint64(out), uint64(in), lo, hi, uint64(pkp))
 	return s.read(out, len(msg)+sealBytes)
@@ -318,12 +344,9 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp, pkp, skp := s.copyIn(ct), s.copyIn(curvePk), s.copyIn(curveSk)
-	out := s.malloc(max(len(ct)-sealBytes, 1))
-	defer s.free(cp)
-	defer s.free(pkp)
-	defer s.free(skp)
-	defer s.free(out)
+	s.arenaReset(alignUp(len(ct)) + alignUp(len(curvePk)) + alignUp(len(curveSk)) + alignUp(len(ct)-sealBytes))
+	cp, pkp, skp := s.takeIn(ct), s.takeIn(curvePk), s.takeIn(curveSk)
+	out := s.take(len(ct) - sealBytes)
 	lo, hi := lenArgs(len(ct))
 	if s.call("crypto_box_seal_open", uint64(out), uint64(cp), lo, hi, uint64(pkp), uint64(skp)) != 0 {
 		return nil, false
