@@ -74,6 +74,9 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
+			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without
+			// another copy. It only queues: the socket write happens on the channel's
+			// writer goroutine, never here on the loop goroutine (net.go writeLoop).
 			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
 				ch.send(b)
 			}

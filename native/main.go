@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -534,6 +535,16 @@ func parseCLI() cliArgs {
 }
 
 func main() {
+	// One P by default: every QuickJS/wasm instruction already runs on the single
+	// event-loop goroutine, so extra Ps serve only the socket goroutines — and cost
+	// idle-P wakeups and cross-CPU migrations on every message. Measured on real
+	// cohorts (each process on dedicated cores): bulk PUT/GET ties the multi-P
+	// default, request round-trip latency halves, and 2–3 Ps — the Go default on a
+	// small VPS, the typical holder box — is the pathological setting (+30–50%,
+	// erratic). An explicit GOMAXPROCS still wins: this is a default, not a cap.
+	if os.Getenv("GOMAXPROCS") == "" {
+		runtime.GOMAXPROCS(1)
+	}
 	a := parseCLI()
 	boot()
 
