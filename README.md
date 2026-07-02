@@ -211,8 +211,6 @@ What a handler **must** internalize:
 
 > **Compute and memory exhaustion are the host's problem.** WebAssembly engines on the JavaScript platform expose no native fuel/timeout mechanism, so this protocol does not specify one. The depth caps (§2.3, §4.4) and the 64 KB envelope limit (§2.2) bound the verify-amplification and recursion vectors, but a single installed handler can still infinite-loop or declare a huge linear memory and OOM the single-threaded host — and a permissive registry (§7.4) multiplies that across many installs. Deployers concerned about runaway handlers should run dispatch in a Worker with a watchdog (for compute) and pre-validate handler bytecode in the installer's policy callback (cap declared memory, forbid unbounded loops/recursion, etc.) before installing. The kernel exposes the call-depth bound (§4.4) but does not bound per-handler execution time or memory footprint.
 
-> **Note.** Signature suite modules (§6.6) are the one exception to the scratch-only memory model. A suite has multi-argument primitives that don't fit the single-buffer scratch model cleanly, so the suite contract uses an explicit `alloc` and pointer arguments. Suite authors are crypto specialists writing thin wrappers around existing libraries; the small extra ceremony is acceptable in that niche.
-
 ### 4.4 Synchronous cross-module calls (`kernel.call`)
 
 `kernel.call` performs a synchronous dispatch to the handler registered for the given `name`. The host wires the two handlers together by copying through their scratch regions:
@@ -234,7 +232,7 @@ What a handler **must** internalize:
 
 **Handlers blocked from `kernel.call`.** Two kinds of handler MUST cause `kernel.call` to return `-1` *before* the target is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers.
 
-1. **State mutators** — handlers that call `kernel.SetHandler`, modify the installer's records, or write to the suite registry. Without the block, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent.
+1. **State mutators** — handlers that call `kernel.SetHandler` or modify the installer's records. Without the block, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent.
 2. **The `signature` wrapper itself** — it does not mutate persistent state, but it pushes a new entry onto the signer stack and re-dispatches. Allowing it via `kernel.call` would let an arbitrary handler reframe the active signer mid-chain and break the "top signer = author" rule.
 
 Blocked handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only queries (`signature.signer`, `installer.lookup`, `installer.caps_of`) remain freely callable.
@@ -308,7 +306,7 @@ Each module is in its own file and can be used standalone — the signature modu
 
 ## 6. The signature module
 
-This is where pluggable signatures live. The signature module maintains a registry of **algorithm suites** identified by `algo_id` and owns the `signature` name — a wrapper format that lets any envelope be signed.
+This is where pluggable signatures live. The signature module dispatches verification to pluggable **algorithm suites** — each an ordinary handler (§6.6) installed at a conventional suite-slot name and selected by `algo_id` — and owns the `signature` name, a wrapper format that lets any envelope be signed.
 
 ### 6.1 Algorithm suite
 
@@ -328,9 +326,9 @@ The signature module needs *something* to verify the very first message. By conv
 - **algo_id 0x0000** = Ed25519 + SHA-3-256
 - It is delivered as a **separate WASM module** (e.g. libsodium compiled to WASM), loaded at boot time.
 - The host trusts it **by hash** — the expected SHA-3-256 hash of the genesis WASM module is the one cryptographic constant in the bootstrap configuration.
-- It can never be removed, but it **can be superseded** for all new messages by registering a new suite (§6.4).
+- It can never be removed, but it **can be superseded** for all new messages by installing a new suite at a different slot (§6.4).
 
-The kernel itself does not know about a genesis suite. The hash is held by the host's bootstrap code, which inserts the suite into the signature module's registry before any messages are dispatched.
+The kernel itself does not know about a genesis suite. The hash is held by the host's bootstrap code, which seeds the suite handler via `SetHandler` at its suite-slot name (§6.4) before any messages are dispatched — exactly like the `signature` handler itself.
 
 During a PQ migration, Ed25519 is typically the **outer** wrapper and the new PQ suite is the **inner** one. See §6.5 (wrapping convention).
 
@@ -363,7 +361,7 @@ flowchart TD
     KERNEL --> NAME{"name == signature?"}
     NAME -->|"yes"| WRAP["Signature module: signature handler"]
     NAME -->|"no"| INNER["Direct handler (unsigned message)"]
-    WRAP --> LOOKUP{"algo_id in registry?"}
+    WRAP --> LOOKUP{"suite handler for algo_id?"}
     LOOKUP -->|"0x0000"| NATIVE["WASM: Ed25519+SHA3-256"]
     LOOKUP -->|"0x0001"| WASM1["WASM: Dilithium+SHA3 (example)"]
     LOOKUP -->|"unknown"| DROP["Drop"]
@@ -374,21 +372,21 @@ flowchart TD
     REDISP --> KERNEL
 ```
 
-Unknown `algo_id`s drop because the suite was never registered (§6.4); only suites in the registry can be verified against.
+Unknown `algo_id`s drop because no handler is installed at that suite slot (§6.4); only installed suites can be verified against.
 
 ### 6.4 Registering new algorithms
 
-Suite modules are not regular kernel handlers — their `verify` / `hash` exports take multi-pointer arguments (§6.6) that don't fit the scratch ABI used by `kernel.call`. Each suite instance lives instead in a **suite registry**, indexed by `algo_id` and held host-side on the signature module's behalf. The signature module reaches suite primitives through a host import that the host dispatches to the right instance.
+A suite is an **ordinary handler** (§6.6): a standard scratch-ABI (§4) WASM module installed at the conventional suite slot `name = hash("seedkernel.signature.suite.v1:" + algo_id_hex)`. There is no suite registry and no separate suite ABI — the signature module reaches a suite by plain `kernel.call` to its slot name, exactly as any handler reaches any other. Multi-argument primitives fit the single-buffer model by length-prefixing (§6.6), the same framing the `signature` wrapper and install payload already use.
 
-The genesis suite is seeded into this registry at bootstrap (§6.2, §10). To add another suite at runtime, send a signed install message targeting the conventional suite slot `hash("seedkernel.signature.suite.v1:" + algo_id_hex)`. The installer recognizes suite-slot names: it runs the same `approveInstall` policy callback as any other install, and on approval — instead of calling `SetHandler` — it asks the host to instantiate the WASM under the suite ABI and place the resulting instance in the registry under `algo_id`. The `(author, bytes_hash, declared_caps, parent)` record is still written to `installations[]` for audit and upgrade lineage; the kernel's handler table never holds a suite.
+The genesis suite is seeded at bootstrap via `SetHandler` at its slot (§6.2, §10), like every other bootstrap handler. To add another suite at runtime, send a signed install message targeting the suite slot for the new `algo_id`. There is nothing special about a suite install: the installer runs the same `approveInstall` policy callback and, on approval, calls `SetHandler(slot_name, instance)` and writes the `(author, bytes_hash, declared_caps, parent)` record to `installations[]` — the identical path as any handler install (§7.2). A suite declares no capabilities; it is pure computation.
 
 The deployer's policy callback (§7.3) governs who may register suites — the same callback that governs every other install. There is no separate "trust for signature.register" path; "may this signer install at the suite slot for `algo_id N`?" is just a policy question. The reference policy's first-install/same-author rule (§7.4) applies: the first installer at a suite slot owns it and is the only author who can replace its WASM later.
 
-Once a new suite is registered, messages signed under it should be wrapped per §6.5: the new suite is the **innermost** signer (the operative authorizer); legacy-suite wrappers go on the outside.
+Once a new suite is installed, messages signed under it should be wrapped per §6.5: the new suite is the **innermost** signer (the operative authorizer); legacy-suite wrappers go on the outside.
 
-**Duplicate registration.** The reference policy's same-author requirement prevents a different signer from replacing a suite once installed. To rotate a suite, deployers allocate a new `algo_id` and install at the new slot. The genesis suite (`algo_id 0x0000`) is seeded into the registry by the host at bootstrap (§10) and cannot be replaced through the installer at all — the installer refuses to overwrite a registry entry it did not place there. Emergency replacement of the genesis suite is a direct host-side write to the registry, like any other host-side intervention.
+**Duplicate registration.** The reference policy's same-author requirement prevents a different signer from replacing a suite once installed. To rotate a suite, deployers allocate a new `algo_id` and install at the new slot. The genesis suite (`algo_id 0x0000`) is seeded by the host at bootstrap (§10) via `SetHandler`, so the reference policy refuses to install over it — its slot has no install record (§7.4, "Slots seeded by `SetHandler` are refused"). Emergency replacement of the genesis suite is a direct host-side `SetHandler`, like any other bootstrap-handler replacement (§10.1).
 
-**Lazy validation.** The signature module does not verify that suite bytes actually implement the suite contract at install time. If the bytes don't export `verify`, the first message signed under that `algo_id` fails verification and drops. This is intentional — schema/interface checking is the installer policy's job if a deployment cares (it can inspect the WASM exports before approving, see §7.3), and the security-relevant path (verify failure → drop) is fail-safe regardless.
+**Lazy validation.** The signature module does not verify that suite bytes actually implement the suite contract at install time. If the bytes don't behave as a suite handler, the first message signed under that `algo_id` fails verification and drops. This is intentional — schema/interface checking is the installer policy's job if a deployment cares (it can inspect the WASM exports before approving, see §7.3), and the security-relevant path (verify failure → drop) is fail-safe regardless.
 
 ### 6.5 Signer stack (signature module internals)
 
@@ -410,19 +408,20 @@ stack while the actual message handler runs: [A, B]   (A pushed first, B on top)
 
 **PQ wrapping convention.** Whichever algorithm is operative MUST be the **innermost** wrapper. A PQ rollout signs PQ first and optionally wraps Ed25519 on top: every layer still has to verify (so a break in either algorithm fails the message), but authorization sits with PQ. Inverting the order would silently downgrade authorization to Ed25519.
 
-### 6.6 Suite WASM contract
+### 6.6 Suite handler contract
 
-A signature-suite module placed in the suite registry (§6.4) MUST export the following. The host calls these exports directly — not via `kernel.call` — when the signature module requests verification through the host's suite-dispatch import. This is the one place in the protocol where a WASM module exposes more than the standard scratch ABI (§4): a suite has multi-argument primitives that don't fit a single-buffer model, so it provides an explicit allocator and pointer arguments instead.
+A suite is a standard scratch-ABI handler (§4): it exports `memory`, `scratch`, and `handle`, reads its input from the scratch region, and writes its response there — no allocator, no pointer arguments, no host-side suite-dispatch import. The signature module invokes it with `kernel.call(suite_slot_name, request)`. The request's first byte selects the operation; multi-argument primitives are length-prefixed into the single buffer, big-endian (§17), exactly like the `signature` wrapper payload (§6.3):
 
-| Export name | WASM signature | Description |
+| Op | Request (at scratch) | Response |
 | --- | --- | --- |
-| `memory` | linear memory | Suite's memory; the host copies pubkey / sig / data into it before calling `verify`. |
-| `verify` | `(i32, i32, i32, i32, i32, i32) → i32` | `(pubkey_ptr, pubkey_len, sig_ptr, sig_len, data_ptr, data_len) → 1 if valid` |
-| `alloc` | `(i32) → i32` | `(size) → ptr` — allocate memory the host writes into before calling `verify` / `hash` |
-| `hash` *(optional)* | `(i32, i32, i32) → i32` | `(data_ptr, data_len, out_ptr) → hash_len` — only used if the host routes id derivation through the suite. The reference host hashes directly via its bundled libsodium (§5.1) and never calls suite `hash`, so genesis suites can omit it; non-genesis suites may export it for hosts that do. |
-| `dealloc` *(optional)* | `(i32) → void` | Counterpart to `alloc`. The reference host pre-allocates suite scratch once and reuses it, so `dealloc` is rarely called; suites may omit it. |
+| `0x00` verify | `[pubkey_len u16][pubkey][sig_len u16][sig][data ..]` | `[valid u8]` (1 = valid, 0 = invalid) |
+| `0x01` hash *(optional)* | `[data ..]` | hash bytes — only used if the host routes id derivation through the suite. The reference host hashes directly via its bundled libsodium (§5.1) and never issues op `0x01`, so genesis suites may reject it; non-genesis suites may implement it for hosts that do. |
 
-The signer-query schema (`signature.signer`) is described in §6.5 — it is exposed by the signature module itself, not by suite modules.
+The `u16` length prefixes accommodate post-quantum suites whose public keys and signatures run to multiple kilobytes (§6.5). The verify request is the `signature` wrapper payload (§6.3) minus its `algo_id`, with the inner envelope as `data`, so the signature module can hand a suite almost exactly the bytes it already parsed.
+
+The one cost versus a bespoke ABI is a single ≤64 KB `memcpy` of `data` into the suite's scratch per verify — negligible against the ~95 µs verify it precedes (§11).
+
+The signer-query schema (`signature.signer`) is described in §6.5 — it is exposed by the signature module itself, not by suite handlers.
 
 ---
 
@@ -480,8 +479,8 @@ When invoked, the installer:
 3. Computes `bytes_hash = genesis_hash(install_payload)` — the hash of the entire install payload, every byte from `seq` through the end of `wasm`. See §7.1 for the rationale (full content commitment, unique per signed install).
 4. Consumes the `seq` and updates the `seq_high_water[(install, signer.pubkey)]` mark in the separate replay table (§7.1, §4.4) — never in the install record. Replays (`seq <= last_seen`) drop here, before any further state mutation.
 5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, wasm, declared_caps, parent, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
-6. For names matching the suite-slot convention (§6.4), instantiates the WASM under the suite ABI (§6.6) and places it in the suite registry under the encoded `algo_id` — `SetHandler` is **not** called. Otherwise instantiates against the standard handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`.
-7. Writes the install record to `installations[name]` (for both paths).
+6. Instantiates the WASM against the standard handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`. Suite installs (§6.4) take this same path — a suite is an ordinary handler at its slot name, with no special-casing.
+7. Writes the install record to `installations[name]`.
 
 The order is deliberate: cheap parse checks first; replay protection before the policy callback (so a denied policy doesn't leave a polluted seq table); the policy callback runs against the *resolved* state (with `bytes_hash` already computed and any existing record fetched), so the policy never has to do that work itself.
 
@@ -545,7 +544,7 @@ The reference policy is one specific way of saying "trust the original author." 
 
 There is no separate revocation cascade. Revocation is something the policy expresses, plus a small mechanism the installer exposes for undoing previous installs.
 
-**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). For ordinary handler installs it clears `installations[name]` and calls `SetHandler(name, null)`. It does **not** clear the `seq_high_water` table (§7.1): the replay high-water marks are tombstone-forever (§4.4), so re-installing at the same name later cannot rewind a signer's sequence. For suite-slot names (§6.4) it clears `installations[name]` and removes the corresponding entry from the suite registry — the kernel handler table is not touched (the slot was never in it). The genesis suite is never installer-managed (its registry entry was placed by the host, not by an install), so `installer.remove` on the genesis slot is a no-op; removing the genesis suite requires a direct host-side write to the registry. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
+**Removing an install.** The installer exposes `installer.remove(name)` as a host-side method (callable by the host directly, not via messages — like `SetHandler`). It clears `installations[name]` and calls `SetHandler(name, null)`. It does **not** clear the `seq_high_water` table (§7.1): the replay high-water marks are tombstone-forever (§4.4), so re-installing at the same name later cannot rewind a signer's sequence. Suite slots (§6.4) are ordinary handler installs and take exactly this path. The genesis suite is never installer-managed (its handler was seeded by the host via `SetHandler`, not by an install), so `installer.remove` on the genesis slot is a no-op; removing the genesis suite requires a direct host-side `SetHandler(name, null)`. Used by operators for emergency cleanup or by message-driven revocation handlers a deployer chooses to add.
 
 **Message-driven revocation.** A deployer who wants signed messages to be able to revoke installs adds a `revoke` handler that:
 
@@ -639,7 +638,7 @@ A "fresh envelope" delivery (via `host.dispatch`) would arrive with an empty cal
 Bootstrap is the host's job, not the kernel's. The host instantiates the kernel and the two modules, then composes the onion.
 
 1. Instantiate the kernel.
-2. Load the genesis signature suite (verified by hash) into the signature module's suite registry.
+2. `SetHandler` for the genesis signature suite handler (verified by hash) at its suite-slot name (§6.4).
 3. `SetHandler` for the `signature` wrapper and the `signature.signer` query handler.
 4. *(Optional — needed for message-driven installation.)* Instantiate the installer and wire `approveInstall(name, author, bytesHash, wasm, caps, parent, existing) => …`. With no installer wired, the deployment is frozen. With it wired but no callback, every install is dropped.
 5. `SetHandler` for `install`, `installer.lookup`, and `installer.caps_of`.
@@ -947,7 +946,7 @@ A signed `chat.text` message arriving at a fully bootstrapped node, traced throu
 1. **Host receives bytes** from the transport, copies them into kernel memory, calls `kernel.dispatch(ptr, len)`.
 2. **Kernel `dispatch`**: `len ≤ 65536` ✓; parse succeeds with `magic=SD`, `version=01`. Look up `handlers[<signature name>]` → found (installed by `SetHandler` at bootstrap). Call `invoke_handler(...)`.
 3. **Host `invoke_handler`** routes to the signature handler, copies the payload into signature module memory, calls `signature.handle_signature(ptr, len)`.
-4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Call `ed25519_verify(pubkey, sig, inner_envelope_bytes)` (host import → libsodium). Verify returns 1. **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
+4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Build the verify request `[0x00][signer_len=32][<keyA>][sig_len=64][sig][inner_envelope_bytes]` and `kernel.call(genesis suite slot, …)`; the reference host services that slot with libsodium's `ed25519_verify`. Response is `[01]` (valid). **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
 5. **Host re-enters the kernel** with the inner bytes: `kernel.dispatch(innerPtr, innerLen)`.
 6. **Kernel `dispatch`** (recursive): parse succeeds, look up `handlers[chat.text@keyA]` → found (installed earlier by the installer). Call `invoke_handler(...)`.
 7. **Host `invoke_handler`** routes to keyA's chat handler WASM instance. Copy payload `"hello, world"` into the chat module's scratch region. Call `chat.handle(12)`.
@@ -979,7 +978,7 @@ The security properties are introduced where they arise (§2.3, §3.1, §4.4, §
 
 **The guest can spend the node's key.** A bundle guest granted the `crypto` domain holds `SIGN` (§13.2) — a raw signing oracle under the node's identity key, by design (the node signs protocol messages on the app's behalf). Two consequences: a malicious-but-admitted app can produce arbitrary signatures attributable to the node, and a node identity key MUST NOT double as a policy `author` key (§13.5), or a crypto-capable guest could mint installs that clear the policy. Keep node identities and author identities disjoint.
 
-**Replay protection is mandatory for mutators, opt-in for apps.** Handlers that mutate kernel-managed state (`install`, suite registration, any deployer-added equivalent) MUST consume a `seq` and enforce a tombstone-forever, canonical-pubkey-keyed high-water mark (§4.4). Ordinary app handlers do not get this automatically: a signed app envelope replayed verbatim re-verifies and re-dispatches, so any handler whose payload causes a meaningful state change MUST add its own `seq` defence (§4.4).
+**Replay protection is mandatory for mutators, opt-in for apps.** Handlers that mutate kernel-managed state (`install`, any deployer-added equivalent) MUST consume a `seq` and enforce a tombstone-forever, canonical-pubkey-keyed high-water mark (§4.4). Ordinary app handlers do not get this automatically: a signed app envelope replayed verbatim re-verifies and re-dispatches, so any handler whose payload causes a meaningful state change MUST add its own `seq` defence (§4.4).
 
 **Signing is opt-in, so capability authority ≠ message authenticity.** A capability check (§8.2) asks "which handler is calling me," not "was the triggering message signed." An unsigned envelope routed to a capable handler still drives that handler's bridge I/O. Handlers whose policy depends on *who* signed MUST consult `signature.signer` and refuse an empty/unauthorized stack themselves; nothing below them enforces it.
 
