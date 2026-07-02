@@ -33,7 +33,7 @@ A reader's-digest mental model; full details follow in §2–§10.
 - **Signing is a wrapper, not a header field.** A signed message is an outer envelope with `name = signature` whose payload carries `(algo_id, signer, sig, inner_envelope)` (§6.3).
 - **Author** — top signer of the current dispatch, read via `kernel.call(signature.signer, …)` (§6.5).
 - **Installer** — holds install records, accepts signed install messages, runs a deployer-supplied policy callback on each (§7).
-- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses first installer at a name; subsequent installs require same author + parent; any capability grant or broadening needs explicit acknowledgement (§7.4).
+- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses first installer at a name; subsequent installs require the same author; any capability grant or broadening needs explicit acknowledgement (§7.4).
 - **Capability** — a declared property of an installation, checked by bridges at I/O time (§8).
 - **Bridges** — `SetHandler`-installed handlers bound to one capability; the only code that performs real I/O (§9).
 - **Bootstrap** — host wires kernel, signature, and (optionally) installer; growth then happens via signed installs (§10).
@@ -94,7 +94,7 @@ This limit applies to the **outermost** envelope on the wire. For signature wrap
 
 The 64 KB limit is a protocol constant, not a per-deployment configuration knob. Keeping it fixed avoids interoperability splits where one node accepts messages another rejects.
 
-**Install messages** (handled by the installer, §7) carry name, capability, and parent metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
+**Install messages** (handled by the installer, §7) carry name and capability metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
 
 ### 2.3 Maximum signature wrapping depth
 
@@ -162,7 +162,7 @@ Most deployments want to install new handlers by sending signed messages, not by
 
 The installer is described in detail in §7. Its surface is two ideas:
 
-- **An install message** binds a `name` to WASM bytes, claiming `(declared_caps, parent)`. The author is the top signer.
+- **An install message** binds a `name` to WASM bytes, claiming `declared_caps`. The author is the top signer.
 - **A policy callback** decides whether to honor each install. The reference policy is in §7.4.
 
 A signed install message reaches the installer exactly like any other signed envelope: the signature wrapper verifies, pushes the signer, and re-dispatches; the kernel routes the inner envelope to `handlers[install]`; the installer runs.
@@ -239,7 +239,7 @@ Blocked handlers run only at top-level dispatch, where the signature wrapper has
 
 The reference host auto-blocks the two bootstrap handlers `signature` and `install`. Deployer-added handlers in either class MUST be marked blocked via `host.blockFromCall(handlerId)` immediately after `host.register`.
 
-**Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(handler, signer.pubkey)]`. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-key-per-handler, lives in a persistent table that is **not** part of any install record (§7.1), and **persists across deny-listing, removal, or other policy changes** (tombstone-forever) — re-admitting (or `installer.remove` + re-installing) a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
+**Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(handler, signer.pubkey)]`. A signed install is self-authenticating and stateless on the wire — its signature stays valid forever, so anyone who has seen the bytes can resend them verbatim; the monotonic high-water mark is what makes the second delivery a no-op. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-key-per-handler, lives in a persistent table that is **not** part of any install record (§7.1), and **persists across deny-listing, removal, or other policy changes** (tombstone-forever) — re-admitting (or `installer.remove` + re-installing) a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
 
 The `signature` wrapper is on the blocklist but consumes no `seq`: it does not act under any signer's authority — it *establishes* the top signer — and its push/pop of the signer stack leaves no persistent state to replay. The two protections target different threats: `seq` cuts off wire replay of authorized mutations; the blocklist cuts off in-pipeline corruption of kernel state.
 
@@ -269,7 +269,7 @@ Modules form an onion: each layer wraps the layers above it and depends only on 
 │   parses install messages        │
 │   runs policy callback           │
 │   holds (author, bytes_hash,     │
-│         caps, parent) records    │
+│         caps) records            │
 ├──────────────────────────────────┤
 │   Signature                      │
 │                                  │
@@ -378,7 +378,7 @@ Unknown `algo_id`s drop because no handler is installed at that suite slot (§6.
 
 A suite is an **ordinary handler** (§6.6): a standard scratch-ABI (§4) WASM module installed at the conventional suite slot `name = hash("seedkernel.signature.suite.v1:" + algo_id_hex)`. There is no suite registry and no separate suite ABI — the signature module reaches a suite by plain `kernel.call` to its slot name, exactly as any handler reaches any other. Multi-argument primitives fit the single-buffer model by length-prefixing (§6.6), the same framing the `signature` wrapper and install payload already use.
 
-The genesis suite is seeded at bootstrap via `SetHandler` at its slot (§6.2, §10), like every other bootstrap handler. To add another suite at runtime, send a signed install message targeting the suite slot for the new `algo_id`. There is nothing special about a suite install: the installer runs the same `approveInstall` policy callback and, on approval, calls `SetHandler(slot_name, instance)` and writes the `(author, bytes_hash, declared_caps, parent)` record to `installations[]` — the identical path as any handler install (§7.2). A suite declares no capabilities; it is pure computation.
+The genesis suite is seeded at bootstrap via `SetHandler` at its slot (§6.2, §10), like every other bootstrap handler. To add another suite at runtime, send a signed install message targeting the suite slot for the new `algo_id`. There is nothing special about a suite install: the installer runs the same `approveInstall` policy callback and, on approval, calls `SetHandler(slot_name, instance)` and writes the `(author, bytes_hash, declared_caps)` record to `installations[]` — the identical path as any handler install (§7.2). A suite declares no capabilities; it is pure computation.
 
 The deployer's policy callback (§7.3) governs who may register suites — the same callback that governs every other install. There is no separate "trust for signature.register" path; "may this signer install at the suite slot for `algo_id N`?" is just a policy question. The reference policy's first-install/same-author rule (§7.4) applies: the first installer at a suite slot owns it and is the only author who can replace its WASM later.
 
@@ -438,7 +438,6 @@ installations[name] → {
   author:         (algo_id, pubkey)
   bytes_hash:     content hash of this install (the entire install payload)
   declared_caps:  list of cap_ids the handler may reach via bridges
-  parent:         bytes_hash this install claims to supersede (empty if none)
 }
 ```
 
@@ -450,7 +449,7 @@ seq_high_water[(handler, signer.pubkey)] → u32   // canonical-pubkey-keyed; se
 
 It lives apart because the §4.4 replay counter must be **tombstone-forever**: `installer.remove` (§7.5) clears `installations[name]`, but it MUST NOT touch `seq_high_water`, or removing and re-admitting the same key would rewind `seq` to zero and let pre-removal wire messages replay. The separation is also structurally necessary — the `install` handler is `SetHandler`-seeded and so has *no* row in `installations[]` (it is invisible to the installer's own tables), so the installer's own replay counter cannot live in a per-name install record in the first place.
 
-`bytes_hash` is the genesis-suite hash (§6.2) of the **entire install payload** — `seq`, `name`, declared caps, claimed parent, and the WASM body. The installer computes it directly from the inbound bytes; sender claims are never trusted. Hashing the whole payload makes `bytes_hash` a unique identifier for that specific signed install message: two republishes of the same content at different `seq` values produce distinct hashes, so a `parent` claim always points at exactly one historical wire message rather than at "any of N messages with the same content." Because `parent` is itself inside the hashed region, each version's `bytes_hash` transitively commits to its predecessor, and a name's current `bytes_hash` is in effect a Merkle root over its entire lineage. `parent` is metadata — the installer records it but does not require the parent bytes_hash to currently be installed (lineage chains are auditable from the bytes, not enforced at install time). The chain is singly-linked: only the immediate predecessor is recorded, so the deeper history is reconstructed by walking past install messages, not from the current record alone.
+`bytes_hash` is the genesis-suite hash (§6.2) of the **entire install payload** — `seq`, `name`, declared caps, and the WASM body. The installer computes it directly from the inbound bytes; sender claims are never trusted. Because `seq` is inside the hashed region, `bytes_hash` is unique to that specific signed install message. It is the content identifier a content-hash allowlist policy (§7.3) matches against, and the value `installer.lookup` returns (§7.6).
 
 `SetHandler`-installed handlers have **no row** in this table. The capability index for them is therefore empty (§8.3), and they have no author of record. The host owns whatever metadata it cares about.
 
@@ -465,12 +464,10 @@ install payload:
   name:          var bytes                         (the name to bind)
   caps_count:    1 byte                            (0 = no capabilities requested)
   caps:          caps_count × [cap_id_len u8][cap_id: var bytes]
-  parent_len:    1 byte                            (0 = no claimed predecessor)
-  parent:        var bytes                         (parent_len bytes; predecessor's bytes_hash)
   wasm:          remainder
 ```
 
-A `caps_count` of `0` means the handler is pure computation — no bridge access of any kind. `cap_id` is opaque to the installer; by convention `hash("seedkernel.cap.v1:" + name)` using the genesis suite's hash. A `parent_len` of `0` means the install does not claim a predecessor — typical for the first version of a handler at a new name. When non-zero, `parent` is exactly the predecessor install's recorded `bytes_hash` — the genesis-suite hash (§6.2) of that earlier install's full payload (see §7.1 for what the hash covers) — and `parent_len` is the genesis suite's hash output length (32 bytes for the default SHA-3-256 suite). Senders typically obtain it by reading the `bytes_hash` field from an `installer.lookup` response (§7.6); the reference policy's `existing.bytes_hash == parent` check is byte-for-byte equality on those hash bytes, so a mismatched length is a guaranteed drop.
+A `caps_count` of `0` means the handler is pure computation — no bridge access of any kind. `cap_id` is opaque to the installer; by convention `hash("seedkernel.cap.v1:" + name)` using the genesis suite's hash.
 
 When invoked, the installer:
 
@@ -478,7 +475,7 @@ When invoked, the installer:
 2. Parses the payload. Drop on malformed.
 3. Computes `bytes_hash = genesis_hash(install_payload)` — the hash of the entire install payload, every byte from `seq` through the end of `wasm`. See §7.1 for the rationale (full content commitment, unique per signed install).
 4. Consumes the `seq` and updates the `seq_high_water[(install, signer.pubkey)]` mark in the separate replay table (§7.1, §4.4) — never in the install record. Replays (`seq <= last_seen`) drop here, before any further state mutation.
-5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, wasm, declared_caps, parent, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
+5. Calls the deployer-supplied **policy callback** `approveInstall(name, author, bytes_hash, wasm, declared_caps, existing_record_or_null) → bool`. If no callback is wired or it returns false, drop. With no callback wired, every install is dropped — installation is opt-in for the deployment.
 6. Instantiates the WASM against the standard handler ABI (§4) and calls `SetHandler(name, instantiatedHandler)`. Suite installs (§6.4) take this same path — a suite is an ordinary handler at its slot name, with no special-casing.
 7. Writes the install record to `installations[name]`.
 
@@ -493,7 +490,6 @@ The callback is the entire authorization story. It receives everything relevant:
 - `bytes_hash` — the content hash of the WASM about to be installed
 - `wasm` — the raw WASM bytes. Pre-approved binaries match against `bytes_hash` cheaply; inspection-based policies (e.g. structural validation, instruction-set filtering, export-table checks for suites) get the bytes directly without re-hashing.
 - `declared_caps` — the capabilities the handler claims it needs
-- `parent` — the predecessor this install claims (empty if none)
 - `existing_record_or_null` — the current installation at `name`, if any
 
 It returns `true` to proceed with the install or `false` to drop. That is the full interface.
@@ -501,7 +497,7 @@ It returns `true` to proceed with the install or `false` to drop. That is the fu
 Deployers wire whatever policy fits their environment. Some examples:
 
 - **Open registry.** `return true;` — anyone may install at any name *with any capabilities*. Because the install path is the same `host.dispatch` that handles remote peer frames (§12), this is remote installation of arbitrary WASM with arbitrary capability acquisition — effectively remote code execution with full I/O reach, not just a name-squatting risk. Useful only for local testing; never appropriate for a deployment exposed to untrusted senders.
-- **Reference policy.** `(existing == null ? deployer_first_install(...) : author == existing.author && existing.bytes_hash == parent) && caps_acknowledged(...)` — author/parent gate plus a capability-acknowledgement gate; see §7.4.
+- **Reference policy.** `(existing == null ? deployer_first_install(...) : author == existing.author) && caps_acknowledged(...)` — author gate plus a capability-acknowledgement gate; see §7.4.
 - **Content-hash allowlist.** `return bytes_hash ∈ approved_hashes;` — only pre-audited binaries.
 
 Other common patterns: fixed author allowlists, M-of-N quorums (requires reading the full signer stack via `signature.signer`), and capability-restricted authors (`declared_caps ⊆ allowed_caps[author]`).
@@ -516,29 +512,29 @@ The reference installer ships with a default policy that is easy to explain. It 
    - An author allowlist (closed registry — only specified keys may claim new names).
    - A naming-convention check (e.g. names must be of the form `hash(canonical || author_pubkey)`, structurally proving the author claimed the name for themselves).
    - `return true` (open registry). **Read the warning in §7.3 before using this** — combined with the fact that the same `host.dispatch` path carries remote peer frames and `install` messages (§12), an unconditional first-install policy is not merely name-squatting: it is remote installation of arbitrary WASM that can declare *any* capability, i.e. remote code execution with full I/O reach.
-2. **Subsequent install at the same name:** the install must be signed by the existing author and must claim the current `bytes_hash` as its parent:
+2. **Subsequent install at the same name:** the install must be signed by the existing author:
    ```
-   author == existing.author && existing.bytes_hash == parent
+   author == existing.author
    ```
 
-   The strict `parent == existing.bytes_hash` form is the reference choice, not a protocol requirement. Every install flows through `approveInstall`, so a deployer who wants to permit gaps — accepting any ancestor in the name's lineage so a node that missed an intermediate install can still upgrade, or skipping the parent check entirely — encodes that in the callback. The lineage stays signed-and-auditable either way; the policy decides how tight the parent claim has to be.
+   This is the reference choice, not a protocol requirement. Every install flows through `approveInstall`, so a deployer who wants stricter update control — a quorum, or an explicit acknowledgement on every update — encodes it in the callback.
 3. **Capability acknowledgement (both paths).** Passing rules 1–2 establishes *who* may bind the name; it does not by itself grant *capabilities*. The reference policy treats any capability grant as requiring explicit acknowledgement:
    - An install that declares **no capabilities** (`caps_count == 0`, §7.2) is pure computation and is auto-accepted once rule 1 or 2 passes — there is nothing to escalate.
    - An install whose `declared_caps` is a subset of the existing record's `declared_caps` (same author re-publishing or narrowing) is auto-accepted — capabilities only ever shrink.
-   - An install that **adds or broadens** a capability — a first install requesting any cap, or an upgrade whose `declared_caps` is not a subset of `existing.declared_caps` — is held for an explicit operator/user acknowledgement (the reference wiring exposes an `acknowledgeCaps(name, author, added_caps)` hook) and is dropped if not acknowledged. This is what closes the silent-escalation gap: a handler installed with `caps=[]` cannot upgrade itself to `caps=[net, fs]` just by being the same author with the right parent.
+   - An install that **adds or broadens** a capability — a first install requesting any cap, or an upgrade whose `declared_caps` is not a subset of `existing.declared_caps` — is held for an explicit operator/user acknowledgement (the reference wiring exposes an `acknowledgeCaps(name, author, added_caps)` hook) and is dropped if not acknowledged. This is what closes the silent-escalation gap: a handler installed with `caps=[]` cannot upgrade itself to `caps=[net, fs]` just by being the same author.
 
    A deployment that prefers maximal caution can require acknowledgement of *every* update, not only capability-broadening ones; the hook sees enough to make that choice. The point of the default is that capability changes are never silent.
 
 These rules give you everything you'd usually want without any extra machinery:
 
 - **Squat-resistant.** Once an author has bound a name, no one else can take it over — their install fails rule 2.
-- **Upgrades just work.** The author installs a new version, sets `parent = current_bytes_hash`, signs with the same key. If the new version keeps the same capabilities (or fewer), the binding updates in place with no further interaction; an upgrade that broadens capabilities additionally needs the acknowledgement from rule 3 before it lands.
-- **Lineage is verifiable.** The chain of `parent → previous bytes_hash` across a name's history is a singly-linked, signed hash chain. Given the full series of install messages, anyone can walk it from the current version back to genesis. A node that never saw an intermediate install lacks the bytes_hash of that link and cannot bridge past the gap on its own — it sees only the current record's immediate parent.
-- **Forks are explicit and non-hostile.** Anyone may install their own fork at a *different* name with `parent = your_bytes_hash`. The chain shows the relationship; no one had to assert anything special.
+- **Upgrades just work.** The author installs a new version and signs it with the same key. If the new version keeps the same capabilities (or fewer), the binding updates in place with no further interaction; an upgrade that broadens capabilities additionally needs the acknowledgement from rule 3 before it lands.
 - **Delegation is just an upgrade.** To hand a name over, the current author installs a new version whose handler treats some other key as the relevant authority going forward, and (optionally) the installer records the new author. The kernel doesn't care; the install record is the source of truth.
 - **Slots seeded by `SetHandler` are refused.** If there is no record for `name` but `kernel.handlers[name]` is non-null, the slot was seeded via host-side `SetHandler` (a bootstrap entry like the signature handler). The installer refuses to overlay it. To replace such a slot, the host uses `SetHandler` directly.
 
 The reference policy is one specific way of saying "trust the original author." Deployments with different needs — quorum-controlled production registries, content-hash allowlists, delegation hierarchies — replace `firstInstallPolicy` or the whole callback. Everything else in the system behaves the same.
+
+**Design note: install state is a register, not a log.** The install payload deliberately carries no backlink to its predecessor — no `parent` hash chaining a name's versions together. Backlinks earn their keep in systems that replicate *history* through untrusted intermediaries — [Secure Scuttlebutt](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` link, [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s backlink/lipmaa links — where the chain verifies a log segment as complete and in-order and makes equivocation provable. Both properties require an observer that *stores* history; `installations[name]` holds only the current record, so a chain here would have no verifier. `seq` (§4.4) already provides everything a backlink could enforce — replay protection and per-signer ordering, the role SSB's sequence number plays — and fork *detection* is structurally impossible for a component that never holds two versions at once. A backlink would also invite a compare-and-swap policy (upgrade only if the claimed parent matches the current `bytes_hash`), which hurts convergence: a node that missed one intermediate install is wedged out of every later upgrade, and partition-induced divergence — which last-writer-wins-by-`seq` heals at the next install — becomes permanent. A deployment that wants verifiable lineage or equivocation-proofs should log the install messages themselves in a replicated append-only log (Bamboo is the design to borrow: entries commit to a payload hash, keeping the log small) and feed the installer from it. The lineage then lives where it can be verified, and the installer stays a register.
 
 ### 7.5 Revocation
 
@@ -568,7 +564,7 @@ The installer exposes read-only queries via `kernel.call`:
 
 | Name | Payload | Response |
 | --- | --- | --- |
-| `installer.lookup` | `[name_len u8][name ..]` | `[0]` if not installed, else `[1] [algo_id u16][pubkey_len u16][pubkey ..] [hash_len u8][bytes_hash ..] [parent_len u8] [parent_hash ..]` (`parent_len = 0` means no parent). Clients constructing upgrade installs read `bytes_hash` from this response to fill in their `parent`. |
+| `installer.lookup` | `[name_len u8][name ..]` | `[0]` if not installed, else `[1] [algo_id u16][pubkey_len u16][pubkey ..] [hash_len u8][bytes_hash ..]`. |
 | `installer.caps_of` | `[name_len u8][name ..]` | `[count u8] [cap_id_len u8][cap_id ..]*` — declared caps; `[0]` for unknown or `SetHandler`-installed slots |
 
 These are the standard surface bridges and app modules use to read installer state. The mutating handler (`install`) is on the `kernel.call` blocklist (§4.4); the queries above are not.
@@ -583,7 +579,7 @@ Capabilities are a property of *installed handlers*. The installer records them 
 
 `declared_caps` rides along with every install (§7.2). It is set once when the policy callback approves and cleared when the install is removed. The policy is the only place where "should this handler be allowed to claim these caps?" is decided — the same callback that decides "should this install be honored at all?" sees the cap list and can refuse on that basis.
 
-A handler that wants additional caps later must reinstall (under the reference policy, that means: the same author signs a new install at the same name with the larger cap list, claiming the current bytes_hash as a parent). The reference policy does not grant the broadened caps silently — a same-author, correct-parent upgrade that *adds or broadens* a capability is held for explicit acknowledgement before it lands (§7.4 rule 3), while an install that requests no new caps applies automatically.
+A handler that wants additional caps later must reinstall (under the reference policy, that means: the same author signs a new install at the same name with the larger cap list). The reference policy does not grant the broadened caps silently — a same-author upgrade that *adds or broadens* a capability is held for explicit acknowledgement before it lands (§7.4 rule 3), while an install that requests no new caps applies automatically.
 
 ### 8.2 Bridge check pattern
 
@@ -640,7 +636,7 @@ Bootstrap is the host's job, not the kernel's. The host instantiates the kernel 
 1. Instantiate the kernel.
 2. `SetHandler` for the genesis signature suite handler (verified by hash) at its suite-slot name (§6.4).
 3. `SetHandler` for the `signature` wrapper and the `signature.signer` query handler.
-4. *(Optional — needed for message-driven installation.)* Instantiate the installer and wire `approveInstall(name, author, bytesHash, wasm, caps, parent, existing) => …`. With no installer wired, the deployment is frozen. With it wired but no callback, every install is dropped.
+4. *(Optional — needed for message-driven installation.)* Instantiate the installer and wire `approveInstall(name, author, bytesHash, wasm, caps, existing) => …`. With no installer wired, the deployment is frozen. With it wired but no callback, every install is dropped.
 5. `SetHandler` for `install`, `installer.lookup`, and `installer.caps_of`.
 6. *(Optional.)* `SetHandler` for I/O bridges (`net.send`, `ui.write`, `fs.read`, …). Bridges are native host code, each bound to one capability.
 7. *(Optional.)* App modules (chat, …) arrive after this point as signed install messages — no further host wiring needed.
@@ -705,7 +701,7 @@ Chat is the simplest possible app module: a single handler installed at a `chat.
 
 `WASM/browser/chat-shell.html` is a runnable end-to-end demo of the whole stack: a browser shell that owns only the kernel, the signature module, the installer, a WebRTC transport (`RtcNetwork`, `host/net-rtc.ts`, §13.7), and a sandboxed iframe — every byte of chat UI and logic arrives as a signed WASM artifact installed at runtime.
 
-On load it generates an Ed25519 identity, instantiates `kernel.wasm` + the signature/installer module, and wires a permissive first-install policy that approves installs signed by the local identity. The user then picks a chat app from a dropdown (`v1 — text only`, `v2 — text + image + nick`), the shell signs the corresponding WASM artifact under the local key, sends it to the installer, and the policy callback approves it — the same pipeline the protocol describes for any signed install. Upgrading from v1 to v2 is an install at the same name with `parent = v1_bytes_hash`, signed by the same key — the reference policy approves it without further intervention.
+On load it generates an Ed25519 identity, instantiates `kernel.wasm` + the signature/installer module, and wires a permissive first-install policy that approves installs signed by the local identity. The user then picks a chat app from a dropdown (`v1 — text only`, `v2 — text + image + nick`), the shell signs the corresponding WASM artifact under the local key, sends it to the installer, and the policy callback approves it — the same pipeline the protocol describes for any signed install. Upgrading from v1 to v2 is an install at the same name, signed by the same key — the reference policy approves it without further intervention.
 
 Peers connect over a WebRTC mesh provided by `RtcNetwork` (`host/net-rtc.ts`, §13.7) — the same relay-signaled, perfect-negotiation fabric the storage demo uses, here consumed directly for fire-and-forget `send`. A signaling relay (`scripts/relay.mjs`), configured from the **Network** tab, is only the rendezvous for the SDP/ICE exchange and can be killed once data channels are open. `RtcNetwork` hands every authenticated inbound frame to `host.dispatch`: the signature verifies against the peer's pubkey, and the inner `chat.text` (or v2 name) envelope routes to the installed handler. A `Start call` button additionally publishes audio/video tracks over the same `RTCPeerConnection`s, rendered as per-peer tiles above the chat UI; a network change kicks an ICE restart (`RtcNetwork.restartAllIce`) so a transient drop recovers without a manual reconnect.
 
@@ -805,7 +801,7 @@ manifest.bundle     the signed manifest envelope (below)
 - **Version coherence.** Installs are per-name and independent; nothing in §7 says "codec at hash X, reputation at hash Y, and guest at hash Z together constitute app v1.2." The manifest is the author's signed statement of the coherent set — without it a node can hold a mix of individually-valid module versions that were never meant to run together.
 - **Operator/author separation.** The shell is one fixed, auditable artifact; the app arrives as content signed by a third-party key the operator's policy admits. Verification is channel-independent: a bundle read from a USB stick verifies exactly like one fetched from a mirror or, later, pushed over a relay.
 
-A bundle adds **no second install mechanism**: its module installs are ordinary §7.2 envelopes dispatched verbatim, so the installer re-runs the same signature, policy, replay (`seq`), and lineage checks as for any wire install. "Push the app over the relay later" is the same `.install` envelopes, sent rather than read from disk.
+A bundle adds **no second install mechanism**: its module installs are ordinary §7.2 envelopes dispatched verbatim, so the installer re-runs the same signature, policy, and replay (`seq`) checks as for any wire install. "Push the app over the relay later" is the same `.install` envelopes, sent rather than read from disk.
 
 **Manifest envelope.** `[author_pk: 32 bytes][sig: 64 bytes][manifest: UTF-8 JSON to end]` — an Ed25519 detached signature over the JSON bytes. There is deliberately no canonical-JSON step: the envelope carries the exact bytes that were signed, and the verifier parses exactly the bytes it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
 
@@ -824,7 +820,7 @@ A bundle adds **no second install mechanism**: its module installs are ordinary 
 
 1. Read `manifest.bundle` and verify the envelope signature. Invalid ⇒ reject; nothing has landed.
 2. Require `author_pk` to be in the policy's `authors` (§13.5).
-3. For each manifest module, in order: read the `.wasm` and require `genesisHash(bytes) == hash` (mismatch ⇒ reject); dispatch the `.install` envelope through the normal pipeline, where the installer independently re-verifies the signature and re-runs policy, `seq`, and lineage (§7.2); then record whether `kernelName` is now registered. A module whose install the policy refuses does not abort the load — the loader reports which modules registered, and the operator decides.
+3. For each manifest module, in order: read the `.wasm` and require `genesisHash(bytes) == hash` (mismatch ⇒ reject); dispatch the `.install` envelope through the normal pipeline, where the installer independently re-verifies the signature and re-runs policy and `seq` (§7.2); then record whether `kernelName` is now registered. A module whose install the policy refuses does not abort the load — the loader reports which modules registered, and the operator decides.
 4. Read the guest source and require `genesisHash(utf8) == guest.hash` (mismatch ⇒ reject).
 5. Only now may the guest run (§13.8): a realm (§13.3) over a cap-bridge restricted to `caps`' op set, loaded with `op preamble ‖ const APP = merge(manifest.config, operator config) ‖ guest source`.
 
@@ -832,7 +828,7 @@ A bundle adds **no second install mechanism**: its module installs are ordinary 
 
 **Operator config wins.** The shell merges the operator's `--app-config` *over* the manifest's `config` before injection. The split is intentional: the author-signed `config` carries content-structural constants (a storage app's k/m/blockSize), the operator's carries per-node policy (a quota). The merge is opaque — the shell never inspects a key — which also means the operator can override a structural constant. That is consistent with the trust model (the operator's host *is* the TCB, §15), but bundle authors should not assume their `config` reaches the guest unmodified.
 
-**What the manifest does not give: freshness.** It carries no `seq` and no parent lineage — `version` is a label, not a protocol. Module installs are individually replay-protected (§4.4), but the *guest* is loaded wholesale from the directory at every boot: feeding a node an older signed bundle directory is a downgrade the bundle format itself does not detect. Today the bundle path is operator-controlled local input, so this is the same trust as the rest of the host; a future relay-delivery path MUST add a freshness rule (e.g. monotonic version per `(author, app)`) before accepting bundles from the wire. See §15.
+**What the manifest does not give: freshness.** It carries no `seq` and no monotonic version — `version` is a label, not a protocol. Module installs are individually replay-protected (§4.4), but the *guest* is loaded wholesale from the directory at every boot: feeding a node an older signed bundle directory is a downgrade the bundle format itself does not detect. Today the bundle path is operator-controlled local input, so this is the same trust as the rest of the host; a future relay-delivery path MUST add a freshness rule (e.g. monotonic version per `(author, app)`) before accepting bundles from the wire. See §15.
 
 ### 13.5 The policy file
 
@@ -974,7 +970,7 @@ The security properties are introduced where they arise (§2.3, §3.1, §4.4, §
 
 **The channel handshake authenticates, but is not an AKE.** §13.6's AUTH signature covers the full transcript — both pubkeys and both nonces, canonically ordered — so a node that is induced to sign (the signing-oracle setup) produces a signature bound to *that* exchange's identities, useless for impersonating it on any other connection. Frame attribution on a `PeerLink` is therefore sound against impersonation and misattribution. What the handshake still does **not** provide is a session key: it proves who the far end was at handshake time, but the frames that follow are neither encrypted nor individually authenticated (§13.6), so an attacker who can hijack or inject into the live TCP stream after authentication can still read and forge frames. When the threat model includes active in-path network attackers, run `PeerLink` inside an encrypted, mutually-authenticated tunnel (TLS, Noise).
 
-**Bundle freshness.** A manifest has no `seq` and no lineage (§13.4): an older signed bundle directory re-loads in full, guest included — a downgrade the format does not detect. This is acceptable while bundles are operator-supplied local input (the operator is the TCB), but a wire-delivery path must add a monotonicity rule — e.g. monotonic version per `(author, app)` — before accepting bundles from peers.
+**Bundle freshness.** A manifest has no `seq` and no monotonic version (§13.4): an older signed bundle directory re-loads in full, guest included — a downgrade the format does not detect. This is acceptable while bundles are operator-supplied local input (the operator is the TCB), but a wire-delivery path must add a monotonicity rule — e.g. monotonic version per `(author, app)` — before accepting bundles from peers.
 
 **The guest can spend the node's key.** A bundle guest granted the `crypto` domain holds `SIGN` (§13.2) — a raw signing oracle under the node's identity key, by design (the node signs protocol messages on the app's behalf). Two consequences: a malicious-but-admitted app can produce arbitrary signatures attributable to the node, and a node identity key MUST NOT double as a policy `author` key (§13.5), or a crypto-capable guest could mint installs that clear the policy. Keep node identities and author identities disjoint.
 
