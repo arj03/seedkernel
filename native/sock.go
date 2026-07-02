@@ -304,7 +304,10 @@ const netShimJS = `
     listeners.set(bound, (id) => onAccept(makeRawStream(id)));
     return bound;
   };
-  globalThis.netCloseListeners = () => N.closeListeners();
+  // Teardown closes every bound listener in Go, so every accept closure here is
+  // stale — clear them too, or they pin their onAccept graphs for the process
+  // lifetime in a long-lived holder that re-serves.
+  globalThis.netCloseListeners = () => { N.closeListeners(); listeners.clear(); };
   globalThis.__netDeliver = (id, bytes) => { const c = chans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
   globalThis.__netClosed = (id) => { const c = chans.get(id); if (c) c.closed(); };
   globalThis.__netAccept = (port, id) => { const a = listeners.get(port); if (a) a(id); };

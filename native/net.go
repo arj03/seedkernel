@@ -251,6 +251,7 @@ func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
 func (framedProto) readLoop(c *sockChannel) {
 	buf := make([]byte, 0, 4096)
 	chunk := make([]byte, 64<<10)
+	idle := 0 // consecutive compactions that left most of cap(buf) unused
 	conn, _ := c.socket()
 	for {
 		n, err := conn.Read(chunk)
@@ -280,6 +281,22 @@ func (framedProto) readLoop(c *sockChannel) {
 			}
 			if off > 0 {
 				buf = append(buf[:0], buf[off:]...) // overlap-safe compaction (memmove)
+				// The compaction keeps the backing array, so one 16 MiB frame would pin
+				// 16 MiB per connection for its life — a real high-water cost on a node
+				// holding many peers after a bulk sync. Snap the capacity back to the
+				// tail once 16 consecutive compactions used under a quarter of it.
+				// Rate-limiting the shrink matters: doing it per-frame made a sustained
+				// stream of large frames realloc-thrash (BenchmarkNetUpload1M: 2.1 →
+				// 5.3 MB/op); every 16th frame amortizes that to noise, while a link
+				// whose burst has passed still frees its buffer within 16 messages.
+				if cap(buf) > 64<<10 && len(buf) < cap(buf)/4 {
+					if idle++; idle >= 16 {
+						idle = 0
+						buf = append(make([]byte, 0, max(len(buf), 4096)), buf...)
+					}
+				} else {
+					idle = 0
+				}
 			}
 		}
 		if err != nil {

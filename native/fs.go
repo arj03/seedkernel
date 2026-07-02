@@ -276,11 +276,11 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		if len(t.Args()) > 0 && !t.Args()[0].IsUndefined() && !t.Args()[0].IsNull() {
 			prefix = str(t, 0)
 		}
-		arr := t.Context().NewArray()
-		for _, k := range fs.list(prefix) {
-			arr.Push(t.Context().NewString(k))
-		}
-		return arr.Value, nil
+		// One \n-joined string, split back into an array by the shim: building a JS
+		// array here costs an engine call (plus a C string) per key, so a content store
+		// with tens of thousands of blocks paid tens of thousands of crossings per
+		// listing. fsKeyChars forbids '\n' in a key, so the join is unambiguous.
+		return t.Context().NewString(strings.Join(fs.list(prefix), "\n")), nil
 	}))
 	o.SetPropertyStr("delete", fn(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(fs.delete(str(t, 0))), nil
@@ -299,8 +299,9 @@ func exposeFs(qc *qjs.Context, dir string) error {
 }
 
 // fsShimJS shapes the Go primitives into the host/fs.ts `Fs` interface the
-// cap-bridge consumes: a get miss is null, a hit is a Uint8Array. The rest
-// (put/has/size/list/delete/stat) pass straight through.
+// cap-bridge consumes: a get miss is null, a hit is a Uint8Array, and list's
+// single \n-joined string becomes the string[]. The rest (put/has/size/delete/
+// stat) pass straight through.
 const fsShimJS = `
 "use strict";
 (function () {
@@ -310,7 +311,9 @@ const fsShimJS = `
     put: (key, bytes) => N.put(key, bytes),
     has: (key) => N.has(key),
     size: (key) => N.size(key),
-    list: (prefix) => N.list(prefix),
+    // Keys cross as one \n-joined string (a single engine call); an empty listing
+    // arrives as "", which must map to [] — split would yield [""].
+    list: (prefix) => { const s = N.list(prefix); return s === "" ? [] : s.split("\n"); },
     delete: (key) => N.delete(key),
     stat: () => N.stat(),
   };

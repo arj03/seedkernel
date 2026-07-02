@@ -93,6 +93,7 @@ func TestFsExposedToRealm(t *testing.T) {
 			String(fs.has("blk1")), String(fs.has("nope")),
 			String(fs.size("blk1")),
 			fs.list("blk").sort().join(","),
+			String(fs.list("zzz").length),
 			String(fs.delete("blk1")), String(fs.has("blk1")),
 			String(fs.stat().used),
 		].join("|");
@@ -100,7 +101,7 @@ func TestFsExposedToRealm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}
-	const want = "payload-one|null|true|false|11|blk1,blk2|true|false|11"
+	const want = "payload-one|null|true|false|11|blk1,blk2|0|true|false|11"
 	if got := res.String(); got != want {
 		t.Fatalf("fs realm round trip:\n got %q\nwant %q", got, want)
 	}

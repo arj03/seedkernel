@@ -284,6 +284,37 @@ func (v *Value) toByteArray() []byte {
 	return out
 }
 
+// toByteArrayWindow copies just the [offset, offset+length) window of the
+// ArrayBuffer's bytes, with the same ownership story as toByteArray: addr is the
+// buffer's live storage, so only the packed bookkeeping cell is freed and the source
+// stays intact. The window is validated against the buffer size QuickJS itself
+// reports — never the caller's numbers alone — so a forged byteOffset/byteLength
+// cannot read past the buffer. Cost is O(window): a small typed-array view over a
+// large buffer copies only its own bytes, instead of copying — and, via the returned
+// subslice, pinning — the entire backing store.
+func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
+	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
+	if packed == 0 {
+		return nil, errors.New("qjs: value is not a byte array")
+	}
+	addr, size := v.c.rt.unpackPtr(packed)
+	v.c.rt.freeAt(packed) // the malloc'd cell only — addr is the live buffer, owned by JS
+	// Compare via subtraction (length > size-offset), not addition: offset and length
+	// arrive from JS getters, and a hostile pair near 2^62 would overflow offset+length.
+	if offset < 0 || length < 0 || offset > int64(size) || length > int64(size)-offset {
+		return nil, errors.New("qjs: typed array view out of range")
+	}
+	out := make([]byte, length)
+	if length > 0 {
+		buf, ok := v.c.rt.mem.Read(addr+uint32(offset), uint32(length))
+		if !ok {
+			return nil, errors.New("qjs: buffer window outside wasm memory")
+		}
+		copy(out, buf)
+	}
+	return out, nil
+}
+
 // exception turns an error/exception value into a Go error (message + stack).
 func (v *Value) exception() error {
 	cause := v.String()
@@ -420,10 +451,12 @@ func (c *Context) Pump() error {
 // independent Go copy. The source is left fully intact: it is NOT detached or
 // neutered, so the same value (a shared singleton, a retained Uint8Array, a node
 // key signed against many peers) can be read any number of times. For views it
-// returns only the view's window (byteOffset..byteOffset+byteLength). Callers never
-// need a defensive .slice() before handing a typed array across this seam — the copy
-// happens here, by default. (The underlying toByteArray copies out of the live buffer
-// and frees only QuickJS's bookkeeping cell, never the buffer itself.)
+// returns only the view's window (byteOffset..byteOffset+byteLength), and copies only
+// those bytes — O(view), not O(backing buffer) — so a small subarray over a large
+// buffer neither pays for nor pins the whole store. Callers never need a defensive
+// .slice() before handing a typed array across this seam — the copy happens here, by
+// default. (The underlying reads copy out of the live buffer and free only QuickJS's
+// bookkeeping cell, never the buffer itself.)
 func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	// Reject non-objects up front: GetPropertyStr("buffer") below would throw a
 	// TypeError on null/undefined/a primitive and leave the exception flag set,
@@ -444,9 +477,5 @@ func JsTypedArrayToGo(input *Value) ([]byte, error) {
 	}
 	offset := input.GetPropertyStr("byteOffset").Int64()
 	length := input.GetPropertyStr("byteLength").Int64()
-	full := buffer.toByteArray()
-	if offset < 0 || length < 0 || offset+length > int64(len(full)) {
-		return nil, errors.New("qjs: typed array view out of range")
-	}
-	return full[offset : offset+length], nil
+	return buffer.toByteArrayWindow(offset, length)
 }
