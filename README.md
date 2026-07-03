@@ -94,7 +94,7 @@ This limit applies to the **outermost** envelope on the wire. For signature wrap
 
 The 64 KB limit is a protocol constant, not a per-deployment configuration knob. Keeping it fixed avoids interoperability splits where one node accepts messages another rejects.
 
-**Install messages** (handled by the installer, §7) carry name and capability metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites (which may be larger, especially post-quantum suites) are installed by the same mechanism and follow the same 64 KB limit.
+**Install messages** (handled by the installer, §7) carry name and capability metadata plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites — including post-quantum ones — install through the same mechanism and follow the same limit. That is tighter than it looks, but tenable: an installed suite is **verify-only** (§6.6 — sign never ships, and the hash op is optional and refusable), and verify-only WASM builds of the NIST PQ schemes (ML-DSA, Falcon, SLH-DSA) run to tens of kilobytes. The 278 KB libsodium blob of §11.2 is not the yardstick — that is the sumo build backing the host's entire raw-byte crypto surface (§13.1), not a single suite. A suite that genuinely cannot fit is seeded host-side via `SetHandler` (§3.1), which is a host call rather than a wire message and so is not subject to the envelope cap — exactly how the genesis suite arrives (§10). A suite is pure computation with no capabilities to declare (§6.4), so the only thing forgone on that path is the installer's author-of-record (§7.1) — the same trade the genesis suite already makes.
 
 ### 2.3 Maximum signature wrapping depth
 
@@ -729,9 +729,9 @@ The split exists because the guest is not a kernel handler: it has no name in th
 
 Beyond the per-install caps that bridges check at I/O time (§8), the runtime provides the capability *backends* an app's confined logic actually drives. They are deliberately structureless — bytes in, bytes out — so the kernel never learns what an app means by them:
 
-- `crypto.*` — the bundled sumo libsodium: hash (BLAKE2b), `sign`/`verify` (Ed25519, as the node identity), the raw `stream_xor` (xchacha20), `random` (`host/cap-bridge.ts`, backed by `loadSodium`).
+- `crypto.*` — the bundled sumo libsodium: hash (BLAKE2b), `verify` (Ed25519), the raw `stream_xor` (xchacha20), `random` (`host/cap-bridge.ts`, backed by `loadSodium`). Signing under the node identity is a backend primitive too, but host-internal only (it backs the PeerLink handshake, §13.6) — not a guest op (§13.2).
 - `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC data channels (`host/net-rtc.ts`, §13.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `requestMany` and `sendMany` (host-side scatter-gather fan-out — the one concurrency a confined guest can't do itself; `requestMany` broadcasts one shared payload to many peers, `sendMany` is the general case of a distinct request per peer), and `peers`.
-- `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`has`/`size`/`list`/`delete`/`stat`. An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
+- `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`size`/`list`/`delete`/`stat` (existence is `size ≥ 0`, so there is no separate `has`). An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
 - `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
 
 Anything with *structure* is a **no-capability module** that transforms bytes: WebSocket framing is `ws.wasm` (`./ws`), Reed–Solomon erasure coding is an app's `codec.wasm` — both pure transforms the host drives, never something the kernel knows.
@@ -740,43 +740,43 @@ Anything with *structure* is a **no-capability module** that transforms bytes: W
 
 An app's confined logic reaches all of the above through a single seam, `host.call(op, bytes) → bytes` — the capability counterpart to a WASM handler's `kernel.call`. `host/cap-bridge.ts` (`./cap-bridge`) services that seam from the primitives above and *only* those. Every op is application-neutral; the bridge has no idea it is hosting storage.
 
-The op numbers are **stable wire identifiers**: the generated preamble injects them into the guest as `const CAP_<NAME> = n;` and the bridge switch reads the same table, so guest and host cannot drift. New ops are appended, never renumbered. Multi-byte integers are big-endian, as everywhere in the protocol (§17).
+The op numbers are a **shared guest↔host identifier**, not a wire value: the generated preamble injects them into the guest as `const CAP_<NAME> = n;` and the bridge switch reads the same table, so the two cannot drift (they are regenerated together, never independently versioned, and the numbers never travel between nodes). The set is one contiguous block grouped by domain; new ops are appended. Multi-byte integers are big-endian, as everywhere in the protocol (§17).
 
 | # | Op | Request | Response |
 | --- | --- | --- | --- |
 | 1 | `HASH` | message bytes | 32-byte generic hash (BLAKE2b) |
 | 2 | `STREAM_XOR` | `[nonce 24][key 32][msg ..]` | `msg` ⊕ XChaCha20 keystream |
-| 3 | `SIGN` | message bytes | 64-byte detached Ed25519 signature under the **node identity** (see §15) |
-| 4 | `VERIFY` | `[pk 32][sig 64][msg ..]` | `[valid u8]` |
-| 5 | `IDENTITY` | (empty) | the node's 32-byte public key |
-| 6 | `RANDOM` | `[n u32]` | `n` random bytes |
-| 7 | `NET_SEND` | `[peer 32][type u8][payload ..]` | `[ok u8][response ..]` |
-| 8 | `NET_REQUEST_MANY` | `[type u8][count u32][peer 32 ×count][plen u32][payload ..]` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
+| 3 | `VERIFY` | `[pk 32][sig 64][msg ..]` | `[valid u8]` |
+| 4 | `IDENTITY` | (empty) | the node's 32-byte public key |
+| 5 | `RANDOM` | `[n u32]` | `n` random bytes |
+| 6 | `NET_SEND` | `[peer 32][type u8][payload ..]` | `[ok u8][response ..]` |
+| 7 | `NET_REQUEST_MANY` | `[type u8][count u32][peer 32 ×count][plen u32][payload ..]` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
+| 8 | `NET_SEND_MANY` | `[count u32] {[peer 32][type u8][plen u32][payload ..]}` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
 | 9 | `NET_PEERS` | (empty) | `[count u32][pk 32 ×count]` |
 | 10 | `FS_GET` | key (utf8) | `[0]` absent \| `[1][bytes ..]` |
 | 11 | `FS_PUT` | `[klen u32][key][bytes ..]` | (empty) |
-| 12 | `FS_HAS` | key (utf8) | `[u8]` |
-| 13 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
-| 14 | `FS_DELETE` | key (utf8) | (empty) |
-| 15 | `FS_STAT` | (empty) | `[used u64][available u64]` |
+| 12 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
+| 13 | `FS_DELETE` | key (utf8) | (empty) |
+| 14 | `FS_STAT` | (empty) | `[used u64][available u64]` |
+| 15 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
 | 16 | `MODULE_CALL` | `[name_len u8][name][request ..]` | the installed handler's response bytes |
 | 17 | `CLOCK` | (empty) | now in unix ms (`u64`) |
-| 18 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
-| 19 | `NET_SEND_MANY` | `[count u32] {[peer 32][type u8][plen u32][payload ..]}` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
 
-The **capability domains** a manifest declares (§13.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of 19 numbers:
+**Why there is no signing op.** A guest can hash, verify, encrypt (`STREAM_XOR`), draw randomness, and read the node's *public* identity — but there is deliberately no op to sign under the node's *private* key (removed outright, not reserved, so the numbering has no gap). Node-identity signing stays host-internal; §15 has the rationale.
+
+The **capability domains** a manifest declares (§13.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of op numbers:
 
 | Domain | Ops |
 | --- | --- |
-| `crypto` | 1–6 (`HASH` … `RANDOM`) |
-| `net` | 7–9, 19 (`NET_SEND`, `NET_REQUEST_MANY`, `NET_PEERS`, `NET_SEND_MANY`) |
-| `fs` | 10–15, 18 (`FS_GET` … `FS_STAT`, `FS_SIZE`) |
+| `crypto` | 1–5 (`HASH`, `STREAM_XOR`, `VERIFY`, `IDENTITY`, `RANDOM`) |
+| `net` | 6–9 (`NET_SEND`, `NET_REQUEST_MANY`, `NET_SEND_MANY`, `NET_PEERS`) |
+| `fs` | 10–15 (`FS_GET`, `FS_PUT`, `FS_LIST`, `FS_DELETE`, `FS_STAT`, `FS_SIZE`) |
 | `module` | 16 (`MODULE_CALL`) |
 | `clock` | 17 (`CLOCK`) |
 
 An op outside the granted domains does not resolve — the bridge refuses it, and the shell never wired the backing resource in the first place (an `fs`-less bundle gets no fs backend at all, not an fs backend behind a check). An unknown domain name in a manifest throws when the realm is built — a typo fails loudly rather than silently granting nothing, or, worse, everything.
 
-**Relation to WASI.** The cap-bridge is deliberately WASI-shaped at the seam: a small syscall table, a zero-authority guest, capability by non-wiring rather than by runtime check. The differences are what justify a bespoke ABI. The ops are identity-centric, not POSIX-flavoured — `net` is addressed by peer pubkey over a channel bound to that key (§13.6), not by socket; `fs` is a flat opaque blob store with no paths; `SIGN`/`IDENTITY` put the node's key on the surface, which WASI has no notion of. And the grant itself is *signed content*: the guest's authority is the `caps` field of an author-signed manifest (§13.4) admitted by operator policy (§13.5), where WASI's grants are host-local instantiation choices with no concept of authorship. WASI begins after the questions of who authored the code, who may install it, and who signed the triggering message are already settled; §2–§10 is the machinery that settles them. The discipline that keeps this from drifting into a worse re-implementation of WASI's surface: ops stay structureless bytes, anything with structure becomes a no-capability module (§13.1), and the table grows by appending sparingly.
+**Relation to WASI.** The cap-bridge is deliberately WASI-shaped at the seam: a small syscall table, a zero-authority guest, capability by non-wiring rather than by runtime check. The differences are what justify a bespoke ABI. The ops are identity-centric, not POSIX-flavoured — `net` is addressed by peer pubkey over a channel bound to that key (§13.6), not by socket; `fs` is a flat opaque blob store with no paths; `IDENTITY` puts the node's public key on the surface, which WASI has no notion of. And the grant itself is *signed content*: the guest's authority is the `caps` field of an author-signed manifest (§13.4) admitted by operator policy (§13.5), where WASI's grants are host-local instantiation choices with no concept of authorship. WASI begins after the questions of who authored the code, who may install it, and who signed the triggering message are already settled; §2–§10 is the machinery that settles them. The discipline that keeps this from drifting into a worse re-implementation of WASI's surface: ops stay structureless bytes, anything with structure becomes a no-capability module (§13.1), and the table grows by appending sparingly.
 
 ### 13.3 Zero-authority JS realms
 
@@ -813,7 +813,7 @@ A bundle adds **no second install mechanism**: its module installs are ordinary 
 | `modules[]` | `{name, file, hash, install, kernelName}` | yes | One entry per WASM module: logical name, filename, `genesisHash(wasm)` hex, the filename of its pre-signed install envelope, and the kernel name that install binds (so the loader can confirm the module actually registered). |
 | `guest` | `{file, hash}` | yes | The guest program: filename + `genesisHash(utf8(source))` hex. |
 | `ops` | name → number | **no** | Documents the §13.2 op ABI the guest was built against. Purely informational; enforcement comes from `caps`. |
-| `caps` | string[] | **yes** | The capability domains (§13.2) granted to the guest. The shell expands these to the allowed op set and wires only the matching backends; nothing outside them resolves. |
+| `caps` | string[] | **yes** | The capability domains (§13.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants node-identity signing — §13.2, §15). |
 | `config` | map (string → string \| number) | no | App constants injected into the guest as `const APP = {…}`. Opaque to the runtime. |
 
 **Load algorithm** (`loadBundle`). The shell is host code, so failures here **throw to the operator** — the §3 "drop" semantics apply to wire messages, not to loading a local directory:
@@ -849,7 +849,7 @@ The shell's only governance knob is `--policy <allowed-keys.json>` (`host/policy
 | `modules` | no | Allowlist of install `bytes_hash`es. Omitted ⇒ any module from an allowed author; present ⇒ the install's hash must be listed (the §7.3 content-hash pattern, compounded with the author gate). |
 | `caps` | no | Allowlist of §8 `cap_id`s an install may declare or escalate to. Omitted or empty ⇒ **every** capability grant is denied — the §7.4 rule-3 acknowledgement hook auto-refuses. |
 
-Note the vocabulary split (§13 intro): `caps` here are §8 cap_ids governing *WASM handlers* at bridges. The *guest's* §13.2 domains are not governed by this file — admitting an author currently admits whatever domains their manifest declares (the shell still wires only the declared backends). A deployment that wants per-author domain limits would extend this schema; the seams are `buildApproveInstall` and the manifest check in `loadBundle`.
+Note the vocabulary split (§13 intro): `caps` here are §8 cap_ids governing *WASM handlers* at bridges. The *guest's* §13.2 domains are not gated by this file — they come from the app's signed manifest, bounded by which bundle the operator chose to run (`--bundle`). That needs no per-author gate because the one domain that would be dangerous to hand out loosely, node-identity signing, isn't grantable to a guest at all (§13.2, §15); the rest (`fs`, `net`, hashing, …) are ordinary app powers.
 
 ### 13.6 Node↔node transport: channel identity binding
 
@@ -975,7 +975,7 @@ The security properties are introduced where they arise (§2.3, §3.1, §4.4, §
 
 **Bundle freshness.** The manifest carries a monotonic `version` integer, enforced at load against a persisted per-`(author, app)` high-water mark (§13.4): a directory whose `version` is below the mark is refused as a downgrade, and the mark is never rewound. This closes the older-directory-reload gap on the **local** path (a stale or confused provisioning step) as well as any future wire-delivery path — a strictly stronger position than deferring the rule until peers can push bundles. Module installs stay independently replay-protected by their own `seq` (§4.4); the `version` mark is what protects the *guest*, which is loaded wholesale from the directory every boot and has no `seq` of its own. The mark is host-local persisted state, so a deliberate rollback is an out-of-band operator action (the operator is the TCB).
 
-**The guest can spend the node's key.** A bundle guest granted the `crypto` domain holds `SIGN` (§13.2) — a raw signing oracle under the node's identity key, by design (the node signs protocol messages on the app's behalf). Two consequences: a malicious-but-admitted app can produce arbitrary signatures attributable to the node, and a node identity key MUST NOT double as a policy `author` key (§13.5), or a crypto-capable guest could mint installs that clear the policy. Keep node identities and author identities disjoint.
+**A guest cannot sign as the node.** There is no `SIGN` op in the guest ABI (§13.2), so no bundle — whatever domains its manifest declares — can produce a signature attributable to the node. The node's identity key signs only host-internal protocol material (the PeerLink handshake transcript, §13.6, domain-separated by `DOMAIN` so it can never be re-used as an envelope or manifest signature), never bytes a guest supplies. Because that escalation is closed structurally rather than by policy, admitting an author grants ordinary app powers (`fs`, `net`, hashing, …) but never node-level authority — which is why the policy file needs no capability gate (§13.5). An app that must sign under its own identity carries that key at the app layer.
 
 **Replay protection is mandatory for mutators, opt-in for apps.** Handlers that mutate kernel-managed state (`install`, any deployer-added equivalent) MUST consume a `seq` and enforce a tombstone-forever, canonical-pubkey-keyed high-water mark (§4.4). Ordinary app handlers do not get this automatically: a signed app envelope replayed verbatim re-verifies and re-dispatches, so any handler whose payload causes a meaningful state change MUST add its own `seq` defence (§4.4).
 
@@ -1015,7 +1015,7 @@ These belong to the reference runtime (§13), not the kernel protocol — a diff
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| Cap op ids | `1`–`19` | cap-bridge (§13.2) | Stable wire identifiers; appended, never renumbered. |
+| Cap op ids | `1`–`17` | cap-bridge (§13.2) | Guest↔host op identifiers, contiguous and grouped by domain (§13.2); regenerated with the guest preamble, never sent between nodes. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§13.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§13.4) | Ed25519 detached signature over `DOMAIN_manifest ‖ json`. |
 | Link message tags | `HELLO 0x01`, `AUTH 0x02`, `FRAME 0x03` | `PeerLink` (§13.6) | AKE handshake + encrypted frame plane; HELLO carries the ephemeral X25519 key, FRAME bodies are AEAD records. |
