@@ -349,9 +349,9 @@ outer envelope:
 
 The inner envelope is a complete envelope — including its own magic, version, name, and payload.
 
-The signature is computed over `inner_envelope` — the raw bytes of the inner envelope, including its own framing. Re-enveloping (relaying) is lossless: the inner bytes don't change, so the signature remains valid.
+The signature is computed over `DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope` — a domain-separation prefix, the two outer wrapper fields, and the raw bytes of the inner envelope including its own framing. `DOMAIN_env` is the constant `"seedkernel-envelope-sig-v1\0"` (§17.1), one of a family of disjoint per-context domain prefixes (§15); it is prepended before signing and verifying but is **not** transmitted — both ends know it, so the wire payload and the §2.2 overhead are unchanged. Re-enveloping (relaying) is lossless: a relay alters none of these fields — not the domain, `algo_id`, `signer`, nor the inner bytes — so the signature stays valid.
 
-**The outer `algo_id` and `signer` fields are not themselves covered by the signature.** Flipping `algo_id` on a captured message normally just causes verification to fail under the wrong suite (fail-safe), and `signer` is the key the suite verifies against, so a wrong value cannot verify. The one place this matters is replay state: it MUST NOT be namespaced by `algo_id` (§4.4), or an attacker who flips the unsigned `algo_id` could replay a message once per suite that happens to verify the same key (§6.4 rotation). Because identity is raw key bytes, the suite MUST also validate the public key — rejecting non-canonical or small-order encodings — before pushing it onto the signer stack, so that the same logical key cannot present two distinct byte encodings.
+**Signing the outer `algo_id` and `signer` closes the flip attacks.** Because the signature now covers `algo_id`, an attacker cannot flip it on a captured message to replay that message under a second suite that happens to verify the same key (§6.4 rotation), and cannot re-attribute a captured message to a different `(algo_id, pubkey)` author identity — either edit changes the signed preimage and fails verification. Two consequences follow: replay state (§4.4) may be keyed however the mutator likes (the earlier prohibition on namespacing it by `algo_id` is retired), and the `signer` a suite verifies against is fixed by the signature rather than an out-of-band hint. Suites SHOULD still reject non-canonical or small-order public keys so that one logical key has exactly one byte encoding — the §4.4 replay high-water marks and the installer's author-matching are both keyed on raw pubkey bytes, so a second encoding would split one identity in two — but with `signer` signed this is defense-in-depth, not the load-bearing barrier it was when the fields travelled unsigned.
 
 After verification, the inner envelope re-enters the pipeline and dispatches normally. The signature module registers a single handler for `signature`; that handler's verify-time flow is:
 
@@ -417,7 +417,7 @@ A suite is a standard scratch-ABI handler (§4): it exports `memory`, `scratch`,
 | `0x00` verify | `[pubkey_len u16][pubkey][sig_len u16][sig][data ..]` | `[valid u8]` (1 = valid, 0 = invalid) |
 | `0x01` hash *(optional)* | `[data ..]` | hash bytes — only used if the host routes id derivation through the suite. The reference host hashes directly via its bundled libsodium (§5.1) and never issues op `0x01`, so genesis suites may reject it; non-genesis suites may implement it for hosts that do. |
 
-The `u16` length prefixes accommodate post-quantum suites whose public keys and signatures run to multiple kilobytes (§6.5). The verify request is the `signature` wrapper payload (§6.3) minus its `algo_id`, with the inner envelope as `data`, so the signature module can hand a suite almost exactly the bytes it already parsed.
+The `u16` length prefixes accommodate post-quantum suites whose public keys and signatures run to multiple kilobytes (§6.5). The `data` field is the full signed preimage `DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope` (§6.3): the signature module prepends the domain constant and the two outer fields to the inner envelope it already parsed, then hands the whole thing to the suite. The suite stays oblivious to the structure — it verifies `sig` over `data` under `pubkey`, nothing more — so domain separation and outer-field binding live entirely in the signature module and every suite gets them for free.
 
 The one cost versus a bespoke ABI is a single ≤64 KB `memcpy` of `data` into the suite's scratch per verify — negligible against the ~95 µs verify it precedes (§11).
 
@@ -802,7 +802,7 @@ manifest.bundle     the signed manifest envelope (below)
 
 A bundle adds **no second install mechanism**: its module installs are ordinary §7.2 envelopes dispatched verbatim, so the installer re-runs the same signature, policy, and replay (`seq`) checks as for any wire install. "Push the app over the relay later" is the same `.install` envelopes, sent rather than read from disk.
 
-**Manifest envelope.** `[author_pk: 32 bytes][sig: 64 bytes][manifest: UTF-8 JSON to end]` — an Ed25519 detached signature over the JSON bytes. There is deliberately no canonical-JSON step: the envelope carries the exact bytes that were signed, and the verifier parses exactly the bytes it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
+**Manifest envelope.** `[author_pk: 32 bytes][sig: 64 bytes][manifest: UTF-8 JSON to end]` — an Ed25519 detached signature over `DOMAIN_manifest ‖ json`, where `DOMAIN_manifest` is the constant `"seedkernel-manifest-sig-v1\0"` (§17.1), prepended before signing/verifying but not stored. The disjoint prefix means a manifest signature can never double as an envelope-wrapper or channel-handshake signature over the same bytes (§6.3, §15). There is deliberately no canonical-JSON step: the envelope carries the exact bytes that were signed, and the verifier parses exactly the bytes it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
 
 **Manifest fields.**
 
@@ -934,14 +934,14 @@ Because the wire and the bundles are shared, a Go node and a Node/Bun node inter
 
 A signed `chat.text` message arriving at a fully bootstrapped node, traced through every boundary. Assume `<keyA>` was used to install the chat handler at name `chat.text@keyA` (the canonical name the deployer's first-install policy approves under), so the chat handler is in the kernel's table and `installations[chat.text@keyA]` has the corresponding record. The message below is signed by `<keyA>`.
 
-**Message on the wire.** An outer signature envelope (per §6.3) carries `algo_id = 0x0000` (genesis), `signer = <keyA pubkey>`, `sig = Ed25519(inner_envelope, keyA_sk)`, and an inner envelope with `name = chat.text@keyA`, `payload = "hello, world"` (per §2). The signature covers the inner envelope's raw bytes.
+**Message on the wire.** An outer signature envelope (per §6.3) carries `algo_id = 0x0000` (genesis), `signer = <keyA pubkey>`, `sig = Ed25519(DOMAIN_env ‖ 0x0000 ‖ <keyA pubkey> ‖ inner_envelope, keyA_sk)`, and an inner envelope with `name = chat.text@keyA`, `payload = "hello, world"` (per §2). The signature covers the domain prefix, the outer `algo_id` and `signer`, and the inner envelope's raw bytes (§6.3).
 
 **Pipeline trace:**
 
 1. **Host receives bytes** from the transport, copies them into kernel memory, calls `kernel.dispatch(ptr, len)`.
 2. **Kernel `dispatch`**: `len ≤ 65536` ✓; parse succeeds with `magic=SD`, `version=01`. Look up `handlers[<signature name>]` → found (installed by `SetHandler` at bootstrap). Call `invoke_handler(...)`.
 3. **Host `invoke_handler`** routes to the signature handler, copies the payload into signature module memory, calls `signature.handle_signature(ptr, len)`.
-4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Build the verify request `[0x00][signer_len=32][<keyA>][sig_len=64][sig][inner_envelope_bytes]` and `kernel.call(genesis suite slot, …)`; the reference host services that slot with libsodium's `ed25519_verify`. Response is `[01]` (valid). **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
+4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Build the verify request `[0x00][signer_len=32][<keyA>][sig_len=64][sig][DOMAIN_env ‖ 0x0000 ‖ <keyA> ‖ inner_envelope_bytes]` — the last field is the signed preimage as `data` (§6.6) — and `kernel.call(genesis suite slot, …)`; the reference host services that slot with libsodium's `ed25519_verify`. Response is `[01]` (valid). **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
 5. **Host re-enters the kernel** with the inner bytes: `kernel.dispatch(innerPtr, innerLen)`.
 6. **Kernel `dispatch`** (recursive): parse succeeds, look up `handlers[chat.text@keyA]` → found (installed earlier by the installer). Call `invoke_handler(...)`.
 7. **Host `invoke_handler`** routes to keyA's chat handler WASM instance. Copy payload `"hello, world"` into the chat module's scratch region. Call `chat.handle(12)`.
@@ -964,6 +964,8 @@ The security properties are introduced where they arise (§2.3, §3.1, §4.4, §
 **Trust boundary / TCB.** The host *is* the trusted computing base. Anyone with access to `SetHandler` (§3.1) owns everything: they can replace the signature module, the installer, or any bridge, with no signed message required (§10.1). The kernel enforces no access control on `SetHandler` — guarding it is the host's job (process permissions, operator console, HSM). Everything above the host is sandboxed WASM that can only reach the outside world through capability-gated bridges.
 
 **The one cryptographic root constant.** The genesis suite's WASM hash (§6.2) is the single trust anchor baked into bootstrap. Every derived `name` and `cap_id` is computed with the genesis suite's hash (§5.1), so swapping the genesis suite re-derives the entire namespace. Pick it once per deployment.
+
+**Domain-separated signature contexts.** Every signature the runtime produces is over a context-specific domain prefix: `DOMAIN_env` for envelope wrappers (§6.3), `DOMAIN_manifest` for bundle manifests (§13.4), and `DOMAIN` for the channel-handshake transcript (§13.6). The prefixes are disjoint and prepended before signing (never transmitted), so a signature harvested in one context cannot verify in another — cross-context replay is closed by construction, not by a runtime check. Folding the wrapper's `algo_id` and `signer` into the envelope preimage (§6.3) extends the same discipline *within* the envelope context: a captured message can no longer be re-attributed to a different suite or key by editing the formerly-unsigned outer fields, since those edits now break verification.
 
 **Kernel authentication vs. transport confidentiality.** At the *kernel protocol* level (§2–§10), envelopes are *signed, not encrypted*: the signature wrapper (§6.3) gives message authentication and integrity, §4.4 gives mutators replay resistance, and the protocol itself provides **no** confidentiality — envelopes stored at rest, or carried over a transport that adds none, are plaintext unless a deployment adds an encryption wrapper (which composes as another layer, §2.1). The *runtime transport* (§13.6) does add its own: after the AKE handshake every frame is an AEAD record under a forward-secret session key, so node↔node frames — kernel envelopes and control req/res alike — are confidential and integrity-protected on the wire across all transports (TCP, WebSocket, WebRTC). WebRTC additionally runs inside DTLS (§13.7), a redundant-but-harmless second layer. The confidentiality boundary is thus the transport: on the wire the runtime protects frames end to end between authenticated peers; at rest, and above the transport, envelopes remain plaintext unless separately encrypted.
 
@@ -1013,9 +1015,11 @@ These belong to the reference runtime (§13), not the kernel protocol — a diff
 | --- | --- | --- | --- |
 | Cap op ids | `1`–`19` | cap-bridge (§13.2) | Stable wire identifiers; appended, never renumbered. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§13.4) | An unknown domain throws when the guest realm is built. |
-| Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§13.4) | Ed25519 detached signature over the JSON bytes. |
+| Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§13.4) | Ed25519 detached signature over `DOMAIN_manifest ‖ json`. |
 | Link message tags | `HELLO 0x01`, `AUTH 0x02`, `FRAME 0x03` | `PeerLink` (§13.6) | AKE handshake + encrypted frame plane; HELLO carries the ephemeral X25519 key, FRAME bodies are AEAD records. |
-| `DOMAIN` | `"seedkernel-channel-id-v1\0"` | AUTH signature (§13.6) | Domain-separation prefix for the signed AKE transcript (both identities, nonces, and ephemeral keys). |
+| `DOMAIN_env` | `"seedkernel-envelope-sig-v1\0"` | Signature wrapper (§6.3) | Domain-separation prefix for the signed envelope preimage (`algo_id ‖ signer ‖ inner`). Prepended before signing, not transmitted. |
+| `DOMAIN_manifest` | `"seedkernel-manifest-sig-v1\0"` | Manifest signature (§13.4) | Domain-separation prefix for the signed bundle-manifest JSON. Prepended before signing, not stored. |
+| `DOMAIN` | `"seedkernel-channel-id-v1\0"` | AUTH signature (§13.6) | Domain-separation prefix for the signed AKE transcript (both identities, nonces, and ephemeral keys). Not transmitted. |
 | `MAX_QUEUE` | `256` | `PeerLink` (§13.6) | Frames buffered pre-auth; oldest dropped. |
 | Transport frame kinds | `req 0x00`, `res 0x01` | `Transport` (§13.6) | Single request/response plane, carried inside the §13.6 AEAD record layer. |
 | Default request timeout | `2000` ms | shell boot (§13.8) | Response deadline before a peer counts as unreachable (`--timeout`). |
