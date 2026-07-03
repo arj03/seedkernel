@@ -15,6 +15,7 @@ Every binding is three orthogonal pieces: the **name** is the kernel's opaque di
 - Modules form layers. Lower layers (signatures, installation) gate higher layers (apps like chat). Each layer can only see downward.
 - Modules are independently usable — each is a standalone WASM module testable in isolation; nothing forces you to use them together.
 - Untrusted code runs confined — a handler reaches the outside world only through the capabilities it declared, and logic too dynamic for WASM runs as zero-authority JavaScript in a QuickJS realm whose only reach is a single `host.call` capability seam.
+- Node-to-node links are confidential by default — the runtime transport opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket, and WebRTC and needing no external TLS or Noise tunnel.
 - The same envelope works for tiny JSON payloads and large binary blobs.
 - Cryptographic algorithms are pluggable; the kernel can survive a post-quantum transition without a protocol rewrite.
 - The kernel compiles to WebAssembly, so the same kernel runs unmodified in every host — browser, server runtime, or a single native binary.
