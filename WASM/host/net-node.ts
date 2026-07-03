@@ -13,7 +13,7 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { NodeNetworkCore, type ChannelFactory, type PeerAddr } from "./net-route.js";
-import { type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { MAX_FRAME_BYTES, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { WsServerChannel, WsClientChannel, type RawByteStream } from "./net-frame.js";
 import { installWasmWsBackend } from "./ws/ws-wasm-backend.js";
 import { writeU32BE, readU32BE, ByteQueue } from "./util.js";
@@ -24,7 +24,9 @@ export type { PeerAddr } from "./net-route.js";
 // The WS codec (net-frame.ts) runs over the WebAssembly ws.wasm on this target.
 installWasmWsBackend();
 
-const MAX_TCP_MESSAGE = 16 * 1024 * 1024; // matches the WS frame cap
+// One wire-visible frame cap for both node↔node transports (§13.6, §17.1): the
+// TCP length prefix is checked against it before the body is buffered, and the WS
+// codec caps identically, so a frame that crosses one crosses the other.
 
 export interface NodeNetworkOptions {
   identity: Identity;
@@ -79,7 +81,7 @@ class TcpChannel implements RawChannel {
       const head = this.q.peek(4);
       if (!head) break;
       const len = readU32BE(head, 0);
-      if (len > MAX_TCP_MESSAGE) { this.fail(); return; }
+      if (len > MAX_FRAME_BYTES) { this.fail(); return; }
       if (this.q.length < 4 + len) break;
       this.q.drop(4);
       this.onMsg?.(this.q.take(len)!);

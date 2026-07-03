@@ -28,7 +28,7 @@
 // The ABI ops, handshake GUID, and scratch caps are shared verbatim with the
 // host driver via host/ws/ws-abi.ts (asc compiles it into this module; tsc reads
 // the same file from ws-codec.ts) so the two units can't drift. SCRATCH_SIZE is
-// sized so the largest TCP transport message (MAX_TCP_MESSAGE, 16 MB, net-node.ts)
+// sized so the largest TCP transport message (MAX_FRAME_BYTES, 16 MiB, net-link.ts)
 // also fits in a single WS frame plus header/mask overhead — the two transports
 // must cap identically, or a message that succeeds over TCP would tear down a WS
 // link. This module heap.allocs SCRATCH_SIZE below as the actual scratch heap.

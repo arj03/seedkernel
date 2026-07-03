@@ -6,12 +6,15 @@
 //   - Network:   the delivery fabric. LoopbackNetwork wires nodes in-process
 //                for tests; a WebRTC/data-channel or TCP implementation (see
 //                net-node.ts) satisfies the same interface in a real deployment.
-//   - Transport: per-node request/response keyed by correlation id, plus the
-//                bulk one-way frame path for content-addressed blocks (§13.6).
+//   - Transport: per-node request/response keyed by correlation id — a single
+//                frame plane (§13.6). Block bytes ride it too: a STORE pushes
+//                bytes in a `req` body and a FETCH returns them in a `res` body,
+//                so the §13.6 record layer authenticates and encrypts them along
+//                with every other frame. There is deliberately no separate
+//                unauthenticated bulk path.
 //
-// Frames on the wire:
-//   control req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
-//   bulk block.data = [2 kind][block_id 32][ciphertext ...]   (unsigned, §13.6)
+// Frames on the wire (carried inside the §13.6 AEAD record layer):
+//   req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
 
 import { writeU32BE, readU32BE } from "./util.js";
 
@@ -19,7 +22,6 @@ export type PeerId = string; // hex of the peer's kernel public key
 
 const KIND_REQ = 0;
 const KIND_RES = 1;
-const KIND_BULK = 2;
 
 /** The delivery fabric. send() is fire-and-forget unicast; the receiver's
  *  registered sink is invoked with the raw frame. */
@@ -66,7 +68,6 @@ export class LoopbackNetwork implements Network {
 }
 
 export type RequestHandler = (from: PeerId, type: number, payload: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
-export type BulkHandler = (from: PeerId, blockId: Uint8Array, bytes: Uint8Array) => void;
 
 interface Pending {
   /** The peer the request went to — a response only resolves if it arrives from
@@ -78,12 +79,11 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
-/** Per-node request/response + bulk transport over a Network. */
+/** Per-node request/response transport over a Network — a single frame plane. */
 export class Transport {
   private corr = 1;
   private pending = new Map<number, Pending>();
   private reqHandler: RequestHandler | null = null;
-  private bulkHandler: BulkHandler | null = null;
 
   constructor(
     readonly peerId: PeerId,
@@ -96,7 +96,6 @@ export class Transport {
   }
 
   onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
-  onBulk(handler: BulkHandler): void { this.bulkHandler = handler; }
 
   /** Send a typed control request and await the typed response. Rejects on
    *  timeout (the peer is offline/unreachable). */
@@ -161,16 +160,6 @@ export class Transport {
     );
   }
 
-  /** Push a content-addressed block over the bulk plane — unsigned, the
-   *  receiver verifies genesis_hash(bytes) == block_id itself (§13.6). */
-  sendBulk(to: PeerId, blockId: Uint8Array, bytes: Uint8Array): void {
-    const frame = new Uint8Array(1 + 32 + bytes.length);
-    frame[0] = KIND_BULK;
-    frame.set(blockId, 1);
-    frame.set(bytes, 33);
-    this.net.send(this.peerId, to, frame);
-  }
-
   close(): void {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("transport closed")); }
     this.pending.clear();
@@ -179,11 +168,6 @@ export class Transport {
 
   private onFrame(from: PeerId, frame: Uint8Array): void {
     const kind = frame[0];
-    if (kind === KIND_BULK) {
-      if (frame.length < 33 || !this.bulkHandler) return;
-      this.bulkHandler(from, frame.slice(1, 33), frame.slice(33));
-      return;
-    }
     const corr = readU32BE(frame, 1);
     if (kind === KIND_RES) {
       const p = this.pending.get(corr);

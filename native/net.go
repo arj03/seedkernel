@@ -20,13 +20,13 @@ import (
 	"time"
 )
 
-const maxTCPMessage = 16 << 20 // frame cap (matches the TS MAX_TCP_MESSAGE / WS cap)
+const maxFrameBytes = 16 << 20 // MAX_FRAME_BYTES (§13.6, §17.1): one wire-visible frame cap
 
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
-// protocol is request/response — even the 1 MiB bulk upload path awaits an ack per
+// protocol is a single request/response plane — even a block upload awaits an ack per
 // chunk — so a healthy link's queue stays a few messages deep; hitting the cap means
 // the peer has stopped draining (or JS is pushing unpaced), and the channel fails
-// rather than buffering without bound. Must exceed maxTCPMessage or a single
+// rather than buffering without bound. Must exceed maxFrameBytes or a single
 // max-size frame could never be queued.
 const sendQueueLimit = 32 << 20
 
@@ -290,7 +290,7 @@ func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
 	// 16 MiB–4 GiB frame the receiver is hardcoded to reject. The read side treats an
 	// over-cap length as fatal (readLoop), so mirror it: fail the channel locally instead
 	// of provoking the peer to drop the link.
-	if len(bytes) > maxTCPMessage {
+	if len(bytes) > maxFrameBytes {
 		c.fail()
 		return
 	}
@@ -328,7 +328,7 @@ func (framedProto) readLoop(c *sockChannel) {
 					break
 				}
 				ln := binary.BigEndian.Uint32(buf[off:])
-				if ln > maxTCPMessage {
+				if ln > maxFrameBytes {
 					c.fail()
 					return
 				}

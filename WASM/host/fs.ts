@@ -22,9 +22,9 @@ export interface FsStat {
 export interface Fs {
   get(key: string): Uint8Array | null;
   put(key: string, bytes: Uint8Array): void;
-  has(key: string): boolean;
-  /** Byte length of the value under `key`, or -1 if absent. Lets a policy layer
-   *  rebuild an index without reading every value back. */
+  /** Byte length of the value under `key`, or -1 if absent. Existence is `size ≥ 0`
+   *  (there is no separate `has`); also lets a policy layer rebuild an index without
+   *  reading every value back. */
   size(key: string): number;
   list(prefix?: string): string[];
   /** true if a value was removed, false if the key was already absent. */
@@ -43,7 +43,6 @@ export class MemoryFs implements Fs {
     return v ? v.slice() : null;
   }
   put(key: string, bytes: Uint8Array): void { this.map.set(key, bytes.slice()); }
-  has(key: string): boolean { return this.map.has(key); }
   size(key: string): number {
     const v = this.map.get(key);
     return v ? v.length : -1;

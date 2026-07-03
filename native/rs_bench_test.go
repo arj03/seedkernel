@@ -8,10 +8,11 @@ package main
 // 64 KB blocks, 640 KB of data per chunk; throughput is reported over data bytes
 // (b.SetBytes(k*bs)), matching bench.mjs's rate() which divides by the data size.
 //
-// Needs the seedstore bundle built (loader_test.go's default path, or SEEDSTORE_BUNDLE);
-// the benchmarks Skip if it isn't there.
+// RS lives in the seedstore repo, so this bench is opt-in: point SEEDSTORE_BUNDLE at a
+// built seedstore bundle to run it; with the var unset the benchmarks Skip. The loader
+// itself has no seedstore dependency (its own tests use a minimal in-repo bundle).
 //
-//	go test -run x -bench 'BenchmarkRS' -benchmem ./...
+//	SEEDSTORE_BUNDLE=/path/to/seedstore/WASM/bundle go test -run x -bench 'BenchmarkRS' -benchmem ./...
 
 import (
 	"bytes"
@@ -44,9 +45,9 @@ func setupRS() {
 	ensureBooted()
 	dir := os.Getenv("SEEDSTORE_BUNDLE")
 	if dir == "" {
-		dir = "../../seedstore/WASM/bundle"
+		return // opt-in only: no seedstore bundle configured → rsReady stays false → Skip
 	}
-	if !strings.HasPrefix(loadBundle(dir), "seedstore v1") {
+	if !strings.HasPrefix(loadBundle(dir), "seedstore v") {
 		return // rsReady stays false → the benchmarks Skip
 	}
 	rsCodecName = name("seedstore.codec")

@@ -231,10 +231,63 @@ func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	return uint32(len(resp))
 }
 
-// env.ed25519_verify — the genesis suite primitive (README §6.2). Routed to
-// libsodium so the genesis verify is the same binary as the browser.
-func edVerify(_ context.Context, m api.Module, pubP, sigP, dataP, dataL uint32) uint32 {
-	if sd.verifyDetached(rd(m.Memory(), sigP, 64), rd(m.Memory(), dataP, dataL), rd(m.Memory(), pubP, 32)) {
+// suiteSlotName derives a signature suite's slot name (README §6.4):
+// hash("seedkernel.signature.suite.v1:" + algo_id_hex, 4 lowercase hex digits).
+// A suite is an ordinary handler at this name — genesis included, seeded
+// natively in boot().
+func suiteSlotName(algoID int) []byte {
+	return sd.hashSha3256([]byte(fmt.Sprintf("seedkernel.signature.suite.v1:%04x", algoID)))
+}
+
+// genesisSuiteVerify services the genesis suite slot (algo_id 0x0000 = Ed25519 +
+// SHA-3-256) with libsodium, so the genesis verify is the same binary as the
+// browser. Standard scratch-ABI verify request (README §6.6):
+//   [0x00][pk_len u16][pk][sig_len u16][sig][data ..] -> [valid u8]
+// `data` is the full signed preimage the signature module assembled
+// (DOMAIN_env ‖ algo_id ‖ signer ‖ inner, §6.3); the suite just verifies sig
+// over data under pk, oblivious to its structure.
+func genesisSuiteVerify(req []byte) []byte {
+	invalid := []byte{0}
+	if len(req) < 1 || req[0] != 0x00 {
+		return invalid
+	}
+	o := 1
+	if o+2 > len(req) {
+		return invalid
+	}
+	pkLen := int(req[o])<<8 | int(req[o+1])
+	o += 2
+	if pkLen != 32 || o+pkLen > len(req) {
+		return invalid
+	}
+	pk := req[o : o+pkLen]
+	o += pkLen
+	if o+2 > len(req) {
+		return invalid
+	}
+	sigLen := int(req[o])<<8 | int(req[o+1])
+	o += 2
+	if sigLen != 64 || o+sigLen > len(req) {
+		return invalid
+	}
+	sig := req[o : o+sigLen]
+	o += sigLen
+	data := req[o:]
+	if sd.verifyDetached(sig, data, pk) {
+		return []byte{1}
+	}
+	return invalid
+}
+
+// env.suite_verify — the signature module's suite dispatch (README §6.6). The
+// module built the op-byte request at [reqP, reqL) in bootstrap memory; derive
+// the suite's slot name from algoID and hand the request to the ordinary
+// handler installed there (genesis natively; other suites as installed wasm).
+// An unknown algo_id (no handler at the slot) returns 0, same as a suite
+// reporting the signature invalid — the fail-safe drop (§6.4).
+func suiteVerify(_ context.Context, m api.Module, algoID, reqP, reqL uint32) uint32 {
+	resp := run(suiteSlotName(int(algoID)), rd(m.Memory(), reqP, reqL))
+	if len(resp) >= 1 && resp[0] == 1 {
 		return 1
 	}
 	return 0
@@ -283,7 +336,7 @@ func installWasm(n, wasm []byte) bool {
 		return false
 	}
 	s := uint32(g.Get())
-	// approve() permits a same-author/parent re-install (host.js), so this name may
+	// approve() permits a same-author re-install (host.js), so this name may
 	// already hold a live handler. Close the previous instance + its compiled code and
 	// drop its scrOf key before replacing, or every upgrade leaks one wasm instance
 	// (linear memory + JITed code) and a stale scrOf entry for the process's life.
@@ -303,21 +356,19 @@ func installWasm(n, wasm []byte) bool {
 // up the QuickJS realm running host.js (installer + bundle verification).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd = bootSodium(rt) // crypto primitive; env.ed25519_verify routes to it below
+	sd = bootSodium(rt) // crypto primitive; the genesis suite verify routes to it below
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
 	env.NewFunctionBuilder().WithFunc(invoke).Export("invoke_handler")
-	env.NewFunctionBuilder().WithFunc(edVerify).Export("ed25519_verify")
-	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32, uint32, uint32, uint32) uint32 {
-		return 0
-	}).Export("suite_verify")
+	env.NewFunctionBuilder().WithFunc(suiteVerify).Export("suite_verify")
 	env.Instantiate(ctx)
 	k := rt.NewHostModuleBuilder("kernel")
 	k.NewFunctionBuilder().WithFunc(kcall).Export("call")
 	k.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, out uint32) uint32 {
-		// Caller stack is [count u8][len u8][name]… (§8.2); an empty stack is a single 0x00.
-		// Real caller tracking is future work — until then write the empty-stack marker so a
-		// handler that reads caller() gets a valid buffer, not an unwritten one.
+		// kernel.caller writes the immediate caller as [name_len u8][name] (§4.2);
+		// [0x00] (name_len = 0) means no caller. Real caller tracking is future
+		// work — until then write the no-caller marker so a handler that reads
+		// caller() gets a valid buffer, not an unwritten one.
 		if !m.Memory().Write(out, []byte{0}) {
 			return ^uint32(0)
 		}
@@ -327,6 +378,14 @@ func boot() {
 	kn = load(kernelWasm, "kernelmod")
 	bs = load(bootWasm, "bootstrap")
 	setHandler(name("signature"), -1)
+
+	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
+	// serviced with libsodium — the reference host's "genesis via SetHandler"
+	// (§6.4). The signature module reaches it through env.suite_verify above.
+	gslot := suiteSlotName(0)
+	natH[string(gslot)] = genesisSuiteVerify
+	setHandler(gslot, nextID)
+	nextID++
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -402,12 +461,14 @@ func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
 
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
 // its guest: the declared cap domains, the manifest config (author-signed
-// structural constants), and the verified guest source.
+// structural constants), and the verified guest source. `author` (hex) + `app` key
+// bundle freshness and derive the guest-signing scope (README §13.2, §13.4).
 type loadedBundle struct {
-	app, version string
-	caps         []string
-	config       json.RawMessage // manifest `config` object (merged under operator config)
-	guestSource  string
+	app, author string
+	version     int
+	caps        []string
+	config      json.RawMessage // manifest `config` object (merged under operator config)
+	guestSource string
 }
 
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
@@ -443,14 +504,20 @@ func loadBundle(dir string) string {
 		return out
 	}
 	var m struct {
-		App, Version string
-		Caps         []string
-		Guest        string
-		Config       json.RawMessage
-		Modules      []struct{ Name, Install, KernelName string }
+		App, Author string
+		Version     int
+		Caps        []string
+		Guest       string
+		Config      json.RawMessage
+		Modules     []struct{ Name, Install, KernelName string }
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
+	}
+	// Freshness (README §13.4 step 3): refuse a version below the persisted (author,
+	// app) high-water mark as a downgrade — nothing lands — otherwise advance the mark.
+	if err := checkBundleFreshness(m.Author, m.App, m.Version); err != nil {
+		return "ERROR: " + err.Error()
 	}
 	var installed []string
 	for _, mod := range m.Modules {
@@ -461,10 +528,57 @@ func loadBundle(dir string) string {
 		}
 	}
 	loaded = &loadedBundle{
-		app: m.App, version: m.Version, caps: m.Caps,
+		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
 		config: m.Config, guestSource: string(goFiles[m.Guest]),
 	}
-	return fmt.Sprintf("%s v%s  installed=%v", m.App, m.Version, installed)
+	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, installed)
+}
+
+// freshnessHW is the persisted per-(author, app) bundle-version high-water mark
+// (README §13.4). Held in memory, seeded from freshnessStorePath at first use and
+// written back on every advance; when the path is empty (tests) it stays purely
+// in-memory, so a fresh process starts with −∞ for every key.
+var (
+	freshnessStorePath string
+	freshnessHW        map[string]int
+)
+
+// loadFreshness reads the persisted marks once (absent/malformed ⇒ empty).
+func loadFreshness() {
+	if freshnessHW != nil {
+		return
+	}
+	freshnessHW = map[string]int{}
+	if freshnessStorePath == "" {
+		return
+	}
+	if b, err := os.ReadFile(freshnessStorePath); err == nil {
+		_ = json.Unmarshal(b, &freshnessHW) // malformed ⇒ start empty
+	}
+}
+
+// checkBundleFreshness enforces the monotonic (author, app) high-water mark: a version
+// below the mark is a refused downgrade; an equal version reloads; a newer one advances
+// (and persists) the mark, which is never rewound. The author hex is fixed-length, so
+// the "author:app" key is unambiguous.
+func checkBundleFreshness(authorHex, app string, version int) error {
+	loadFreshness()
+	k := authorHex + ":" + app
+	if hw, ok := freshnessHW[k]; ok {
+		if version < hw {
+			return fmt.Errorf("version %d is below the (author, app) freshness high-water mark %d — downgrade refused", version, hw)
+		}
+		if version == hw {
+			return nil
+		}
+	}
+	freshnessHW[k] = version
+	if freshnessStorePath != "" {
+		if b, err := json.Marshal(freshnessHW); err == nil {
+			_ = os.WriteFile(freshnessStorePath, b, 0o644)
+		}
+	}
+	return nil
 }
 
 // applyPolicy installs the shell's install policy (host/policy.ts shape) into the
@@ -640,6 +754,9 @@ func main() {
 	// targets a bundle (there is always a --bundle / default dir), so a load error is fatal:
 	// the node has no app to run or serve. Exit non-zero rather than keep serving as a silent
 	// bundle-less relay, which would hide the failure from a driving script (§13.4).
+	// Persist the freshness high-water mark in a sibling of the data dir, so a
+	// fs-capable guest (whose keys are files *inside* the dir) can never tamper with it.
+	freshnessStorePath = filepath.Clean(a.dataDir) + ".freshness.json"
 	bundleResult := loadBundle(a.bundleDir)
 	fmt.Println("  bundle " + bundleResult)
 	if strings.HasPrefix(bundleResult, "ERROR") {
@@ -650,7 +767,7 @@ func main() {
 	if loaded != nil {
 		// Build the cap funnel for the bundle's declared domains, then the confined
 		// guest from its verified source + the merged APP config (manifest ∪ operator).
-		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s)`, jsStrArray(loaded.caps)))); err != nil {
+		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s, %q, %q)`, jsStrArray(loaded.caps), loaded.author, loaded.app))); err != nil {
 			fatal("cap-bridge", err)
 			return
 		}

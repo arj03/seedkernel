@@ -86,6 +86,13 @@ var sodiumExports = map[string]string{
 	"crypto_sign_ed25519_sk_to_curve25519": "gi",
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
+	// The §13.6 transport AKE: ephemeral X25519 (box keypair + scalarmult) and the
+	// ChaCha20-Poly1305-IETF record layer. PeerLink (shared net-link.ts) calls these
+	// through the `sodium` object below, so the native node runs the same handshake.
+	"crypto_box_keypair":                        "Ua",
+	"crypto_scalarmult":                         "Dg",
+	"crypto_aead_chacha20poly1305_ietf_encrypt": "D",
+	"crypto_aead_chacha20poly1305_ietf_decrypt": "H",
 }
 
 // EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes
@@ -354,6 +361,70 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 	return s.read(out, len(ct)-sealBytes), true
 }
 
+// ── §13.6 transport AKE primitives ──
+
+const aeadABytes = 16 // crypto_aead_chacha20poly1305_ietf_ABYTES (the Poly1305 tag)
+
+// boxKeypair mints a fresh ephemeral X25519 keypair (32-byte pk + sk) for one
+// PeerLink connection's key exchange.
+func (s *libsodium) boxKeypair() (pk, sk []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arenaReset(alignUp(32) + alignUp(32))
+	pkp, skp := s.take(32), s.take(32)
+	s.call("crypto_box_keypair", uint64(pkp), uint64(skp))
+	return s.read(pkp, 32), s.read(skp, 32)
+}
+
+// scalarmult computes the X25519 shared point q = n·p (32 bytes). Returns
+// ok=false on a low-order / all-zero result (return -1), which PeerLink treats as
+// a failed handshake — mirroring libsodium-wrappers throwing there.
+func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arenaReset(alignUp(32) + alignUp(len(n)) + alignUp(len(p)))
+	q, np, pp := s.take(32), s.takeIn(n), s.takeIn(p)
+	if s.call("crypto_scalarmult", uint64(q), uint64(np), uint64(pp)) != 0 {
+		return nil, false
+	}
+	return s.read(q, 32), true
+}
+
+// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, no AAD.
+// The result is msg ‖ 16-byte tag. The record layer supplies no additional data.
+func (s *libsodium) aeadEncrypt(msg, npub, key []byte) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	outLen := len(msg) + aeadABytes
+	s.arenaReset(alignUp(len(msg)) + alignUp(len(npub)) + alignUp(len(key)) + alignUp(outLen))
+	in, np, kp, out := s.takeIn(msg), s.takeIn(npub), s.takeIn(key), s.take(outLen)
+	mlo, mhi := lenArgs(len(msg))
+	// c, clen_p=NULL, m, mlen(lo,hi), ad=NULL, adlen=0(lo,hi), nsec=NULL, npub, k
+	s.call("crypto_aead_chacha20poly1305_ietf_encrypt",
+		uint64(out), 0, uint64(in), mlo, mhi, 0, 0, 0, 0, uint64(np), uint64(kp))
+	return s.read(out, outLen)
+}
+
+// aeadDecrypt opens a ChaCha20-Poly1305-IETF record. ok=false on any tag/length
+// failure — PeerLink tears the link down (strict per-direction ordering).
+func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
+	if len(ct) < aeadABytes {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	outLen := len(ct) - aeadABytes
+	s.arenaReset(alignUp(len(ct)) + alignUp(len(npub)) + alignUp(len(key)) + alignUp(outLen))
+	cp, np, kp, out := s.takeIn(ct), s.takeIn(npub), s.takeIn(key), s.take(outLen)
+	clo, chi := lenArgs(len(ct))
+	// m, mlen_p=NULL, nsec=NULL, c, clen(lo,hi), ad=NULL, adlen=0(lo,hi), npub, k
+	if s.call("crypto_aead_chacha20poly1305_ietf_decrypt",
+		uint64(out), 0, 0, uint64(cp), clo, chi, 0, 0, 0, uint64(np), uint64(kp)) != 0 {
+		return nil, false
+	}
+	return s.read(out, outLen), true
+}
+
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
 // exposeSodium installs `__sodium` (ArrayBuffer-returning primitives) into the
@@ -406,6 +477,27 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		}
 		return ab(t, pt), nil
 	}))
+	o.SetPropertyStr("crypto_box_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
+		pk, skv := s.boxKeypair()
+		return keypairObj(t.Context(), pk, skv), nil
+	}))
+	o.SetPropertyStr("crypto_scalarmult", fn(func(t *qjs.This) (*qjs.Value, error) {
+		q, ok := s.scalarmult(arg(t, 0), arg(t, 1))
+		if !ok {
+			return t.Context().NewNull(), nil
+		}
+		return ab(t, q), nil
+	}))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
+		return ab(t, s.aeadEncrypt(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	}))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
+		pt, ok := s.aeadDecrypt(arg(t, 0), arg(t, 1), arg(t, 2))
+		if !ok {
+			return t.Context().NewNull(), nil
+		}
+		return ab(t, pt), nil
+	}))
 	o.SetPropertyStr("crypto_sign_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
 		pk, skv := s.signKeypair()
 		return keypairObj(t.Context(), pk, skv), nil
@@ -452,6 +544,25 @@ const sodiumShimJS = `
     crypto_box_seal_open: (c, pk, sk) => {
       const r = N.crypto_box_seal_open(c, pk, sk);
       if (r === null) throw new Error("crypto_box_seal_open: incorrect key pair for the given ciphertext");
+      return u8(r);
+    },
+    // §13.6 transport AKE: ephemeral X25519 + ChaCha20-Poly1305-IETF record layer.
+    crypto_box_keypair: () => {
+      const k = N.crypto_box_keypair();
+      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "x25519" };
+    },
+    crypto_scalarmult: (sk, pk) => {
+      const r = N.crypto_scalarmult(sk, pk);
+      if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");
+      return u8(r);
+    },
+    // libsodium-wrappers' signature is (message, ad, nsec, npub, key); the record
+    // layer uses no additional data, so the native primitive takes just (m, npub, key).
+    crypto_aead_chacha20poly1305_ietf_encrypt: (m, _ad, _nsec, npub, key) =>
+      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, npub, key)),
+    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, _ad, npub, key) => {
+      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, npub, key);
+      if (r === null) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
       return u8(r);
     },
     crypto_sign_keypair: () => {

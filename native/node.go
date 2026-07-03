@@ -106,9 +106,12 @@ const engineNodeJS = `
   globalThis.__nodeReady = function () { return __network.ready().catch(() => {}); };
   // Build the single cap funnel for the loaded bundle's declared domains, over this
   // node's identity + transport + cohort, with module-call routed to Go (installed
-  // wasm handlers). caps is the manifest's cap array.
-  globalThis.__buildNodeBridge = function (caps) {
-    __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall);
+  // wasm handlers). caps is the manifest's cap array; authorHex + app derive the
+  // guest-signing scope (README §13.2), so the guest's SIGN op is bound to this
+  // bundle's namespace rather than being a raw node-key oracle.
+  globalThis.__buildNodeBridge = function (caps, authorHex, app) {
+    const scope = guestSignScope(fromHex(authorHex), app);
+    __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall, scope);
   };
 })();
 `

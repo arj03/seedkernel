@@ -1,29 +1,20 @@
 package main
 
 import (
-	"os"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
 
-// The Ed25519 author key that signs the seedstore bundle's manifest and both module
-// installs (read from manifest.bundle / *.install).
-const seedstoreAuthor = "56216c9c9077f177454008cc5600f817d96009c1625b2e0fe5fbd9ea0928f470"
-
-func bundleDir() string {
-	if d := os.Getenv("SEEDSTORE_BUNDLE"); d != "" {
-		return d
-	}
-	return "../../seedstore/WASM/bundle"
-}
-
 // With the bundle author allow-listed, the closed policy still loads the bundle.
 func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	boot()
-	if err := applyPolicy(`{"authors":["` + seedstoreAuthor + `"]}`); err != nil {
+	author, authorPub := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	if status := loadBundle(bundleDir()); !strings.HasPrefix(status, "seedstore v1  installed=[codec reputation]") {
+	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }
@@ -34,7 +25,9 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + strings.Repeat("ab", 32) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	if status := loadBundle(bundleDir()); !strings.Contains(status, "manifest author not in policy") {
+	author, authorPub := testAuthor(t)
+	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(dir); !strings.Contains(status, "manifest author not in policy") {
 		t.Fatalf("expected foreign-author rejection, got: %s", status)
 	}
 }
@@ -48,7 +41,9 @@ func TestPolicyMalformed(t *testing.T) {
 		}
 	}
 	// A still-permissive realm (policy never took) loads the bundle.
-	if status := loadBundle(bundleDir()); !strings.HasPrefix(status, "seedstore v1  installed=[codec reputation]") {
+	author, authorPub := testAuthor(t)
+	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("after rejected policies the realm should stay permissive: %s", status)
 	}
 }

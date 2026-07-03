@@ -41,10 +41,13 @@ func TestCapBridgeOps(t *testing.T) {
 	qc, _, done := capBridgeRealm(t)
 	defer done()
 
-	// Grant crypto + fs + clock (not net/module) and an identity from sodium.
+	// Grant crypto + fs + clock (not net/module) and an identity from sodium. The
+	// guest-signing scope binds SIGN to a bundle namespace (README §13.2); a real node
+	// derives it from the manifest's (author, app), here a throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["crypto", "fs", "clock"], __id, null, []);
+		globalThis.__scope = guestSignScope(__id.publicKey, "testapp");
+		__buildCapBridge(["crypto", "fs", "clock"], __id, null, [], null, __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -85,32 +88,40 @@ func TestCapBridgeOps(t *testing.T) {
 		t.Fatalf("IDENTITY = %x, want node pubkey %x", id, pk)
 	}
 
-	// CAP.SIGN (3) + CAP.VERIFY (4): sign as this identity, verify with its pubkey.
+	// CAP.SIGN (3) + CAP.VERIFY (4): SIGN is scoped, so it signs DOMAIN_guest ‖ scope ‖
+	// msg, not raw msg. VERIFY stays raw, so we reconstruct the prefixed preimage.
 	msg := []byte("a message to sign")
 	sig := callBytes(3, msg)
 	if len(sig) != 64 {
 		t.Fatalf("SIGN len = %d, want 64", len(sig))
 	}
-	verifyArg := append(append(append([]byte{}, pk...), sig...), msg...) // [pk 32][sig 64][msg]
-	if v := callBytes(4, verifyArg); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("VERIFY = %v, want [1]", v)
+	scope := jsBytes(t, qc, `__scope`)
+	preimage := append(append(append([]byte{}, []byte("seedkernel-guest-sig-v1\x00")...), scope...), msg...)
+	verifyGood := append(append(append([]byte{}, pk...), sig...), preimage...) // [pk 32][sig 64][preimage]
+	if v := callBytes(4, verifyGood); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("VERIFY(scoped preimage) = %v, want [1]", v)
+	}
+	// The raw message must NOT verify — proof the signature is bound to the scope.
+	verifyRaw := append(append(append([]byte{}, pk...), sig...), msg...)
+	if v := callBytes(4, verifyRaw); len(v) != 1 || v[0] != 0 {
+		t.Fatalf("VERIFY(raw msg) = %v, want [0] (SIGN is scoped, never raw)", v)
 	}
 
-	// CAP.FS_PUT (11) then CAP.FS_GET (10): content-addressed round trip.
+	// CAP.FS_PUT (12) then CAP.FS_GET (11): content-addressed round trip.
 	key := []byte("blk")
 	value := []byte("a content-addressed block")
 	put := make([]byte, 4+len(key)+len(value)) // [klen u32][key][bytes]
 	binary.BigEndian.PutUint32(put, uint32(len(key)))
 	copy(put[4:], key)
 	copy(put[4+len(key):], value)
-	callBytes(11, put)
-	got := callBytes(10, key) // [1][bytes] on hit
+	callBytes(12, put)
+	got := callBytes(11, key) // [1][bytes] on hit
 	if len(got) == 0 || got[0] != 1 || !bytes.Equal(got[1:], value) {
 		t.Fatalf("FS_GET = %v, want [1] ++ %q", got, value)
 	}
 
-	// CAP.CLOCK (17): 8-byte big-endian millis, nonzero.
-	if clk := callBytes(17, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
+	// CAP.CLOCK (18): 8-byte big-endian millis, nonzero.
+	if clk := callBytes(18, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
 		t.Fatalf("CLOCK = %v, want nonzero u64", clk)
 	}
 

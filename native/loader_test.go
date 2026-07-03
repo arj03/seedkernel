@@ -3,19 +3,17 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/binary"
-	"math"
-	"os"
 	"strings"
 	"testing"
 )
 
-// End-to-end: boot the shell, exercise the signature pipeline, load the real
-// seedstore bundle, and confirm its installed modules run. Set SEEDSTORE_BUNDLE
-// to point at the bundle dir (defaults to the repo-relative path).
-func TestShellRunsSeedstoreBundle(t *testing.T) {
+// End-to-end: boot the shell, exercise the signature pipeline, load a minimal signed
+// bundle built right here (no seedstore / sibling-repo dependency), and confirm its
+// installed module runs and can reach another handler through kernel.call.
+func TestShellRunsBundle(t *testing.T) {
 	boot()
 
+	// Signature pipeline: a signed envelope routed to a native handler dispatches once.
 	echo := 0
 	registerNative("test.echo", func(p []byte) []byte { echo++; return p })
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
@@ -24,42 +22,21 @@ func TestShellRunsSeedstoreBundle(t *testing.T) {
 		t.Fatalf("signed dispatch → echo = %d, want 1", echo)
 	}
 
-	dir := os.Getenv("SEEDSTORE_BUNDLE")
-	if dir == "" {
-		dir = "../../seedstore/WASM/bundle"
-	}
-	if status := loadBundle(dir); !strings.HasPrefix(status, "seedstore v1  installed=[codec reputation]") {
+	// A minimal signed bundle: verify the manifest, govern it, install its module.
+	author, authorPub := testAuthor(t)
+	dir, kernelName := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("bundle load: %s", status)
 	}
 
-	if got := fnv(run(name("seedstore.codec"), codecEncodeReq())); got != 0xd9b165c5 {
-		t.Fatalf("codec encode fnv=%08x, want d9b165c5", got)
+	// The installed module actually runs: drive the forwarder to relay a payload to the
+	// echo handler via kernel.call — reaching it proves the bundle-installed wasm executes.
+	en := name("test.echo")
+	fwdReq := append(append([]byte{byte(len(en))}, en...), []byte("relayed")...)
+	run(kernelName, fwdReq)
+	if echo != 2 {
+		t.Fatalf("bundle module forward → echo = %d, want 2 (module ran + reached echo)", echo)
 	}
-	if s := observeReputation(); s != 1.0 {
-		t.Fatalf("reputation score=%v, want 1.0", s)
-	}
-}
-
-func codecEncodeReq() []byte {
-	req := make([]byte, 7+10*65536)
-	req[0], req[1], req[2] = 1, 10, 6 // OP_ENCODE k=10 m=6
-	binary.BigEndian.PutUint32(req[3:7], 65536)
-	for i := 7; i < len(req); i++ {
-		req[i] = byte((i-7)*1103515245 + 12345)
-	}
-	return req
-}
-
-func observeReputation() float64 {
-	req := make([]byte, 1+32+8+1)
-	req[0] = 1 // OP_OBSERVE; pk=zeros; now=1e6 ms BE; result=1 (pass)
-	binary.BigEndian.PutUint64(req[33:41], 1_000_000)
-	req[41] = 1
-	resp := run(name("seedstore.reputation"), req)
-	if len(resp) != 8 {
-		return -1
-	}
-	return math.Float64frombits(binary.LittleEndian.Uint64(resp))
 }
 
 func envelope(n, payload []byte) []byte {
@@ -68,16 +45,15 @@ func envelope(n, payload []byte) []byte {
 
 func sign(priv ed25519.PrivateKey, pub, innerName, payload []byte) []byte {
 	inner := envelope(innerName, payload)
+	// README §6.3: sign over DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope,
+	// not the bare inner bytes. The domain prefix and outer fields are
+	// reconstructed by the verifier, never transmitted.
+	var pre []byte
+	pre = append(pre, "seedkernel-envelope-sig-v1\x00"...)
+	pre = append(pre, 0, 0) // algo_id 0x0000 (genesis)
+	pre = append(pre, pub...)
+	pre = append(pre, inner...)
 	wp := append([]byte{0, 0, 0, 32}, pub...)
-	wp = append(append(wp, 0, 64), ed25519.Sign(priv, inner)...)
+	wp = append(append(wp, 0, 64), ed25519.Sign(priv, pre)...)
 	return envelope(name("signature"), append(wp, inner...))
-}
-
-func fnv(b []byte) uint32 {
-	h := uint32(2166136261)
-	for _, x := range b {
-		h ^= uint32(x)
-		h *= 16777619
-	}
-	return h
 }

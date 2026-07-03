@@ -19,37 +19,45 @@ import type { PeerId } from "./net.js";
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "./util.js";
 import type { SafeRealmBridge } from "./safe-js.js";
 
-/** The generic op catalog — the seam ABI. `capPreamble()` injects these as
- *  `const CAP_X = n;` into the guest, and the bridge switch reads them here, so
- *  guest and host can never drift. Numbers are stable wire identifiers. */
+/** The generic op catalog — the seam ABI (README §13.2). `capPreamble()` injects
+ *  these as `const CAP_X = n;` into the guest, and the bridge switch reads them
+ *  here, so guest and host can never drift. The numbers are a shared guest↔host
+ *  identifier regenerated with the preamble — never a wire value between nodes — so
+ *  they form one contiguous block grouped by domain (crypto 1–6, net 7–10, fs 11–16,
+ *  module 17, clock 18); new ops are appended. */
 export const CAP = {
+  // crypto (1–6)
   HASH: 1,             // bytes -> 32B generic hash (blake2b / crypto_generichash)
   STREAM_XOR: 2,       // [nonce 24][key 32][msg] -> xchacha20 keystream XOR
-  SIGN: 3,             // msg -> 64B detached ed25519 signature by this identity
+  SIGN: 3,             // msg -> 64B detached ed25519 signature by this identity, over
+                       //   DOMAIN_guest ‖ scope ‖ msg (scoped, never raw — see below)
   VERIFY: 4,           // [pk 32][sig 64][msg] -> [valid u8]
   IDENTITY: 5,         // -> this node's 32B public key
   RANDOM: 6,           // [n u32] -> n random bytes
+  // net (7–10)
   NET_SEND: 7,         // [peer 32][type u8][payload] -> [ok u8][resp]
   NET_REQUEST_MANY: 8, // [type u8][count u32][peer 32 …][plen u32][payload]
                        //   -> [count u32]{[peer 32][ok u8][len u32][bytes]}
-  NET_PEERS: 9,        // -> [count u32][pk 32 …]
-  FS_GET: 10,          // key(utf8) -> [0] | [1][bytes]
-  FS_PUT: 11,          // [klen u32][key(utf8)][bytes] -> []
-  FS_HAS: 12,          // key(utf8) -> [u8]
-  FS_LIST: 13,         // prefix(utf8, may be empty) -> [count u32]{[klen u32][key]}
-  FS_DELETE: 14,       // key(utf8) -> []
-  FS_STAT: 15,         // -> [used u64 BE][available u64 BE]
-  MODULE_CALL: 16,     // [nameLen u8][name][req] -> installed handler response bytes
-  CLOCK: 17,           // -> now ms (u64 BE)
-  FS_SIZE: 18,         // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
-                       //   lets a policy layer rebuild a byte budget (quota) without
-                       //   reading every value back. Appended (18) so 1–17 stay stable.
-  NET_SEND_MANY: 19,   // [count u32]{[peer 32][type u8][plen u32][payload]}
+  NET_SEND_MANY: 9,    // [count u32]{[peer 32][type u8][plen u32][payload]}
                        //   -> [count u32]{[peer 32][ok u8][len u32][bytes]}
                        //   Per-peer fan-out: a DISTINCT request per peer, concurrently
                        //   (NET_REQUEST_MANY is the all-payloads-equal special case).
                        //   The parallel transport primitive a sync guest drives one
-                       //   batched cap at a time. Appended (19) so 1–18 stay stable.
+                       //   batched cap at a time.
+  NET_PEERS: 10,       // -> [count u32][pk 32 …]
+  // fs (11–16)
+  FS_GET: 11,          // key(utf8) -> [0] | [1][bytes]
+  FS_PUT: 12,          // [klen u32][key(utf8)][bytes] -> []
+  FS_LIST: 13,         // prefix(utf8, may be empty) -> [count u32]{[klen u32][key]}
+  FS_DELETE: 14,       // key(utf8) -> []
+  FS_STAT: 15,         // -> [used u64 BE][available u64 BE]
+  FS_SIZE: 16,         // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
+                       //   lets a policy layer rebuild a byte budget (quota) without
+                       //   reading every value back. Existence is size ≥ 0, so there is
+                       //   no separate FS_HAS.
+  // module (17) + clock (18)
+  MODULE_CALL: 17,     // [nameLen u8][name][req] -> installed handler response bytes
+  CLOCK: 18,           // -> now ms (u64 BE)
 } as const;
 
 /** The generated `const CAP_NAME = n;` block the guest is written against. */
@@ -65,12 +73,33 @@ export function capPreamble(): string {
 export const CAP_DOMAINS = {
   crypto: [CAP.HASH, CAP.STREAM_XOR, CAP.SIGN, CAP.VERIFY, CAP.IDENTITY, CAP.RANDOM],
   net:    [CAP.NET_SEND, CAP.NET_REQUEST_MANY, CAP.NET_SEND_MANY, CAP.NET_PEERS],
-  fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_HAS, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
+  fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
   module: [CAP.MODULE_CALL],
   clock:  [CAP.CLOCK],
 } as const;
 
 export type CapDomain = keyof typeof CAP_DOMAINS;
+
+/** Domain-separation prefix for guest-obtainable signatures (README §13.2, §17.1).
+ *  Prepended before signing, never transmitted. Disjoint from DOMAIN_env / DOMAIN_
+ *  manifest / the channel DOMAIN, so no guest-obtained signature can verify in any
+ *  other protocol context. */
+const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
+
+/** The host-derived scope the SIGN op binds every guest signature to (README §13.2):
+ *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
+ *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
+ *  and two bundles derive disjoint scopes. Every node running the same bundle derives
+ *  the same bytes, which is what makes the scoped signatures portable across a cohort. */
+export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
+  const appBytes = enc.encode(app);
+  if (appBytes.length > 255) throw new Error("cap-bridge: app name too long for a scope (>255 bytes)");
+  const out = new Uint8Array(author.length + 1 + appBytes.length);
+  out.set(author, 0);
+  out[author.length] = appBytes.length;
+  out.set(appBytes, author.length + 1);
+  return out;
+}
 
 /** Expand declared capability domains to the concrete op numbers a bridge allows.
  *  Throws on an unknown domain so a typo in a manifest fails loudly rather than
@@ -111,9 +140,15 @@ export interface CapTransport {
 export interface CapBridgeDeps {
   sodium: CapSodium;
   /** This node's kernel keypair (README §13.1): SIGN signs as it, IDENTITY
-   *  returns its pk — so a `crypto`-domain guest holds a signing oracle under
-   *  this key (README §15). */
+   *  returns its pk. SIGN is a signing oracle under this key but a *scoped* one —
+   *  it prepends `DOMAIN_guest ‖ signScope` so a guest never obtains a raw
+   *  node-key signature (README §13.2, §15). */
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
+  /** The host-derived signing scope `author_pk ‖ app_len u8 ‖ app` from the admitted
+   *  manifest (README §13.2, `guestSignScope`). SIGN binds every guest signature to
+   *  `DOMAIN_guest ‖ signScope ‖ msg`; without it SIGN is unavailable (guest signing
+   *  is never raw). A host-side caller that never exposes SIGN may omit it. */
+  signScope?: Uint8Array;
   /** Reach an installed WASM handler by name (KernelHost.callHandler). */
   callHandler: (name: Uint8Array, payload: Uint8Array) => Uint8Array | null;
   transport: CapTransport;
@@ -180,8 +215,14 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         const key = payload.slice(24, 56);
         return sodium.crypto_stream_xchacha20_xor(payload.slice(56), nonce, key);
       }
-      case CAP.SIGN:
-        return sodium.crypto_sign_detached(payload, identity.privateKey);
+      case CAP.SIGN: {
+        // Scoped, never raw (README §13.2, §15): the host signs
+        // `DOMAIN_guest ‖ scope ‖ msg`, so a guest signature can never verify as an
+        // envelope wrapper, manifest, or channel AUTH, nor in another app's scope.
+        if (!deps.signScope) throw new Error("cap-bridge: SIGN needs a bundle scope (guest signing is never raw)");
+        const pre = concatBytes([DOMAIN_GUEST, deps.signScope, payload]);
+        return sodium.crypto_sign_detached(pre, identity.privateKey);
+      }
       case CAP.VERIFY: {
         const pk = payload.slice(0, 32), sig = payload.slice(32, 96), msg = payload.slice(96);
         try { return sodium.crypto_sign_verify_detached(sig, msg, pk) ? ONE : ZERO; }
@@ -281,8 +322,6 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         fs().put(key, payload.slice(4 + klen));
         return NONE;
       }
-      case CAP.FS_HAS:
-        return fs().has(dec.decode(payload)) ? ONE : ZERO;
       case CAP.FS_LIST: {
         const prefix = payload.length ? dec.decode(payload) : undefined;
         const keys = fs().list(prefix);

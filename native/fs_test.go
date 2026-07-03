@@ -14,7 +14,7 @@ func TestNodeFsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fs.has("k1") || fs.size("k1") != -1 || fs.get("k1") != nil {
+	if fs.size("k1") != -1 || fs.get("k1") != nil {
 		t.Fatal("a missing key should read as absent")
 	}
 
@@ -22,8 +22,8 @@ func TestNodeFsRoundTrip(t *testing.T) {
 	if err := fs.put("k1", val); err != nil {
 		t.Fatal(err)
 	}
-	if !fs.has("k1") || fs.size("k1") != len(val) {
-		t.Fatalf("after put: has=%v size=%d", fs.has("k1"), fs.size("k1"))
+	if fs.size("k1") != len(val) {
+		t.Fatalf("after put: size=%d", fs.size("k1"))
 	}
 	if got := fs.get("k1"); !bytes.Equal(got, val) {
 		t.Fatalf("get = %q, want %q", got, val)
@@ -41,7 +41,7 @@ func TestNodeFsRoundTrip(t *testing.T) {
 		t.Fatalf("list(\"k\") = %v", pref)
 	}
 
-	if !fs.delete("k1") || fs.has("k1") {
+	if !fs.delete("k1") || fs.size("k1") != -1 {
 		t.Fatal("delete should remove the key")
 	}
 	if fs.delete("k1") {
@@ -60,7 +60,7 @@ func TestNodeFsRejectsUnsafeKeys(t *testing.T) {
 		if err := fs.put(k, []byte("x")); err == nil {
 			t.Fatalf("put(%q) accepted an unsafe key", k)
 		}
-		if fs.has(k) || fs.size(k) != -1 || fs.get(k) != nil || fs.delete(k) {
+		if fs.size(k) != -1 || fs.get(k) != nil || fs.delete(k) {
 			t.Fatalf("unsafe key %q resolved on read/delete", k)
 		}
 	}
@@ -90,18 +90,18 @@ func TestFsExposedToRealm(t *testing.T) {
 		[
 			dec(fs.get("blk1")),
 			fs.get("nope") === null ? "null" : "notnull",
-			String(fs.has("blk1")), String(fs.has("nope")),
-			String(fs.size("blk1")),
+			String(fs.size("blk1")), String(fs.size("nope")),
 			fs.list("blk").sort().join(","),
 			String(fs.list("zzz").length),
-			String(fs.delete("blk1")), String(fs.has("blk1")),
+			String(fs.delete("blk1")), String(fs.size("blk1")),
 			String(fs.stat().used),
 		].join("|");
 	`))
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}
-	const want = "payload-one|null|true|false|11|blk1,blk2|0|true|false|11"
+	// Existence is size ≥ 0 now (no `has`): present blk1 = 11, absent = -1.
+	const want = "payload-one|null|11|-1|blk1,blk2|0|true|-1|11"
 	if got := res.String(); got != want {
 		t.Fatalf("fs realm round trip:\n got %q\nwant %q", got, want)
 	}

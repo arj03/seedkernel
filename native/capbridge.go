@@ -39,8 +39,10 @@ const capBridgeGlueJS = `
   // Build the single capability funnel for a loaded bundle. caps = the manifest's
   // declared domains (e.g. ["crypto","fs","net"]); only their ops resolve. identity
   // is the node keypair ({publicKey,privateKey} Uint8Arrays — sodium.crypto_sign_keypair
-  // shape). transport/peers/moduleCall may be omitted for a local-only node.
-  globalThis.__buildCapBridge = function (caps, identity, transport, peers, moduleCall) {
+  // shape). transport/peers/moduleCall may be omitted for a local-only node. scope is
+  // the host-derived guest-signing scope (guestSignScope(author, app) — README §13.2);
+  // omit it only where SIGN is never exercised.
+  globalThis.__buildCapBridge = function (caps, identity, transport, peers, moduleCall, scope) {
     globalThis.__capBridge = createCapBridge({
       sodium,
       identity,
@@ -57,6 +59,7 @@ const capBridgeGlueJS = `
       fs,
       now: () => Date.now(),
       allowedOps: opsForCaps(new Set(caps)),
+      signScope: scope || undefined,
     });
   };
 

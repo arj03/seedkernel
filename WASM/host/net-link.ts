@@ -1,26 +1,41 @@
-// Channel identity binding (README §13.6). A real socket carries no trustworthy
-// "from" field, so before a connection is allowed to deliver frames it runs a
-// mutual challenge/response that proves each end holds the kernel private key
-// for the public key it claims. From then on every frame is attributed to that
-// authenticated identity — never to anything inside the frame. This is the
-// node↔node analogue of chat-shell.js pinning each data-channel to a kernel pk
-// and dropping envelopes signed by anyone else.
+// Channel identity binding + forward-secret record layer (README §13.6). A real
+// socket carries no trustworthy "from" field, so before a connection is allowed
+// to deliver frames it runs a mutual challenge/response that proves each end
+// holds the kernel private key for the public key it claims, and — in the same
+// exchange — agrees an ephemeral session key. From then on every frame is an
+// authenticated, encrypted record attributed to that authenticated identity,
+// never to anything inside the frame. This is the node↔node analogue of
+// chat-shell.js pinning each data-channel to a kernel pk and dropping envelopes
+// signed by anyone else.
 //
 // PeerLink is transport-agnostic: it drives any RawChannel that delivers whole
 // messages (TCP gets message framing from a length prefix; WebSocket already has
 // message boundaries). Three short message types ride the channel:
-//   HELLO = pubkey(32) ‖ nonce(32)         sent by both ends immediately
-//   AUTH  = sign(transcript)(64)           binds both pubkeys + both nonces
-//   FRAME = the opaque Network frame        only after both ends authenticate
+//   HELLO = pubkey(32) ‖ nonce(32) ‖ eph(32)   sent by both ends immediately
+//   AUTH  = sign(transcript)(64)               binds both pubkeys, nonces + ephs
+//   FRAME = ChaCha20-Poly1305 record           only after both ends authenticate
 //
-// AUTH signs the whole transcript — DOMAIN ‖ the two (pubkey ‖ nonce) pairs in a
-// canonical order — not just the peer's nonce. Signing the nonce alone would make a
-// node a signing oracle: an attacker could relay a victim's outstanding nonce as its
-// own HELLO, collect the node's signature, and replay it on another connection to
-// impersonate the node. Binding both identities and both nonces ties every signature
-// to the single exchange that produced it, so a harvested one verifies nowhere else.
+// `eph` is a fresh ephemeral X25519 public key, generated per connection. AUTH
+// signs the whole transcript — DOMAIN ‖ the two (pubkey ‖ nonce ‖ eph) triples in
+// a canonical order — not just the peer's nonce. Signing the nonce alone would
+// make a node a signing oracle: an attacker could relay a victim's outstanding
+// nonce as its own HELLO, collect the node's signature, and replay it on another
+// connection to impersonate the node. Binding both identities, both nonces, and
+// both ephemeral keys ties every signature to the single exchange that produced
+// it, so a harvested one verifies nowhere else — and, because the signature
+// covers `eph`, it authenticates the key exchange itself (a SIGMA-style AKE).
+//
+// Once both AUTHs verify, each end computes the ephemeral–ephemeral DH and derives
+// two directional ChaCha20-Poly1305 keys from it and the transcript hash. The
+// canonical lo/hi ordering assigns the directions, so both ends agree without
+// negotiation. Every post-AUTH FRAME is then an AEAD record under the sending
+// direction's key with an implicit monotonic counter as the nonce (never
+// transmitted) and strict counter enforcement on receive — individually
+// authenticated, confidential, replay-protected, and forward-secret because the
+// DH keys are ephemeral. The identity Ed25519 key stays signing-only and never
+// takes a DH role.
 
-import { toHex } from "./util.js";
+import { concatBytes, toHex, writeU32BE } from "./util.js";
 
 /** A peer identity — the node's kernel ed25519 keypair (README §13.6). */
 export interface Identity {
@@ -29,11 +44,24 @@ export interface Identity {
 }
 
 /** The narrow libsodium surface the channel handshake needs: sign/verify the
- *  handshake transcript and a CSPRNG for nonces. Any libsodium build satisfies it
- *  structurally, so the transport need not depend on a specific sodium type. */
+ *  handshake transcript, an ephemeral X25519 key exchange, a KDF (BLAKE2b) for
+ *  the session keys, ChaCha20-Poly1305 for the record layer, and a CSPRNG for
+ *  nonces. Any libsodium build satisfies it structurally, so the transport need
+ *  not depend on a specific sodium type. */
 export interface TransportCrypto {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
+  crypto_box_keypair(): { publicKey: Uint8Array; privateKey: Uint8Array };
+  crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
+  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+  crypto_aead_chacha20poly1305_ietf_encrypt(
+    message: Uint8Array, additional_data: Uint8Array | null, secret_nonce: Uint8Array | null,
+    public_nonce: Uint8Array, key: Uint8Array,
+  ): Uint8Array;
+  crypto_aead_chacha20poly1305_ietf_decrypt(
+    secret_nonce: Uint8Array | null, ciphertext: Uint8Array, additional_data: Uint8Array | null,
+    public_nonce: Uint8Array, key: Uint8Array,
+  ): Uint8Array;
   randombytes_buf(length: number): Uint8Array;
 }
 
@@ -46,11 +74,24 @@ export interface RawChannel {
 }
 
 const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
-const PK_LEN = 32, NONCE_LEN = 32, SIG_LEN = 64;
+const PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
+const HELLO_LEN = PK_LEN + NONCE_LEN + EPH_LEN;
+const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
 const DOMAIN = new TextEncoder().encode("seedkernel-channel-id-v1\0");
-// Cap on frames buffered while the handshake completes. Sends past it drop the
-// oldest — a peer that never authenticates cannot make us hoard memory.
-const MAX_QUEUE = 256;
+// Directional session-key labels (README §13.6): the `lo` end encrypts with
+// k_lo→hi and decrypts with k_hi→lo; the `hi` end mirrors. Distinct constants so
+// the two directions never share a key.
+const LABEL_LO2HI = new TextEncoder().encode("seedkernel-session-lo->hi-v1\0");
+const LABEL_HI2LO = new TextEncoder().encode("seedkernel-session-hi->lo-v1\0");
+// Hard cap on one link frame, matching §17.1; the transports enforce it on the
+// length prefix (TCP) / frame length (WS) before buffering. Exported so every
+// transport caps identically — a frame that crosses one crosses the other.
+export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
+// Total bytes of frames buffered while the handshake completes. Sends past it
+// drop the oldest — a byte bound (not a frame count), so a few large frames
+// cannot evade it, and a peer that never authenticates cannot make us hoard
+// memory.
+const MAX_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export interface PeerLinkOptions {
   channel: RawChannel;
@@ -76,9 +117,17 @@ export class PeerLink {
   private readonly ch: RawChannel;
   private readonly sodium: TransportCrypto;
   private readonly myNonce: Uint8Array;
+  private readonly myEph: { publicKey: Uint8Array; privateKey: Uint8Array };
   private readonly queue: Uint8Array[] = [];
+  private queuedBytes = 0;
   private peerNonce: Uint8Array | null = null;
+  private peerEph: Uint8Array | null = null;
   private closed = false;
+  // Directional record-layer state, set once the session key is derived (onAuth).
+  private sendKey: Uint8Array | null = null;
+  private recvKey: Uint8Array | null = null;
+  private sendCtr = 0;
+  private recvCtr = 0;
 
   constructor(opts: PeerLinkOptions) {
     this.opts = opts;
@@ -86,17 +135,23 @@ export class PeerLink {
     this.sodium = opts.sodium;
     this.weDialed = opts.weDialed;
     this.myNonce = opts.sodium.randombytes_buf(NONCE_LEN);
+    this.myEph = opts.sodium.crypto_box_keypair();
     this.ch.onMessage((m) => this.onMessage(m));
     this.ch.onClose(() => this.onChannelClose());
     this.sendHello();
   }
 
-  /** Queue (pre-auth) or send (post-auth) a Network frame to this peer. */
+  /** Queue (pre-auth) or send (post-auth, as an AEAD record) a Network frame. */
   send(frame: Uint8Array): void {
     if (this.closed) return;
-    if (this.authed) { this.ch.send(this.tag(MSG_FRAME, frame)); return; }
-    if (this.queue.length >= MAX_QUEUE) this.queue.shift();
+    if (this.authed) { this.ch.send(this.tag(MSG_FRAME, this.seal(frame))); return; }
     this.queue.push(frame);
+    this.queuedBytes += frame.length;
+    // Byte-bounded pre-auth buffer: drop the oldest until we are back under the
+    // cap (but always keep the frame just queued).
+    while (this.queuedBytes > MAX_QUEUE_BYTES && this.queue.length > 1) {
+      this.queuedBytes -= this.queue.shift()!.length;
+    }
   }
 
   close(): void {
@@ -114,28 +169,38 @@ export class PeerLink {
   }
 
   private sendHello(): void {
-    const hello = new Uint8Array(PK_LEN + NONCE_LEN);
+    const hello = new Uint8Array(HELLO_LEN);
     hello.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
     hello.set(this.myNonce, PK_LEN);
+    hello.set(this.myEph.publicKey.subarray(0, EPH_LEN), PK_LEN + NONCE_LEN);
     this.ch.send(this.tag(MSG_HELLO, hello));
   }
 
-  /** The bytes both ends sign and verify: DOMAIN followed by each side's
-   *  (pubkey ‖ nonce) block, the two ordered by their bytes so both ends derive an
-   *  identical transcript regardless of who dialed. Requires peerPubkey/peerNonce. */
+  /** My (pubkey ‖ nonce ‖ eph) triple — one side of the transcript. */
+  private myTriple(): Uint8Array {
+    const t = new Uint8Array(HELLO_LEN);
+    t.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
+    t.set(this.myNonce, PK_LEN);
+    t.set(this.myEph.publicKey.subarray(0, EPH_LEN), PK_LEN + NONCE_LEN);
+    return t;
+  }
+
+  /** The peer's (pubkey ‖ nonce ‖ eph) triple. Requires peerPubkey/Nonce/Eph. */
+  private peerTriple(): Uint8Array {
+    const t = new Uint8Array(HELLO_LEN);
+    t.set(this.peerPubkey!, 0);
+    t.set(this.peerNonce!, PK_LEN);
+    t.set(this.peerEph!, PK_LEN + NONCE_LEN);
+    return t;
+  }
+
+  /** The bytes both ends sign and verify: DOMAIN followed by the two triples
+   *  ordered by their bytes so both ends derive an identical transcript regardless
+   *  of who dialed. */
   private transcript(): Uint8Array {
-    const mine = new Uint8Array(PK_LEN + NONCE_LEN);
-    mine.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
-    mine.set(this.myNonce, PK_LEN);
-    const theirs = new Uint8Array(PK_LEN + NONCE_LEN);
-    theirs.set(this.peerPubkey!, 0);
-    theirs.set(this.peerNonce!, PK_LEN);
+    const mine = this.myTriple(), theirs = this.peerTriple();
     const [lo, hi] = bytesCompare(mine, theirs) <= 0 ? [mine, theirs] : [theirs, mine];
-    const msg = new Uint8Array(DOMAIN.length + lo.length + hi.length);
-    msg.set(DOMAIN, 0);
-    msg.set(lo, DOMAIN.length);
-    msg.set(hi, DOMAIN.length + lo.length);
-    return msg;
+    return concatBytes([DOMAIN, lo, hi]);
   }
 
   private onMessage(m: Uint8Array): void {
@@ -144,34 +209,87 @@ export class PeerLink {
     const body = m.subarray(1);
     if (type === MSG_HELLO) this.onHello(body);
     else if (type === MSG_AUTH) this.onAuth(body);
-    else if (type === MSG_FRAME) { if (this.authed) this.opts.onFrame(this.peerId, body.slice()); }
+    else if (type === MSG_FRAME) this.onRecord(body);
   }
 
   private onHello(body: Uint8Array): void {
-    if (this.peerPubkey || body.length < PK_LEN + NONCE_LEN) { this.close(); return; }
+    if (this.peerPubkey || body.length < HELLO_LEN) { this.close(); return; }
     const pubkey = body.slice(0, PK_LEN);
     const peerNonce = body.slice(PK_LEN, PK_LEN + NONCE_LEN);
+    const peerEph = body.slice(PK_LEN + NONCE_LEN, HELLO_LEN);
     const peerId = toHex(pubkey);
     if (this.opts.expectPeerId && peerId !== this.opts.expectPeerId) { this.close(); return; }
     this.peerPubkey = pubkey;
     this.peerNonce = peerNonce;
+    this.peerEph = peerEph;
     this.peerId = peerId;
-    // Authenticate over the full transcript — both pubkeys, both nonces — so this
-    // signature is bound to this exchange and cannot be replayed on another.
+    // Authenticate over the full transcript — both pubkeys, both nonces, both
+    // ephemeral keys — so this signature is bound to this exchange (and this key
+    // exchange) and cannot be replayed on another.
     const sig = this.sodium.crypto_sign_detached(this.transcript(), this.opts.identity.privateKey);
     this.ch.send(this.tag(MSG_AUTH, sig));
   }
 
   private onAuth(sig: Uint8Array): void {
-    if (this.authed || !this.peerPubkey || !this.peerNonce || sig.length < SIG_LEN) { this.close(); return; }
+    if (this.authed || !this.peerPubkey || !this.peerEph || sig.length < SIG_LEN) { this.close(); return; }
     let ok = false;
     try { ok = this.sodium.crypto_sign_verify_detached(sig.slice(0, SIG_LEN), this.transcript(), this.peerPubkey); }
     catch { ok = false; }
     if (!ok) { this.close(); return; }
+    // A malformed/low-order ephemeral key makes the DH throw; treat that as a
+    // failed handshake rather than letting it escape the message callback.
+    try { this.deriveSession(); } catch { this.close(); return; }
     this.authed = true;
     this.opts.onAuth(this.peerId, this);
-    for (const f of this.queue) this.ch.send(this.tag(MSG_FRAME, f));
+    for (const f of this.queue) this.ch.send(this.tag(MSG_FRAME, this.seal(f)));
     this.queue.length = 0;
+    this.queuedBytes = 0;
+  }
+
+  /** Compute the ephemeral–ephemeral DH and derive the two directional session
+   *  keys from it and the transcript hash (README §13.6). The canonical lo/hi
+   *  ordering picks which key encrypts and which decrypts. */
+  private deriveSession(): void {
+    const dh = this.sodium.crypto_scalarmult(this.myEph.privateKey, this.peerEph!);
+    const th = this.sodium.crypto_generichash(32, this.transcript(), null);
+    const kdf = (label: Uint8Array): Uint8Array =>
+      this.sodium.crypto_generichash(KEY_LEN, concatBytes([dh, th, label]), null);
+    const kLoHi = kdf(LABEL_LO2HI), kHiLo = kdf(LABEL_HI2LO);
+    const iAmLo = bytesCompare(this.myTriple(), this.peerTriple()) <= 0;
+    this.sendKey = iAmLo ? kLoHi : kHiLo;
+    this.recvKey = iAmLo ? kHiLo : kLoHi;
+  }
+
+  /** A 12-byte ChaCha20-Poly1305-IETF nonce from an implicit monotonic counter.
+   *  Never transmitted — each direction reconstructs it from its own counter. */
+  private static nonce(ctr: number): Uint8Array {
+    const n = new Uint8Array(NPUB_LEN);
+    writeU32BE(n, 4, Math.floor(ctr / 0x100000000));
+    writeU32BE(n, 8, ctr >>> 0);
+    return n;
+  }
+
+  /** Encrypt a plaintext frame into an AEAD record under the send key + counter. */
+  private seal(frame: Uint8Array): Uint8Array {
+    const ct = this.sodium.crypto_aead_chacha20poly1305_ietf_encrypt(
+      frame, null, null, PeerLink.nonce(this.sendCtr), this.sendKey!,
+    );
+    this.sendCtr++;
+    return ct;
+  }
+
+  /** Decrypt and deliver a post-auth record; any failure (bad tag, wrong
+   *  counter, pre-auth) tears the link down — strict per-direction ordering. */
+  private onRecord(body: Uint8Array): void {
+    if (!this.authed || !this.recvKey || body.length < TAG_LEN) { this.close(); return; }
+    let plain: Uint8Array;
+    try {
+      plain = this.sodium.crypto_aead_chacha20poly1305_ietf_decrypt(
+        null, body.slice(), null, PeerLink.nonce(this.recvCtr), this.recvKey,
+      );
+    } catch { this.close(); return; }
+    this.recvCtr++;
+    this.opts.onFrame(this.peerId, plain);
   }
 
   private onChannelClose(): void {
