@@ -284,8 +284,11 @@ export class PeerLink {
     if (!this.authed || !this.recvKey || body.length < TAG_LEN) { this.close(); return; }
     let plain: Uint8Array;
     try {
+      // No defensive copy: the channel hands each message its own buffer, and decrypt
+      // consumes `body` synchronously (copying into the wasm heap / native Go), so
+      // nothing aliases it afterwards.
       plain = this.sodium.crypto_aead_chacha20poly1305_ietf_decrypt(
-        null, body.slice(), null, PeerLink.nonce(this.recvCtr), this.recvKey,
+        null, body, null, PeerLink.nonce(this.recvCtr), this.recvKey,
       );
     } catch { this.close(); return; }
     this.recvCtr++;
