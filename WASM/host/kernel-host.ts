@@ -432,11 +432,25 @@ export class KernelHost {
     const exps = instance.exports as {
       memory?: WebAssembly.Memory;
       scratch?: WebAssembly.Global;
+      scratchSize?: WebAssembly.Global;
       handle?: (input_len: number) => number;
     };
     if (!exps.memory || !(exps.scratch instanceof WebAssembly.Global) || typeof exps.handle !== "function") return false;
     const scratchOffset = exps.scratch.value as number;
     if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) return false;
+    // A handler may OPTIONALLY export `scratchSize` to declare a bigger I/O region
+    // than the 128 KB default (README §4.1, "set per handler at instantiation") —
+    // e.g. the storage codec reserves a whole chunk's worth of blocks. Honor it only
+    // when it names real, in-bounds memory the handler actually reserved past
+    // `scratch`; otherwise fall back to the default. Never shrink below the default.
+    let scratchSize = DEFAULT_SCRATCH_SIZE;
+    if (exps.scratchSize instanceof WebAssembly.Global) {
+      const declared = exps.scratchSize.value as number;
+      if (typeof declared === "number" && declared >= DEFAULT_SCRATCH_SIZE &&
+          scratchOffset + declared <= exps.memory.buffer.byteLength) {
+        scratchSize = declared;
+      }
+    }
 
     // SetHandler is unconditional at the kernel level — replace whatever is
     // there. The installer's replacement policy was applied before this
@@ -454,7 +468,7 @@ export class KernelHost {
     this.wasmHandlers.set(handlerId, {
       memory: exps.memory,
       scratch: scratchOffset,
-      scratchSize: DEFAULT_SCRATCH_SIZE,
+      scratchSize,
       handle: exps.handle,
       exports: instance.exports,
     });
