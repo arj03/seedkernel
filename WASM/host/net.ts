@@ -77,6 +77,8 @@ interface Pending {
   resolve: (payload: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Re-armed on every frame from `to` (the stall clock — see request()). */
+  expire: () => void;
 }
 
 /** Per-node request/response transport over a Network — a single frame plane. */
@@ -88,8 +90,11 @@ export class Transport {
   constructor(
     readonly peerId: PeerId,
     private readonly net: Network,
-    /** How long to wait for a response before treating the peer as unreachable
-     *  (§13.6). Small in tests; a deployment tunes it against real latency. */
+    /** How long a peer may stay SILENT before a request to it is treated as
+     *  unreachable (§13.6). This is a stall bound, not an absolute deadline: any
+     *  frame arriving from the peer re-arms the clock of every request pending to
+     *  it (see request()). Small in tests; a deployment tunes it against real
+     *  latency. */
     private readonly timeoutMs = 200,
   ) {
     this.net.register(peerId, (from, frame) => this.onFrame(from, frame));
@@ -97,8 +102,15 @@ export class Transport {
 
   onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
 
-  /** Send a typed control request and await the typed response. Rejects on
-   *  timeout (the peer is offline/unreachable). */
+  /** Send a typed control request and await the typed response. Rejects when the
+   *  peer stalls — no frame of any kind from it for timeoutMs. The clock is
+   *  re-armed by every arriving frame from that peer rather than fixed at issue
+   *  time: a bulk fan-out (a PUT's STORE round) hands the socket many queued
+   *  megabytes against one issue instant, so an absolute deadline would fail the
+   *  tail of a transfer that is visibly progressing on a slow link. A dead peer
+   *  still rejects after exactly timeoutMs of silence; a peer that keeps
+   *  responding can never string one request along forever, because each reset
+   *  costs it a delivered frame. */
   request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array> {
     const corr = this.corr++;
     const frame = new Uint8Array(1 + 4 + 1 + payload.length);
@@ -107,11 +119,12 @@ export class Transport {
     frame[5] = type & 255;
     frame.set(payload, 6);
     return new Promise<Uint8Array>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const expire = () => {
         this.pending.delete(corr);
         reject(new Error(`net.send: timeout to ${to.slice(0, 8)} (type ${type})`));
-      }, this.timeoutMs);
-      this.pending.set(corr, { to, resolve, reject, timer });
+      };
+      const timer = setTimeout(expire, this.timeoutMs);
+      this.pending.set(corr, { to, resolve, reject, timer, expire });
       this.net.send(this.peerId, to, frame);
     });
   }
@@ -167,6 +180,14 @@ export class Transport {
   }
 
   private onFrame(from: PeerId, frame: Uint8Array): void {
+    // Liveness proof: any frame from this peer re-arms the stall clock of every
+    // request pending to it (the timeout is silence-based — see request()). O(pending)
+    // per frame, and pending is bounded by the fan-out window, so this stays cheap.
+    for (const p of this.pending.values()) {
+      if (p.to !== from) continue;
+      clearTimeout(p.timer);
+      p.timer = setTimeout(p.expire, this.timeoutMs);
+    }
     const kind = frame[0];
     const corr = readU32BE(frame, 1);
     if (kind === KIND_RES) {

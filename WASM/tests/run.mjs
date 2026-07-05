@@ -1587,6 +1587,41 @@ async function testTransportResponseBinding() {
   console.log("  OK\n");
 }
 
+async function testTransportStallTimeout() {
+  console.log("Test: the request timeout is a stall bound — frames from the peer re-arm it");
+
+  const a = generateKeyPair(), b = generateKeyPair();
+  const A = toHex(a.publicKey), B = toHex(b.publicKey);
+  const net = new LoopbackNetwork();
+  const ta = new Transport(A, net, 250);
+  const tb = new Transport(B, net, 250);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // B answers each request after 150·type ms: 150 / 300 / 450. Issued together at
+  // t≈0, responses 2 and 3 land past the 250 ms timeout — but each arriving
+  // response is a frame from B that re-arms the later requests' stall clocks
+  // (every inter-frame gap is 150 ms < 250 ms), so all three must resolve. This is
+  // the PUT STORE round in miniature: many requests against one issue instant,
+  // with the tail alive only because the transfer is visibly progressing.
+  tb.onRequest(async (_from, type) => { await sleep(150 * type); return new Uint8Array([type]); });
+
+  try {
+    const rs = await Promise.all([1, 2, 3].map((t) => ta.request(B, t, new Uint8Array())));
+    assertEqual(rs.map((r) => r[0]), [1, 2, 3], "a slow-but-streaming peer never times out");
+
+    // A silent peer still fails after ~timeoutMs — the stall clock is a real bound.
+    const t0 = Date.now();
+    let failed = false;
+    try { await ta.request(toHex(generateKeyPair().publicKey), 9, new Uint8Array()); }
+    catch { failed = true; }
+    assert(failed, "a silent peer still times out");
+    assert(Date.now() - t0 < 2000, "silence is detected promptly, not hung");
+  } finally {
+    ta.close(); tb.close();
+  }
+
+  console.log("  OK\n");
+}
+
 async function testWsFragmentation() {
   console.log("Test: WS fragmented messages reassemble (FIN=0 + continuation frames)");
 
@@ -1964,6 +1999,7 @@ await testSyncSafeRealm();
 await testCapBridgeEnforcement();
 await testCallHandlerGuards();
 await testTransportResponseBinding();
+await testTransportStallTimeout();
 await testWsFragmentation();
 await testRedialAfterFailedDial();
 await testSafeRealmSerialization();
