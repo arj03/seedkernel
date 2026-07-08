@@ -153,12 +153,12 @@ func (n *netHost) dial(addr string, raw bool) int64 {
 // __netAccept has created the JS channel — otherwise the read goroutine could
 // deliver a frame before JS has a channel to route it to.
 func (n *netHost) listen(host string, port int, raw bool) (int, error) {
-	// Control sets SO_RCVBUF/SO_SNDBUF on the listening socket BEFORE bind, so every
-	// accepted connection inherits the large buffer at the handshake and negotiates a
-	// big TCP window scale. Raising the buffer on an already-accepted socket (tuneTCP)
-	// is too late to fix the window scale — which is why a high-RTT receive (PUT into a
-	// holder) otherwise stays window-limited even with a large post-accept SO_RCVBUF.
-	lc := net.ListenConfig{Control: controlSocketBuffers}
+	// Accepted sockets keep default buffer options on purpose: a fixed SO_RCVBUF set
+	// pre-bind is clamped to net.core.rmem_max (208 KiB stock) and locks out receive
+	// autotuning, pinning a high-RTT PUT into a holder near a 64 KiB window (~2.5 MB/s
+	// at 26 ms RTT). Defaults autotune to tcp_rmem[2] (~6 MB) and fill the link (see
+	// the note above dialTCP in net.go).
+	var lc net.ListenConfig
 	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
