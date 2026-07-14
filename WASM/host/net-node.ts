@@ -35,6 +35,10 @@ export interface NodeNetworkOptions {
   listen?: { host: string; port: number };
   /** WebSocket listener for browser↔node peers. Port 0 binds an ephemeral port. */
   wsListen?: { host: string; port: number };
+  /** Parallel connections per dialed peer (default 1) — see NodeNetworkCore.
+   *  A native-loader initiator sets this to stripe a bulk PUT across N TCP flows;
+   *  a listen-only holder needs no setting, as inbound multiplicity is automatic. */
+  connsPerPeer?: number;
 }
 
 // ── RawChannel: length-prefixed frames over a TCP socket ──────────────────────

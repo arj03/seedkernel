@@ -44,6 +44,12 @@ export interface NodeNetworkCoreOptions {
   channels: ChannelFactory;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
+  /** How many parallel connections to open per peer we DIAL (default 1). Bulk
+   *  transfers stripe frames round-robin across them so N flows fill a link a
+   *  single TCP flow can't. Inbound multiplicity needs no setting — a node keeps
+   *  every inbound link a peer opens to it, so a holder serves multi-flow initiators
+   *  regardless of its own value. */
+  connsPerPeer?: number;
 }
 
 export class NodeNetworkCore implements Network {
@@ -60,11 +66,13 @@ export class NodeNetworkCore implements Network {
   private readonly ownId: PeerId;
   private sink: ((from: PeerId, frame: Uint8Array) => void) | null = null;
 
-  private readonly links = new Map<PeerId, PeerLink>();      // authenticated, routable
-  private readonly connecting = new Map<PeerId, PeerLink>(); // outbound, pre-auth
-  private readonly inbound = new Set<PeerLink>();            // accepted, pre-auth
-  private readonly addrs = new Map<PeerId, PeerAddr>();      // how to reach a peer
-  private readonly authWaiters = new Set<() => void>();      // ready() callers
+  private readonly links = new Map<PeerId, PeerLink[]>();      // authenticated, routable (1..N per peer)
+  private readonly connecting = new Map<PeerId, PeerLink[]>(); // outbound, pre-auth
+  private readonly inbound = new Set<PeerLink>();              // accepted, pre-auth
+  private readonly addrs = new Map<PeerId, PeerAddr>();        // how to reach a peer
+  private readonly authWaiters = new Set<() => void>();        // ready() callers
+  private readonly rr = new Map<PeerId, number>();             // round-robin send cursor per peer
+  private readonly conns: number;                             // connsPerPeer for outbound dials
 
   private readonly listenOpt?: { host: string; port: number };
   private readonly wsListenOpt?: { host: string; port: number };
@@ -76,6 +84,12 @@ export class NodeNetworkCore implements Network {
     this.ownId = toHex(opts.identity.publicKey);
     this.listenOpt = opts.listen;
     this.wsListenOpt = opts.wsListen;
+    this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
+  }
+
+  // Small helpers for the per-peer link arrays.
+  private static push(m: Map<PeerId, PeerLink[]>, peerId: PeerId, link: PeerLink): void {
+    const a = m.get(peerId); if (a) a.push(link); else m.set(peerId, [link]);
   }
 
   // ── Network interface ──────────────────────────────────────────────────────
@@ -93,10 +107,16 @@ export class NodeNetworkCore implements Network {
   send(_from: PeerId, to: PeerId, frame: Uint8Array): void {
     if (to === this.ownId) return;
     this.framesSent++;
-    const link = this.links.get(to) ?? this.connecting.get(to) ?? this.dial(to);
-    if (link) link.send(frame);
-    // No link and no address → silently dropped, exactly as LoopbackNetwork drops
-    // a frame to an unknown peer; the Transport's timeout handles the fallout.
+    // Prefer authenticated links; fall back to a pre-auth one (it buffers until the
+    // handshake lands), dialing if we hold none. Stripe round-robin across whatever
+    // pool we route over so a bulk transfer fans out across every parallel flow.
+    let pool = this.links.get(to);
+    if (!pool || pool.length === 0) pool = this.connecting.get(to);
+    if (!pool || pool.length === 0) { this.dial(to); pool = this.connecting.get(to); }
+    if (!pool || pool.length === 0) return; // no link and no address → dropped; Transport times out
+    const i = (this.rr.get(to) ?? 0) % pool.length;
+    this.rr.set(to, i + 1);
+    pool[i].send(frame);
   }
 
   // ── teach the network how to reach a peer ──────────────────────────────────
@@ -120,11 +140,10 @@ export class NodeNetworkCore implements Network {
    *  moment its last handshake lands. */
   async ready(timeoutMs = 5000): Promise<void> {
     const targets = [...this.addrs.keys()].filter((p) => p !== this.ownId);
-    // Skip peers already dialing (in `connecting`) as well as connected ones —
-    // a second dial would orphan the in-flight PeerLink and open a redundant
-    // socket, and the double-self-dial defeats canonicalKeep's tie-break.
-    for (const p of targets) if (!this.links.has(p) && !this.connecting.has(p)) this.dial(p);
-    const allUp = (): boolean => targets.every((p) => this.links.has(p));
+    // dial() is idempotent — it tops each peer up to connsPerPeer outbound and never
+    // over-dials — so calling it per target is safe and completes any partial fan-out.
+    for (const p of targets) this.dial(p);
+    const allUp = (): boolean => targets.every((p) => (this.links.get(p)?.length ?? 0) >= 1);
     if (allUp()) return;
     await new Promise<void>((resolve) => {
       const done = (): void => { clearTimeout(timer); this.authWaiters.delete(check); resolve(); };
@@ -136,29 +155,35 @@ export class NodeNetworkCore implements Network {
 
   /** Tear down every connection and listener. */
   close(): void {
-    for (const l of this.links.values()) l.close();
-    for (const l of this.connecting.values()) l.close();
+    for (const arr of this.links.values()) for (const l of arr) l.close();
+    for (const arr of this.connecting.values()) for (const l of arr) l.close();
     for (const l of this.inbound) l.close();
     this.links.clear();
     this.connecting.clear();
     this.inbound.clear();
+    this.rr.clear();
     this.channels.close();
   }
 
   // ── link management ────────────────────────────────────────────────────────
-  private dial(peerId: PeerId): PeerLink | null {
+  /** Top a dialed peer up to connsPerPeer outbound connections. Idempotent: it only
+   *  opens the shortfall (existing links + in-flight dials counted), so a redundant
+   *  call — from ready() or a send with a not-yet-auth pool — never over-dials. */
+  private dial(peerId: PeerId): void {
     const addr = this.addrs.get(peerId);
-    if (!addr) return null;
-    const channel = this.channels.connect(addr);
-    const link = new PeerLink({
-      channel, identity: this.identity, sodium: this.sodium,
-      weDialed: true, expectPeerId: peerId,
-      onAuth: (pid, l) => this.promote(pid, l),
-      onFrame: (pid, frame) => this.deliver(pid, frame),
-      onClose: (l) => this.forget(l),
-    });
-    this.connecting.set(peerId, link);
-    return link;
+    if (!addr) return;
+    const have = (this.links.get(peerId)?.length ?? 0) + (this.connecting.get(peerId)?.length ?? 0);
+    for (let n = have; n < this.conns; n++) {
+      const channel = this.channels.connect(addr);
+      const link = new PeerLink({
+        channel, identity: this.identity, sodium: this.sodium,
+        weDialed: true, expectPeerId: peerId,
+        onAuth: (pid, l) => this.promote(pid, l),
+        onFrame: (pid, frame) => this.deliver(pid, frame),
+        onClose: (l) => this.forget(l),
+      });
+      NodeNetworkCore.push(this.connecting, peerId, link);
+    }
   }
 
   private accept(channel: RawChannel): void {
@@ -176,17 +201,28 @@ export class NodeNetworkCore implements Network {
    *  peer, resolving a double-connect by a rule both ends compute identically. */
   private promote(peerId: PeerId, link: PeerLink): void {
     this.inbound.delete(link);
-    if (this.connecting.get(peerId) === link) this.connecting.delete(peerId);
-    const existing = this.links.get(peerId);
-    if (existing && existing !== link) {
-      // Two connections to the same peer (each dialed the other). Keep the one
-      // whose *dialer* holds the smaller pubkey — a deterministic choice both
-      // ends agree on, so exactly one survives.
-      if (this.canonicalKeep(link)) { existing.close(); this.links.set(peerId, link); }
-      else { link.close(); }
+    NodeNetworkCore.drop(this.connecting, peerId, link);
+    const arr = this.links.get(peerId) ?? [];
+    // A symmetric double-connect — OUR outbound and THEIR inbound for the same peer,
+    // each end having dialed the other — is ONE logical link carried twice, so keep
+    // exactly one, chosen by a rule both ends compute identically (canonicalKeep).
+    // Deliberate parallel connections are all one direction (all dialed, or all
+    // accepted), so `weDialed` matches across them and they never trip this — they
+    // coexist as the N flows we opened on purpose.
+    const rival = arr.find((l) => l.weDialed !== link.weDialed);
+    if (rival) {
+      if (this.canonicalKeep(link)) {
+        rival.close();
+        const i = arr.indexOf(rival); if (i >= 0) arr.splice(i, 1);
+        arr.push(link);
+      } else {
+        link.close();
+        return;
+      }
     } else {
-      this.links.set(peerId, link);
+      arr.push(link);
     }
+    this.links.set(peerId, arr);
     for (const w of [...this.authWaiters]) w();
   }
 
@@ -210,9 +246,26 @@ export class NodeNetworkCore implements Network {
     // registered in `connecting` under the *target* peerId before the peer's
     // HELLO ever arrives (link.peerId is still ""), so a dial that dies pre-
     // handshake (ECONNREFUSED, expectPeerId mismatch) must still be removed —
-    // otherwise send() returns the dead link forever and never redials.
-    for (const [pid, l] of this.connecting) if (l === link) this.connecting.delete(pid);
-    for (const [pid, l] of this.links) if (l === link) this.links.delete(pid);
+    // otherwise send() routes to the dead link forever and never redials. Only the
+    // peer whose LAST link drops loses its rr cursor; losing one of several parallel
+    // flows leaves the peer routable over the rest.
+    for (const pid of [...this.connecting.keys()]) if (NodeNetworkCore.drop(this.connecting, pid, link)) break;
+    for (const pid of [...this.links.keys()]) {
+      if (NodeNetworkCore.drop(this.links, pid, link)) {
+        if (!this.links.has(pid)) this.rr.delete(pid);
+        break;
+      }
+    }
+  }
+
+  /** Remove link from its peer's array, dropping the map entry when it empties.
+   *  Returns true if the link was found (and thus removed). */
+  private static drop(m: Map<PeerId, PeerLink[]>, peerId: PeerId, link: PeerLink): boolean {
+    const a = m.get(peerId); if (!a) return false;
+    const i = a.indexOf(link); if (i < 0) return false;
+    a.splice(i, 1);
+    if (a.length === 0) m.delete(peerId);
+    return true;
   }
 }
 

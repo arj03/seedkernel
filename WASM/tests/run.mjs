@@ -1693,6 +1693,201 @@ async function testRedialAfterFailedDial() {
   console.log("  OK\n");
 }
 
+// ─── Test: connsPerPeer opens N parallel flows and stripes across them ──────
+//
+// The multi-flow upload feature (net-route / net-ws): a dialer opens connsPerPeer
+// parallel links to one peer and stripes frames round-robin over them, so N TCP
+// flows fill a high-RTT/lossy link a single CUBIC flow can't. We drive two
+// NodeNetworkCores through an in-memory ChannelFactory (no sockets) so we can
+// count the dials and the per-link sends directly:
+//   • connsPerPeer=3 opens exactly 3 dials, and ready() is idempotent (no over-dial);
+//   • post-auth frames stripe evenly round-robin across the 3 links;
+//   • the peer stays reachable while ≥1 link survives — losing one flow is not a down.
+
+async function testConnsPerPeerFanout() {
+  console.log("Test: connsPerPeer opens N parallel flows and stripes frames round-robin");
+  const { NodeNetworkCore } = await imp("build/host/net-route.js");
+
+  // An in-memory RawChannel pair: whole-message, async delivery, closing either
+  // end notifies both. Each end tallies how many frames it has carried.
+  function rawPair() {
+    const mk = () => ({
+      twin: null, onMsg: null, onCls: null, open: true, sends: 0,
+      send(bytes) {
+        this.sends++;
+        const t = this.twin, copy = bytes.slice();
+        queueMicrotask(() => { if (t.open) t.onMsg?.(copy); });
+      },
+      onMessage(cb) { this.onMsg = cb; },
+      onClose(cb) { this.onCls = cb; },
+      close() {
+        if (!this.open) return;
+        this.open = false; this.twin.open = false;
+        queueMicrotask(() => { this.onCls?.(); this.twin.onCls?.(); });
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
+  }
+
+  let onAccept = null;
+  const serverFactory = {
+    connect() { throw new Error("server does not dial"); },
+    listen(_tcp, _ws, cb) { onAccept = cb; return Promise.resolve({ port: 1, wsPort: 0 }); },
+    close() {},
+  };
+  const clientLinks = []; // every client-side channel we dialed, in dial order
+  const clientFactory = {
+    connect(_addr) { const [c, s] = rawPair(); clientLinks.push(c); queueMicrotask(() => onAccept(s)); return c; },
+    listen() { return Promise.resolve({ port: 0, wsPort: 0 }); },
+    close() {},
+  };
+
+  const idS = generateKeyPair(), idC = generateKeyPair();
+  const server = new NodeNetworkCore({ identity: idS, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
+  await server.start();
+  const got = [];
+  server.register(toHex(idS.publicKey), (_from, frame) => got.push(frame));
+
+  const client = new NodeNetworkCore({ identity: idC, sodium, channels: clientFactory, connsPerPeer: 3 });
+  client.register(toHex(idC.publicKey), () => {});
+  client.addPeerAddr(toHex(idS.publicKey), { host: "x", port: 1, transport: "tcp" });
+  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+
+  try {
+    await client.ready(2000);
+    assertEqual(clientLinks.length, 3, "connsPerPeer=3 opens exactly 3 parallel dials");
+
+    // ready() resolves on the FIRST link up; let the other two finish their handshake.
+    await sleep(50);
+    // A second ready() must not over-dial — the shortfall is zero once all three are up.
+    await client.ready(2000);
+    assertEqual(clientLinks.length, 3, "a second ready() is idempotent — no redundant dials");
+
+    // Round-robin striping: 6 post-auth frames over 3 links → 2 each (each PeerLink.send
+    // is exactly one channel send post-auth, so per-link tallies read the routing directly).
+    const base = clientLinks.map((l) => l.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
+    await sleep(50);
+    const deltas = clientLinks.map((l, i) => l.sends - base[i]);
+    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 parallel links");
+    assertEqual(got.length, 6, "all 6 striped frames are delivered to the peer");
+
+    // Resilience: drop one link — the peer is still reachable over the other two.
+    clientLinks[0].close();
+    await sleep(50);
+    const before = got.length;
+    for (let i = 0; i < 4; i++) sendC(new Uint8Array([9]));
+    await sleep(50);
+    assertEqual(got.length - before, 4, "losing one of three flows leaves the peer reachable over the rest");
+  } finally {
+    client.close(); server.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: WsNetwork connsPerPeer — N parallel WS flows, up/down fire once ──
+//
+// The browser-edge counterpart to testConnsPerPeerFanout: WsNetwork (what p2p.html
+// and p2p-cli dial with) opens connsPerPeer WebSockets to one peer and stripes over
+// them. The cohort/quorum logic keys off onPeerUp/onPeerDown, so those must fire
+// exactly once per peer regardless of how many parallel links back it. We drive the
+// client through an in-memory WsLike factory whose twin runs a hand-wired server
+// PeerLink, so no real socket is opened:
+//   • connsPerPeer=3 opens 3 WebSockets but onPeerUp fires once;
+//   • frames stripe evenly round-robin across the 3 links;
+//   • dropping links keeps the peer up until the LAST one goes — onPeerDown fires once.
+
+async function testWsNetworkFanout() {
+  console.log("Test: WsNetwork connsPerPeer — 3 parallel WS flows, onPeerUp/Down fire once");
+  const { WsNetwork, WsChannel } = await imp("build/host/net-ws.js");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // An in-memory WsLike pair (numeric readyState, as WsChannel checks === OPEN):
+  // whole-message async delivery, open on next tick, close notifies both ends.
+  function wsPair() {
+    const mk = () => ({
+      binaryType: "blob", readyState: 0 /* CONNECTING */, sends: 0,
+      _l: { open: [], close: [], error: [], message: [] }, twin: null,
+      addEventListener(t, cb) { this._l[t].push(cb); },
+      send(bytes) {
+        this.sends++;
+        const t = this.twin, buf = bytes.slice().buffer;
+        queueMicrotask(() => { if (t.readyState === 1) for (const cb of t._l.message) cb({ data: buf }); });
+      },
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3; for (const cb of this._l.close) cb();
+        const t = this.twin; if (t.readyState !== 3) { t.readyState = 3; for (const cb of t._l.close) cb(); }
+      },
+      open() { this.readyState = 1; for (const cb of this._l.open) cb(); },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
+  }
+
+  const idS = generateKeyPair(), idC = generateKeyPair();
+  const clientWs = [];   // client-side WsLike per parallel link, in dial order
+  const serverGot = [];  // frames the server received
+  let serverAuthed = 0;  // server-side auths (one per accepted link)
+
+  // Each dial: make a pair, wrap the server twin in a server-side PeerLink, and open
+  // both ends next tick so the buffered HELLOs flush and the handshake runs.
+  const factory = (_url) => {
+    const [cli, srv] = wsPair();
+    clientWs.push(cli);
+    new PeerLink({
+      channel: new WsChannel(srv), identity: idS, sodium, weDialed: false,
+      onAuth: () => { serverAuthed++; }, onFrame: (_pid, f) => serverGot.push(f), onClose: () => {},
+    });
+    queueMicrotask(() => { cli.open(); srv.open(); });
+    return cli;
+  };
+
+  let ups = 0, downs = 0;
+  const client = new WsNetwork({
+    identity: idC, sodium, webSocketFactory: factory, connsPerPeer: 3,
+    onPeerUp: () => { ups++; }, onPeerDown: () => { downs++; },
+  });
+  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+
+  try {
+    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
+    await sleep(80); // let all three handshakes complete
+    assertEqual(clientWs.length, 3, "connsPerPeer=3 opens exactly 3 WebSockets");
+    assertEqual(serverAuthed, 3, "all three parallel links authenticate on the server");
+    assertEqual(ups, 1, "onPeerUp fires once, when the peer first becomes reachable");
+    assertEqual(client.linkedPeers().length, 1, "the three links are one logical peer");
+
+    // Round-robin striping: 6 post-auth frames over 3 links → 2 each.
+    const base = clientWs.map((w) => w.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
+    await sleep(50);
+    const deltas = clientWs.map((w, i) => w.sends - base[i]);
+    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 WS links");
+    assertEqual(serverGot.length, 6, "all 6 striped frames reach the peer");
+
+    // Drop two of three links: the peer stays up (no onPeerDown yet) and still routes.
+    clientWs[0].close();
+    clientWs[1].close();
+    await sleep(50);
+    assertEqual(downs, 0, "losing 2 of 3 flows does not down the peer");
+    const before = serverGot.length;
+    for (let i = 0; i < 3; i++) sendC(new Uint8Array([9]));
+    await sleep(50);
+    assertEqual(serverGot.length - before, 3, "the peer is still reachable over the surviving flow");
+
+    // The last link drops → onPeerDown fires exactly once.
+    clientWs[2].close();
+    await sleep(50);
+    assertEqual(downs, 1, "onPeerDown fires once, only when the last flow drops");
+    assertEqual(client.linkedPeers().length, 0, "the peer is no longer linked once every flow is gone");
+  } finally {
+    client.close();
+  }
+
+  console.log("  OK\n");
+}
+
 async function testSafeRealmSerialization() {
   console.log("Test: concurrent call()s on one safe-js realm serialize (no __arg clobber)");
 
@@ -2002,6 +2197,8 @@ await testTransportResponseBinding();
 await testTransportStallTimeout();
 await testWsFragmentation();
 await testRedialAfterFailedDial();
+await testConnsPerPeerFanout();
+await testWsNetworkFanout();
 await testSafeRealmSerialization();
 await testPerf10k();
 
