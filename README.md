@@ -94,7 +94,7 @@ This limit applies to the **outermost** envelope on the wire. For signature wrap
 
 The 64 KB limit is a protocol constant, not a per-deployment configuration knob. Keeping it fixed avoids interoperability splits where one node accepts messages another rejects.
 
-**Install messages** (handled by the installer, §7) carry a name plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites — including post-quantum ones — install through the same mechanism and follow the same limit. That is tighter than it looks, but tenable: an installed suite is **verify-only** (§6.6 — sign never ships, and the hash op is optional and refusable), and verify-only WASM builds of the NIST PQ schemes (ML-DSA, Falcon, SLH-DSA) run to tens of kilobytes. The 278 KB libsodium blob of §11.2 is not the yardstick — that is the sumo build backing the host's entire raw-byte crypto surface (§13.1), not a single suite. A suite that genuinely cannot fit is seeded host-side via `SetHandler` (§3.1), which is a host call rather than a wire message and so is not subject to the envelope cap — exactly how the genesis suite arrives (§10). A suite is pure computation (§6.4), so the only thing forgone on that path is the installer's author-of-record (§7.1) — the same trade the genesis suite already makes.
+**Install messages** (handled by the installer, §7) carry a name plus a WASM module inside their payload, and so are subject to the same 64 KB cap. The reference implementation modules are well within budget (see §11.2 for sizes). Signature suites — including post-quantum ones — install through the same mechanism and follow the same limit. That is tighter than it looks, but tenable: an installed suite is **verify-only** (§6.6 — the handler exposes a single verify op; sign and hash never ship), and verify-only WASM builds of the NIST PQ schemes (ML-DSA, Falcon, SLH-DSA) run to tens of kilobytes. The 278 KB libsodium blob of §11.2 is not the yardstick — that is the sumo build backing the host's entire raw-byte crypto surface (§13.1), not a single suite. A suite that genuinely cannot fit is seeded host-side via `SetHandler` (§3.1), which is a host call rather than a wire message and so is not subject to the envelope cap — exactly how the genesis suite arrives (§10). A suite is pure computation (§6.4), so the only thing forgone on that path is the installer's author-of-record (§7.1) — the same trade the genesis suite already makes.
 
 ### 2.3 Maximum signature wrapping depth
 
@@ -318,7 +318,7 @@ An algorithm suite is a bundle of:
 | `hash(data) → bytes` | Produce a name from a canonical string | SHA-3-256 → 32 bytes |
 | `verify(pubkey, signature, data) → bool` | Verify a message signature | Ed25519 |
 
-Each suite declares fixed sizes (key length, sig max length, hash length) used for sanity-checking the wrapper payload. Signing is a sender-side operation and lives in the host (no WASM export — see §6.6).
+Each suite declares fixed sizes (key length, sig max length, hash length) used for sanity-checking the wrapper payload. Only `verify` is exposed as a WASM handler op (§6.6): signing is a sender-side operation that lives in the host, and id derivation hashes host-side too (§5.1, §6.2) — the suite handler runs neither.
 
 ### 6.2 The Genesis suite (algo_id = 0x0000)
 
@@ -413,12 +413,13 @@ stack while the actual message handler runs: [A, B]   (A pushed first, B on top)
 
 ### 6.6 Suite handler contract
 
-A suite is a standard scratch-ABI handler (§4): it exports `memory`, `scratch`, and `handle`, reads its input from the scratch region, and writes its response there — no allocator, no pointer arguments, no host-side suite-dispatch import. The signature module invokes it with `kernel.call(suite_slot_name, request)`. The request's first byte selects the operation; multi-argument primitives are length-prefixed into the single buffer, big-endian (§17), exactly like the `signature` wrapper payload (§6.3):
+A suite is a standard scratch-ABI handler (§4): it exports `memory`, `scratch`, and `handle`, reads its input from the scratch region, and writes its response there — no allocator, no pointer arguments, no host-side suite-dispatch import. The signature module invokes it with `kernel.call(suite_slot_name, request)`. A suite performs exactly one operation — **verify** — so the request carries no op selector; its fields are length-prefixed into the single buffer, big-endian (§17), exactly like the `signature` wrapper payload (§6.3):
 
-| Op | Request (at scratch) | Response |
-| --- | --- | --- |
-| `0x00` verify | `[pubkey_len u16][pubkey][sig_len u16][sig][data ..]` | `[valid u8]` (1 = valid, 0 = invalid) |
-| `0x01` hash *(optional)* | `[data ..]` | hash bytes — only used if the host routes id derivation through the suite. The reference host hashes directly via its bundled libsodium (§5.1) and never issues op `0x01`, so genesis suites may reject it; non-genesis suites may implement it for hosts that do. |
+| Request (at scratch) | Response |
+| --- | --- |
+| `[pubkey_len u16][pubkey][sig_len u16][sig][data ..]` | `[valid u8]` (1 = valid, 0 = invalid) |
+
+Verify is the suite's whole contract. Id derivation is **not** routed through the suite: the reference host hashes directly via its bundled libsodium (§5.1), and the genesis hash is a host-side constant (§6.2), so a suite never exposes a hash. If a suite ABI ever has to grow a second operation, that is a *new contract at a new slot version* — the slot name pins `…signature.suite.v1:` (§6.4), so a `v2` suite lives at a distinct slot and the two can never collide. No in-band op or version byte is needed: the slot you call already names the ABI you get.
 
 The `u16` length prefixes accommodate post-quantum suites whose public keys and signatures run to multiple kilobytes (§6.5). The `data` field is the full signed preimage `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (§6.3): the signature module prepends the domain constant and the outer fields (including the 2-byte `signer_len`, which keeps the preimage self-delimiting) to the inner envelope it already parsed, then hands the whole thing to the suite. The suite stays oblivious to the structure — it verifies `sig` over `data` under `pubkey`, nothing more — so domain separation and outer-field binding live entirely in the signature module and every suite gets them for free.
 

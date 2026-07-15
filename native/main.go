@@ -241,17 +241,14 @@ func suiteSlotName(algoID int) []byte {
 
 // genesisSuiteVerify services the genesis suite slot (algo_id 0x0000 = Ed25519 +
 // SHA-3-256) with libsodium, so the genesis verify is the same binary as the
-// browser. Standard scratch-ABI verify request (README §6.6):
-//   [0x00][pk_len u16][pk][sig_len u16][sig][data ..] -> [valid u8]
+// browser. A suite verifies, nothing else, so the request has no op selector (§6.6):
+//   [pk_len u16][pk][sig_len u16][sig][data ..] -> [valid u8]
 // `data` is the full signed preimage the signature module assembled
 // (DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner, §6.3); the suite just verifies
 // sig over data under pk, oblivious to its structure.
 func genesisSuiteVerify(req []byte) []byte {
 	invalid := []byte{0}
-	if len(req) < 1 || req[0] != 0x00 {
-		return invalid
-	}
-	o := 1
+	o := 0
 	if o+2 > len(req) {
 		return invalid
 	}
@@ -280,7 +277,7 @@ func genesisSuiteVerify(req []byte) []byte {
 }
 
 // env.suite_verify — the signature module's suite dispatch (README §6.6). The
-// module built the op-byte request at [reqP, reqL) in bootstrap memory; derive
+// module built the verify request at [reqP, reqL) in bootstrap memory; derive
 // the suite's slot name from algoID and hand the request to the ordinary
 // handler installed there (genesis natively; other suites as installed wasm).
 // An unknown algo_id (no handler at the slot) returns 0, same as a suite

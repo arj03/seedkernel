@@ -11,7 +11,7 @@
 //       3. host reads inner bytes from bootstrap memory, dispatches through kernel
 //       4. host calls bootstrap.pop_signer() after inner dispatch returns
 //   - Services the signature module's suite_verify import (§6.6) by dispatching
-//     the op-byte request to the ordinary handler at the algo's suite slot
+//     the verify request to the ordinary handler at the algo's suite slot
 //     (§6.4) — genesis included, seeded as a host-serviced suite handler
 //   - Provides kernel.call / kernel.caller imports to dynamic handlers (§4.2)
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
@@ -41,7 +41,6 @@ const SUITE_SLOT_PREFIX = "seedkernel.signature.suite.v1:";
 // cannot verify in another.
 const DOMAIN_ENV = new TextEncoder().encode("seedkernel-envelope-sig-v1\0");
 
-const SUITE_OP_VERIFY = 0x00;
 
 /** Lowercase 4-hex-digit encoding of a u16 algo_id for suite slot names (§6.4). */
 function algoIdHex(algoId: number): string {
@@ -189,8 +188,8 @@ export class KernelHost {
     // ── load bootstrap.wasm (signature module) ────────────────────────
     const bootstrapImports: WebAssembly.Imports = {
       env: {
-        // README §6.6: the signature module builds the op-byte suite request
-        // (verify op, then length-prefixed pubkey/sig/data) in its own memory
+        // README §6.6: the signature module builds the suite verify request
+        // (length-prefixed pubkey/sig/data, no op selector) in its own memory
         // and passes it here with the algo_id. The host derives the suite's slot
         // name (§6.4) and dispatches the request to whatever ordinary handler is
         // installed there — genesis included, which is seeded as a host-serviced
@@ -575,8 +574,10 @@ export class KernelHost {
    *  any ordinary handler, either by the signature module's suite dispatch or
    *  by a plain `kernel.call`. Standard scratch-ABI request/response (§6.6):
    *
-   *    op 0x00 verify: [0x00][pk_len u16][pk][sig_len u16][sig][data ..] → [valid u8]
-   *    op 0x01 hash:   refused — the reference host derives ids directly (§6.6).
+   *    verify: [pk_len u16][pk][sig_len u16][sig][data ..] → [valid u8]
+   *
+   *  Verify is the suite's whole contract (§6.6) — no op selector, and the
+   *  reference host derives ids directly, so there is no hash op.
    *
    *  `data` is the full signed preimage the signature module assembled
    *  (`DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope`, §6.3); the suite
@@ -590,8 +591,7 @@ export class KernelHost {
    *  the guarantee explicit and independent of the verify path. */
   private readonly _genesisSuiteHandler: Handler = (_name, req) => {
     const INVALID = new Uint8Array([0]);
-    if (req.length < 1 || req[0] !== SUITE_OP_VERIFY) return INVALID;
-    let o = 1;
+    let o = 0;
     if (o + 2 > req.length) return INVALID;
     const pkLen = (req[o] << 8) | req[o + 1]; o += 2;
     if (pkLen !== GENESIS_PUBKEY_LEN || o + pkLen > req.length) return INVALID;
@@ -652,7 +652,7 @@ export class KernelHost {
   }
 
   /** Service the signature module's suite dispatch (§6.6). The module built the
-   *  op-byte request at `[reqPtr, reqLen)` in bootstrap memory; the host derives
+   *  verify request at `[reqPtr, reqLen)` in bootstrap memory; the host derives
    *  the suite's slot name from `algoId` and hands the request to whatever
    *  ordinary handler is installed there. An unknown algo_id (no handler at the
    *  slot) or an unexpected response drops (returns 0), exactly as a suite that

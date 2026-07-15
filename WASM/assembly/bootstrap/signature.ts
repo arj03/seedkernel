@@ -13,11 +13,11 @@
 
 // Verify a signature under the suite for `algoId` (README §6.4, §6.6). A suite
 // is an ordinary handler installed at the slot `hash(SUITE_SLOT_PREFIX +
-// algo_id_hex)`; the host derives that slot name and dispatches the op-byte
+// algo_id_hex)`; the host derives that slot name and dispatches the verify
 // request this module builds at [reqPtr, reqLen) to the handler there — genesis
 // (algo_id 0x0000) included, seeded as a host-serviced suite handler at boot.
-// The request is the standard scratch-ABI verify request (§6.6):
-//   [0x00][pubkey_len u16][pubkey][sig_len u16][sig][data ..]
+// A suite verifies, nothing else, so the request carries no op selector (§6.6):
+//   [pubkey_len u16][pubkey][sig_len u16][sig][data ..]
 // where `data` is the full signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖
 // signer ‖ inner_envelope (§6.3). The signer is length-prefixed so the preimage is
 // self-delimiting — a variable-length-key suite cannot re-split (signer, inner) to
@@ -27,8 +27,6 @@
 declare function suiteVerify(algoId: i32, reqPtr: i32, reqLen: i32): i32;
 
 // ─── constants ───────────────────────────────────────────────────────────
-
-const SUITE_OP_VERIFY: u8 = 0x00;
 
 // Max nested `signature` wrappers per inbound message (README §2.3). Bounds
 // the per-message verify cost so a single 64 KB envelope cannot force hundreds
@@ -165,8 +163,8 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   const innerLen = payload.length - o;
   if (innerLen <= 0) return 0;
 
-  // Build the op-byte suite request (§6.6):
-  //   [0x00][signer_len u16][signer][sig_len u16][sig][data]
+  // Build the suite verify request (§6.6):
+  //   [signer_len u16][signer][sig_len u16][sig][data]
   // where data is the signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖
   // inner (§6.3). Assembling data here — prepending the domain and the outer fields to
   // the inner envelope — is what gives every suite domain separation and outer-field
@@ -174,10 +172,9 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   // prefixed inside `data` too, so the (signer, inner) boundary is unambiguous and a
   // future variable-length-key suite cannot splice a different split onto the same bytes.
   const dataLen = DOMAIN_ENV.length + 2 + 2 + signerLen + innerLen;
-  const reqLen = 1 + 2 + signerLen + 2 + sigLen + dataLen;
+  const reqLen = 2 + signerLen + 2 + sigLen + dataLen;
   const req = new Uint8Array(reqLen);
   let w: i32 = 0;
-  req[w++] = SUITE_OP_VERIFY;
   req[w++] = ((signerLen >> 8) & 0xff) as u8;
   req[w++] = (signerLen & 0xff) as u8;
   req.set(payload.subarray(signerOffset, signerOffset + signerLen), w); w += signerLen;
