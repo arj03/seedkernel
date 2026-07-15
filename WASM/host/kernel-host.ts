@@ -389,7 +389,7 @@ export class KernelHost {
    *  dispatch, or a host/guest-originated frame) returns the single byte
    *  [0x00] (name_len = 0). Only the immediate caller is ever exposed — the
    *  deeper chain is deliberately unreachable so a handler cannot treat a
-   *  non-immediate frame as authoritative (§4.2, §8.2). */
+   *  non-immediate frame as authoritative (§4.2, §9). */
   private _serializeImmediateCaller(): Uint8Array {
     const n = this.callerStack.length ? this.callerStack[this.callerStack.length - 1] : null;
     if (!n) return new Uint8Array([0]);
@@ -675,22 +675,15 @@ export class KernelHost {
    *  pipeline (or by a host/guest-originated frame). Host-side equivalent of
    *  the kernel.caller WASM import (§4.2). Only the immediate caller is exposed;
    *  the deeper chain is deliberately unreachable so a bridge cannot authorize
-   *  on a non-immediate frame (§8.2). */
+   *  on a non-immediate frame (§9). */
   get currentCaller(): Uint8Array | null {
     if (this.callerStack.length === 0) return null;
     return this.callerStack[this.callerStack.length - 1] ?? null;
   }
 
-  /** Return the capability IDs declared at install time by the handler
-   *  registered under `name`, or [] for unknown / SetHandler-installed
-   *  slots (§8.3). Convenience wrapper for the equivalent kernel.call to
-   *  `installer.caps_of`. */
-  getHandlerDeclaredCaps(name: Uint8Array): readonly Uint8Array[] {
-    return this._installer ? this._installer.capsOf(name) : [];
-  }
-
-  /** Read-only access to the install record at `name`, or null. Convenience
-   *  wrapper for `installer.lookup`. */
+  /** Read-only access to the install record at `name`, or null. Host-side
+   *  read of the installer's records — the policy callback already receives the
+   *  resolved `existing` record, so there is no wire query (README §7.6). */
   lookupInstall(name: Uint8Array): InstallRecord | null {
     return this._installer ? this._installer.lookup(name) : null;
   }
@@ -710,7 +703,7 @@ export class KernelHost {
 
   /** Host-level handler management (README §3.1). Installs or replaces a
    *  handler unconditionally. SetHandler-installed handlers are immune to
-   *  installer state by construction (§8.3) — any matching install record
+   *  installer state by construction (§9) — any matching install record
    *  is cleared as a side effect. */
   setHandler(name: Uint8Array, handlerId: number): void {
     const ptr = this.writeToKernel(name);
@@ -721,9 +714,8 @@ export class KernelHost {
     this.nameToHandlerId.set(key, handlerId);
     this.handlerIdToName.set(handlerId, name.slice());
     // SetHandler entries are bootstrap-only by construction (§3.1) — clear
-    // any stale install record at this slot so a future lookup / caps_of
-    // can't return stale data for brand-new bytes (§3.1 "Replacing installer-
-    // managed names").
+    // any stale install record at this slot so a future lookup can't return
+    // stale data for brand-new bytes (§3.1 "Replacing installer-managed names").
     if (this._installer) this._installer._onKernelSlotMutated(name);
   }
 
@@ -770,20 +762,16 @@ export class KernelHost {
     this.blockedFromCall.add(handlerId);
   }
 
-  /** Register the Installer (README §7). Wires the install message handler,
-   *  the installer.lookup query, and the installer.caps_of query. Without
-   *  calling this, the deployment is frozen — no message-driven installs.
-   *  Returns the Installer instance for further configuration. */
-  registerInstaller(
-    installName: Uint8Array,
-    lookupName: Uint8Array,
-    capsOfName: Uint8Array,
-  ): Installer {
+  /** Register the Installer (README §7). Wires the (blocked) install message
+   *  handler — the installer's whole wire surface. Install records are read
+   *  host-side via `lookupInstall`; there is no `installer.lookup` /
+   *  `installer.caps_of` query message (README §7.6). Without calling this, the
+   *  deployment is frozen — no message-driven installs. Returns the Installer
+   *  instance for further configuration. */
+  registerInstaller(installName: Uint8Array): Installer {
     const ih = new Installer(this, installName);
     const id = this.register(installName, ih.handler);
     this.blockFromCall(id);
-    this.register(lookupName, ih.lookupHandler);
-    this.register(capsOfName, ih.capsOfHandler);
     this._installer = ih;
     return ih;
   }
@@ -800,42 +788,24 @@ export class KernelHost {
   /** Build an install payload (README §7.2):
    *    [seq u32 BE]
    *    [name_len u8][name ..]
-   *    [caps_count u8][caps...]    each cap = [cap_id_len u8][cap_id ..]
    *    [wasm]
    *
-   *  `seq` is the §4.4 replay-protection sequence number for the signer.
-   *  Pass an empty caps array for pure-computation handlers. */
+   *  `seq` is the §4.4 replay-protection sequence number for the signer. */
   encodeInstallPayload(
     seq: number,
     name: Uint8Array,
-    caps: Uint8Array[],
     wasmBytes: Uint8Array,
   ): Uint8Array {
     if (name.length === 0 || name.length > 255)
       throw new Error("encodeInstallPayload: name length must be 1..255");
     if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
       throw new Error("encodeInstallPayload: seq must fit in u32");
-    if (caps.length > 255)
-      throw new Error("encodeInstallPayload: caps count must be 0..255");
-    for (const cap of caps) {
-      if (cap.length > 255)
-        throw new Error("encodeInstallPayload: each cap_id length must be 0..255");
-    }
-    let headerLen = 4;                   // seq
-    headerLen += 1 + name.length;        // name_len + name
-    headerLen += 1;                      // caps_count
-    for (const cap of caps) headerLen += 1 + cap.length;
+    const headerLen = 4 + 1 + name.length; // seq + name_len + name
     const out = new Uint8Array(headerLen + wasmBytes.length);
     let o = 0;
     writeU32BE(out, o, seq); o += 4;
     out[o++] = name.length;
     out.set(name, o); o += name.length;
-    out[o++] = caps.length;
-    for (const cap of caps) {
-      out[o++] = cap.length;
-      out.set(cap, o);
-      o += cap.length;
-    }
     out.set(wasmBytes, o);
     return out;
   }
@@ -894,7 +864,7 @@ export class KernelHost {
     if (this.blockedFromCall.has(hid)) return null;
     if (this.callDepth >= MAX_CALL_DEPTH) return null;
     // Push an anonymous caller frame so the target (and any bridge doing the
-    // §8.2 capability check) sees "no installed caller" rather than a stale
+    // §9 caller-pinning check) sees "no installed caller" rather than a stale
     // frame from an outer dispatch — the host/guest caller has no kernel name.
     this.callerStack.push(null);
     this.callDepth++;
@@ -943,8 +913,7 @@ export class KernelHost {
   }
 
   /** Direct host-side access to the installer (read-only). Most code should
-   *  go through the convenience wrappers (`lookupInstall`, `getHandlerDeclaredCaps`)
-   *  or kernel.call to the lookup/caps_of names. */
+   *  go through the `lookupInstall` convenience wrapper. */
   get installer(): Installer | null {
     return this._installer;
   }

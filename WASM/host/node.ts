@@ -65,7 +65,6 @@ export {
 export type {
   ApproveInstall,
   FirstInstallPolicy,
-  AcknowledgeCaps,
   InstallRecord,
 } from "./installer.js";
 export {

@@ -162,11 +162,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const host = await KernelHost.load(opts.kernelBytes as BufferSource, opts.bootstrapBytes as BufferSource, sodium);
 
   host.registerSignature(host.deriveBootstrapName("signature"));
-  host.registerInstaller(
-    host.deriveBootstrapName("install"),
-    host.deriveBootstrapName("installer.lookup"),
-    host.deriveBootstrapName("installer.caps_of"),
-  );
+  host.registerInstaller(host.deriveBootstrapName("install"));
   // Omitted policy ⇒ deny-all (empty author set): the node boots and serves but
   // nothing installs. A *provided* file is still parsed strictly (≥1 author) so a
   // typo'd allowed-keys.json fails loudly rather than silently widening trust.

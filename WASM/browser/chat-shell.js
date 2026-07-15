@@ -92,12 +92,10 @@ const host = await loadKernelHost(
 const signatureName       = host.deriveBootstrapName("signature");
 const signatureSignerName = host.deriveBootstrapName("signature.signer");
 const installName         = host.deriveBootstrapName("install");
-const lookupName          = host.deriveBootstrapName("installer.lookup");
-const capsOfName          = host.deriveBootstrapName("installer.caps_of");
 
 host.registerSignature(signatureName);
 host.registerSignerQuery(signatureSignerName);   // apps query the signer
-host.registerInstaller(installName, lookupName, capsOfName);
+host.registerInstaller(installName);
 
 // ── install-approval policy ────────────────────────────────────────────
 //
@@ -109,7 +107,7 @@ host.registerInstaller(installName, lookupName, capsOfName);
 // before dispatching the signed envelope. Anything else is dropped.
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
-host.setApproveInstall((name, author, bytesHash, _wasm, _caps, existing) => {
+host.setApproveInstall((name, author, bytesHash, _wasm, existing) => {
   const hex = bytesToHex(bytesHash);
   if (existing) {
     if (existing.author.algoId !== author.algoId) return false;
@@ -356,18 +354,9 @@ function parseInstallPayload(payload) {
   const nameLen = payload[o++];
   if (nameLen === 0 || payload.length < o + nameLen) return null;
   const name = payload.subarray(o, o + nameLen); o += nameLen;
-  if (payload.length < o + 1) return null;
-  const capsCount = payload[o++];
-  const caps = [];
-  for (let i = 0; i < capsCount; i++) {
-    if (payload.length < o + 1) return null;
-    const capLen = payload[o++];
-    if (payload.length < o + capLen) return null;
-    caps.push(payload.subarray(o, o + capLen)); o += capLen;
-  }
   const wasm = payload.subarray(o);
   if (wasm.length === 0) return null;
-  return { seq, name, caps, wasm };
+  return { seq, name, wasm };
 }
 
 function unwrapSealed(sealedBytes) {
@@ -383,7 +372,10 @@ function unwrapSealed(sealedBytes) {
     authorPk: wrapper.signer,
     authorAlgo: wrapper.algo,
     installPayload: inner.payload,
-    bytesHash: host.genesisHash(inner.payload),
+    // bytes_hash is the installer's content id for the module (§7.1):
+    // genesisHash(wasm), the same value the approve callback receives — so it
+    // keys pendingApprovals and doubles as the artifact's display hash.
+    bytesHash: host.genesisHash(install.wasm),
     install,
   };
 }
@@ -391,9 +383,8 @@ function unwrapSealed(sealedBytes) {
 // ── installing an app (local-authored) ─────────────────────────────────
 async function buildSealedInstall(meta, wasmBytes) {
   const handlerName = appHandlerName(meta.id);
-  const uiName = appUiBridgeName(meta.id);
   const installPayload = host.encodeInstallPayload(
-    nextSeq(), handlerName, [uiName], wasmBytes);
+    nextSeq(), handlerName, wasmBytes);
   return host.wrapAndEncode(
     myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installName, installPayload);
 }
@@ -432,13 +423,11 @@ async function applySealedInstall(sealedBytes) {
     description: meta.description || "",
     authorPk: peeked.authorPk.slice(),
     authorAlgo: peeked.authorAlgo,
+    // Content hash of the WASM module (§7.1: genesisHash(wasm)). Stable across
+    // re-signings / re-seqs by different authors, so two peers offering the same
+    // compiled artifact display the same hash — it is now the installer's own
+    // bytes_hash, so nothing separate to track.
     bytesHash: peeked.bytesHash,
-    // Content hash of just the WASM payload. Stable across re-signings /
-    // re-seqs by different authors, so two peers offering the same compiled
-    // artifact display the same hash. `bytesHash` (above) covers the full
-    // install payload — author seq and caps — and so changes per
-    // install message.
-    wasmHash: host.genesisHash(peeked.install.wasm),
     sealedBytes: sealedBytes.slice(),
     handlerName,
     uiHtml,
@@ -674,7 +663,6 @@ async function handleOffer(sealedBytes, fromPkHex) {
   pendingOffers.set(hex, {
     sealedBytes: sealedBytes.slice(),
     peeked: { ...peeked, meta },
-    wasmHash: host.genesisHash(peeked.install.wasm),
     fromPkHex,
   });
   renderOfferList();
@@ -768,7 +756,7 @@ function buildAppRow(rec) {
   meta.innerHTML =
     `<b>id</b> ${rec.id} · <b>author</b> ${authorHex.slice(0, 8)}` +
     (isMine ? " (you)" : "") +
-    ` · <b>wasm</b> ${bytesToHex(rec.wasmHash).slice(0, 12)}`;
+    ` · <b>wasm</b> ${bytesToHex(rec.bytesHash).slice(0, 12)}`;
   li.appendChild(meta);
 
   const btns = document.createElement("div");
@@ -869,7 +857,7 @@ function buildOfferRow(hex, offer) {
   m.innerHTML =
     `<b>id</b> ${meta.id} · <b>author</b> ${bytesToHex(offer.peeked.authorPk).slice(0, 8)}` +
     ` · <b>from</b> ${offer.fromPkHex.slice(0, 8)}` +
-    ` · <b>wasm</b> ${bytesToHex(offer.wasmHash).slice(0, 12)}`;
+    ` · <b>wasm</b> ${bytesToHex(offer.peeked.bytesHash).slice(0, 12)}`;
   li.appendChild(m);
   const btns = document.createElement("div");
   btns.className = "app-row-buttons";

@@ -78,22 +78,20 @@ async function makeHost(approveInstall = () => true) {
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
 
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(approveInstall);
 
-  return { host, signatureName, installName, lookupName, capsOfName };
+  return { host, signatureName, installName };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
 // Encode an install + sign it, returning the wire bytes ready for dispatch.
-function buildInstall(host, signSk, signPk, installName, seq, targetName, caps, wasm) {
-  const payload = host.encodeInstallPayload(seq, targetName, caps, wasm);
+function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
+  const payload = host.encodeInstallPayload(seq, targetName, wasm);
   return host.wrapAndEncode(signSk, signPk, CURRENT_VERSION, installName, payload);
 }
 
@@ -109,7 +107,7 @@ async function testFullLifecycle() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   // Install the chat handler under the author's scoped name.
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), chatTextName, [], forwarderBytes));
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "chat.text installed");
 
   // The installer should have a record for it.
@@ -234,17 +232,15 @@ async function testRefuseOverlayBootstrapSlot() {
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const seq = makeSeq();
   // Try to overlay the signature slot (seeded by SetHandler at bootstrap).
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    signatureName, [], forwarderBytes));
+    signatureName, forwarderBytes));
 
   // signature must still verify — if it had been overwritten with the
   // forwarder, the next signed message would fail.
@@ -264,25 +260,22 @@ async function testApproveInstallRejects() {
   console.log("Test: approveInstall can reject an install");
 
   let seen = null;
-  const approve = (name, author, bytesHash, _wasm, caps, existing) => {
-    seen = { name, author, bytesHash, caps: [...caps], existing };
+  const approve = (name, author, bytesHash, _wasm, existing) => {
+    seen = { name, author, bytesHash, existing };
     return false;
   };
   const { host, installName } = await makeHost(approve);
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
-  const netCapId = host.deriveBootstrapName("cap.net");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [netCapId], forwarderBytes));
+    chatTextName, forwarderBytes));
 
   assert(!host.isRegistered(chatTextName), "install rejected");
   assert(seen !== null, "approveInstall was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
-  assertEqual(seen.caps.length, 1, "callback saw 1 declared cap");
-  assertEqual(seen.caps[0], netCapId, "callback saw the cap value");
   assertEqual(seen.author.publicKey, pk, "callback saw the author pubkey");
   assert(seen.existing === null, "no existing record for first install");
 
@@ -290,11 +283,11 @@ async function testApproveInstallRejects() {
 }
 
 async function testApproveInstallReceivesBytesHash() {
-  console.log("Test: approveInstall receives genesis-hash of FULL install payload (§7.1)");
+  console.log("Test: approveInstall receives genesisHash(wasm) as bytes_hash (§7.1)");
 
   let seenHash = null;
   let seenPayloadLen = 0;
-  const approve = (_n, _a, bytesHash, wasm, _c, _e) => {
+  const approve = (_n, _a, bytesHash, wasm, _e) => {
     seenHash = bytesHash;
     seenPayloadLen = wasm.length; // for sanity
     return true;
@@ -305,14 +298,16 @@ async function testApproveInstallReceivesBytesHash() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   const seq = makeSeq();
-  const payload = host.encodeInstallPayload(seq(pk), chatTextName, [], forwarderBytes);
+  const payload = host.encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
   host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, installName, payload));
   assert(host.isRegistered(chatTextName), "install accepted");
 
   assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
-  // The hash must cover the ENTIRE install payload, not just the WASM.
-  const expected = host.genesisHash(payload);
-  assertEqual(seenHash, expected, "bytes_hash = genesisHash(install_payload)");
+  // The hash is the content id of the WASM module — the same identifier a
+  // manifest's modules[].hash and a policy allowlist use (§7.1), independent of
+  // seq or the install framing.
+  const expected = host.genesisHash(forwarderBytes);
+  assertEqual(seenHash, expected, "bytes_hash = genesisHash(wasm)");
   assert(seenPayloadLen === forwarderBytes.length, "wasm bytes passed to callback are unchanged");
 
   console.log("  OK\n");
@@ -329,7 +324,7 @@ async function testNoApproveInstallDropsAll() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], forwarderBytes));
+    chatTextName, forwarderBytes));
 
   assert(!host.isRegistered(chatTextName), "install dropped");
 
@@ -344,10 +339,8 @@ async function testReferencePolicyUpgradeRules() {
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
   const seq = makeSeq();
@@ -359,7 +352,7 @@ async function testReferencePolicyUpgradeRules() {
 
   // A claims sharedName (first install — accepted).
   host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], forwarderBytes));
+    sharedName, forwarderBytes));
   assert(host.isRegistered(sharedName), "A's first install accepted");
   const recA = host.lookupInstall(sharedName);
   assert(recA !== null, "record exists after A's install");
@@ -367,7 +360,7 @@ async function testReferencePolicyUpgradeRules() {
 
   // B tries to install over the same name — rejected (different author).
   host.dispatch(buildInstall(host, bSk, bPk, installName, seq(bPk),
-    sharedName, [], forwarderBytes));
+    sharedName, forwarderBytes));
   const recAfterB = host.lookupInstall(sharedName);
   assertEqual(recAfterB.author.publicKey, aPk, "different-author install rejected, A still owns");
   assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
@@ -375,78 +368,18 @@ async function testReferencePolicyUpgradeRules() {
   // A re-installs (same author) — accepted; record updates in place. There is
   // no parent/lineage gate anymore (§7.4): same author is the whole rule.
   host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], forwarderBytes));
+    sharedName, forwarderBytes));
   const recAfterUpgrade = host.lookupInstall(sharedName);
   assert(recAfterUpgrade !== null, "upgrade left a record");
   assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
-  assert(
-    JSON.stringify([...recAfterUpgrade.bytesHash]) !== JSON.stringify([...aBytesHash]),
-    "bytes_hash changed (new payload, new seq)"
-  );
-
-  console.log("  OK\n");
-}
-
-// ─── Test: reference policy capability acknowledgement (§7.4 rule 3) ─────
-
-async function testReferencePolicyCapAcknowledgement() {
-  console.log("Test: reference policy gates capability grants on acknowledgement (§7.4 rule 3)");
-
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
-  host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
-
-  // Acknowledgement hook records what it was asked and answers per `ackAnswer`.
-  let ackAdded = null;
-  let ackAnswer = false;
-  host.setApproveInstall(referencePolicy(host, () => true, (_name, _author, added) => {
-    ackAdded = added.map((c) => [...c]);
-    return ackAnswer;
-  }));
-
-  const seq = makeSeq();
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const netCap = host.deriveBootstrapName("cap.net");
-  const fsCap  = host.deriveBootstrapName("cap.fs");
-
-  // 1. Caps-free first install → accepted with no ack prompt.
-  const pureName = host.deriveBootstrapName("test.pure");
-  ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), pureName, [], forwarderBytes));
-  assert(host.isRegistered(pureName), "caps-free first install accepted");
-  assert(ackAdded === null, "no ack prompt for caps-free install");
-
-  // 2. First install requesting a cap → ack denies → dropped.
-  const capName = host.deriveBootstrapName("test.capped");
-  ackAnswer = false; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], forwarderBytes));
-  assert(!host.isRegistered(capName), "cap-requesting install dropped when ack denies");
-  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw the requested cap");
-
-  // 3. Same install, ack approves → accepted, cap recorded.
-  ackAnswer = true; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], forwarderBytes));
-  assert(host.isRegistered(capName), "cap-requesting install accepted when ack approves");
-  const rec1 = host.lookupInstall(capName);
-  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "one cap recorded");
-
-  // 4. Same-author upgrade keeping the SAME cap → auto-accepted, no ack prompt.
-  ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], forwarderBytes));
-  assert(host.isRegistered(capName), "same-cap upgrade accepted");
-  assert(ackAdded === null, "no ack prompt when caps unchanged on upgrade");
-  const rec2 = host.lookupInstall(capName);
-
-  // 5. Same-author upgrade BROADENING caps (add fs) → needs ack; denied → dropped.
-  ackAnswer = false; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap, fsCap], forwarderBytes));
-  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw only the newly-added cap");
-  assertEqual(ackAdded[0], [...fsCap], "added cap is fs, not the already-held net");
-  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "broadening dropped — caps unchanged");
+  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm under a
+  // fresh seq keeps the same content id — the identifier tracks the binary, not the
+  // signed install message. (A different wasm would hash differently; §7.1 makes the
+  // content id, a manifest's modules[].hash, and a policy allowlist all one value.)
+  assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
+    "bytes_hash unchanged across a same-wasm re-install");
+  assertEqual(recAfterUpgrade.bytesHash, host.genesisHash(forwarderBytes),
+    "bytes_hash = genesisHash(wasm)");
 
   console.log("  OK\n");
 }
@@ -457,7 +390,7 @@ async function testInstallReplayRejected() {
   console.log("Test: install handler rejects wire-byte replay (§4.4)");
 
   let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _c, _e) => {
+  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
     approveCalls++;
     return true;
   });
@@ -466,7 +399,7 @@ async function testInstallReplayRejected() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   // Original install with seq=1.
-  const wire = buildInstall(host, sk, pk, installName, 1, chatTextName, [], forwarderBytes);
+  const wire = buildInstall(host, sk, pk, installName, 1, chatTextName, forwarderBytes);
   host.dispatch(wire);
   assert(host.isRegistered(chatTextName), "first install succeeded");
   assertEqual(approveCalls, 1, "approve called once");
@@ -481,100 +414,41 @@ async function testInstallReplayRejected() {
   assertEqual(approveCalls, 1, "approve NOT re-prompted on replay");
 
   // Fresh install at seq=2 still works.
-  host.dispatch(buildInstall(host, sk, pk, installName, 2, chatTextName, [], forwarderBytes));
+  host.dispatch(buildInstall(host, sk, pk, installName, 2, chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "fresh higher-seq install succeeded");
   assertEqual(approveCalls, 2, "approve called for legitimate retry");
 
   console.log("  OK\n");
 }
 
-// ─── Test: installer.lookup query handler ───────────────────────────────
+// ─── Test: installer.lookup (host-side) returns the install record ───────
 
-async function testInstallerLookupQuery() {
-  console.log("Test: installer.lookup returns the install record over kernel.call");
-
-  const { host, installName, lookupName } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
-
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], forwarderBytes));
-  assert(host.isRegistered(chatTextName), "install ok");
-
-  // Exercise the WASM-facing lookup handler via the forwarder fixture. The
-  // forwarder calls kernel.call(target, payload); we make the target the
-  // installer.lookup name and the payload a [len][name] lookup query, then
-  // read back the response from the forwarder's private memory.
-  const lookupQuery = new Uint8Array(1 + chatTextName.length);
-  lookupQuery[0] = chatTextName.length;
-  lookupQuery.set(chatTextName, 1);
-
-  // Install a fresh forwarder under a scoped name so it can kernel.call into
-  // installer.lookup.
-  const forwarderName = host.deriveScopedName("test.forwarder", pk);
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    forwarderName, [], forwarderBytes));
-  assert(host.isRegistered(forwarderName), "forwarder installed");
-
-  // Payload format the forwarder expects: [target_name_len][target_name][forward_data]
-  const fwdPayload = new Uint8Array(1 + lookupName.length + lookupQuery.length);
-  fwdPayload[0] = lookupName.length;
-  fwdPayload.set(lookupName, 1);
-  fwdPayload.set(lookupQuery, 1 + lookupName.length);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, fwdPayload));
-
-  // Read back the response the forwarder stored.
-  const respPtr = host.callDynamicHandlerI32(forwarderName, "last_resp_ptr");
-  const respLen = host.callDynamicHandlerI32(forwarderName, "last_resp_len");
-  assert(respLen > 0, "installer.lookup returned a non-empty response");
-  const resp = host.readDynamicHandlerMemory(forwarderName, respPtr, respLen);
-  assertEqual(resp[0], 1, "response starts with [1] (record present)");
-
-  // Lookup for an unknown name returns [0].
-  const unknown = host.deriveBootstrapName("does.not.exist");
-  const unknownQuery = new Uint8Array(1 + unknown.length);
-  unknownQuery[0] = unknown.length;
-  unknownQuery.set(unknown, 1);
-  const fwdPayload2 = new Uint8Array(1 + lookupName.length + unknownQuery.length);
-  fwdPayload2[0] = lookupName.length;
-  fwdPayload2.set(lookupName, 1);
-  fwdPayload2.set(unknownQuery, 1 + lookupName.length);
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, fwdPayload2));
-  const respLen2 = host.callDynamicHandlerI32(forwarderName, "last_resp_len");
-  const respPtr2 = host.callDynamicHandlerI32(forwarderName, "last_resp_ptr");
-  const resp2 = host.readDynamicHandlerMemory(forwarderName, respPtr2, respLen2);
-  assertEqual(resp2[0], 0, "unknown name returns [0]");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: installer.caps_of returns declared caps ───────────────────────
-
-async function testInstallerCapsOf() {
-  console.log("Test: installer.caps_of reflects declared capabilities");
+async function testInstallerLookupHostSide() {
+  console.log("Test: host-side lookupInstall returns the install record (§7.6)");
 
   const { host, installName } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
-  const netCapId = host.deriveBootstrapName("cap.net");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [netCapId], forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "install ok");
 
-  const declared = host.getHandlerDeclaredCaps(chatTextName);
-  assertEqual(declared.length, 1, "one declared cap");
-  assertEqual(declared[0], netCapId, "declared cap is netCapId");
+  // The installer is a pure sink: records are read host-side, not via a wire
+  // query. The policy callback already receives the resolved record; bridges
+  // pin kernel.caller instead of consulting a capability index.
+  const rec = host.lookupInstall(chatTextName);
+  assert(rec !== null, "record present for an installed name");
+  assertEqual(rec.author.publicKey, pk, "record author matches signer");
+  assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
 
-  // SetHandler-installed handlers have no record — caps_of returns [].
-  const sigName = host.deriveBootstrapName("signature");
-  assertEqual(host.getHandlerDeclaredCaps(sigName).length, 0,
-    "bootstrap handler has no declared caps (§8.3)");
+  // Unknown / SetHandler-seeded names have no record.
+  assert(host.lookupInstall(host.deriveBootstrapName("does.not.exist")) === null,
+    "unknown name has no record");
+  assert(host.lookupInstall(host.deriveBootstrapName("signature")) === null,
+    "SetHandler-seeded bootstrap handler has no record");
 
   console.log("  OK\n");
 }
@@ -585,7 +459,7 @@ async function testInstallerRemove() {
   console.log("Test: installer.remove clears record and kernel slot, replay still blocked");
 
   let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _c, _e) => {
+  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
     approveCalls++;
     return true;
   });
@@ -595,7 +469,7 @@ async function testInstallerRemove() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "install ok");
   assert(host.lookupInstall(chatTextName) !== null, "record present");
 
@@ -608,7 +482,7 @@ async function testInstallerRemove() {
 
   // Fresh install at higher seq succeeds.
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
@@ -627,11 +501,11 @@ async function testCallerStackFormat() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    forwarderName, [], forwarderBytes));
+    forwarderName, forwarderBytes));
   assert(host.isRegistered(forwarderName), "forwarder installed");
 
   // A probe handler reads its immediate caller each time it's called. Only the
-  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §8.2).
+  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §9).
   const probeName = host.deriveBootstrapName("probe.caller");
   let seenImmediate = null;
   host.register(probeName, (_n, _payload, h) => {
@@ -655,38 +529,35 @@ async function testCallerStackFormat() {
   console.log("  OK\n");
 }
 
-// ─── Test: Bridge cap check end-to-end ──────────────────────────────────
+// ─── Test: Bridge authorizes by pinning kernel.caller ───────────────────
 
-async function testBridgeCapabilityCheckEndToEnd() {
-  console.log("Test: Bridge enforces caller capability check end-to-end (§8.2)");
+async function testBridgeCallerPinning() {
+  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §9)");
 
   const { host, installName } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatNoCapName   = host.deriveScopedName("chat.nocap",   pk);
-  const chatWithCapName = host.deriveScopedName("chat.withcap", pk);
-  const netSendName     = host.deriveBootstrapName("cap.net.send");
-  const netCapId        = host.deriveBootstrapName("cap.net");
+  const chatPinnedName = host.deriveScopedName("chat.pinned", pk);
+  const chatOtherName  = host.deriveScopedName("chat.other",  pk);
+  const netSendName    = host.deriveBootstrapName("cap.net.send");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatNoCapName, [], forwarderBytes));
+    chatPinnedName, forwarderBytes));
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatWithCapName, [netCapId], forwarderBytes));
-  assert(host.isRegistered(chatNoCapName), "chat.nocap installed");
-  assert(host.isRegistered(chatWithCapName), "chat.withcap installed");
+    chatOtherName, forwarderBytes));
+  assert(host.isRegistered(chatPinnedName), "chat.pinned installed");
+  assert(host.isRegistered(chatOtherName), "chat.other installed");
 
-  // The bridge: §8.2 preamble. Use the immediate caller (last entry of stack).
+  // The bridge pins exactly the caller name it serves (the chat shell's UI-bridge
+  // pattern, generalized): it compares kernel.caller against chatPinnedName and
+  // refuses anyone else. There is no capability index to consult — kernel.caller
+  // is the single bridge-authorization primitive.
+  const bytesEq = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
   let bridgeCalls = 0;
   host.register(netSendName, (_n, _p, h) => {
     bridgeCalls++;
-    const callerName = h.currentCaller;
-    if (!callerName) return null;
-    const callerCaps = h.getHandlerDeclaredCaps(callerName);
-    const hasNet = callerCaps.some(
-      (cap) => cap.length === netCapId.length && cap.every((b, i) => b === netCapId[i])
-    );
-    if (!hasNet) return null;
+    if (!bytesEq(h.currentCaller, chatPinnedName)) return null;
     return new Uint8Array([1]);
   });
 
@@ -699,15 +570,15 @@ async function testBridgeCapabilityCheckEndToEnd() {
     return out;
   }
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatNoCapName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 1, "bridge invoked for no-cap caller");
-  assertEqual(host.callDynamicHandlerI32(chatNoCapName, "last_resp_len"), 0,
-    "no-cap caller: bridge rejected (no response)");
+  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatOtherName, makeForward(netSendName)));
+  assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
+  assertEqual(host.callDynamicHandlerI32(chatOtherName, "last_resp_len"), 0,
+    "unpinned caller: bridge rejected (no response)");
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatWithCapName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 2, "bridge invoked for with-cap caller");
-  assertEqual(host.callDynamicHandlerI32(chatWithCapName, "last_resp_len"), 1,
-    "with-cap caller: bridge returned 1 byte");
+  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatPinnedName, makeForward(netSendName)));
+  assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
+  assertEqual(host.callDynamicHandlerI32(chatPinnedName, "last_resp_len"), 1,
+    "pinned caller: bridge returned 1 byte");
 
   console.log("  OK\n");
 }
@@ -736,7 +607,7 @@ async function testBlockFromCall() {
   const seq = makeSeq();
   const fwdName = host.deriveScopedName("test.forwarder", pk);
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    fwdName, [], forwarderBytes));
+    fwdName, forwarderBytes));
   assert(host.isRegistered(fwdName), "forwarder installed");
 
   const fwdPayload = new Uint8Array(1 + mutateName.length);
@@ -1150,7 +1021,7 @@ async function testPolicy() {
     host.setApproveInstall(buildApproveInstall(host, parsePolicy(policyJson)));
     const seq = makeSeq();
     const name = host.deriveScopedName("mod", author.publicKey);
-    host.dispatch(buildInstall(host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, [], forwarderBytes));
+    host.dispatch(buildInstall(host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes));
     const rec = host.lookupInstall(name);
     return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
   };
@@ -1207,7 +1078,7 @@ async function testShellBoot() {
     const installName = shell.host.deriveBootstrapName("install");
     const name = shell.host.deriveScopedName("mod", author.publicKey);
     shell.installFromEnvelope(buildInstall(
-      shell.host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, [], forwarderBytes,
+      shell.host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes,
     ));
     assert(shell.host.isRegistered(name), "an allowed signed install lands on the booted shell");
   } finally {
@@ -1239,7 +1110,7 @@ async function testBundle() {
     const kernelName = h.deriveScopedName("codec", author.publicKey);
     const install = buildInstall(
       h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
-      seq(author.publicKey), kernelName, [], forwarderBytes,
+      seq(author.publicKey), kernelName, forwarderBytes,
     );
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
@@ -1551,7 +1422,7 @@ async function testCallHandlerGuards() {
     "callHandler refuses the signature wrapper");
 
   // A normal handler still works, and sees an *empty* immediate caller — not a
-  // stale frame from some outer dispatch (the §8.2 confused-deputy check).
+  // stale frame from some outer dispatch (the §9 confused-deputy check).
   let sawCaller = "unset";
   const echoName = host.deriveBootstrapName("test.echo2");
   host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
@@ -2340,7 +2211,7 @@ async function testBundleCorruptNewerRollback() {
     const kernelName = h.deriveScopedName("codec", author.publicKey);
     const install = buildInstall(
       h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
-      seq(author.publicKey), kernelName, [], forwarderBytes,
+      seq(author.publicKey), kernelName, forwarderBytes,
     );
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
@@ -2402,13 +2273,11 @@ await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
 await testReferencePolicyUpgradeRules();
-await testReferencePolicyCapAcknowledgement();
 await testInstallReplayRejected();
-await testInstallerLookupQuery();
-await testInstallerCapsOf();
+await testInstallerLookupHostSide();
 await testInstallerRemove();
 await testCallerStackFormat();
-await testBridgeCapabilityCheckEndToEnd();
+await testBridgeCallerPinning();
 await testBlockFromCall();
 await testWrapRejectsInvalidKeySizes();
 await testFs();

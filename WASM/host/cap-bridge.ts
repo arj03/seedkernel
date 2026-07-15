@@ -171,7 +171,7 @@ export interface CapBridgeDeps {
   /** The allowed op set, expanded from the manifest's declared cap domains
    *  (README §13.2, `opsForCaps` — not from `ops`, which is documentation-only).
    *  When present, any op outside the set is refused — the guest analogue of the
-   *  §8.2 bridge check. Omitted = unrestricted (a trusted host-side caller that
+   *  §9 bridge check. Omitted = unrestricted (a trusted host-side caller that
    *  holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
