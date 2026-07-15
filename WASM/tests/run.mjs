@@ -762,40 +762,15 @@ async function testFs() {
   console.log("  OK\n");
 }
 
-// ─── Test: Transport.requestMany scatter-gather (step 7) ────────────────
-
-async function testRequestMany() {
-  console.log("Test: Transport.requestMany — scatter-gather with partial results (step 7)");
-
-  const a = generateKeyPair(), b = generateKeyPair();
-  const net = new LoopbackNetwork();
-  const ta = new Transport(toHex(a.publicKey), net, 40);
-  const tb = new Transport(toHex(b.publicKey), net, 40);
-  tb.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
-
-  try {
-    const dead = toHex(generateKeyPair().publicKey); // never registered → unreachable
-    const results = await ta.requestMany([toHex(b.publicKey), dead], 7, new Uint8Array([3, 4]));
-    assertEqual(results.length, 2, "one result per input peer, order preserved");
-    assert(results[0].ok, "the live peer answered ok");
-    assert(bytesEqual(results[0].bytes, new Uint8Array([7, 3, 4])), "the live peer echoed type+payload");
-    assert(!results[1].ok, "the unreachable peer comes back ok:false (partial, not a reject)");
-    assertEqual(results[1].bytes.length, 0, "the unreachable peer carries no bytes");
-  } finally {
-    ta.close(); tb.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 19) ─────────
+// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 8) ──────────
 //
 // The per-peer fan-out: a DISTINCT payload per peer, concurrently. This is the
 // primitive the sync storage guest drives for placement/gather (one batched cap
-// per round) instead of a host-side Promise.all.
+// per round) instead of a host-side Promise.all. An all-payloads-equal broadcast
+// is just N identical entries.
 
 async function testSendMany() {
-  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 19)");
+  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 8)");
 
   const u32 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
   const rd32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
@@ -851,7 +826,7 @@ async function testSendMany() {
     tBridge.close();
 
     // 3) A guest-controlled count not backed by bytes is a clean throw, never an
-    //    unbounded host loop (the same defensive check NET_REQUEST_MANY makes).
+    //    unbounded host loop.
     let threw = false;
     try { await bridge(CAP.NET_SEND_MANY, concatBytes([u32(2), entry(b.publicKey, 7, U(1))])); }
     catch { threw = true; }
@@ -1120,7 +1095,7 @@ async function testBundle() {
         install: "codec.install", kernelName: toHex(kernelName),
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      ops: { PING: 1 }, caps: [],
+      caps: [],
     };
     wf(pjoin(dir, "codec.wasm"), forwarderBytes);
     wf(pjoin(dir, "codec.install"), install);
@@ -1367,7 +1342,7 @@ async function testCapBridgeEnforcement() {
   console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async () => new Uint8Array(), requestMany: async () => [], sendMany: async () => [] };
+  const stubTransport = { request: async () => new Uint8Array(), sendMany: async () => [] };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
@@ -1391,8 +1366,8 @@ async function testCapBridgeEnforcement() {
   try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "RANDOM over the cap is refused");
   threw = false;
-  try { await open(CAP.NET_REQUEST_MANY, U(7, 0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
-  assert(threw, "NET_REQUEST_MANY with a count not backed by payload bytes is refused");
+  try { await open(CAP.NET_SEND_MANY, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
+  assert(threw, "NET_SEND_MANY with a count not backed by payload bytes is refused");
 
   // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
   // op set the bridge enforces (the "wire the caps" path). A guest that declared
@@ -2221,7 +2196,7 @@ async function testBundleCorruptNewerRollback() {
         install: "codec.install", kernelName: toHex(kernelName),
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      ops: {}, caps: [],
+      caps: [],
     });
     wf(pjoin(dir, "codec.install"), install);
     wf(pjoin(dir, "guest.js"), guestText);
@@ -2281,7 +2256,6 @@ await testBridgeCallerPinning();
 await testBlockFromCall();
 await testWrapRejectsInvalidKeySizes();
 await testFs();
-await testRequestMany();
 await testSendMany();
 await testCapBridge();
 await testPolicy();

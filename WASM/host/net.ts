@@ -14,7 +14,9 @@
 //                unauthenticated bulk path.
 //
 // Frames on the wire (carried inside the §13.6 AEAD record layer):
-//   req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
+//   req = [0 kind][corr u32 BE][type u8][payload ...]
+//   res = [1 kind][corr u32 BE][payload ...]   (no type — the requester matches
+//         the response to its request by corr; the type it sent is what it wanted)
 
 import { writeU32BE, readU32BE } from "./util.js";
 
@@ -34,6 +36,11 @@ const DEFAULT_MAX_STALL_WINDOWS = 50;
 /** The delivery fabric. send() is fire-and-forget unicast; the receiver's
  *  registered sink is invoked with the raw frame. */
 export interface Network {
+  /** Unicast `frame` to peer `to`. `from` is only meaningful for LoopbackNetwork,
+   *  which multiplexes every in-process node over one fabric and needs it to pick
+   *  the recipient's sink and attribute the delivery. A real transport is bound to a
+   *  single local identity, so its `send` ignores `from` (the implementations name it
+   *  `_from`) — the sender is implicit in the connection. */
   send(from: PeerId, to: PeerId, frame: Uint8Array): void;
   register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void;
   unregister(peerId: PeerId): void;
@@ -172,36 +179,14 @@ export class Transport {
     });
   }
 
-  /** Scatter-gather: send the same typed request to many peers and gather the
-   *  responses that arrive before the timeout. One entry per input peer (order
-   *  preserved); an unreachable or timed-out peer comes back `ok:false` with no
-   *  bytes (partial results, never a reject). This is the one concurrency a
-   *  confined safe-js guest cannot do itself — `Promise.all` aborts the VM, so
-   *  the fan-out lives host-side and the guest just consumes a finished list. */
-  async requestMany(
-    peers: PeerId[],
-    type: number,
-    payload: Uint8Array,
-  ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]> {
-    return Promise.all(
-      peers.map(async (peer) => {
-        try {
-          return { peer, ok: true, bytes: await this.request(peer, type, payload) };
-        } catch {
-          return { peer, ok: false, bytes: new Uint8Array(0) };
-        }
-      }),
-    );
-  }
-
   /** Per-peer scatter-gather: send a *distinct* typed request to each peer and
-   *  gather the responses that arrive before the timeout. The general case of
-   *  `requestMany` (which is this with one shared payload broadcast to all). One
-   *  entry per input request, order preserved; an unreachable/timed-out peer comes
-   *  back `ok:false` with no bytes (partial results, never a reject). This is the
-   *  app-neutral parallel primitive a confined safe-js guest drives one batched cap
-   *  at a time — `Promise.all` aborts the VM, so the fan-out lives here and the
-   *  sync guest just consumes a finished list (see cap-bridge NET_SEND_MANY). */
+   *  gather the responses that arrive before the timeout. A broadcast of one shared
+   *  payload to many peers is just N identical entries. One entry per input request,
+   *  order preserved; an unreachable/timed-out peer comes back `ok:false` with no
+   *  bytes (partial results, never a reject). This is the one concurrency a confined
+   *  safe-js guest cannot do itself — `Promise.all` aborts the VM, so the fan-out
+   *  lives host-side and the sync guest just consumes a finished list (see cap-bridge
+   *  NET_SEND_MANY). */
   async sendMany(
     requests: { peer: PeerId; type: number; payload: Uint8Array }[],
   ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]> {
@@ -240,7 +225,7 @@ export class Transport {
       if (p.to !== from) return;
       clearTimeout(p.timer);
       this.pending.delete(corr);
-      p.resolve(frame.slice(6));
+      p.resolve(frame.slice(5)); // res = [1][corr u32][payload] — no type byte
       return;
     }
     // KIND_REQ — dispatch to the node's handler and reply with the same corr.
@@ -262,11 +247,12 @@ export class Transport {
       }
     }
     const body = resp ?? new Uint8Array(0);
-    const frame = new Uint8Array(6 + body.length);
+    // res carries no type byte: the requester matches by corr and already knows the
+    // type it asked for. (req still carries it — that's how the responder dispatches.)
+    const frame = new Uint8Array(5 + body.length);
     frame[0] = KIND_RES;
     writeU32BE(frame, 1, corr);
-    frame[5] = type & 255;
-    frame.set(body, 6);
+    frame.set(body, 5);
     this.net.send(this.peerId, from, frame);
   }
 }

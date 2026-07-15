@@ -68,7 +68,6 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		Version int               `json:"version"`
 		Modules []mod             `json:"modules"`
 		Guest   map[string]string `json:"guest"`
-		Ops     map[string]int    `json:"ops"`
 		Caps    []string          `json:"caps"`
 	}{
 		App:     app,
@@ -78,7 +77,6 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 			Install: "fwd.install", KernelName: hex.EncodeToString(kernelName),
 		}},
 		Guest: map[string]string{"file": "guest.js", "hash": hex.EncodeToString(sd.hashSha3256([]byte(guestSrc)))},
-		Ops:   map[string]int{},
 		Caps:  []string{},
 	}
 	mjson, err := json.Marshal(manifest)

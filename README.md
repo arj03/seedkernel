@@ -154,7 +154,7 @@ Because `SetHandler`-installed handlers have no installer record, their name is 
 
 The same call the host uses during bootstrap (§10) remains available afterward for emergency replacement of any handler, including bootstrap handlers like `signature` and the installer itself. Message-driven installation lives in the installer (§7); the host-level `SetHandler` path is the emergency fallback.
 
-**Replacing installer-managed names.** When the host uses `SetHandler` to replace a handler that already has an installer record (§7.1), the kernel does not touch the record. A stale record (author, bytes_hash) would then misattribute the replacement — the old author would still apply to brand-new bytes, so the reference policy would treat the next same-name install as a same-author upgrade of code it never signed. The host MUST first call `installer.remove(name)` (§7.5) to clear the record and null the slot, then `SetHandler(name, newHandler)` to install the replacement. The replacement runs with no install record until the host explicitly wires one.
+**Replacing installer-managed names.** The kernel never touches an installer record — it does not know records exist (§7.1). But a stale record (author, bytes_hash) left behind by a raw replacement would misattribute it: the old author would still apply to brand-new bytes, so the reference policy would treat the next same-name install as a same-author upgrade of code it never signed. So the host's own handler-management path clears any install record at a name as a side effect of (re)binding or removing that slot — `SetHandler`/`register` and `removeHandler` all auto-clear it. A `SetHandler` replacement therefore always runs with no install record (a later signed install may wire a fresh one), and the host needs no separate `installer.remove(name)` step first. `installer.remove` (§7.5) remains the path for message-driven or operator revocation, where clearing the record is the whole point.
 
 ### 3.2 The installer (optional)
 
@@ -703,7 +703,7 @@ The manifest's `caps` field is the guest's *entire* authority — which is why i
 Beyond the bridges that pin caller names (§9), the runtime provides the capability *backends* an app's confined logic actually drives. They are deliberately structureless — bytes in, bytes out — so the kernel never learns what an app means by them:
 
 - `crypto.*` — the bundled sumo libsodium: hash (BLAKE2b), `sign`/`verify` (Ed25519), the raw `stream_xor` (xchacha20), `random` (`host/cap-bridge.ts`, backed by `loadSodium`). `sign` is under the node identity but **scoped**: the host prepends `DOMAIN_guest` plus the app's identity to the message before signing (§13.2), so a guest never obtains a raw node-key signature. Raw signing stays host-internal (it backs the PeerLink handshake, §13.6).
-- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC data channels (`host/net-rtc.ts`, §13.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `requestMany` and `sendMany` (host-side scatter-gather fan-out — the one concurrency a confined guest can't do itself; `requestMany` broadcasts one shared payload to many peers, `sendMany` is the general case of a distinct request per peer), and `peers`.
+- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC data channels (`host/net-rtc.ts`, §13.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send`, `sendMany` (host-side scatter-gather fan-out — the one concurrency a confined guest can't do itself: a distinct request per peer, of which broadcasting one shared payload to many peers is just N identical entries), and `peers`.
 - `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`size`/`list`/`delete`/`stat` (existence is `size ≥ 0`, so there is no separate `has`). An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
 - `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
 
@@ -724,17 +724,16 @@ The op numbers are a **shared guest↔host identifier**, not a wire value: the g
 | 5 | `IDENTITY` | (empty) | the node's 32-byte public key |
 | 6 | `RANDOM` | `[n u32]` | `n` random bytes |
 | 7 | `NET_SEND` | `[peer 32][type u8][payload ..]` | `[ok u8][response ..]` |
-| 8 | `NET_REQUEST_MANY` | `[type u8][count u32][peer 32 ×count][plen u32][payload ..]` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
-| 9 | `NET_SEND_MANY` | `[count u32] {[peer 32][type u8][plen u32][payload ..]}` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
-| 10 | `NET_PEERS` | (empty) | `[count u32][pk 32 ×count]` |
-| 11 | `FS_GET` | key (utf8) | `[0]` absent \| `[1][bytes ..]` |
-| 12 | `FS_PUT` | `[klen u32][key][bytes ..]` | (empty) |
-| 13 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
-| 14 | `FS_DELETE` | key (utf8) | (empty) |
-| 15 | `FS_STAT` | (empty) | `[used u64][available u64]` |
-| 16 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
-| 17 | `MODULE_CALL` | `[name_len u8][name][request ..]` | the installed handler's response bytes |
-| 18 | `CLOCK` | (empty) | now in unix ms (`u64`) |
+| 8 | `NET_SEND_MANY` | `[count u32] {[peer 32][type u8][plen u32][payload ..]}` | `[count u32] {[peer 32][ok u8][len u32][bytes ..]}` |
+| 9 | `NET_PEERS` | (empty) | `[count u32][pk 32 ×count]` |
+| 10 | `FS_GET` | key (utf8) | `[0]` absent \| `[1][bytes ..]` |
+| 11 | `FS_PUT` | `[klen u32][key][bytes ..]` | (empty) |
+| 12 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
+| 13 | `FS_DELETE` | key (utf8) | (empty) |
+| 14 | `FS_STAT` | (empty) | `[used u64][available u64]` |
+| 15 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
+| 16 | `MODULE_CALL` | `[name_len u8][name][request ..]` | the installed handler's response bytes |
+| 17 | `CLOCK` | (empty) | now in unix ms (`u64`) |
 
 **The signing op is scoped, never raw.** `SIGN` does not sign the guest's bytes as given: the host signs `DOMAIN_guest ‖ scope ‖ msg`, where `scope = author_pk ‖ app_len u8 ‖ app` is derived from the admitted manifest (§13.4) — the same `(author, app)` pair that keys bundle freshness — and is never guest-supplied. The domain-prefix family is disjoint (§15, §17.1), so a guest-obtained signature can never verify as an envelope wrapper, a bundle manifest, or a channel AUTH; and two different bundles derive disjoint scopes, so one app cannot sign objects in another's namespace. `VERIFY` stays raw — verification is not an oracle — so an app checks a scoped signature by reconstructing the prefixed preimage itself; every node running the same bundle derives the same scope, which is what makes the signatures portable across a cohort. One consequence to design for: rotating a bundle's author key changes the scope and orphans previously signed objects, so an app that anticipates handover records its scope inside its own signed formats. §15 has the trust rationale.
 
@@ -743,10 +742,10 @@ The **capability domains** a manifest declares (§13.4) expand to fixed op sets 
 | Domain | Ops |
 | --- | --- |
 | `crypto` | 1–6 (`HASH`, `STREAM_XOR`, `SIGN`, `VERIFY`, `IDENTITY`, `RANDOM`) |
-| `net` | 7–10 (`NET_SEND`, `NET_REQUEST_MANY`, `NET_SEND_MANY`, `NET_PEERS`) |
-| `fs` | 11–16 (`FS_GET`, `FS_PUT`, `FS_LIST`, `FS_DELETE`, `FS_STAT`, `FS_SIZE`) |
-| `module` | 17 (`MODULE_CALL`) |
-| `clock` | 18 (`CLOCK`) |
+| `net` | 7–9 (`NET_SEND`, `NET_SEND_MANY`, `NET_PEERS`) |
+| `fs` | 10–15 (`FS_GET`, `FS_PUT`, `FS_LIST`, `FS_DELETE`, `FS_STAT`, `FS_SIZE`) |
+| `module` | 16 (`MODULE_CALL`) |
+| `clock` | 17 (`CLOCK`) |
 
 An op outside the granted domains does not resolve — the bridge refuses it, and the shell never wired the backing resource in the first place (an `fs`-less bundle gets no fs backend at all, not an fs backend behind a check). An unknown domain name in a manifest throws when the realm is built — a typo fails loudly rather than silently granting nothing, or, worse, everything.
 
@@ -786,7 +785,6 @@ A bundle adds **no second install mechanism**: its module installs are ordinary 
 | `version` | integer | **yes** | Monotonic version of the coherent set. A load whose `version` is below the persisted `(author, app)` high-water mark is refused as a downgrade (see freshness below). |
 | `modules[]` | `{name, file, hash, install, kernelName}` | yes | One entry per WASM module: logical name, filename, `genesisHash(wasm)` hex (the *same* value the installer records as the module's `bytes_hash` and a policy `modules` allowlist matches, §7.1), the filename of its pre-signed install envelope, and the kernel name that install binds (so the loader can confirm the module actually registered). |
 | `guest` | `{file, hash}` | yes | The guest program: filename + `genesisHash(utf8(source))` hex. |
-| `ops` | name → number | **no** | Documents the §13.2 op ABI the guest was built against. Purely informational; enforcement comes from `caps`. |
 | `caps` | string[] | **yes** | The capability domains (§13.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants raw node-identity signing — the `crypto` domain's `SIGN` is scoped to this app's namespace, §13.2, §15). |
 | `config` | map (string → string \| number) | no | App constants injected into the guest as `const APP = {…}`. Opaque to the runtime. |
 
@@ -850,16 +848,16 @@ Above the link, `Transport` (`host/net.ts`) runs typed request/response inside t
 
 ```
 req = [0x00][corr: u32][type: u8][payload ..]
-res = [0x01][corr: u32][type: u8][payload ..]
+res = [0x01][corr: u32][payload ..]
 ```
 
-Block bytes ride this plane too (in seed store, a STORE pushes bytes in a `req` body and a FETCH returns them in a `res` body), so the record layer authenticates and encrypts them along with every other frame; content-addressing (`genesisHash(bytes) == block_id`) remains the app-level admission check on those payloads, not the transport's integrity story. A response resolves only if it arrives from the peer the request went to, so an authenticated-but-malicious cohort member cannot answer on another peer's behalf by guessing the correlation counter. `requestMany` (one shared payload to many peers) and `sendMany` (its general case — a distinct request per peer) are host-side scatter-gather over this — the one concurrency a confined guest cannot do itself — each returning one `{peer, ok, bytes}` entry per input peer: partial results, never a rejection.
+The `res` frame carries no `type`: the requester matches a response to its outstanding request by `corr`, and it already knows the `type` it asked for, so echoing it back is dead weight the requester ignores. Block bytes ride this plane too (in seed store, a STORE pushes bytes in a `req` body and a FETCH returns them in a `res` body), so the record layer authenticates and encrypts them along with every other frame; content-addressing (`genesisHash(bytes) == block_id`) remains the app-level admission check on those payloads, not the transport's integrity story. A response resolves only if it arrives from the peer the request went to, so an authenticated-but-malicious cohort member cannot answer on another peer's behalf by guessing the correlation counter. `sendMany` (a distinct request per peer, of which broadcasting one shared payload is just N identical entries) is host-side scatter-gather over this — the one concurrency a confined guest cannot do itself — returning one `{peer, ok, bytes}` entry per input peer: partial results, never a rejection.
 
 **What the handshake gives.** Because AUTH signs the full transcript, it authenticates that the far end held the claimed private key *for this exchange*: the signature is bound to the exact identities, nonces, and ephemeral keys that produced it, so it cannot be harvested on one connection and replayed on another, and a node used as a signing oracle yields nothing reusable. The same signature binds the ephemeral keys, so the derived session is authenticated end to end. Every post-AUTH frame is then individually authenticated, confidential, and replay-protected (strict counter enforcement over the ordered channel), and the session is **forward-secret** because the DH keys are ephemeral — an in-path attacker who hijacks or injects into the live stream *after* authentication can neither read nor forge frames. This retires the earlier requirement to run `PeerLink` inside an external encrypted tunnel (TLS, Noise); the record layer lives in the shared `net-link.ts`, so the same protection is uniform across TCP, WebSocket, and WebRTC. See §15.
 
 ### 13.7 Browser↔console WebRTC
 
-§13.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `requestMany` / `sendMany` / `peers` surface as the TCP and WebSocket transports.
+§13.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `sendMany` / `peers` surface as the TCP and WebSocket transports.
 
 **`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; a relay (`scripts/relay.mjs`) is only the *signaling* rendezvous for the SDP/ICE exchange and can be killed once channels are open — there is no server in the data path. One ordered binary data channel per peer carries everything, and `Transport` (§13.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — the relay, a DHT, gossip, or even an existing `PeerLink` between two already-connected peers all satisfy it — and deliberately carries *no* SDP-fingerprint signature, because identity is proven in-channel: `PeerLink`'s HELLO/AUTH runs *inside* the data channel (§13.6), which is stronger than a one-shot SDP-fingerprint assertion at the signaling layer (the approach an earlier version of the chat shell used, now replaced by this path — §12). A MITM relay can splice SDP and bring DTLS up to itself but can never complete AUTH without the peer's private key, so the link never authenticates and never delivers a byte. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins the same mesh by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §13.6 move applied to WebRTC. werift (pure-TS) is used rather than the native `node-datachannel` because the latter segfaults under Bun.
 

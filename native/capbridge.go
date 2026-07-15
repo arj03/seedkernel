@@ -52,7 +52,6 @@ const capBridgeGlueJS = `
       },
       transport: transport || {
         request: () => Promise.reject(new Error("cap-bridge: net not wired")),
-        requestMany: () => Promise.resolve([]),
         sendMany: () => Promise.resolve([]),
       },
       peers: () => peers || [],

@@ -3,7 +3,7 @@
 // zero-authority guest program, and a signed manifest declaring the op catalog +
 // the capabilities the bundle needs. The shell verifies the manifest signature,
 // governs it against its policy (author + module hashes), and installs the
-// modules; the manifest's `ops`/`caps` describe the seam the app's guest is wired
+// modules; the manifest's `caps` describe the seam the app's guest is wired
 // over — honored by the generic cap bridge (README §13.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
@@ -42,9 +42,6 @@ export interface BundleManifest {
   modules: BundleModule[];
   /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex. */
   guest: { file: string; hash: string };
-  /** Op catalog — the guest's `host.call(op)` seam (name → number). Documents the
-   *  ABI the guest was built against; the shell enforces via `caps`, not this. */
-  ops: Record<string, number>;
   /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
    *  "module" | "clock") the bundle's guest is granted. The shell expands these to
    *  the concrete allowed op set and wires only the matching backends — so this is
