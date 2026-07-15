@@ -23,6 +23,14 @@ export type PeerId = string; // hex of the peer's kernel public key
 const KIND_REQ = 0;
 const KIND_RES = 1;
 
+// Absolute backstop, as a multiple of timeoutMs (see Transport.request). The silence
+// clock re-arms on any frame from the peer, so on its own it never bounds a request
+// whose response will never come while the peer keeps sending *other* frames. This caps
+// that. Generous — a legit bulk request's tail waits out the whole concurrent batch
+// draining to the peer — but finite, so a busy-and-buggy or hostile peer can't pin the
+// pending map forever.
+const DEFAULT_MAX_STALL_WINDOWS = 50;
+
 /** The delivery fabric. send() is fire-and-forget unicast; the receiver's
  *  registered sink is invoked with the raw frame. */
 export interface Network {
@@ -99,6 +107,13 @@ export class Transport {
      *  it (see request()). Small in tests; a deployment tunes it against real
      *  latency. */
     private readonly timeoutMs = 200,
+    /** Hard ceiling on a single request's lifetime, as a multiple of timeoutMs — the
+     *  backstop the silence clock lacks. A request rejects after this many silence
+     *  windows since it was issued regardless of how live the peer looks, so a peer that
+     *  withholds one response while keeping the wire warm (buggy or hostile) cannot pin
+     *  the pending map indefinitely. Kept generous so it never kills a legit bulk
+     *  request whose tail is genuinely still draining. */
+    private readonly maxStallWindows = DEFAULT_MAX_STALL_WINDOWS,
   ) {
     this.net.register(peerId, (from, frame) => this.onFrame(from, frame));
   }
@@ -111,9 +126,14 @@ export class Transport {
    *  time: a bulk fan-out (a PUT's STORE round) hands the socket many queued
    *  megabytes against one issue instant, so an absolute deadline would fail the
    *  tail of a transfer that is visibly progressing on a slow link. A dead peer
-   *  still rejects after exactly timeoutMs of silence; a peer that keeps
-   *  responding can never string one request along forever, because each reset
-   *  costs it a delivered frame. */
+   *  still rejects after exactly timeoutMs of silence.
+   *
+   *  Silence is not the only failure signal, though: a peer that withholds *this*
+   *  response while other traffic keeps flowing (a hung/declining handler, or a
+   *  hostile peer selectively answering) would re-arm the clock forever. So a
+   *  second, absolute backstop rejects after maxStallWindows silence windows since
+   *  issue no matter how live the peer looks — finite, but generous enough never to
+   *  fire on a legit request whose tail is still draining. */
   request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array> {
     const corr = this.corr++;
     const frame = new Uint8Array(1 + 4 + 1 + payload.length);
@@ -123,20 +143,28 @@ export class Transport {
     frame.set(payload, 6);
     return new Promise<Uint8Array>((resolve, reject) => {
       const issuedAt = Date.now();
-      // Silence-based stall clock, re-armed lazily. On expiry, reject only if the peer
-      // has been silent for timeoutMs since the later of this request's issue time and
-      // the peer's last frame; otherwise a frame arrived recently (a bulk fan-out is
-      // still progressing), so re-arm just this one timer for the remaining window. The
+      // Absolute deadline the per-frame re-arm cannot push out (see maxStallWindows).
+      const deadline = issuedAt + this.timeoutMs * this.maxStallWindows;
+      // Silence-based stall clock, re-armed lazily. On expiry, reject if the peer has
+      // been silent for timeoutMs since the later of this request's issue time and the
+      // peer's last frame; otherwise a frame arrived recently (a bulk fan-out is still
+      // progressing), so re-arm just this one timer for the remaining window — but never
+      // past the absolute backstop, so a live-but-withholding peer still rejects. The
       // liveness signal is the single per-peer timestamp updated O(1) in onFrame — no
       // per-frame sweep over every pending request.
       const check = (): void => {
         const p = this.pending.get(corr);
         if (!p) return;
+        const now = Date.now();
         const last = Math.max(issuedAt, this.lastFrameAt.get(to) ?? 0);
-        const remaining = last + this.timeoutMs - Date.now();
-        if (remaining > 0) { p.timer = setTimeout(check, remaining); return; }
+        const remaining = last + this.timeoutMs - now;
+        if (remaining > 0 && now < deadline) {
+          p.timer = setTimeout(check, Math.min(remaining, deadline - now));
+          return;
+        }
         this.pending.delete(corr);
-        reject(new Error(`net.send: timeout to ${to.slice(0, 8)} (type ${type})`));
+        const why = remaining > 0 ? "backstop" : "timeout"; // live-but-withholding vs. silent
+        reject(new Error(`net.send: ${why} to ${to.slice(0, 8)} (type ${type})`));
       };
       const timer = setTimeout(check, this.timeoutMs);
       this.pending.set(corr, { to, resolve, reject, timer, issuedAt });

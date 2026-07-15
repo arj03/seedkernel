@@ -147,16 +147,23 @@ export class WsNetwork implements Network {
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
    *  `wss://…` for TLS). The link authenticates in-channel (PeerLink), pinned to the
-   *  declared `pubkey`, and onPeerUp fires once it does. Dialing a peer already
-   *  linked or in-flight is a no-op; returns the parsed peer id either way. */
+   *  declared `pubkey`, and onPeerUp fires once it does. Idempotent top-up, mirroring
+   *  NodeNetworkCore.dial(): it opens only the shortfall to connsPerPeer, so the first
+   *  call opens the full fan-out and a re-connect() after some of the parallel flows
+   *  dropped restores just the lost ones instead of no-op'ing on the survivors (an
+   *  early-return on "already dialing" would leave the pool permanently degraded to
+   *  whatever survived). Returns the parsed peer id either way. */
   connect(spec: string): PeerId {
     const { peerId, url } = parseWsPeer(spec);
-    if (peerId === this.ownId || this.dialing.has(peerId)) return peerId;
-    // Open connsPerPeer parallel connections, each its own PeerLink over its own
-    // WebSocket. They authenticate independently; onPeerUp fires on the first.
-    const arr: PeerLink[] = [];
-    this.dialing.set(peerId, arr);
-    for (let i = 0; i < this.conns; i++) {
+    if (peerId === this.ownId) return peerId;
+    // `dialing` holds every live link we dialed to this peer — pre-auth AND post-auth
+    // (promote() leaves them here; forget() removes one the instant it closes) — so its
+    // length is the current outbound flow count. Open connsPerPeer parallel connections,
+    // each its own PeerLink over its own WebSocket. They authenticate independently;
+    // onPeerUp fires on the first to reach a peer that had none.
+    let arr = this.dialing.get(peerId);
+    if (!arr) { arr = []; this.dialing.set(peerId, arr); }
+    for (let i = arr.length; i < this.conns; i++) {
       const link: PeerLink = new PeerLink({
         channel: new WsChannel(this.mkWs(url)),
         identity: this.opts.identity,

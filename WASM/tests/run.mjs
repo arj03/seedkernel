@@ -1622,6 +1622,43 @@ async function testTransportStallTimeout() {
   console.log("  OK\n");
 }
 
+async function testTransportBackstop() {
+  console.log("Test: an absolute backstop rejects a withheld response even from a 'live' peer");
+
+  const a = generateKeyPair(), b = generateKeyPair();
+  const A = toHex(a.publicKey), B = toHex(b.publicKey);
+  const net = new LoopbackNetwork();
+  // timeoutMs 50, maxStallWindows 3 → backstop ≈ 150 ms. There is no Transport for B, so
+  // it never answers A's request; we keep B "live" from A's view by dribbling an unrelated
+  // frame every 20 ms (< the 50 ms silence window), which re-arms A's stall clock forever.
+  // This is the buggy/hostile peer: it withholds THIS response while keeping the wire warm,
+  // so silence alone would never fire — only the absolute backstop bounds the request.
+  const ta = new Transport(A, net, 50, 3);
+  let alive = true;
+  (async () => {
+    // A KIND_RES frame for a corr with no pending entry: onFrame stamps lastFrameAt[B]
+    // (re-arming every request pending to B) then drops it — nothing ever resolves.
+    while (alive) { net.send(B, A, Uint8Array.from([1, 0, 0, 0, 255, 0])); await sleep(20); }
+  })();
+
+  try {
+    const t0 = Date.now();
+    let failed = false, msg = "";
+    try { await ta.request(B, 7, new Uint8Array()); }
+    catch (e) { failed = true; msg = String(e?.message ?? e); }
+    const dt = Date.now() - t0;
+    assert(failed, "a request whose response never comes still rejects, despite a live peer");
+    assert(/backstop/.test(msg), `it rejects via the absolute backstop, not silence (got: ${msg})`);
+    assert(dt >= 140, `the backstop waits out ~maxStallWindows×timeoutMs before firing (got ${dt}ms)`);
+    assert(dt < 900, `but it DOES fire — the request is not pinned forever (got ${dt}ms)`);
+  } finally {
+    alive = false;
+    ta.close();
+  }
+
+  console.log("  OK\n");
+}
+
 async function testWsFragmentation() {
   console.log("Test: WS fragmented messages reassemble (FIN=0 + continuation frames)");
 
@@ -1876,8 +1913,26 @@ async function testWsNetworkFanout() {
     await sleep(50);
     assertEqual(serverGot.length - before, 3, "the peer is still reachable over the surviving flow");
 
-    // The last link drops → onPeerDown fires exactly once.
-    clientWs[2].close();
+    // Re-dial: connect() is an idempotent top-up, so it re-opens ONLY the two dropped
+    // flows (not a fresh three) — the browser/CLI recovers the striping win after a
+    // partial drop instead of running degraded to one flow for the rest of the session.
+    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
+    await sleep(80);
+    assertEqual(clientWs.length, 5, "re-connect() opens exactly the 2-flow shortfall, not 3 more");
+    assertEqual(serverAuthed, 5, "the two topped-up links authenticate too");
+    assertEqual(ups, 1, "onPeerUp does NOT fire again — the peer was already reachable");
+    assertEqual(client.linkedPeers().length, 1, "still one logical peer after the top-up");
+
+    // Striping is back to three flows: 6 frames over the survivor + 2 re-opened links.
+    const survivors = [clientWs[2], clientWs[3], clientWs[4]];
+    const base2 = survivors.map((w) => w.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([7]));
+    await sleep(50);
+    assertEqual(survivors.map((w, i) => w.sends - base2[i]), [2, 2, 2],
+      "after the top-up, 6 frames stripe evenly across all 3 restored flows");
+
+    // Every remaining flow drops → onPeerDown fires exactly once.
+    for (const w of survivors) w.close();
     await sleep(50);
     assertEqual(downs, 1, "onPeerDown fires once, only when the last flow drops");
     assertEqual(client.linkedPeers().length, 0, "the peer is no longer linked once every flow is gone");
@@ -2375,6 +2430,7 @@ await testCapBridgeEnforcement();
 await testCallHandlerGuards();
 await testTransportResponseBinding();
 await testTransportStallTimeout();
+await testTransportBackstop();
 await testWsFragmentation();
 await testRedialAfterFailedDial();
 await testConnsPerPeerFanout();
