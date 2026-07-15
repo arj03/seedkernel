@@ -31,17 +31,16 @@ func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
 	return priv, pub
 }
 
-// buildInstall wraps a §7.2 install payload — [seq u32][nameLen u8][name][capCount u8=0]
-// [wasm] — in an author-signed envelope routed to the install handler, the same shape a
-// bundle's `.install` file carries. A caps-free install clears the permissive default policy.
+// buildInstall wraps a §7.2 install payload — [seq u32][nameLen u8][name][wasm] — in
+// an author-signed envelope routed to the install handler, the same shape a bundle's
+// `.install` file carries (no cap block — capabilities are no longer install-declared).
 func buildInstall(priv ed25519.PrivateKey, pub, kernelName, wasm []byte, seq uint32) []byte {
-	payload := make([]byte, 0, 4+1+len(kernelName)+1+len(wasm))
+	payload := make([]byte, 0, 4+1+len(kernelName)+len(wasm))
 	var s [4]byte
 	binary.BigEndian.PutUint32(s[:], seq)
 	payload = append(payload, s[:]...)
 	payload = append(payload, byte(len(kernelName)))
 	payload = append(payload, kernelName...)
-	payload = append(payload, 0) // cap count = 0
 	payload = append(payload, wasm...)
 	return sign(priv, pub, name("install"), payload)
 }

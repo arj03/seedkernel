@@ -5,7 +5,7 @@
 // host/installer.ts and host/bundle.ts; future host logic is written once, here.
 "use strict";
 
-const records = new Map(); // nameHex  -> { algo, pk, hash, caps }   (§7.1)
+const records = new Map(); // nameHex  -> { algo, pk, hash }   (§7.1)
 const lastSeen = new Map(); // pkHex   -> seq                                 (§4.4)
 
 const hex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -14,10 +14,11 @@ const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 // ── Installer (README §7) ────────────────────────────────────────────────
 
-// The shell's install policy. null ⇒ the permissive default (caps-free first
-// installs). When set via setPolicy it narrows trust to a closed author-key set,
-// an optional module bytesHash allowlist, and an optional capability allowlist —
-// mirrors host/policy.ts (parsePolicy + buildApproveInstall) for the Go target.
+// The shell's install policy. null ⇒ the permissive default (first installs
+// accepted). When set via setPolicy it narrows trust to a closed author-key set
+// and an optional module bytesHash allowlist — mirrors host/policy.ts (parsePolicy
+// + buildApproveInstall) for the Go target. Capabilities are no longer install-
+// declared (the JS sandbox is the confinement), so there is no cap allowlist.
 let policy = null;
 
 function parsePolicy(json) {
@@ -29,28 +30,24 @@ function parsePolicy(json) {
   };
   const authors = hexList(raw.authors, "authors");
   if (authors.length === 0) throw new Error('policy: "authors" must list at least one allowed author key');
-  const p = { authors: new Set(authors), modules: null, caps: new Set() };
+  const p = { authors: new Set(authors), modules: null };
   if (raw.modules !== undefined) p.modules = new Set(hexList(raw.modules, "modules"));
-  if (raw.caps !== undefined) p.caps = new Set(hexList(raw.caps, "caps"));
   return p;
 }
 globalThis.setPolicy = function (json) { policy = parsePolicy(json); };
 
-// approve — the §7.4 install gate. Permissive default: a caps-free first install,
-// or a same-author caps-free upgrade (author-only; no parent/lineage gate). Under
-// a policy: the author must be allow-listed, the module hash must clear an optional
-// hash allowlist, and every declared cap must be in the cap allowlist (omitted ⇒
-// no cap may be granted).
-function approve(author, hash, caps, ex) {
+// approve — the §7.4 install gate. Two rules for WHO may bind a name (capabilities
+// are no longer install-declared): a subsequent install must match the existing
+// record's author; a first install is accepted by the permissive default, or gated
+// by the policy's author set + optional module bytesHash allowlist. Mirrors
+// host/policy.ts (referencePolicy) + host/installer.ts.
+function approve(author, hash, ex) {
+  if (ex) return author.algo === ex.algo && eq(author.pk, ex.pk);
   if (policy) {
     if (!policy.authors.has(hex(author.pk))) return false;
     if (policy.modules && !policy.modules.has(hex(hash))) return false;
-    for (const c of caps) if (!policy.caps.has(hex(c))) return false;
-    if (ex) return author.algo === ex.algo && eq(author.pk, ex.pk);
-    return true;
   }
-  if (!ex) return caps.length === 0;
-  return author.algo === ex.algo && eq(author.pk, ex.pk) && caps.length === 0;
+  return true;
 }
 
 // onInstall — the §7.2 install-message handler. Go calls this when a signed
@@ -61,33 +58,25 @@ globalThis.onInstall = function (payloadBuf) {
   if (sig.length < 3 || p.length < 5) return;
   const author = { algo: (sig[0] << 8) | sig[1], pk: sig.slice(2) };
 
+  // §7.2 payload: [seq u32][name_len u8][name][wasm]. No cap block — capabilities
+  // are no longer install-declared (mirrors host/installer.ts).
   const seq = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
   let o = 4;
   const nLen = p[o++];
   if (nLen === 0 || o + nLen > p.length) return;
   const name = p.slice(o, (o += nLen));
-  const cc = p[o++];
-  const caps = [];
-  for (let i = 0; i < cc; i++) {
-    // Past-the-end check must come first: p[o] would be undefined, making
-    // o + cl NaN — and NaN > length is false, so the next check can't catch it.
-    if (o >= p.length) return;
-    const cl = p[o++];
-    if (o + cl > p.length) return;
-    caps.push(p.slice(o, (o += cl)));
-  }
   const wasm = p.slice(o);
   if (wasm.length === 0) return;
 
-  const hash = sodium.crypto_hash_sha3256(p); // bytes_hash over the whole payload
+  const hash = sodium.crypto_hash_sha3256(wasm); // bytes_hash = genesisHash(wasm) (§7.1)
   const pkHex = hex(author.pk);
   if (lastSeen.has(pkHex) && seq <= lastSeen.get(pkHex)) return; // §4.4 replay
   lastSeen.set(pkHex, seq);
 
   const ex = records.get(hex(name)) || null;
-  if (!approve(author, hash, caps, ex)) return;
+  if (!approve(author, hash, ex)) return;
   if (!bridge.installWasm(name, wasm)) return;
-  records.set(hex(name), { algo: author.algo, pk: author.pk, hash, caps });
+  records.set(hex(name), { algo: author.algo, pk: author.pk, hash });
 };
 
 // ── Bundle verification (README §13.4) ───────────────────────────────────
