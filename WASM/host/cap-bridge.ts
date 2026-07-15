@@ -101,6 +101,16 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
   return out;
 }
 
+/** The full scoped-signature *prefix* the SIGN op prepends to a guest message before
+ *  signing: `DOMAIN_guest ‖ scope`. Exported so a host-side signer/verifier in another
+ *  package (e.g. seedstore's out-of-band descriptor signing, README §16) reconstructs the
+ *  byte-identical preimage `guestSignPrefix(scope) ‖ msg` WITHOUT mirroring the domain
+ *  tag — if this string ever revs, every such verifier revs with it instead of silently
+ *  diverging. `scope` comes from `guestSignScope(author, app)`. */
+export function guestSignPrefix(scope: Uint8Array): Uint8Array {
+  return concatBytes([DOMAIN_GUEST, scope]);
+}
+
 /** Expand declared capability domains to the concrete op numbers a bridge allows.
  *  Throws on an unknown domain so a typo in a manifest fails loudly rather than
  *  silently granting nothing (or, worse, everything). */
@@ -220,7 +230,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // `DOMAIN_guest ‖ scope ‖ msg`, so a guest signature can never verify as an
         // envelope wrapper, manifest, or channel AUTH, nor in another app's scope.
         if (!deps.signScope) throw new Error("cap-bridge: SIGN needs a bundle scope (guest signing is never raw)");
-        const pre = concatBytes([DOMAIN_GUEST, deps.signScope, payload]);
+        const pre = concatBytes([guestSignPrefix(deps.signScope), payload]);
         return sodium.crypto_sign_detached(pre, identity.privateKey);
       }
       case CAP.VERIFY: {
