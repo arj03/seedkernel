@@ -5,7 +5,7 @@
 // host/installer.ts and host/bundle.ts; future host logic is written once, here.
 "use strict";
 
-const records = new Map(); // nameHex  -> { algo, pk, hash, parent, caps }   (§7.1)
+const records = new Map(); // nameHex  -> { algo, pk, hash }   (§7.1)
 const lastSeen = new Map(); // pkHex   -> seq                                 (§4.4)
 
 const hex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -14,10 +14,11 @@ const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
 
 // ── Installer (README §7) ────────────────────────────────────────────────
 
-// The shell's install policy. null ⇒ the permissive default (caps-free first
-// installs). When set via setPolicy it narrows trust to a closed author-key set,
-// an optional module bytesHash allowlist, and an optional capability allowlist —
-// mirrors host/policy.ts (parsePolicy + buildApproveInstall) for the Go target.
+// The shell's install policy. null ⇒ the permissive default (first installs
+// accepted). When set via setPolicy it narrows trust to a closed author-key set
+// and an optional module bytesHash allowlist — mirrors host/policy.ts (parsePolicy
+// + buildApproveInstall) for the Go target. Capabilities are no longer install-
+// declared (the JS sandbox is the confinement), so there is no cap allowlist.
 let policy = null;
 
 function parsePolicy(json) {
@@ -29,28 +30,24 @@ function parsePolicy(json) {
   };
   const authors = hexList(raw.authors, "authors");
   if (authors.length === 0) throw new Error('policy: "authors" must list at least one allowed author key');
-  const p = { authors: new Set(authors), modules: null, caps: new Set() };
+  const p = { authors: new Set(authors), modules: null };
   if (raw.modules !== undefined) p.modules = new Set(hexList(raw.modules, "modules"));
-  if (raw.caps !== undefined) p.caps = new Set(hexList(raw.caps, "caps"));
   return p;
 }
 globalThis.setPolicy = function (json) { policy = parsePolicy(json); };
 
-// approve — the §7.4 install gate. Permissive default: a caps-free first install,
-// or a same-author / parent-matched caps-free upgrade. Under a policy: the author
-// must be allow-listed, the module hash must clear an optional hash allowlist, and
-// every declared cap must be in the cap allowlist (omitted ⇒ no cap may be granted).
-function approve(author, hash, caps, parent, ex) {
+// approve — the §7.4 install gate. Two rules for WHO may bind a name (capabilities
+// are no longer install-declared): a subsequent install must match the existing
+// record's author; a first install is accepted by the permissive default, or gated
+// by the policy's author set + optional module bytesHash allowlist. Mirrors
+// host/policy.ts (referencePolicy) + host/installer.ts.
+function approve(author, hash, ex) {
+  if (ex) return author.algo === ex.algo && eq(author.pk, ex.pk);
   if (policy) {
     if (!policy.authors.has(hex(author.pk))) return false;
     if (policy.modules && !policy.modules.has(hex(hash))) return false;
-    for (const c of caps) if (!policy.caps.has(hex(c))) return false;
-    if (ex) return author.algo === ex.algo && eq(author.pk, ex.pk) && !!parent && eq(parent, ex.hash);
-    return true;
   }
-  if (!ex) return caps.length === 0;
-  return author.algo === ex.algo && eq(author.pk, ex.pk) &&
-         parent && eq(parent, ex.hash) && caps.length === 0;
+  return true;
 }
 
 // onInstall — the §7.2 install-message handler. Go calls this when a signed
@@ -61,38 +58,35 @@ globalThis.onInstall = function (payloadBuf) {
   if (sig.length < 3 || p.length < 5) return;
   const author = { algo: (sig[0] << 8) | sig[1], pk: sig.slice(2) };
 
+  // §7.2 payload: [seq u32][name_len u8][name][wasm]. No cap block — capabilities
+  // are no longer install-declared (mirrors host/installer.ts).
   const seq = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
   let o = 4;
   const nLen = p[o++];
   if (nLen === 0 || o + nLen > p.length) return;
   const name = p.slice(o, (o += nLen));
-  const cc = p[o++];
-  const caps = [];
-  for (let i = 0; i < cc; i++) {
-    // Past-the-end check must come first: p[o] would be undefined, making
-    // o + cl NaN — and NaN > length is false, so the next check can't catch it.
-    if (o >= p.length) return;
-    const cl = p[o++];
-    if (o + cl > p.length) return;
-    caps.push(p.slice(o, (o += cl)));
-  }
-  const pl = p[o++];
-  const parent = pl > 0 ? p.slice(o, (o += pl)) : null;
   const wasm = p.slice(o);
   if (wasm.length === 0) return;
 
-  const hash = sodium.crypto_hash_sha3256(p); // bytes_hash over the whole payload
+  const hash = sodium.crypto_hash_sha3256(wasm); // bytes_hash = genesisHash(wasm) (§7.1)
   const pkHex = hex(author.pk);
   if (lastSeen.has(pkHex) && seq <= lastSeen.get(pkHex)) return; // §4.4 replay
   lastSeen.set(pkHex, seq);
 
   const ex = records.get(hex(name)) || null;
-  if (!approve(author, hash, caps, parent, ex)) return;
+  if (!approve(author, hash, ex)) return;
   if (!bridge.installWasm(name, wasm)) return;
-  records.set(hex(name), { algo: author.algo, pk: author.pk, hash, parent, caps });
+  records.set(hex(name), { algo: author.algo, pk: author.pk, hash });
 };
 
 // ── Bundle verification (README §13.4) ───────────────────────────────────
+
+// Domain-separation prefix for the manifest signature (README §13.4, §17.1):
+// "seedkernel-manifest-sig-v1\0". Prepended to the JSON before verifying, never
+// stored in the envelope — mirrors host/bundle.ts. The disjoint prefix keeps a
+// manifest signature from doubling as an envelope-wrapper or channel-handshake
+// signature over the same bytes.
+const DOMAIN_MANIFEST = Uint8Array.from("seedkernel-manifest-sig-v1\0", (c) => c.charCodeAt(0));
 
 // verifyBundle checks an app bundle's signed manifest and module/guest content
 // integrity, returning a slim descriptor for Go to act on (Go dispatches the
@@ -102,9 +96,13 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
   const env = new Uint8Array(manifestEnvBuf);
   if (env.length < 96) return "ERROR: manifest too short";
   const author = env.slice(0, 32), sig = env.slice(32, 96), json = env.slice(96);
+  // Verify over DOMAIN_manifest ‖ json (§13.4); the prefix is signed, not stored.
+  const preimage = new Uint8Array(DOMAIN_MANIFEST.length + json.length);
+  preimage.set(DOMAIN_MANIFEST, 0);
+  preimage.set(json, DOMAIN_MANIFEST.length);
   // sodium.* reads its args via JsTypedArrayToGo, which copies and leaves the source
   // intact, so `author`/`json` survive for the policy check + parsing below.
-  if (!sodium.crypto_sign_verify_detached(sig, json, author)) return "ERROR: bad manifest signature";
+  if (!sodium.crypto_sign_verify_detached(sig, preimage, author)) return "ERROR: bad manifest signature";
   if (policy && !policy.authors.has(hex(author))) return "ERROR: manifest author not in policy"; // §13.4 bundle governance
   let s = "";
   for (let i = 0; i < json.length; i++) s += String.fromCharCode(json[i]); // manifest is ASCII
@@ -115,6 +113,9 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
     if (sha(files[mod.file]) !== mod.hash.toLowerCase()) return "ERROR: hash mismatch " + mod.name;
   }
   if (sha(files[m.guest.file]) !== m.guest.hash.toLowerCase()) return "ERROR: guest hash mismatch";
+
+  // Freshness key material (§13.4): version is an enforced monotonic integer.
+  if (!Number.isInteger(m.version)) return "ERROR: manifest version must be an integer";
 
   return JSON.stringify({
     app: m.app, version: m.version, author: hex(author), caps: m.caps || [],

@@ -3,7 +3,7 @@
 // zero-authority guest program, and a signed manifest declaring the op catalog +
 // the capabilities the bundle needs. The shell verifies the manifest signature,
 // governs it against its policy (author + module hashes), and installs the
-// modules; the manifest's `ops`/`caps` describe the seam the app's guest is wired
+// modules; the manifest's `caps` describe the seam the app's guest is wired
 // over — honored by the generic cap bridge (README §13.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
@@ -35,13 +35,13 @@ export interface BundleModule {
 
 export interface BundleManifest {
   app: string;
-  version: string;
+  /** Monotonic version of the coherent set (README §13.4). Enforced at load against
+   *  a persisted per-`(author, app)` high-water mark: a load whose `version` is below
+   *  the mark is refused as a downgrade. An integer, not a label. */
+  version: number;
   modules: BundleModule[];
   /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex. */
   guest: { file: string; hash: string };
-  /** Op catalog — the guest's `host.call(op)` seam (name → number). Documents the
-   *  ABI the guest was built against; the shell enforces via `caps`, not this. */
-  ops: Record<string, number>;
   /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
    *  "module" | "clock") the bundle's guest is granted. The shell expands these to
    *  the concrete allowed op set and wires only the matching backends — so this is
@@ -62,6 +62,13 @@ export interface ManifestCrypto {
 const PK_LEN = 32;
 const SIG_LEN = 64;
 
+// Domain-separation prefix for the manifest signature (README §13.4, §17.1):
+// `"seedkernel-manifest-sig-v1\0"`. Prepended to the manifest JSON before
+// signing/verifying, never stored in the envelope — the disjoint prefix means a
+// manifest signature can never double as an envelope-wrapper (DOMAIN_env, §6.3)
+// or channel-handshake (DOMAIN, §13.6) signature over the same bytes.
+const DOMAIN_MANIFEST = new TextEncoder().encode("seedkernel-manifest-sig-v1\0");
+
 /** Canonical manifest bytes. The signed envelope carries these verbatim, and the
  *  verifier parses the exact bytes it checked, so no separate canonicalisation is
  *  needed — the bytes *are* the manifest. */
@@ -69,10 +76,16 @@ export function encodeManifest(m: BundleManifest): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(m));
 }
 
+/** The signed preimage: `DOMAIN_manifest ‖ json`. The prefix is signed but not
+ *  stored — the envelope carries only the raw json. */
+function manifestPreimage(json: Uint8Array): Uint8Array {
+  return concatBytes([DOMAIN_MANIFEST, json]);
+}
+
 /** Sign a manifest → envelope `[authorPk(32)][sig(64)][utf8 json]`. */
 export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Array, m: BundleManifest): Uint8Array {
   const json = encodeManifest(m);
-  const sig = sodium.crypto_sign_detached(json, sk);
+  const sig = sodium.crypto_sign_detached(manifestPreimage(json), sk);
   return concatBytes([pk, sig, json]);
 }
 
@@ -83,7 +96,7 @@ export function verifyManifest(sodium: ManifestCrypto, env: Uint8Array): { autho
   const author = env.slice(0, PK_LEN);
   const sig = env.slice(PK_LEN, PK_LEN + SIG_LEN);
   const json = env.slice(PK_LEN + SIG_LEN);
-  if (!sodium.crypto_sign_verify_detached(sig, json, author)) return null;
+  if (!sodium.crypto_sign_verify_detached(sig, manifestPreimage(json), author)) return null;
   try { return { author, manifest: JSON.parse(new TextDecoder().decode(json)) as BundleManifest }; }
   catch { return null; }
 }

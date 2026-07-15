@@ -6,12 +6,17 @@
 //   - Network:   the delivery fabric. LoopbackNetwork wires nodes in-process
 //                for tests; a WebRTC/data-channel or TCP implementation (see
 //                net-node.ts) satisfies the same interface in a real deployment.
-//   - Transport: per-node request/response keyed by correlation id, plus the
-//                bulk one-way frame path for content-addressed blocks (§13.6).
+//   - Transport: per-node request/response keyed by correlation id — a single
+//                frame plane (§13.6). Block bytes ride it too: a STORE pushes
+//                bytes in a `req` body and a FETCH returns them in a `res` body,
+//                so the §13.6 record layer authenticates and encrypts them along
+//                with every other frame. There is deliberately no separate
+//                unauthenticated bulk path.
 //
-// Frames on the wire:
-//   control req/res = [0|1 kind][corr u32 BE][type u8][payload ...]
-//   bulk block.data = [2 kind][block_id 32][ciphertext ...]   (unsigned, §13.6)
+// Frames on the wire (carried inside the §13.6 AEAD record layer):
+//   req = [0 kind][corr u32 BE][type u8][payload ...]
+//   res = [1 kind][corr u32 BE][payload ...]   (no type — the requester matches
+//         the response to its request by corr; the type it sent is what it wanted)
 
 import { writeU32BE, readU32BE } from "./util.js";
 
@@ -19,11 +24,23 @@ export type PeerId = string; // hex of the peer's kernel public key
 
 const KIND_REQ = 0;
 const KIND_RES = 1;
-const KIND_BULK = 2;
+
+// Absolute backstop, as a multiple of timeoutMs (see Transport.request). The silence
+// clock re-arms on any frame from the peer, so on its own it never bounds a request
+// whose response will never come while the peer keeps sending *other* frames. This caps
+// that. Generous — a legit bulk request's tail waits out the whole concurrent batch
+// draining to the peer — but finite, so a busy-and-buggy or hostile peer can't pin the
+// pending map forever.
+const DEFAULT_MAX_STALL_WINDOWS = 50;
 
 /** The delivery fabric. send() is fire-and-forget unicast; the receiver's
  *  registered sink is invoked with the raw frame. */
 export interface Network {
+  /** Unicast `frame` to peer `to`. `from` is only meaningful for LoopbackNetwork,
+   *  which multiplexes every in-process node over one fabric and needs it to pick
+   *  the recipient's sink and attribute the delivery. A real transport is bound to a
+   *  single local identity, so its `send` ignores `from` (the implementations name it
+   *  `_from`) — the sender is implicit in the connection. */
   send(from: PeerId, to: PeerId, frame: Uint8Array): void;
   register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void;
   unregister(peerId: PeerId): void;
@@ -66,7 +83,6 @@ export class LoopbackNetwork implements Network {
 }
 
 export type RequestHandler = (from: PeerId, type: number, payload: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
-export type BulkHandler = (from: PeerId, blockId: Uint8Array, bytes: Uint8Array) => void;
 
 interface Pending {
   /** The peer the request went to — a response only resolves if it arrives from
@@ -76,30 +92,55 @@ interface Pending {
   resolve: (payload: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** When the request was issued — the floor of its silence clock (see request()). */
+  issuedAt: number;
 }
 
-/** Per-node request/response + bulk transport over a Network. */
+/** Per-node request/response transport over a Network — a single frame plane. */
 export class Transport {
   private corr = 1;
   private pending = new Map<number, Pending>();
+  /** Most-recent frame arrival time per peer — the O(1) liveness signal every pending
+   *  request to that peer reads to decide whether it has stalled (see onFrame/request). */
+  private lastFrameAt = new Map<PeerId, number>();
   private reqHandler: RequestHandler | null = null;
-  private bulkHandler: BulkHandler | null = null;
 
   constructor(
     readonly peerId: PeerId,
     private readonly net: Network,
-    /** How long to wait for a response before treating the peer as unreachable
-     *  (§13.6). Small in tests; a deployment tunes it against real latency. */
+    /** How long a peer may stay SILENT before a request to it is treated as
+     *  unreachable (§13.6). This is a stall bound, not an absolute deadline: any
+     *  frame arriving from the peer re-arms the clock of every request pending to
+     *  it (see request()). Small in tests; a deployment tunes it against real
+     *  latency. */
     private readonly timeoutMs = 200,
+    /** Hard ceiling on a single request's lifetime, as a multiple of timeoutMs — the
+     *  backstop the silence clock lacks. A request rejects after this many silence
+     *  windows since it was issued regardless of how live the peer looks, so a peer that
+     *  withholds one response while keeping the wire warm (buggy or hostile) cannot pin
+     *  the pending map indefinitely. Kept generous so it never kills a legit bulk
+     *  request whose tail is genuinely still draining. */
+    private readonly maxStallWindows = DEFAULT_MAX_STALL_WINDOWS,
   ) {
     this.net.register(peerId, (from, frame) => this.onFrame(from, frame));
   }
 
   onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
-  onBulk(handler: BulkHandler): void { this.bulkHandler = handler; }
 
-  /** Send a typed control request and await the typed response. Rejects on
-   *  timeout (the peer is offline/unreachable). */
+  /** Send a typed control request and await the typed response. Rejects when the
+   *  peer stalls — no frame of any kind from it for timeoutMs. The clock is
+   *  re-armed by every arriving frame from that peer rather than fixed at issue
+   *  time: a bulk fan-out (a PUT's STORE round) hands the socket many queued
+   *  megabytes against one issue instant, so an absolute deadline would fail the
+   *  tail of a transfer that is visibly progressing on a slow link. A dead peer
+   *  still rejects after exactly timeoutMs of silence.
+   *
+   *  Silence is not the only failure signal, though: a peer that withholds *this*
+   *  response while other traffic keeps flowing (a hung/declining handler, or a
+   *  hostile peer selectively answering) would re-arm the clock forever. So a
+   *  second, absolute backstop rejects after maxStallWindows silence windows since
+   *  issue no matter how live the peer looks — finite, but generous enough never to
+   *  fire on a legit request whose tail is still draining. */
   request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array> {
     const corr = this.corr++;
     const frame = new Uint8Array(1 + 4 + 1 + payload.length);
@@ -108,45 +149,44 @@ export class Transport {
     frame[5] = type & 255;
     frame.set(payload, 6);
     return new Promise<Uint8Array>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const issuedAt = Date.now();
+      // Absolute deadline the per-frame re-arm cannot push out (see maxStallWindows).
+      const deadline = issuedAt + this.timeoutMs * this.maxStallWindows;
+      // Silence-based stall clock, re-armed lazily. On expiry, reject if the peer has
+      // been silent for timeoutMs since the later of this request's issue time and the
+      // peer's last frame; otherwise a frame arrived recently (a bulk fan-out is still
+      // progressing), so re-arm just this one timer for the remaining window — but never
+      // past the absolute backstop, so a live-but-withholding peer still rejects. The
+      // liveness signal is the single per-peer timestamp updated O(1) in onFrame — no
+      // per-frame sweep over every pending request.
+      const check = (): void => {
+        const p = this.pending.get(corr);
+        if (!p) return;
+        const now = Date.now();
+        const last = Math.max(issuedAt, this.lastFrameAt.get(to) ?? 0);
+        const remaining = last + this.timeoutMs - now;
+        if (remaining > 0 && now < deadline) {
+          p.timer = setTimeout(check, Math.min(remaining, deadline - now));
+          return;
+        }
         this.pending.delete(corr);
-        reject(new Error(`net.send: timeout to ${to.slice(0, 8)} (type ${type})`));
-      }, this.timeoutMs);
-      this.pending.set(corr, { to, resolve, reject, timer });
+        const why = remaining > 0 ? "backstop" : "timeout"; // live-but-withholding vs. silent
+        reject(new Error(`net.send: ${why} to ${to.slice(0, 8)} (type ${type})`));
+      };
+      const timer = setTimeout(check, this.timeoutMs);
+      this.pending.set(corr, { to, resolve, reject, timer, issuedAt });
       this.net.send(this.peerId, to, frame);
     });
   }
 
-  /** Scatter-gather: send the same typed request to many peers and gather the
-   *  responses that arrive before the timeout. One entry per input peer (order
-   *  preserved); an unreachable or timed-out peer comes back `ok:false` with no
-   *  bytes (partial results, never a reject). This is the one concurrency a
-   *  confined safe-js guest cannot do itself — `Promise.all` aborts the VM, so
-   *  the fan-out lives host-side and the guest just consumes a finished list. */
-  async requestMany(
-    peers: PeerId[],
-    type: number,
-    payload: Uint8Array,
-  ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]> {
-    return Promise.all(
-      peers.map(async (peer) => {
-        try {
-          return { peer, ok: true, bytes: await this.request(peer, type, payload) };
-        } catch {
-          return { peer, ok: false, bytes: new Uint8Array(0) };
-        }
-      }),
-    );
-  }
-
   /** Per-peer scatter-gather: send a *distinct* typed request to each peer and
-   *  gather the responses that arrive before the timeout. The general case of
-   *  `requestMany` (which is this with one shared payload broadcast to all). One
-   *  entry per input request, order preserved; an unreachable/timed-out peer comes
-   *  back `ok:false` with no bytes (partial results, never a reject). This is the
-   *  app-neutral parallel primitive a confined safe-js guest drives one batched cap
-   *  at a time — `Promise.all` aborts the VM, so the fan-out lives here and the
-   *  sync guest just consumes a finished list (see cap-bridge NET_SEND_MANY). */
+   *  gather the responses that arrive before the timeout. A broadcast of one shared
+   *  payload to many peers is just N identical entries. One entry per input request,
+   *  order preserved; an unreachable/timed-out peer comes back `ok:false` with no
+   *  bytes (partial results, never a reject). This is the one concurrency a confined
+   *  safe-js guest cannot do itself — `Promise.all` aborts the VM, so the fan-out
+   *  lives host-side and the sync guest just consumes a finished list (see cap-bridge
+   *  NET_SEND_MANY). */
   async sendMany(
     requests: { peer: PeerId; type: number; payload: Uint8Array }[],
   ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]> {
@@ -161,29 +201,21 @@ export class Transport {
     );
   }
 
-  /** Push a content-addressed block over the bulk plane — unsigned, the
-   *  receiver verifies genesis_hash(bytes) == block_id itself (§13.6). */
-  sendBulk(to: PeerId, blockId: Uint8Array, bytes: Uint8Array): void {
-    const frame = new Uint8Array(1 + 32 + bytes.length);
-    frame[0] = KIND_BULK;
-    frame.set(blockId, 1);
-    frame.set(bytes, 33);
-    this.net.send(this.peerId, to, frame);
-  }
-
   close(): void {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("transport closed")); }
     this.pending.clear();
+    this.lastFrameAt.clear();
     this.net.unregister(this.peerId);
   }
 
   private onFrame(from: PeerId, frame: Uint8Array): void {
+    // Liveness proof: record this peer's most-recent frame time. Every request pending to
+    // it reads this as its stall clock (the timeout is silence-based — see request()), so
+    // a frame costs one O(1) timestamp write instead of clearing + re-arming a timer for
+    // every pending request on the hot receive path. Each pending timer re-arms itself
+    // lazily off this stamp when it fires.
+    this.lastFrameAt.set(from, Date.now());
     const kind = frame[0];
-    if (kind === KIND_BULK) {
-      if (frame.length < 33 || !this.bulkHandler) return;
-      this.bulkHandler(from, frame.slice(1, 33), frame.slice(33));
-      return;
-    }
     const corr = readU32BE(frame, 1);
     if (kind === KIND_RES) {
       const p = this.pending.get(corr);
@@ -193,7 +225,7 @@ export class Transport {
       if (p.to !== from) return;
       clearTimeout(p.timer);
       this.pending.delete(corr);
-      p.resolve(frame.slice(6));
+      p.resolve(frame.slice(5)); // res = [1][corr u32][payload] — no type byte
       return;
     }
     // KIND_REQ — dispatch to the node's handler and reply with the same corr.
@@ -215,11 +247,12 @@ export class Transport {
       }
     }
     const body = resp ?? new Uint8Array(0);
-    const frame = new Uint8Array(6 + body.length);
+    // res carries no type byte: the requester matches by corr and already knows the
+    // type it asked for. (req still carries it — that's how the responder dispatches.)
+    const frame = new Uint8Array(5 + body.length);
     frame[0] = KIND_RES;
     writeU32BE(frame, 1, corr);
-    frame[5] = type & 255;
-    frame.set(body, 6);
+    frame.set(body, 5);
     this.net.send(this.peerId, from, frame);
   }
 }

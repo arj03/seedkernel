@@ -10,12 +10,12 @@
 //       2. host calls bootstrap.handle_signature() → returns 1 if verified
 //       3. host reads inner bytes from bootstrap memory, dispatches through kernel
 //       4. host calls bootstrap.pop_signer() after inner dispatch returns
-//   - Holds the suite registry for pluggable algorithm suites (§6.4) and
-//     dispatches suite_verify imports from bootstrap.wasm to the right suite
+//   - Services the signature module's suite_verify import (§6.6) by dispatching
+//     the verify request to the ordinary handler at the algo's suite slot
+//     (§6.4) — genesis included, seeded as a host-serviced suite handler
 //   - Provides kernel.call / kernel.caller imports to dynamic handlers (§4.2)
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
-//     instantiating WASM handlers + setHandler, registering suite instances,
-//     genesis hashing, top-signer access
+//     instantiating WASM handlers + setHandler, genesis hashing, top-signer access
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
@@ -27,6 +27,25 @@ export const GENESIS_ALGO_ID        = 0x0000;
 export const GENESIS_PUBKEY_LEN     = 32;
 export const GENESIS_SIGNATURE_LEN  = 64;
 export const GENESIS_SECRET_KEY_LEN = 64;
+
+// README §6.4: an algorithm suite is an ordinary scratch-ABI handler installed
+// at a conventional slot name, `hash(SUITE_SLOT_PREFIX + algo_id_hex)`. The
+// genesis suite (Ed25519 + SHA-3-256, algo_id 0x0000) is seeded at that slot by
+// the host at bootstrap and serviced with the bundled libsodium (§6.2, §14).
+const SUITE_SLOT_PREFIX = "seedkernel.signature.suite.v1:";
+
+// README §6.3 / §17.1: the envelope-signature domain prefix. The signed preimage is
+// `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (signer is length-
+// prefixed so the preimage is self-delimiting); the prefix is prepended before
+// signing/verifying but never transmitted, so a signature harvested in one context
+// cannot verify in another.
+const DOMAIN_ENV = new TextEncoder().encode("seedkernel-envelope-sig-v1\0");
+
+
+/** Lowercase 4-hex-digit encoding of a u16 algo_id for suite slot names (§6.4). */
+function algoIdHex(algoId: number): string {
+  return (algoId & 0xffff).toString(16).padStart(4, "0");
+}
 
 export interface Signer {
   algoId: number;
@@ -67,30 +86,6 @@ interface BootstrapExports {
   signer_pubkey_len(index: number): number;
 }
 
-// ─── pluggable suite WASM contract (README §6.6) ─────────────────────────
-
-interface SuiteInstance {
-  memory: WebAssembly.Memory;
-  alloc(size: number): number;
-  dealloc(ptr: number): void;
-  verify(pubPtr: number, pubLen: number, sigPtr: number, sigLen: number, dataPtr: number, dataLen: number): number;
-  // Optional suite export (README §6.6). The reference host derives ids via its
-  // bundled libsodium and never calls this, but it is captured so SuiteInstance
-  // mirrors the full suite contract — a host that routed id derivation through
-  // the suite would call it here. Do not remove as "dead": it documents the ABI.
-  hash(dataPtr: number, dataLen: number, outPtr: number): number;
-  // Sizes declared at registration; the host validates pubkey/sig lengths on
-  // each verify call so the signature module can stay metadata-free.
-  pubkeyLen: number;
-  sigMaxLen: number;
-  // Reused buffers in the suite's linear memory. Allocated once at registration
-  // and grown on demand for data.
-  pubScratch: number;
-  sigScratch: number;
-  dataScratch: number;
-  dataScratchSize: number;
-}
-
 // ─── handler routing ─────────────────────────────────────────────────────
 
 const HANDLER_SIGNATURE        = -1;
@@ -126,7 +121,6 @@ export class KernelHost {
   private wasmHandlers = new Map<number, WasmHandlerRef>();
   private nameToHandlerId = new Map<string, number>();
   private handlerIdToName = new Map<number, Uint8Array>();
-  private suiteRegistry = new Map<number, SuiteInstance>();
   private nextHandlerId = 1;
   private callDepth = 0;
   // Call-chain tracking for kernel.caller (§4.2). Outermost is first, immediate
@@ -194,16 +188,14 @@ export class KernelHost {
     // ── load bootstrap.wasm (signature module) ────────────────────────
     const bootstrapImports: WebAssembly.Imports = {
       env: {
-        ed25519_verify: (pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number => {
-          return host._ed25519Verify(pubPtr, sigPtr, dataPtr, dataLen);
-        },
-        suite_verify: (
-          algoId: number,
-          pubPtr: number, pubLen: number,
-          sigPtr: number, sigLen: number,
-          dataPtr: number, dataLen: number
-        ): number => {
-          return host._suiteVerify(algoId, pubPtr, pubLen, sigPtr, sigLen, dataPtr, dataLen);
+        // README §6.6: the signature module builds the suite verify request
+        // (length-prefixed pubkey/sig/data, no op selector) in its own memory
+        // and passes it here with the algo_id. The host derives the suite's slot
+        // name (§6.4) and dispatches the request to whatever ordinary handler is
+        // installed there — genesis included, which is seeded as a host-serviced
+        // suite handler at bootstrap. Returns 1 iff the suite reports valid.
+        suite_verify: (algoId: number, reqPtr: number, reqLen: number): number => {
+          return host._suiteVerify(algoId, reqPtr, reqLen);
         },
         abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
           throw new Error(`bootstrap.wasm abort at ${line}:${col}`);
@@ -391,26 +383,18 @@ export class KernelHost {
     return out;
   }
 
-  /** Serialize the current callerStack into the `[count u8] [len1 u8][name1] ...`
-   *  format the kernel.caller import returns (§4.2). Empty stack returns the
-   *  single byte [0x00]. Used by both the WASM import and host-JS bridges
-   *  that want the full chain. */
-  private _serializeCallerStack(): Uint8Array {
-    const entries: Uint8Array[] = [];
-    let size = 1;
-    for (const n of this.callerStack) {
-      if (!n) continue;
-      entries.push(n);
-      size += 1 + n.length;
-    }
-    const out = new Uint8Array(size);
-    let o = 0;
-    out[o++] = entries.length;
-    for (const n of entries) {
-      out[o++] = n.length;
-      out.set(n, o);
-      o += n.length;
-    }
+  /** Serialize the **immediate** caller into the `[name_len u8][name ..]`
+   *  format the kernel.caller import returns (§4.2). No caller (top-level
+   *  dispatch, or a host/guest-originated frame) returns the single byte
+   *  [0x00] (name_len = 0). Only the immediate caller is ever exposed — the
+   *  deeper chain is deliberately unreachable so a handler cannot treat a
+   *  non-immediate frame as authoritative (§4.2, §9). */
+  private _serializeImmediateCaller(): Uint8Array {
+    const n = this.callerStack.length ? this.callerStack[this.callerStack.length - 1] : null;
+    if (!n) return new Uint8Array([0]);
+    const out = new Uint8Array(1 + n.length);
+    out[0] = n.length;
+    out.set(n, 1);
     return out;
   }
 
@@ -448,11 +432,25 @@ export class KernelHost {
     const exps = instance.exports as {
       memory?: WebAssembly.Memory;
       scratch?: WebAssembly.Global;
+      scratchSize?: WebAssembly.Global;
       handle?: (input_len: number) => number;
     };
     if (!exps.memory || !(exps.scratch instanceof WebAssembly.Global) || typeof exps.handle !== "function") return false;
     const scratchOffset = exps.scratch.value as number;
     if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) return false;
+    // A handler may OPTIONALLY export `scratchSize` to declare a bigger I/O region
+    // than the 128 KB default (README §4.1, "set per handler at instantiation") —
+    // e.g. the storage codec reserves a whole chunk's worth of blocks. Honor it only
+    // when it names real, in-bounds memory the handler actually reserved past
+    // `scratch`; otherwise fall back to the default. Never shrink below the default.
+    let scratchSize = DEFAULT_SCRATCH_SIZE;
+    if (exps.scratchSize instanceof WebAssembly.Global) {
+      const declared = exps.scratchSize.value as number;
+      if (typeof declared === "number" && declared >= DEFAULT_SCRATCH_SIZE &&
+          scratchOffset + declared <= exps.memory.buffer.byteLength) {
+        scratchSize = declared;
+      }
+    }
 
     // SetHandler is unconditional at the kernel level — replace whatever is
     // there. The installer's replacement policy was applied before this
@@ -470,7 +468,7 @@ export class KernelHost {
     this.wasmHandlers.set(handlerId, {
       memory: exps.memory,
       scratch: scratchOffset,
-      scratchSize: DEFAULT_SCRATCH_SIZE,
+      scratchSize,
       handle: exps.handle,
       exports: instance.exports,
     });
@@ -559,38 +557,56 @@ export class KernelHost {
   }
 
   /** Host import provided to dynamic handlers as `kernel.caller` (§4.2).
-   *  Writes the full caller stack at outPtr in `[count u8] [len1][name1] ...`
-   *  format and returns the total bytes written. Empty stack writes the
-   *  single byte [0x00] and returns 1. */
+   *  Writes the **immediate** caller at outPtr as `[name_len u8][name ..]` and
+   *  returns the total bytes written. No caller writes the single byte [0x00]
+   *  (name_len = 0) and returns 1. The deeper chain is never exposed. */
   private _kernelCallerFromHandler(callerHandlerId: number, outPtr: number): number {
     const caller = this.wasmHandlers.get(callerHandlerId);
     if (!caller) return 0;
-    const bytes = this._serializeCallerStack();
+    const bytes = this._serializeImmediateCaller();
     if (outPtr + bytes.length > caller.memory.buffer.byteLength) return 0;
     new Uint8Array(caller.memory.buffer, outPtr, bytes.length).set(bytes);
     return bytes.length;
   }
 
-  /** Ed25519 verify — reads from bootstrap.wasm memory, calls libsodium.
+  /** The genesis suite handler (algo_id 0x0000 = Ed25519 + SHA-3-256). Seeded
+   *  by `registerSignature` at the genesis suite slot (§6.4) and reached like
+   *  any ordinary handler, either by the signature module's suite dispatch or
+   *  by a plain `kernel.call`. Standard scratch-ABI request/response (§6.6):
    *
-   *  Since the raw public-key bytes become the signer's identity (and the
-   *  canonical replay key, §4.4), the key MUST be validated before use:
-   *  reject non-canonical or small-order encodings so the same logical key
-   *  cannot present two distinct byte forms (README §6.3). libsodium's
-   *  `crypto_sign_verify_detached` already rejects small-order / non-canonical
-   *  public keys internally; we additionally gate on `crypto_core_ed25519_is_
-   *  valid_point` when the wrapper build exposes it, to make the guarantee
-   *  explicit and independent of the verify path. */
-  private _ed25519Verify(pubPtr: number, sigPtr: number, dataPtr: number, dataLen: number): number {
+   *    verify: [pk_len u16][pk][sig_len u16][sig][data ..] → [valid u8]
+   *
+   *  Verify is the suite's whole contract (§6.6) — no op selector, and the
+   *  reference host derives ids directly, so there is no hash op.
+   *
+   *  `data` is the full signed preimage the signature module assembled
+   *  (`DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope`, §6.3); the suite
+   *  is oblivious to its structure and just verifies `sig` over `data` under `pk`.
+   *
+   *  The raw public-key bytes are the signer's identity (and the canonical
+   *  replay key, §4.4), so the key is validated before use: non-canonical /
+   *  small-order encodings are rejected so one logical key has exactly one byte
+   *  form (§6.3). libsodium's verify already rejects them internally; the extra
+   *  `crypto_core_ed25519_is_valid_point` gate (when the build exposes it) makes
+   *  the guarantee explicit and independent of the verify path. */
+  private readonly _genesisSuiteHandler: Handler = (_name, req) => {
+    const INVALID = new Uint8Array([0]);
+    let o = 0;
+    if (o + 2 > req.length) return INVALID;
+    const pkLen = (req[o] << 8) | req[o + 1]; o += 2;
+    if (pkLen !== GENESIS_PUBKEY_LEN || o + pkLen > req.length) return INVALID;
+    const pk = req.slice(o, o + pkLen); o += pkLen;
+    if (o + 2 > req.length) return INVALID;
+    const sigLen = (req[o] << 8) | req[o + 1]; o += 2;
+    if (sigLen !== GENESIS_SIGNATURE_LEN || o + sigLen > req.length) return INVALID;
+    const sig = req.slice(o, o + sigLen); o += sigLen;
+    const data = req.slice(o);
     try {
-      const mem  = this.bootstrapExports.memory.buffer;
-      const pub  = new Uint8Array(mem, pubPtr,  32);
-      const sig  = new Uint8Array(mem, sigPtr,  64);
-      const data = new Uint8Array(mem, dataPtr, dataLen);
-      if (!this._pubkeyIsValidPoint(pub)) return 0;
-      return this.sodium.crypto_sign_verify_detached(sig, data, pub) ? 1 : 0;
-    } catch { return 0; }
-  }
+      if (!this._pubkeyIsValidPoint(pk)) return INVALID;
+      return this.sodium.crypto_sign_verify_detached(sig, data, pk)
+        ? new Uint8Array([1]) : INVALID;
+    } catch { return INVALID; }
+  };
 
   /** Gate on crypto_core_ed25519_is_valid_point (canonical encoding +
    *  prime-order subgroup), memoizing the result per distinct key. Builds that
@@ -626,129 +642,48 @@ export class KernelHost {
     this.nameToHandlerId.delete(key);
   }
 
-  /** Install a pluggable algorithm suite into the host registry (§6.4).
-   *  Called by the Installer when an install lands on a suite-slot name. */
-  _registerSuite(
-    algoId: number,
-    pubkeyLen: number,
-    sigMaxLen: number,
-    wasmBytes: Uint8Array,
-  ): boolean {
-    if (this.suiteRegistry.has(algoId)) return false;
-    try {
-      const mod = new WebAssembly.Module(wasmBytes as BufferSource);
-      const suiteImports: WebAssembly.Imports = {
-        env: {
-          abort: (_m: number, _f: number, l: number, c: number) => {
-            throw new Error(`suite abort at ${l}:${c}`);
-          },
-        },
-      };
-      const instance = new WebAssembly.Instance(mod, suiteImports);
-      const exps = instance.exports as {
-        memory?: WebAssembly.Memory;
-        alloc?: (size: number) => number;
-        dealloc?: (ptr: number) => void;
-        verify?: (pubPtr: number, pubLen: number, sigPtr: number, sigLen: number, dataPtr: number, dataLen: number) => number;
-        hash?: (dataPtr: number, dataLen: number, outPtr: number) => number;
-      };
-      if (!exps.memory || typeof exps.alloc !== "function" || typeof exps.verify !== "function") return false;
-      const alloc = exps.alloc;
-      const INITIAL_DATA_SCRATCH = 4096;
-      this.suiteRegistry.set(algoId, {
-        memory: exps.memory,
-        alloc,
-        dealloc: exps.dealloc ?? (() => {}),
-        verify: exps.verify,
-        hash: exps.hash ?? ((_dp: number, _dl: number, _op: number) => 0),
-        pubkeyLen,
-        sigMaxLen,
-        pubScratch:  alloc(pubkeyLen),
-        sigScratch:  alloc(sigMaxLen),
-        dataScratch: alloc(INITIAL_DATA_SCRATCH),
-        dataScratchSize: INITIAL_DATA_SCRATCH,
-      });
-      return true;
-    } catch {
-      return false;
-    }
+  /** Derive the conventional slot name a suite for `algoId` is installed at
+   *  (README §6.4): `genesisHash(SUITE_SLOT_PREFIX + algo_id_hex)`. A suite is
+   *  an ordinary handler at this name — no registry, no separate ABI. */
+  deriveSuiteSlotName(algoId: number): Uint8Array {
+    return this.genesisHash(
+      new TextEncoder().encode(SUITE_SLOT_PREFIX + algoIdHex(algoId)),
+    );
   }
 
-  /** Remove a suite registry entry. Called by Installer.remove(). */
-  _unregisterSuite(algoId: number): boolean {
-    return this.suiteRegistry.delete(algoId);
-  }
-
-  /** Call a registered suite's verify function (§6.6). Validates sizes
-   *  against the suite's declared metadata; an unknown algoId or a size
-   *  mismatch returns 0. Pointers are into bootstrap.wasm's memory. */
-  private _suiteVerify(
-    algoId: number,
-    pubPtr: number, pubLen: number,
-    sigPtr: number, sigLen: number,
-    dataPtr: number, dataLen: number
-  ): number {
-    const suite = this.suiteRegistry.get(algoId);
-    if (!suite) return 0;
-    if (pubLen !== suite.pubkeyLen) return 0;
-    if (sigLen <= 0 || sigLen > suite.sigMaxLen) return 0;
-    if (dataLen > suite.dataScratchSize) {
-      // Allocate the larger buffer BEFORE freeing the old one. If alloc throws
-      // (OOM in the suite's memory), the suite's scratch state stays intact —
-      // freeing first would leave `dataScratch` dangling at the old (now freed)
-      // pointer while `dataScratchSize` still claimed the old capacity, so the
-      // next verify would write through a freed pointer.
-      const newScratch = suite.alloc(dataLen);
-      try { suite.dealloc(suite.dataScratch); } catch { /* swallow */ }
-      suite.dataScratch = newScratch;
-      suite.dataScratchSize = dataLen;
-    }
-    const bootMem = new Uint8Array(this.bootstrapExports.memory.buffer);
-    const sMem    = new Uint8Array(suite.memory.buffer);
-    sMem.set(bootMem.subarray(pubPtr,  pubPtr  + pubLen),  suite.pubScratch);
-    sMem.set(bootMem.subarray(sigPtr,  sigPtr  + sigLen),  suite.sigScratch);
-    sMem.set(bootMem.subarray(dataPtr, dataPtr + dataLen), suite.dataScratch);
-    try {
-      return suite.verify(
-        suite.pubScratch,  pubLen,
-        suite.sigScratch,  sigLen,
-        suite.dataScratch, dataLen,
-      );
-    } catch {
-      return 0;
-    }
+  /** Service the signature module's suite dispatch (§6.6). The module built the
+   *  verify request at `[reqPtr, reqLen)` in bootstrap memory; the host derives
+   *  the suite's slot name from `algoId` and hands the request to whatever
+   *  ordinary handler is installed there. An unknown algo_id (no handler at the
+   *  slot) or an unexpected response drops (returns 0), exactly as a suite that
+   *  reports "invalid" — the fail-safe path (§6.4 lazy validation). */
+  private _suiteVerify(algoId: number, reqPtr: number, reqLen: number): number {
+    let req: Uint8Array;
+    try { req = this.readFromBootstrap(reqPtr, reqLen); }
+    catch { return 0; }
+    const slotName = this.deriveSuiteSlotName(algoId);
+    const hid = this.nameToHandlerId.get(nameKey(slotName));
+    if (hid === undefined) return 0;
+    const resp = this._invokeHandlerGetResponse(hid, slotName, req);
+    return resp !== null && resp.length >= 1 && resp[0] === 1 ? 1 : 0;
   }
 
   // ─── public API ──────────────────────────────────────────────────────
 
-  /** The name of the handler that initiated the current kernel.call, or null
-   *  when the current handler was invoked directly from the pipeline. Host-side
-   *  equivalent of the kernel.caller WASM import (§4.2) — returns the
-   *  immediate caller (last entry of the chain). */
+  /** The name of the **immediate** caller — the handler whose `kernel.call`
+   *  reached the current one — or null when it was invoked directly from the
+   *  pipeline (or by a host/guest-originated frame). Host-side equivalent of
+   *  the kernel.caller WASM import (§4.2). Only the immediate caller is exposed;
+   *  the deeper chain is deliberately unreachable so a bridge cannot authorize
+   *  on a non-immediate frame (§9). */
   get currentCaller(): Uint8Array | null {
     if (this.callerStack.length === 0) return null;
     return this.callerStack[this.callerStack.length - 1] ?? null;
   }
 
-  /** Read the entire caller stack — outermost first, immediate caller last
-   *  (§4.2). Useful for audit logging in host-side bridges; capability checks
-   *  MUST use the immediate caller only (i.e. `currentCaller`). */
-  get currentCallerStack(): readonly Uint8Array[] {
-    const out: Uint8Array[] = [];
-    for (const n of this.callerStack) if (n) out.push(n);
-    return out;
-  }
-
-  /** Return the capability IDs declared at install time by the handler
-   *  registered under `name`, or [] for unknown / SetHandler-installed
-   *  slots (§8.3). Convenience wrapper for the equivalent kernel.call to
-   *  `installer.caps_of`. */
-  getHandlerDeclaredCaps(name: Uint8Array): readonly Uint8Array[] {
-    return this._installer ? this._installer.capsOf(name) : [];
-  }
-
-  /** Read-only access to the install record at `name`, or null. Convenience
-   *  wrapper for `installer.lookup`. */
+  /** Read-only access to the install record at `name`, or null. Host-side
+   *  read of the installer's records — the policy callback already receives the
+   *  resolved `existing` record, so there is no wire query (README §7.6). */
   lookupInstall(name: Uint8Array): InstallRecord | null {
     return this._installer ? this._installer.lookup(name) : null;
   }
@@ -768,7 +703,7 @@ export class KernelHost {
 
   /** Host-level handler management (README §3.1). Installs or replaces a
    *  handler unconditionally. SetHandler-installed handlers are immune to
-   *  installer state by construction (§8.3) — any matching install record
+   *  installer state by construction (§9) — any matching install record
    *  is cleared as a side effect. */
   setHandler(name: Uint8Array, handlerId: number): void {
     const ptr = this.writeToKernel(name);
@@ -779,9 +714,8 @@ export class KernelHost {
     this.nameToHandlerId.set(key, handlerId);
     this.handlerIdToName.set(handlerId, name.slice());
     // SetHandler entries are bootstrap-only by construction (§3.1) — clear
-    // any stale install record at this slot so a future lookup / caps_of
-    // can't return stale data for brand-new bytes (§3.1 "Replacing installer-
-    // managed names").
+    // any stale install record at this slot so a future lookup can't return
+    // stale data for brand-new bytes (§3.1 "Replacing installer-managed names").
     if (this._installer) this._installer._onKernelSlotMutated(name);
   }
 
@@ -798,11 +732,17 @@ export class KernelHost {
     } finally { this.kernelExports.dealloc(ptr); }
   }
 
-  /** Register the signature wrapper handler (§6.5). Required for any signed
-   *  message to dispatch. */
+  /** Register the signature wrapper handler (§6.5) and seed the genesis suite
+   *  (§6.2) at its slot. Required for any signed message to dispatch: the
+   *  wrapper verifies via the suite installed at the algo's slot (§6.4), and the
+   *  genesis suite (Ed25519 + SHA-3-256) is the one that must exist at boot.
+   *  It is registered like any other bootstrap handler — a SetHandler-seeded
+   *  slot with no install record, so the reference policy refuses to overlay it
+   *  (§6.4) and the host retains it as the emergency-replacement path (§10.1). */
   registerSignature(signatureName: Uint8Array): void {
     this.setHandler(signatureName, HANDLER_SIGNATURE);
     this._signatureName = signatureName.slice();
+    this.register(this.deriveSuiteSlotName(GENESIS_ALGO_ID), this._genesisSuiteHandler);
   }
 
   /** Register the `signature.signer` query handler (§6.5). Any handler that
@@ -822,20 +762,16 @@ export class KernelHost {
     this.blockedFromCall.add(handlerId);
   }
 
-  /** Register the Installer (README §7). Wires the install message handler,
-   *  the installer.lookup query, and the installer.caps_of query. Without
-   *  calling this, the deployment is frozen — no message-driven installs.
-   *  Returns the Installer instance for further configuration. */
-  registerInstaller(
-    installName: Uint8Array,
-    lookupName: Uint8Array,
-    capsOfName: Uint8Array,
-  ): Installer {
+  /** Register the Installer (README §7). Wires the (blocked) install message
+   *  handler — the installer's whole wire surface. Install records are read
+   *  host-side via `lookupInstall`; there is no `installer.lookup` /
+   *  `installer.caps_of` query message (README §7.6). Without calling this, the
+   *  deployment is frozen — no message-driven installs. Returns the Installer
+   *  instance for further configuration. */
+  registerInstaller(installName: Uint8Array): Installer {
     const ih = new Installer(this, installName);
     const id = this.register(installName, ih.handler);
     this.blockFromCall(id);
-    this.register(lookupName, ih.lookupHandler);
-    this.register(capsOfName, ih.capsOfHandler);
     this._installer = ih;
     return ih;
   }
@@ -852,50 +788,24 @@ export class KernelHost {
   /** Build an install payload (README §7.2):
    *    [seq u32 BE]
    *    [name_len u8][name ..]
-   *    [caps_count u8][caps...]    each cap = [cap_id_len u8][cap_id ..]
-   *    [parent_len u8][parent ..]  parent_len = 0 means no claimed predecessor
    *    [wasm]
    *
-   *  `seq` is the §4.4 replay-protection sequence number for the signer.
-   *  Pass an empty caps array for pure-computation handlers. */
+   *  `seq` is the §4.4 replay-protection sequence number for the signer. */
   encodeInstallPayload(
     seq: number,
     name: Uint8Array,
-    caps: Uint8Array[],
-    parent: Uint8Array | null,
     wasmBytes: Uint8Array,
   ): Uint8Array {
     if (name.length === 0 || name.length > 255)
       throw new Error("encodeInstallPayload: name length must be 1..255");
     if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
       throw new Error("encodeInstallPayload: seq must fit in u32");
-    if (caps.length > 255)
-      throw new Error("encodeInstallPayload: caps count must be 0..255");
-    for (const cap of caps) {
-      if (cap.length > 255)
-        throw new Error("encodeInstallPayload: each cap_id length must be 0..255");
-    }
-    const parentLen = parent ? parent.length : 0;
-    if (parentLen > 255)
-      throw new Error("encodeInstallPayload: parent length must be 0..255");
-    let headerLen = 4;                   // seq
-    headerLen += 1 + name.length;        // name_len + name
-    headerLen += 1;                      // caps_count
-    for (const cap of caps) headerLen += 1 + cap.length;
-    headerLen += 1 + parentLen;          // parent_len + parent
+    const headerLen = 4 + 1 + name.length; // seq + name_len + name
     const out = new Uint8Array(headerLen + wasmBytes.length);
     let o = 0;
     writeU32BE(out, o, seq); o += 4;
     out[o++] = name.length;
     out.set(name, o); o += name.length;
-    out[o++] = caps.length;
-    for (const cap of caps) {
-      out[o++] = cap.length;
-      out.set(cap, o);
-      o += cap.length;
-    }
-    out[o++] = parentLen;
-    if (parent) { out.set(parent, o); o += parentLen; }
     out.set(wasmBytes, o);
     return out;
   }
@@ -954,7 +864,7 @@ export class KernelHost {
     if (this.blockedFromCall.has(hid)) return null;
     if (this.callDepth >= MAX_CALL_DEPTH) return null;
     // Push an anonymous caller frame so the target (and any bridge doing the
-    // §8.2 capability check) sees "no installed caller" rather than a stale
+    // §9 caller-pinning check) sees "no installed caller" rather than a stale
     // frame from an outer dispatch — the host/guest caller has no kernel name.
     this.callerStack.push(null);
     this.callDepth++;
@@ -1003,8 +913,7 @@ export class KernelHost {
   }
 
   /** Direct host-side access to the installer (read-only). Most code should
-   *  go through the convenience wrappers (`lookupInstall`, `getHandlerDeclaredCaps`)
-   *  or kernel.call to the lookup/caps_of names. */
+   *  go through the `lookupInstall` convenience wrapper. */
   get installer(): Installer | null {
     return this._installer;
   }
@@ -1071,7 +980,23 @@ export class KernelHost {
     if (projectedTotal > MAX_ENVELOPE_BYTES) {
       throw new Error("wrap: envelope exceeds 64 KB");
     }
-    const sig = this.sodium.crypto_sign_detached(innerBytes, privateKey);
+    // README §6.3: sign over `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖
+    // inner_envelope`, not the bare inner bytes. Folding the outer fields into the
+    // preimage closes the algo_id/signer flip attacks, and length-prefixing the signer
+    // makes the preimage self-delimiting so no other (signer, inner) split can hash to
+    // the same bytes; the domain prefix keeps an envelope signature from verifying in any
+    // other context. The prefix and outer fields are reconstructed by the verifier, never
+    // transmitted (the wrapper carries signer_len already).
+    const preimage = new Uint8Array(DOMAIN_ENV.length + 2 + 2 + GENESIS_PUBKEY_LEN + innerBytes.length);
+    let p = 0;
+    preimage.set(DOMAIN_ENV, p); p += DOMAIN_ENV.length;
+    preimage[p++] = (GENESIS_ALGO_ID >> 8) & 0xff;
+    preimage[p++] = GENESIS_ALGO_ID & 0xff;
+    preimage[p++] = (GENESIS_PUBKEY_LEN >> 8) & 0xff;
+    preimage[p++] = GENESIS_PUBKEY_LEN & 0xff;
+    preimage.set(publicKey, p); p += GENESIS_PUBKEY_LEN;
+    preimage.set(innerBytes, p);
+    const sig = this.sodium.crypto_sign_detached(preimage, privateKey);
     const wrapperPayload = new Uint8Array(wrapperPayloadLen);
     let o = 0;
     wrapperPayload[o++] = (GENESIS_ALGO_ID >> 8) & 0xff;

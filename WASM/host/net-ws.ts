@@ -93,6 +93,13 @@ export interface WsNetworkOptions {
   /** Optional roster gate applied *after* the identity handshake proves who the
    *  peer is: an off-roster peer is dropped before any frame is delivered. */
   admit?: (peerId: PeerId) => boolean;
+  /** How many parallel connections to open per peer (default 1). Bulk PUT/GET
+   *  stripes its frames round-robin across them — each still its own PeerLink and
+   *  record session — so a high-RTT/lossy link that a single TCP flow can't fill is
+   *  filled by N flows. The peer must keep multiple inbound links per peer for this
+   *  to take effect (NodeNetworkCore does; a full holder cohort must be built with
+   *  the multi-link routing core). */
+  connsPerPeer?: number;
 }
 
 export class WsNetwork implements Network {
@@ -102,14 +109,17 @@ export class WsNetwork implements Network {
   private readonly opts: WsNetworkOptions;
   private readonly ownId: PeerId;
   private readonly mkWs: (url: string) => WsLike;
+  private readonly conns: number;
   private sink: ((from: PeerId, frame: Uint8Array) => void) | null = null;
-  private readonly links = new Map<PeerId, PeerLink>();    // authenticated, routable
-  private readonly dialing = new Map<PeerId, PeerLink>();   // every peer we have dialed
+  private readonly links = new Map<PeerId, PeerLink[]>();    // authenticated, routable (1..connsPerPeer)
+  private readonly dialing = new Map<PeerId, PeerLink[]>();  // every link we have dialed to a peer
+  private readonly rr = new Map<PeerId, number>();           // round-robin send cursor per peer
 
   constructor(opts: WsNetworkOptions) {
     this.opts = opts;
     this.ownId = toHex(opts.identity.publicKey);
     this.mkWs = opts.webSocketFactory ?? ((url: string) => new WebSocket(url) as unknown as WsLike);
+    this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
   }
 
   // ── Network interface ──────────────────────────────────────────────────────────
@@ -124,47 +134,71 @@ export class WsNetwork implements Network {
   }
   send(_from: PeerId, to: PeerId, frame: Uint8Array): void {
     // A frame to a peer with no authenticated link is dropped, exactly as the other
-    // Networks drop to an unknown peer; the Transport's timeout copes with it.
-    this.links.get(to)?.send(frame);
+    // Networks drop to an unknown peer; the Transport's timeout copes with it. With
+    // multiple links, stripe frames round-robin so a bulk transfer fans out across
+    // every parallel flow (each is its own record session; the peer's Transport
+    // correlates the reply by corr id, not by which link delivered it).
+    const pool = this.links.get(to);
+    if (!pool || pool.length === 0) return;
+    const i = (this.rr.get(to) ?? 0) % pool.length;
+    this.rr.set(to, i + 1);
+    pool[i].send(frame);
   }
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
    *  `wss://…` for TLS). The link authenticates in-channel (PeerLink), pinned to the
-   *  declared `pubkey`, and onPeerUp fires once it does. Dialing a peer already
-   *  linked or in-flight is a no-op; returns the parsed peer id either way. */
+   *  declared `pubkey`, and onPeerUp fires once it does. Idempotent top-up, mirroring
+   *  NodeNetworkCore.dial(): it opens only the shortfall to connsPerPeer, so the first
+   *  call opens the full fan-out and a re-connect() after some of the parallel flows
+   *  dropped restores just the lost ones instead of no-op'ing on the survivors (an
+   *  early-return on "already dialing" would leave the pool permanently degraded to
+   *  whatever survived). Returns the parsed peer id either way. */
   connect(spec: string): PeerId {
     const { peerId, url } = parseWsPeer(spec);
-    if (peerId === this.ownId || this.dialing.has(peerId)) return peerId;
-    const link = new PeerLink({
-      channel: new WsChannel(this.mkWs(url)),
-      identity: this.opts.identity,
-      sodium: this.opts.sodium,
-      weDialed: true,
-      expectPeerId: peerId, // pin the far key to the address we dialed
-      onAuth: (pid, l) => this.promote(pid, l),
-      onFrame: (pid, frame) => this.deliver(pid, frame),
-      onClose: () => this.forget(peerId),
-    });
-    this.dialing.set(peerId, link);
+    if (peerId === this.ownId) return peerId;
+    // `dialing` holds every live link we dialed to this peer — pre-auth AND post-auth
+    // (promote() leaves them here; forget() removes one the instant it closes) — so its
+    // length is the current outbound flow count. Open connsPerPeer parallel connections,
+    // each its own PeerLink over its own WebSocket. They authenticate independently;
+    // onPeerUp fires on the first to reach a peer that had none.
+    let arr = this.dialing.get(peerId);
+    if (!arr) { arr = []; this.dialing.set(peerId, arr); }
+    for (let i = arr.length; i < this.conns; i++) {
+      const link: PeerLink = new PeerLink({
+        channel: new WsChannel(this.mkWs(url)),
+        identity: this.opts.identity,
+        sodium: this.opts.sodium,
+        weDialed: true,
+        expectPeerId: peerId, // pin the far key to the address we dialed
+        onAuth: (pid, l) => this.promote(pid, l),
+        onFrame: (pid, frame) => this.deliver(pid, frame),
+        onClose: () => this.forget(peerId, link),
+      });
+      arr.push(link);
+    }
     return peerId;
   }
 
-  /** The peers we currently hold an authenticated link to (for UI / cohort). */
+  /** The peers we currently hold at least one authenticated link to (for UI / cohort). */
   linkedPeers(): PeerId[] { return [...this.links.keys()]; }
 
   /** Tear down every link. */
   close(): void {
-    for (const l of this.dialing.values()) l.close();
+    for (const arr of this.dialing.values()) for (const l of arr) l.close();
     this.links.clear();
     this.dialing.clear();
+    this.rr.clear();
   }
 
   private promote(peerId: PeerId, link: PeerLink): void {
     // Final gate: even a peer that completed the identity handshake is dropped if it
     // is not on the roster. Identity is proven now, so this is a trustworthy call.
     if (this.opts.admit && !this.opts.admit(peerId)) { link.close(); return; }
-    this.links.set(peerId, link);
-    this.opts.onPeerUp?.(peerId);
+    let pool = this.links.get(peerId);
+    const first = !pool || pool.length === 0;
+    if (!pool) { pool = []; this.links.set(peerId, pool); }
+    pool.push(link);
+    if (first) this.opts.onPeerUp?.(peerId); // fire once, when the peer first becomes reachable
   }
 
   private deliver(peerId: PeerId, frame: Uint8Array): void {
@@ -173,10 +207,16 @@ export class WsNetwork implements Network {
     this.sink(peerId, frame); // PeerLink only delivers post-auth, tagged with the proven id
   }
 
-  private forget(peerId: PeerId): void {
-    const had = this.links.delete(peerId);
-    this.dialing.delete(peerId);
-    if (had) this.opts.onPeerDown?.(peerId);
+  private forget(peerId: PeerId, link: PeerLink): void {
+    const dl = this.dialing.get(peerId);
+    if (dl) { const i = dl.indexOf(link); if (i >= 0) dl.splice(i, 1); if (dl.length === 0) this.dialing.delete(peerId); }
+    const pool = this.links.get(peerId);
+    if (!pool) return;
+    const i = pool.indexOf(link);
+    if (i >= 0) pool.splice(i, 1);
+    // onPeerDown only when the LAST link to the peer drops — losing one of several
+    // parallel flows leaves the peer reachable, so the cohort must not evict it.
+    if (pool.length === 0) { this.links.delete(peerId); this.rr.delete(peerId); this.opts.onPeerDown?.(peerId); }
   }
 }
 

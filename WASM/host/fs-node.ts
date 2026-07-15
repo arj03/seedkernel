@@ -30,7 +30,6 @@ export class NodeFs implements Fs {
     try { return new Uint8Array(readFileSync(this.path(key))); } catch { return null; }
   }
   put(key: string, bytes: Uint8Array): void { writeFileSync(this.path(key), bytes); }
-  has(key: string): boolean { return this.size(key) >= 0; }
   size(key: string): number {
     try { return statSync(this.path(key)).size; } catch { return -1; }
   }

@@ -4,12 +4,20 @@
 // — a JS API that no WASM handler can reach on its own.
 //
 // Owns:
-//   - install records keyed by name (author, bytes_hash, declared caps, parent)
+//   - install records keyed by name (author, bytes_hash)
 //   - canonical-pubkey-keyed seq high-water counters, kept in a table SEPARATE
 //     from the install records so removal can't rewind them (§4.4, §7.1)
-//   - the suite-slot map (which install names route to the suite registry
-//     instead of the kernel handler table — §6.4)
 //   - the deployer-supplied policy callback (§7.3)
+//
+// A signature suite is an ordinary handler installed at its slot name (§6.4);
+// the installer has no special case for it — it flows through the same
+// SetHandler path as any other install.
+//
+// The installer is a pure sink: its only wire-facing handler is the (blocked)
+// `install` mutator. Install records are read host-side via `lookup` — there is
+// no `installer.lookup` / `installer.caps_of` query message. Bridges authorize
+// their callers by pinning `kernel.caller` (README §9), not by consulting a
+// capability index.
 //
 // Optional — deployments that don't want message-driven installation simply
 // skip registerInstaller and the deployment is frozen.
@@ -34,27 +42,12 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-function capListContains(list: readonly Uint8Array[], cap: Uint8Array): boolean {
-  for (const c of list) if (bytesEqual(c, cap)) return true;
-  return false;
-}
-
 /** A single install record (README §7.1). */
 export interface InstallRecord {
   readonly author: Signer;
+  /** Content hash of the installed WASM module (`genesisHash(wasm)`, §7.1) — the
+   *  same identifier a manifest's `modules[].hash` and a policy allowlist use. */
   readonly bytesHash: Uint8Array;
-  readonly declaredCaps: readonly Uint8Array[];
-  /** The predecessor's bytes_hash, or null if this install claimed no parent. */
-  readonly parent: Uint8Array | null;
-}
-
-/** Suite-slot configuration (README §6.4). Installs landing on `name` are
- *  routed to the suite registry under `algoId` instead of through SetHandler.
- *  The host validates pubkey/sig sizes on each verify call against this entry. */
-export interface SuiteSlot {
-  readonly algoId: number;
-  readonly pubkeyLen: number;
-  readonly sigMaxLen: number;
 }
 
 /** Install-approval callback (README §7.3). Receives every piece of relevant
@@ -67,8 +60,6 @@ export type ApproveInstall = (
   author: Signer,
   bytesHash: Uint8Array,
   wasm: Uint8Array,
-  declaredCaps: readonly Uint8Array[],
-  parent: Uint8Array | null,
   existing: InstallRecord | null,
 ) => boolean;
 
@@ -81,66 +72,27 @@ export type FirstInstallPolicy = (
   name: Uint8Array,
   author: Signer,
   bytesHash: Uint8Array,
-  declaredCaps: readonly Uint8Array[],
 ) => boolean;
 
-/** Capability-acknowledgement hook for the reference policy (README §7.4
- *  rule 3). Invoked ONLY when an install adds or broadens capabilities beyond
- *  what the current record already holds — every cap on a first install counts
- *  as added. Receives the exact set of newly-requested caps so an operator /
- *  user can review them. Return true to let the broadened install proceed,
- *  false to drop it. */
-export type AcknowledgeCaps = (
-  name: Uint8Array,
-  author: Signer,
-  addedCaps: readonly Uint8Array[],
-) => boolean;
-
-/** The reference policy (README §7.4). Three rules — two for WHO may bind a
- *  name, one for WHAT capabilities an install may acquire:
+/** The reference policy (README §7.4). Two rules for WHO may bind a name:
  *   1. First install at a name → defer to `firstInstall`. (If no record exists
  *      but the kernel slot is occupied, the slot was SetHandler-seeded — a
  *      bootstrap entry — so refuse.)
- *   2. Subsequent install → author must match existing.author AND parent must
- *      equal existing.bytes_hash.
- *   3. Capability acknowledgement: capabilities may shrink freely, but any cap
- *      not already held (every cap on a first install, or a broadened cap on an
- *      upgrade) is an escalation and is dropped unless `acknowledgeCaps`
- *      approves it. A caps-free install has nothing to escalate and is
- *      auto-accepted once rules 1–2 pass. When no `acknowledgeCaps` hook is
- *      wired the policy denies every escalation — capabilities are never
- *      granted silently. Pass a hook that always returns true only for trusted
- *      local testing.
+ *   2. Subsequent install → author must match existing.author.
  *
  *  Returns an ApproveInstall the deployer can hand to setApproveInstall. */
 export function referencePolicy(
   host: KernelHost,
   firstInstall: FirstInstallPolicy,
-  acknowledgeCaps?: AcknowledgeCaps,
 ): ApproveInstall {
-  const ack: AcknowledgeCaps = acknowledgeCaps ?? (() => false);
-  return (name, author, bytesHash, _wasm, declaredCaps, parent, existing) => {
-    // Rules 1–2: decide who may bind the name, and capture the caps the
-    // current record (if any) already holds.
-    let existingCaps: readonly Uint8Array[];
+  return (name, author, bytesHash, _wasm, existing) => {
     if (existing == null) {
       // Refuse to overlay a SetHandler-seeded slot.
       if (host.isRegistered(name)) return false;
-      if (!firstInstall(name, author, bytesHash, declaredCaps)) return false;
-      existingCaps = [];
-    } else {
-      if (existing.author.algoId !== author.algoId) return false;
-      if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
-      if (parent == null) return false;
-      if (!bytesEqual(existing.bytesHash, parent)) return false;
-      existingCaps = existing.declaredCaps;
+      return firstInstall(name, author, bytesHash);
     }
-
-    // Rule 3: any requested cap not already held is an escalation that needs
-    // acknowledgement. No additions (caps-free or a subset) → auto-accept.
-    const added = declaredCaps.filter((c) => !capListContains(existingCaps, c));
-    if (added.length === 0) return true;
-    return ack(name, author, added);
+    if (existing.author.algoId !== author.algoId) return false;
+    return bytesEqual(existing.author.publicKey, author.publicKey);
   };
 }
 
@@ -156,10 +108,8 @@ export class Installer {
   //
   // LIMITATION: in-memory only — tombstone-forever holds for the lifetime of
   // this host instance, not across process / page restarts. A persistent
-  // deployment must commit (installations + lastSeen + suiteSlots) atomically.
+  // deployment must commit (installations + lastSeen) atomically.
   private lastSeen = new Map<string, number>();
-  // Suite-slot routing (README §6.4). Deployer-populated via registerSuiteSlot.
-  private suiteSlots = new Map<string, SuiteSlot>();
   private _approveInstall: ApproveInstall | null = null;
 
   constructor(
@@ -174,112 +124,38 @@ export class Installer {
     this._approveInstall = callback;
   }
 
-  /** Declare that installs landing on `name` should be instantiated under
-   *  the suite ABI (§6.6) and placed in the suite registry under `algoId`,
-   *  rather than going through SetHandler (§6.4). The deployer calls this
-   *  before any suite install for `algoId` reaches the installer. */
-  registerSuiteSlot(name: Uint8Array, slot: SuiteSlot): void {
-    this.suiteSlots.set(nameKey(name), { ...slot });
-  }
-
-  /** Read-only access to the install record at `name`, if any. */
+  /** Read-only access to the install record at `name`, if any. Host-side only —
+   *  there is no wire query (README §7.6); the policy callback already receives
+   *  the resolved `existing` record, and bridges pin `kernel.caller`. */
   lookup(name: Uint8Array): InstallRecord | null {
     return this.installations.get(nameKey(name)) ?? null;
   }
 
-  /** Declared capabilities for `name`, or [] for unknown / SetHandler-seeded
-   *  slots (README §8.3). */
-  capsOf(name: Uint8Array): readonly Uint8Array[] {
-    const rec = this.installations.get(nameKey(name));
-    return rec ? rec.declaredCaps : [];
-  }
-
-  /** Host-side `installer.remove(name)` (README §7.5). For ordinary handler
-   *  installs: clears the record and calls SetHandler(name, null). For suite
-   *  slots: clears the record and removes the suite registry entry — the
-   *  kernel handler table is not touched (the slot was never in it). Returns
-   *  true if a record was removed. */
+  /** Host-side `installer.remove(name)` (README §7.5). Clears the record and
+   *  calls SetHandler(name, null). Suite slots (§6.4) are ordinary handler
+   *  installs and take exactly this path. Does NOT touch `lastSeen`: the replay
+   *  high-water marks are tombstone-forever (§4.4). Returns true if a record
+   *  was removed. */
   remove(name: Uint8Array): boolean {
     const key = nameKey(name);
     const rec = this.installations.get(key);
     if (!rec) return false;
-    const slot = this.suiteSlots.get(key);
     this.installations.delete(key);
-    if (slot) this.host._unregisterSuite(slot.algoId);
-    else this.host.removeHandler(name);
+    this.host.removeHandler(name);
     return true;
   }
 
   /** Called by KernelHost when a name is rebound via setHandler / register /
-   *  removeHandler. Drops any matching install record (and suite entry) so
-   *  stale records can't mislead lookup / caps_of. Idempotent. */
+   *  removeHandler. Drops any matching install record so a stale record can't
+   *  mislead lookup. Idempotent. */
   _onKernelSlotMutated(name: Uint8Array): void {
-    const key = nameKey(name);
-    const rec = this.installations.get(key);
-    if (!rec) return;
-    const slot = this.suiteSlots.get(key);
-    this.installations.delete(key);
-    if (slot) this.host._unregisterSuite(slot.algoId);
+    this.installations.delete(nameKey(name));
   }
 
   /** Handler the host registers under the install name (§7.2). */
   readonly handler: Handler = (_name, payload, _host) => {
     this._handle(payload);
     return null;
-  };
-
-  /** Handler the host registers under `installer.lookup`. Payload:
-   *      [name_len u8][name ..]
-   *  Response:
-   *      [0]                              if not installed
-   *      [1] [algo u16 BE][pk_len u16 BE][pk ..]
-   *          [hash_len u8][bytes_hash ..]
-   *          [parent_len u8][parent_hash ..]   (parent_len = 0 means none) */
-  readonly lookupHandler: Handler = (_name, payload, _host) => {
-    if (payload.length < 1) return new Uint8Array([0]);
-    const nameLen = payload[0];
-    if (payload.length < 1 + nameLen) return new Uint8Array([0]);
-    const target = payload.slice(1, 1 + nameLen);
-    const rec = this.installations.get(nameKey(target));
-    if (!rec) return new Uint8Array([0]);
-    const pk = rec.author.publicKey;
-    const parentLen = rec.parent ? rec.parent.length : 0;
-    const size = 1 + 2 + 2 + pk.length + 1 + rec.bytesHash.length + 1 + parentLen;
-    const out = new Uint8Array(size);
-    let o = 0;
-    out[o++] = 1;
-    out[o++] = (rec.author.algoId >> 8) & 0xff;
-    out[o++] = rec.author.algoId & 0xff;
-    out[o++] = (pk.length >> 8) & 0xff;
-    out[o++] = pk.length & 0xff;
-    out.set(pk, o); o += pk.length;
-    out[o++] = rec.bytesHash.length;
-    out.set(rec.bytesHash, o); o += rec.bytesHash.length;
-    out[o++] = parentLen;
-    if (rec.parent) out.set(rec.parent, o);
-    return out;
-  };
-
-  /** Handler the host registers under `installer.caps_of` (§7.6). Payload:
-   *      [name_len u8][name ..]
-   *  Response:
-   *      [count u8] [cap_id_len u8][cap_id ..]* */
-  readonly capsOfHandler: Handler = (_name, payload, _host) => {
-    if (payload.length < 1) return new Uint8Array([0]);
-    const nameLen = payload[0];
-    if (payload.length < 1 + nameLen) return new Uint8Array([0]);
-    const target = payload.slice(1, 1 + nameLen);
-    const caps = this.capsOf(target);
-    let size = 1;
-    for (const c of caps) size += 1 + c.length;
-    const out = new Uint8Array(size);
-    let o = 0;
-    out[o++] = caps.length;
-    for (const c of caps) {
-      out[o++] = c.length;
-      out.set(c, o); o += c.length;
-    }
-    return out;
   };
 
   /** Returns true if `seq` is fresh for this signer (strictly greater than
@@ -297,7 +173,7 @@ export class Installer {
     const author = this.host.currentTopSigner;
     if (!author) return;
 
-    // 2. Parse the payload (§7.2).
+    // 2. Parse the payload (§7.2): [seq u32][name_len u8][name][wasm].
     if (payload.length < 4) return;
     let o = 0;
     const seq = readU32BE(payload, o); o += 4;
@@ -307,30 +183,12 @@ export class Installer {
     if (o + nameLen > payload.length) return;
     const name = payload.slice(o, o + nameLen); o += nameLen;
 
-    if (o + 1 > payload.length) return;
-    const capsCount = payload[o]; o += 1;
-    const declaredCaps: Uint8Array[] = [];
-    for (let i = 0; i < capsCount; i++) {
-      if (o + 1 > payload.length) return;
-      const capIdLen = payload[o]; o += 1;
-      if (o + capIdLen > payload.length) return;
-      declaredCaps.push(payload.slice(o, o + capIdLen));
-      o += capIdLen;
-    }
-
-    if (o + 1 > payload.length) return;
-    const parentLen = payload[o]; o += 1;
-    if (o + parentLen > payload.length) return;
-    const parent: Uint8Array | null = parentLen > 0
-      ? payload.slice(o, o + parentLen)
-      : null;
-    o += parentLen;
-
     const wasmBytes = payload.slice(o);
     if (wasmBytes.length === 0) return;
 
-    // 3. bytes_hash covers the entire install payload (§7.1).
-    const bytesHash = this.host.genesisHash(payload);
+    // 3. bytes_hash is the content id of the WASM module (§7.1): genesisHash(wasm),
+    //    the same identifier a manifest's modules[].hash and a policy allowlist use.
+    const bytesHash = this.host.genesisHash(wasmBytes);
 
     // 4. Consume seq (§4.4 replay protection). Runs before the policy call
     //    so a single replay can't keep re-running an expensive policy.
@@ -343,34 +201,22 @@ export class Installer {
     if (!this._approveInstall) return;
     let approved = false;
     try {
-      approved = this._approveInstall(
-        name, author, bytesHash, wasmBytes,
-        declaredCaps, parent, existing,
-      );
+      approved = this._approveInstall(name, author, bytesHash, wasmBytes, existing);
     } catch {
       approved = false;
     }
     if (!approved) return;
 
-    // 7. Suite-slot vs handler-slot routing.
-    const slot = this.suiteSlots.get(nameKey(name));
-    if (slot) {
-      const ok = this.host._registerSuite(
-        slot.algoId, slot.pubkeyLen, slot.sigMaxLen, wasmBytes,
-      );
-      if (!ok) return;
-    } else {
-      const ok = this.host._installWasmHandler(name, wasmBytes);
-      if (!ok) return;
-    }
+    // 7. Instantiate against the standard handler ABI (§4) and SetHandler.
+    //    A suite install (§6.4) is an ordinary handler at its slot name — no
+    //    special-casing; it takes this same path.
+    if (!this.host._installWasmHandler(name, wasmBytes)) return;
 
     // 8. Record. Stored after the kernel state change so a record never
     //    points at a slot we failed to populate.
     this.installations.set(nameKey(name), {
       author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
       bytesHash,
-      declaredCaps: declaredCaps.map((c) => c.slice()),
-      parent: parent ? parent.slice() : null,
     });
   }
 }

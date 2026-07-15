@@ -20,13 +20,13 @@ import (
 	"time"
 )
 
-const maxTCPMessage = 16 << 20 // frame cap (matches the TS MAX_TCP_MESSAGE / WS cap)
+const maxFrameBytes = 16 << 20 // MAX_FRAME_BYTES (§13.6, §17.1): one wire-visible frame cap
 
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
-// protocol is request/response — even the 1 MiB bulk upload path awaits an ack per
+// protocol is a single request/response plane — even a block upload awaits an ack per
 // chunk — so a healthy link's queue stays a few messages deep; hitting the cap means
 // the peer has stopped draining (or JS is pushing unpaced), and the channel fails
-// rather than buffering without bound. Must exceed maxTCPMessage or a single
+// rather than buffering without bound. Must exceed maxFrameBytes or a single
 // max-size frame could never be queued.
 const sendQueueLimit = 32 << 20
 
@@ -35,22 +35,20 @@ const sendQueueLimit = 32 << 20
 // regardless — so closing a channel to a wedged peer can't pin its writer forever.
 const closeGrace = 5 * time.Second
 
-// tcpSocketBuffer is the send/receive socket buffer set on every TCP connection
-// (dialed and accepted). The request/response traffic pattern leaves idle gaps
-// between bursts, which stops the kernel's receive-buffer autotuning from ramping,
-// so over a high-RTT link a connection otherwise stalls near the OS default window
-// (~64 KiB → only a few MB/s at 27 ms RTT — the bandwidth-delay product is the cap,
-// not the link). A fixed generous buffer lifts that ceiling: 4 MiB covers a fast,
-// high-RTT link's BDP with headroom.
-const tcpSocketBuffer = 4 << 20
+// Socket buffers are deliberately left at kernel defaults — do NOT set SO_RCVBUF/
+// SO_SNDBUF here. An explicit value is silently clamped to net.core.{r,w}mem_max
+// (208 KiB on stock Linux) and, worse, LOCKS the buffer, disabling the kernel's
+// autotuning that would otherwise grow it to tcp_{r,w}mem[2] (~6 MB) as a bulk
+// transfer ramps. A fixed 4 MiB set pre-handshake here once pinned every holder
+// connection on an untuned box to a ~64 KiB receive window — 2.5 MB/s per
+// connection at 26 ms RTT — the very stall it was meant to fix, while iperf on
+// the same box (default sockets, autotuned) filled the link.
 
-// dialTCP dials with SO_RCVBUF/SO_SNDBUF set on the socket BEFORE connect (the
-// Dialer's Control hook runs on the raw fd pre-handshake), so the TCP window scale
-// advertised in the SYN is sized for the large buffer. Setting the buffer after the
-// connection is up is too late to widen the window scale, which otherwise caps a
-// high-RTT transfer near the OS-default window.
+// dialTCP dials with default socket options; the kernel autotunes the buffers
+// and negotiates a window scale sized for tcp_rmem[2], so a high-RTT bulk
+// transfer is not window-limited.
 func dialTCP(addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second, Control: controlSocketBuffers}
+	d := net.Dialer{Timeout: 5 * time.Second}
 	return d.DialContext(context.Background(), "tcp", addr)
 }
 
@@ -290,7 +288,7 @@ func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
 	// 16 MiB–4 GiB frame the receiver is hardcoded to reject. The read side treats an
 	// over-cap length as fatal (readLoop), so mirror it: fail the channel locally instead
 	// of provoking the peer to drop the link.
-	if len(bytes) > maxTCPMessage {
+	if len(bytes) > maxFrameBytes {
 		c.fail()
 		return
 	}
@@ -328,7 +326,7 @@ func (framedProto) readLoop(c *sockChannel) {
 					break
 				}
 				ln := binary.BigEndian.Uint32(buf[off:])
-				if ln > maxTCPMessage {
+				if ln > maxFrameBytes {
 					c.fail()
 					return
 				}

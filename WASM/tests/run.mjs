@@ -27,7 +27,7 @@ const {
 // where they live, rather than only from a downstream consumer.
 const { NodeNetwork } = await imp("build/host/net-node.js");
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
-const { CAP, createCapBridge, opsForCaps } = await imp("build/host/cap-bridge.js");
+const { CAP, createCapBridge, opsForCaps, guestSignScope } = await imp("build/host/cap-bridge.js");
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
@@ -78,22 +78,20 @@ async function makeHost(approveInstall = () => true) {
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
 
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(approveInstall);
 
-  return { host, signatureName, installName, lookupName, capsOfName };
+  return { host, signatureName, installName };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
 // Encode an install + sign it, returning the wire bytes ready for dispatch.
-function buildInstall(host, signSk, signPk, installName, seq, targetName, caps, parent, wasm) {
-  const payload = host.encodeInstallPayload(seq, targetName, caps, parent, wasm);
+function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
+  const payload = host.encodeInstallPayload(seq, targetName, wasm);
   return host.wrapAndEncode(signSk, signPk, CURRENT_VERSION, installName, payload);
 }
 
@@ -109,14 +107,13 @@ async function testFullLifecycle() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   // Install the chat handler under the author's scoped name.
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), chatTextName, [], null, forwarderBytes));
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "chat.text installed");
 
   // The installer should have a record for it.
   const rec = host.lookupInstall(chatTextName);
   assert(rec !== null, "install record exists");
   assertEqual(rec.author.publicKey, pk, "record author matches signer");
-  assertEqual(rec.parent, null, "first install has null parent");
 
   // Now send a signed app message. The chat handler is the forwarder fixture,
   // so we forward to a host-side echo handler to verify it ran.
@@ -235,17 +232,15 @@ async function testRefuseOverlayBootstrapSlot() {
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const seq = makeSeq();
   // Try to overlay the signature slot (seeded by SetHandler at bootstrap).
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    signatureName, [], null, forwarderBytes));
+    signatureName, forwarderBytes));
 
   // signature must still verify — if it had been overwritten with the
   // forwarder, the next signed message would fail.
@@ -265,38 +260,34 @@ async function testApproveInstallRejects() {
   console.log("Test: approveInstall can reject an install");
 
   let seen = null;
-  const approve = (name, author, bytesHash, _wasm, caps, parent, existing) => {
-    seen = { name, author, bytesHash, caps: [...caps], parent, existing };
+  const approve = (name, author, bytesHash, _wasm, existing) => {
+    seen = { name, author, bytesHash, existing };
     return false;
   };
   const { host, installName } = await makeHost(approve);
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
-  const netCapId = host.deriveBootstrapName("cap.net");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [netCapId], null, forwarderBytes));
+    chatTextName, forwarderBytes));
 
   assert(!host.isRegistered(chatTextName), "install rejected");
   assert(seen !== null, "approveInstall was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
-  assertEqual(seen.caps.length, 1, "callback saw 1 declared cap");
-  assertEqual(seen.caps[0], netCapId, "callback saw the cap value");
   assertEqual(seen.author.publicKey, pk, "callback saw the author pubkey");
-  assert(seen.parent === null, "first install has null parent");
   assert(seen.existing === null, "no existing record for first install");
 
   console.log("  OK\n");
 }
 
 async function testApproveInstallReceivesBytesHash() {
-  console.log("Test: approveInstall receives genesis-hash of FULL install payload (§7.1)");
+  console.log("Test: approveInstall receives genesisHash(wasm) as bytes_hash (§7.1)");
 
   let seenHash = null;
   let seenPayloadLen = 0;
-  const approve = (_n, _a, bytesHash, wasm, _c, _p, _e) => {
+  const approve = (_n, _a, bytesHash, wasm, _e) => {
     seenHash = bytesHash;
     seenPayloadLen = wasm.length; // for sanity
     return true;
@@ -307,14 +298,16 @@ async function testApproveInstallReceivesBytesHash() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   const seq = makeSeq();
-  const payload = host.encodeInstallPayload(seq(pk), chatTextName, [], null, forwarderBytes);
+  const payload = host.encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
   host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, installName, payload));
   assert(host.isRegistered(chatTextName), "install accepted");
 
   assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
-  // The hash must cover the ENTIRE install payload, not just the WASM.
-  const expected = host.genesisHash(payload);
-  assertEqual(seenHash, expected, "bytes_hash = genesisHash(install_payload)");
+  // The hash is the content id of the WASM module — the same identifier a
+  // manifest's modules[].hash and a policy allowlist use (§7.1), independent of
+  // seq or the install framing.
+  const expected = host.genesisHash(forwarderBytes);
+  assertEqual(seenHash, expected, "bytes_hash = genesisHash(wasm)");
   assert(seenPayloadLen === forwarderBytes.length, "wasm bytes passed to callback are unchanged");
 
   console.log("  OK\n");
@@ -331,7 +324,7 @@ async function testNoApproveInstallDropsAll() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], null, forwarderBytes));
+    chatTextName, forwarderBytes));
 
   assert(!host.isRegistered(chatTextName), "install dropped");
 
@@ -341,15 +334,13 @@ async function testNoApproveInstallDropsAll() {
 // ─── Test: reference policy upgrade rules (§7.4) ────────────────────────
 
 async function testReferencePolicyUpgradeRules() {
-  console.log("Test: reference policy enforces same-author + parent=bytes_hash on upgrade (§7.4)");
+  console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
 
   const host = await loadKernelHost(kernelWasm, bootstrapWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
   host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
+  host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
   const seq = makeSeq();
@@ -361,7 +352,7 @@ async function testReferencePolicyUpgradeRules() {
 
   // A claims sharedName (first install — accepted).
   host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], null, forwarderBytes));
+    sharedName, forwarderBytes));
   assert(host.isRegistered(sharedName), "A's first install accepted");
   const recA = host.lookupInstall(sharedName);
   assert(recA !== null, "record exists after A's install");
@@ -369,99 +360,26 @@ async function testReferencePolicyUpgradeRules() {
 
   // B tries to install over the same name — rejected (different author).
   host.dispatch(buildInstall(host, bSk, bPk, installName, seq(bPk),
-    sharedName, [], aBytesHash, forwarderBytes));
+    sharedName, forwarderBytes));
   const recAfterB = host.lookupInstall(sharedName);
   assertEqual(recAfterB.author.publicKey, aPk, "different-author install rejected, A still owns");
+  assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
 
-  // A re-installs with wrong parent — rejected.
+  // A re-installs (same author) — accepted; record updates in place. There is
+  // no parent/lineage gate anymore (§7.4): same author is the whole rule.
   host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], new Uint8Array(32), forwarderBytes));
-  const recAfterWrongParent = host.lookupInstall(sharedName);
-  assertEqual(recAfterWrongParent.bytesHash, aBytesHash,
-    "same-author wrong-parent install rejected");
-
-  // A re-installs with no parent — rejected.
-  host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], null, forwarderBytes));
-  const recAfterNullParent = host.lookupInstall(sharedName);
-  assertEqual(recAfterNullParent.bytesHash, aBytesHash,
-    "same-author null-parent re-install rejected");
-
-  // A re-installs with correct parent — accepted; record updates in place.
-  host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, [], aBytesHash, forwarderBytes));
+    sharedName, forwarderBytes));
   const recAfterUpgrade = host.lookupInstall(sharedName);
   assert(recAfterUpgrade !== null, "upgrade left a record");
   assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
-  assertEqual(recAfterUpgrade.parent, aBytesHash, "parent recorded");
-  assert(
-    JSON.stringify([...recAfterUpgrade.bytesHash]) !== JSON.stringify([...aBytesHash]),
-    "bytes_hash changed (new payload, new seq)"
-  );
-
-  console.log("  OK\n");
-}
-
-// ─── Test: reference policy capability acknowledgement (§7.4 rule 3) ─────
-
-async function testReferencePolicyCapAcknowledgement() {
-  console.log("Test: reference policy gates capability grants on acknowledgement (§7.4 rule 3)");
-
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  const installName   = host.deriveBootstrapName("install");
-  const lookupName    = host.deriveBootstrapName("installer.lookup");
-  const capsOfName    = host.deriveBootstrapName("installer.caps_of");
-  host.registerSignature(signatureName);
-  host.registerInstaller(installName, lookupName, capsOfName);
-
-  // Acknowledgement hook records what it was asked and answers per `ackAnswer`.
-  let ackAdded = null;
-  let ackAnswer = false;
-  host.setApproveInstall(referencePolicy(host, () => true, (_name, _author, added) => {
-    ackAdded = added.map((c) => [...c]);
-    return ackAnswer;
-  }));
-
-  const seq = makeSeq();
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const netCap = host.deriveBootstrapName("cap.net");
-  const fsCap  = host.deriveBootstrapName("cap.fs");
-
-  // 1. Caps-free first install → accepted with no ack prompt.
-  const pureName = host.deriveBootstrapName("test.pure");
-  ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), pureName, [], null, forwarderBytes));
-  assert(host.isRegistered(pureName), "caps-free first install accepted");
-  assert(ackAdded === null, "no ack prompt for caps-free install");
-
-  // 2. First install requesting a cap → ack denies → dropped.
-  const capName = host.deriveBootstrapName("test.capped");
-  ackAnswer = false; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], null, forwarderBytes));
-  assert(!host.isRegistered(capName), "cap-requesting install dropped when ack denies");
-  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw the requested cap");
-
-  // 3. Same install, ack approves → accepted, cap recorded.
-  ackAnswer = true; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], null, forwarderBytes));
-  assert(host.isRegistered(capName), "cap-requesting install accepted when ack approves");
-  const rec1 = host.lookupInstall(capName);
-  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "one cap recorded");
-
-  // 4. Same-author upgrade keeping the SAME cap → auto-accepted, no ack prompt.
-  ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap], rec1.bytesHash, forwarderBytes));
-  assert(host.isRegistered(capName), "same-cap upgrade accepted");
-  assert(ackAdded === null, "no ack prompt when caps unchanged on upgrade");
-  const rec2 = host.lookupInstall(capName);
-
-  // 5. Same-author upgrade BROADENING caps (add fs) → needs ack; denied → dropped.
-  ackAnswer = false; ackAdded = null;
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), capName, [netCap, fsCap], rec2.bytesHash, forwarderBytes));
-  assert(ackAdded !== null && ackAdded.length === 1, "ack hook saw only the newly-added cap");
-  assertEqual(ackAdded[0], [...fsCap], "added cap is fs, not the already-held net");
-  assertEqual(host.getHandlerDeclaredCaps(capName).length, 1, "broadening dropped — caps unchanged");
+  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm under a
+  // fresh seq keeps the same content id — the identifier tracks the binary, not the
+  // signed install message. (A different wasm would hash differently; §7.1 makes the
+  // content id, a manifest's modules[].hash, and a policy allowlist all one value.)
+  assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
+    "bytes_hash unchanged across a same-wasm re-install");
+  assertEqual(recAfterUpgrade.bytesHash, host.genesisHash(forwarderBytes),
+    "bytes_hash = genesisHash(wasm)");
 
   console.log("  OK\n");
 }
@@ -472,7 +390,7 @@ async function testInstallReplayRejected() {
   console.log("Test: install handler rejects wire-byte replay (§4.4)");
 
   let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _c, _p, _e) => {
+  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
     approveCalls++;
     return true;
   });
@@ -481,7 +399,7 @@ async function testInstallReplayRejected() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   // Original install with seq=1.
-  const wire = buildInstall(host, sk, pk, installName, 1, chatTextName, [], null, forwarderBytes);
+  const wire = buildInstall(host, sk, pk, installName, 1, chatTextName, forwarderBytes);
   host.dispatch(wire);
   assert(host.isRegistered(chatTextName), "first install succeeded");
   assertEqual(approveCalls, 1, "approve called once");
@@ -496,100 +414,41 @@ async function testInstallReplayRejected() {
   assertEqual(approveCalls, 1, "approve NOT re-prompted on replay");
 
   // Fresh install at seq=2 still works.
-  host.dispatch(buildInstall(host, sk, pk, installName, 2, chatTextName, [], null, forwarderBytes));
+  host.dispatch(buildInstall(host, sk, pk, installName, 2, chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "fresh higher-seq install succeeded");
   assertEqual(approveCalls, 2, "approve called for legitimate retry");
 
   console.log("  OK\n");
 }
 
-// ─── Test: installer.lookup query handler ───────────────────────────────
+// ─── Test: installer.lookup (host-side) returns the install record ───────
 
-async function testInstallerLookupQuery() {
-  console.log("Test: installer.lookup returns the install record over kernel.call");
-
-  const { host, installName, lookupName } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
-
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], null, forwarderBytes));
-  assert(host.isRegistered(chatTextName), "install ok");
-
-  // Exercise the WASM-facing lookup handler via the forwarder fixture. The
-  // forwarder calls kernel.call(target, payload); we make the target the
-  // installer.lookup name and the payload a [len][name] lookup query, then
-  // read back the response from the forwarder's private memory.
-  const lookupQuery = new Uint8Array(1 + chatTextName.length);
-  lookupQuery[0] = chatTextName.length;
-  lookupQuery.set(chatTextName, 1);
-
-  // Install a fresh forwarder under a scoped name so it can kernel.call into
-  // installer.lookup.
-  const forwarderName = host.deriveScopedName("test.forwarder", pk);
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    forwarderName, [], null, forwarderBytes));
-  assert(host.isRegistered(forwarderName), "forwarder installed");
-
-  // Payload format the forwarder expects: [target_name_len][target_name][forward_data]
-  const fwdPayload = new Uint8Array(1 + lookupName.length + lookupQuery.length);
-  fwdPayload[0] = lookupName.length;
-  fwdPayload.set(lookupName, 1);
-  fwdPayload.set(lookupQuery, 1 + lookupName.length);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, fwdPayload));
-
-  // Read back the response the forwarder stored.
-  const respPtr = host.callDynamicHandlerI32(forwarderName, "last_resp_ptr");
-  const respLen = host.callDynamicHandlerI32(forwarderName, "last_resp_len");
-  assert(respLen > 0, "installer.lookup returned a non-empty response");
-  const resp = host.readDynamicHandlerMemory(forwarderName, respPtr, respLen);
-  assertEqual(resp[0], 1, "response starts with [1] (record present)");
-
-  // Lookup for an unknown name returns [0].
-  const unknown = host.deriveBootstrapName("does.not.exist");
-  const unknownQuery = new Uint8Array(1 + unknown.length);
-  unknownQuery[0] = unknown.length;
-  unknownQuery.set(unknown, 1);
-  const fwdPayload2 = new Uint8Array(1 + lookupName.length + unknownQuery.length);
-  fwdPayload2[0] = lookupName.length;
-  fwdPayload2.set(lookupName, 1);
-  fwdPayload2.set(unknownQuery, 1 + lookupName.length);
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, fwdPayload2));
-  const respLen2 = host.callDynamicHandlerI32(forwarderName, "last_resp_len");
-  const respPtr2 = host.callDynamicHandlerI32(forwarderName, "last_resp_ptr");
-  const resp2 = host.readDynamicHandlerMemory(forwarderName, respPtr2, respLen2);
-  assertEqual(resp2[0], 0, "unknown name returns [0]");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: installer.caps_of returns declared caps ───────────────────────
-
-async function testInstallerCapsOf() {
-  console.log("Test: installer.caps_of reflects declared capabilities");
+async function testInstallerLookupHostSide() {
+  console.log("Test: host-side lookupInstall returns the install record (§7.6)");
 
   const { host, installName } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
-  const netCapId = host.deriveBootstrapName("cap.net");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [netCapId], null, forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "install ok");
 
-  const declared = host.getHandlerDeclaredCaps(chatTextName);
-  assertEqual(declared.length, 1, "one declared cap");
-  assertEqual(declared[0], netCapId, "declared cap is netCapId");
+  // The installer is a pure sink: records are read host-side, not via a wire
+  // query. The policy callback already receives the resolved record; bridges
+  // pin kernel.caller instead of consulting a capability index.
+  const rec = host.lookupInstall(chatTextName);
+  assert(rec !== null, "record present for an installed name");
+  assertEqual(rec.author.publicKey, pk, "record author matches signer");
+  assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
 
-  // SetHandler-installed handlers have no record — caps_of returns [].
-  const sigName = host.deriveBootstrapName("signature");
-  assertEqual(host.getHandlerDeclaredCaps(sigName).length, 0,
-    "bootstrap handler has no declared caps (§8.3)");
+  // Unknown / SetHandler-seeded names have no record.
+  assert(host.lookupInstall(host.deriveBootstrapName("does.not.exist")) === null,
+    "unknown name has no record");
+  assert(host.lookupInstall(host.deriveBootstrapName("signature")) === null,
+    "SetHandler-seeded bootstrap handler has no record");
 
   console.log("  OK\n");
 }
@@ -600,7 +459,7 @@ async function testInstallerRemove() {
   console.log("Test: installer.remove clears record and kernel slot, replay still blocked");
 
   let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _c, _p, _e) => {
+  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
     approveCalls++;
     return true;
   });
@@ -610,7 +469,7 @@ async function testInstallerRemove() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], null, forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "install ok");
   assert(host.lookupInstall(chatTextName) !== null, "record present");
 
@@ -623,7 +482,7 @@ async function testInstallerRemove() {
 
   // Fresh install at higher seq succeeds.
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, [], null, forwarderBytes));
+    chatTextName, forwarderBytes));
   assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
@@ -633,7 +492,7 @@ async function testInstallerRemove() {
 // ─── Test: caller stack format ──────────────────────────────────────────
 
 async function testCallerStackFormat() {
-  console.log("Test: kernel.caller / currentCaller / currentCallerStack (§4.2)");
+  console.log("Test: kernel.caller / currentCaller — immediate caller only (§4.2)");
 
   const { host, installName } = await makeHost();
 
@@ -642,71 +501,63 @@ async function testCallerStackFormat() {
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    forwarderName, [], null, forwarderBytes));
+    forwarderName, forwarderBytes));
   assert(host.isRegistered(forwarderName), "forwarder installed");
 
-  // A probe handler reads the host-side caller stack each time it's called.
+  // A probe handler reads its immediate caller each time it's called. Only the
+  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §9).
   const probeName = host.deriveBootstrapName("probe.caller");
   let seenImmediate = null;
-  let seenStack = null;
   host.register(probeName, (_n, _payload, h) => {
     seenImmediate = h.currentCaller ? new Uint8Array(h.currentCaller) : null;
-    seenStack = h.currentCallerStack.map((n) => new Uint8Array(n));
     return new Uint8Array([0xff]);
   });
 
-  // forwarder → probe — stack should have exactly one entry (the forwarder).
+  // forwarder → probe — the probe's immediate caller is the forwarder.
   const payload = new Uint8Array(1 + probeName.length);
   payload[0] = probeName.length;
   payload.set(probeName, 1);
   host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, payload));
   assert(seenImmediate !== null, "probe saw a caller");
   assertEqual(seenImmediate, forwarderName, "immediate caller is the forwarder");
-  assertEqual(seenStack.length, 1, "caller stack has 1 entry");
-  assertEqual(seenStack[0], forwarderName, "stack entry is the forwarder");
 
   // Top-level dispatch directly into the probe — no caller.
   seenImmediate = null;
-  seenStack = null;
   host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, probeName, new Uint8Array(0)));
   assert(seenImmediate === null, "no immediate caller for top-level dispatch");
-  assertEqual(seenStack.length, 0, "caller stack is empty");
 
   console.log("  OK\n");
 }
 
-// ─── Test: Bridge cap check end-to-end ──────────────────────────────────
+// ─── Test: Bridge authorizes by pinning kernel.caller ───────────────────
 
-async function testBridgeCapabilityCheckEndToEnd() {
-  console.log("Test: Bridge enforces caller capability check end-to-end (§8.2)");
+async function testBridgeCallerPinning() {
+  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §9)");
 
   const { host, installName } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatNoCapName   = host.deriveScopedName("chat.nocap",   pk);
-  const chatWithCapName = host.deriveScopedName("chat.withcap", pk);
-  const netSendName     = host.deriveBootstrapName("cap.net.send");
-  const netCapId        = host.deriveBootstrapName("cap.net");
+  const chatPinnedName = host.deriveScopedName("chat.pinned", pk);
+  const chatOtherName  = host.deriveScopedName("chat.other",  pk);
+  const netSendName    = host.deriveBootstrapName("cap.net.send");
 
   const seq = makeSeq();
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatNoCapName, [], null, forwarderBytes));
+    chatPinnedName, forwarderBytes));
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatWithCapName, [netCapId], null, forwarderBytes));
-  assert(host.isRegistered(chatNoCapName), "chat.nocap installed");
-  assert(host.isRegistered(chatWithCapName), "chat.withcap installed");
+    chatOtherName, forwarderBytes));
+  assert(host.isRegistered(chatPinnedName), "chat.pinned installed");
+  assert(host.isRegistered(chatOtherName), "chat.other installed");
 
-  // The bridge: §8.2 preamble. Use the immediate caller (last entry of stack).
+  // The bridge pins exactly the caller name it serves (the chat shell's UI-bridge
+  // pattern, generalized): it compares kernel.caller against chatPinnedName and
+  // refuses anyone else. There is no capability index to consult — kernel.caller
+  // is the single bridge-authorization primitive.
+  const bytesEq = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
   let bridgeCalls = 0;
   host.register(netSendName, (_n, _p, h) => {
     bridgeCalls++;
-    const callerName = h.currentCaller;
-    if (!callerName) return null;
-    const callerCaps = h.getHandlerDeclaredCaps(callerName);
-    const hasNet = callerCaps.some(
-      (cap) => cap.length === netCapId.length && cap.every((b, i) => b === netCapId[i])
-    );
-    if (!hasNet) return null;
+    if (!bytesEq(h.currentCaller, chatPinnedName)) return null;
     return new Uint8Array([1]);
   });
 
@@ -719,15 +570,15 @@ async function testBridgeCapabilityCheckEndToEnd() {
     return out;
   }
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatNoCapName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 1, "bridge invoked for no-cap caller");
-  assertEqual(host.callDynamicHandlerI32(chatNoCapName, "last_resp_len"), 0,
-    "no-cap caller: bridge rejected (no response)");
+  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatOtherName, makeForward(netSendName)));
+  assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
+  assertEqual(host.callDynamicHandlerI32(chatOtherName, "last_resp_len"), 0,
+    "unpinned caller: bridge rejected (no response)");
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatWithCapName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 2, "bridge invoked for with-cap caller");
-  assertEqual(host.callDynamicHandlerI32(chatWithCapName, "last_resp_len"), 1,
-    "with-cap caller: bridge returned 1 byte");
+  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatPinnedName, makeForward(netSendName)));
+  assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
+  assertEqual(host.callDynamicHandlerI32(chatPinnedName, "last_resp_len"), 1,
+    "pinned caller: bridge returned 1 byte");
 
   console.log("  OK\n");
 }
@@ -756,7 +607,7 @@ async function testBlockFromCall() {
   const seq = makeSeq();
   const fwdName = host.deriveScopedName("test.forwarder", pk);
   host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    fwdName, [], null, forwarderBytes));
+    fwdName, forwarderBytes));
   assert(host.isRegistered(fwdName), "forwarder installed");
 
   const fwdPayload = new Uint8Array(1 + mutateName.length);
@@ -869,12 +720,12 @@ async function testFs() {
     const { fs, cleanup } = make();
     try {
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-      assert(!fs.has("a.blk"), `${name}: absent before put`);
+      assert(fs.size("a.blk") < 0, `${name}: absent before put`);
       assertEqual(fs.size("a.blk"), -1, `${name}: size -1 when absent`);
       assertEqual(fs.get("a.blk"), null, `${name}: get null when absent`);
 
       fs.put("a.blk", bytes);
-      assert(fs.has("a.blk"), `${name}: present after put`);
+      assert(fs.size("a.blk") >= 0, `${name}: present after put`);
       assertEqual(fs.size("a.blk"), 5, `${name}: size reflects bytes`);
       assert(bytesEqual(fs.get("a.blk"), bytes), `${name}: get round-trips`);
 
@@ -886,7 +737,7 @@ async function testFs() {
       assert(fs.stat().available > 0, `${name}: stat.available is positive`);
 
       assert(fs.delete("a.blk"), `${name}: delete reports removal`);
-      assert(!fs.has("a.blk"), `${name}: absent after delete`);
+      assert(fs.size("a.blk") < 0, `${name}: absent after delete`);
       assert(!fs.delete("a.blk"), `${name}: second delete is false`);
     } finally {
       cleanup();
@@ -911,40 +762,15 @@ async function testFs() {
   console.log("  OK\n");
 }
 
-// ─── Test: Transport.requestMany scatter-gather (step 7) ────────────────
-
-async function testRequestMany() {
-  console.log("Test: Transport.requestMany — scatter-gather with partial results (step 7)");
-
-  const a = generateKeyPair(), b = generateKeyPair();
-  const net = new LoopbackNetwork();
-  const ta = new Transport(toHex(a.publicKey), net, 40);
-  const tb = new Transport(toHex(b.publicKey), net, 40);
-  tb.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
-
-  try {
-    const dead = toHex(generateKeyPair().publicKey); // never registered → unreachable
-    const results = await ta.requestMany([toHex(b.publicKey), dead], 7, new Uint8Array([3, 4]));
-    assertEqual(results.length, 2, "one result per input peer, order preserved");
-    assert(results[0].ok, "the live peer answered ok");
-    assert(bytesEqual(results[0].bytes, new Uint8Array([7, 3, 4])), "the live peer echoed type+payload");
-    assert(!results[1].ok, "the unreachable peer comes back ok:false (partial, not a reject)");
-    assertEqual(results[1].bytes.length, 0, "the unreachable peer carries no bytes");
-  } finally {
-    ta.close(); tb.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 19) ─────────
+// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 8) ──────────
 //
 // The per-peer fan-out: a DISTINCT payload per peer, concurrently. This is the
 // primitive the sync storage guest drives for placement/gather (one batched cap
-// per round) instead of a host-side Promise.all.
+// per round) instead of a host-side Promise.all. An all-payloads-equal broadcast
+// is just N identical entries.
 
 async function testSendMany() {
-  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 19)");
+  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 8)");
 
   const u32 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
   const rd32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
@@ -1000,7 +826,7 @@ async function testSendMany() {
     tBridge.close();
 
     // 3) A guest-controlled count not backed by bytes is a clean throw, never an
-    //    unbounded host loop (the same defensive check NET_REQUEST_MANY makes).
+    //    unbounded host loop.
     let threw = false;
     try { await bridge(CAP.NET_SEND_MANY, concatBytes([u32(2), entry(b.publicKey, 7, U(1))])); }
     catch { threw = true; }
@@ -1031,10 +857,13 @@ async function testCapBridge() {
   const echoName = host.deriveBootstrapName("test.echo");
   host.register(echoName, (_n, p) => new Uint8Array([p.length, ...p]));
 
+  // A host-derived signing scope binds the guest's SIGN op to a bundle namespace
+  // (README §13.2); a real node derives it from the manifest's (author, app).
+  const signScope = guestSignScope(id.publicKey, "testapp");
   const bridge = createCapBridge({
     sodium, identity: id,
     callHandler: (name, p) => host.callHandler(name, p),
-    transport, peers: () => [toHex(id.publicKey)], fs,
+    transport, peers: () => [toHex(id.publicKey)], fs, signScope,
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -1045,9 +874,13 @@ async function testCapBridge() {
     const key = sodium.randombytes_buf(32), nonce = sodium.randombytes_buf(24);
     assert(bytesEqual(await bridge(CAP.STREAM_XOR, concatBytes([nonce, key, msg])),
       sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "CAP_STREAM_XOR = xchacha20 keystream");
+    // CAP_SIGN is scoped, never raw (README §13.2): it signs DOMAIN_guest ‖ scope ‖ msg.
+    const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
     const sig = await bridge(CAP.SIGN, msg);
-    assert(sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "CAP_SIGN signs as the node identity");
-    assertEqual((await bridge(CAP.VERIFY, concatBytes([id.publicKey, sig, msg])))[0], 1, "CAP_VERIFY accepts a good sig");
+    const preimage = concatBytes([DOMAIN_GUEST, signScope, msg]);
+    assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "CAP_SIGN signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
+    assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "CAP_SIGN never signs the raw message (scoped, not raw)");
+    assertEqual((await bridge(CAP.VERIFY, concatBytes([id.publicKey, sig, preimage])))[0], 1, "CAP_VERIFY (raw) accepts the scoped preimage");
     assertEqual((await bridge(CAP.VERIFY, concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "CAP_VERIFY rejects a forged message");
     assert(bytesEqual(await bridge(CAP.IDENTITY, U()), id.publicKey), "CAP_IDENTITY = the node pubkey");
     assertEqual((await bridge(CAP.RANDOM, U(0, 0, 0, 16))).length, 16, "CAP_RANDOM returns n bytes");
@@ -1058,7 +891,6 @@ async function testCapBridge() {
     await bridge(CAP.FS_PUT, concatBytes([U(0, 0, 0, fk.length), fk, fv]));
     const got = await bridge(CAP.FS_GET, fk);
     assert(got[0] === 1 && bytesEqual(got.slice(1), fv), "CAP_FS_PUT/GET round-trips under an opaque key");
-    assertEqual((await bridge(CAP.FS_HAS, fk))[0], 1, "CAP_FS_HAS true after put");
     assertEqual((await bridge(CAP.FS_GET, new TextEncoder().encode("missing")))[0], 0, "CAP_FS_GET of an absent key → [0]");
     const szPresent = await bridge(CAP.FS_SIZE, fk);
     assertEqual(new DataView(szPresent.buffer, szPresent.byteOffset).getUint32(0, false), fv.length, "CAP_FS_SIZE returns the value's byte length");
@@ -1069,7 +901,7 @@ async function testCapBridge() {
     // Promise) except the net ops, which round-trip — this is exactly what lets a
     // SYNC realm host the holder side while the async realm awaits net.
     assert(!(bridge(CAP.HASH, msg) instanceof Promise), "CAP_HASH resolves synchronously (bytes, no Promise)");
-    assert(!(bridge(CAP.FS_HAS, fk) instanceof Promise), "CAP_FS_HAS resolves synchronously");
+    assert(!(bridge(CAP.FS_SIZE, fk) instanceof Promise), "CAP_FS_SIZE resolves synchronously");
     assert(bridge(CAP.NET_PEERS, U()) instanceof Uint8Array, "CAP_NET_PEERS is synchronous");
     const sendResult = bridge(CAP.NET_SEND, concatBytes([id.publicKey, U(7)]));
     assert(sendResult instanceof Promise, "CAP_NET_SEND returns a Promise (a real round trip)");
@@ -1164,7 +996,7 @@ async function testPolicy() {
     host.setApproveInstall(buildApproveInstall(host, parsePolicy(policyJson)));
     const seq = makeSeq();
     const name = host.deriveScopedName("mod", author.publicKey);
-    host.dispatch(buildInstall(host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, [], null, forwarderBytes));
+    host.dispatch(buildInstall(host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes));
     const rec = host.lookupInstall(name);
     return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
   };
@@ -1221,7 +1053,7 @@ async function testShellBoot() {
     const installName = shell.host.deriveBootstrapName("install");
     const name = shell.host.deriveScopedName("mod", author.publicKey);
     shell.installFromEnvelope(buildInstall(
-      shell.host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, [], null, forwarderBytes,
+      shell.host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes,
     ));
     assert(shell.host.isRegistered(name), "an allowed signed install lands on the booted shell");
   } finally {
@@ -1253,17 +1085,17 @@ async function testBundle() {
     const kernelName = h.deriveScopedName("codec", author.publicKey);
     const install = buildInstall(
       h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
-      seq(author.publicKey), kernelName, [], null, forwarderBytes,
+      seq(author.publicKey), kernelName, forwarderBytes,
     );
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
-      app: "test", version: "1",
+      app: "test", version: 1,
       modules: [{
         name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
         install: "codec.install", kernelName: toHex(kernelName),
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      ops: { PING: 1 }, caps: [],
+      caps: [],
     };
     wf(pjoin(dir, "codec.wasm"), forwarderBytes);
     wf(pjoin(dir, "codec.install"), install);
@@ -1287,6 +1119,20 @@ async function testBundle() {
     assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
     assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
+
+    // Freshness (§13.4): version is an enforced monotonic high-water per (author, app).
+    // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
+    // version and reloading through the same shell exercises the downgrade gate.
+    const remanifest = (version) =>
+      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, { ...manifest, version }));
+    remanifest(1); shell.loadBundle(dir); // equal version reloads (an ordinary reboot)
+    remanifest(2); shell.loadBundle(dir); // newer version advances the mark to 2
+    remanifest(1);                          // now a downgrade
+    let downgradeRefused = false;
+    try { shell.loadBundle(dir); } catch { downgradeRefused = true; }
+    assert(downgradeRefused, "a version below the (author, app) high-water mark is refused as a downgrade");
+    remanifest(2); shell.loadBundle(dir);   // the mark held at 2, so v2 still loads
+    remanifest(1);                          // restore the original manifest for the shell2 check below
 
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
@@ -1496,7 +1342,7 @@ async function testCapBridgeEnforcement() {
   console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async () => new Uint8Array(), requestMany: async () => [], sendMany: async () => [] };
+  const stubTransport = { request: async () => new Uint8Array(), sendMany: async () => [] };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
@@ -1520,8 +1366,8 @@ async function testCapBridgeEnforcement() {
   try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "RANDOM over the cap is refused");
   threw = false;
-  try { await open(CAP.NET_REQUEST_MANY, U(7, 0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
-  assert(threw, "NET_REQUEST_MANY with a count not backed by payload bytes is refused");
+  try { await open(CAP.NET_SEND_MANY, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
+  assert(threw, "NET_SEND_MANY with a count not backed by payload bytes is refused");
 
   // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
   // op set the bridge enforces (the "wire the caps" path). A guest that declared
@@ -1529,7 +1375,7 @@ async function testCapBridgeEnforcement() {
   const cryptoOnly = mk(opsForCaps(["crypto"]));
   assertEqual((await cryptoOnly(CAP.HASH, U(1, 2))).length, 32, "a declared domain (crypto) grants its ops");
   threw = false;
-  try { await cryptoOnly(CAP.FS_HAS, U(120)); } catch { threw = true; }
+  try { await cryptoOnly(CAP.FS_GET, U(120)); } catch { threw = true; }
   assert(threw, "an op outside the declared domains (fs) is refused");
   threw = false;
   try { opsForCaps(["crypto", "nope"]); } catch { threw = true; }
@@ -1551,7 +1397,7 @@ async function testCallHandlerGuards() {
     "callHandler refuses the signature wrapper");
 
   // A normal handler still works, and sees an *empty* immediate caller — not a
-  // stale frame from some outer dispatch (the §8.2 confused-deputy check).
+  // stale frame from some outer dispatch (the §9 confused-deputy check).
   let sawCaller = "unset";
   const echoName = host.deriveBootstrapName("test.echo2");
   host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
@@ -1582,6 +1428,78 @@ async function testTransportResponseBinding() {
     assertEqual([...resp], [42], "the real peer's response resolves, not the spoof");
   } finally {
     ta.close(); tb.close(); tc.close();
+  }
+
+  console.log("  OK\n");
+}
+
+async function testTransportStallTimeout() {
+  console.log("Test: the request timeout is a stall bound — frames from the peer re-arm it");
+
+  const a = generateKeyPair(), b = generateKeyPair();
+  const A = toHex(a.publicKey), B = toHex(b.publicKey);
+  const net = new LoopbackNetwork();
+  const ta = new Transport(A, net, 250);
+  const tb = new Transport(B, net, 250);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // B answers each request after 150·type ms: 150 / 300 / 450. Issued together at
+  // t≈0, responses 2 and 3 land past the 250 ms timeout — but each arriving
+  // response is a frame from B that re-arms the later requests' stall clocks
+  // (every inter-frame gap is 150 ms < 250 ms), so all three must resolve. This is
+  // the PUT STORE round in miniature: many requests against one issue instant,
+  // with the tail alive only because the transfer is visibly progressing.
+  tb.onRequest(async (_from, type) => { await sleep(150 * type); return new Uint8Array([type]); });
+
+  try {
+    const rs = await Promise.all([1, 2, 3].map((t) => ta.request(B, t, new Uint8Array())));
+    assertEqual(rs.map((r) => r[0]), [1, 2, 3], "a slow-but-streaming peer never times out");
+
+    // A silent peer still fails after ~timeoutMs — the stall clock is a real bound.
+    const t0 = Date.now();
+    let failed = false;
+    try { await ta.request(toHex(generateKeyPair().publicKey), 9, new Uint8Array()); }
+    catch { failed = true; }
+    assert(failed, "a silent peer still times out");
+    assert(Date.now() - t0 < 2000, "silence is detected promptly, not hung");
+  } finally {
+    ta.close(); tb.close();
+  }
+
+  console.log("  OK\n");
+}
+
+async function testTransportBackstop() {
+  console.log("Test: an absolute backstop rejects a withheld response even from a 'live' peer");
+
+  const a = generateKeyPair(), b = generateKeyPair();
+  const A = toHex(a.publicKey), B = toHex(b.publicKey);
+  const net = new LoopbackNetwork();
+  // timeoutMs 50, maxStallWindows 3 → backstop ≈ 150 ms. There is no Transport for B, so
+  // it never answers A's request; we keep B "live" from A's view by dribbling an unrelated
+  // frame every 20 ms (< the 50 ms silence window), which re-arms A's stall clock forever.
+  // This is the buggy/hostile peer: it withholds THIS response while keeping the wire warm,
+  // so silence alone would never fire — only the absolute backstop bounds the request.
+  const ta = new Transport(A, net, 50, 3);
+  let alive = true;
+  (async () => {
+    // A KIND_RES frame for a corr with no pending entry: onFrame stamps lastFrameAt[B]
+    // (re-arming every request pending to B) then drops it — nothing ever resolves.
+    while (alive) { net.send(B, A, Uint8Array.from([1, 0, 0, 0, 255, 0])); await sleep(20); }
+  })();
+
+  try {
+    const t0 = Date.now();
+    let failed = false, msg = "";
+    try { await ta.request(B, 7, new Uint8Array()); }
+    catch (e) { failed = true; msg = String(e?.message ?? e); }
+    const dt = Date.now() - t0;
+    assert(failed, "a request whose response never comes still rejects, despite a live peer");
+    assert(/backstop/.test(msg), `it rejects via the absolute backstop, not silence (got: ${msg})`);
+    assert(dt >= 140, `the backstop waits out ~maxStallWindows×timeoutMs before firing (got ${dt}ms)`);
+    assert(dt < 900, `but it DOES fire — the request is not pinned forever (got ${dt}ms)`);
+  } finally {
+    alive = false;
+    ta.close();
   }
 
   console.log("  OK\n");
@@ -1653,6 +1571,219 @@ async function testRedialAfterFailedDial() {
   } finally {
     if (netS) netS.close();
     netB.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: connsPerPeer opens N parallel flows and stripes across them ──────
+//
+// The multi-flow upload feature (net-route / net-ws): a dialer opens connsPerPeer
+// parallel links to one peer and stripes frames round-robin over them, so N TCP
+// flows fill a high-RTT/lossy link a single CUBIC flow can't. We drive two
+// NodeNetworkCores through an in-memory ChannelFactory (no sockets) so we can
+// count the dials and the per-link sends directly:
+//   • connsPerPeer=3 opens exactly 3 dials, and ready() is idempotent (no over-dial);
+//   • post-auth frames stripe evenly round-robin across the 3 links;
+//   • the peer stays reachable while ≥1 link survives — losing one flow is not a down.
+
+async function testConnsPerPeerFanout() {
+  console.log("Test: connsPerPeer opens N parallel flows and stripes frames round-robin");
+  const { NodeNetworkCore } = await imp("build/host/net-route.js");
+
+  // An in-memory RawChannel pair: whole-message, async delivery, closing either
+  // end notifies both. Each end tallies how many frames it has carried.
+  function rawPair() {
+    const mk = () => ({
+      twin: null, onMsg: null, onCls: null, open: true, sends: 0,
+      send(bytes) {
+        this.sends++;
+        const t = this.twin, copy = bytes.slice();
+        queueMicrotask(() => { if (t.open) t.onMsg?.(copy); });
+      },
+      onMessage(cb) { this.onMsg = cb; },
+      onClose(cb) { this.onCls = cb; },
+      close() {
+        if (!this.open) return;
+        this.open = false; this.twin.open = false;
+        queueMicrotask(() => { this.onCls?.(); this.twin.onCls?.(); });
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
+  }
+
+  let onAccept = null;
+  const serverFactory = {
+    connect() { throw new Error("server does not dial"); },
+    listen(_tcp, _ws, cb) { onAccept = cb; return Promise.resolve({ port: 1, wsPort: 0 }); },
+    close() {},
+  };
+  const clientLinks = []; // every client-side channel we dialed, in dial order
+  const clientFactory = {
+    connect(_addr) { const [c, s] = rawPair(); clientLinks.push(c); queueMicrotask(() => onAccept(s)); return c; },
+    listen() { return Promise.resolve({ port: 0, wsPort: 0 }); },
+    close() {},
+  };
+
+  const idS = generateKeyPair(), idC = generateKeyPair();
+  const server = new NodeNetworkCore({ identity: idS, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
+  await server.start();
+  const got = [];
+  server.register(toHex(idS.publicKey), (_from, frame) => got.push(frame));
+
+  const client = new NodeNetworkCore({ identity: idC, sodium, channels: clientFactory, connsPerPeer: 3 });
+  client.register(toHex(idC.publicKey), () => {});
+  client.addPeerAddr(toHex(idS.publicKey), { host: "x", port: 1, transport: "tcp" });
+  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+
+  try {
+    await client.ready(2000);
+    assertEqual(clientLinks.length, 3, "connsPerPeer=3 opens exactly 3 parallel dials");
+
+    // ready() resolves on the FIRST link up; let the other two finish their handshake.
+    await sleep(50);
+    // A second ready() must not over-dial — the shortfall is zero once all three are up.
+    await client.ready(2000);
+    assertEqual(clientLinks.length, 3, "a second ready() is idempotent — no redundant dials");
+
+    // Round-robin striping: 6 post-auth frames over 3 links → 2 each (each PeerLink.send
+    // is exactly one channel send post-auth, so per-link tallies read the routing directly).
+    const base = clientLinks.map((l) => l.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
+    await sleep(50);
+    const deltas = clientLinks.map((l, i) => l.sends - base[i]);
+    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 parallel links");
+    assertEqual(got.length, 6, "all 6 striped frames are delivered to the peer");
+
+    // Resilience: drop one link — the peer is still reachable over the other two.
+    clientLinks[0].close();
+    await sleep(50);
+    const before = got.length;
+    for (let i = 0; i < 4; i++) sendC(new Uint8Array([9]));
+    await sleep(50);
+    assertEqual(got.length - before, 4, "losing one of three flows leaves the peer reachable over the rest");
+  } finally {
+    client.close(); server.close();
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: WsNetwork connsPerPeer — N parallel WS flows, up/down fire once ──
+//
+// The browser-edge counterpart to testConnsPerPeerFanout: WsNetwork (what p2p.html
+// and p2p-cli dial with) opens connsPerPeer WebSockets to one peer and stripes over
+// them. The cohort/quorum logic keys off onPeerUp/onPeerDown, so those must fire
+// exactly once per peer regardless of how many parallel links back it. We drive the
+// client through an in-memory WsLike factory whose twin runs a hand-wired server
+// PeerLink, so no real socket is opened:
+//   • connsPerPeer=3 opens 3 WebSockets but onPeerUp fires once;
+//   • frames stripe evenly round-robin across the 3 links;
+//   • dropping links keeps the peer up until the LAST one goes — onPeerDown fires once.
+
+async function testWsNetworkFanout() {
+  console.log("Test: WsNetwork connsPerPeer — 3 parallel WS flows, onPeerUp/Down fire once");
+  const { WsNetwork, WsChannel } = await imp("build/host/net-ws.js");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // An in-memory WsLike pair (numeric readyState, as WsChannel checks === OPEN):
+  // whole-message async delivery, open on next tick, close notifies both ends.
+  function wsPair() {
+    const mk = () => ({
+      binaryType: "blob", readyState: 0 /* CONNECTING */, sends: 0,
+      _l: { open: [], close: [], error: [], message: [] }, twin: null,
+      addEventListener(t, cb) { this._l[t].push(cb); },
+      send(bytes) {
+        this.sends++;
+        const t = this.twin, buf = bytes.slice().buffer;
+        queueMicrotask(() => { if (t.readyState === 1) for (const cb of t._l.message) cb({ data: buf }); });
+      },
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3; for (const cb of this._l.close) cb();
+        const t = this.twin; if (t.readyState !== 3) { t.readyState = 3; for (const cb of t._l.close) cb(); }
+      },
+      open() { this.readyState = 1; for (const cb of this._l.open) cb(); },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
+  }
+
+  const idS = generateKeyPair(), idC = generateKeyPair();
+  const clientWs = [];   // client-side WsLike per parallel link, in dial order
+  const serverGot = [];  // frames the server received
+  let serverAuthed = 0;  // server-side auths (one per accepted link)
+
+  // Each dial: make a pair, wrap the server twin in a server-side PeerLink, and open
+  // both ends next tick so the buffered HELLOs flush and the handshake runs.
+  const factory = (_url) => {
+    const [cli, srv] = wsPair();
+    clientWs.push(cli);
+    new PeerLink({
+      channel: new WsChannel(srv), identity: idS, sodium, weDialed: false,
+      onAuth: () => { serverAuthed++; }, onFrame: (_pid, f) => serverGot.push(f), onClose: () => {},
+    });
+    queueMicrotask(() => { cli.open(); srv.open(); });
+    return cli;
+  };
+
+  let ups = 0, downs = 0;
+  const client = new WsNetwork({
+    identity: idC, sodium, webSocketFactory: factory, connsPerPeer: 3,
+    onPeerUp: () => { ups++; }, onPeerDown: () => { downs++; },
+  });
+  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+
+  try {
+    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
+    await sleep(80); // let all three handshakes complete
+    assertEqual(clientWs.length, 3, "connsPerPeer=3 opens exactly 3 WebSockets");
+    assertEqual(serverAuthed, 3, "all three parallel links authenticate on the server");
+    assertEqual(ups, 1, "onPeerUp fires once, when the peer first becomes reachable");
+    assertEqual(client.linkedPeers().length, 1, "the three links are one logical peer");
+
+    // Round-robin striping: 6 post-auth frames over 3 links → 2 each.
+    const base = clientWs.map((w) => w.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
+    await sleep(50);
+    const deltas = clientWs.map((w, i) => w.sends - base[i]);
+    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 WS links");
+    assertEqual(serverGot.length, 6, "all 6 striped frames reach the peer");
+
+    // Drop two of three links: the peer stays up (no onPeerDown yet) and still routes.
+    clientWs[0].close();
+    clientWs[1].close();
+    await sleep(50);
+    assertEqual(downs, 0, "losing 2 of 3 flows does not down the peer");
+    const before = serverGot.length;
+    for (let i = 0; i < 3; i++) sendC(new Uint8Array([9]));
+    await sleep(50);
+    assertEqual(serverGot.length - before, 3, "the peer is still reachable over the surviving flow");
+
+    // Re-dial: connect() is an idempotent top-up, so it re-opens ONLY the two dropped
+    // flows (not a fresh three) — the browser/CLI recovers the striping win after a
+    // partial drop instead of running degraded to one flow for the rest of the session.
+    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
+    await sleep(80);
+    assertEqual(clientWs.length, 5, "re-connect() opens exactly the 2-flow shortfall, not 3 more");
+    assertEqual(serverAuthed, 5, "the two topped-up links authenticate too");
+    assertEqual(ups, 1, "onPeerUp does NOT fire again — the peer was already reachable");
+    assertEqual(client.linkedPeers().length, 1, "still one logical peer after the top-up");
+
+    // Striping is back to three flows: 6 frames over the survivor + 2 re-opened links.
+    const survivors = [clientWs[2], clientWs[3], clientWs[4]];
+    const base2 = survivors.map((w) => w.sends);
+    for (let i = 0; i < 6; i++) sendC(new Uint8Array([7]));
+    await sleep(50);
+    assertEqual(survivors.map((w, i) => w.sends - base2[i]), [2, 2, 2],
+      "after the top-up, 6 frames stripe evenly across all 3 restored flows");
+
+    // Every remaining flow drops → onPeerDown fires exactly once.
+    for (const w of survivors) w.close();
+    await sleep(50);
+    assertEqual(downs, 1, "onPeerDown fires once, only when the last flow drops");
+    assertEqual(client.linkedPeers().length, 0, "the peer is no longer linked once every flow is gone");
+  } finally {
+    client.close();
   }
 
   console.log("  OK\n");
@@ -1927,6 +2058,185 @@ async function testWeriftRtcNetwork() {
   console.log("  OK\n");
 }
 
+// ─── Test: PeerLink record layer — tamper / replay / reorder tears the link down ──
+//
+// The core security property of the §13.6 record layer: after the AKE, every FRAME is
+// an AEAD record under a forward-secret key with an implicit monotonic counter as its
+// nonce, and any record that fails to decrypt in strict counter order tears the link
+// down. We drive two real PeerLinks over an in-memory channel pair, let the handshake
+// complete untouched, then intercept the sender's post-auth records to tamper, replay,
+// or reorder them — each must fail the receiver's decrypt and drop the connection.
+async function testRecordLayerIntegrity() {
+  console.log("Test: PeerLink record layer — tampered / replayed / reordered records tear the link down");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // An in-memory RawChannel pair. HELLO(1)/AUTH(2) always pass through so the handshake
+  // runs; a post-auth FRAME(3) from A is routed through `hook.fn(record, deliver)` when a
+  // test installs one, so it can tamper / replay / reorder / drop. B→A always passes.
+  function pair(hook) {
+    const mk = () => ({
+      msg: null, cls: null, closed: false, twin: null,
+      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
+      close() {
+        if (this.closed) return;
+        this.closed = true;
+        queueMicrotask(() => this.cls && this.cls());
+        const t = this.twin;
+        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a;
+    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
+    a.send = (bytes) => {
+      const m = bytes.slice();
+      if (m[0] === 3 /* MSG_FRAME */ && hook.fn) hook.fn(m, (out) => deliver(b, out));
+      else deliver(b, m);
+    };
+    b.send = (bytes) => deliver(a, bytes.slice());
+    return { a, b, injectB: (bytes) => deliver(b, bytes.slice()) };
+  }
+
+  // Build an authenticated pair, returning handles + a live state snapshot.
+  async function authedPair() {
+    const hook = { fn: null };
+    const { a: chA, b: chB, injectB } = pair(hook);
+    const idA = generateKeyPair(), idB = generateKeyPair();
+    const st = { aAuthed: false, bAuthed: false, aClosed: false, bGot: [] };
+    const linkB = new PeerLink({
+      channel: chB, identity: idB, sodium, weDialed: false,
+      onAuth: () => { st.bAuthed = true; }, onFrame: (_p, f) => st.bGot.push(f), onClose: () => {},
+    });
+    const linkA = new PeerLink({
+      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
+      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => { st.aClosed = true; },
+    });
+    for (let i = 0; i < 20 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
+    return { hook, linkA, linkB, injectB, st };
+  }
+
+  // 1. Tamper: flip a byte of the sealed ciphertext → Poly1305 tag check fails → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before tampering");
+    p.hook.fn = (rec, deliver) => { rec[1] ^= 0x01; deliver(rec); };
+    p.linkA.send(new Uint8Array([1, 2, 3]));
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "a tampered record tears the link down");
+    assertEqual(p.st.bGot.length, 0, "the tampered frame is never delivered to the guest");
+  }
+
+  // 2. Replay: deliver a valid record, then re-deliver the identical bytes — the receiver's
+  //    counter has advanced, so the reconstructed nonce no longer matches → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before replay");
+    let captured = null;
+    p.hook.fn = (rec, deliver) => { captured = rec.slice(); deliver(rec); };
+    p.linkA.send(new Uint8Array([7]));
+    for (let i = 0; i < 20 && p.st.bGot.length < 1; i++) await sleep(2);
+    assertEqual(p.st.bGot.length, 1, "the first record decrypts and is delivered");
+    p.injectB(captured); // replay the exact same sealed record
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "a replayed record tears the link down");
+    assertEqual(p.st.bGot.length, 1, "the replayed record is not delivered a second time");
+  }
+
+  // 3. Reorder: hold record ctr0, then deliver ctr1 before ctr0 — the receiver expects
+  //    ctr0's nonce, so the out-of-order record fails to decrypt → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before reorder");
+    const recs = [];
+    p.hook.fn = (rec, deliver) => {
+      recs.push(rec.slice());
+      if (recs.length === 2) { deliver(recs[1]); deliver(recs[0]); } // ctr1 then ctr0
+    };
+    p.linkA.send(new Uint8Array([10])); // ctr0 (held)
+    p.linkA.send(new Uint8Array([20])); // ctr1 → triggers reordered delivery
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "an out-of-order record tears the link down");
+    assertEqual(p.st.bGot.length, 0, "no reordered frame is delivered");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
+//
+// Finding guard: the freshness high-water mark must record only versions that fully
+// loaded. A newer bundle whose manifest is intact and signed but whose module file is
+// corrupt (a half-landed upgrade) must fail the content check WITHOUT raising the mark —
+// otherwise reloading the known-good older directory would be refused as a downgrade,
+// bricking rollback (README §13.4).
+async function testBundleCorruptNewerRollback() {
+  console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
+  const { signManifest } = await imp("build/host/bundle.js");
+  const { boot } = await imp("build/host/main.js");
+  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+
+  const author = generateKeyPair();
+  const identity = generateKeyPair();
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-rollback-"));
+  let shell;
+  try {
+    const { host: h } = await makeHost();
+    const seq = makeSeq();
+    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const install = buildInstall(
+      h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
+      seq(author.publicKey), kernelName, forwarderBytes,
+    );
+    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const manifest = (version) => ({
+      app: "rollback", version,
+      modules: [{
+        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
+        install: "codec.install", kernelName: toHex(kernelName),
+      }],
+      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
+      caps: [],
+    });
+    wf(pjoin(dir, "codec.install"), install);
+    wf(pjoin(dir, "guest.js"), guestText);
+    const writeManifest = (version) =>
+      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));
+
+    shell = await boot({
+      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
+      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      dir: pjoin(dir, "_data"), identity,
+    });
+
+    // 1. Good v4 loads and sets the mark to 4.
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
+    writeManifest(4);
+    shell.loadBundle(dir);
+
+    // 2. A corrupt v5: validly signed at version 5, but the on-disk module no longer
+    //    matches its declared hash. The load must throw on the content check.
+    writeManifest(5);
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes.slice(0, forwarderBytes.length - 1));
+    let v5Failed = false;
+    try { shell.loadBundle(dir); } catch { v5Failed = true; }
+    assert(v5Failed, "a corrupt v5 bundle fails to load");
+
+    // 3. Restore the good v4 directory and reload. If the failed v5 load had advanced the
+    //    mark to 5, this would now be refused as a downgrade. It must still load.
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
+    writeManifest(4);
+    let v4Reloaded = true;
+    try { shell.loadBundle(dir); } catch { v4Reloaded = false; }
+    assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
+  } finally {
+    if (shell) shell.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -1938,22 +2248,20 @@ await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
 await testReferencePolicyUpgradeRules();
-await testReferencePolicyCapAcknowledgement();
 await testInstallReplayRejected();
-await testInstallerLookupQuery();
-await testInstallerCapsOf();
+await testInstallerLookupHostSide();
 await testInstallerRemove();
 await testCallerStackFormat();
-await testBridgeCapabilityCheckEndToEnd();
+await testBridgeCallerPinning();
 await testBlockFromCall();
 await testWrapRejectsInvalidKeySizes();
 await testFs();
-await testRequestMany();
 await testSendMany();
 await testCapBridge();
 await testPolicy();
 await testShellBoot();
 await testBundle();
+await testBundleCorruptNewerRollback();
 await testWsFraming();
 await testChannelPinning();
 await testRtcNetwork();
@@ -1964,8 +2272,13 @@ await testSyncSafeRealm();
 await testCapBridgeEnforcement();
 await testCallHandlerGuards();
 await testTransportResponseBinding();
+await testTransportStallTimeout();
+await testTransportBackstop();
 await testWsFragmentation();
 await testRedialAfterFailedDial();
+await testConnsPerPeerFanout();
+await testWsNetworkFanout();
+await testRecordLayerIntegrity();
 await testSafeRealmSerialization();
 await testPerf10k();
 

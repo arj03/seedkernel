@@ -132,7 +132,7 @@ func (f *nodeFs) put(key string, b []byte) error {
 	}
 	// Write atomically: land the bytes in a temp file, then rename onto the key. os.WriteFile
 	// truncates the key in place, so a crash mid-write would leave a short/corrupt block that
-	// has() still reports as held — the node advertises it, then fails the verification-fetch.
+	// size() ≥ 0 still reports as held — the node advertises it, then fails the verification-fetch.
 	// Rename swaps the whole file in one step (atomic within a dir on POSIX; MoveFileEx with
 	// REPLACE_EXISTING on Windows), so a reader only ever sees the old or the complete new
 	// block. A crash can at worst orphan the temp file, which scanUsed reclaims at open. We
@@ -186,8 +186,6 @@ func (f *nodeFs) size(key string) int {
 	}
 	return int(fi.Size())
 }
-
-func (f *nodeFs) has(key string) bool { return f.size(key) >= 0 }
 
 func (f *nodeFs) list(prefix string) []string {
 	entries, err := os.ReadDir(f.dir)
@@ -262,9 +260,6 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		}
 		return t.Context().NewUndefined(), nil
 	}))
-	o.SetPropertyStr("has", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(fs.has(str(t, 0))), nil
-	}))
 	o.SetPropertyStr("size", fn(func(t *qjs.This) (*qjs.Value, error) {
 		// NewInt64, not NewInt32: fs.size returns a 64-bit length, and a ≥2 GiB file
 		// would wrap to a negative int32 and read back as "missing" (-1). (-1 itself,
@@ -300,8 +295,8 @@ func exposeFs(qc *qjs.Context, dir string) error {
 
 // fsShimJS shapes the Go primitives into the host/fs.ts `Fs` interface the
 // cap-bridge consumes: a get miss is null, a hit is a Uint8Array, and list's
-// single \n-joined string becomes the string[]. The rest (put/has/size/delete/
-// stat) pass straight through.
+// single \n-joined string becomes the string[]. The rest (put/size/delete/stat)
+// pass straight through. Existence is size ≥ 0, so there is no separate `has`.
 const fsShimJS = `
 "use strict";
 (function () {
@@ -309,7 +304,6 @@ const fsShimJS = `
   globalThis.fs = {
     get: (key) => { const r = N.get(key); return r === null ? null : new Uint8Array(r); },
     put: (key, bytes) => N.put(key, bytes),
-    has: (key) => N.has(key),
     size: (key) => N.size(key),
     // Keys cross as one \n-joined string (a single engine call); an empty listing
     // arrives as "", which must map to [] — split would yield [""].

@@ -11,31 +11,39 @@
 
 // ─── host imports ────────────────────────────────────────────────────────
 
-@external("env", "ed25519_verify")
-declare function ed25519Verify(pubPtr: i32, sigPtr: i32, dataPtr: i32, dataLen: i32): i32;
-
-// Called by handle_signature for non-genesis algorithm suites (§6.1, §6.4).
-// The host owns the suite registry: it looks up algoId, validates pub/sig
-// sizes against the suite's declared metadata, and dispatches to the suite's
-// verify export. Pointers are into this module's linear memory.
+// Verify a signature under the suite for `algoId` (README §6.4, §6.6). A suite
+// is an ordinary handler installed at the slot `hash(SUITE_SLOT_PREFIX +
+// algo_id_hex)`; the host derives that slot name and dispatches the verify
+// request this module builds at [reqPtr, reqLen) to the handler there — genesis
+// (algo_id 0x0000) included, seeded as a host-serviced suite handler at boot.
+// A suite verifies, nothing else, so the request carries no op selector (§6.6):
+//   [pubkey_len u16][pubkey][sig_len u16][sig][data ..]
+// where `data` is the full signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖
+// signer ‖ inner_envelope (§6.3). The signer is length-prefixed so the preimage is
+// self-delimiting — a variable-length-key suite cannot re-split (signer, inner) to
+// forge a collision. Returns 1 iff the suite reports the signature valid; an unknown
+// algo_id (no handler at the slot) returns 0.
 @external("env", "suite_verify")
-declare function suiteVerify(
-  algoId: i32,
-  pubPtr: i32, pubLen: i32,
-  sigPtr: i32, sigLen: i32,
-  dataPtr: i32, dataLen: i32
-): i32;
+declare function suiteVerify(algoId: i32, reqPtr: i32, reqLen: i32): i32;
 
 // ─── constants ───────────────────────────────────────────────────────────
-
-export const GENESIS_ALGO_ID: u16 = 0x0000;
-export const GENESIS_PUBKEY_LEN: i32 = 32;
-export const GENESIS_SIG_LEN: i32 = 64;
 
 // Max nested `signature` wrappers per inbound message (README §2.3). Bounds
 // the per-message verify cost so a single 64 KB envelope cannot force hundreds
 // of crypto verifications on the single-threaded dispatch loop.
 export const MAX_SIGNATURE_DEPTH: i32 = 4;
+
+// DOMAIN_env (README §6.3, §17.1): "seedkernel-envelope-sig-v1\0". Prepended to
+// the signed preimage before verifying, never transmitted, so an envelope
+// signature cannot double as any other protocol's signature over the same bytes.
+const DOMAIN_ENV: Uint8Array = domainEnv();
+function domainEnv(): Uint8Array {
+  const s = "seedkernel-envelope-sig-v1";
+  const out = new Uint8Array(s.length + 1);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) as u8;
+  out[s.length] = 0; // trailing NUL
+  return out;
+}
 
 // ─── memory helpers ──────────────────────────────────────────────────────
 
@@ -109,9 +117,10 @@ export function pop_signer(): void {
 // Returns 1 if verified (signer pushed, inner bytes available via get_inner_ptr/len),
 // 0 if the message should be dropped.
 //
-// For non-genesis suites the host validates pub_len / sig_len against the
-// suite's declared metadata before calling suite.verify, so this module only
-// has to bounds-check the wrapper structure against the payload length.
+// The suite handler validates pub_len / sig_len for its algorithm, so this
+// module only bounds-checks the wrapper structure against the payload length
+// and hands the suite a well-formed request. Genesis is not special-cased — it
+// is just the suite at algo_id 0x0000 (README §6.4).
 //
 // Inner bytes are stored in the module-level _innerBuffer (a GC root) so the
 // pointer returned by get_inner_ptr() remains valid after handle_signature returns.
@@ -134,13 +143,11 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
 
   let o: i32 = 0;
   const algoId = readU16BE(payload, o); o += 2;
-  const isGenesis: bool = algoId == GENESIS_ALGO_ID;
 
   // signer_len is u16 BE (§6.3) so post-quantum suites with multi-kilobyte
   // public keys fit. Always 2 bytes.
   const signerLen = readU16BE(payload, o) as i32; o += 2;
   if (signerLen <= 0) return 0;
-  if (isGenesis && signerLen != GENESIS_PUBKEY_LEN) return 0;
   if (o + signerLen > payload.length) return 0;
   const signerOffset = o;
   o += signerLen;
@@ -148,7 +155,6 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   if (o + 2 > payload.length) return 0;
   const sigLen = readU16BE(payload, o) as i32; o += 2;
   if (sigLen <= 0) return 0;
-  if (isGenesis && sigLen != GENESIS_SIG_LEN) return 0;
   if (o + sigLen > payload.length) return 0;
   const sigOffset = o;
   o += sigLen;
@@ -157,24 +163,35 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   const innerLen = payload.length - o;
   if (innerLen <= 0) return 0;
 
-  let valid: i32;
-  if (isGenesis) {
-    valid = ed25519Verify(
-      payload.dataStart as i32 + signerOffset,
-      payload.dataStart as i32 + sigOffset,
-      payload.dataStart as i32 + innerOffset,
-      innerLen
-    );
-  } else {
-    // Host validates suite-registered sizes; returns 0 for unknown algoId or
-    // a size mismatch.
-    valid = suiteVerify(
-      algoId as i32,
-      payload.dataStart as i32 + signerOffset, signerLen,
-      payload.dataStart as i32 + sigOffset, sigLen,
-      payload.dataStart as i32 + innerOffset, innerLen
-    );
-  }
+  // Build the suite verify request (§6.6):
+  //   [signer_len u16][signer][sig_len u16][sig][data]
+  // where data is the signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖
+  // inner (§6.3). Assembling data here — prepending the domain and the outer fields to
+  // the inner envelope — is what gives every suite domain separation and outer-field
+  // binding for free; the suite just verifies sig over data. The signer is length-
+  // prefixed inside `data` too, so the (signer, inner) boundary is unambiguous and a
+  // future variable-length-key suite cannot splice a different split onto the same bytes.
+  const dataLen = DOMAIN_ENV.length + 2 + 2 + signerLen + innerLen;
+  const reqLen = 2 + signerLen + 2 + sigLen + dataLen;
+  const req = new Uint8Array(reqLen);
+  let w: i32 = 0;
+  req[w++] = ((signerLen >> 8) & 0xff) as u8;
+  req[w++] = (signerLen & 0xff) as u8;
+  req.set(payload.subarray(signerOffset, signerOffset + signerLen), w); w += signerLen;
+  req[w++] = ((sigLen >> 8) & 0xff) as u8;
+  req[w++] = (sigLen & 0xff) as u8;
+  req.set(payload.subarray(sigOffset, sigOffset + sigLen), w); w += sigLen;
+  // data: DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner
+  req.set(DOMAIN_ENV, w); w += DOMAIN_ENV.length;
+  req[w++] = ((algoId >> 8) & 0xff) as u8;
+  req[w++] = (algoId & 0xff) as u8;
+  req[w++] = ((signerLen >> 8) & 0xff) as u8;
+  req[w++] = (signerLen & 0xff) as u8;
+  req.set(payload.subarray(signerOffset, signerOffset + signerLen), w); w += signerLen;
+  req.set(payload.subarray(innerOffset, innerOffset + innerLen), w); w += innerLen;
+
+  // Unknown algo_id → no handler at the slot → host returns 0 (drop).
+  const valid = suiteVerify(algoId as i32, req.dataStart as i32, reqLen);
   if (valid == 0) return 0;
 
   const pubKey = payload.slice(signerOffset, signerOffset + signerLen);

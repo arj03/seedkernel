@@ -92,29 +92,26 @@ const host = await loadKernelHost(
 const signatureName       = host.deriveBootstrapName("signature");
 const signatureSignerName = host.deriveBootstrapName("signature.signer");
 const installName         = host.deriveBootstrapName("install");
-const lookupName          = host.deriveBootstrapName("installer.lookup");
-const capsOfName          = host.deriveBootstrapName("installer.caps_of");
 
 host.registerSignature(signatureName);
 host.registerSignerQuery(signatureSignerName);   // apps query the signer
-host.registerInstaller(installName, lookupName, capsOfName);
+host.registerInstaller(installName);
 
 // ── install-approval policy ────────────────────────────────────────────
 //
 // Updates from an author we already trust (= we already hold an install
-// record under this name with the same author key) are auto-approved as long
-// as the parent chain matches — that is exactly the "trust updates from the
-// same author" guarantee. First installs require explicit user consent; the
+// record under this name with the same author key) are auto-approved — that is
+// exactly the "trust updates from the same author" guarantee (§7.4, author-only;
+// no parent/lineage gate). First installs require explicit user consent; the
 // UI gates them by adding the install's bytes_hash to `pendingApprovals`
 // before dispatching the signed envelope. Anything else is dropped.
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
-host.setApproveInstall((name, author, bytesHash, _wasm, _caps, parent, existing) => {
+host.setApproveInstall((name, author, bytesHash, _wasm, existing) => {
   const hex = bytesToHex(bytesHash);
   if (existing) {
     if (existing.author.algoId !== author.algoId) return false;
     if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
-    if (!parent || !bytesEqual(existing.bytesHash, parent)) return false;
     pendingApprovals.delete(hex);   // consume even if not strictly needed
     return true;
   }
@@ -357,23 +354,9 @@ function parseInstallPayload(payload) {
   const nameLen = payload[o++];
   if (nameLen === 0 || payload.length < o + nameLen) return null;
   const name = payload.subarray(o, o + nameLen); o += nameLen;
-  if (payload.length < o + 1) return null;
-  const capsCount = payload[o++];
-  const caps = [];
-  for (let i = 0; i < capsCount; i++) {
-    if (payload.length < o + 1) return null;
-    const capLen = payload[o++];
-    if (payload.length < o + capLen) return null;
-    caps.push(payload.subarray(o, o + capLen)); o += capLen;
-  }
-  if (payload.length < o + 1) return null;
-  const parentLen = payload[o++];
-  if (payload.length < o + parentLen) return null;
-  const parent = parentLen > 0 ? payload.subarray(o, o + parentLen) : null;
-  o += parentLen;
   const wasm = payload.subarray(o);
   if (wasm.length === 0) return null;
-  return { seq, name, caps, parent, wasm };
+  return { seq, name, wasm };
 }
 
 function unwrapSealed(sealedBytes) {
@@ -389,17 +372,19 @@ function unwrapSealed(sealedBytes) {
     authorPk: wrapper.signer,
     authorAlgo: wrapper.algo,
     installPayload: inner.payload,
-    bytesHash: host.genesisHash(inner.payload),
+    // bytes_hash is the installer's content id for the module (§7.1):
+    // genesisHash(wasm), the same value the approve callback receives — so it
+    // keys pendingApprovals and doubles as the artifact's display hash.
+    bytesHash: host.genesisHash(install.wasm),
     install,
   };
 }
 
 // ── installing an app (local-authored) ─────────────────────────────────
-async function buildSealedInstall(meta, wasmBytes, parent) {
+async function buildSealedInstall(meta, wasmBytes) {
   const handlerName = appHandlerName(meta.id);
-  const uiName = appUiBridgeName(meta.id);
   const installPayload = host.encodeInstallPayload(
-    nextSeq(), handlerName, [uiName], parent, wasmBytes);
+    nextSeq(), handlerName, wasmBytes);
   return host.wrapAndEncode(
     myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installName, installPayload);
 }
@@ -438,13 +423,11 @@ async function applySealedInstall(sealedBytes) {
     description: meta.description || "",
     authorPk: peeked.authorPk.slice(),
     authorAlgo: peeked.authorAlgo,
+    // Content hash of the WASM module (§7.1: genesisHash(wasm)). Stable across
+    // re-signings / re-seqs by different authors, so two peers offering the same
+    // compiled artifact display the same hash — it is now the installer's own
+    // bytes_hash, so nothing separate to track.
     bytesHash: peeked.bytesHash,
-    // Content hash of just the WASM payload. Stable across re-signings /
-    // re-seqs by different authors, so two peers offering the same compiled
-    // artifact display the same hash. `bytesHash` (above) covers the full
-    // install payload — author seq, parent, caps — and so changes per
-    // install message.
-    wasmHash: host.genesisHash(peeked.install.wasm),
     sealedBytes: sealedBytes.slice(),
     handlerName,
     uiHtml,
@@ -469,9 +452,10 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
   }
   const handlerName = appHandlerName(meta.id);
   const existing = host.lookupInstall(handlerName);
-  // If we're updating something WE authored, chain the parent. Updates to
-  // an app authored by someone else are not supported from this path —
-  // those arrive via Offer from the original author.
+  // Updating something WE authored is a plain same-author re-install (§7.4 —
+  // no parent/lineage gate). Updates to an app authored by someone else are
+  // not supported from this path — those arrive via Offer from the original
+  // author.
   if (existing) {
     if (existing.author.algoId !== 0 ||
         !bytesEqual(existing.author.publicKey, myKeys.publicKey)) {
@@ -486,8 +470,7 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
       return;
     }
   }
-  const parent = existing ? existing.bytesHash : null;
-  const sealedBytes = await buildSealedInstall(meta, wasmBytes, parent);
+  const sealedBytes = await buildSealedInstall(meta, wasmBytes);
   const peeked = unwrapSealed(sealedBytes);
   if (!peeked) throw new Error("internal: just-built sealed install did not parse");
 
@@ -654,13 +637,12 @@ async function handleOffer(sealedBytes, fromPkHex) {
   const handlerName = appHandlerName(meta.id);
   const existing = host.lookupInstall(handlerName);
 
-  // Auto-install path: the author + parent chain match an app we already
-  // trust. The reference policy in setApproveInstall verifies the same
-  // facts, so dispatching is safe — no extra approval needed.
+  // Auto-install path: the author matches an app we already trust. The
+  // reference policy in setApproveInstall verifies the same facts (§7.4,
+  // author-only), so dispatching is safe — no extra approval needed.
   if (existing &&
       existing.author.algoId === peeked.authorAlgo &&
-      bytesEqual(existing.author.publicKey, authorPk) &&
-      install.parent && bytesEqual(existing.bytesHash, install.parent)) {
+      bytesEqual(existing.author.publicKey, authorPk)) {
     try {
       const rec = await applySealedInstall(sealedBytes);
       shellPrint(
@@ -681,7 +663,6 @@ async function handleOffer(sealedBytes, fromPkHex) {
   pendingOffers.set(hex, {
     sealedBytes: sealedBytes.slice(),
     peeked: { ...peeked, meta },
-    wasmHash: host.genesisHash(peeked.install.wasm),
     fromPkHex,
   });
   renderOfferList();
@@ -775,7 +756,7 @@ function buildAppRow(rec) {
   meta.innerHTML =
     `<b>id</b> ${rec.id} · <b>author</b> ${authorHex.slice(0, 8)}` +
     (isMine ? " (you)" : "") +
-    ` · <b>wasm</b> ${bytesToHex(rec.wasmHash).slice(0, 12)}`;
+    ` · <b>wasm</b> ${bytesToHex(rec.bytesHash).slice(0, 12)}`;
   li.appendChild(meta);
 
   const btns = document.createElement("div");
@@ -876,7 +857,7 @@ function buildOfferRow(hex, offer) {
   m.innerHTML =
     `<b>id</b> ${meta.id} · <b>author</b> ${bytesToHex(offer.peeked.authorPk).slice(0, 8)}` +
     ` · <b>from</b> ${offer.fromPkHex.slice(0, 8)}` +
-    ` · <b>wasm</b> ${bytesToHex(offer.wasmHash).slice(0, 12)}`;
+    ` · <b>wasm</b> ${bytesToHex(offer.peeked.bytesHash).slice(0, 12)}`;
   li.appendChild(m);
   const btns = document.createElement("div");
   btns.className = "app-row-buttons";

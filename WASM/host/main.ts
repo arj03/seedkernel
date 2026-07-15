@@ -13,9 +13,9 @@
 // README §13.9) embeds and runs this same shared host JS — no Node install needed.
 
 import { readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
@@ -23,7 +23,7 @@ import { parsePolicy, buildApproveInstall, type ShellPolicy } from "./policy.js"
 import { verifyManifest, contentMatches, type BundleManifest } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
 import { Transport, type Network, type PeerId } from "./net.js";
-import { createCapBridge, capPreamble, opsForCaps, type CapSodium } from "./cap-bridge.js";
+import { createCapBridge, capPreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
 import { createSafeRealm, createSyncSafeRealm, type SafeRealm, type SyncSafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { NodeFs } from "./fs-node.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
@@ -102,6 +102,59 @@ export interface Shell {
   close(): void;
 }
 
+/** The persisted bundle-freshness high-water mark per `(author, app)` (README §13.4).
+ *  Host-local state that survives reboots, so an older signed bundle directory cannot
+ *  silently replace a newer one — the guest is loaded wholesale from the directory at
+ *  every boot and carries no `seq` of its own. */
+export interface FreshnessStore {
+  /** The highest `version` ever loaded for this `(author, app)`, or −Infinity if none. */
+  get(author: Uint8Array, app: string): number;
+  /** Advance the mark to `version` (monotonic; a lower value never rewinds it). */
+  set(author: Uint8Array, app: string, version: number): void;
+}
+
+/** A `FreshnessStore` backed by one JSON file (`{ "authorHex:app": version }`). Kept
+ *  *outside* the guest-writable fs directory (a sibling file), so a `fs`-capable guest
+ *  cannot tamper with its own freshness mark. An operator rolls back by deleting or
+ *  lowering it out of band (the operator is the TCB, README §15). */
+export class FileFreshnessStore implements FreshnessStore {
+  private readonly marks = new Map<string, number>();
+  constructor(private readonly path: string) {
+    try {
+      const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      for (const [k, v] of Object.entries(raw)) if (typeof v === "number") this.marks.set(k, v);
+    } catch { /* absent/unreadable ⇒ start empty (−∞ for every key) */ }
+  }
+  private key(author: Uint8Array, app: string): string { return toHex(author) + ":" + app; }
+  get(author: Uint8Array, app: string): number {
+    const v = this.marks.get(this.key(author, app));
+    return v === undefined ? -Infinity : v;
+  }
+  set(author: Uint8Array, app: string, version: number): void {
+    const k = this.key(author, app);
+    const cur = this.marks.get(k);
+    if (cur !== undefined && cur >= version) return; // monotonic: never rewound
+    this.marks.set(k, version);
+    const obj: Record<string, number> = {};
+    for (const [kk, vv] of this.marks) obj[kk] = vv;
+    // Persist atomically: write a sibling temp then rename onto the path (atomic within
+    // a directory on POSIX; ReplaceFile semantics on Windows). A bare writeFileSync
+    // truncates the file in place, so a crash mid-write could leave truncated JSON — which
+    // the constructor's catch would silently read as "start empty", discarding the entire
+    // downgrade-protection mark set on the next boot (README §13.4). Rename swaps the whole
+    // file in one step, so a reader only ever sees the old or the complete new contents.
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, this.path);
+  }
+}
+
+/** The freshness file for a data directory: a sibling of the dir, so it can never
+ *  collide with or be clobbered by a guest fs key (which is a file *inside* the dir). */
+function freshnessPathFor(dir: string): string {
+  return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
+}
+
 /** Assemble the runtime: kernel + bootstrap + signature + installer under the
  *  loaded policy, plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
@@ -109,11 +162,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const host = await KernelHost.load(opts.kernelBytes as BufferSource, opts.bootstrapBytes as BufferSource, sodium);
 
   host.registerSignature(host.deriveBootstrapName("signature"));
-  host.registerInstaller(
-    host.deriveBootstrapName("install"),
-    host.deriveBootstrapName("installer.lookup"),
-    host.deriveBootstrapName("installer.caps_of"),
-  );
+  host.registerInstaller(host.deriveBootstrapName("install"));
   // Omitted policy ⇒ deny-all (empty author set): the node boots and serves but
   // nothing installs. A *provided* file is still parsed strictly (≥1 author) so a
   // typo'd allowed-keys.json fails loudly rather than silently widening trust.
@@ -125,6 +174,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // crypto (sumo), net (this transport), fs (this dir), the installed handlers,
   // clock, and identity. The kernel itself never learns what app it is running.
   const fs = new NodeFs(opts.dir);
+  const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
   const ownsNet = !opts.network;
   const net: Network = opts.network ??
     new NodeNetwork({ identity: opts.identity, sodium, listen: opts.listen, wsListen: opts.wsListen });
@@ -162,6 +212,9 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
       fs: caps.has("fs") ? fs : undefined,   // only hand over the fs backend if declared
       now: () => Date.now(),
       allowedOps: opsForCaps(caps),
+      // Scope the guest's SIGN op to this bundle's namespace (README §13.2): the host
+      // signs `DOMAIN_guest ‖ scope ‖ msg`, never the raw node key over guest bytes.
+      signScope: guestSignScope(b.author, b.manifest.app),
     });
   };
   // The guest source as signed content, fronted by the generic op preamble and the
@@ -178,7 +231,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     host, net, transport, fs, sodium, policy, peers,
     addPeer(p) { if (p !== peerId) peers.add(p); },
     installFromEnvelope(bytes) { host.dispatch(bytes); },
-    loadBundle(dir) { return (loaded = loadBundle(host, sodium, policy, dir)); },
+    loadBundle(dir) { return (loaded = loadBundle(host, sodium, policy, dir, freshness)); },
     async runGuest(entry, payload) {
       const b = requireLoaded();
       if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
@@ -202,16 +255,32 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
 }
 
 /** Load a signed bundle directory onto a host: verify the manifest signature,
- *  require its author to be in the policy, integrity-check each module against its
- *  declared content hash, dispatch the pre-signed installs (the installer re-checks
- *  author + module hash), and integrity-check the guest. Returns the parsed
- *  manifest + guest source + which modules registered. */
-export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, dir: string): LoadedBundle {
+ *  require its author to be in the policy, enforce version freshness, integrity-check
+ *  each module against its declared content hash, dispatch the pre-signed installs (the
+ *  installer re-checks author + module hash), and integrity-check the guest. Returns
+ *  the parsed manifest + guest source + which modules registered. */
+export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, dir: string, freshness?: FreshnessStore): LoadedBundle {
   const env = new Uint8Array(readFileSync(join(dir, "manifest.bundle")));
   const v = verifyManifest(sodium, env);
   if (!v) throw new Error("bundle: manifest signature invalid");
   if (!policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
     throw new Error("bundle: manifest author is not in the policy's allowed set");
+  }
+  // Freshness (README §13.4 step 3): the `version` is an enforced monotonic integer.
+  // Refuse a load below the persisted `(author, app)` high-water mark as a downgrade —
+  // nothing lands — otherwise advance the mark. Equal versions reload (an ordinary
+  // reboot re-reads the same directory); the mark is never rewound.
+  const version = v.manifest.version;
+  if (typeof version !== "number" || !Number.isInteger(version)) {
+    throw new Error("bundle: manifest version must be an integer");
+  }
+  if (freshness) {
+    const highWater = freshness.get(v.author, v.manifest.app);
+    if (version < highWater) {
+      throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
+    }
+    // NB: the mark is advanced at the *end* of this function, only after every module
+    // and the guest have integrity-checked and installed — not here. See below.
   }
   const gh = (b: Uint8Array) => host.genesisHash(b);
   const installed: string[] = [];
@@ -225,6 +294,14 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
     throw new Error("bundle: guest content hash mismatch");
   }
+  // Advance the freshness mark only now — after a fully successful load. Advancing it
+  // during the downgrade check above (before the per-module and guest hash checks) would
+  // brick rollback: a partially written or corrupt *newer* bundle — manifest intact and
+  // signed, but one module or the guest file wrong — would raise the mark to the new
+  // version, then throw. Nothing runs, yet reloading the known-good older directory is now
+  // refused as a downgrade until an operator hand-edits the freshness file. The mark must
+  // record the highest version that actually loaded (README §13.4).
+  if (freshness) freshness.set(v.author, v.manifest.app, version);
   return { manifest: v.manifest, author: v.author, guestSource, installed };
 }
 

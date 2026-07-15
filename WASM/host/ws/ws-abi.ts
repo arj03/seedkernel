@@ -20,7 +20,7 @@ export const OP_BASE64 = 4;
 export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // One WS frame must fit the scratch region. Sized so the largest TCP transport
-// message (MAX_TCP_MESSAGE, 16 MB, net-node.ts) also fits in a single WS frame
+// message (MAX_FRAME_BYTES, 16 MiB, net-link.ts) also fits in a single WS frame
 // plus header/mask overhead — the two transports must cap identically, or a
 // message that succeeds over TCP would tear down a WS link. The AS module
 // heap.allocs exactly SCRATCH_SIZE; the host caps every request against it.

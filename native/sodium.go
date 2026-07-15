@@ -7,12 +7,26 @@
 // libsodium-wrappers method names — so the shared host JS (and, later, cap-bridge.ts)
 // calls `sodium.*` unchanged.
 //
-// The one exception is genericHash (BLAKE2b-256, the content-address block-id hash):
-// it runs on native Go (golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is fully
-// standardized, so native output is byte-identical to libsodium's (pinned by a KAT in
-// TestSodiumGenericHash) — but it's on the storage data path (every block hashed on
-// PUT, verified on bulk receive, §13.6) and it's the one primitive wazero runs the
-// wasm materially slower than V8, so native (~600 vs ~390 MB/s) is the clear win.
+// Two primitives run on native Go instead — both are fully standardized, so native
+// output is byte-identical to libsodium's, and both sit on the storage data path
+// where wazero runs the wasm materially slower:
+//
+//   - genericHash (BLAKE2b-256, the content-address block-id hash;
+//     golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is standardized, so native
+//     output matches libsodium (pinned by a KAT in TestSodiumGenericHash); every
+//     block is hashed on PUT and verified on bulk receive (§13.6), and it's the one
+//     hash wazero runs slower than V8 (~600 vs ~390 MB/s native).
+//
+//   - the ChaCha20-Poly1305-IETF record layer (RFC 8439;
+//     golang.org/x/crypto/chacha20poly1305). Every post-AUTH frame is a seal on send
+//     and an open on receive (§13.6), so it's a per-frame cost on the bulk frame path.
+//     RFC 8439 is byte-exact, so native ciphertext is identical to libsodium's (pinned
+//     by TestSodiumAead, captured from this build's binary); native runs it ~8× faster
+//     than the wasm, and — needing no scratch arena — takes no lock.
+//
+// Ed25519 stays on libsodium (consensus-critical: a signature a Go node accepts every
+// node must accept), and X25519/scalarmult stays wasm (handshake-only, amortized over
+// the link, so speed doesn't matter). Both keep the exact-binary guarantee for free.
 package main
 
 import (
@@ -28,6 +42,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"golang.org/x/crypto/blake2b"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 //go:embed wasm/libsodium.wasm
@@ -86,6 +101,12 @@ var sodiumExports = map[string]string{
 	"crypto_sign_ed25519_sk_to_curve25519": "gi",
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
+	// The §13.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
+	// wasm (handshake-only, amortized over the link). PeerLink (shared net-link.ts)
+	// drives them through the `sodium` object below. The ChaCha20-Poly1305-IETF record
+	// layer is native Go (see aeadEncrypt / the file header), so it needs no export here.
+	"crypto_box_keypair": "Ua",
+	"crypto_scalarmult":  "Dg",
 }
 
 // EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes
@@ -354,6 +375,64 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 	return s.read(out, len(ct)-sealBytes), true
 }
 
+// ── §13.6 transport AKE primitives ──
+
+// boxKeypair mints a fresh ephemeral X25519 keypair (32-byte pk + sk) for one
+// PeerLink connection's key exchange.
+func (s *libsodium) boxKeypair() (pk, sk []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arenaReset(alignUp(32) + alignUp(32))
+	pkp, skp := s.take(32), s.take(32)
+	s.call("crypto_box_keypair", uint64(pkp), uint64(skp))
+	return s.read(pkp, 32), s.read(skp, 32)
+}
+
+// scalarmult computes the X25519 shared point q = n·p (32 bytes). Returns
+// ok=false on a low-order / all-zero result (return -1), which PeerLink treats as
+// a failed handshake — mirroring libsodium-wrappers throwing there.
+func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arenaReset(alignUp(32) + alignUp(len(n)) + alignUp(len(p)))
+	q, np, pp := s.take(32), s.takeIn(n), s.takeIn(p)
+	if s.call("crypto_scalarmult", uint64(q), uint64(np), uint64(pp)) != 0 {
+		return nil, false
+	}
+	return s.read(q, 32), true
+}
+
+// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, no AAD; the
+// result is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header): RFC
+// 8439 is byte-exact, so the ciphertext is identical to the wasm's (pinned by
+// TestSodiumAead). npub/key are locally derived (always 12/32 B), so New/Seal can only
+// fail on an invariant violation — panic, matching the other primitives. No wasm
+// scratch means no lock: per-connection goroutines seal concurrently.
+func (s *libsodium) aeadEncrypt(msg, npub, key []byte) []byte {
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
+	}
+	return aead.Seal(nil, npub, msg, nil)
+}
+
+// aeadDecrypt opens a ChaCha20-Poly1305-IETF record (native Go, see aeadEncrypt).
+// ok=false on any tag/length failure — PeerLink tears the link down (strict
+// per-direction ordering). ct is attacker-controlled, so a bad tag or a short ct is
+// an ordinary open failure (ok=false), never a panic; npub/key are ours, so a wrong
+// length there is an invariant violation and does panic.
+func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		panic(fmt.Sprintf("chacha20poly1305.New: %v", err))
+	}
+	pt, err := aead.Open(nil, npub, ct, nil)
+	if err != nil {
+		return nil, false
+	}
+	return pt, true
+}
+
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
 // exposeSodium installs `__sodium` (ArrayBuffer-returning primitives) into the
@@ -406,6 +485,27 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		}
 		return ab(t, pt), nil
 	}))
+	o.SetPropertyStr("crypto_box_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
+		pk, skv := s.boxKeypair()
+		return keypairObj(t.Context(), pk, skv), nil
+	}))
+	o.SetPropertyStr("crypto_scalarmult", fn(func(t *qjs.This) (*qjs.Value, error) {
+		q, ok := s.scalarmult(arg(t, 0), arg(t, 1))
+		if !ok {
+			return t.Context().NewNull(), nil
+		}
+		return ab(t, q), nil
+	}))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
+		return ab(t, s.aeadEncrypt(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	}))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
+		pt, ok := s.aeadDecrypt(arg(t, 0), arg(t, 1), arg(t, 2))
+		if !ok {
+			return t.Context().NewNull(), nil
+		}
+		return ab(t, pt), nil
+	}))
 	o.SetPropertyStr("crypto_sign_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
 		pk, skv := s.signKeypair()
 		return keypairObj(t.Context(), pk, skv), nil
@@ -452,6 +552,25 @@ const sodiumShimJS = `
     crypto_box_seal_open: (c, pk, sk) => {
       const r = N.crypto_box_seal_open(c, pk, sk);
       if (r === null) throw new Error("crypto_box_seal_open: incorrect key pair for the given ciphertext");
+      return u8(r);
+    },
+    // §13.6 transport AKE: ephemeral X25519 + ChaCha20-Poly1305-IETF record layer.
+    crypto_box_keypair: () => {
+      const k = N.crypto_box_keypair();
+      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "x25519" };
+    },
+    crypto_scalarmult: (sk, pk) => {
+      const r = N.crypto_scalarmult(sk, pk);
+      if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");
+      return u8(r);
+    },
+    // libsodium-wrappers' signature is (message, ad, nsec, npub, key); the record
+    // layer uses no additional data, so the native primitive takes just (m, npub, key).
+    crypto_aead_chacha20poly1305_ietf_encrypt: (m, _ad, _nsec, npub, key) =>
+      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, npub, key)),
+    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, _ad, npub, key) => {
+      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, npub, key);
+      if (r === null) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
       return u8(r);
     },
     crypto_sign_keypair: () => {
