@@ -45,12 +45,14 @@ func envelope(n, payload []byte) []byte {
 
 func sign(priv ed25519.PrivateKey, pub, innerName, payload []byte) []byte {
 	inner := envelope(innerName, payload)
-	// README §6.3: sign over DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope,
-	// not the bare inner bytes. The domain prefix and outer fields are
-	// reconstructed by the verifier, never transmitted.
+	// README §6.3: sign over DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope,
+	// not the bare inner bytes. The domain prefix and outer fields are reconstructed by
+	// the verifier, never transmitted; the signer is length-prefixed (2-byte BE, 32 here)
+	// so the preimage is self-delimiting.
 	var pre []byte
 	pre = append(pre, "seedkernel-envelope-sig-v1\x00"...)
-	pre = append(pre, 0, 0) // algo_id 0x0000 (genesis)
+	pre = append(pre, 0, 0)  // algo_id 0x0000 (genesis)
+	pre = append(pre, 0, 32) // signer_len = 32 (u16 BE)
 	pre = append(pre, pub...)
 	pre = append(pre, inner...)
 	wp := append([]byte{0, 0, 0, 32}, pub...)

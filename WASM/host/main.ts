@@ -13,7 +13,7 @@
 // README §13.9) embeds and runs this same shared host JS — no Node install needed.
 
 import { readFile } from "node:fs/promises";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
@@ -137,7 +137,15 @@ export class FileFreshnessStore implements FreshnessStore {
     this.marks.set(k, version);
     const obj: Record<string, number> = {};
     for (const [kk, vv] of this.marks) obj[kk] = vv;
-    writeFileSync(this.path, JSON.stringify(obj));
+    // Persist atomically: write a sibling temp then rename onto the path (atomic within
+    // a directory on POSIX; ReplaceFile semantics on Windows). A bare writeFileSync
+    // truncates the file in place, so a crash mid-write could leave truncated JSON — which
+    // the constructor's catch would silently read as "start empty", discarding the entire
+    // downgrade-protection mark set on the next boot (README §13.4). Rename swaps the whole
+    // file in one step, so a reader only ever sees the old or the complete new contents.
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, this.path);
   }
 }
 
@@ -275,7 +283,8 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
     if (version < highWater) {
       throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
     }
-    freshness.set(v.author, v.manifest.app, version);
+    // NB: the mark is advanced at the *end* of this function, only after every module
+    // and the guest have integrity-checked and installed — not here. See below.
   }
   const gh = (b: Uint8Array) => host.genesisHash(b);
   const installed: string[] = [];
@@ -289,6 +298,14 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
     throw new Error("bundle: guest content hash mismatch");
   }
+  // Advance the freshness mark only now — after a fully successful load. Advancing it
+  // during the downgrade check above (before the per-module and guest hash checks) would
+  // brick rollback: a partially written or corrupt *newer* bundle — manifest intact and
+  // signed, but one module or the guest file wrong — would raise the mark to the new
+  // version, then throw. Nothing runs, yet reloading the known-good older directory is now
+  // refused as a downgrade until an operator hand-edits the freshness file. The mark must
+  // record the highest version that actually loaded (README §13.4).
+  if (freshness) freshness.set(v.author, v.manifest.app, version);
   return { manifest: v.manifest, author: v.author, guestSource, installed };
 }
 

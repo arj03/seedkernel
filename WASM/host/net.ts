@@ -77,14 +77,17 @@ interface Pending {
   resolve: (payload: Uint8Array) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
-  /** Re-armed on every frame from `to` (the stall clock — see request()). */
-  expire: () => void;
+  /** When the request was issued — the floor of its silence clock (see request()). */
+  issuedAt: number;
 }
 
 /** Per-node request/response transport over a Network — a single frame plane. */
 export class Transport {
   private corr = 1;
   private pending = new Map<number, Pending>();
+  /** Most-recent frame arrival time per peer — the O(1) liveness signal every pending
+   *  request to that peer reads to decide whether it has stalled (see onFrame/request). */
+  private lastFrameAt = new Map<PeerId, number>();
   private reqHandler: RequestHandler | null = null;
 
   constructor(
@@ -119,12 +122,24 @@ export class Transport {
     frame[5] = type & 255;
     frame.set(payload, 6);
     return new Promise<Uint8Array>((resolve, reject) => {
-      const expire = () => {
+      const issuedAt = Date.now();
+      // Silence-based stall clock, re-armed lazily. On expiry, reject only if the peer
+      // has been silent for timeoutMs since the later of this request's issue time and
+      // the peer's last frame; otherwise a frame arrived recently (a bulk fan-out is
+      // still progressing), so re-arm just this one timer for the remaining window. The
+      // liveness signal is the single per-peer timestamp updated O(1) in onFrame — no
+      // per-frame sweep over every pending request.
+      const check = (): void => {
+        const p = this.pending.get(corr);
+        if (!p) return;
+        const last = Math.max(issuedAt, this.lastFrameAt.get(to) ?? 0);
+        const remaining = last + this.timeoutMs - Date.now();
+        if (remaining > 0) { p.timer = setTimeout(check, remaining); return; }
         this.pending.delete(corr);
         reject(new Error(`net.send: timeout to ${to.slice(0, 8)} (type ${type})`));
       };
-      const timer = setTimeout(expire, this.timeoutMs);
-      this.pending.set(corr, { to, resolve, reject, timer, expire });
+      const timer = setTimeout(check, this.timeoutMs);
+      this.pending.set(corr, { to, resolve, reject, timer, issuedAt });
       this.net.send(this.peerId, to, frame);
     });
   }
@@ -176,18 +191,17 @@ export class Transport {
   close(): void {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("transport closed")); }
     this.pending.clear();
+    this.lastFrameAt.clear();
     this.net.unregister(this.peerId);
   }
 
   private onFrame(from: PeerId, frame: Uint8Array): void {
-    // Liveness proof: any frame from this peer re-arms the stall clock of every
-    // request pending to it (the timeout is silence-based — see request()). O(pending)
-    // per frame, and pending is bounded by the fan-out window, so this stays cheap.
-    for (const p of this.pending.values()) {
-      if (p.to !== from) continue;
-      clearTimeout(p.timer);
-      p.timer = setTimeout(p.expire, this.timeoutMs);
-    }
+    // Liveness proof: record this peer's most-recent frame time. Every request pending to
+    // it reads this as its stall clock (the timeout is silence-based — see request()), so
+    // a frame costs one O(1) timestamp write instead of clearing + re-arming a timer for
+    // every pending request on the hot receive path. Each pending timer re-arms itself
+    // lazily off this stamp when it fires.
+    this.lastFrameAt.set(from, Date.now());
     const kind = frame[0];
     const corr = readU32BE(frame, 1);
     if (kind === KIND_RES) {

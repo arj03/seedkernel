@@ -2157,6 +2157,185 @@ async function testWeriftRtcNetwork() {
   console.log("  OK\n");
 }
 
+// ─── Test: PeerLink record layer — tamper / replay / reorder tears the link down ──
+//
+// The core security property of the §13.6 record layer: after the AKE, every FRAME is
+// an AEAD record under a forward-secret key with an implicit monotonic counter as its
+// nonce, and any record that fails to decrypt in strict counter order tears the link
+// down. We drive two real PeerLinks over an in-memory channel pair, let the handshake
+// complete untouched, then intercept the sender's post-auth records to tamper, replay,
+// or reorder them — each must fail the receiver's decrypt and drop the connection.
+async function testRecordLayerIntegrity() {
+  console.log("Test: PeerLink record layer — tampered / replayed / reordered records tear the link down");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // An in-memory RawChannel pair. HELLO(1)/AUTH(2) always pass through so the handshake
+  // runs; a post-auth FRAME(3) from A is routed through `hook.fn(record, deliver)` when a
+  // test installs one, so it can tamper / replay / reorder / drop. B→A always passes.
+  function pair(hook) {
+    const mk = () => ({
+      msg: null, cls: null, closed: false, twin: null,
+      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
+      close() {
+        if (this.closed) return;
+        this.closed = true;
+        queueMicrotask(() => this.cls && this.cls());
+        const t = this.twin;
+        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a;
+    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
+    a.send = (bytes) => {
+      const m = bytes.slice();
+      if (m[0] === 3 /* MSG_FRAME */ && hook.fn) hook.fn(m, (out) => deliver(b, out));
+      else deliver(b, m);
+    };
+    b.send = (bytes) => deliver(a, bytes.slice());
+    return { a, b, injectB: (bytes) => deliver(b, bytes.slice()) };
+  }
+
+  // Build an authenticated pair, returning handles + a live state snapshot.
+  async function authedPair() {
+    const hook = { fn: null };
+    const { a: chA, b: chB, injectB } = pair(hook);
+    const idA = generateKeyPair(), idB = generateKeyPair();
+    const st = { aAuthed: false, bAuthed: false, aClosed: false, bGot: [] };
+    const linkB = new PeerLink({
+      channel: chB, identity: idB, sodium, weDialed: false,
+      onAuth: () => { st.bAuthed = true; }, onFrame: (_p, f) => st.bGot.push(f), onClose: () => {},
+    });
+    const linkA = new PeerLink({
+      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
+      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => { st.aClosed = true; },
+    });
+    for (let i = 0; i < 20 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
+    return { hook, linkA, linkB, injectB, st };
+  }
+
+  // 1. Tamper: flip a byte of the sealed ciphertext → Poly1305 tag check fails → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before tampering");
+    p.hook.fn = (rec, deliver) => { rec[1] ^= 0x01; deliver(rec); };
+    p.linkA.send(new Uint8Array([1, 2, 3]));
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "a tampered record tears the link down");
+    assertEqual(p.st.bGot.length, 0, "the tampered frame is never delivered to the guest");
+  }
+
+  // 2. Replay: deliver a valid record, then re-deliver the identical bytes — the receiver's
+  //    counter has advanced, so the reconstructed nonce no longer matches → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before replay");
+    let captured = null;
+    p.hook.fn = (rec, deliver) => { captured = rec.slice(); deliver(rec); };
+    p.linkA.send(new Uint8Array([7]));
+    for (let i = 0; i < 20 && p.st.bGot.length < 1; i++) await sleep(2);
+    assertEqual(p.st.bGot.length, 1, "the first record decrypts and is delivered");
+    p.injectB(captured); // replay the exact same sealed record
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "a replayed record tears the link down");
+    assertEqual(p.st.bGot.length, 1, "the replayed record is not delivered a second time");
+  }
+
+  // 3. Reorder: hold record ctr0, then deliver ctr1 before ctr0 — the receiver expects
+  //    ctr0's nonce, so the out-of-order record fails to decrypt → drop.
+  {
+    const p = await authedPair();
+    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before reorder");
+    const recs = [];
+    p.hook.fn = (rec, deliver) => {
+      recs.push(rec.slice());
+      if (recs.length === 2) { deliver(recs[1]); deliver(recs[0]); } // ctr1 then ctr0
+    };
+    p.linkA.send(new Uint8Array([10])); // ctr0 (held)
+    p.linkA.send(new Uint8Array([20])); // ctr1 → triggers reordered delivery
+    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
+    assert(p.st.aClosed, "an out-of-order record tears the link down");
+    assertEqual(p.st.bGot.length, 0, "no reordered frame is delivered");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
+//
+// Finding guard: the freshness high-water mark must record only versions that fully
+// loaded. A newer bundle whose manifest is intact and signed but whose module file is
+// corrupt (a half-landed upgrade) must fail the content check WITHOUT raising the mark —
+// otherwise reloading the known-good older directory would be refused as a downgrade,
+// bricking rollback (README §13.4).
+async function testBundleCorruptNewerRollback() {
+  console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
+  const { signManifest } = await imp("build/host/bundle.js");
+  const { boot } = await imp("build/host/main.js");
+  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+
+  const author = generateKeyPair();
+  const identity = generateKeyPair();
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-rollback-"));
+  let shell;
+  try {
+    const { host: h } = await makeHost();
+    const seq = makeSeq();
+    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const install = buildInstall(
+      h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
+      seq(author.publicKey), kernelName, [], forwarderBytes,
+    );
+    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const manifest = (version) => ({
+      app: "rollback", version,
+      modules: [{
+        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
+        install: "codec.install", kernelName: toHex(kernelName),
+      }],
+      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
+      ops: {}, caps: [],
+    });
+    wf(pjoin(dir, "codec.install"), install);
+    wf(pjoin(dir, "guest.js"), guestText);
+    const writeManifest = (version) =>
+      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));
+
+    shell = await boot({
+      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
+      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      dir: pjoin(dir, "_data"), identity,
+    });
+
+    // 1. Good v4 loads and sets the mark to 4.
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
+    writeManifest(4);
+    shell.loadBundle(dir);
+
+    // 2. A corrupt v5: validly signed at version 5, but the on-disk module no longer
+    //    matches its declared hash. The load must throw on the content check.
+    writeManifest(5);
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes.slice(0, forwarderBytes.length - 1));
+    let v5Failed = false;
+    try { shell.loadBundle(dir); } catch { v5Failed = true; }
+    assert(v5Failed, "a corrupt v5 bundle fails to load");
+
+    // 3. Restore the good v4 directory and reload. If the failed v5 load had advanced the
+    //    mark to 5, this would now be refused as a downgrade. It must still load.
+    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
+    writeManifest(4);
+    let v4Reloaded = true;
+    try { shell.loadBundle(dir); } catch { v4Reloaded = false; }
+    assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
+  } finally {
+    if (shell) shell.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -2184,6 +2363,7 @@ await testCapBridge();
 await testPolicy();
 await testShellBoot();
 await testBundle();
+await testBundleCorruptNewerRollback();
 await testWsFraming();
 await testChannelPinning();
 await testRtcNetwork();
@@ -2199,6 +2379,7 @@ await testWsFragmentation();
 await testRedialAfterFailedDial();
 await testConnsPerPeerFanout();
 await testWsNetworkFanout();
+await testRecordLayerIntegrity();
 await testSafeRealmSerialization();
 await testPerf10k();
 

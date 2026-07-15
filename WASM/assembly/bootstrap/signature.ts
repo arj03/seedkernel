@@ -18,9 +18,11 @@
 // (algo_id 0x0000) included, seeded as a host-serviced suite handler at boot.
 // The request is the standard scratch-ABI verify request (§6.6):
 //   [0x00][pubkey_len u16][pubkey][sig_len u16][sig][data ..]
-// where `data` is the full signed preimage DOMAIN_env ‖ algo_id ‖ signer ‖
-// inner_envelope (§6.3). Returns 1 iff the suite reports the signature valid;
-// an unknown algo_id (no handler at the slot) returns 0.
+// where `data` is the full signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖
+// signer ‖ inner_envelope (§6.3). The signer is length-prefixed so the preimage is
+// self-delimiting — a variable-length-key suite cannot re-split (signer, inner) to
+// forge a collision. Returns 1 iff the suite reports the signature valid; an unknown
+// algo_id (no handler at the slot) returns 0.
 @external("env", "suite_verify")
 declare function suiteVerify(algoId: i32, reqPtr: i32, reqLen: i32): i32;
 
@@ -165,11 +167,13 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
 
   // Build the op-byte suite request (§6.6):
   //   [0x00][signer_len u16][signer][sig_len u16][sig][data]
-  // where data is the signed preimage DOMAIN_env ‖ algo_id ‖ signer ‖ inner
-  // (§6.3). Assembling data here — prepending the domain and the two outer
-  // fields to the inner envelope — is what gives every suite domain separation
-  // and outer-field binding for free; the suite just verifies sig over data.
-  const dataLen = DOMAIN_ENV.length + 2 + signerLen + innerLen;
+  // where data is the signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖
+  // inner (§6.3). Assembling data here — prepending the domain and the outer fields to
+  // the inner envelope — is what gives every suite domain separation and outer-field
+  // binding for free; the suite just verifies sig over data. The signer is length-
+  // prefixed inside `data` too, so the (signer, inner) boundary is unambiguous and a
+  // future variable-length-key suite cannot splice a different split onto the same bytes.
+  const dataLen = DOMAIN_ENV.length + 2 + 2 + signerLen + innerLen;
   const reqLen = 1 + 2 + signerLen + 2 + sigLen + dataLen;
   const req = new Uint8Array(reqLen);
   let w: i32 = 0;
@@ -180,10 +184,12 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   req[w++] = ((sigLen >> 8) & 0xff) as u8;
   req[w++] = (sigLen & 0xff) as u8;
   req.set(payload.subarray(sigOffset, sigOffset + sigLen), w); w += sigLen;
-  // data
+  // data: DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner
   req.set(DOMAIN_ENV, w); w += DOMAIN_ENV.length;
   req[w++] = ((algoId >> 8) & 0xff) as u8;
   req[w++] = (algoId & 0xff) as u8;
+  req[w++] = ((signerLen >> 8) & 0xff) as u8;
+  req[w++] = (signerLen & 0xff) as u8;
   req.set(payload.subarray(signerOffset, signerOffset + signerLen), w); w += signerLen;
   req.set(payload.subarray(innerOffset, innerOffset + innerLen), w); w += innerLen;
 

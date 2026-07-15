@@ -34,10 +34,11 @@ export const GENESIS_SECRET_KEY_LEN = 64;
 // the host at bootstrap and serviced with the bundled libsodium (§6.2, §14).
 const SUITE_SLOT_PREFIX = "seedkernel.signature.suite.v1:";
 
-// README §6.3 / §17.1: the envelope-signature domain prefix. The signed
-// preimage is `DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope`; the prefix is
-// prepended before signing/verifying but never transmitted, so a signature
-// harvested in one context cannot verify in another.
+// README §6.3 / §17.1: the envelope-signature domain prefix. The signed preimage is
+// `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (signer is length-
+// prefixed so the preimage is self-delimiting); the prefix is prepended before
+// signing/verifying but never transmitted, so a signature harvested in one context
+// cannot verify in another.
 const DOMAIN_ENV = new TextEncoder().encode("seedkernel-envelope-sig-v1\0");
 
 const SUITE_OP_VERIFY = 0x00;
@@ -578,8 +579,8 @@ export class KernelHost {
    *    op 0x01 hash:   refused — the reference host derives ids directly (§6.6).
    *
    *  `data` is the full signed preimage the signature module assembled
-   *  (`DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope`, §6.3); the suite is
-   *  oblivious to its structure and just verifies `sig` over `data` under `pk`.
+   *  (`DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope`, §6.3); the suite
+   *  is oblivious to its structure and just verifies `sig` over `data` under `pk`.
    *
    *  The raw public-key bytes are the signer's identity (and the canonical
    *  replay key, §4.4), so the key is validated before use: non-canonical /
@@ -1010,16 +1011,20 @@ export class KernelHost {
     if (projectedTotal > MAX_ENVELOPE_BYTES) {
       throw new Error("wrap: envelope exceeds 64 KB");
     }
-    // README §6.3: sign over `DOMAIN_env ‖ algo_id ‖ signer ‖ inner_envelope`,
-    // not the bare inner bytes. Folding the outer fields into the preimage
-    // closes the algo_id/signer flip attacks; the domain prefix keeps an
-    // envelope signature from verifying in any other context. The prefix and
-    // outer fields are reconstructed by the verifier, never transmitted.
-    const preimage = new Uint8Array(DOMAIN_ENV.length + 2 + GENESIS_PUBKEY_LEN + innerBytes.length);
+    // README §6.3: sign over `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖
+    // inner_envelope`, not the bare inner bytes. Folding the outer fields into the
+    // preimage closes the algo_id/signer flip attacks, and length-prefixing the signer
+    // makes the preimage self-delimiting so no other (signer, inner) split can hash to
+    // the same bytes; the domain prefix keeps an envelope signature from verifying in any
+    // other context. The prefix and outer fields are reconstructed by the verifier, never
+    // transmitted (the wrapper carries signer_len already).
+    const preimage = new Uint8Array(DOMAIN_ENV.length + 2 + 2 + GENESIS_PUBKEY_LEN + innerBytes.length);
     let p = 0;
     preimage.set(DOMAIN_ENV, p); p += DOMAIN_ENV.length;
     preimage[p++] = (GENESIS_ALGO_ID >> 8) & 0xff;
     preimage[p++] = GENESIS_ALGO_ID & 0xff;
+    preimage[p++] = (GENESIS_PUBKEY_LEN >> 8) & 0xff;
+    preimage[p++] = GENESIS_PUBKEY_LEN & 0xff;
     preimage.set(publicKey, p); p += GENESIS_PUBKEY_LEN;
     preimage.set(innerBytes, p);
     const sig = this.sodium.crypto_sign_detached(preimage, privateKey);

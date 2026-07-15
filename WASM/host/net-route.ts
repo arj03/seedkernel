@@ -48,7 +48,15 @@ export interface NodeNetworkCoreOptions {
    *  transfers stripe frames round-robin across them so N flows fill a link a
    *  single TCP flow can't. Inbound multiplicity needs no setting — a node keeps
    *  every inbound link a peer opens to it, so a holder serves multi-flow initiators
-   *  regardless of its own value. */
+   *  regardless of its own value.
+   *
+   *  This assumes an initiator→holder topology: exactly one side dials. The
+   *  double-connect tie-break (promote()) only leaves parallel flows alone when they
+   *  share a direction (all dialed, or all accepted). If BOTH ends set connsPerPeer > 1
+   *  and dial each other (a symmetric mesh), each outbound flow pairs off against an
+   *  inbound rival and the tie-break collapses them toward a single surviving link —
+   *  with transiently mixed pools and dropped frames along the way. Don't stripe from
+   *  both ends of the same peer pair. */
   connsPerPeer?: number;
 }
 

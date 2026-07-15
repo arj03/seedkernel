@@ -244,8 +244,8 @@ func suiteSlotName(algoID int) []byte {
 // browser. Standard scratch-ABI verify request (README §6.6):
 //   [0x00][pk_len u16][pk][sig_len u16][sig][data ..] -> [valid u8]
 // `data` is the full signed preimage the signature module assembled
-// (DOMAIN_env ‖ algo_id ‖ signer ‖ inner, §6.3); the suite just verifies sig
-// over data under pk, oblivious to its structure.
+// (DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner, §6.3); the suite just verifies
+// sig over data under pk, oblivious to its structure.
 func genesisSuiteVerify(req []byte) []byte {
 	invalid := []byte{0}
 	if len(req) < 1 || req[0] != 0x00 {
@@ -382,10 +382,7 @@ func boot() {
 	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
 	// serviced with libsodium — the reference host's "genesis via SetHandler"
 	// (§6.4). The signature module reaches it through env.suite_verify above.
-	gslot := suiteSlotName(0)
-	natH[string(gslot)] = genesisSuiteVerify
-	setHandler(gslot, nextID)
-	nextID++
+	registerNativeAt(suiteSlotName(0), genesisSuiteVerify)
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -437,11 +434,17 @@ func dispatch(b []byte) {
 	wasmCall(kn, "dealloc", uint64(p))
 }
 
-func registerNative(canonical string, fn func([]byte) []byte) {
-	n := name(canonical)
+// registerNativeAt binds a native host service at the raw kernel name `n` and assigns it
+// the next handler id. registerNative is the canonical-name convenience over it; the
+// genesis suite slot (whose name derives differently, §6.4) calls it directly in boot().
+func registerNativeAt(n []byte, fn func([]byte) []byte) {
 	natH[string(n)] = fn
 	setHandler(n, nextID)
 	nextID++
+}
+
+func registerNative(canonical string, fn func([]byte) []byte) {
+	registerNativeAt(name(canonical), fn)
 }
 
 // invokeFree calls the named global function as global.name(args...), then frees the
@@ -514,8 +517,9 @@ func loadBundle(dir string) string {
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
 	}
-	// Freshness (README §13.4 step 3): refuse a version below the persisted (author,
-	// app) high-water mark as a downgrade — nothing lands — otherwise advance the mark.
+	// Freshness (README §13.4 step 3): refuse a version below the persisted (author, app)
+	// high-water mark as a downgrade — nothing lands. The mark is NOT advanced here; that
+	// waits until after the installs so a partial/corrupt newer bundle can't raise it.
 	if err := checkBundleFreshness(m.Author, m.App, m.Version); err != nil {
 		return "ERROR: " + err.Error()
 	}
@@ -527,6 +531,9 @@ func loadBundle(dir string) string {
 			installed = append(installed, mod.Name)
 		}
 	}
+	// Advance the freshness mark only now, after the modules installed — so it records the
+	// highest version that actually loaded, keeping rollback to a known-good bundle possible.
+	advanceBundleFreshness(m.Author, m.App, m.Version)
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
 		config: m.Config, guestSource: string(goFiles[m.Guest]),
@@ -557,26 +564,67 @@ func loadFreshness() {
 	}
 }
 
-// checkBundleFreshness enforces the monotonic (author, app) high-water mark: a version
-// below the mark is a refused downgrade; an equal version reloads; a newer one advances
-// (and persists) the mark, which is never rewound. The author hex is fixed-length, so
-// the "author:app" key is unambiguous.
+// checkBundleFreshness enforces the monotonic (author, app) high-water mark WITHOUT
+// mutating it: a version below the mark is a refused downgrade; an equal or newer version
+// is allowed. The mark is advanced only later, by advanceBundleFreshness, after the
+// installs land — so a partial/corrupt newer bundle that fails mid-load cannot raise the
+// mark past the last version that actually ran (README §13.4). The author hex is
+// fixed-length, so the "author:app" key is unambiguous.
 func checkBundleFreshness(authorHex, app string, version int) error {
 	loadFreshness()
 	k := authorHex + ":" + app
-	if hw, ok := freshnessHW[k]; ok {
-		if version < hw {
-			return fmt.Errorf("version %d is below the (author, app) freshness high-water mark %d — downgrade refused", version, hw)
-		}
-		if version == hw {
-			return nil
-		}
+	if hw, ok := freshnessHW[k]; ok && version < hw {
+		return fmt.Errorf("version %d is below the (author, app) freshness high-water mark %d — downgrade refused", version, hw)
+	}
+	return nil
+}
+
+// advanceBundleFreshness records `version` as the new (author, app) high-water mark and
+// persists it, called only after a bundle has fully loaded (README §13.4). Monotonic: an
+// equal or lower version never rewinds the mark. Persistence is atomic (temp file + rename,
+// mirroring fs.go's put) so a crash mid-write can never truncate the JSON — which
+// loadFreshness would silently read as empty, discarding every downgrade mark on the next
+// boot. A persist error is logged, not fatal: the in-memory mark still protects the running
+// process; only the next boot would be left unprotected, which the operator must see.
+func advanceBundleFreshness(authorHex, app string, version int) {
+	loadFreshness()
+	k := authorHex + ":" + app
+	if hw, ok := freshnessHW[k]; ok && version <= hw {
+		return // never rewind; an equal-version reload keeps the mark unchanged
 	}
 	freshnessHW[k] = version
-	if freshnessStorePath != "" {
-		if b, err := json.Marshal(freshnessHW); err == nil {
-			_ = os.WriteFile(freshnessStorePath, b, 0o644)
-		}
+	if freshnessStorePath == "" {
+		return
+	}
+	b, err := json.Marshal(freshnessHW)
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic(freshnessStorePath, b); err != nil {
+		fmt.Fprintf(os.Stderr, "seedkernel: could not persist freshness mark to %s: %v\n", freshnessStorePath, err)
+	}
+}
+
+// writeFileAtomic writes b to path via a sibling temp file + rename, so a reader (or a
+// crash) only ever sees the old or the complete new contents — never a truncated write.
+func writeFileAtomic(path string, b []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".freshness-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
 	}
 	return nil
 }

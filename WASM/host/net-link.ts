@@ -87,10 +87,20 @@ const LABEL_HI2LO = new TextEncoder().encode("seedkernel-session-hi->lo-v1\0");
 // length prefix (TCP) / frame length (WS) before buffering. Exported so every
 // transport caps identically — a frame that crosses one crosses the other.
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
-// Total bytes of frames buffered while the handshake completes. Sends past it
-// drop the oldest — a byte bound (not a frame count), so a few large frames
-// cannot evade it, and a peer that never authenticates cannot make us hoard
-// memory.
+// The largest *plaintext* frame send() accepts. Sealing wraps a frame in the 1-byte
+// MSG_FRAME tag plus the 16-byte Poly1305 tag, and MAX_FRAME_BYTES is enforced on that
+// framed record at the receiver — so a plaintext frame within 17 bytes of the wire cap
+// would seal to an over-cap record and be rejected on the receiver's length prefix,
+// tearing the whole link down (and every request in flight on it) instead of failing
+// gracefully. send() refuses anything above this budget. Exported so callers can size
+// payloads against the plaintext limit rather than the wire one.
+export const MAX_PLAINTEXT_FRAME_BYTES = MAX_FRAME_BYTES - 1 - TAG_LEN;
+// Total bytes of frames buffered while the handshake completes. Sends past it drop the
+// oldest — a byte bound rather than a frame count, so a flood of small frames can't
+// silently balloon the buffer. Drop-oldest always keeps the newest frame, so a single
+// large frame (up to MAX_PLAINTEXT_FRAME_BYTES) can transiently sit above this bound; the
+// guarantee is only that a peer which never authenticates cannot make us hoard unbounded
+// memory, not that the buffer is a hard ceiling.
 const MAX_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export interface PeerLinkOptions {
@@ -144,6 +154,11 @@ export class PeerLink {
   /** Queue (pre-auth) or send (post-auth, as an AEAD record) a Network frame. */
   send(frame: Uint8Array): void {
     if (this.closed) return;
+    // Refuse a frame that would seal to an over-cap wire record (plaintext + MSG_FRAME
+    // byte + AEAD tag > MAX_FRAME_BYTES) rather than send it: the receiver would reject
+    // the record on its length prefix and tear the link down. Dropping it here degrades
+    // to a single request timing out instead of killing every request on the link.
+    if (frame.length > MAX_PLAINTEXT_FRAME_BYTES) return;
     if (this.authed) { this.ch.send(this.tag(MSG_FRAME, this.seal(frame))); return; }
     this.queue.push(frame);
     this.queuedBytes += frame.length;
@@ -215,6 +230,13 @@ export class PeerLink {
   private onHello(body: Uint8Array): void {
     if (this.peerPubkey || body.length < HELLO_LEN) { this.close(); return; }
     const pubkey = body.slice(0, PK_LEN);
+    // Reflection guard: a peer presenting OUR own kernel key is either our own HELLO
+    // echoed back or an attacker replaying it. Because the transcript is canonically
+    // ordered, both ends sign identical AUTH bytes, so echoing our HELLO+AUTH would
+    // otherwise let the connection "authenticate" as our own identity and install a link
+    // to ourselves in the routing tables (visible to linkedPeers()/cohort logic).
+    // expectPeerId only guards the dialing side; a node never links to itself — drop it.
+    if (bytesCompare(pubkey, this.opts.identity.publicKey.subarray(0, PK_LEN)) === 0) { this.close(); return; }
     const peerNonce = body.slice(PK_LEN, PK_LEN + NONCE_LEN);
     const peerEph = body.slice(PK_LEN + NONCE_LEN, HELLO_LEN);
     const peerId = toHex(pubkey);
@@ -241,6 +263,11 @@ export class PeerLink {
     try { this.deriveSession(); } catch { this.close(); return; }
     this.authed = true;
     this.opts.onAuth(this.peerId, this);
+    // onAuth may have torn this link down synchronously: the promote() double-connect
+    // tie-break calls link.close() on the loser from inside this callback. Don't seal and
+    // send the queue onto a now-closed channel — bail; the frames route over the surviving
+    // link on the next send (this link's queue dies with it).
+    if (this.closed) return;
     for (const f of this.queue) this.ch.send(this.tag(MSG_FRAME, this.seal(f)));
     this.queue.length = 0;
     this.queuedBytes = 0;

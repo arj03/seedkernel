@@ -37,7 +37,10 @@ export interface NodeNetworkOptions {
   wsListen?: { host: string; port: number };
   /** Parallel connections per dialed peer (default 1) — see NodeNetworkCore.
    *  A native-loader initiator sets this to stripe a bulk PUT across N TCP flows;
-   *  a listen-only holder needs no setting, as inbound multiplicity is automatic. */
+   *  a listen-only holder needs no setting, as inbound multiplicity is automatic.
+   *  Assumes one side dials (initiator→holder): if both ends stripe and dial each
+   *  other, the symmetric double-connects collapse toward a single link — see the
+   *  NodeNetworkCore docs. */
   connsPerPeer?: number;
 }
 
