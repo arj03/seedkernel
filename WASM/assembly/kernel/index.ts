@@ -7,7 +7,6 @@
 //   set_handler                   — host-level handler install/replace (§3.1)
 //   remove_handler                — SetHandler(name, null) — remove (§3.1)
 //   is_registered                 — query handler table
-//   handler_count                 — number of registered handlers
 //   dispatch                      — parse envelope + dispatch
 //
 // Imports:
@@ -119,10 +118,6 @@ export function remove_handler(
 export function is_registered(namePtr: i32, nameLen: i32): i32 {
   const name = readBytes(namePtr, nameLen);
   return findIndex(name) >= 0 ? 1 : 0;
-}
-
-export function handler_count(): i32 {
-  return handlers.length;
 }
 
 export function dispatch(bytesPtr: i32, bytesLen: i32): void {

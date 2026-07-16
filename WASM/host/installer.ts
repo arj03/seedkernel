@@ -22,8 +22,8 @@
 // Optional — deployments that don't want message-driven installation simply
 // skip registerInstaller and the deployment is frozen.
 
-import { nameKey, readU32BE, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
-import { toHex } from "./util.js";
+import { nameKey, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
+import { readU32BE, toHex } from "./util.js";
 
 // Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
 // algo_id is an unauthenticated outer field of the signature wrapper (README
@@ -114,8 +114,6 @@ export class Installer {
 
   constructor(
     private readonly host: KernelHost,
-    /** The name that signed install messages target (§7.2). */
-    private readonly installName: Uint8Array,
   ) {}
 
   /** Wire the deployer-supplied install-approval callback (README §7.3).

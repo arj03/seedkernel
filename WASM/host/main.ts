@@ -199,7 +199,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // and wires only the matching backends, so a guest holds exactly what it
   // declared — nothing outside its caps resolves (`ops` only documents the ABI).
   const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
-    const caps = new Set(b.manifest.caps ?? []);
+    const caps = new Set(b.manifest.caps);
     return createCapBridge({
       // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
       // bridge's minimal crypto surface (its crypto_generichash types the key as
@@ -267,14 +267,12 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   if (!policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
     throw new Error("bundle: manifest author is not in the policy's allowed set");
   }
-  // Freshness (README §13.4 step 3): the `version` is an enforced monotonic integer.
-  // Refuse a load below the persisted `(author, app)` high-water mark as a downgrade —
-  // nothing lands — otherwise advance the mark. Equal versions reload (an ordinary
-  // reboot re-reads the same directory); the mark is never rewound.
+  // Freshness (README §13.4 step 3): the `version` is an enforced monotonic integer
+  // (verifyManifest already shape-checked it). Refuse a load below the persisted
+  // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
+  // the mark. Equal versions reload (an ordinary reboot re-reads the same directory);
+  // the mark is never rewound.
   const version = v.manifest.version;
-  if (typeof version !== "number" || !Number.isInteger(version)) {
-    throw new Error("bundle: manifest version must be an integer");
-  }
   if (freshness) {
     const highWater = freshness.get(v.author, v.manifest.app);
     if (version < highWater) {
@@ -284,20 +282,29 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
     // and the guest have integrity-checked and installed — not here. See below.
   }
   const gh = (b: Uint8Array) => host.genesisHash(b);
-  const installed: string[] = [];
+  // Verify everything, then land anything (README §13.4 "mismatch ⇒ reject; nothing
+  // has landed"). Read + integrity-check every module and the guest FIRST, holding
+  // the verified bytes in memory; only once the whole set checks out do we install.
+  // A mismatch anywhere throws before any SetHandler runs, so a bad file can never
+  // leave a partial bundle installed on the kernel.
+  const verified: { mod: (typeof v.manifest.modules)[number]; wasm: Uint8Array }[] = [];
   for (const mod of v.manifest.modules) {
     const wasm = new Uint8Array(readFileSync(join(dir, mod.file)));
     if (!contentMatches(wasm, mod.hash, gh)) throw new Error(`bundle: ${mod.name} content hash mismatch`);
-    // Install the manifest-verified bytes directly under the module's kernel name,
-    // synthesizing the install record with the manifest author (§13.4). No per-module
-    // `.install` envelope means no 64 KB envelope cap and no boot-time seq — an
-    // equal-version reload just re-installs. A module the policy refuses does not
-    // abort the load: it is simply reported as not installed.
-    if (host.installBundleModule(fromHex(mod.kernelName), wasm, v.author)) installed.push(mod.name);
+    verified.push({ mod, wasm });
   }
   const guestSource = readFileSync(join(dir, v.manifest.guest.file), "utf8");
   if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
     throw new Error("bundle: guest content hash mismatch");
+  }
+  // Everything integrity-checked — install the verified bytes. Each module lands
+  // directly under its kernel name, synthesizing the install record with the manifest
+  // author (§13.4). No per-module `.install` envelope means no 64 KB envelope cap and
+  // no boot-time seq — an equal-version reload just re-installs. A module the policy
+  // refuses does not abort the load: it is simply reported as not installed.
+  const installed: string[] = [];
+  for (const { mod, wasm } of verified) {
+    if (host.installBundleModule(fromHex(mod.kernelName), wasm, v.author)) installed.push(mod.name);
   }
   // Advance the freshness mark only now — after a fully successful load. Advancing it
   // during the downgrade check above (before the per-module and guest hash checks) would
@@ -441,10 +448,6 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
     const outFile = str(args, "out");
     if (outFile) { writeFileSync(outFile, data); console.log(`  GET ok: ${data.length} B → ${outFile}`); }
     else process.stdout.write(data);
-  }
-
-  if (args["relay"]) {
-    console.warn(`  relay  ${str(args, "relay")}: relay client not yet wired — ignored`);
   }
 
   const serving = !!(nodeNet.port || nodeNet.wsPort);

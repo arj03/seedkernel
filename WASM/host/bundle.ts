@@ -90,16 +90,53 @@ export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Ar
   return concatBytes([pk, sig, json]);
 }
 
+/** Structural check on a parsed manifest. Runs only *after* the signature
+ *  verified, so this is not a security boundary — it turns a manifest the author
+ *  signed but got wrong (a missing/mistyped field) into a clean, loud rejection
+ *  instead of a raw TypeError surfacing deep in the loader, and lets the rest of
+ *  the runtime treat every field as present and correctly typed (matching the
+ *  fail-loud posture of parsePolicy). `caps` is required here — the enforced
+ *  capability declaration is never optional. */
+function isValidManifest(m: unknown): m is BundleManifest {
+  if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
+  const o = m as Record<string, unknown>;
+  if (typeof o.app !== "string") return false;
+  if (typeof o.version !== "number" || !Number.isInteger(o.version)) return false;
+  if (!Array.isArray(o.modules)) return false;
+  for (const mod of o.modules) {
+    if (typeof mod !== "object" || mod === null) return false;
+    const mm = mod as Record<string, unknown>;
+    if (typeof mm.name !== "string" || typeof mm.file !== "string" ||
+        typeof mm.hash !== "string" || typeof mm.kernelName !== "string") return false;
+  }
+  const g = o.guest as Record<string, unknown> | null;
+  if (typeof g !== "object" || g === null ||
+      typeof g.file !== "string" || typeof g.hash !== "string") return false;
+  if (!Array.isArray(o.caps) || o.caps.some((c) => typeof c !== "string")) return false;
+  if (o.config !== undefined) {
+    if (typeof o.config !== "object" || o.config === null || Array.isArray(o.config)) return false;
+    for (const v of Object.values(o.config as Record<string, unknown>)) {
+      if (typeof v !== "string" && typeof v !== "number") return false;
+    }
+  }
+  return true;
+}
+
 /** Verify a manifest envelope; returns the author key + parsed manifest, or null
- *  if the signature is bad or the body is not valid manifest JSON. */
+ *  if the signature is bad. Throws `bundle: malformed manifest` when the body is
+ *  validly signed but is not parseable JSON of the expected shape — a signed-but-
+ *  broken manifest is a fail-loud condition, not an untrusted input to drop. */
 export function verifyManifest(sodium: ManifestCrypto, env: Uint8Array): { author: Uint8Array; manifest: BundleManifest } | null {
   if (env.length < PK_LEN + SIG_LEN) return null;
   const author = env.slice(0, PK_LEN);
   const sig = env.slice(PK_LEN, PK_LEN + SIG_LEN);
   const json = env.slice(PK_LEN + SIG_LEN);
   if (!sodium.crypto_sign_verify_detached(sig, manifestPreimage(json), author)) return null;
-  try { return { author, manifest: JSON.parse(new TextDecoder().decode(json)) as BundleManifest }; }
-  catch { return null; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(new TextDecoder().decode(json)); }
+  catch { throw new Error("bundle: malformed manifest (not JSON)"); }
+  if (!isValidManifest(parsed)) throw new Error("bundle: malformed manifest");
+  return { author, manifest: parsed };
 }
 
 /** True if `bytes` content hashes to the declared genesisHash hex (integrity). */

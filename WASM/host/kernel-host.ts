@@ -69,7 +69,6 @@ interface KernelExports {
   set_handler(namePtr: number, nameLen: number, handlerId: number): void;
   remove_handler(namePtr: number, nameLen: number): number;
   is_registered(namePtr: number, nameLen: number): number;
-  handler_count(): number;
   dispatch(bytesPtr: number, bytesLen: number): void;
 }
 
@@ -111,10 +110,6 @@ interface WasmHandlerRef {
 export function nameKey(name: Uint8Array): string {
   return toHex(name);
 }
-
-// The u32-BE codec lives in util.ts; re-exported here because this module is
-// where downstream consumers historically imported it from.
-export { writeU32BE, readU32BE } from "./util.js";
 
 export class KernelHost {
   private kernelExports!: KernelExports;
@@ -822,7 +817,7 @@ export class KernelHost {
    *  deployment is frozen — no message-driven installs. Returns the Installer
    *  instance for further configuration. */
   registerInstaller(installName: Uint8Array): Installer {
-    const ih = new Installer(this, installName);
+    const ih = new Installer(this);
     const id = this.register(installName, ih.handler);
     this.blockFromCall(id);
     this._installer = ih;
@@ -861,16 +856,6 @@ export class KernelHost {
     out.set(name, o); o += name.length;
     out.set(wasmBytes, o);
     return out;
-  }
-
-  /** Test helper: read a byte range from a dynamic WASM handler's memory by
-   *  name. */
-  readDynamicHandlerMemory(name: Uint8Array, ptr: number, len: number): Uint8Array | null {
-    const hid = this.nameToHandlerId.get(nameKey(name));
-    if (hid === undefined) return null;
-    const wasm = this.wasmHandlers.get(hid);
-    if (!wasm) return null;
-    return new Uint8Array(wasm.memory.buffer, ptr, len).slice();
   }
 
   /** Test helper: call an arbitrary `(): i32` export on a dynamic WASM handler. */
@@ -951,10 +936,6 @@ export class KernelHost {
     finally { this.kernelExports.dealloc(ptr); }
   }
 
-  get handlerCount(): number {
-    return this.kernelExports.handler_count();
-  }
-
   /** Feed raw envelope bytes into the pipeline. */
   dispatch(bytes: Uint8Array): void {
     if (bytes.length > MAX_ENVELOPE_BYTES) return;
@@ -1001,15 +982,16 @@ export class KernelHost {
 
   /** Encode an envelope (README §2). Pure binary layout — no security boundary
    *  on the encoder side, so it lives in the host. The kernel still enforces
-   *  the §2.2 64 KB limit on decode. */
-  encodeEnvelope(version: number, name: Uint8Array, payload: Uint8Array): Uint8Array {
+   *  the §2.2 64 KB limit on decode, and rejects any version byte other than
+   *  CURRENT_VERSION, so the encoder always writes CURRENT_VERSION. */
+  encodeEnvelope(name: Uint8Array, payload: Uint8Array): Uint8Array {
     if (name.length === 0 || name.length > 255) throw new Error("encodeEnvelope: name length must be 1..255");
     const total = 4 + name.length + payload.length;
     if (total > MAX_ENVELOPE_BYTES) throw new Error("encodeEnvelope: envelope exceeds 64 KB");
     const out = new Uint8Array(total);
     out[0] = (MAGIC >> 8) & 0xff;
     out[1] = MAGIC & 0xff;
-    out[2] = version;
+    out[2] = CURRENT_VERSION;
     out[3] = name.length;
     out.set(name, 4);
     out.set(payload, 4 + name.length);
@@ -1063,16 +1045,15 @@ export class KernelHost {
     wrapperPayload.set(sig, o); o += GENESIS_SIGNATURE_LEN;
     wrapperPayload.set(innerBytes, o);
 
-    return this.encodeEnvelope(CURRENT_VERSION, this._signatureName, wrapperPayload);
+    return this.encodeEnvelope(this._signatureName, wrapperPayload);
   }
 
   /** Convenience: encode an inner envelope then wrap + sign it. */
   wrapAndEncode(
     privateKey: Uint8Array, publicKey: Uint8Array,
-    version: number,
     name: Uint8Array, payload: Uint8Array
   ): Uint8Array {
-    const innerBytes = this.encodeEnvelope(version, name, payload);
+    const innerBytes = this.encodeEnvelope(name, payload);
     return this.wrap(privateKey, publicKey, innerBytes);
   }
 }

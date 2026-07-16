@@ -17,7 +17,6 @@ const {
   loadKernelHost,
   generateKeyPair,
   ensureSodium,
-  CURRENT_VERSION,
   referencePolicy,
 } = await imp("build/host/node.js");
 
@@ -92,7 +91,7 @@ const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.w
 // Encode an install + sign it, returning the wire bytes ready for dispatch.
 function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
   const payload = host.encodeInstallPayload(seq, targetName, wasm);
-  return host.wrapAndEncode(signSk, signPk, CURRENT_VERSION, installName, payload);
+  return host.wrapAndEncode(signSk, signPk, installName, payload);
 }
 
 // ─── Test: Full lifecycle ───────────────────────────────────────────────
@@ -127,7 +126,7 @@ async function testFullLifecycle() {
   forwardPayload.set(echoName, 1);
   forwardPayload.set(text, 1 + echoName.length);
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatTextName, forwardPayload));
+  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName, forwardPayload));
   assertEqual(echoCalls, 1, "echo invoked once via kernel.call");
 
   console.log("  OK\n");
@@ -144,7 +143,7 @@ async function testInvalidSignatureDropped() {
   host.register(chatTextName, () => { received++; });
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const wire = host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatTextName,
+  const wire = host.wrapAndEncode(sk, pk, chatTextName,
     new TextEncoder().encode("should not arrive"));
   wire[40] ^= 0xff;
   host.dispatch(wire);
@@ -164,7 +163,7 @@ async function testSizeLimitEnforced() {
   let received = 0;
   host.register(chatTextName, () => { received++; });
 
-  const smallWire = host.encodeEnvelope(CURRENT_VERSION, chatTextName,
+  const smallWire = host.encodeEnvelope(chatTextName,
     new TextEncoder().encode("ok"));
   const oversized = new Uint8Array(65537);
   oversized.set(smallWire);
@@ -202,7 +201,7 @@ async function testSignatureDepthCap() {
     for (let i = 0; i < n; i++) bytes = host.wrap(sk, pk, bytes);
     return bytes;
   };
-  const inner = host.encodeEnvelope(CURRENT_VERSION, chatTextName,
+  const inner = host.encodeEnvelope(chatTextName,
     new TextEncoder().encode("hi"));
 
   // 4 wrappers: signer stack reaches [s4,s3,s2,s1] = length 4 at the innermost
@@ -247,7 +246,7 @@ async function testRefuseOverlayBootstrapSlot() {
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
   host.register(chatTextName, () => { received++; });
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatTextName,
+  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName,
     new TextEncoder().encode("still works")));
   assertEqual(received, 1, "signature handler still verifying after refused overlay");
 
@@ -299,7 +298,7 @@ async function testApproveInstallReceivesBytesHash() {
 
   const seq = makeSeq();
   const payload = host.encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, installName, payload));
+  host.dispatch(host.wrapAndEncode(sk, pk, installName, payload));
   assert(host.isRegistered(chatTextName), "install accepted");
 
   assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
@@ -517,13 +516,13 @@ async function testCallerStackFormat() {
   const payload = new Uint8Array(1 + probeName.length);
   payload[0] = probeName.length;
   payload.set(probeName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, forwarderName, payload));
+  host.dispatch(host.wrapAndEncode(sk, pk, forwarderName, payload));
   assert(seenImmediate !== null, "probe saw a caller");
   assertEqual(seenImmediate, forwarderName, "immediate caller is the forwarder");
 
   // Top-level dispatch directly into the probe — no caller.
   seenImmediate = null;
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, probeName, new Uint8Array(0)));
+  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array(0)));
   assert(seenImmediate === null, "no immediate caller for top-level dispatch");
 
   console.log("  OK\n");
@@ -570,12 +569,12 @@ async function testBridgeCallerPinning() {
     return out;
   }
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatOtherName, makeForward(netSendName)));
+  host.dispatch(host.wrapAndEncode(sk, pk, chatOtherName, makeForward(netSendName)));
   assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
   assertEqual(host.callDynamicHandlerI32(chatOtherName, "last_resp_len"), 0,
     "unpinned caller: bridge rejected (no response)");
 
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatPinnedName, makeForward(netSendName)));
+  host.dispatch(host.wrapAndEncode(sk, pk, chatPinnedName, makeForward(netSendName)));
   assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
   assertEqual(host.callDynamicHandlerI32(chatPinnedName, "last_resp_len"), 1,
     "pinned caller: bridge returned 1 byte");
@@ -600,7 +599,7 @@ async function testBlockFromCall() {
   host.blockFromCall(id);
 
   // Top-level dispatch must still reach the handler.
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, mutateName, new Uint8Array(0)));
+  host.dispatch(host.wrapAndEncode(sk, pk, mutateName, new Uint8Array(0)));
   assertEqual(mutateCalls, 1, "direct dispatch still reaches blocked handler");
 
   // Install a forwarder, have it kernel.call the blocked handler. Must drop.
@@ -613,7 +612,7 @@ async function testBlockFromCall() {
   const fwdPayload = new Uint8Array(1 + mutateName.length);
   fwdPayload[0] = mutateName.length;
   fwdPayload.set(mutateName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, CURRENT_VERSION, fwdName, fwdPayload));
+  host.dispatch(host.wrapAndEncode(sk, pk, fwdName, fwdPayload));
   assertEqual(mutateCalls, 1, "kernel.call to blocked handler did NOT invoke it");
   assertEqual(host.callDynamicHandlerI32(fwdName, "last_resp_len"), 0,
     "kernel.call to blocked handler returned -1 (no response stored)");
@@ -630,7 +629,7 @@ async function testWrapRejectsInvalidKeySizes() {
   host.registerSignature(host.deriveBootstrapName("signature"));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const inner = host.encodeEnvelope(CURRENT_VERSION,
+  const inner = host.encodeEnvelope(
     host.deriveBootstrapName("chat.text"),
     new TextEncoder().encode("ok"));
 
@@ -668,7 +667,7 @@ async function testPerf10k() {
 
   for (let i = 0; i < N; i++) {
     const payload = new TextEncoder().encode(`message #${i}: hello world benchmark payload data`);
-    wireMessages[i] = host.wrapAndEncode(sk, pk, CURRENT_VERSION, chatTextName, payload);
+    wireMessages[i] = host.wrapAndEncode(sk, pk, chatTextName, payload);
     payloads[i]     = payload;
     signatures[i]   = sodium.crypto_sign_detached(payload, sk);
   }

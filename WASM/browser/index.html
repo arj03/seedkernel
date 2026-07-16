@@ -24,7 +24,7 @@ then times dispatching them through the full pipeline vs. plain Ed25519 verify.<
 
 <script type="module">
 import sodium from "./libsodium-wrappers.mjs";
-import { loadKernelHost, CURRENT_VERSION }
+import { loadKernelHost }
   from "../build/host/browser.js";
 
 const log = document.getElementById("log");
@@ -65,7 +65,7 @@ async function runBenchmark() {
 
   for (let i = 0; i < N; i++) {
     const payloadBytes = new TextEncoder().encode(`message #${i}: hello world benchmark payload data`);
-    wireMessages[i] = mk.wrapAndEncode(rootSk, rootPk, CURRENT_VERSION, chatTextName, payloadBytes);
+    wireMessages[i] = mk.wrapAndEncode(rootSk, rootPk, chatTextName, payloadBytes);
     payloads[i] = payloadBytes;
     signatures[i] = sodium.crypto_sign_detached(payloadBytes, rootSk);
   }

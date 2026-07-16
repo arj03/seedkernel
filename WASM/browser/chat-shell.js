@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { loadKernelHost, CURRENT_VERSION }
+import { loadKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 
@@ -386,7 +386,7 @@ async function buildSealedInstall(meta, wasmBytes) {
   const installPayload = host.encodeInstallPayload(
     nextSeq(), handlerName, wasmBytes);
   return host.wrapAndEncode(
-    myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, installName, installPayload);
+    myKeys.privateKey, myKeys.publicKey, installName, installPayload);
 }
 
 // Dispatch a sealed install we already trust (the bytesHash has been added to
@@ -699,7 +699,7 @@ function offerApp(id) {
   const rec = installedApps.get(id);
   if (!rec) return;
   const offerWire = host.wrapAndEncode(
-    myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION, appOfferName, rec.sealedBytes);
+    myKeys.privateKey, myKeys.publicKey, appOfferName, rec.sealedBytes);
   const n = broadcastWire(offerWire);
   shellPrint(
     n > 0
@@ -949,7 +949,7 @@ window.addEventListener("message", (ev) => {
     payload[0] = msg.chatType & 0xff;
     payload.set(body, 1);
     const wire = host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION,
+      myKeys.privateKey, myKeys.publicKey,
       appHandlerName(activeAppId), payload);
     broadcastWire(wire);
     host.dispatch(wire);              // local echo
@@ -1013,7 +1013,7 @@ const net = new RtcNetwork({
       payload[0] = 0x02;
       payload.set(body, 1);
       const wire = host.wrapAndEncode(
-        myKeys.privateKey, myKeys.publicKey, CURRENT_VERSION,
+        myKeys.privateKey, myKeys.publicKey,
         appHandlerName(lastSentNickBody.appId), payload);
       net.send(myPkHex, peerId, wire);
     }
