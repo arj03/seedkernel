@@ -7,6 +7,7 @@
 //   set_handler                   — host-level handler install/replace (§3.1)
 //   remove_handler                — SetHandler(name, null) — remove (§3.1)
 //   is_registered                 — query handler table
+//   find_handler                  — resolve name → handler id (kernel.call routing)
 //   dispatch                      — parse envelope + dispatch
 //
 // Imports:
@@ -116,8 +117,17 @@ export function remove_handler(
 }
 
 export function is_registered(namePtr: i32, nameLen: i32): i32 {
-  const name = readBytes(namePtr, nameLen);
-  return findIndex(name) >= 0 ? 1 : 0;
+  return findIndexAtPtr(namePtr, nameLen) >= 0 ? 1 : 0;
+}
+
+/** Resolve the handler id bound to `name`, or -1 if none is (README §3.1).
+ *  This is the kernel's single routing decision: top-level `dispatch` and a
+ *  handler's `kernel.call` both resolve targets through the same handler table,
+ *  so the two paths can never see different worlds. Zero-copy scan over the raw
+ *  name bytes at `namePtr` — the host stages the name and reads back the id. */
+export function find_handler(namePtr: i32, nameLen: i32): i32 {
+  const idx = findIndexAtPtr(namePtr, nameLen);
+  return idx < 0 ? -1 : handlers[idx].handlerId;
 }
 
 export function dispatch(bytesPtr: i32, bytesLen: i32): void {

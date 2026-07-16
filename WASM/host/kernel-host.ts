@@ -69,6 +69,7 @@ interface KernelExports {
   set_handler(namePtr: number, nameLen: number, handlerId: number): void;
   remove_handler(namePtr: number, nameLen: number): number;
   is_registered(namePtr: number, nameLen: number): number;
+  find_handler(namePtr: number, nameLen: number): number;
   dispatch(bytesPtr: number, bytesLen: number): void;
 }
 
@@ -94,6 +95,19 @@ interface WasmHandlerRef {
   exports: WebAssembly.Exports;
 }
 
+// Everything the host tracks about one installed handler, keyed by the kernel's
+// handler id. The kernel owns the name → id table (its `find_handler` export is
+// the one routing decision, consulted by both dispatch and kernel.call); the
+// host owns only the per-id metadata the kernel doesn't need — the impl, the
+// name (for kernel.caller), and whether kernel.call may reach it (§4.4). Exactly
+// one of `handler` / `wasm` is set: a host-JS handler or a dynamic WASM handler.
+interface HandlerEntry {
+  name: Uint8Array;
+  blocked: boolean;
+  handler: Handler | null;
+  wasm: WasmHandlerRef | null;
+}
+
 export function nameKey(name: Uint8Array): string {
   return toHex(name);
 }
@@ -101,10 +115,10 @@ export function nameKey(name: Uint8Array): string {
 export class KernelHost {
   private kernelExports!: KernelExports;
   private sodium!: Sodium;
-  private handlers = new Map<number, Handler>();
-  private wasmHandlers = new Map<number, WasmHandlerRef>();
-  private nameToHandlerId = new Map<string, number>();
-  private handlerIdToName = new Map<number, Uint8Array>();
+  // Host-side handler state, keyed by the kernel's handler id. The kernel owns
+  // the name → id table (find_handler); the host owns only per-id metadata, so
+  // there is no name mirror to drift from what dispatch sees.
+  private entries = new Map<number, HandlerEntry>();
   private nextHandlerId = 1;
   private callDepth = 0;
   // Call-chain tracking for kernel.caller (§4.2). Outermost is first, immediate
@@ -121,10 +135,6 @@ export class KernelHost {
   // The signature module's WASM bytes, kept from load() so registerSignature can
   // instantiate it as an ordinary handler once the host knows its name.
   private _signatureBytes!: Uint8Array;
-  // Handler IDs that kernel.call must refuse (README §4.4). The signature
-  // wrapper's id is added by registerSignature and the installer's by
-  // registerInstaller; deployer-added mutators register via blockFromCall.
-  private blockedFromCall = new Set<number>();
   // Name used to build outer signature envelopes in wrap(). Set by
   // registerSignature; null until then.
   private _signatureName: Uint8Array | null = null;
@@ -198,17 +208,33 @@ export class KernelHost {
     return new Uint8Array(this.kernelExports.memory.buffer, ptr, len).slice();
   }
 
-  /** When a name is being rebound to a new handlerId, drop the old handler's
-   *  host-side state. Kernel-side replacement is done separately by the
-   *  kernel.wasm set_handler call. */
-  private _displaceHandlerAtName(key: string, newId: number): void {
-    const oldId = this.nameToHandlerId.get(key);
-    if (oldId !== undefined && oldId !== newId) {
-      this.wasmHandlers.delete(oldId);
-      this.handlers.delete(oldId);
-      this.handlerIdToName.delete(oldId);
-      this.blockedFromCall.delete(oldId);
+  /** Resolve the handler id bound to `name` via the kernel's find_handler
+   *  export, or -1 if none. The single name → id lookup used by every host path
+   *  (kernel.call routing, callHandler, the test helpers) so they can never
+   *  disagree with what `dispatch` sees. */
+  private findHandlerId(name: Uint8Array): number {
+    const ptr = this.writeToKernel(name);
+    try { return this.kernelExports.find_handler(ptr, name.length); }
+    finally { this.kernelExports.dealloc(ptr); }
+  }
+
+  /** Bind `name` to `id` in the kernel table and record `entry` host-side,
+   *  dropping whatever entry the name was previously bound to. Centralizes the
+   *  "one name ⇒ one handler id" bookkeeping so register / _installWasmHandler
+   *  can't leave a stale entry behind. The old id is resolved (find_handler)
+   *  before the rebind (set_handler) inside a single kernel-memory staging so
+   *  displacement sees the pre-rebind table. */
+  private bindHandler(name: Uint8Array, id: number, entry: HandlerEntry): void {
+    const ptr = this.writeToKernel(name);
+    let oldId: number;
+    try {
+      oldId = this.kernelExports.find_handler(ptr, name.length);
+      this.kernelExports.set_handler(ptr, name.length, id);
+    } finally {
+      this.kernelExports.dealloc(ptr);
     }
+    if (oldId >= 0 && oldId !== id) this.entries.delete(oldId);
+    this.entries.set(id, entry);
   }
 
   // ─── import implementations ──────────────────────────────────────────
@@ -278,7 +304,9 @@ export class KernelHost {
     name: Uint8Array,
     payload: Uint8Array
   ): Uint8Array | null {
-    const wasm = this.wasmHandlers.get(handlerId);
+    const entry = this.entries.get(handlerId);
+    if (!entry) return null;
+    const wasm = entry.wasm;
     if (wasm) {
       // Scratch-region contract (README §4): write input at the handler's
       // scratch offset, call handle(input_len), read response from the
@@ -291,7 +319,7 @@ export class KernelHost {
       if (responseLen <= 0 || responseLen > wasm.scratchSize) return null;
       return new Uint8Array(wasm.memory.buffer, wasm.scratch, responseLen).slice();
     }
-    const handler = this.handlers.get(handlerId);
+    const handler = entry.handler;
     if (handler) {
       // An exception aborts the call but must not unwind through dispatch
       // and corrupt the signer stack or kernel state above it.
@@ -398,28 +426,20 @@ export class KernelHost {
     }
 
     // SetHandler is unconditional at the kernel level — replace whatever is
-    // there. The installer's replacement policy was applied before this
-    // method was called.
-    const kPtr = this.writeToKernel(targetName);
-    try {
-      this.kernelExports.set_handler(kPtr, targetName.length, handlerId);
-    } finally {
-      this.kernelExports.dealloc(kPtr);
-    }
-
-    const targetKey = nameKey(targetName);
-    this._displaceHandlerAtName(targetKey, handlerId);
-
-    this.wasmHandlers.set(handlerId, {
-      memory: exps.memory,
-      scratch: scratchOffset,
-      scratchSize,
-      handle: exps.handle,
-      exports: instance.exports,
+    // there (bindHandler drops the displaced id's host entry). The installer's
+    // replacement policy was applied before this method was called.
+    this.bindHandler(targetName, handlerId, {
+      name: targetName.slice(),
+      blocked: false,
+      handler: null,
+      wasm: {
+        memory: exps.memory,
+        scratch: scratchOffset,
+        scratchSize,
+        handle: exps.handle,
+        exports: instance.exports,
+      },
     });
-
-    this.nameToHandlerId.set(targetKey, handlerId);
-    this.handlerIdToName.set(handlerId, targetName.slice());
 
     return true;
   }
@@ -439,7 +459,8 @@ export class KernelHost {
     payloadPtr: number, payloadLen: number
   ): number {
     if (this.callDepth >= MAX_CALL_DEPTH) return -1;
-    const caller = this.wasmHandlers.get(callerHandlerId);
+    const callerEntry = this.entries.get(callerHandlerId);
+    const caller = callerEntry?.wasm;
     if (!caller) return -1;
     // The four pointers come straight from the calling handler and may be out
     // of range (bad offset, negative length, run past the end of memory).
@@ -454,13 +475,15 @@ export class KernelHost {
     } catch {
       return -1;
     }
-    const targetId = this.nameToHandlerId.get(nameKey(name));
-    if (targetId === undefined) return -1;
-    if (this.blockedFromCall.has(targetId)) return -1;
+    // Route through the kernel's find_handler — the same table dispatch uses —
+    // so the two paths can never resolve a name differently (README §4.4).
+    const targetId = this.findHandlerId(name);
+    if (targetId < 0) return -1;
+    const target = this.entries.get(targetId);
+    if (!target || target.blocked) return -1;
 
     // Push caller name onto the stack so kernel.caller works in the target.
-    const callerName = this.handlerIdToName.get(callerHandlerId) ?? null;
-    this.callerStack.push(callerName);
+    this.callerStack.push(callerEntry.name);
 
     this.callDepth++;
     let response: Uint8Array | null = null;
@@ -480,7 +503,7 @@ export class KernelHost {
    *  returns the total bytes written. No caller writes the single byte [0x00]
    *  (name_len = 0) and returns 1. The deeper chain is never exposed. */
   private _kernelCallerFromHandler(callerHandlerId: number, outPtr: number): number {
-    const caller = this.wasmHandlers.get(callerHandlerId);
+    const caller = this.entries.get(callerHandlerId)?.wasm;
     if (!caller) return 0;
     const bytes = this._serializeImmediateCaller();
     if (outPtr + bytes.length > caller.memory.buffer.byteLength) return 0;
@@ -549,19 +572,6 @@ export class KernelHost {
     return true;
   }
 
-  /** Clear host-side index entries for a handler the kernel just removed. */
-  private _dropHostMaps(name: Uint8Array): void {
-    const key = nameKey(name);
-    const hid = this.nameToHandlerId.get(key);
-    if (hid !== undefined) {
-      this.wasmHandlers.delete(hid);
-      this.handlers.delete(hid);
-      this.handlerIdToName.delete(hid);
-      this.blockedFromCall.delete(hid);
-    }
-    this.nameToHandlerId.delete(key);
-  }
-
   /** The conventional slot name a suite for `algoId` is installed at (README
    *  §6.4): the literal-ASCII `SUITE_SLOT_PREFIX + algo_id_hex`. A suite is an
    *  ordinary handler at this name — no registry, no separate ABI. The name is
@@ -615,13 +625,20 @@ export class KernelHost {
    *  installer state by construction (§9) — any matching install record
    *  is cleared as a side effect. */
   setHandler(name: Uint8Array, handlerId: number): void {
+    // Bind an already-registered id under `name`, displacing whatever was there.
+    // Unlike register / _installWasmHandler this does not create the impl — the
+    // entry for `handlerId` is expected to exist already, so merge the name into
+    // it rather than clobbering its handler/wasm ref.
     const ptr = this.writeToKernel(name);
-    try { this.kernelExports.set_handler(ptr, name.length, handlerId); }
-    finally { this.kernelExports.dealloc(ptr); }
-    const key = nameKey(name);
-    this._displaceHandlerAtName(key, handlerId);
-    this.nameToHandlerId.set(key, handlerId);
-    this.handlerIdToName.set(handlerId, name.slice());
+    let oldId: number;
+    try {
+      oldId = this.kernelExports.find_handler(ptr, name.length);
+      this.kernelExports.set_handler(ptr, name.length, handlerId);
+    } finally { this.kernelExports.dealloc(ptr); }
+    if (oldId >= 0 && oldId !== handlerId) this.entries.delete(oldId);
+    const entry = this.entries.get(handlerId);
+    if (entry) entry.name = name.slice();
+    else this.entries.set(handlerId, { name: name.slice(), blocked: false, handler: null, wasm: null });
     // SetHandler entries are bootstrap-only by construction (§3.1) — clear
     // any stale install record at this slot so a future lookup can't return
     // stale data for brand-new bytes (§3.1 "Replacing installer-managed names").
@@ -632,9 +649,10 @@ export class KernelHost {
   removeHandler(name: Uint8Array): boolean {
     const ptr = this.writeToKernel(name);
     try {
+      const id = this.kernelExports.find_handler(ptr, name.length);
       const ok = this.kernelExports.remove_handler(ptr, name.length) === 1;
       if (ok) {
-        this._dropHostMaps(name);
+        if (id >= 0) this.entries.delete(id);
         if (this._installer) this._installer._onKernelSlotMutated(name);
       }
       return ok;
@@ -659,8 +677,8 @@ export class KernelHost {
     if (!this._installWasmHandler(signatureName, this._signatureBytes)) {
       throw new Error("registerSignature: failed to instantiate the signature module");
     }
-    const id = this.nameToHandlerId.get(nameKey(signatureName));
-    if (id === undefined) throw new Error("registerSignature: signature handler id missing");
+    const id = this.findHandlerId(signatureName);
+    if (id < 0) throw new Error("registerSignature: signature handler id missing");
     this.signatureId = id;
     this._signatureName = signatureName.slice();
     this.blockFromCall(id);
@@ -682,7 +700,8 @@ export class KernelHost {
    *  by registerSignature; the installer is blocked when registerInstaller runs.
    *  Idempotent. */
   blockFromCall(handlerId: number): void {
-    this.blockedFromCall.add(handlerId);
+    const entry = this.entries.get(handlerId);
+    if (entry) entry.blocked = true;
   }
 
   /** Register the Installer (README §7). Wires the (blocked) install message
@@ -735,9 +754,9 @@ export class KernelHost {
 
   /** Test helper: call an arbitrary `(): i32` export on a dynamic WASM handler. */
   callDynamicHandlerI32(name: Uint8Array, exportName: string): number | null {
-    const hid = this.nameToHandlerId.get(nameKey(name));
-    if (hid === undefined) return null;
-    const wasm = this.wasmHandlers.get(hid);
+    const hid = this.findHandlerId(name);
+    if (hid < 0) return null;
+    const wasm = this.entries.get(hid)?.wasm;
     if (!wasm) return null;
     const fn = (wasm.exports as { [k: string]: unknown })[exportName];
     if (typeof fn !== "function") return null;
@@ -751,9 +770,9 @@ export class KernelHost {
     exportName: string,
     payload: Uint8Array,
   ): number | null | undefined {
-    const hid = this.nameToHandlerId.get(nameKey(name));
-    if (hid === undefined) return null;
-    const wasm = this.wasmHandlers.get(hid);
+    const hid = this.findHandlerId(name);
+    if (hid < 0) return null;
+    const wasm = this.entries.get(hid)?.wasm;
     if (!wasm) return null;
     const fn = (wasm.exports as { [k: string]: unknown })[exportName];
     if (typeof fn !== "function") return null;
@@ -769,12 +788,13 @@ export class KernelHost {
    *  handler) without the kernel knowing what they are — the host counterpart of
    *  a WASM handler's `kernel.call(name, payload)`. */
   callHandler(name: Uint8Array, payload: Uint8Array): Uint8Array | null {
-    const hid = this.nameToHandlerId.get(nameKey(name));
-    if (hid === undefined) return null;
+    const hid = this.findHandlerId(name);
+    if (hid < 0) return null;
     // Same guards as the kernel.call router (§4.4): a handler the router would
     // refuse (signature wrapper, installer, deployer-blocked mutators) must not
     // become reachable by name through this host-side path either.
-    if (this.blockedFromCall.has(hid)) return null;
+    const entry = this.entries.get(hid);
+    if (!entry || entry.blocked) return null;
     if (this.callDepth >= MAX_CALL_DEPTH) return null;
     // Push an anonymous caller frame so the target (and any bridge doing the
     // §9 caller-pinning check) sees "no installed caller" rather than a stale
@@ -791,16 +811,12 @@ export class KernelHost {
   /** Register a host-side handler. Returns the assigned id. */
   register(name: Uint8Array, handler: Handler): number {
     const id = this.nextHandlerId++;
-    const ptr = this.writeToKernel(name);
-    try { this.kernelExports.set_handler(ptr, name.length, id); }
-    finally { this.kernelExports.dealloc(ptr); }
-
-    const key = nameKey(name);
-    this._displaceHandlerAtName(key, id);
-
-    this.handlers.set(id, handler);
-    this.nameToHandlerId.set(key, id);
-    this.handlerIdToName.set(id, name.slice());
+    this.bindHandler(name, id, {
+      name: name.slice(),
+      blocked: false,
+      handler,
+      wasm: null,
+    });
     if (this._installer) this._installer._onKernelSlotMutated(name);
     return id;
   }
