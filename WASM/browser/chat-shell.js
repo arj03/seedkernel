@@ -86,7 +86,7 @@ function bytesToHex(b) {
 
 shellPrint("Loading kernel + bootstrap WASM...", "sys");
 const host = await loadKernelHost(
-  "../build/kernel.wasm", "../build/bootstrap.wasm", sodium);
+  "../build/kernel.wasm", "../build/signature.wasm", sodium);
 
 // ─── bootstrap: signature wrapper + installer ──────────────────────────
 const signatureName       = host.deriveBootstrapName("signature");

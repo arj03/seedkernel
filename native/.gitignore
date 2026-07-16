@@ -3,10 +3,10 @@
 *.gen.js
 
 # WASM artifacts built from this repo's source and copied in by
-# `npm run build:loader` (kernel/bootstrap from assembly/, libsodium from the
+# `npm run build:loader` (kernel/signature from assembly/, libsodium from the
 # upstream npm dist). qjs/qjs.wasm is NOT ignored — it's vendored upstream.
 /wasm/kernel.wasm
-/wasm/bootstrap.wasm
+/wasm/signature.wasm
 /wasm/ws.wasm
 /wasm/libsodium.wasm
 

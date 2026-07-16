@@ -1,19 +1,19 @@
-// Host driver that loads kernel.wasm + bootstrap.wasm (signature module) and
-// wires them together.
+// Host driver that loads kernel.wasm + the signature module (a stateless,
+// standard scratch-ABI handler, §4) and wires them together.
 //
 // The host is the orchestrator:
-//   - Provides libsodium Ed25519 + SHA-3-256 to bootstrap.wasm
-//   - Routes invoke_handler callbacks from kernel.wasm to bootstrap.wasm's
-//     signature handler or to host-side JS handlers
-//   - Drives the signature push/pop lifecycle (§6.5):
-//       1. kernel invokes HANDLER_SIGNATURE
-//       2. host calls bootstrap.handle_signature() → returns 1 if verified
-//       3. host reads inner bytes from bootstrap memory, dispatches through kernel
-//       4. host calls bootstrap.pop_signer() after inner dispatch returns
-//   - Provides the signature module's kernel.call import (§6.6) so it can reach
-//     a suite by plain kernel.call to the suite's slot name (§6.4) — genesis
-//     included, seeded as a host-serviced suite handler; no suite-dispatch import
-//   - Provides kernel.call / kernel.caller imports to dynamic handlers (§4.2)
+//   - Owns the signer stack (§6.5) and drives the push/dispatch/pop lifecycle
+//     around each verified `signature` wrapper:
+//       1. kernel invokes the signature handler
+//       2. host runs it through the standard §4 scratch ABI; a verified wrapper
+//          returns [algo_id][signer_len][signer][inner]
+//       3. host pushes the signer, dispatches the inner envelope, pops on return
+//     so "pushed ⟺ verified" is a three-line host-local invariant.
+//   - Provides libsodium Ed25519 + SHA-3-256 as the genesis suite handler (§6.2)
+//   - Routes invoke_handler callbacks from kernel.wasm to WASM or host-JS handlers
+//   - Provides kernel.call / kernel.caller imports to every handler (§4.2) — the
+//     signature module reaches a suite by the same kernel.call to the suite's slot
+//     name (§6.4, §6.6); no bespoke suite-dispatch import
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
 //     instantiating WASM handlers + setHandler, genesis hashing, top-signer access
 
@@ -72,28 +72,15 @@ interface KernelExports {
   dispatch(bytesPtr: number, bytesLen: number): void;
 }
 
-// ─── bootstrap.wasm exports (signature module only) ──────────────────────
-
-interface BootstrapExports {
-  memory: WebAssembly.Memory;
-  scratch: WebAssembly.Global;
-  alloc(size: number): number;
-  dealloc(ptr: number): void;
-  handle_signature(payloadPtr: number, payloadLen: number): number;
-  get_inner_ptr(): number;
-  get_inner_len(): number;
-  pop_signer(): void;
-  get_signer_count(): number;
-  read_signer(index: number, outAlgoPtr: number, outPubPtr: number, outPubMaxLen: number): number;
-  signer_pubkey_len(index: number): number;
-}
-
 // ─── handler routing ─────────────────────────────────────────────────────
 
-const HANDLER_SIGNATURE        = -1;
-const HANDLER_SIGNATURE_SIGNER = -2;
-
 const MAX_CALL_DEPTH = 8;
+
+// README §2.3: cap nested `signature` wrappers per inbound message. Bounds the
+// per-message verify cost so a single 64 KB envelope cannot force hundreds of
+// crypto verifications on the single-threaded dispatch loop. Enforced here,
+// host-side, because the signer stack lives here (§6.5).
+const MAX_SIGNATURE_DEPTH = 4;
 
 // Default scratch size mirrored by the host — handlers must reserve at least
 // this much I/O space at their `scratch` offset (README §4.1).
@@ -113,7 +100,6 @@ export function nameKey(name: Uint8Array): string {
 
 export class KernelHost {
   private kernelExports!: KernelExports;
-  private bootstrapExports!: BootstrapExports;
   private sodium!: Sodium;
   private handlers = new Map<number, Handler>();
   private wasmHandlers = new Map<number, WasmHandlerRef>();
@@ -124,11 +110,21 @@ export class KernelHost {
   // Call-chain tracking for kernel.caller (§4.2). Outermost is first, immediate
   // caller is last (push order).
   private callerStack: (Uint8Array | null)[] = [];
+  // The signer stack (README §6.5): the keys verified during the current
+  // top-level dispatch, outermost first. Owned here, not in the signature module —
+  // _handleSignature pushes a verified signer, dispatches the inner envelope under
+  // it, and pops on return, so the stack is always balanced.
+  private signerStack: Signer[] = [];
+  // Handler id of the `signature` wrapper, set by registerSignature; -1 until
+  // then, so no invoke_handler id ever matches it before registration.
+  private signatureId = -1;
+  // The signature module's WASM bytes, kept from load() so registerSignature can
+  // instantiate it as an ordinary handler once the host knows its name.
+  private _signatureBytes!: Uint8Array;
   // Handler IDs that kernel.call must refuse (README §4.4). The signature
-  // wrapper is blocked by its sentinel; the installer's positive ID is added
-  // when registerInstaller runs. Deployer-added mutators register via
-  // blockFromCall.
-  private blockedFromCall = new Set<number>([HANDLER_SIGNATURE]);
+  // wrapper's id is added by registerSignature and the installer's by
+  // registerInstaller; deployer-added mutators register via blockFromCall.
+  private blockedFromCall = new Set<number>();
   // Name used to build outer signature envelopes in wrap(). Set by
   // registerSignature; null until then.
   private _signatureName: Uint8Array | null = null;
@@ -144,29 +140,26 @@ export class KernelHost {
   // keys evicts oldest-first (FIFO via Set insertion order).
   private validatedPubkeys = new Set<string>();
   private static readonly MAX_VALIDATED_PUBKEYS = 4096;
-  // Scratch offset the signature module (bootstrap.wasm) exports (§4.1); a
-  // kernel.call from that module writes its response here. Read once at load.
-  private _bootstrapScratch = 0;
-  // Upper bound on a kernel.call response written into the signature module's
-  // scratch — mirrors the module's reserved region. The only call it makes is
-  // the suite verify (§6.6), whose response is a single [valid u8].
-  private static readonly BOOTSTRAP_SCRATCH_SIZE = 64;
 
   private constructor() {}
 
-  /** Instantiate the kernel + bootstrap modules from in-memory bytes. The
+  /** Instantiate the kernel from in-memory bytes and keep the signature module's
+   *  bytes for `registerSignature` to instantiate as an ordinary handler (§4). The
    *  caller supplies the bytes and an initialized libsodium for Ed25519 +
-   *  SHA-3-256 — keeping the entry point free of Node- or browser-specific
-   *  I/O is what lets the same host run in Node, browsers, Deno, Bun, etc.
-   *  The thin entry points in `node.ts` / `browser.ts` package the loading
-   *  dance for each platform. */
+   *  SHA-3-256 — keeping the entry point free of Node- or browser-specific I/O is
+   *  what lets the same host run in Node, browsers, Deno, Bun, etc. The thin entry
+   *  points in `node.ts` / `browser.ts` package the loading dance for each
+   *  platform. */
   static async load(
     kernelBytes: BufferSource,
-    bootstrapBytes: BufferSource,
+    signatureBytes: BufferSource,
     sodium: Sodium,
   ): Promise<KernelHost> {
     const host = new KernelHost();
     host.sodium = sodium;
+    host._signatureBytes = ArrayBuffer.isView(signatureBytes)
+      ? new Uint8Array(signatureBytes.buffer, signatureBytes.byteOffset, signatureBytes.byteLength)
+      : new Uint8Array(signatureBytes);
 
     // ── load kernel.wasm ──────────────────────────────────────────────
     const kernelImports: WebAssembly.Imports = {
@@ -190,31 +183,6 @@ export class KernelHost {
     const kernelResult = await WebAssembly.instantiate(kernelBytes, kernelImports);
     host.kernelExports = kernelResult.instance.exports as unknown as KernelExports;
 
-    // ── load bootstrap.wasm (signature module) ────────────────────────
-    const bootstrapImports: WebAssembly.Imports = {
-      // README §6.6: the signature module reaches a suite by plain kernel.call
-      // to the suite's slot name (§6.4) — there is no host-side suite-dispatch
-      // import. The module builds the literal-ASCII slot name itself and passes
-      // the verify request through this same kernel.call; the response lands in
-      // the module's scratch.
-      kernel: {
-        call: (nPtr: number, nLen: number, plPtr: number, plLen: number): number =>
-          host._kernelCallFromBootstrap(nPtr, nLen, plPtr, plLen),
-      },
-      env: {
-        abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
-          throw new Error(`bootstrap.wasm abort at ${line}:${col}`);
-        },
-        seed: () => Date.now(),
-        trace: () => {},
-      },
-    };
-    const bootstrapResult = await WebAssembly.instantiate(bootstrapBytes, bootstrapImports);
-    host.bootstrapExports = bootstrapResult.instance.exports as unknown as BootstrapExports;
-    // Read the module's scratch offset once (README §4.1); kernel.call responses
-    // for the signature module are written there.
-    host._bootstrapScratch = host.bootstrapExports.scratch.value as number;
-
     return host;
   }
 
@@ -228,29 +196,6 @@ export class KernelHost {
 
   private readFromKernel(ptr: number, len: number): Uint8Array {
     return new Uint8Array(this.kernelExports.memory.buffer, ptr, len).slice();
-  }
-
-  // ─── bootstrap memory helpers ────────────────────────────────────────
-
-  private readFromBootstrap(ptr: number, len: number): Uint8Array {
-    return new Uint8Array(this.bootstrapExports.memory.buffer, ptr, len).slice();
-  }
-
-  /** Allocate in bootstrap memory and copy len bytes from kernel memory at
-   *  srcPtr → bootstrap[ret..ret+len]. Caller deallocates. */
-  private _copyKernelToBootstrap(srcPtr: number, len: number): number {
-    const dstPtr = this.bootstrapExports.alloc(len);
-    new Uint8Array(this.bootstrapExports.memory.buffer, dstPtr, len)
-      .set(new Uint8Array(this.kernelExports.memory.buffer, srcPtr, len));
-    return dstPtr;
-  }
-
-  /** Mirror of _copyKernelToBootstrap going the other direction. */
-  private _copyBootstrapToKernel(srcPtr: number, len: number): number {
-    const dstPtr = this.kernelExports.alloc(len);
-    new Uint8Array(this.kernelExports.memory.buffer, dstPtr, len)
-      .set(new Uint8Array(this.bootstrapExports.memory.buffer, srcPtr, len));
-    return dstPtr;
   }
 
   /** When a name is being rebound to a new handlerId, drop the old handler's
@@ -276,52 +221,53 @@ export class KernelHost {
     payloadPtr: number,
     payloadLen: number
   ): void {
-    if (handlerId === HANDLER_SIGNATURE) {
-      const payPtr = this._copyKernelToBootstrap(payloadPtr, payloadLen);
-      // Snapshot the signer-stack depth so the drop path can undo a signer that
-      // handle_signature pushed but then failed to commit (e.g. an allocation
-      // threw after the push). The reference signature module pushes as its last
-      // step, but the host must not depend on that: a leaked signer would
-      // mis-attribute the next top-level message to a key that never signed it,
-      // and accumulated leaks would fill MAX_SIGNATURE_DEPTH and wedge all
-      // signed traffic.
-      const signerCountBefore = this.bootstrapExports.get_signer_count();
-      let verified = 0;
-      try {
-        try { verified = this.bootstrapExports.handle_signature(payPtr, payloadLen); }
-        catch { verified = 0; }
-      } finally {
-        this.bootstrapExports.dealloc(payPtr);
-      }
-      if (!verified) {
-        while (this.bootstrapExports.get_signer_count() > signerCountBefore) {
-          this.bootstrapExports.pop_signer();
-        }
-        return;
-      }
-
-      // From here on the signer is on the bootstrap stack. Any throw before
-      // pop_signer runs would leak the signer and let an unrelated later
-      // message impersonate this one — wrap everything in a single finally.
-      let kPtr = 0;
-      try {
-        const innerLen = this.bootstrapExports.get_inner_len();
-        const innerPtr = this.bootstrapExports.get_inner_ptr();
-        kPtr = this._copyBootstrapToKernel(innerPtr, innerLen);
-        try { this.kernelExports.dispatch(kPtr, innerLen); }
-        catch { /* drop — pop_signer in finally restores the stack */ }
-      } finally {
-        if (kPtr) this.kernelExports.dealloc(kPtr);
-        this.bootstrapExports.pop_signer();
-      }
+    const payload = this.readFromKernel(payloadPtr, payloadLen);
+    if (handlerId === this.signatureId) {
+      this._handleSignature(payload);
       return;
     }
 
     // Dynamic WASM handler or host-JS handler — response is dropped for
     // inbound dispatch. kernel.call is the path that surfaces responses.
     const name = this.readFromKernel(namePtr, nameLen);
-    const payload = this.readFromKernel(payloadPtr, payloadLen);
     this._invokeHandlerGetResponse(handlerId, name, payload);
+  }
+
+  /** Drive one accepted `signature` wrapper (README §6.5). The wrapper is a
+   *  stateless standard-ABI handler (§4): it parses + verifies and returns
+   *  `[algo_id u16][signer_len u16][signer][inner]` on success, or nothing to
+   *  drop. The host owns the signer stack and the push/dispatch/pop lifecycle, so
+   *  the "pushed ⟺ verified" invariant is the three lines below and no failure in
+   *  the module can leak a signer onto the stack. */
+  private _handleSignature(payload: Uint8Array): void {
+    // README §2.3: reject before any verify work once the stack is full.
+    if (this.signerStack.length >= MAX_SIGNATURE_DEPTH) return;
+
+    const out = this._invokeHandlerGetResponse(this.signatureId, this._signatureName!, payload);
+    // No output ⇒ malformed wrapper or the suite reported invalid ⇒ drop (§6.3).
+    if (!out) return;
+
+    // Parse [algo_id u16][signer_len u16][signer][inner].
+    let o = 0;
+    if (o + 4 > out.length) return;
+    const algoId = (out[o] << 8) | out[o + 1]; o += 2;
+    const signerLen = (out[o] << 8) | out[o + 1]; o += 2;
+    if (signerLen <= 0 || o + signerLen > out.length) return;
+    const publicKey = out.slice(o, o + signerLen); o += signerLen;
+    const inner = out.slice(o);
+    if (inner.length === 0) return;
+
+    // Push the verified signer, dispatch the inner envelope under it, pop. Any
+    // throw in dispatch unwinds through the finally, so the stack stays balanced.
+    this.signerStack.push({ algoId, publicKey });
+    try {
+      const kPtr = this.writeToKernel(inner);
+      try { this.kernelExports.dispatch(kPtr, inner.length); }
+      catch { /* drop */ }
+      finally { this.kernelExports.dealloc(kPtr); }
+    } finally {
+      this.signerStack.pop();
+    }
   }
 
   /** Core invocation used both by inbound dispatch (response dropped) and by
@@ -332,9 +278,6 @@ export class KernelHost {
     name: Uint8Array,
     payload: Uint8Array
   ): Uint8Array | null {
-    if (handlerId === HANDLER_SIGNATURE_SIGNER) {
-      return this._serializeSignerStack();
-    }
     const wasm = this.wasmHandlers.get(handlerId);
     if (wasm) {
       // Scratch-region contract (README §4): write input at the handler's
@@ -367,26 +310,20 @@ export class KernelHost {
    *  the `signature.signer` query handler returns (§6.5). pubkey_len is u16
    *  BE so post-quantum suites with multi-kilobyte public keys fit. */
   private _serializeSignerStack(): Uint8Array {
-    const count = this.bootstrapExports.get_signer_count();
+    const count = this.signerStack.length;
     if (count === 0) return new Uint8Array([0]);
-    const entries: { algo: number; pk: Uint8Array }[] = [];
     let size = 1;
-    for (let i = 0; i < count; i++) {
-      const s = this._readSignerAt(i);
-      if (s === null) continue;
-      entries.push({ algo: s.algoId, pk: s.pubKey });
-      size += 2 + 2 + s.pubKey.length;
-    }
+    for (const s of this.signerStack) size += 2 + 2 + s.publicKey.length;
     const out = new Uint8Array(size);
     let o = 0;
-    out[o++] = entries.length;
-    for (const e of entries) {
-      out[o++] = (e.algo >> 8) & 0xff;
-      out[o++] = e.algo & 0xff;
-      out[o++] = (e.pk.length >> 8) & 0xff;
-      out[o++] = e.pk.length & 0xff;
-      out.set(e.pk, o);
-      o += e.pk.length;
+    out[o++] = count; // capped at MAX_SIGNATURE_DEPTH, fits a u8
+    for (const s of this.signerStack) {
+      out[o++] = (s.algoId >> 8) & 0xff;
+      out[o++] = s.algoId & 0xff;
+      out[o++] = (s.publicKey.length >> 8) & 0xff;
+      out[o++] = s.publicKey.length & 0xff;
+      out.set(s.publicKey, o);
+      o += s.publicKey.length;
     }
     return out;
   }
@@ -489,36 +426,10 @@ export class KernelHost {
 
   /** Top-of-stack signer, or null if the signer stack is empty. */
   get currentTopSigner(): Signer | null {
-    const s = this._readTopSigner();
-    if (!s) return null;
-    return { algoId: s.algoId, publicKey: s.pubKey };
-  }
-
-  /** Read signer at index, sizing the pubkey buffer to the suite's actual
-   *  pubkey length so post-quantum keys are not truncated. */
-  private _readSignerAt(index: number): { algoId: number; pubKey: Uint8Array } | null {
-    const required = this.bootstrapExports.signer_pubkey_len(index);
-    if (required < 0) return null;
-    if (required === 0) return null;
-    const algoBuf = this.bootstrapExports.alloc(2);
-    const pubBuf  = this.bootstrapExports.alloc(required);
-    try {
-      const pubLen = this.bootstrapExports.read_signer(index, algoBuf, pubBuf, required);
-      if (pubLen < 0) return null;
-      const mem = new DataView(this.bootstrapExports.memory.buffer);
-      const algoId = (mem.getUint8(algoBuf) << 8) | mem.getUint8(algoBuf + 1);
-      return { algoId, pubKey: this.readFromBootstrap(pubBuf, pubLen) };
-    } finally {
-      this.bootstrapExports.dealloc(algoBuf);
-      this.bootstrapExports.dealloc(pubBuf);
-    }
-  }
-
-  /** Read the top-of-stack signer from bootstrap.wasm. */
-  private _readTopSigner(): { algoId: number; pubKey: Uint8Array } | null {
-    const count = this.bootstrapExports.get_signer_count();
-    if (count === 0) return null;
-    return this._readSignerAt(count - 1);
+    const n = this.signerStack.length;
+    if (n === 0) return null;
+    const s = this.signerStack[n - 1];
+    return { algoId: s.algoId, publicKey: s.publicKey.slice() };
   }
 
   /** Host import provided to dynamic handlers as `kernel.call` (README §4.4). */
@@ -578,9 +489,10 @@ export class KernelHost {
   }
 
   /** The genesis suite handler (algo_id 0x0000 = Ed25519 + SHA-3-256). Seeded
-   *  by `registerSignature` at the genesis suite slot (§6.4) and reached like
-   *  any ordinary handler, either by the signature module's suite dispatch or
-   *  by a plain `kernel.call`. Standard scratch-ABI request/response (§6.6):
+   *  by `registerSignature` at the genesis suite slot (§6.4) and reached like any
+   *  ordinary handler by a plain `kernel.call` — the signature wrapper calls it
+   *  the same way any handler calls any other. Standard scratch-ABI
+   *  request/response (§6.6):
    *
    *    verify: [pk_len u16][pk][sig_len u16][sig][data ..] → [valid u8]
    *
@@ -659,49 +571,6 @@ export class KernelHost {
     return new TextEncoder().encode(SUITE_SLOT_PREFIX + algoIdHex(algoId));
   }
 
-  /** `kernel.call` for the signature module (bootstrap.wasm) — the same import
-   *  any handler gets (§4.2), so the signature module reaches a suite by plain
-   *  kernel.call to its slot name (§6.4, §6.6) with no special suite-dispatch
-   *  path. Reads name + payload from bootstrap memory, dispatches, and writes
-   *  the response into the module's scratch region; returns the response length,
-   *  `0` when the target produced no response, or `-1` on error (no handler at
-   *  the name, depth exceeded, response too large). The signature module's only
-   *  use is the suite verify: an unknown algo_id has no handler at the slot, so
-   *  this returns -1 and the module drops (§6.4 lazy validation). */
-  private _kernelCallFromBootstrap(
-    namePtr: number, nameLen: number,
-    payloadPtr: number, payloadLen: number,
-  ): number {
-    if (this.callDepth >= MAX_CALL_DEPTH) return -1;
-    let name: Uint8Array;
-    let payload: Uint8Array;
-    try {
-      name = new Uint8Array(this.bootstrapExports.memory.buffer, namePtr, nameLen).slice();
-      payload = new Uint8Array(this.bootstrapExports.memory.buffer, payloadPtr, payloadLen).slice();
-    } catch {
-      return -1;
-    }
-    const targetId = this.nameToHandlerId.get(nameKey(name));
-    if (targetId === undefined) return -1;
-    if (this.blockedFromCall.has(targetId)) return -1;
-
-    // The signature wrapper is the immediate caller of whatever it dispatches.
-    this.callerStack.push(this._signatureName);
-    this.callDepth++;
-    let response: Uint8Array | null = null;
-    try { response = this._invokeHandlerGetResponse(targetId, name, payload); }
-    finally {
-      this.callDepth--;
-      this.callerStack.pop();
-    }
-    if (!response) return 0;
-    if (response.length > KernelHost.BOOTSTRAP_SCRATCH_SIZE) return -1;
-    const buf = this.bootstrapExports.memory.buffer;
-    if (this._bootstrapScratch + response.length > buf.byteLength) return -1;
-    new Uint8Array(buf, this._bootstrapScratch, response.length).set(response);
-    return response.length;
-  }
-
   // ─── public API ──────────────────────────────────────────────────────
 
   /** The name of the **immediate** caller — the handler whose `kernel.call`
@@ -736,17 +605,9 @@ export class KernelHost {
     return this._installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 
-  /** Read the current signer stack from bootstrap.wasm (§6.5). */
+  /** Read the current signer stack (§6.5), outermost first. */
   get currentSigners(): readonly Signer[] {
-    const count = this.bootstrapExports.get_signer_count();
-    if (count === 0) return [];
-    const result: Signer[] = [];
-    for (let i = 0; i < count; i++) {
-      const s = this._readSignerAt(i);
-      if (s === null) continue;
-      result.push({ algoId: s.algoId, publicKey: s.pubKey });
-    }
-    return result;
+    return this.signerStack.map((s) => ({ algoId: s.algoId, publicKey: s.publicKey.slice() }));
   }
 
   /** Host-level handler management (README §3.1). Installs or replaces a
@@ -784,28 +645,42 @@ export class KernelHost {
    *  (§6.2) at its slot. Required for any signed message to dispatch: the
    *  wrapper verifies via the suite installed at the algo's slot (§6.4), and the
    *  genesis suite (Ed25519 + SHA-3-256) is the one that must exist at boot.
-   *  It is registered like any other bootstrap handler — a SetHandler-seeded
-   *  slot with no install record, so the reference policy refuses to overlay it
-   *  (§6.4) and the host retains it as the emergency-replacement path (§10.1). */
+   *
+   *  The wrapper is an ordinary scratch-ABI WASM handler (§4) — the host
+   *  instantiates it and SetHandler-seeds it here, like any bootstrap handler
+   *  (§10). It is privileged only in that the host recognizes its id and drives
+   *  the signer-stack lifecycle around its output (_handleSignature), never in its
+   *  ABI. Being SetHandler-seeded with no install record, the reference policy
+   *  refuses to overlay it (§6.4) and the host keeps the emergency-replacement
+   *  path (§10.1). Blocked from `kernel.call` (§4.4): the wrapper establishes the
+   *  top signer, so letting a handler invoke it would let it reframe the active
+   *  signer mid-chain. */
   registerSignature(signatureName: Uint8Array): void {
-    this.setHandler(signatureName, HANDLER_SIGNATURE);
+    if (!this._installWasmHandler(signatureName, this._signatureBytes)) {
+      throw new Error("registerSignature: failed to instantiate the signature module");
+    }
+    const id = this.nameToHandlerId.get(nameKey(signatureName));
+    if (id === undefined) throw new Error("registerSignature: signature handler id missing");
+    this.signatureId = id;
     this._signatureName = signatureName.slice();
+    this.blockFromCall(id);
     this.register(this.deriveSuiteSlotName(GENESIS_ALGO_ID), this._genesisSuiteHandler);
   }
 
-  /** Register the `signature.signer` query handler (§6.5). Any handler that
-   *  wants to read the current signer stack via `kernel.call(signerQueryName, …)`
-   *  needs this wired. Optional — the wrapper works without it; only apps
-   *  that introspect the author of a dispatch require it. */
+  /** Register the `signature.signer` query handler (§6.5): an ordinary host
+   *  handler that serializes the host-owned signer stack. Any handler that wants
+   *  to read the current signer stack via `kernel.call(signerQueryName, …)` needs
+   *  this wired. Optional — the wrapper works without it; only apps that
+   *  introspect the author of a dispatch require it. */
   registerSignerQuery(signerQueryName: Uint8Array): void {
-    this.setHandler(signerQueryName, HANDLER_SIGNATURE_SIGNER);
+    this.register(signerQueryName, () => this._serializeSignerStack());
   }
 
   /** Mark a handler as forbidden from `kernel.call` (README §4.4). Use this
    *  for any deployer-added handler that calls `kernel.SetHandler` internally
-   *  or that re-dispatches under a new author. The bootstrap signature wrapper
-   *  is blocked by construction; the installer is blocked when registerInstaller
-   *  runs. Idempotent. */
+   *  or that re-dispatches under a new author. The signature wrapper is blocked
+   *  by registerSignature; the installer is blocked when registerInstaller runs.
+   *  Idempotent. */
   blockFromCall(handlerId: number): void {
     this.blockedFromCall.add(handlerId);
   }

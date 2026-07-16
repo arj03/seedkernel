@@ -17,7 +17,7 @@
 </head>
 <body>
 <h1>SeedKernel WASM — 10k Signature Benchmark</h1>
-<p class="dim">Loads kernel.wasm + bootstrap.wasm, builds 10k signed envelopes,
+<p class="dim">Loads kernel.wasm + signature.wasm, builds 10k signed envelopes,
 then times dispatching them through the full pipeline vs. plain Ed25519 verify.</p>
 <button id="run" disabled>Loading...</button>
 <pre id="log"></pre>
@@ -45,7 +45,7 @@ async function runBenchmark() {
   log.textContent = "";
 
   print("Loading WASM modules...");
-  const mk = await loadKernelHost("../build/kernel.wasm", "../build/bootstrap.wasm", sodium);
+  const mk = await loadKernelHost("../build/kernel.wasm", "../build/signature.wasm", sodium);
 
   // Bootstrap: just the signature wrapper (README §10). The benchmark
   // registers its receiver host-side via mk.register, so no installer is
@@ -103,8 +103,8 @@ async function runBenchmark() {
   print(`Overhead: ${((ratio - 1) * 100).toFixed(1)}% over raw verify`);
 
   const kSize = (await (await fetch("../build/kernel.wasm")).arrayBuffer()).byteLength;
-  const bSize = (await (await fetch("../build/bootstrap.wasm")).arrayBuffer()).byteLength;
-  print(`\nWASM modules: kernel.wasm (${kSize} bytes) + bootstrap.wasm (${bSize} bytes)`, "dim");
+  const bSize = (await (await fetch("../build/signature.wasm")).arrayBuffer()).byteLength;
+  print(`\nWASM modules: kernel.wasm (${kSize} bytes) + signature.wasm (${bSize} bytes)`, "dim");
 
   btn.disabled = false;
   btn.textContent = "Run again";
@@ -114,7 +114,7 @@ btn.disabled = false;
 btn.textContent = "Run benchmark";
 btn.addEventListener("click", runBenchmark);
 print("Ready. Click the button to start.\n", "dim");
-print("Distribution: kernel-host.js + kernel.wasm + bootstrap.wasm", "dim");
+print("Distribution: kernel-host.js + kernel.wasm + signature.wasm", "dim");
 print("Protocol logic (envelope format, signature wrapper, signer stack)", "dim");
 print("lives in WASM. The JS host is pure glue: load modules, bridge", "dim");
 print("memories, route callbacks, provide libsodium.", "dim");

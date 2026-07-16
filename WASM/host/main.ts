@@ -34,7 +34,7 @@ type Identity = { publicKey: Uint8Array; privateKey: Uint8Array };
 /** The two genesis modules the runtime always loads. */
 export interface KernelWasm {
   kernelBytes: Uint8Array;
-  bootstrapBytes: Uint8Array;
+  signatureBytes: Uint8Array;
 }
 
 export interface ShellOptions extends KernelWasm {
@@ -155,11 +155,11 @@ function freshnessPathFor(dir: string): string {
   return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
 }
 
-/** Assemble the runtime: kernel + bootstrap + signature + installer under the
+/** Assemble the runtime: kernel + signature + installer under the
  *  loaded policy, plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
-  const host = await KernelHost.load(opts.kernelBytes as BufferSource, opts.bootstrapBytes as BufferSource, sodium);
+  const host = await KernelHost.load(opts.kernelBytes as BufferSource, opts.signatureBytes as BufferSource, sodium);
 
   host.registerSignature(host.deriveBootstrapName("signature"));
   host.registerInstaller(host.deriveBootstrapName("install"));
@@ -322,9 +322,9 @@ export async function loadKernelWasmNode(): Promise<KernelWasm> {
   const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
   const [k, b] = await Promise.all([
     readFile(join(root, "build/kernel.wasm")),
-    readFile(join(root, "build/bootstrap.wasm")),
+    readFile(join(root, "build/signature.wasm")),
   ]);
-  return { kernelBytes: new Uint8Array(k), bootstrapBytes: new Uint8Array(b) };
+  return { kernelBytes: new Uint8Array(k), signatureBytes: new Uint8Array(b) };
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -382,7 +382,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
 
   const sodium = await loadSodium();
   const identity = loadIdentity(sodium, keyPath);
-  const { kernelBytes, bootstrapBytes } = await loadWasm();
+  const { kernelBytes, signatureBytes } = await loadWasm();
 
   // Operator-supplied app config (e.g. a storage node's quota), merged over the
   // bundle's author-signed config. Opaque JSON the shell forwards into `const APP`.
@@ -391,7 +391,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
     : undefined;
 
   const shell = await boot({
-    kernelBytes, bootstrapBytes, policyJson, dir, identity,
+    kernelBytes, signatureBytes, policyJson, dir, identity,
     listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
     wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
     timeoutMs: args["timeout"] ? Number(str(args, "timeout")) : undefined,

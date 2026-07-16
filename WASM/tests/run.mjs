@@ -68,13 +68,13 @@ function makeSeq() {
 }
 
 const kernelWasm = join(root, "build/kernel.wasm");
-const bootstrapWasm = join(root, "build/bootstrap.wasm");
+const signatureWasm = join(root, "build/signature.wasm");
 
 // Standard bootstrap (README §10): signature handler + installer. The default
 // policy accepts every install; tests that need rejection override via
 // host.setApproveInstall.
 async function makeHost(approveInstall = () => true) {
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
 
@@ -157,7 +157,7 @@ async function testInvalidSignatureDropped() {
 async function testSizeLimitEnforced() {
   console.log("Test: Oversized envelope rejected (§2.2)");
 
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
 
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
@@ -183,7 +183,7 @@ async function testSizeLimitEnforced() {
 async function testSignatureDepthCap() {
   console.log("Test: Signature wrapping depth capped at MAX_SIGNATURE_DEPTH=4 (§2.3)");
 
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   host.registerSignature(signatureName);
 
@@ -228,7 +228,7 @@ async function testRefuseOverlayBootstrapSlot() {
   // Use the reference policy with an allow-all first-install branch so this
   // test exercises only the bootstrap-slot refusal — not an unrelated first-
   // install rejection.
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
   host.registerSignature(signatureName);
@@ -335,7 +335,7 @@ async function testNoApproveInstallDropsAll() {
 async function testReferencePolicyUpgradeRules() {
   console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
 
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
   host.registerSignature(signatureName);
@@ -625,7 +625,7 @@ async function testBlockFromCall() {
 async function testWrapRejectsInvalidKeySizes() {
   console.log("Test: wrap() rejects invalid Ed25519 key sizes");
 
-  const host = await loadKernelHost(kernelWasm, bootstrapWasm);
+  const host = await loadKernelHost(kernelWasm, signatureWasm);
   host.registerSignature(host.deriveBootstrapName("signature"));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
@@ -1041,7 +1041,7 @@ async function testShellBoot() {
   try {
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
@@ -1105,7 +1105,7 @@ async function testBundle() {
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
@@ -1131,7 +1131,7 @@ async function testBundle() {
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(generateKeyPair().publicKey)] }),
       dir: pjoin(dir, "_data2"), identity,
     });
@@ -2193,7 +2193,7 @@ async function testBundleCorruptNewerRollback() {
 
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      bootstrapBytes: new Uint8Array(readFileSync(bootstrapWasm)),
+      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });

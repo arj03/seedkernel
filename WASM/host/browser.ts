@@ -12,15 +12,15 @@ type Sodium = typeof import("libsodium-wrappers-sumo");
  *  KernelHost. Pass URLs as strings or URL objects relative to the page. */
 export async function loadKernelHost(
   kernelUrl: string | URL,
-  bootstrapUrl: string | URL,
+  signatureUrl: string | URL,
   sodium: Sodium,
 ): Promise<KernelHost> {
-  const [kernelBytes, bootstrapBytes] = await Promise.all([
+  const [kernelBytes, signatureBytes] = await Promise.all([
     fetch(kernelUrl).then((r) => r.arrayBuffer()),
-    fetch(bootstrapUrl).then((r) => r.arrayBuffer()),
+    fetch(signatureUrl).then((r) => r.arrayBuffer()),
     sodium.ready,
   ]);
-  return KernelHost.load(kernelBytes, bootstrapBytes, sodium);
+  return KernelHost.load(kernelBytes, signatureBytes, sodium);
 }
 
 export {

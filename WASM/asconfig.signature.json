@@ -1,16 +1,16 @@
 {
-  "entries": ["assembly/bootstrap/index.ts"],
+  "entries": ["assembly/signature/index.ts"],
   "targets": {
     "debug": {
-      "outFile": "build/bootstrap.debug.wasm",
-      "textFile": "build/bootstrap.debug.wat",
+      "outFile": "build/signature.debug.wasm",
+      "textFile": "build/signature.debug.wat",
       "sourceMap": true,
       "debug": true,
       "exportRuntime": true
     },
     "release": {
-      "outFile": "build/bootstrap.wasm",
-      "textFile": "build/bootstrap.wat",
+      "outFile": "build/signature.wasm",
+      "textFile": "build/signature.wat",
       "optimizeLevel": 3,
       "shrinkLevel": 2,
       "converge": false,

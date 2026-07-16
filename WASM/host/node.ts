@@ -20,14 +20,14 @@ const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sum
  *  instantiate a KernelHost. */
 export async function loadKernelHost(
   kernelWasmPath: string,
-  bootstrapWasmPath: string,
+  signatureWasmPath: string,
 ): Promise<KernelHost> {
-  const [kernelBytes, bootstrapBytes] = await Promise.all([
+  const [kernelBytes, signatureBytes] = await Promise.all([
     readFile(kernelWasmPath),
-    readFile(bootstrapWasmPath),
+    readFile(signatureWasmPath),
     sodium.ready,
   ]);
-  return KernelHost.load(kernelBytes, bootstrapBytes, sodium);
+  return KernelHost.load(kernelBytes, signatureBytes, sodium);
 }
 
 export async function ensureSodium(): Promise<void> {

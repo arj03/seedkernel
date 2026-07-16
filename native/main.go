@@ -2,9 +2,10 @@
 // signed bundles (README §13) — nothing application-specific lives here. Host
 // orchestration (installer §7, bundle verification §13) is JavaScript in QuickJS
 // (host.js); this Go layer is only the bridge: loads the genesis wasm, supplies the
-// genesis crypto (Ed25519 + SHA-3), runs the signature shuttle (the one piece needing
-// raw wasm-memory access), and exposes byte primitives to the realm. Pure Go, no cgo
-// (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero bridge) → one static binary.
+// genesis crypto (Ed25519 + SHA-3), owns the signer stack and drives the signature
+// lifecycle (§6.5) around the stateless signature handler, and exposes byte
+// primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
+// in-repo qjs/wazero bridge) → one static binary.
 package main
 
 import (
@@ -31,8 +32,8 @@ import (
 //go:embed wasm/kernel.wasm
 var kernelWasm []byte
 
-//go:embed wasm/bootstrap.wasm
-var bootWasm []byte
+//go:embed wasm/signature.wasm
+var sigWasm []byte
 
 //go:embed host.js
 var hostJS string
@@ -54,7 +55,7 @@ type signer struct {
 var (
 	ctx     = context.Background()
 	rt      wazero.Runtime
-	kn, bs  api.Module
+	kn      api.Module
 	qc      *qjs.Context
 	qrt     *qjs.Runtime
 	wasmH   = map[string]handler{}             // name → wasm app handler
@@ -62,7 +63,18 @@ var (
 	scrOf   = map[api.Module]uint32{}          // wasm handler module → scratch offset
 	blocked = map[string]bool{}                // names refused via kernel.call (§4.4)
 	nextID  = int32(10)
+	// The signer stack (README §6.5): keys verified during the current top-level
+	// dispatch, outermost first. Owned here, not in the signature module —
+	// handleSignature pushes a verified signer, dispatches the inner envelope under
+	// it, and pops on return. Dispatch is single-threaded (§4.2), so a plain slice
+	// needs no locking.
+	sigStack []signer
+	sigID    int32 // handler id of the signature wrapper, set in boot()
 )
+
+// maxSigDepth caps nested `signature` wrappers per inbound message (README §2.3),
+// enforced host-side because the signer stack lives here.
+const maxSigDepth = 4
 
 // maxCallDepth caps kernel.call re-entrancy (README §11 MAX_CALL_DEPTH, §4.4).
 //
@@ -166,38 +178,51 @@ func run(n, payload []byte) []byte {
 	return nil
 }
 
-// env.invoke_handler — kernel matched a name (README §3). id -1 = signature wrapper.
+// env.invoke_handler — kernel matched a name (README §3). sigID = the signature
+// wrapper: run it, then drive the signer-stack lifecycle around its output (§6.5).
 func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
-	if int32(hid) == -1 { // verify → re-dispatch inner envelope → pop signer (§6.5)
-		payload := rd(km.Memory(), pP, pL)
-		bp := wr(bs, payload)
-		if bp == 0 { // alloc failed — don't run the verifier over a null pointer
-			return
-		}
-		ok := wasmCall(bs, "handle_signature", uint64(bp), uint64(len(payload)))
-		wasmCall(bs, "dealloc", uint64(bp))
-		if len(ok) == 0 || uint32(ok[0]) == 0 {
-			return
-		}
-		// handle_signature pushed a signer (§6.5). Pop it on *every* exit path below —
-		// including the defensive get_inner_* early-return — or a stale signer leaks onto
-		// the stack and the next dispatched message runs under its authority (§6.5).
-		defer wasmCall(bs, "pop_signer")
-		ip := wasmCall(bs, "get_inner_ptr")
-		il := wasmCall(bs, "get_inner_len")
-		if len(ip) == 0 || len(il) == 0 {
-			return
-		}
-		inner := rd(bs.Memory(), uint32(ip[0]), uint32(il[0]))
-		kp := wr(kn, inner)
-		if kp == 0 { // alloc failed — the deferred pop_signer still unwinds §6.5 state
-			return
-		}
-		wasmCall(kn, "dispatch", uint64(kp), uint64(len(inner)))
-		wasmCall(kn, "dealloc", uint64(kp))
+	p := rd(km.Memory(), pP, pL)
+	if int32(hid) == sigID {
+		handleSignature(p)
 		return
 	}
-	run(rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL)) // inbound: response dropped
+	run(rd(km.Memory(), nP, nL), p) // inbound: response dropped
+}
+
+// handleSignature drives one accepted `signature` wrapper (README §6.5). The
+// wrapper is a stateless scratch-ABI handler (§4): run() returns
+// [algo_id u16][signer_len u16][signer][inner] on a verified wrapper, or nothing
+// to drop. The host owns the signer stack and the push/dispatch/pop lifecycle, so
+// "pushed ⟺ verified" is local and no failure in the module can leak a signer.
+func handleSignature(payload []byte) {
+	// README §2.3: reject before any verify work once the stack is full.
+	if len(sigStack) >= maxSigDepth {
+		return
+	}
+	out := run(name("signature"), payload) // standard scratch ABI (§4)
+	// Malformed wrapper or the suite reported invalid ⇒ no usable output ⇒ drop.
+	if len(out) < 4 {
+		return
+	}
+	o := 0
+	algo := int(out[o])<<8 | int(out[o+1])
+	o += 2
+	sl := int(out[o])<<8 | int(out[o+1])
+	o += 2
+	if sl <= 0 || o+sl > len(out) {
+		return
+	}
+	pk := append([]byte(nil), out[o:o+sl]...)
+	o += sl
+	inner := out[o:]
+	if len(inner) == 0 {
+		return
+	}
+	// Push the verified signer, dispatch the inner envelope under it, pop. The defer
+	// balances the stack even if dispatch unwinds (§6.5).
+	sigStack = append(sigStack, signer{algo, pk})
+	defer func() { sigStack = sigStack[:len(sigStack)-1] }()
+	dispatch(inner)
 }
 
 // kernel.call — one handler reaches another (README §4.4). Returns the response length,
@@ -208,9 +233,10 @@ func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	if blocked[string(n)] {
 		return ^uint32(0)
 	}
-	// scrOf is set only for modules installed as handlers (installWasm). A module that
-	// reaches kernel.call without one (kn/bs) has the zero-value offset, so writing the
-	// response would clobber its low memory — refuse rather than corrupt.
+	// scrOf is set only for modules registered as handlers (installWasm, and the
+	// signature module in boot()). A module that reaches kernel.call without one (kn)
+	// has the zero-value offset, so writing the response would clobber its low
+	// memory — refuse rather than corrupt.
 	s, ok := scrOf[caller]
 	if !ok {
 		return ^uint32(0)
@@ -281,28 +307,13 @@ func genesisSuiteVerify(req []byte) []byte {
 	return invalid
 }
 
-// topSigner reads the innermost verified signer from bootstrap.wasm (§6.5).
+// topSigner returns the innermost verified signer (README §6.5), or false if the
+// signer stack is empty. The stack is host-owned (see handleSignature).
 func topSigner() (signer, bool) {
-	c := wasmCall(bs, "get_signer_count")
-	if len(c) == 0 || uint32(c[0]) == 0 {
+	if len(sigStack) == 0 {
 		return signer{}, false
 	}
-	idx := uint64(uint32(c[0]) - 1)
-	pl := wasmCall(bs, "signer_pubkey_len", idx)
-	if len(pl) == 0 || int32(pl[0]) <= 0 {
-		return signer{}, false
-	}
-	ab := wasmCall(bs, "alloc", 2)
-	pb := wasmCall(bs, "alloc", pl[0])
-	if len(ab) == 0 || len(pb) == 0 {
-		return signer{}, false
-	}
-	defer wasmCall(bs, "dealloc", ab[0]) // free the scratch allocs read below
-	defer wasmCall(bs, "dealloc", pb[0])
-
-	wasmCall(bs, "read_signer", idx, ab[0], pb[0], pl[0])
-	a := rd(bs.Memory(), uint32(ab[0]), 2)
-	return signer{int(a[0])<<8 | int(a[1]), rd(bs.Memory(), uint32(pb[0]), uint32(pl[0]))}, true
+	return sigStack[len(sigStack)-1], true
 }
 
 // installWasm instantiates handler bytes and binds them to the raw name `n`.
@@ -363,15 +374,25 @@ func boot() {
 	}).Export("caller")
 	k.Instantiate(ctx)
 	kn = load(kernelWasm, "kernelmod")
-	bs = load(bootWasm, "bootstrap")
-	// The signature module reaches a suite by plain kernel.call (§6.6), so it needs
-	// a scratch offset registered like any handler — otherwise kcall refuses it (no
-	// scrOf entry). It exports `scratch` (§4.1); record it so kcall can write the
-	// suite's [valid u8] response there for the module to read.
-	if g := bs.ExportedGlobal("scratch"); g != nil {
-		scrOf[bs] = uint32(g.Get())
+	// The signature wrapper is an ordinary scratch-ABI handler (§4): a stateless
+	// module that parses + verifies and returns [algo][signer_len][signer][inner]
+	// (§6.3). The host owns the signer stack and drives push/dispatch/pop
+	// (handleSignature), so it is wired like any wasm handler — its own scratch, its
+	// own id in wasmH — and only invoke() recognizes the id to run the lifecycle.
+	sig := load(sigWasm, "signature")
+	var sigScr uint32
+	if g := sig.ExportedGlobal("scratch"); g != nil { // §4.1 scratch offset
+		sigScr = uint32(g.Get())
 	}
-	setHandler(name("signature"), -1)
+	sigID = nextID
+	nextID++
+	scrOf[sig] = sigScr
+	wasmH[string(name("signature"))] = handler{sig, nil, sig.ExportedFunction("handle"), sigScr}
+	sigStack = nil
+	setHandler(name("signature"), sigID)
+	// Blocked from kernel.call (§4.4): the wrapper establishes the top signer, so an
+	// arbitrary handler reaching it via kernel.call could reframe the active signer.
+	blocked[string(name("signature"))] = true
 
 	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
 	// serviced with libsodium — the reference host's "genesis via SetHandler"

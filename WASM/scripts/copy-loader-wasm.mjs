@@ -16,7 +16,7 @@ mkdirSync(dst, { recursive: true });
 
 const copies = [
   ["build/kernel.wasm", "kernel.wasm"],
-  ["build/bootstrap.wasm", "bootstrap.wasm"],
+  ["build/signature.wasm", "signature.wasm"],
   ["build/ws.wasm", "ws.wasm"],
   ["browser/libsodium.wasm", "libsodium.wasm"],
 ];

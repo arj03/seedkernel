@@ -98,11 +98,11 @@ The 64 KB limit is a protocol constant, not a per-deployment configuration knob.
 
 ### 2.3 Maximum signature wrapping depth
 
-The signature module MUST reject any `signature` envelope when the signer stack already contains `MAX_SIGNATURE_DEPTH` entries. **`MAX_SIGNATURE_DEPTH` is a protocol constant equal to `4`.**
+The host MUST drop any `signature` envelope when the signer stack already contains `MAX_SIGNATURE_DEPTH` entries. **`MAX_SIGNATURE_DEPTH` is a protocol constant equal to `4`.**
 
 **Rationale.** Each signature wrapper costs one verify (~95 µs for Ed25519 on a modern core). Per-wrapper overhead is ~140 bytes for Ed25519 (§2.2), so a 64 KB envelope can in principle nest ~475 wrappers. Without a cap, a single inbound message can force that many verifies (~45 ms CPU), turning a tiny attacker input into a CPU-amplification DoS against the single-threaded dispatch loop. Capping depth at 4 supports realistic use cases (single-sig, hybrid Ed25519+PQ, key-rotation overlays, an attestation envelope) while keeping per-message verify cost bounded.
 
-This limit is enforced by the signature handler reading the current signer stack length before verifying — implementations do not need a separate counter. The 4-entry cap aligns with the authorization model in §6.5: the operative authorization is always the top signer, so deeper wrappers add no semantic value the kernel can use.
+The host enforces this by checking the signer-stack depth before it runs the wrapper handler — the stack is host-owned (§6.5), so the check is a length read and a full stack costs no verify. The 4-entry cap aligns with the authorization model in §6.5: the operative authorization is always the top signer, so deeper wrappers add no semantic value the kernel can use.
 
 ---
 
@@ -234,7 +234,7 @@ What a handler **must** internalize:
 **Handlers blocked from `kernel.call`.** Two kinds of handler MUST cause `kernel.call` to return `-1` *before* the target is invoked. The check belongs at the call router (the host's `kernel.call` import), not inside the handlers.
 
 1. **State mutators** — handlers that call `kernel.SetHandler` or modify the installer's records. Without the block, an in-handler `kernel.call` could mutate state under the current top signer's authority without that signer's intent.
-2. **The `signature` wrapper itself** — it does not mutate persistent state, but it pushes a new entry onto the signer stack and re-dispatches. Allowing it via `kernel.call` would let an arbitrary handler reframe the active signer mid-chain and break the "top signer = author" rule.
+2. **The `signature` wrapper itself** — it does not mutate persistent state, but accepting it pushes a new entry onto the signer stack and re-dispatches the inner envelope under it. Allowing it via `kernel.call` would let an arbitrary handler reframe the active signer mid-chain and break the "top signer = author" rule.
 
 Blocked handlers run only at top-level dispatch, where the signature wrapper has already verified the outer signature. Read-only queries (`signature.signer`) remain freely callable.
 
@@ -242,7 +242,7 @@ The reference host auto-blocks the two bootstrap handlers `signature` and `insta
 
 **Replay protection (mandatory for state-mutating handlers).** Every mutator that acts under the top signer's authority — `install` and any deployer-added equivalent — MUST consume a `u32` big-endian sequence number as the *first* field of its payload and MUST drop the message if `seq <= last_seen[(handler, signer.pubkey)]`. A signed install is self-authenticating and stateless on the wire — its signature stays valid forever, so anyone who has seen the bytes can resend them verbatim; the monotonic high-water mark is what makes the second delivery a no-op. The seq check MUST run before any state mutation; cheap-drop checks MAY run first to avoid polluting the seq table with messages that would have been refused anyway. The high-water mark is per-key-per-handler, lives in a persistent table that is **not** part of any install record (§7.1), and **persists across deny-listing, removal, or other policy changes** (tombstone-forever) — re-admitting (or `installer.remove` + re-installing) a previously-denied signer MUST NOT rewind their sequence, or pre-denial wire bytes could be replayed after the re-admission. Senders pick strictly increasing seqs (gaps are fine); on counter loss, jump forward conservatively.
 
-The `signature` wrapper is on the blocklist but consumes no `seq`: it does not act under any signer's authority — it *establishes* the top signer — and its push/pop of the signer stack leaves no persistent state to replay. The two protections target different threats: `seq` cuts off wire replay of authorized mutations; the blocklist cuts off in-pipeline corruption of kernel state.
+The `signature` wrapper is on the blocklist but consumes no `seq`: it does not act under any signer's authority — it *establishes* the top signer — and the push/pop of the signer stack it drives leaves no persistent state to replay. The two protections target different threats: `seq` cuts off wire replay of authorized mutations; the blocklist cuts off in-pipeline corruption of kernel state.
 
 **Application handlers: replay protection is opt-in.** The protocol mandates `seq` only for handlers that mutate kernel-managed state (the installer and any deployer-added equivalent). Ordinary app handlers (chat, ...) are not on the blocklist, do not consume `seq` by default, and a signed envelope replayed verbatim onto the wire will re-verify and re-dispatch byte-identically — anyone who has ever seen the bytes can resend them. Whether that matters is application-specific: idempotent handlers (e.g. appending a chat line to a display log, where seeing the same message twice is a UX nit rather than a security failure) can ignore replays; handlers whose payload causes a meaningful state change (transferring an asset, casting a vote, flipping a switch, charging an account) MUST defend themselves. The mechanism is the same one this section prescribes for mutators — a `seq` field consumed before the action with a per-`(handler, signer.pubkey)` high-water mark keyed by the canonical public key — but the app chooses the field placement in its payload, the storage backing the counter, and whether related handlers share a high-water map or keep independent ones. Apps that need stronger guarantees than monotonic `seq` (e.g. exactly-once semantics across a network partition, or freshness windows) layer their own nonce / timestamp / challenge-response scheme on top; the kernel exposes no clock and offers no help here.
 
@@ -356,22 +356,23 @@ Length-prefixing `signer` inside the preimage makes it **self-delimiting**: the 
 
 **Signing the outer `algo_id` and `signer` closes the flip attacks.** Because the signature now covers `algo_id`, an attacker cannot flip it on a captured message to replay that message under a second suite that happens to verify the same key (§6.4 rotation), and cannot re-attribute a captured message to a different `(algo_id, pubkey)` author identity — either edit changes the signed preimage and fails verification. Two consequences follow: replay state (§4.4) may be keyed however the mutator likes (the earlier prohibition on namespacing it by `algo_id` is retired), and the `signer` a suite verifies against is fixed by the signature rather than an out-of-band hint. Suites SHOULD still reject non-canonical or small-order public keys so that one logical key has exactly one byte encoding — the §4.4 replay high-water marks and the installer's author-matching are both keyed on raw pubkey bytes, so a second encoding would split one identity in two — but with `signer` signed this is defense-in-depth, not the load-bearing barrier it was when the fields travelled unsigned.
 
-After verification, the inner envelope re-enters the pipeline and dispatches normally. The signature module registers a single handler for `signature`; that handler's verify-time flow is:
+After verification, the inner envelope re-enters the pipeline and dispatches normally. A single handler is registered at the `signature` name: an ordinary scratch-ABI handler (§4) that parses the wrapper, verifies it via the suite, and — on success — returns the verified signer together with the inner envelope. It is stateless: the host owns the signer stack and drives the lifecycle around the handler's output — push, re-dispatch, pop (§6.5). The verify-time flow is:
 
 ```mermaid
 flowchart TD
     MSG["Incoming bytes"] --> KERNEL["Kernel.Dispatch"]
     KERNEL --> NAME{"name == signature?"}
-    NAME -->|"yes"| WRAP["Signature module: signature handler"]
+    NAME -->|"yes"| WRAP["signature handler: parse wrapper"]
     NAME -->|"no"| INNER["Direct handler (unsigned message)"]
     WRAP --> LOOKUP{"suite handler for algo_id?"}
-    LOOKUP -->|"0x0000"| NATIVE["WASM: Ed25519+SHA3-256"]
-    LOOKUP -->|"0x0001"| WASM1["WASM: Dilithium+SHA3 (example)"]
+    LOOKUP -->|"0x0000"| NATIVE["suite: Ed25519+SHA3-256"]
+    LOOKUP -->|"0x0001"| WASM1["suite: Dilithium+SHA3 (example)"]
     LOOKUP -->|"unknown"| DROP["Drop"]
     NATIVE --> VERIFY{"verify ok?"}
     WASM1 --> VERIFY
     VERIFY -->|"no"| DROP
-    VERIFY -->|"yes"| REDISP["push to signer stack, re-Dispatch(inner)"]
+    VERIFY -->|"yes"| RETURN["handler returns (signer, inner)"]
+    RETURN --> REDISP["host: push signer stack, re-Dispatch(inner)"]
     REDISP --> KERNEL
 ```
 
@@ -391,11 +392,11 @@ Once a new suite is installed, messages signed under it should be wrapped per §
 
 **Lazy validation.** The signature module does not verify that suite bytes actually implement the suite contract at install time. If the bytes don't behave as a suite handler, the first message signed under that `algo_id` fails verification and drops. This is intentional — schema/interface checking is the installer policy's job if a deployment cares (it can inspect the WASM exports before approving, see §7.3), and the security-relevant path (verify failure → drop) is fail-safe regardless.
 
-### 6.5 Signer stack (signature module internals)
+### 6.5 Signer stack
 
-The signature module maintains a **signer stack** — an internal list that tracks which keys have been verified during the current top-level dispatch. The kernel doesn't know it exists.
+The host maintains a **signer stack** — the keys verified during the current top-level dispatch. The kernel doesn't know it exists, and neither does the signature module: the wrapper handler is stateless (§6.3), so the stack and its lifecycle live in the one component that already spans the inner dispatch.
 
-**Lifecycle.** Every accepted `signature` wrapper pushes one entry, executes the inner dispatch synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline, capped at `MAX_SIGNATURE_DEPTH` (§2.3).
+**Lifecycle.** On every accepted `signature` wrapper the host pushes one entry, dispatches the inner envelope synchronously, and pops on return. Stack depth therefore equals the number of nested `signature` wrappers active at the current point in the pipeline, capped at `MAX_SIGNATURE_DEPTH` (§2.3, checked before the wrapper runs). Because the push, the dispatch, and the pop are three consecutive host statements — `push` / `dispatch(inner)` / `pop` in a `finally` — the invariant "an entry is on the stack ⟺ its wrapper verified" holds by construction: no partial state, no repair path, nothing to leak across a module boundary.
 
 ```
 signature-envelope  (algo = Ed25519,  signer = A)        ← outer
@@ -621,7 +622,7 @@ Benchmarks verify 10,000 signed messages (Ed25519, genesis suite) through the fu
 
 ### 11.1 Kernel pipeline vs. raw verify
 
-Measured in Node.js with `performance.now()` on an AMD Ryzen 7 PRO 7840U. The kernel and signature are separate `.wasm` modules (AssemblyScript); the installer is host-side JS (`host/installer.ts`). A JavaScript host orchestrates them and provides Ed25519 via libsodium (also WASM). Each signed message crosses 7 WASM boundary crossings and ~6 memory copies.
+Measured in Node.js with `performance.now()` on an AMD Ryzen 7 PRO 7840U. The kernel and signature are separate `.wasm` modules (AssemblyScript), the signature module being an ordinary scratch-ABI handler (§4); the installer is host-side JS (`host/installer.ts`). A JavaScript host orchestrates them and provides Ed25519 via libsodium (also WASM). Each signed message crosses a handful of WASM boundary crossings and memory copies.
 
 | Method | Node.js |
 |---|---|
@@ -629,7 +630,7 @@ Measured in Node.js with `performance.now()` on an AMD Ryzen 7 PRO 7840U. The ke
 | Plain Ed25519 verify only | 810 ms (~81 µs/msg) |
 | **Overhead** | **~2.9%** |
 
-The Ed25519 verify dominates. Each signed message crosses ~7 WASM boundaries and ~6 memory copies (envelope parse, signature wrapper parse, verify, re-dispatch of the inner envelope, inner handler invocation, signer pop); even so, the sandbox tax is ~2 µs/msg over the raw verify.
+The Ed25519 verify dominates. Each signed message crosses a handful of WASM boundaries and memory copies (envelope parse, signature-wrapper parse, suite verify via `kernel.call`, re-dispatch of the inner envelope, inner handler invocation — the signer push/pop is a host array operation, not a boundary crossing); even so, the sandbox tax is ~2 µs/msg over the raw verify.
 
 Collapsing the previous version's trust + install machinery into a single host-side installer means fewer cross-module queries on the install hot path, but installation is not on the message hot path, so the overhead ratio for the steady-state pipeline is unchanged from the previous baseline.
 
@@ -638,14 +639,14 @@ Collapsing the previous version's trust + install machinery into a single host-s
 | Component | Size |
 |---|---|
 | kernel.wasm | 6 KB |
-| bootstrap.wasm (signature) | 6 KB |
+| signature.wasm | 5.6 KB |
 | host/*.js — minified (`build/host-min`; ~20 KB gzipped) | 88 KB |
 | libsodium.wasm (sumo build: Ed25519 + SHA-3-256, plus the §13.1 BLAKE2b / XChaCha20 backends) | 278 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 152 KB |
 | **Total deployment with default genesis suite** | **~530 KB** |
 | QuickJS realm engines (release asyncify + sync, from `quickjs-emscripten`) — only loaded when a bundle's guest runs (§13.3) | ~1.5 MB |
 
-The kernel and signature modules are pure protocol logic — no cryptographic code — and together come to ~12 KB of WASM. The `host/*.js` layer is the runtime around them: it loads the modules, routes `invoke_handler` callbacks, drives the signature push/pop lifecycle, provides the `kernel.call` / `kernel.caller` imports (the signature module reaches the genesis suite through the same `kernel.call`, §6.6), services the genesis suite handler with libsodium, and contains the installer (install records, policy callback, host-side `lookup` — §7). It also now contains the whole shell (§13) — net, fs, cap-bridge, safe-js, bundle, policy — which is why it is larger than the kernel-pipeline-only host of earlier revisions. libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6 — the sumo build is larger than a sign-only build because it also backs the §13.1 raw-byte crypto capability. A future post-quantum suite installed at a new suite slot (§6.4) would be a larger module because it bundles its own algorithm implementation. The QuickJS engines are lazy: a node that only relays and dispatches envelopes never pays for them.
+The kernel and signature modules are pure protocol logic — no cryptographic code — and together come to ~12 KB of WASM. The signature module is a stateless scratch-ABI handler (§4) like any other; it is the only WASM the host recognizes by name to drive a lifecycle around, but it carries no bespoke ABI. The `host/*.js` layer is the runtime around them: it loads the modules, routes `invoke_handler` callbacks, owns the signer stack and drives its push/dispatch/pop lifecycle (§6.5), provides the `kernel.call` / `kernel.caller` imports every handler gets — the signature module reaches the genesis suite through that same `kernel.call` (§6.6) — services the genesis suite handler with libsodium, and contains the installer (install records, policy callback, host-side `lookup` — §7). It also now contains the whole shell (§13) — net, fs, cap-bridge, safe-js, bundle, policy — which is why it is larger than the kernel-pipeline-only host of earlier revisions. libsodium is the host's choice of default genesis suite, not part of the protocol; a different deployment could swap in any suite that satisfies §6.6 — the sumo build is larger than a sign-only build because it also backs the §13.1 raw-byte crypto capability. A future post-quantum suite installed at a new suite slot (§6.4) would be a larger module because it bundles its own algorithm implementation. The QuickJS engines are lazy: a node that only relays and dispatches envelopes never pays for them.
 
 `npm run build` emits the host twice: the readable `build/host` (144 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (88 KB, ~20 KB gzipped) for shipping. The doc-comment density is high enough that a small dependency-free comment stripper (`scripts/minify.mjs`, with every emitted file gated through `node --check`) cuts ~40% of the source size — no bundler, no new dependencies. The host figure in the table above is the shipped, minified build.
 
@@ -892,13 +893,13 @@ A signed `chat.text` message arriving at a fully bootstrapped node, traced throu
 
 1. **Host receives bytes** from the transport, copies them into kernel memory, calls `kernel.dispatch(ptr, len)`.
 2. **Kernel `dispatch`**: `len ≤ 65536` ✓; parse succeeds with `magic=SD`, `version=01`. Look up `handlers[<signature name>]` → found (installed by `SetHandler` at bootstrap). Call `invoke_handler(...)`.
-3. **Host `invoke_handler`** routes to the signature handler, copies the payload into signature module memory, calls `signature.handle_signature(ptr, len)`.
-4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Build the verify request `[signer_len=32][<keyA>][sig_len=64][sig][DOMAIN_env ‖ 0x0000 ‖ 0x0020 ‖ <keyA> ‖ inner_envelope_bytes]` — the fields are length-prefixed with no op selector (§6.6), and the last field is the signed preimage as `data` (`0x0020` is `signer_len` = 32, §6.3) — and `kernel.call(genesis suite slot, …)`; the reference host services that slot with libsodium's `ed25519_verify`. Response is `[01]` (valid). **Push `(0, <keyA>)` onto the signer stack.** Stash inner bytes. Return 1.
-5. **Host re-enters the kernel** with the inner bytes: `kernel.dispatch(innerPtr, innerLen)`.
+3. **Host `invoke_handler`** routes to the signature handler, stages the payload in its scratch region, calls `signature.handle(len)` (the standard §4 scratch ABI).
+4. **Signature handler**: Parse `algo_id=0` → genesis. `signer_len=32` matches Ed25519. Build the verify request `[signer_len=32][<keyA>][sig_len=64][sig][DOMAIN_env ‖ 0x0000 ‖ 0x0020 ‖ <keyA> ‖ inner_envelope_bytes]` — the fields are length-prefixed with no op selector (§6.6), and the last field is the signed preimage as `data` (`0x0020` is `signer_len` = 32, §6.3) — and `kernel.call(genesis suite slot, …)`; the reference host services that slot with libsodium's `ed25519_verify`. Response is `[01]` (valid). The handler writes `[algo_id=0x0000][signer_len=32][<keyA>][inner_envelope_bytes]` back into its scratch and returns that length. It holds no state.
+5. **Host reads that output**, pushes `(0, <keyA>)` onto the (host-owned) signer stack, and re-enters the kernel with the inner bytes: `kernel.dispatch(innerPtr, innerLen)`.
 6. **Kernel `dispatch`** (recursive): parse succeeds, look up `handlers[chat.text@keyA]` → found (installed earlier by the installer). Call `invoke_handler(...)`.
 7. **Host `invoke_handler`** routes to keyA's chat handler WASM instance. Copy payload `"hello, world"` into the chat module's scratch region. Call `chat.handle(12)`.
 8. **Chat handler** reads from scratch, prints (or appends to a buffer), returns `0` (no response). Inbound dispatch ignores the response.
-9. **Inner dispatch returns**, host calls `signature.pop_signer()` — stack is now empty.
+9. **Inner dispatch returns**, host pops the signer stack — now empty.
 10. **Outer `dispatch` returns** to the host. Done.
 
 If the chat handler had wanted to know *who sent this*, it would have called `kernel.call(signature.signer, [])` between steps 7 and 8 and received `[01] [00 00] [00 20] [<keyA pubkey>]` — count=1, algo_id=0, pubkey_len=32 (u16 BE), 32 pubkey bytes.
