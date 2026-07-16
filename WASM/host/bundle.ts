@@ -1,10 +1,10 @@
-// The app bundle format (README §13.4). A bundle is *signed
+// The app bundle format (README §12.4). A bundle is *signed
 // content* the generic shell loads from a file: a set of WASM handler modules, a
 // zero-authority guest program, and a signed manifest declaring the op catalog +
 // the capabilities the bundle needs. The shell verifies the manifest signature,
 // governs it against its policy (author + module hashes), and installs the
 // modules; the manifest's `caps` describe the seam the app's guest is wired
-// over — honored by the generic cap bridge (README §13.2).
+// over — honored by the generic cap bridge (README §12.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
 // (its build-bundle script). On disk a bundle is a directory:
@@ -15,7 +15,7 @@
 //
 // The manifest commits to every module's genesisHash and the shell verifies the
 // bytes against it, so the loader installs the verified module directly under its
-// declared kernel name (§13.4) — there is no separate per-module install envelope.
+// declared kernel name (§12.4) — there is no separate per-module install envelope.
 // A live update over the relay is an ordinary signed §7.2 install (the wire path).
 
 import { concatBytes, toHex } from "./util.js";
@@ -26,17 +26,17 @@ export interface BundleModule {
   /** The module's filename within the bundle (`<name>.wasm`). */
   file: string;
   /** genesisHash(wasm) hex — content integrity for the .wasm file, and the
-   *  module's `bytes_hash` in the synthesized install record (§7.1, §13.4). */
+   *  module's `bytes_hash` in the synthesized install record (§7.1, §12.4). */
   hash: string;
   /** Kernel name the loader binds the module at via SetHandler
    *  (deriveBootstrapName/deriveScopedName hex). The manifest is the authoritative
-   *  source of the bind name now that modules install directly (§13.4). */
+   *  source of the bind name now that modules install directly (§12.4). */
   kernelName: string;
 }
 
 export interface BundleManifest {
   app: string;
-  /** Monotonic version of the coherent set (README §13.4). Enforced at load against
+  /** Monotonic version of the coherent set (README §12.4). Enforced at load against
    *  a persisted per-`(author, app)` high-water mark: a load whose `version` is below
    *  the mark is refused as a downgrade. An integer, not a label. */
   version: number;
@@ -63,11 +63,11 @@ export interface ManifestCrypto {
 const PK_LEN = 32;
 const SIG_LEN = 64;
 
-// Domain-separation prefix for the manifest signature (README §13.4, §17.1):
+// Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // `"seedkernel-manifest-sig-v1\0"`. Prepended to the manifest JSON before
 // signing/verifying, never stored in the envelope — the disjoint prefix means a
 // manifest signature can never double as an envelope-wrapper (DOMAIN_env, §6.3)
-// or channel-handshake (DOMAIN, §13.6) signature over the same bytes.
+// or channel-handshake (DOMAIN, §12.6) signature over the same bytes.
 const DOMAIN_MANIFEST = new TextEncoder().encode("seedkernel-manifest-sig-v1\0");
 
 /** Canonical manifest bytes. The signed envelope carries these verbatim, and the

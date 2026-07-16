@@ -34,7 +34,7 @@ func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
 // buildInstall wraps a §7.2 install payload — [seq u32][nameLen u8][name][wasm] — in
 // an author-signed envelope routed to the install handler. This is the live-update
 // wire path (§7.2, onInstall); bundles no longer carry per-module install envelopes
-// (they install directly, §13.4). No cap block — capabilities are not install-declared.
+// (they install directly, §12.4). No cap block — capabilities are not install-declared.
 func buildInstall(priv ed25519.PrivateKey, pub, kernelName, wasm []byte, seq uint32) []byte {
 	payload := make([]byte, 0, 4+1+len(kernelName)+len(wasm))
 	var s [4]byte
@@ -46,7 +46,7 @@ func buildInstall(priv ed25519.PrivateKey, pub, kernelName, wasm []byte, seq uin
 	return sign(priv, pub, name("install"), payload)
 }
 
-// writeTestBundle assembles a minimal signed bundle directory (README §13.4) in a fresh
+// writeTestBundle assembles a minimal signed bundle directory (README §12.4) in a fresh
 // temp dir: one forwarder module + a stub guest, under an author-signed manifest at the
 // given (app, version). Returns the dir and the module's raw kernel name. Requires boot()
 // first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle.
@@ -83,7 +83,7 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		t.Fatal(err)
 	}
 	// Manifest envelope: [author_pk 32][sig 64][json]. The Ed25519 detached sig is over
-	// DOMAIN_manifest ‖ json (§13.4) — the prefix is signed but not stored in the envelope.
+	// DOMAIN_manifest ‖ json (§12.4) — the prefix is signed but not stored in the envelope.
 	sig := ed25519.Sign(priv, append([]byte("seedkernel-manifest-sig-v1\x00"), mjson...))
 	menv := append(append(append([]byte{}, pub...), sig...), mjson...)
 

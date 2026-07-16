@@ -42,7 +42,7 @@ func TestShellRunsBundle(t *testing.T) {
 // TestWireInstall drives the live-update wire path (README §7.2): a signed install
 // envelope dispatched through the pipeline reaches onInstall, clears the permissive
 // default policy, and binds the module. This path stays after bundles moved to direct
-// installs (§13.4), so it keeps its own coverage here.
+// installs (§12.4), so it keeps its own coverage here.
 func TestWireInstall(t *testing.T) {
 	boot()
 	author, authorPub := testAuthor(t)

@@ -15,7 +15,7 @@
 // no host-driven step loop. The same `quickjs.wasm` is hosted by JSC here
 // (Node/Bun) and by WAMR in the native engine later — one artifact for both
 // runtimes (the runtime split). An app builds its own guest confinement on top
-// of this generic primitive (README §13.3).
+// of this generic primitive (README §12.3).
 //
 // A second factory, `createSyncSafeRealm`, runs the *non-Asyncify* QuickJS build:
 // same ABI, but `host.call` resolves synchronously with no stack unwind. It exists

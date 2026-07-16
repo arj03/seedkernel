@@ -1,5 +1,5 @@
 // host.js — seedkernel host orchestration, run inside QuickJS by the Go loader.
-// This is the REUSABLE layer (installer §7 + bundle verification §13); the Go
+// This is the REUSABLE layer (installer §7 + bundle verification §12); the Go
 // loader is only a bridge — `bridge.*` exposes byte-level primitives into the
 // wasm runtime, which QuickJS cannot touch directly. Same logic as
 // host/installer.ts and host/bundle.ts; future host logic is written once, here.
@@ -79,11 +79,11 @@ globalThis.onInstall = function (payloadBuf) {
   records.set(hex(name), { algo: author.algo, pk: author.pk, hash });
 };
 
-// bundleAuthor is the {algo, pk} of the last verified manifest (§13.4), stashed by
+// bundleAuthor is the {algo, pk} of the last verified manifest (§12.4), stashed by
 // verifyBundle so installModule can synthesize each module's record under it.
 let bundleAuthor = null;
 
-// installModule installs a manifest-verified bundle module directly (README §13.4),
+// installModule installs a manifest-verified bundle module directly (README §12.4),
 // synthesizing the install record with the MANIFEST author — no per-module .install
 // envelope, no seq. The bundle's signed manifest already committed to the module's
 // genesisHash (Go verified the bytes before calling this), so the second signature
@@ -102,9 +102,9 @@ globalThis.installModule = function (kernelNameHex, wasmBuf) {
   return true;
 };
 
-// ── Bundle verification (README §13.4) ───────────────────────────────────
+// ── Bundle verification (README §12.4) ───────────────────────────────────
 
-// Domain-separation prefix for the manifest signature (README §13.4, §17.1):
+// Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // "seedkernel-manifest-sig-v1\0". Prepended to the JSON before verifying, never
 // stored in the envelope — mirrors host/bundle.ts. The disjoint prefix keeps a
 // manifest signature from doubling as an envelope-wrapper or channel-handshake
@@ -119,14 +119,14 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
   const env = new Uint8Array(manifestEnvBuf);
   if (env.length < 96) return "ERROR: manifest too short";
   const author = env.slice(0, 32), sig = env.slice(32, 96), json = env.slice(96);
-  // Verify over DOMAIN_manifest ‖ json (§13.4); the prefix is signed, not stored.
+  // Verify over DOMAIN_manifest ‖ json (§12.4); the prefix is signed, not stored.
   const preimage = new Uint8Array(DOMAIN_MANIFEST.length + json.length);
   preimage.set(DOMAIN_MANIFEST, 0);
   preimage.set(json, DOMAIN_MANIFEST.length);
   // sodium.* reads its args via JsTypedArrayToGo, which copies and leaves the source
   // intact, so `author`/`json` survive for the policy check + parsing below.
   if (!sodium.crypto_sign_verify_detached(sig, preimage, author)) return "ERROR: bad manifest signature";
-  if (policy && !policy.authors.has(hex(author))) return "ERROR: manifest author not in policy"; // §13.4 bundle governance
+  if (policy && !policy.authors.has(hex(author))) return "ERROR: manifest author not in policy"; // §12.4 bundle governance
   let s = "";
   for (let i = 0; i < json.length; i++) s += String.fromCharCode(json[i]); // manifest is ASCII
   const m = JSON.parse(s);
@@ -137,7 +137,7 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
   }
   if (sha(files[m.guest.file]) !== m.guest.hash.toLowerCase()) return "ERROR: guest hash mismatch";
 
-  // Freshness key material (§13.4): version is an enforced monotonic integer.
+  // Freshness key material (§12.4): version is an enforced monotonic integer.
   if (!Number.isInteger(m.version)) return "ERROR: manifest version must be an integer";
 
   // Stash the manifest author (Ed25519 genesis key) so installModule can synthesize

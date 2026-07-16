@@ -47,7 +47,7 @@ async function runBenchmark() {
   print("Loading WASM modules...");
   const mk = await loadKernelHost("../build/kernel.wasm", "../build/signature.wasm", sodium);
 
-  // Bootstrap: just the signature wrapper (README §10). The benchmark
+  // Bootstrap: just the signature wrapper (README §9). The benchmark
   // registers its receiver host-side via mk.register, so no installer is
   // needed — host-side handlers carry no install record, see §3.1.
   mk.registerSignature(mk.deriveBootstrapName("signature"));

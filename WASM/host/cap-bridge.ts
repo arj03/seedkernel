@@ -10,7 +10,7 @@
 //
 // This is what lets the seedkernel shell run an arbitrary signed guest: it
 // constructs a cap-bridge from kernel primitives it already holds (README
-// §13.2). A host-side caller that holds the same primitives constructs the
+// §12.2). A host-side caller that holds the same primitives constructs the
 // identical bridge, so output orchestrated through the confined guest is
 // byte-compatible with a host-side reference path.
 
@@ -19,7 +19,7 @@ import type { PeerId } from "./net.js";
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "./util.js";
 import type { SafeRealmBridge } from "./safe-js.js";
 
-/** The generic op catalog — the seam ABI (README §13.2). `capPreamble()` injects
+/** The generic op catalog — the seam ABI (README §12.2). `capPreamble()` injects
  *  these as `const CAP_X = n;` into the guest, and the bridge switch reads them
  *  here, so guest and host can never drift. The numbers are a shared guest↔host
  *  identifier regenerated with the preamble — never a wire value between nodes — so
@@ -78,13 +78,13 @@ export const CAP_DOMAINS = {
 
 export type CapDomain = keyof typeof CAP_DOMAINS;
 
-/** Domain-separation prefix for guest-obtainable signatures (README §13.2, §17.1).
+/** Domain-separation prefix for guest-obtainable signatures (README §12.2, §16.1).
  *  Prepended before signing, never transmitted. Disjoint from DOMAIN_env / DOMAIN_
  *  manifest / the channel DOMAIN, so no guest-obtained signature can verify in any
  *  other protocol context. */
 const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
 
-/** The host-derived scope the SIGN op binds every guest signature to (README §13.2):
+/** The host-derived scope the SIGN op binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
  *  and two bundles derive disjoint scopes. Every node running the same bundle derives
@@ -101,7 +101,7 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
 
 /** The full scoped-signature *prefix* the SIGN op prepends to a guest message before
  *  signing: `DOMAIN_guest ‖ scope`. Exported so a host-side signer/verifier in another
- *  package (e.g. seedstore's out-of-band descriptor signing, README §13.2) reconstructs the
+ *  package (e.g. seedstore's out-of-band descriptor signing, README §12.2) reconstructs the
  *  byte-identical preimage `guestSignPrefix(scope) ‖ msg` WITHOUT mirroring the domain
  *  tag — if this string ever revs, every such verifier revs with it instead of silently
  *  diverging. `scope` comes from `guestSignScope(author, app)`. */
@@ -145,13 +145,13 @@ export interface CapTransport {
 /** Everything a cap-bridge needs — all kernel primitives, zero app knowledge. */
 export interface CapBridgeDeps {
   sodium: CapSodium;
-  /** This node's kernel keypair (README §13.1): SIGN signs as it, IDENTITY
+  /** This node's kernel keypair (README §12.1): SIGN signs as it, IDENTITY
    *  returns its pk. SIGN is a signing oracle under this key but a *scoped* one —
    *  it prepends `DOMAIN_guest ‖ signScope` so a guest never obtains a raw
-   *  node-key signature (README §13.2, §15). */
+   *  node-key signature (README §12.2, §14). */
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
   /** The host-derived signing scope `author_pk ‖ app_len u8 ‖ app` from the admitted
-   *  manifest (README §13.2, `guestSignScope`). SIGN binds every guest signature to
+   *  manifest (README §12.2, `guestSignScope`). SIGN binds every guest signature to
    *  `DOMAIN_guest ‖ signScope ‖ msg`; without it SIGN is unavailable (guest signing
    *  is never raw). A host-side caller that never exposes SIGN may omit it. */
   signScope?: Uint8Array;
@@ -165,9 +165,9 @@ export interface CapBridgeDeps {
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
   /** The allowed op set, expanded from the manifest's declared cap domains
-   *  (README §13.2, `opsForCaps` — not from `ops`, which is documentation-only).
+   *  (README §12.2, `opsForCaps` — not from `ops`, which is documentation-only).
    *  When present, any op outside the set is refused — the guest analogue of the
-   *  §9 bridge check. Omitted = unrestricted (a trusted host-side caller that
+   *  §8 bridge check. Omitted = unrestricted (a trusted host-side caller that
    *  holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
@@ -222,7 +222,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         return sodium.crypto_stream_xchacha20_xor(payload.slice(56), nonce, key);
       }
       case CAP.SIGN: {
-        // Scoped, never raw (README §13.2, §15): the host signs
+        // Scoped, never raw (README §12.2, §14): the host signs
         // `DOMAIN_guest ‖ scope ‖ msg`, so a guest signature can never verify as an
         // envelope wrapper, manifest, or channel AUTH, nor in another app's scope.
         if (!deps.signScope) throw new Error("cap-bridge: SIGN needs a bundle scope (guest signing is never raw)");

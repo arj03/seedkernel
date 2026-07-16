@@ -1,5 +1,5 @@
 // net-route.ts — the platform-agnostic routing core of a real Network (README
-// §13.6). It owns NO sockets: links/connecting/inbound/addrs, the PeerLink
+// §12.6). It owns NO sockets: links/connecting/inbound/addrs, the PeerLink
 // handshake wiring, the deterministic double-connect rule, frame delivery and
 // readiness all live here, and channel creation is injected as a ChannelFactory.
 //

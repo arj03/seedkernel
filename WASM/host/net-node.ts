@@ -24,7 +24,7 @@ export type { PeerAddr } from "./net-route.js";
 // The WS codec (net-frame.ts) runs over the WebAssembly ws.wasm on this target.
 installWasmWsBackend();
 
-// One wire-visible frame cap for both node↔node transports (§13.6, §17.1): the
+// One wire-visible frame cap for both node↔node transports (§12.6, §16.1): the
 // TCP length prefix is checked against it before the body is buffered, and the WS
 // codec caps identically, so a frame that crosses one crosses the other.
 

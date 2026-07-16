@@ -1,16 +1,16 @@
-// seedkernel-shell — the generic runtime entry (README §13).
+// seedkernel-shell — the generic runtime entry (README §12).
 // It boots the kernel under an install policy and serves; it knows nothing about
 // storage or any other app. Everything an app needs arrives as signed installs
 // that must clear the --policy gate. The runtime offers raw-byte capabilities —
 // crypto (the bundled sumo), fs.* on --dir, net.* on --listen — and the safe-js
 // confinement host, wired to a bundle's declared cap domains when one loads
-// (§13.4); the kernel itself stays application-neutral.
+// (§12.4); the kernel itself stays application-neutral.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 --install ./codec.install,./reputation.install
 //
 // For a self-contained non-browser binary, the Go/native target (native/,
-// README §13.9) embeds and runs this same shared host JS — no Node install needed.
+// README §12.9) embeds and runs this same shared host JS — no Node install needed.
 
 import { readFile } from "node:fs/promises";
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
@@ -44,7 +44,7 @@ export interface ShellOptions extends KernelWasm {
   policyJson?: string;
   /** Directory backing the fs.* capability. */
   dir: string;
-  /** This node's kernel keypair (README §13.6). */
+  /** This node's kernel keypair (README §12.6). */
   identity: Identity;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
@@ -90,19 +90,19 @@ export interface Shell {
   loadBundle(dir: string): LoadedBundle;
   /** Run a loaded bundle's guest entrypoint (e.g. put/get/repair) through a
    *  generic cap-bridge over the kernel's primitives. Load a bundle first. This
-   *  is "the shell runs the app" (README §13.7). */
+   *  is "the shell runs the app" (README §12.8). */
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   /** Serve the app's request side: build a *synchronous* confined realm from the
    *  loaded guest and route incoming transport requests to its `handle`
    *  entrypoint. The sync realm answers from local fs + crypto without yielding,
    *  so it can respond while the async `runGuest` realm is parked mid-await — this
    *  is how the runtime becomes a holder with no app-specific host code
-   *  (README §13.7). Idempotent; load a bundle first. */
+   *  (README §12.8). Idempotent; load a bundle first. */
   serveAsHolder(): Promise<void>;
   close(): void;
 }
 
-/** The persisted bundle-freshness high-water mark per `(author, app)` (README §13.4).
+/** The persisted bundle-freshness high-water mark per `(author, app)` (README §12.4).
  *  Host-local state that survives reboots, so an older signed bundle directory cannot
  *  silently replace a newer one — the guest is loaded wholesale from the directory at
  *  every boot and carries no `seq` of its own. */
@@ -116,7 +116,7 @@ export interface FreshnessStore {
 /** A `FreshnessStore` backed by one JSON file (`{ "authorHex:app": version }`). Kept
  *  *outside* the guest-writable fs directory (a sibling file), so a `fs`-capable guest
  *  cannot tamper with its own freshness mark. An operator rolls back by deleting or
- *  lowering it out of band (the operator is the TCB, README §15). */
+ *  lowering it out of band (the operator is the TCB, README §14). */
 export class FileFreshnessStore implements FreshnessStore {
   private readonly marks = new Map<string, number>();
   constructor(private readonly path: string) {
@@ -141,7 +141,7 @@ export class FileFreshnessStore implements FreshnessStore {
     // a directory on POSIX; ReplaceFile semantics on Windows). A bare writeFileSync
     // truncates the file in place, so a crash mid-write could leave truncated JSON — which
     // the constructor's catch would silently read as "start empty", discarding the entire
-    // downgrade-protection mark set on the next boot (README §13.4). Rename swaps the whole
+    // downgrade-protection mark set on the next boot (README §12.4). Rename swaps the whole
     // file in one step, so a reader only ever sees the old or the complete new contents.
     const tmp = `${this.path}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(obj));
@@ -212,7 +212,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
       fs: caps.has("fs") ? fs : undefined,   // only hand over the fs backend if declared
       now: () => Date.now(),
       allowedOps: opsForCaps(caps),
-      // Scope the guest's SIGN op to this bundle's namespace (README §13.2): the host
+      // Scope the guest's SIGN op to this bundle's namespace (README §12.2): the host
       // signs `DOMAIN_guest ‖ scope ‖ msg`, never the raw node key over guest bytes.
       signScope: guestSignScope(b.author, b.manifest.app),
     });
@@ -258,7 +258,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
  *  require its author to be in the policy, enforce version freshness, integrity-check
  *  each module against its declared content hash, install each verified module directly
  *  under its declared kernel name (synthesizing the record with the manifest author,
- *  under the same install policy — §13.4), and integrity-check the guest. Returns the
+ *  under the same install policy — §12.4), and integrity-check the guest. Returns the
  *  parsed manifest + guest source + which modules registered. */
 export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, dir: string, freshness?: FreshnessStore): LoadedBundle {
   const env = new Uint8Array(readFileSync(join(dir, "manifest.bundle")));
@@ -267,7 +267,7 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   if (!policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
     throw new Error("bundle: manifest author is not in the policy's allowed set");
   }
-  // Freshness (README §13.4 step 3): the `version` is an enforced monotonic integer
+  // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
   // (verifyManifest already shape-checked it). Refuse a load below the persisted
   // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
   // the mark. Equal versions reload (an ordinary reboot re-reads the same directory);
@@ -282,7 +282,7 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
     // and the guest have integrity-checked and installed — not here. See below.
   }
   const gh = (b: Uint8Array) => host.genesisHash(b);
-  // Verify everything, then land anything (README §13.4 "mismatch ⇒ reject; nothing
+  // Verify everything, then land anything (README §12.4 "mismatch ⇒ reject; nothing
   // has landed"). Read + integrity-check every module and the guest FIRST, holding
   // the verified bytes in memory; only once the whole set checks out do we install.
   // A mismatch anywhere throws before any SetHandler runs, so a bad file can never
@@ -299,7 +299,7 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   }
   // Everything integrity-checked — install the verified bytes. Each module lands
   // directly under its kernel name, synthesizing the install record with the manifest
-  // author (§13.4). No per-module `.install` envelope means no 64 KB envelope cap and
+  // author (§12.4). No per-module `.install` envelope means no 64 KB envelope cap and
   // no boot-time seq — an equal-version reload just re-installs. A module the policy
   // refuses does not abort the load: it is simply reported as not installed.
   const installed: string[] = [];
@@ -312,7 +312,7 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   // signed, but one module or the guest file wrong — would raise the mark to the new
   // version, then throw. Nothing runs, yet reloading the known-good older directory is now
   // refused as a downgrade until an operator hand-edits the freshness file. The mark must
-  // record the highest version that actually loaded (README §13.4).
+  // record the highest version that actually loaded (README §12.4).
   if (freshness) freshness.set(v.author, v.manifest.app, version);
   return { manifest: v.manifest, author: v.author, guestSource, installed };
 }
@@ -431,7 +431,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
     }
   }
   // One-shot client ops through the loaded guest — "the shell runs the app" as
-  // the *initiator* (README §13.7). The request (holder) side is
+  // the *initiator* (README §12.8). The request (holder) side is
   // served below once we start listening, from the same confined guest.
   // The shell stays application-neutral: arguments cross as raw bytes (hex
   // tokens joined by ':') and responses come back as raw bytes — any structure
@@ -454,7 +454,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   if (!serving) { shell.close(); return; }
   // A serving node with an app loaded also *holds* for the cohort: route incoming
   // requests to the app's confined request side (HAVE/OFFER/STORE/FETCH for
-  // storage), with no app-specific host code in the runtime (README §13.7).
+  // storage), with no app-specific host code in the runtime (README §12.8).
   if (args["bundle"]) {
     await shell.serveAsHolder();
     console.log("  holder serving the app's request side from the confined guest");

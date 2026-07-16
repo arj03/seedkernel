@@ -7,7 +7,7 @@ import (
 )
 
 // The bundle-freshness high-water mark must survive a reboot: it is persisted to a file
-// and re-read into an empty in-memory map at next boot (README §13.4). This exercises the
+// and re-read into an empty in-memory map at next boot (README §12.4). This exercises the
 // persist → forget → reload path directly on checkBundleFreshness/advanceBundleFreshness,
 // so a regression that dropped the write (or left it non-atomic and unreadable) shows up
 // as a downgrade that is wrongly allowed after the "reboot".

@@ -33,10 +33,10 @@ export const GENESIS_SECRET_KEY_LEN = 64;
 // Slot names are plain ASCII, not genesis-hash-derived (§5.1), so the signature
 // module builds the same name itself and reaches the suite by plain kernel.call.
 // The genesis suite (Ed25519 + SHA-3-256, algo_id 0x0000) is seeded at that slot
-// by the host at bootstrap and serviced with the bundled libsodium (§6.2, §14).
+// by the host at bootstrap and serviced with the bundled libsodium (§6.2, §13).
 const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
 
-// README §6.3 / §17.1: the envelope-signature domain prefix. The signed preimage is
+// README §6.3 / §16.1: the envelope-signature domain prefix. The signed preimage is
 // `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (signer is length-
 // prefixed so the preimage is self-delimiting); the prefix is prepended before
 // signing/verifying but never transmitted, so a signature harvested in one context
@@ -361,7 +361,7 @@ export class KernelHost {
    *  dispatch, or a host/guest-originated frame) returns the single byte
    *  [0x00] (name_len = 0). Only the immediate caller is ever exposed — the
    *  deeper chain is deliberately unreachable so a handler cannot treat a
-   *  non-immediate frame as authoritative (§4.2, §9). */
+   *  non-immediate frame as authoritative (§4.2, §8). */
   private _serializeImmediateCaller(): Uint8Array {
     const n = this.callerStack.length ? this.callerStack[this.callerStack.length - 1] : null;
     if (!n) return new Uint8Array([0]);
@@ -588,7 +588,7 @@ export class KernelHost {
    *  pipeline (or by a host/guest-originated frame). Host-side equivalent of
    *  the kernel.caller WASM import (§4.2). Only the immediate caller is exposed;
    *  the deeper chain is deliberately unreachable so a bridge cannot authorize
-   *  on a non-immediate frame (§9). */
+   *  on a non-immediate frame (§8). */
   get currentCaller(): Uint8Array | null {
     if (this.callerStack.length === 0) return null;
     return this.callerStack[this.callerStack.length - 1] ?? null;
@@ -602,13 +602,13 @@ export class KernelHost {
   }
 
   /** Install a bundle module directly under its manifest-declared kernel name
-   *  (README §13.4). The signed manifest already authenticated the coherent set
+   *  (README §12.4). The signed manifest already authenticated the coherent set
    *  and pinned each module's content hash, so the loader installs verified bytes
    *  here rather than dispatching a redundant per-module `.install` envelope —
    *  lifting the §2.2 64 KB envelope cap for bundled modules and removing the
    *  boot-time `seq` re-dispatch. The install record's author is the manifest
-   *  `authorPubKey` (an Ed25519 genesis key, §13.4); the same install policy still
-   *  gates it (§13.4 "two gates"). Returns true on success, false if no installer
+   *  `authorPubKey` (an Ed25519 genesis key, §12.4); the same install policy still
+   *  gates it (§12.4 "two gates"). Returns true on success, false if no installer
    *  is wired or the policy refuses. */
   installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     if (!this._installer) return false;
@@ -622,7 +622,7 @@ export class KernelHost {
 
   /** Host-level handler management (README §3.1). Installs or replaces a
    *  handler unconditionally. SetHandler-installed handlers are immune to
-   *  installer state by construction (§9) — any matching install record
+   *  installer state by construction (§8) — any matching install record
    *  is cleared as a side effect. */
   setHandler(name: Uint8Array, handlerId: number): void {
     // Bind an already-registered id under `name`, displacing whatever was there.
@@ -666,11 +666,11 @@ export class KernelHost {
    *
    *  The wrapper is an ordinary scratch-ABI WASM handler (§4) — the host
    *  instantiates it and SetHandler-seeds it here, like any bootstrap handler
-   *  (§10). It is privileged only in that the host recognizes its id and drives
+   *  (§9). It is privileged only in that the host recognizes its id and drives
    *  the signer-stack lifecycle around its output (_handleSignature), never in its
    *  ABI. Being SetHandler-seeded with no install record, the reference policy
    *  refuses to overlay it (§6.4) and the host keeps the emergency-replacement
-   *  path (§10.1). Blocked from `kernel.call` (§4.4): the wrapper establishes the
+   *  path (§9.1). Blocked from `kernel.call` (§4.4): the wrapper establishes the
    *  top signer, so letting a handler invoke it would let it reframe the active
    *  signer mid-chain. */
   registerSignature(signatureName: Uint8Array): void {
@@ -797,7 +797,7 @@ export class KernelHost {
     if (!entry || entry.blocked) return null;
     if (this.callDepth >= MAX_CALL_DEPTH) return null;
     // Push an anonymous caller frame so the target (and any bridge doing the
-    // §9 caller-pinning check) sees "no installed caller" rather than a stale
+    // §8 caller-pinning check) sees "no installed caller" rather than a stale
     // frame from an outer dispatch — the host/guest caller has no kernel name.
     this.callerStack.push(null);
     this.callDepth++;

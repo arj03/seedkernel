@@ -1,4 +1,4 @@
-// Channel identity binding + forward-secret record layer (README §13.6). A real
+// Channel identity binding + forward-secret record layer (README §12.6). A real
 // socket carries no trustworthy "from" field, so before a connection is allowed
 // to deliver frames it runs a mutual challenge/response that proves each end
 // holds the kernel private key for the public key it claims, and — in the same
@@ -37,7 +37,7 @@
 
 import { concatBytes, toHex, writeU32BE } from "./util.js";
 
-/** A peer identity — the node's kernel ed25519 keypair (README §13.6). */
+/** A peer identity — the node's kernel ed25519 keypair (README §12.6). */
 export interface Identity {
   publicKey: Uint8Array;
   privateKey: Uint8Array;
@@ -78,12 +78,12 @@ const PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const HELLO_LEN = PK_LEN + NONCE_LEN + EPH_LEN;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
 const DOMAIN_CHANNEL = new TextEncoder().encode("seedkernel-channel-id-v1\0");
-// Directional session-key labels (README §13.6): the `lo` end encrypts with
+// Directional session-key labels (README §12.6): the `lo` end encrypts with
 // k_lo→hi and decrypts with k_hi→lo; the `hi` end mirrors. Distinct constants so
 // the two directions never share a key.
 const LABEL_LO2HI = new TextEncoder().encode("seedkernel-session-lo->hi-v1\0");
 const LABEL_HI2LO = new TextEncoder().encode("seedkernel-session-hi->lo-v1\0");
-// Hard cap on one link frame, matching §17.1; the transports enforce it on the
+// Hard cap on one link frame, matching §16.1; the transports enforce it on the
 // length prefix (TCP) / frame length (WS) before buffering. Exported so every
 // transport caps identically — a frame that crosses one crosses the other.
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
@@ -274,7 +274,7 @@ export class PeerLink {
   }
 
   /** Compute the ephemeral–ephemeral DH and derive the two directional session
-   *  keys from it and the transcript hash (README §13.6). The canonical lo/hi
+   *  keys from it and the transcript hash (README §12.6). The canonical lo/hi
    *  ordering picks which key encrypts and which decrypts. */
   private deriveSession(): void {
     const dh = this.sodium.crypto_scalarmult(this.myEph.privateKey, this.peerEph!);

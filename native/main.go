@@ -1,6 +1,6 @@
 // seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive as
-// signed bundles (README §13) — nothing application-specific lives here. Host
-// orchestration (installer §7, bundle verification §13) is JavaScript in QuickJS
+// signed bundles (README §12) — nothing application-specific lives here. Host
+// orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS
 // (host.js); this Go layer is only the bridge: loads the genesis wasm, supplies the
 // genesis crypto (Ed25519 + SHA-3), owns the signer stack and drives the signature
 // lifecycle (§6.5) around the stateless signature handler, and exposes byte
@@ -76,7 +76,7 @@ var (
 // enforced host-side because the signer stack lives here.
 const maxSigDepth = 4
 
-// maxCallDepth caps kernel.call re-entrancy (README §11 MAX_CALL_DEPTH, §4.4).
+// maxCallDepth caps kernel.call re-entrancy (README §10 MAX_CALL_DEPTH, §4.4).
 //
 // Note there is no cross-module *size* bound here: a handler exports only its scratch
 // offset (the `scratch` global), not its scratch size, and sizes vary per handler (the RS
@@ -480,7 +480,7 @@ func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
 // its guest: the declared cap domains, the manifest config (author-signed
 // structural constants), and the verified guest source. `author` (hex) + `app` key
-// bundle freshness and derive the guest-signing scope (README §13.2, §13.4).
+// bundle freshness and derive the guest-signing scope (README §12.2, §12.4).
 type loadedBundle struct {
 	app, author string
 	version     int
@@ -492,7 +492,7 @@ type loadedBundle struct {
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
 var loaded *loadedBundle
 
-// loadBundle loads a signed app bundle directory (README §13.4): JS verifies the
+// loadBundle loads a signed app bundle directory (README §12.4): JS verifies the
 // manifest signature + module/guest content hashes, then Go installs each verified
 // module directly under its kernel name (JS installModule synthesizes the record
 // with the manifest author, under the same policy) — no per-module install envelope,
@@ -534,7 +534,7 @@ func loadBundle(dir string) string {
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
 	}
-	// Freshness (README §13.4 step 3): refuse a version below the persisted (author, app)
+	// Freshness (README §12.4 step 3): refuse a version below the persisted (author, app)
 	// high-water mark as a downgrade — nothing lands. The mark is NOT advanced here; that
 	// waits until after the installs so a partial/corrupt newer bundle can't raise it.
 	if err := checkBundleFreshness(m.Author, m.App, m.Version); err != nil {
@@ -542,7 +542,7 @@ func loadBundle(dir string) string {
 	}
 	var installed []string
 	for _, mod := range m.Modules {
-		// Install the manifest-verified bytes directly (README §13.4): JS installModule
+		// Install the manifest-verified bytes directly (README §12.4): JS installModule
 		// synthesizes the record with the manifest author and runs the same policy — no
 		// install envelope dispatched, so no seq and no 64 KB cap.
 		if res, _ := invokeFree("installModule", qc.NewString(mod.KernelName), qc.NewArrayBuffer(goFiles[mod.File])); res != nil {
@@ -564,7 +564,7 @@ func loadBundle(dir string) string {
 }
 
 // freshnessHW is the persisted per-(author, app) bundle-version high-water mark
-// (README §13.4). Held in memory, seeded from freshnessStorePath at first use and
+// (README §12.4). Held in memory, seeded from freshnessStorePath at first use and
 // written back on every advance; when the path is empty (tests) it stays purely
 // in-memory, so a fresh process starts with −∞ for every key.
 var (
@@ -590,7 +590,7 @@ func loadFreshness() {
 // mutating it: a version below the mark is a refused downgrade; an equal or newer version
 // is allowed. The mark is advanced only later, by advanceBundleFreshness, after the
 // installs land — so a partial/corrupt newer bundle that fails mid-load cannot raise the
-// mark past the last version that actually ran (README §13.4). The author hex is
+// mark past the last version that actually ran (README §12.4). The author hex is
 // fixed-length, so the "author:app" key is unambiguous.
 func checkBundleFreshness(authorHex, app string, version int) error {
 	loadFreshness()
@@ -602,7 +602,7 @@ func checkBundleFreshness(authorHex, app string, version int) error {
 }
 
 // advanceBundleFreshness records `version` as the new (author, app) high-water mark and
-// persists it, called only after a bundle has fully loaded (README §13.4). Monotonic: an
+// persists it, called only after a bundle has fully loaded (README §12.4). Monotonic: an
 // equal or lower version never rewinds the mark. Persistence is atomic (temp file + rename,
 // mirroring fs.go's put) so a crash mid-write can never truncate the JSON — which
 // loadFreshness would silently read as empty, discarding every downgrade mark on the next
@@ -823,7 +823,7 @@ func main() {
 	// The signed bundle: verify + install its modules, capture its guest. Every invocation
 	// targets a bundle (there is always a --bundle / default dir), so a load error is fatal:
 	// the node has no app to run or serve. Exit non-zero rather than keep serving as a silent
-	// bundle-less relay, which would hide the failure from a driving script (§13.4).
+	// bundle-less relay, which would hide the failure from a driving script (§12.4).
 	// Persist the freshness high-water mark in a sibling of the data dir, so a
 	// fs-capable guest (whose keys are files *inside* the dir) can never tamper with it.
 	freshnessStorePath = filepath.Clean(a.dataDir) + ".freshness.json"
@@ -853,7 +853,7 @@ func main() {
 		defer g.close()
 
 		// One-shot client ops through the loaded guest — "the shell runs the app" as
-		// the initiator (README §13.7). Arguments/results cross as raw bytes.
+		// the initiator (README §12.7). Arguments/results cross as raw bytes.
 		if a.put != "" {
 			data, err := os.ReadFile(a.put)
 			if err != nil {
@@ -895,7 +895,7 @@ func main() {
 		return
 	}
 	// A serving node with an app loaded also holds for the cohort: route incoming
-	// requests to the guest's confined `handle` — no app-specific host code (§13.7).
+	// requests to the guest's confined `handle` — no app-specific host code (§12.7).
 	if g != nil {
 		wireHolder(qc, g)
 		fmt.Println("  holder serving the app's request side from the confined guest")

@@ -1,4 +1,4 @@
-// capbridge.go — wires the shared cap-bridge (host/cap-bridge.ts, README §13.2)
+// capbridge.go — wires the shared cap-bridge (host/cap-bridge.ts, README §12.2)
 // into the host realm. cap-bridge.ts is reused verbatim: it is the single
 // capability funnel the confined guest reaches through `host.call(op, bytes)`. It
 // runs in the HOST realm (where sodium/fs/transport live) so the guest realm
@@ -40,7 +40,7 @@ const capBridgeGlueJS = `
   // declared domains (e.g. ["crypto","fs","net"]); only their ops resolve. identity
   // is the node keypair ({publicKey,privateKey} Uint8Arrays — sodium.crypto_sign_keypair
   // shape). transport/peers/moduleCall may be omitted for a local-only node. scope is
-  // the host-derived guest-signing scope (guestSignScope(author, app) — README §13.2);
+  // the host-derived guest-signing scope (guestSignScope(author, app) — README §12.2);
   // omit it only where SIGN is never exercised.
   globalThis.__buildCapBridge = function (caps, identity, transport, peers, moduleCall, scope) {
     globalThis.__capBridge = createCapBridge({

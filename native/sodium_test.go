@@ -65,7 +65,7 @@ func TestSodiumGenericHash(t *testing.T) {
 	}
 }
 
-// The ChaCha20-Poly1305-IETF record layer (§13.6) runs on native Go, not libsodium
+// The ChaCha20-Poly1305-IETF record layer (§12.6) runs on native Go, not libsodium
 // (sodium.go header). Every node's frames must open on every peer's link, so native
 // ciphertext MUST be byte-identical to libsodium's. RFC 8439 is byte-exact, so it is —
 // pinned three ways: a round-trip + tamper/wrong-key check of the no-AAD wrapper, KATs

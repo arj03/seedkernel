@@ -10,7 +10,7 @@ import (
 	"seedloader/qjs"
 )
 
-// serveAsHolder (README §13.7): a node answers a peer's request from its
+// serveAsHolder (README §12.7): a node answers a peer's request from its
 // confined guest's synchronous `handle`, with no app-specific host code. This wires
 // the whole stack together — net (real socket req/res) + cap-bridge (fs) + a
 // confined guest realm — and proves a holder: peer B stores a value at A and fetches

@@ -107,7 +107,7 @@ const engineNodeJS = `
   // Build the single cap funnel for the loaded bundle's declared domains, over this
   // node's identity + transport + cohort, with module-call routed to Go (installed
   // wasm handlers). caps is the manifest's cap array; authorHex + app derive the
-  // guest-signing scope (README §13.2), so the guest's SIGN op is bound to this
+  // guest-signing scope (README §12.2), so the guest's SIGN op is bound to this
   // bundle's namespace rather than being a raw node-key oracle.
   globalThis.__buildNodeBridge = function (caps, authorHex, app) {
     const scope = guestSignScope(fromHex(authorHex), app);
@@ -117,7 +117,7 @@ const engineNodeJS = `
 `
 
 // wireHolder routes incoming transport requests to a confined guest's `handle`
-// entrypoint — "the shell runs the app" as a holder (README §13.7). The host realm
+// entrypoint — "the shell runs the app" as a holder (README §12.7). The host realm
 // must hold the bundle's Transport at globalThis.__transport. The guest answers
 // synchronously from local fs + crypto, so onRequest gets bytes back immediately.
 func wireHolder(hostQc *qjs.Context, g *guestRealm) {

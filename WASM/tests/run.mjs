@@ -70,7 +70,7 @@ function makeSeq() {
 const kernelWasm = join(root, "build/kernel.wasm");
 const signatureWasm = join(root, "build/signature.wasm");
 
-// Standard bootstrap (README §10): signature handler + installer. The default
+// Standard bootstrap (README §9): signature handler + installer. The default
 // policy accepts every install; tests that need rejection override via
 // host.setApproveInstall.
 async function makeHost(approveInstall = () => true) {
@@ -504,7 +504,7 @@ async function testCallerStackFormat() {
   assert(host.isRegistered(forwarderName), "forwarder installed");
 
   // A probe handler reads its immediate caller each time it's called. Only the
-  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §9).
+  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §8).
   const probeName = host.deriveBootstrapName("probe.caller");
   let seenImmediate = null;
   host.register(probeName, (_n, _payload, h) => {
@@ -531,7 +531,7 @@ async function testCallerStackFormat() {
 // ─── Test: Bridge authorizes by pinning kernel.caller ───────────────────
 
 async function testBridgeCallerPinning() {
-  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §9)");
+  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §8)");
 
   const { host, installName } = await makeHost();
 
@@ -857,7 +857,7 @@ async function testCapBridge() {
   host.register(echoName, (_n, p) => new Uint8Array([p.length, ...p]));
 
   // A host-derived signing scope binds the guest's SIGN op to a bundle namespace
-  // (README §13.2); a real node derives it from the manifest's (author, app).
+  // (README §12.2); a real node derives it from the manifest's (author, app).
   const signScope = guestSignScope(id.publicKey, "testapp");
   const bridge = createCapBridge({
     sodium, identity: id,
@@ -873,7 +873,7 @@ async function testCapBridge() {
     const key = sodium.randombytes_buf(32), nonce = sodium.randombytes_buf(24);
     assert(bytesEqual(await bridge(CAP.STREAM_XOR, concatBytes([nonce, key, msg])),
       sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "CAP_STREAM_XOR = xchacha20 keystream");
-    // CAP_SIGN is scoped, never raw (README §13.2): it signs DOMAIN_guest ‖ scope ‖ msg.
+    // CAP_SIGN is scoped, never raw (README §12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
     const sig = await bridge(CAP.SIGN, msg);
     const preimage = concatBytes([DOMAIN_GUEST, signScope, msg]);
@@ -944,7 +944,7 @@ async function testWsFraming() {
   console.log("  OK\n");
 }
 
-// ─── Test: channel identity pinning (transport §13.6) ─────────────────────
+// ─── Test: channel identity pinning (transport §12.6) ─────────────────────
 
 async function testChannelPinning() {
   console.log("Test: a connection is pinned to the peer's key — wrong key → no delivery");
@@ -1079,7 +1079,7 @@ async function testBundle() {
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
     // throwaway host to derive the kernel name and hash content. Modules install
-    // directly from the manifest (§13.4) — no per-module .install envelope.
+    // directly from the manifest (§12.4) — no per-module .install envelope.
     const { host: h } = await makeHost();
     const kernelName = h.deriveScopedName("codec", author.publicKey);
     const guestText = "register('ping', () => new Uint8Array([1]));";
@@ -1114,7 +1114,7 @@ async function testBundle() {
     assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
 
-    // Freshness (§13.4): version is an enforced monotonic high-water per (author, app).
+    // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
     // version and reloading through the same shell exercises the downgrade gate.
     const remanifest = (version) =>
@@ -1391,7 +1391,7 @@ async function testCallHandlerGuards() {
     "callHandler refuses the signature wrapper");
 
   // A normal handler still works, and sees an *empty* immediate caller — not a
-  // stale frame from some outer dispatch (the §9 confused-deputy check).
+  // stale frame from some outer dispatch (the §8 confused-deputy check).
   let sawCaller = "unset";
   const echoName = host.deriveBootstrapName("test.echo2");
   host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
@@ -2054,7 +2054,7 @@ async function testWeriftRtcNetwork() {
 
 // ─── Test: PeerLink record layer — tamper / replay / reorder tears the link down ──
 //
-// The core security property of the §13.6 record layer: after the AKE, every FRAME is
+// The core security property of the §12.6 record layer: after the AKE, every FRAME is
 // an AEAD record under a forward-secret key with an implicit monotonic counter as its
 // nonce, and any record that fails to decrypt in strict counter order tears the link
 // down. We drive two real PeerLinks over an in-memory channel pair, let the handshake
@@ -2161,7 +2161,7 @@ async function testRecordLayerIntegrity() {
 // loaded. A newer bundle whose manifest is intact and signed but whose module file is
 // corrupt (a half-landed upgrade) must fail the content check WITHOUT raising the mark —
 // otherwise reloading the known-good older directory would be refused as a downgrade,
-// bricking rollback (README §13.4).
+// bricking rollback (README §12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
   const { signManifest } = await imp("build/host/bundle.js");

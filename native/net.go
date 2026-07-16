@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const maxFrameBytes = 16 << 20 // MAX_FRAME_BYTES (§13.6, §17.1): one wire-visible frame cap
+const maxFrameBytes = 16 << 20 // MAX_FRAME_BYTES (§12.6, §16.1): one wire-visible frame cap
 
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
 // protocol is a single request/response plane — even a block upload awaits an ack per

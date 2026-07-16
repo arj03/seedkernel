@@ -1,19 +1,19 @@
-// net.send transport (README §13.6) + a request/response layer over it.
+// net.send transport (README §12.6) + a request/response layer over it.
 //
 // net.send is "addressed unicast to a peer over its data channel" and is async
 // by nature — it returns a correlation id and the host later delivers the
-// response (§13.6). This module provides:
+// response (§12.6). This module provides:
 //   - Network:   the delivery fabric. LoopbackNetwork wires nodes in-process
 //                for tests; a WebRTC/data-channel or TCP implementation (see
 //                net-node.ts) satisfies the same interface in a real deployment.
 //   - Transport: per-node request/response keyed by correlation id — a single
-//                frame plane (§13.6). Block bytes ride it too: a STORE pushes
+//                frame plane (§12.6). Block bytes ride it too: a STORE pushes
 //                bytes in a `req` body and a FETCH returns them in a `res` body,
-//                so the §13.6 record layer authenticates and encrypts them along
+//                so the §12.6 record layer authenticates and encrypts them along
 //                with every other frame. There is deliberately no separate
 //                unauthenticated bulk path.
 //
-// Frames on the wire (carried inside the §13.6 AEAD record layer):
+// Frames on the wire (carried inside the §12.6 AEAD record layer):
 //   req = [0 kind][corr u32 BE][type u8][payload ...]
 //   res = [1 kind][corr u32 BE][payload ...]   (no type — the requester matches
 //         the response to its request by corr; the type it sent is what it wanted)
@@ -109,7 +109,7 @@ export class Transport {
     readonly peerId: PeerId,
     private readonly net: Network,
     /** How long a peer may stay SILENT before a request to it is treated as
-     *  unreachable (§13.6). This is a stall bound, not an absolute deadline: any
+     *  unreachable (§12.6). This is a stall bound, not an absolute deadline: any
      *  frame arriving from the peer re-arms the clock of every request pending to
      *  it (see request()). Small in tests; a deployment tunes it against real
      *  latency. */

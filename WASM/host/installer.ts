@@ -16,7 +16,7 @@
 // The installer is a pure sink: its only wire-facing handler is the (blocked)
 // `install` mutator. Install records are read host-side via `lookup` — there is
 // no `installer.lookup` / `installer.caps_of` query message. Bridges authorize
-// their callers by pinning `kernel.caller` (README §9), not by consulting a
+// their callers by pinning `kernel.caller` (README §8), not by consulting a
 // capability index.
 //
 // Optional — deployments that don't want message-driven installation simply
@@ -26,12 +26,15 @@ import { nameKey, type Handler, type KernelHost, type Signer } from "./kernel-ho
 import { readU32BE, toHex } from "./util.js";
 
 // Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
-// algo_id is an unauthenticated outer field of the signature wrapper (README
-// §6.3); keying replay state by it would let an attacker flip algo_id to land a
-// captured message in a fresh `last_seen == 0` namespace and replay it once per
-// suite that verifies the same key (§4.4, §6.4 rotation). The signature layer
-// rejects non-canonical / small-order keys before they reach here, so equal key
-// bytes mean the same identity.
+// A public key is one identity, so its seq high-water mark must be a single
+// monotonic namespace: the same key reused across suites (§6.4 rotation) shares
+// one counter rather than getting a fresh `last_seen == 0` per algo_id that
+// would accept a replay once per suite. algo_id is folded into the signed
+// preimage now (§6.3), so it is authenticated and cannot be flipped on a
+// captured message anyway — but this keying is prior to that: replay state is a
+// property of the key, not the suite (§4.4). The signature layer rejects
+// non-canonical / small-order keys before they reach here, so equal key bytes
+// mean the same identity.
 function signerKey(pubKey: Uint8Array): string {
   return toHex(pubKey);
 }
@@ -150,7 +153,7 @@ export class Installer {
     this.installations.delete(nameKey(name));
   }
 
-  /** Install a bundle module directly (README §13.4), synthesizing its install
+  /** Install a bundle module directly (README §12.4), synthesizing its install
    *  record instead of consuming a signed install envelope. The bundle's signed
    *  manifest already authenticated the coherent set and committed to each
    *  module's `genesisHash` — the loader verified the bytes against it — so the
@@ -158,7 +161,7 @@ export class Installer {
    *  under the same policy, was redundant; this replaces it. The **same policy
    *  still runs** (author set, module-hash allowlist, first-install/same-author),
    *  but there is deliberately **no `seq`**: a bundle's freshness guard is the
-   *  manifest's monotonic `version` (§13.4), so an equal-version reload re-installs
+   *  manifest's monotonic `version` (§12.4), so an equal-version reload re-installs
    *  cleanly here rather than being dropped as a replay of an already-consumed seq.
    *  Because it does not go through the kernel's envelope path, a bundled module is
    *  not bound by the §2.2 64 KB cap. `author` is the manifest author. Wire installs

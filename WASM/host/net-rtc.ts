@@ -1,4 +1,4 @@
-// WebRTC as a first-class Network (README §13.6: net.send is "addressed unicast
+// WebRTC as a first-class Network (README §12.6: net.send is "addressed unicast
 // to a peer over its data channel"; net.ts notes "a WebRTC/data-channel … satisfies
 // the same interface"). This is the real-P2P fabric: peers reach each other
 // directly over RTCDataChannels — the relay is only a signaling rendezvous and can

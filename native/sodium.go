@@ -14,12 +14,12 @@
 //   - genericHash (BLAKE2b-256, the content-address block-id hash;
 //     golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is standardized, so native
 //     output matches libsodium (pinned by a KAT in TestSodiumGenericHash); every
-//     block is hashed on PUT and verified on bulk receive (§13.6), and it's the one
+//     block is hashed on PUT and verified on bulk receive (§12.6), and it's the one
 //     hash wazero runs slower than V8 (~600 vs ~390 MB/s native).
 //
 //   - the ChaCha20-Poly1305-IETF record layer (RFC 8439;
 //     golang.org/x/crypto/chacha20poly1305). Every post-AUTH frame is a seal on send
-//     and an open on receive (§13.6), so it's a per-frame cost on the bulk frame path.
+//     and an open on receive (§12.6), so it's a per-frame cost on the bulk frame path.
 //     RFC 8439 is byte-exact, so native ciphertext is identical to libsodium's (pinned
 //     by TestSodiumAead, captured from this build's binary); native runs it ~8× faster
 //     than the wasm, and — needing no scratch arena — takes no lock.
@@ -101,7 +101,7 @@ var sodiumExports = map[string]string{
 	"crypto_sign_ed25519_sk_to_curve25519": "gi",
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
-	// The §13.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
+	// The §12.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
 	// wasm (handshake-only, amortized over the link). PeerLink (shared net-link.ts)
 	// drives them through the `sodium` object below. The ChaCha20-Poly1305-IETF record
 	// layer is native Go (see aeadEncrypt / the file header), so it needs no export here.
@@ -375,7 +375,7 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 	return s.read(out, len(ct)-sealBytes), true
 }
 
-// ── §13.6 transport AKE primitives ──
+// ── §12.6 transport AKE primitives ──
 
 // boxKeypair mints a fresh ephemeral X25519 keypair (32-byte pk + sk) for one
 // PeerLink connection's key exchange.
@@ -554,7 +554,7 @@ const sodiumShimJS = `
       if (r === null) throw new Error("crypto_box_seal_open: incorrect key pair for the given ciphertext");
       return u8(r);
     },
-    // §13.6 transport AKE: ephemeral X25519 + ChaCha20-Poly1305-IETF record layer.
+    // §12.6 transport AKE: ephemeral X25519 + ChaCha20-Poly1305-IETF record layer.
     crypto_box_keypair: () => {
       const k = N.crypto_box_keypair();
       return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "x25519" };

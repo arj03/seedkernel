@@ -41,7 +41,7 @@ scratch = heap.alloc(SCRATCH_SIZE) as i32;
 // handler at boot.
 const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
 
-// DOMAIN_env (README §6.3, §17.1): "seedkernel-envelope-sig-v1\0". Prepended to
+// DOMAIN_env (README §6.3, §16.1): "seedkernel-envelope-sig-v1\0". Prepended to
 // the signed preimage before verifying, never transmitted, so an envelope
 // signature cannot double as any other protocol's signature over the same bytes.
 const DOMAIN_ENV: Uint8Array = domainEnv();
