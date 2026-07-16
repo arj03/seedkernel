@@ -39,6 +39,25 @@ func TestShellRunsBundle(t *testing.T) {
 	}
 }
 
+// TestWireInstall drives the live-update wire path (README §7.2): a signed install
+// envelope dispatched through the pipeline reaches onInstall, clears the permissive
+// default policy, and binds the module. This path stays after bundles moved to direct
+// installs (§13.4), so it keeps its own coverage here.
+func TestWireInstall(t *testing.T) {
+	boot()
+	author, authorPub := testAuthor(t)
+	target := name("wire.mod")
+	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
+	if _, ok := wasmH[string(target)]; !ok {
+		t.Fatal("wire install did not register the module")
+	}
+	// A replay of the same seq is dropped; the module stays bound to the same bytes.
+	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
+	if _, ok := wasmH[string(target)]; !ok {
+		t.Fatal("module unbound after a replayed install")
+	}
+}
+
 func envelope(n, payload []byte) []byte {
 	return append(append([]byte{0x53, 0x44, 1, byte(len(n))}, n...), payload...)
 }

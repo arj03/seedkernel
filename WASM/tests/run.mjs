@@ -945,7 +945,7 @@ async function testWsFraming() {
   console.log("  OK\n");
 }
 
-// ─── Test: channel identity pinning (transport §16) ─────────────────────
+// ─── Test: channel identity pinning (transport §13.6) ─────────────────────
 
 async function testChannelPinning() {
   console.log("Test: a connection is pinned to the peer's key — wrong key → no delivery");
@@ -1079,26 +1079,21 @@ async function testBundle() {
   let shell, shell2;
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
-    // throwaway host to derive the name, encode the install, and hash content.
+    // throwaway host to derive the kernel name and hash content. Modules install
+    // directly from the manifest (§13.4) — no per-module .install envelope.
     const { host: h } = await makeHost();
-    const seq = makeSeq();
     const kernelName = h.deriveScopedName("codec", author.publicKey);
-    const install = buildInstall(
-      h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
-      seq(author.publicKey), kernelName, forwarderBytes,
-    );
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
       modules: [{
         name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        install: "codec.install", kernelName: toHex(kernelName),
+        kernelName: toHex(kernelName),
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
       caps: [],
     };
     wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    wf(pjoin(dir, "codec.install"), install);
     wf(pjoin(dir, "guest.js"), guestText);
     wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest));
 
@@ -2182,23 +2177,17 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const seq = makeSeq();
     const kernelName = h.deriveScopedName("codec", author.publicKey);
-    const install = buildInstall(
-      h, author.privateKey, author.publicKey, h.deriveBootstrapName("install"),
-      seq(author.publicKey), kernelName, forwarderBytes,
-    );
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
       modules: [{
         name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        install: "codec.install", kernelName: toHex(kernelName),
+        kernelName: toHex(kernelName),
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
       caps: [],
     });
-    wf(pjoin(dir, "codec.install"), install);
     wf(pjoin(dir, "guest.js"), guestText);
     const writeManifest = (version) =>
       wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));

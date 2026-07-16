@@ -152,6 +152,40 @@ export class Installer {
     this.installations.delete(nameKey(name));
   }
 
+  /** Install a bundle module directly (README §13.4), synthesizing its install
+   *  record instead of consuming a signed install envelope. The bundle's signed
+   *  manifest already authenticated the coherent set and committed to each
+   *  module's `genesisHash` — the loader verified the bytes against it — so the
+   *  per-module `.install` envelope, a second signature re-proving the same thing
+   *  under the same policy, was redundant; this replaces it. The **same policy
+   *  still runs** (author set, module-hash allowlist, first-install/same-author),
+   *  but there is deliberately **no `seq`**: a bundle's freshness guard is the
+   *  manifest's monotonic `version` (§13.4), so an equal-version reload re-installs
+   *  cleanly here rather than being dropped as a replay of an already-consumed seq.
+   *  Because it does not go through the kernel's envelope path, a bundled module is
+   *  not bound by the §2.2 64 KB cap. `author` is the manifest author. Wire installs
+   *  (§7.2) are unchanged. Returns true on success, false if no policy is wired or
+   *  the policy refuses. */
+  installDirect(name: Uint8Array, wasm: Uint8Array, author: Signer): boolean {
+    if (name.length === 0 || wasm.length === 0) return false;
+    const bytesHash = this.host.genesisHash(wasm);
+    const existing = this.installations.get(nameKey(name)) ?? null;
+    if (!this._approveInstall) return false;
+    let approved = false;
+    try {
+      approved = this._approveInstall(name, author, bytesHash, wasm, existing);
+    } catch {
+      approved = false;
+    }
+    if (!approved) return false;
+    if (!this.host._installWasmHandler(name, wasm)) return false;
+    this.installations.set(nameKey(name), {
+      author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
+      bytesHash,
+    });
+    return true;
+  }
+
   /** Handler the host registers under the install name (§7.2). */
   readonly handler: Handler = (_name, payload, _host) => {
     this._handle(payload);

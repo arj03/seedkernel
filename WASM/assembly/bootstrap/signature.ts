@@ -11,22 +11,31 @@
 
 // ─── host imports ────────────────────────────────────────────────────────
 
-// Verify a signature under the suite for `algoId` (README §6.4, §6.6). A suite
-// is an ordinary handler installed at the slot `hash(SUITE_SLOT_PREFIX +
-// algo_id_hex)`; the host derives that slot name and dispatches the verify
-// request this module builds at [reqPtr, reqLen) to the handler there — genesis
-// (algo_id 0x0000) included, seeded as a host-serviced suite handler at boot.
-// A suite verifies, nothing else, so the request carries no op selector (§6.6):
-//   [pubkey_len u16][pubkey][sig_len u16][sig][data ..]
-// where `data` is the full signed preimage DOMAIN_env ‖ algo_id ‖ signer_len ‖
-// signer ‖ inner_envelope (§6.3). The signer is length-prefixed so the preimage is
-// self-delimiting — a variable-length-key suite cannot re-split (signer, inner) to
-// forge a collision. Returns 1 iff the suite reports the signature valid; an unknown
-// algo_id (no handler at the slot) returns 0.
-@external("env", "suite_verify")
-declare function suiteVerify(algoId: i32, reqPtr: i32, reqLen: i32): i32;
+// kernel.call (README §4.2, §4.4): synchronous dispatch to the handler
+// registered for a name. This module uses it to reach a signature suite by
+// plain `kernel.call` to the suite's slot name (§6.4, §6.6) — there is no
+// host-side suite-dispatch import. The response is written into this module's
+// `scratch` region; the return value is the response length, or -1 on error
+// (no handler at the slot, depth exceeded).
+@external("kernel", "call")
+declare function kernelCall(namePtr: i32, nameLen: i32, payloadPtr: i32, payloadLen: i32): i32;
 
 // ─── constants ───────────────────────────────────────────────────────────
+
+// Suite slot-name prefix (README §6.4). A suite is an ordinary handler at the
+// LITERAL-ASCII slot `"seedkernel.suite.v1:" + algo_id_hex` (4 lowercase hex
+// digits). Bootstrap/suite slot names are plain ASCII, not genesis-hash-derived
+// (§5.1), so this module can build the name itself and reach the suite with a
+// plain `kernel.call` — genesis (algo_id 0x0000) included, seeded as a suite
+// handler at boot.
+const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
+
+// Scratch region for kernel.call responses (README §4.1). The only call this
+// module makes is the suite verify (§6.6), whose response is a single
+// `[valid u8]`; reserve a little headroom.
+const SCRATCH_SIZE: i32 = 64;
+export let scratch: i32 = 0;
+scratch = heap.alloc(SCRATCH_SIZE) as i32;
 
 // Max nested `signature` wrappers per inbound message (README §2.3). Bounds
 // the per-message verify cost so a single 64 KB envelope cannot force hundreds
@@ -55,6 +64,22 @@ function readBytes(ptr: i32, len: i32): Uint8Array {
 
 function readU16BE(arr: Uint8Array, offset: i32): u16 {
   return ((arr[offset] as u16) << 8) | (arr[offset + 1] as u16);
+}
+
+/** Build a suite's slot name (README §6.4): `"seedkernel.suite.v1:" + algo_id_hex`
+ *  as literal ASCII, algo_id formatted as 4 lowercase hex digits. Names are opaque
+ *  bytes and no longer genesis-hash-derived (§5.1), so the module builds this itself
+ *  and reaches the suite by plain `kernel.call`. */
+function suiteSlotName(algoId: u16): Uint8Array {
+  const HEX = "0123456789abcdef";
+  const p = SUITE_SLOT_PREFIX;
+  const out = new Uint8Array(p.length + 4);
+  for (let i = 0; i < p.length; i++) out[i] = p.charCodeAt(i) as u8;
+  out[p.length]     = HEX.charCodeAt((algoId >> 12) & 0xf) as u8;
+  out[p.length + 1] = HEX.charCodeAt((algoId >> 8) & 0xf) as u8;
+  out[p.length + 2] = HEX.charCodeAt((algoId >> 4) & 0xf) as u8;
+  out[p.length + 3] = HEX.charCodeAt(algoId & 0xf) as u8;
+  return out;
 }
 
 export function alloc(size: i32): i32 {
@@ -190,9 +215,15 @@ export function handle_signature(payloadPtr: i32, payloadLen: i32): i32 {
   req.set(payload.subarray(signerOffset, signerOffset + signerLen), w); w += signerLen;
   req.set(payload.subarray(innerOffset, innerOffset + innerLen), w); w += innerLen;
 
-  // Unknown algo_id → no handler at the slot → host returns 0 (drop).
-  const valid = suiteVerify(algoId as i32, req.dataStart as i32, reqLen);
-  if (valid == 0) return 0;
+  // Reach the suite by plain `kernel.call` to its slot name (§6.4, §6.6) — no
+  // host-side suite-dispatch import. Build the literal-ASCII slot name here and
+  // dispatch the request; the suite writes its `[valid u8]` response into our
+  // scratch. An unknown algo_id has no handler at the slot, so kernel.call
+  // returns -1 → drop, the same fail-safe as a suite reporting "invalid".
+  const slot = suiteSlotName(algoId);
+  const respLen = kernelCall(slot.dataStart as i32, slot.length, req.dataStart as i32, reqLen);
+  if (respLen < 1) return 0;
+  if (load<u8>(scratch) != 1) return 0;
 
   const pubKey = payload.slice(signerOffset, signerOffset + signerLen);
 

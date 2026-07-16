@@ -101,7 +101,7 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
 
 /** The full scoped-signature *prefix* the SIGN op prepends to a guest message before
  *  signing: `DOMAIN_guest ‖ scope`. Exported so a host-side signer/verifier in another
- *  package (e.g. seedstore's out-of-band descriptor signing, README §16) reconstructs the
+ *  package (e.g. seedstore's out-of-band descriptor signing, README §13.2) reconstructs the
  *  byte-identical preimage `guestSignPrefix(scope) ‖ msg` WITHOUT mirroring the domain
  *  tag — if this string ever revs, every such verifier revs with it instead of silently
  *  diverging. `scope` comes from `guestSignScope(author, app)`. */

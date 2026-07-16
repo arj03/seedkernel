@@ -107,8 +107,12 @@ func wr(m api.Module, data []byte) uint32 {
 	return p
 }
 
+// name is a bootstrap handler name (README §5.1): the literal-ASCII
+// "seedkernel.bootstrap.v1:" + canonical. Bootstrap names are plain ASCII, not
+// genesis-hash-derived — swapping the genesis suite no longer re-derives the
+// bootstrap namespace (only bytes_hash still depends on the genesis hash).
 func name(canonical string) []byte {
-	return sd.hashSha3256([]byte("seedkernel.bootstrap.v1:" + canonical))
+	return []byte("seedkernel.bootstrap.v1:" + canonical)
 }
 
 func setHandler(n []byte, id int32) {
@@ -231,12 +235,13 @@ func kcall(_ context.Context, caller api.Module, nP, nL, pP, pL uint32) uint32 {
 	return uint32(len(resp))
 }
 
-// suiteSlotName derives a signature suite's slot name (README §6.4):
-// hash("seedkernel.signature.suite.v1:" + algo_id_hex, 4 lowercase hex digits).
-// A suite is an ordinary handler at this name — genesis included, seeded
-// natively in boot().
+// suiteSlotName is a signature suite's slot name (README §6.4): the literal-ASCII
+// "seedkernel.suite.v1:" + algo_id_hex (4 lowercase hex digits). Slot names are
+// plain ASCII, not genesis-hash-derived (§5.1), so the signature module builds the
+// byte-identical name and reaches the suite by plain kernel.call. A suite is an
+// ordinary handler at this name — genesis included, seeded natively in boot().
 func suiteSlotName(algoID int) []byte {
-	return sd.hashSha3256([]byte(fmt.Sprintf("seedkernel.signature.suite.v1:%04x", algoID)))
+	return []byte(fmt.Sprintf("seedkernel.suite.v1:%04x", algoID))
 }
 
 // genesisSuiteVerify services the genesis suite slot (algo_id 0x0000 = Ed25519 +
@@ -274,20 +279,6 @@ func genesisSuiteVerify(req []byte) []byte {
 		return []byte{1}
 	}
 	return invalid
-}
-
-// env.suite_verify — the signature module's suite dispatch (README §6.6). The
-// module built the verify request at [reqP, reqL) in bootstrap memory; derive
-// the suite's slot name from algoID and hand the request to the ordinary
-// handler installed there (genesis natively; other suites as installed wasm).
-// An unknown algo_id (no handler at the slot) returns 0, same as a suite
-// reporting the signature invalid — the fail-safe drop (§6.4).
-func suiteVerify(_ context.Context, m api.Module, algoID, reqP, reqL uint32) uint32 {
-	resp := run(suiteSlotName(int(algoID)), rd(m.Memory(), reqP, reqL))
-	if len(resp) >= 1 && resp[0] == 1 {
-		return 1
-	}
-	return 0
 }
 
 // topSigner reads the innermost verified signer from bootstrap.wasm (§6.5).
@@ -357,7 +348,6 @@ func boot() {
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
 	env.NewFunctionBuilder().WithFunc(invoke).Export("invoke_handler")
-	env.NewFunctionBuilder().WithFunc(suiteVerify).Export("suite_verify")
 	env.Instantiate(ctx)
 	k := rt.NewHostModuleBuilder("kernel")
 	k.NewFunctionBuilder().WithFunc(kcall).Export("call")
@@ -374,11 +364,18 @@ func boot() {
 	k.Instantiate(ctx)
 	kn = load(kernelWasm, "kernelmod")
 	bs = load(bootWasm, "bootstrap")
+	// The signature module reaches a suite by plain kernel.call (§6.6), so it needs
+	// a scratch offset registered like any handler — otherwise kcall refuses it (no
+	// scrOf entry). It exports `scratch` (§4.1); record it so kcall can write the
+	// suite's [valid u8] response there for the module to read.
+	if g := bs.ExportedGlobal("scratch"); g != nil {
+		scrOf[bs] = uint32(g.Get())
+	}
 	setHandler(name("signature"), -1)
 
 	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
 	// serviced with libsodium — the reference host's "genesis via SetHandler"
-	// (§6.4). The signature module reaches it through env.suite_verify above.
+	// (§6.4). The signature module reaches it by plain kernel.call to this slot.
 	registerNativeAt(suiteSlotName(0), genesisSuiteVerify)
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
@@ -475,9 +472,11 @@ type loadedBundle struct {
 var loaded *loadedBundle
 
 // loadBundle loads a signed app bundle directory (README §13.4): JS verifies the
-// manifest signature + module/guest content hashes, then Go dispatches each
-// pre-signed install envelope (the installer re-checks author + replay). On success
-// it records the verified guest source + caps + config in `loaded` for the node.
+// manifest signature + module/guest content hashes, then Go installs each verified
+// module directly under its kernel name (JS installModule synthesizes the record
+// with the manifest author, under the same policy) — no per-module install envelope,
+// so no 64 KB cap and no boot-time seq. On success it records the verified guest
+// source + caps + config in `loaded` for the node.
 func loadBundle(dir string) string {
 	menv, err := os.ReadFile(filepath.Join(dir, "manifest.bundle"))
 	if err != nil {
@@ -509,7 +508,7 @@ func loadBundle(dir string) string {
 		Caps        []string
 		Guest       string
 		Config      json.RawMessage
-		Modules     []struct{ Name, Install, KernelName string }
+		Modules     []struct{ Name, File, KernelName string }
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
@@ -522,7 +521,12 @@ func loadBundle(dir string) string {
 	}
 	var installed []string
 	for _, mod := range m.Modules {
-		dispatch(goFiles[mod.Install]) // → installer (JS onInstall) → installWasm
+		// Install the manifest-verified bytes directly (README §13.4): JS installModule
+		// synthesizes the record with the manifest author and runs the same policy — no
+		// install envelope dispatched, so no seq and no 64 KB cap.
+		if res, _ := invokeFree("installModule", qc.NewString(mod.KernelName), qc.NewArrayBuffer(goFiles[mod.File])); res != nil {
+			res.Free()
+		}
 		kName, _ := hex.DecodeString(mod.KernelName)
 		if _, ok := wasmH[string(kName)]; ok {
 			installed = append(installed, mod.Name)

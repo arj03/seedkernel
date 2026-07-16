@@ -10,9 +10,9 @@
 //       2. host calls bootstrap.handle_signature() → returns 1 if verified
 //       3. host reads inner bytes from bootstrap memory, dispatches through kernel
 //       4. host calls bootstrap.pop_signer() after inner dispatch returns
-//   - Services the signature module's suite_verify import (§6.6) by dispatching
-//     the verify request to the ordinary handler at the algo's suite slot
-//     (§6.4) — genesis included, seeded as a host-serviced suite handler
+//   - Provides the signature module's kernel.call import (§6.6) so it can reach
+//     a suite by plain kernel.call to the suite's slot name (§6.4) — genesis
+//     included, seeded as a host-serviced suite handler; no suite-dispatch import
 //   - Provides kernel.call / kernel.caller imports to dynamic handlers (§4.2)
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
 //     instantiating WASM handlers + setHandler, genesis hashing, top-signer access
@@ -29,10 +29,12 @@ export const GENESIS_SIGNATURE_LEN  = 64;
 export const GENESIS_SECRET_KEY_LEN = 64;
 
 // README §6.4: an algorithm suite is an ordinary scratch-ABI handler installed
-// at a conventional slot name, `hash(SUITE_SLOT_PREFIX + algo_id_hex)`. The
-// genesis suite (Ed25519 + SHA-3-256, algo_id 0x0000) is seeded at that slot by
-// the host at bootstrap and serviced with the bundled libsodium (§6.2, §14).
-const SUITE_SLOT_PREFIX = "seedkernel.signature.suite.v1:";
+// at a conventional slot name, the LITERAL-ASCII `SUITE_SLOT_PREFIX + algo_id_hex`.
+// Slot names are plain ASCII, not genesis-hash-derived (§5.1), so the signature
+// module builds the same name itself and reaches the suite by plain kernel.call.
+// The genesis suite (Ed25519 + SHA-3-256, algo_id 0x0000) is seeded at that slot
+// by the host at bootstrap and serviced with the bundled libsodium (§6.2, §14).
+const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
 
 // README §6.3 / §17.1: the envelope-signature domain prefix. The signed preimage is
 // `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (signer is length-
@@ -75,6 +77,7 @@ interface KernelExports {
 
 interface BootstrapExports {
   memory: WebAssembly.Memory;
+  scratch: WebAssembly.Global;
   alloc(size: number): number;
   dealloc(ptr: number): void;
   handle_signature(payloadPtr: number, payloadLen: number): number;
@@ -146,6 +149,13 @@ export class KernelHost {
   // keys evicts oldest-first (FIFO via Set insertion order).
   private validatedPubkeys = new Set<string>();
   private static readonly MAX_VALIDATED_PUBKEYS = 4096;
+  // Scratch offset the signature module (bootstrap.wasm) exports (§4.1); a
+  // kernel.call from that module writes its response here. Read once at load.
+  private _bootstrapScratch = 0;
+  // Upper bound on a kernel.call response written into the signature module's
+  // scratch — mirrors the module's reserved region. The only call it makes is
+  // the suite verify (§6.6), whose response is a single [valid u8].
+  private static readonly BOOTSTRAP_SCRATCH_SIZE = 64;
 
   private constructor() {}
 
@@ -187,16 +197,16 @@ export class KernelHost {
 
     // ── load bootstrap.wasm (signature module) ────────────────────────
     const bootstrapImports: WebAssembly.Imports = {
+      // README §6.6: the signature module reaches a suite by plain kernel.call
+      // to the suite's slot name (§6.4) — there is no host-side suite-dispatch
+      // import. The module builds the literal-ASCII slot name itself and passes
+      // the verify request through this same kernel.call; the response lands in
+      // the module's scratch.
+      kernel: {
+        call: (nPtr: number, nLen: number, plPtr: number, plLen: number): number =>
+          host._kernelCallFromBootstrap(nPtr, nLen, plPtr, plLen),
+      },
       env: {
-        // README §6.6: the signature module builds the suite verify request
-        // (length-prefixed pubkey/sig/data, no op selector) in its own memory
-        // and passes it here with the algo_id. The host derives the suite's slot
-        // name (§6.4) and dispatches the request to whatever ordinary handler is
-        // installed there — genesis included, which is seeded as a host-serviced
-        // suite handler at bootstrap. Returns 1 iff the suite reports valid.
-        suite_verify: (algoId: number, reqPtr: number, reqLen: number): number => {
-          return host._suiteVerify(algoId, reqPtr, reqLen);
-        },
         abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
           throw new Error(`bootstrap.wasm abort at ${line}:${col}`);
         },
@@ -206,6 +216,9 @@ export class KernelHost {
     };
     const bootstrapResult = await WebAssembly.instantiate(bootstrapBytes, bootstrapImports);
     host.bootstrapExports = bootstrapResult.instance.exports as unknown as BootstrapExports;
+    // Read the module's scratch offset once (README §4.1); kernel.call responses
+    // for the signature module are written there.
+    host._bootstrapScratch = host.bootstrapExports.scratch.value as number;
 
     return host;
   }
@@ -642,30 +655,56 @@ export class KernelHost {
     this.nameToHandlerId.delete(key);
   }
 
-  /** Derive the conventional slot name a suite for `algoId` is installed at
-   *  (README §6.4): `genesisHash(SUITE_SLOT_PREFIX + algo_id_hex)`. A suite is
-   *  an ordinary handler at this name — no registry, no separate ABI. */
+  /** The conventional slot name a suite for `algoId` is installed at (README
+   *  §6.4): the literal-ASCII `SUITE_SLOT_PREFIX + algo_id_hex`. A suite is an
+   *  ordinary handler at this name — no registry, no separate ABI. The name is
+   *  plain ASCII (not genesis-hash-derived, §5.1), so the signature module
+   *  builds the byte-identical name and reaches the suite by plain kernel.call. */
   deriveSuiteSlotName(algoId: number): Uint8Array {
-    return this.genesisHash(
-      new TextEncoder().encode(SUITE_SLOT_PREFIX + algoIdHex(algoId)),
-    );
+    return new TextEncoder().encode(SUITE_SLOT_PREFIX + algoIdHex(algoId));
   }
 
-  /** Service the signature module's suite dispatch (§6.6). The module built the
-   *  verify request at `[reqPtr, reqLen)` in bootstrap memory; the host derives
-   *  the suite's slot name from `algoId` and hands the request to whatever
-   *  ordinary handler is installed there. An unknown algo_id (no handler at the
-   *  slot) or an unexpected response drops (returns 0), exactly as a suite that
-   *  reports "invalid" — the fail-safe path (§6.4 lazy validation). */
-  private _suiteVerify(algoId: number, reqPtr: number, reqLen: number): number {
-    let req: Uint8Array;
-    try { req = this.readFromBootstrap(reqPtr, reqLen); }
-    catch { return 0; }
-    const slotName = this.deriveSuiteSlotName(algoId);
-    const hid = this.nameToHandlerId.get(nameKey(slotName));
-    if (hid === undefined) return 0;
-    const resp = this._invokeHandlerGetResponse(hid, slotName, req);
-    return resp !== null && resp.length >= 1 && resp[0] === 1 ? 1 : 0;
+  /** `kernel.call` for the signature module (bootstrap.wasm) — the same import
+   *  any handler gets (§4.2), so the signature module reaches a suite by plain
+   *  kernel.call to its slot name (§6.4, §6.6) with no special suite-dispatch
+   *  path. Reads name + payload from bootstrap memory, dispatches, and writes
+   *  the response into the module's scratch region; returns the response length,
+   *  `0` when the target produced no response, or `-1` on error (no handler at
+   *  the name, depth exceeded, response too large). The signature module's only
+   *  use is the suite verify: an unknown algo_id has no handler at the slot, so
+   *  this returns -1 and the module drops (§6.4 lazy validation). */
+  private _kernelCallFromBootstrap(
+    namePtr: number, nameLen: number,
+    payloadPtr: number, payloadLen: number,
+  ): number {
+    if (this.callDepth >= MAX_CALL_DEPTH) return -1;
+    let name: Uint8Array;
+    let payload: Uint8Array;
+    try {
+      name = new Uint8Array(this.bootstrapExports.memory.buffer, namePtr, nameLen).slice();
+      payload = new Uint8Array(this.bootstrapExports.memory.buffer, payloadPtr, payloadLen).slice();
+    } catch {
+      return -1;
+    }
+    const targetId = this.nameToHandlerId.get(nameKey(name));
+    if (targetId === undefined) return -1;
+    if (this.blockedFromCall.has(targetId)) return -1;
+
+    // The signature wrapper is the immediate caller of whatever it dispatches.
+    this.callerStack.push(this._signatureName);
+    this.callDepth++;
+    let response: Uint8Array | null = null;
+    try { response = this._invokeHandlerGetResponse(targetId, name, payload); }
+    finally {
+      this.callDepth--;
+      this.callerStack.pop();
+    }
+    if (!response) return 0;
+    if (response.length > KernelHost.BOOTSTRAP_SCRATCH_SIZE) return -1;
+    const buf = this.bootstrapExports.memory.buffer;
+    if (this._bootstrapScratch + response.length > buf.byteLength) return -1;
+    new Uint8Array(buf, this._bootstrapScratch, response.length).set(response);
+    return response.length;
   }
 
   // ─── public API ──────────────────────────────────────────────────────
@@ -686,6 +725,20 @@ export class KernelHost {
    *  resolved `existing` record, so there is no wire query (README §7.6). */
   lookupInstall(name: Uint8Array): InstallRecord | null {
     return this._installer ? this._installer.lookup(name) : null;
+  }
+
+  /** Install a bundle module directly under its manifest-declared kernel name
+   *  (README §13.4). The signed manifest already authenticated the coherent set
+   *  and pinned each module's content hash, so the loader installs verified bytes
+   *  here rather than dispatching a redundant per-module `.install` envelope —
+   *  lifting the §2.2 64 KB envelope cap for bundled modules and removing the
+   *  boot-time `seq` re-dispatch. The install record's author is the manifest
+   *  `authorPubKey` (an Ed25519 genesis key, §13.4); the same install policy still
+   *  gates it (§13.4 "two gates"). Returns true on success, false if no installer
+   *  is wired or the policy refuses. */
+  installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
+    if (!this._installer) return false;
+    return this._installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 
   /** Read the current signer stack from bootstrap.wasm (§6.5). */
@@ -918,12 +971,13 @@ export class KernelHost {
     return this._installer;
   }
 
-  /** Derive a bootstrap name: SHA-3-256("seedkernel.bootstrap.v1:" + canonical).
-   *  Use this for bootstrap handler names per §5.1. */
+  /** A bootstrap handler name (README §5.1): the literal-ASCII
+   *  `"seedkernel.bootstrap.v1:" + canonical`. Bootstrap names are plain ASCII,
+   *  not genesis-hash-derived — so swapping the genesis suite no longer re-derives
+   *  the bootstrap namespace (only `bytes_hash` still depends on the genesis hash),
+   *  and names read plainly in logs. */
   deriveBootstrapName(canonical: string): Uint8Array {
-    return this.sodium.crypto_hash_sha3256(
-      new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical),
-    );
+    return new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical);
   }
 
   /** Hash the raw bytes of `data` with the genesis suite (SHA-3-256). Used

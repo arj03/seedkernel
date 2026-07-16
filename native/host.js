@@ -79,6 +79,29 @@ globalThis.onInstall = function (payloadBuf) {
   records.set(hex(name), { algo: author.algo, pk: author.pk, hash });
 };
 
+// bundleAuthor is the {algo, pk} of the last verified manifest (§13.4), stashed by
+// verifyBundle so installModule can synthesize each module's record under it.
+let bundleAuthor = null;
+
+// installModule installs a manifest-verified bundle module directly (README §13.4),
+// synthesizing the install record with the MANIFEST author — no per-module .install
+// envelope, no seq. The bundle's signed manifest already committed to the module's
+// genesisHash (Go verified the bytes before calling this), so the second signature
+// was redundant. The same §7.4 policy still gates it via approve(); wire installs
+// (§7.2, onInstall) are unchanged. Returns true iff the module registered.
+globalThis.installModule = function (kernelNameHex, wasmBuf) {
+  if (!bundleAuthor) return false;
+  const name = fromHex(kernelNameHex);
+  const wasm = new Uint8Array(wasmBuf);
+  if (name.length === 0 || wasm.length === 0) return false;
+  const hash = sodium.crypto_hash_sha3256(wasm); // bytes_hash = genesisHash(wasm) (§7.1)
+  const ex = records.get(hex(name)) || null;
+  if (!approve(bundleAuthor, hash, ex)) return false;
+  if (!bridge.installWasm(name, wasm)) return false;
+  records.set(hex(name), { algo: bundleAuthor.algo, pk: bundleAuthor.pk, hash });
+  return true;
+};
+
 // ── Bundle verification (README §13.4) ───────────────────────────────────
 
 // Domain-separation prefix for the manifest signature (README §13.4, §17.1):
@@ -89,9 +112,9 @@ globalThis.onInstall = function (payloadBuf) {
 const DOMAIN_MANIFEST = Uint8Array.from("seedkernel-manifest-sig-v1\0", (c) => c.charCodeAt(0));
 
 // verifyBundle checks an app bundle's signed manifest and module/guest content
-// integrity, returning a slim descriptor for Go to act on (Go dispatches the
-// pre-signed installs). `files` is { filename: ArrayBuffer }. Mirrors bundle.ts
-// verifyManifest + contentMatches.
+// integrity, returning a slim descriptor for Go to act on (Go reads each module's
+// bytes and calls installModule). `files` is { filename: ArrayBuffer }. Mirrors
+// bundle.ts verifyManifest + contentMatches.
 globalThis.verifyBundle = function (manifestEnvBuf, files) {
   const env = new Uint8Array(manifestEnvBuf);
   if (env.length < 96) return "ERROR: manifest too short";
@@ -117,9 +140,13 @@ globalThis.verifyBundle = function (manifestEnvBuf, files) {
   // Freshness key material (§13.4): version is an enforced monotonic integer.
   if (!Number.isInteger(m.version)) return "ERROR: manifest version must be an integer";
 
+  // Stash the manifest author (Ed25519 genesis key) so installModule can synthesize
+  // each module's record under it — the same key the manifest signature authenticated.
+  bundleAuthor = { algo: 0x0000, pk: author };
+
   return JSON.stringify({
     app: m.app, version: m.version, author: hex(author), caps: m.caps || [],
     guest: m.guest.file, config: m.config || {},
-    modules: m.modules.map((x) => ({ name: x.name, install: x.install, kernelName: x.kernelName })),
+    modules: m.modules.map((x) => ({ name: x.name, file: x.file, kernelName: x.kernelName })),
   });
 };

@@ -3,7 +3,7 @@
 // instantiate WebAssembly modules — a JS-only capability.
 
 export {
-  alloc, dealloc,
+  alloc, dealloc, scratch,
   handle_signature, get_inner_ptr, get_inner_len,
   pop_signer, get_signer_count, read_signer, signer_pubkey_len,
 } from "./signature";

@@ -11,11 +11,12 @@
 //
 //   manifest.bundle    signed manifest envelope [authorPk(32)][sig(64)][utf8 json]
 //   <module>.wasm       each handler module
-//   <module>.install    its author-signed install envelope (dispatched verbatim)
 //   <guest>.js          the safe-js guest program
 //
-// "Later pushed over the relay as signed installs" is the same `.install`
-// envelopes, sent rather than read from disk.
+// The manifest commits to every module's genesisHash and the shell verifies the
+// bytes against it, so the loader installs the verified module directly under its
+// declared kernel name (§13.4) — there is no separate per-module install envelope.
+// A live update over the relay is an ordinary signed §7.2 install (the wire path).
 
 import { concatBytes, toHex } from "./util.js";
 
@@ -24,12 +25,12 @@ export interface BundleModule {
   name: string;
   /** The module's filename within the bundle (`<name>.wasm`). */
   file: string;
-  /** genesisHash(wasm) hex — content integrity for the .wasm file. */
+  /** genesisHash(wasm) hex — content integrity for the .wasm file, and the
+   *  module's `bytes_hash` in the synthesized install record (§7.1, §13.4). */
   hash: string;
-  /** Filename of the module's pre-signed install envelope within the bundle. */
-  install: string;
-  /** Kernel name the install binds (deriveBootstrapName/deriveScopedName hex), so
-   *  the loader can confirm the module actually registered. */
+  /** Kernel name the loader binds the module at via SetHandler
+   *  (deriveBootstrapName/deriveScopedName hex). The manifest is the authoritative
+   *  source of the bind name now that modules install directly (§13.4). */
   kernelName: string;
 }
 

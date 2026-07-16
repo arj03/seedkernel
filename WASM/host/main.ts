@@ -256,9 +256,10 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
 
 /** Load a signed bundle directory onto a host: verify the manifest signature,
  *  require its author to be in the policy, enforce version freshness, integrity-check
- *  each module against its declared content hash, dispatch the pre-signed installs (the
- *  installer re-checks author + module hash), and integrity-check the guest. Returns
- *  the parsed manifest + guest source + which modules registered. */
+ *  each module against its declared content hash, install each verified module directly
+ *  under its declared kernel name (synthesizing the record with the manifest author,
+ *  under the same install policy — §13.4), and integrity-check the guest. Returns the
+ *  parsed manifest + guest source + which modules registered. */
 export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, dir: string, freshness?: FreshnessStore): LoadedBundle {
   const env = new Uint8Array(readFileSync(join(dir, "manifest.bundle")));
   const v = verifyManifest(sodium, env);
@@ -287,8 +288,12 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   for (const mod of v.manifest.modules) {
     const wasm = new Uint8Array(readFileSync(join(dir, mod.file)));
     if (!contentMatches(wasm, mod.hash, gh)) throw new Error(`bundle: ${mod.name} content hash mismatch`);
-    host.dispatch(new Uint8Array(readFileSync(join(dir, mod.install))));
-    if (host.isRegistered(fromHex(mod.kernelName))) installed.push(mod.name);
+    // Install the manifest-verified bytes directly under the module's kernel name,
+    // synthesizing the install record with the manifest author (§13.4). No per-module
+    // `.install` envelope means no 64 KB envelope cap and no boot-time seq — an
+    // equal-version reload just re-installs. A module the policy refuses does not
+    // abort the load: it is simply reported as not installed.
+    if (host.installBundleModule(fromHex(mod.kernelName), wasm, v.author)) installed.push(mod.name);
   }
   const guestSource = readFileSync(join(dir, v.manifest.guest.file), "utf8");
   if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {

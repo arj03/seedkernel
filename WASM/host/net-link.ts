@@ -16,7 +16,7 @@
 //   FRAME = ChaCha20-Poly1305 record           only after both ends authenticate
 //
 // `eph` is a fresh ephemeral X25519 public key, generated per connection. AUTH
-// signs the whole transcript — DOMAIN ‖ the two (pubkey ‖ nonce ‖ eph) triples in
+// signs the whole transcript — DOMAIN_CHANNEL ‖ the two (pubkey ‖ nonce ‖ eph) triples in
 // a canonical order — not just the peer's nonce. Signing the nonce alone would
 // make a node a signing oracle: an attacker could relay a victim's outstanding
 // nonce as its own HELLO, collect the node's signature, and replay it on another
@@ -77,7 +77,7 @@ const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
 const PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const HELLO_LEN = PK_LEN + NONCE_LEN + EPH_LEN;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
-const DOMAIN = new TextEncoder().encode("seedkernel-channel-id-v1\0");
+const DOMAIN_CHANNEL = new TextEncoder().encode("seedkernel-channel-id-v1\0");
 // Directional session-key labels (README §13.6): the `lo` end encrypts with
 // k_lo→hi and decrypts with k_hi→lo; the `hi` end mirrors. Distinct constants so
 // the two directions never share a key.
@@ -209,13 +209,13 @@ export class PeerLink {
     return t;
   }
 
-  /** The bytes both ends sign and verify: DOMAIN followed by the two triples
+  /** The bytes both ends sign and verify: DOMAIN_CHANNEL followed by the two triples
    *  ordered by their bytes so both ends derive an identical transcript regardless
    *  of who dialed. */
   private transcript(): Uint8Array {
     const mine = this.myTriple(), theirs = this.peerTriple();
     const [lo, hi] = bytesCompare(mine, theirs) <= 0 ? [mine, theirs] : [theirs, mine];
-    return concatBytes([DOMAIN, lo, hi]);
+    return concatBytes([DOMAIN_CHANNEL, lo, hi]);
   }
 
   private onMessage(m: Uint8Array): void {

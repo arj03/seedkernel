@@ -32,8 +32,9 @@ func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
 }
 
 // buildInstall wraps a §7.2 install payload — [seq u32][nameLen u8][name][wasm] — in
-// an author-signed envelope routed to the install handler, the same shape a bundle's
-// `.install` file carries (no cap block — capabilities are no longer install-declared).
+// an author-signed envelope routed to the install handler. This is the live-update
+// wire path (§7.2, onInstall); bundles no longer carry per-module install envelopes
+// (they install directly, §13.4). No cap block — capabilities are not install-declared.
 func buildInstall(priv ed25519.PrivateKey, pub, kernelName, wasm []byte, seq uint32) []byte {
 	payload := make([]byte, 0, 4+1+len(kernelName)+len(wasm))
 	var s [4]byte
@@ -59,7 +60,6 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		Name       string `json:"name"`
 		File       string `json:"file"`
 		Hash       string `json:"hash"`
-		Install    string `json:"install"`
 		KernelName string `json:"kernelName"`
 	}
 	manifest := struct {
@@ -73,7 +73,7 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		Version: version,
 		Modules: []mod{{
 			Name: "fwd", File: "fwd.wasm", Hash: hex.EncodeToString(sd.hashSha3256(forwarderWasm)),
-			Install: "fwd.install", KernelName: hex.EncodeToString(kernelName),
+			KernelName: hex.EncodeToString(kernelName),
 		}},
 		Guest: map[string]string{"file": "guest.js", "hash": hex.EncodeToString(sd.hashSha3256([]byte(guestSrc)))},
 		Caps:  []string{},
@@ -93,7 +93,6 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		}
 	}
 	write("fwd.wasm", forwarderWasm)
-	write("fwd.install", buildInstall(priv, pub, kernelName, forwarderWasm, 1))
 	write("guest.js", []byte(guestSrc))
 	write("manifest.bundle", menv)
 	return dir, kernelName
