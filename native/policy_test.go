@@ -63,12 +63,10 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
 
-	// Nor does a signed §7.2 wire install. The name must be unique across the package:
-	// boot() rebuilds the realm but not the loader's wasmH table, so a name another
-	// test bound would still look "installed" here.
+	// Nor does a signed §7.2 wire install.
 	target := name("nopolicy.mod")
 	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
-	if _, ok := wasmH[string(target)]; ok {
+	if boundToWasm(target) {
 		t.Fatal("no --policy must deny a wire install, but the module bound")
 	}
 }
@@ -83,10 +81,14 @@ func TestFirstInstallCannotOverlaySeededSlot(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	// `install` is seeded by boot() and has no install record, so it is a bootstrap slot.
+	// It is seeded as a native handler, so the slot still holding a non-wasm impl
+	// afterwards is exactly "the install did not overlay it".
 	seeded := name("install")
-	before := wasmH[string(seeded)]
 	dispatch(buildInstall(author, authorPub, seeded, forwarderWasm, 1))
-	if _, ok := wasmH[string(seeded)]; ok && before.mod == nil {
+	if boundToWasm(seeded) {
 		t.Fatal("a first install overlaid the SetHandler-seeded `install` slot")
+	}
+	if id := findHandlerID(seeded); id < 0 || entries[id].nat == nil {
+		t.Fatal("the seeded `install` handler is gone from its slot")
 	}
 }

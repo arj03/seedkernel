@@ -17,7 +17,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +49,17 @@ func setupRS() {
 	if dir == "" {
 		return // opt-in only: no seedstore bundle configured → rsReady stays false → Skip
 	}
+	// The booted default policy is deny-all, which would refuse the bundle. The bench is
+	// pointed at a bundle the operator chose, so authorize its own manifest author: the
+	// manifest envelope is [author_pk 32][sig 64][json] (§12.4) and loadBundle still
+	// verifies the signature against this key.
+	menv, err := os.ReadFile(filepath.Join(dir, "manifest.bundle"))
+	if err != nil || len(menv) < 32 {
+		return
+	}
+	if applyPolicy(`{"authors":["`+hex.EncodeToString(menv[:32])+`"]}`) != nil {
+		return
+	}
 	if !strings.HasPrefix(loadBundle(dir), "seedstore v") {
 		return // rsReady stays false → the benchmarks Skip
 	}
@@ -64,7 +77,7 @@ func setupRS() {
 	binary.BigEndian.PutUint32(rsEncodeReq[3:7], rsBS)
 	copy(rsEncodeReq[7:], data)
 
-	parity := run(rsCodecName, rsEncodeReq)
+	parity := callHandler(rsCodecName, rsEncodeReq)
 	if len(parity) != rsM*rsBS {
 		return
 	}
@@ -85,7 +98,7 @@ func setupRS() {
 	rows[rsK-1] = byte(rsK) // first parity row (index k)
 	copy(blocks[(rsK-1)*rsBS:], parity[:rsBS])
 
-	out := run(rsCodecName, rsDecodeReq)
+	out := callHandler(rsCodecName, rsDecodeReq)
 	if len(out) != rsK*rsBS || !bytes.Equal(out[:rsBS], data[:rsBS]) {
 		return // decode didn't reconstruct the lost block — don't report a bogus rate
 	}
@@ -100,7 +113,7 @@ func BenchmarkRSEncode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		run(rsCodecName, rsEncodeReq)
+		callHandler(rsCodecName, rsEncodeReq)
 	}
 }
 
@@ -112,6 +125,6 @@ func BenchmarkRSDecode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		run(rsCodecName, rsDecodeReq)
+		callHandler(rsCodecName, rsDecodeReq)
 	}
 }

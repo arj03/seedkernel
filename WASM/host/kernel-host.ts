@@ -317,7 +317,11 @@ export class KernelHost {
       let responseLen: number;
       try { responseLen = wasm.handle(payload.length); }
       catch { return null; }
-      if (responseLen <= 0 || responseLen > wasm.scratchSize) return null;
+      // handle returns output_len ≥ 0 (§4): only a trap or a negative/oversized
+      // length is a failure. Zero is a valid EMPTY response — return an empty
+      // array for it, distinct from null, so kernel.call can tell "empty OK"
+      // (0, §4.4) from "no handler / trap" (-1).
+      if (responseLen < 0 || responseLen > wasm.scratchSize) return null;
       return new Uint8Array(wasm.memory.buffer, wasm.scratch, responseLen).slice();
     }
     const handler = entry.handler;
@@ -493,7 +497,10 @@ export class KernelHost {
       this.callDepth--;
       this.callerStack.pop();
     }
-    if (!response) return 0;
+    // null = trap or no output at all — an error (-1, §4.4). A genuine
+    // zero-length response is a non-null empty array and returns 0 below,
+    // leaving the caller's scratch untouched.
+    if (!response) return -1;
     if (response.length > caller.scratchSize) return -1;
     new Uint8Array(caller.memory.buffer, caller.scratch, response.length).set(response);
     return response.length;
