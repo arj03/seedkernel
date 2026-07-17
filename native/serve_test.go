@@ -10,13 +10,13 @@ import (
 	"seedloader/qjs"
 )
 
-// serveAsHolder (README §12.7): a node answers a peer's request from its
-// confined guest's synchronous `handle`, with no app-specific host code. This wires
-// the whole stack together — net (real socket req/res) + cap-bridge (fs) + a
-// confined guest realm — and proves a holder: peer B stores a value at A and fetches
-// it back, served entirely by A's guest. Two nodes share one host realm (only A
-// holds / touches fs), as in transport_test.go.
-func TestServeAsHolder(t *testing.T) {
+// wireServe (README §12.8): a node answers a peer's request from its confined
+// guest's synchronous `handle`, with no app-specific host code. This wires the whole
+// stack together — net (real socket req/res) + cap-bridge (fs) + a confined guest
+// realm — and proves it against a storage-shaped app: peer B stores a value at A and
+// fetches it back, served entirely by A's guest. Two nodes share one host realm (only
+// A holds / touches fs), as in transport_test.go.
+func TestServe(t *testing.T) {
 	dir := t.TempDir()
 	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd := bootSodium(wrt)
@@ -35,7 +35,7 @@ func TestServeAsHolder(t *testing.T) {
 	defer func() { rt.Close(); wrt.Close(ctx) }()
 
 	// A (holder, listens) and B (requester) in the one host realm. A's cap-bridge is
-	// built over A's identity + transport; __transport is the one wireHolder serves.
+	// built over A's identity + transport; __transport is the one wireServe serves.
 	if _, err := hostQc.Eval("setup.js", qjs.Code(`
 		globalThis.idA = sodium.crypto_sign_keypair();
 		globalThis.idB = sodium.crypto_sign_keypair();
@@ -72,7 +72,7 @@ func TestServeAsHolder(t *testing.T) {
 		t.Fatal("guest:", err)
 	}
 	defer g.close()
-	wireHolder(hostQc, g)
+	wireServe(hostQc, g)
 
 	// B dials A, stores a value through A's holder, then fetches it back.
 	kind, value, msg, err := el.await(`(async () => {

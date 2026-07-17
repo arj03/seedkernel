@@ -116,11 +116,12 @@ const engineNodeJS = `
 })();
 `
 
-// wireHolder routes incoming transport requests to a confined guest's `handle`
-// entrypoint — "the shell runs the app" as a holder (README §12.7). The host realm
-// must hold the bundle's Transport at globalThis.__transport. The guest answers
-// synchronously from local fs + crypto, so onRequest gets bytes back immediately.
-func wireHolder(hostQc *qjs.Context, g *guestRealm) {
+// wireServe routes incoming transport requests to a confined guest's `handle`
+// entrypoint — "the shell runs the app" on the request side (README §12.8), the
+// engine twin of the reference shell's serve(). The host realm must hold the
+// bundle's Transport at globalThis.__transport. The guest answers synchronously
+// from local fs + crypto, so onRequest gets bytes back immediately.
+func wireServe(hostQc *qjs.Context, g *guestRealm) {
 	hostQc.Global().SetPropertyStr("__serveHandle", hostQc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		typ := byte(t.Args()[0].Int32())
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[1])
@@ -135,9 +136,9 @@ func wireHolder(hostQc *qjs.Context, g *guestRealm) {
 	}))
 	// net.ts dispatchRequest does frame.set(resp, …), so the handler must return a
 	// Uint8Array — wrap the ArrayBuffer __serveHandle hands back.
-	if _, err := hostQc.Eval("wire-holder.js", qjs.Code(
+	if _, err := hostQc.Eval("wire-serve.js", qjs.Code(
 		`__transport.onRequest((from, type, payload) => new Uint8Array(__serveHandle(type, payload)));`,
 	)); err != nil {
-		panic(fmt.Sprintf("wireHolder: %v", err))
+		panic(fmt.Sprintf("wireServe: %v", err))
 	}
 }

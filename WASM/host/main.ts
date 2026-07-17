@@ -85,17 +85,17 @@ export interface Shell {
   /** Load a signed bundle directory: verify the manifest, govern it against the
    *  policy, integrity-check + install the modules, and return the guest source. */
   loadBundle(dir: string): LoadedBundle;
-  /** Run a loaded bundle's guest entrypoint (e.g. put/get/repair) through a
-   *  generic cap-bridge over the kernel's primitives. Load a bundle first. This
-   *  is "the shell runs the app" (README §12.8). */
+  /** Run one of a loaded bundle's guest entrypoints — whichever names the app
+   *  declares — through a generic cap-bridge over the kernel's primitives. Load a
+   *  bundle first. This is "the shell runs the app" (README §12.8). */
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   /** Serve the app's request side: build a *synchronous* confined realm from the
    *  loaded guest and route incoming transport requests to its `handle`
    *  entrypoint. The sync realm answers from local fs + crypto without yielding,
    *  so it can respond while the async `runGuest` realm is parked mid-await — this
-   *  is how the runtime becomes a holder with no app-specific host code
+   *  is how the runtime answers for a cohort with no app-specific host code
    *  (README §12.8). Idempotent; load a bundle first. */
-  serveAsHolder(): Promise<void>;
+  serve(): Promise<void>;
   close(): void;
 }
 
@@ -140,6 +140,9 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const host = await KernelHost.load(opts.kernelBytes as BufferSource, sodium);
 
   host.registerSignature(host.deriveBootstrapName("signature"), opts.signatureBytes as BufferSource);
+  // The §6.5 query API: read-only, so it costs a bundle's WASM handlers nothing to
+  // have it and they cannot ask "who signed this dispatch?" without it.
+  host.registerSignerQuery(host.deriveBootstrapName("signature.signer"));
   host.registerInstaller(host.deriveBootstrapName("install"));
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts).
   const policy = policyFromJson(opts.policyJson);
@@ -161,8 +164,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const peers = new Set<PeerId>(opts.peers ?? []);
 
   let loaded: LoadedBundle | null = null;
-  let realm: SafeRealm | null = null;          // async — the initiator (put/get/repair)
-  let holderRealm: SyncSafeRealm | null = null; // sync — the request side (handle)
+  let realm: SafeRealm | null = null;         // async — the initiator (runGuest)
+  let serveRealm: SyncSafeRealm | null = null; // sync — the request side (handle)
 
   const requireLoaded = (): LoadedBundle => {
     if (!loaded) throw new Error("shell: load a bundle first (loadBundle)");
@@ -213,10 +216,10 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
       if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
       return realm.call(entry, payload);
     },
-    async serveAsHolder() {
+    async serve() {
       const b = requireLoaded();
-      if (holderRealm) return;
-      const hr = holderRealm = await createSyncSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
+      if (serveRealm) return;
+      const hr = serveRealm = await createSyncSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
       // arg = [type u8][payload]; the guest's `handle` returns the response bytes
       // synchronously (admission / store / fetch are local fs + crypto only).
       transport.onRequest((_from, type, payload) => {
@@ -226,7 +229,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         return hr.call("handle", arg);
       });
     },
-    close() { realm?.dispose(); holderRealm?.dispose(); transport.close(); if (ownsNet) (net as NodeNetwork).close(); },
+    close() { realm?.dispose(); serveRealm?.dispose(); transport.close(); if (ownsNet) (net as NodeNetwork).close(); },
   };
 }
 
@@ -359,12 +362,12 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
       console.log(`  install ${f} → dispatched`);
     }
   }
-  // One-shot client ops through the loaded guest — "the shell runs the app" as
-  // the *initiator* (README §12.8). The request (holder) side is
-  // served below once we start listening, from the same confined guest.
-  // The shell stays application-neutral: arguments cross as raw bytes (hex
-  // tokens joined by ':') and responses come back as raw bytes — any structure
-  // in them belongs to the app, so the shell prints hex and never decodes.
+  // One-shot client ops through the loaded guest — "the shell runs the app" as the
+  // *initiator* (README §12.8). The request side is served below once we start
+  // listening, from the same confined guest. The shell stays application-neutral:
+  // arguments cross as raw bytes (a file for --put, hex tokens joined by ':' for
+  // --get) and responses come back as raw bytes — any structure in them belongs to
+  // the app, so the shell prints hex or writes them verbatim and never decodes.
   if (args["bundle"] && args["put"]) {
     const data = new Uint8Array(readFileSync(str(args, "put")!));
     const r = await shell.runGuest("put", data);
@@ -381,12 +384,12 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
 
   const serving = !!(nodeNet.port || nodeNet.wsPort);
   if (!serving) { shell.close(); return; }
-  // A serving node with an app loaded also *holds* for the cohort: route incoming
-  // requests to the app's confined request side (HAVE/OFFER/STORE/FETCH for
-  // storage), with no app-specific host code in the runtime (README §12.8).
+  // A serving node with an app loaded also answers for the cohort: route incoming
+  // requests to the app's confined request side, with no app-specific host code in
+  // the runtime — the request types are the app's own (README §12.8).
   if (args["bundle"]) {
-    await shell.serveAsHolder();
-    console.log("  holder serving the app's request side from the confined guest");
+    await shell.serve();
+    console.log("  serving the app's request side from the confined guest");
   }
   console.log("serving — Ctrl-C to stop");
   process.on("SIGINT", () => { shell.close(); process.exit(0); });

@@ -36,6 +36,7 @@
 // takes a DH role.
 
 import { concatBytes, toHex, writeU32BE } from "./util.js";
+import { DOMAIN_CHANNEL } from "./domains.js";
 
 /** A peer identity — the node's kernel ed25519 keypair (README §12.6). */
 export interface Identity {
@@ -77,7 +78,6 @@ const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
 const PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const HELLO_LEN = PK_LEN + NONCE_LEN + EPH_LEN;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
-const DOMAIN_CHANNEL = new TextEncoder().encode("seedkernel-channel-id-v1\0");
 // Directional session-key labels (README §12.6): the `lo` end encrypts with
 // k_lo→hi and decrypts with k_hi→lo; the `hi` end mirrors. Distinct constants so
 // the two directions never share a key.

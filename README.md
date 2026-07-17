@@ -848,7 +848,7 @@ The `res` frame carries no `type`: the requester matches a response to its outst
 
 ### 12.8 The shell
 
-`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — kernel + signature + installer under the loaded policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `runGuest`, `serveAsHolder`, `installFromEnvelope`); a CLI wraps it:
+`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — kernel + signature + installer under the loaded policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `runGuest`, `serve`, `installFromEnvelope`); a CLI wraps it:
 
 ```sh
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
@@ -856,7 +856,7 @@ node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./n
      --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
 ```
 
-A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §12.3 realm) **and** serves its *request* side from a confined realm (`serveAsHolder` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§12.9). seed store's WASM README has a complete storage walkthrough.
+A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest`, an async §12.3 realm) **and** serves its *request* side from a confined realm (`serve` builds a *sync* realm from the byte-identical guest and routes `transport.onRequest` to its `handle` entrypoint — the sync realm answers from local fs + crypto without yielding, so it can respond while the async realm is parked mid-`await`). The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§12.9). seed store's WASM README has a complete storage walkthrough.
 
 ### 12.9 The Go/native shell — the primary non-browser deployment
 
@@ -988,3 +988,5 @@ These belong to the reference runtime (§12), not the kernel protocol — a diff
 | `MAX_QUEUE_BYTES` | `1048576` (1 MiB) | `PeerLink` (§12.6) | Total bytes of frames buffered pre-auth; oldest dropped once the sum would exceed it. A byte bound (not a frame count) so pre-auth buffering is capped regardless of frame size. |
 | Transport frame kinds | `req 0x00`, `res 0x01` | `Transport` (§12.6) | Single request/response plane, carried inside the §12.6 AEAD record layer. |
 | Default request timeout | `2000` ms | shell boot (§12.8) | Response deadline before a peer counts as unreachable (`--timeout`). |
+
+**The `DOMAIN_*` family lives in one file.** The four prefixes above are a *family*, and the only thing they are for is disjointness: no signature made under one may verify under another, over any bytes, ever. That is a property of the whole set rather than of any member, so the set is declared together in `host/domains.ts` — where adding a fifth means reading the other four on the same screen — and imported by the modules that sign (`kernel-host.ts`, `bundle.ts`, `cap-bridge.ts`, `net-link.ts`). The Go/native target evaluates that same file through its generated bundles (§12.9), so its prefixes are these bytes by construction, not by a second copy that could drift. There is exactly one hand-copied member anywhere: `assembly/signature/signature.ts` bakes `DOMAIN_env` in because it compiles to wasm as AssemblyScript and cannot import host TS; `domains.ts` names it as the copy to keep in step.

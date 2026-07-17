@@ -1,0 +1,17 @@
+{
+  "entries": ["tests/fixtures/signer-probe.ts"],
+  "targets": {
+    "release": {
+      "outFile": "build/signer-probe.wasm",
+      "textFile": "build/signer-probe.wat",
+      "optimizeLevel": 3,
+      "shrinkLevel": 2,
+      "converge": false,
+      "noAssert": true,
+      "exportRuntime": true
+    }
+  },
+  "options": {
+    "bindings": "raw"
+  }
+}

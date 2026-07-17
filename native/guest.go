@@ -1,4 +1,4 @@
-// guest.go — the confined guest realm (README §12.3 / §12.7). A second,
+// guest.go — the confined guest realm (README §12.3 / §12.8). A second,
 // zero-authority QuickJS realm: a fresh context exposes only the ECMAScript
 // intrinsics, so the guest cannot even *name* sodium / fs / net. Its single seam is
 // host.call(op, bytes), which Go funnels into the host realm's cap-bridge
@@ -153,10 +153,10 @@ func (g *guestRealm) runGuest(entry string, payload []byte) ([]byte, error) {
 	return value, nil
 }
 
-// serveHandle invokes the guest's `handle` entrypoint synchronously — the holder
-// side (README §12.7). The arg is [type u8][payload]; the guest answers from local
+// serveHandle invokes the guest's `handle` entrypoint synchronously — the request
+// side (README §12.8). The arg is [type u8][payload]; the guest answers from local
 // fs + crypto (no net), so it returns bytes without yielding. Called re-entrantly
-// from the host realm's transport.onRequest (wireHolder).
+// from the host realm's transport.onRequest (wireServe).
 func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
 	// Stage [type][payload] straight into one wasm buffer instead of building a
 	// concatenated Go slice first and copying it in again (two passes over payload).

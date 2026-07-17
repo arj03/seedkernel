@@ -3,9 +3,12 @@
 // net.send is "addressed unicast to a peer over its data channel" and is async
 // by nature — it returns a correlation id and the host later delivers the
 // response (§12.6). This module provides:
-//   - Network:   the delivery fabric. LoopbackNetwork wires nodes in-process
-//                for tests; a WebRTC/data-channel or TCP implementation (see
-//                net-node.ts) satisfies the same interface in a real deployment.
+//   - Network:   the delivery fabric. It vends a per-node Endpoint bound to one
+//                id; LoopbackNetwork multiplexes many in-process nodes over one
+//                fabric for tests, and a WebRTC/data-channel or TCP transport (see
+//                net-node.ts) is a single-identity fabric satisfying the same shape.
+//   - Endpoint:  one node's attachment to the fabric — send(to, frame) with the
+//                sender implicit, plus an onFrame sink.
 //   - Transport: per-node request/response keyed by correlation id — a single
 //                frame plane (§12.6). Block bytes ride it too: a STORE pushes
 //                bytes in a `req` body and a FETCH returns them in a `res` body,
@@ -33,17 +36,25 @@ const KIND_RES = 1;
 // pending map forever.
 const DEFAULT_MAX_STALL_WINDOWS = 50;
 
-/** The delivery fabric. send() is fire-and-forget unicast; the receiver's
- *  registered sink is invoked with the raw frame. */
+/** A node's attachment to a Network: an endpoint is bound to one local id, so
+ *  `send` names only the destination — the sender is implicit. Transport (and the
+ *  browser shells) hold one of these rather than the whole fabric, which is why no
+ *  `from` rides the hot send path. */
+export interface Endpoint {
+  /** Unicast `frame` to peer `to`. The sender is this endpoint's own id. */
+  send(to: PeerId, frame: Uint8Array): void;
+  /** Route inbound frames to `sink` (`from` is the sending peer's id). Last set wins. */
+  onFrame(sink: (from: PeerId, frame: Uint8Array) => void): void;
+  /** Detach from the fabric: stop delivering; a real transport also tears down. */
+  close(): void;
+}
+
+/** The delivery fabric. It vends a per-node {@link Endpoint} for a local id.
+ *  LoopbackNetwork multiplexes many in-process nodes over one fabric; a real
+ *  transport (net-node/net-rtc/net-ws) is a single-identity fabric that vends only
+ *  its own endpoint. */
 export interface Network {
-  /** Unicast `frame` to peer `to`. `from` is only meaningful for LoopbackNetwork,
-   *  which multiplexes every in-process node over one fabric and needs it to pick
-   *  the recipient's sink and attribute the delivery. A real transport is bound to a
-   *  single local identity, so its `send` ignores `from` (the implementations name it
-   *  `_from`) — the sender is implicit in the connection. */
-  send(from: PeerId, to: PeerId, frame: Uint8Array): void;
-  register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void;
-  unregister(peerId: PeerId): void;
+  endpoint(id: PeerId): Endpoint;
 }
 
 /** In-process network for tests and single-process multi-node demos. Delivery
@@ -56,11 +67,14 @@ export class LoopbackNetwork implements Network {
   /** Total frames delivered — handy for asserting traffic in tests. */
   framesDelivered = 0;
 
-  register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void {
-    this.sinks.set(peerId, sink);
-  }
-  unregister(peerId: PeerId): void {
-    this.sinks.delete(peerId);
+  /** An endpoint for `id`. Every in-process node calls this for its own id; the
+   *  endpoints share this one fabric, and each send attributes `from = id`. */
+  endpoint(id: PeerId): Endpoint {
+    return {
+      send: (to, frame) => this.deliver(id, to, frame),
+      onFrame: (sink) => { this.sinks.set(id, sink); },
+      close: () => { this.sinks.delete(id); },
+    };
   }
   setOnline(peerId: PeerId, online: boolean): void {
     if (online) this.offline.delete(peerId);
@@ -69,7 +83,7 @@ export class LoopbackNetwork implements Network {
   isOnline(peerId: PeerId): boolean {
     return this.sinks.has(peerId) && !this.offline.has(peerId);
   }
-  send(from: PeerId, to: PeerId, frame: Uint8Array): void {
+  private deliver(from: PeerId, to: PeerId, frame: Uint8Array): void {
     if (this.offline.has(from) || this.offline.has(to)) return; // dropped
     const sink = this.sinks.get(to);
     if (!sink) return;
@@ -104,10 +118,12 @@ export class Transport {
    *  request to that peer reads to decide whether it has stalled (see onFrame/request). */
   private lastFrameAt = new Map<PeerId, number>();
   private reqHandler: RequestHandler | null = null;
+  /** This node's attachment to the fabric — bound to peerId, so sends carry no `from`. */
+  private readonly endpoint: Endpoint;
 
   constructor(
     readonly peerId: PeerId,
-    private readonly net: Network,
+    net: Network,
     /** How long a peer may stay SILENT before a request to it is treated as
      *  unreachable (§12.6). This is a stall bound, not an absolute deadline: any
      *  frame arriving from the peer re-arms the clock of every request pending to
@@ -122,7 +138,8 @@ export class Transport {
      *  request whose tail is genuinely still draining. */
     private readonly maxStallWindows = DEFAULT_MAX_STALL_WINDOWS,
   ) {
-    this.net.register(peerId, (from, frame) => this.onFrame(from, frame));
+    this.endpoint = net.endpoint(peerId);
+    this.endpoint.onFrame((from, frame) => this.onFrame(from, frame));
   }
 
   onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
@@ -175,7 +192,7 @@ export class Transport {
       };
       const timer = setTimeout(check, this.timeoutMs);
       this.pending.set(corr, { to, resolve, reject, timer, issuedAt });
-      this.net.send(this.peerId, to, frame);
+      this.endpoint.send(to, frame);
     });
   }
 
@@ -205,7 +222,7 @@ export class Transport {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("transport closed")); }
     this.pending.clear();
     this.lastFrameAt.clear();
-    this.net.unregister(this.peerId);
+    this.endpoint.close();
   }
 
   private onFrame(from: PeerId, frame: Uint8Array): void {
@@ -253,6 +270,6 @@ export class Transport {
     frame[0] = KIND_RES;
     writeU32BE(frame, 1, corr);
     frame.set(body, 5);
-    this.net.send(this.peerId, from, frame);
+    this.endpoint.send(from, frame);
   }
 }

@@ -20,7 +20,7 @@
 // the browser's native-WebSocket counterpart, and also runs under Node ≥22 / Bun
 // (which expose a global WebSocket) for headless testing.
 
-import type { Network, PeerId } from "./net.js";
+import type { Network, Endpoint, PeerId } from "./net.js";
 import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { toHex } from "./util.js";
 
@@ -123,16 +123,16 @@ export class WsNetwork implements Network {
   }
 
   // ── Network interface ──────────────────────────────────────────────────────────
-  register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void {
-    if (peerId !== this.ownId) throw new Error("WsNetwork is bound to one identity");
-    this.sink = sink; // Transport registers its frame sink here (net.ts)
+  /** A single-identity fabric: it vends exactly one endpoint, its own. */
+  endpoint(id: PeerId): Endpoint {
+    if (id !== this.ownId) throw new Error("WsNetwork is bound to one identity");
+    return {
+      send: (to, frame) => this.sendFrame(to, frame),
+      onFrame: (sink) => { this.sink = sink; }, // Transport routes its frame sink here (net.ts)
+      close: () => { this.sink = null; this.close(); },
+    };
   }
-  unregister(peerId: PeerId): void {
-    if (peerId !== this.ownId) return;
-    this.sink = null;
-    this.close();
-  }
-  send(_from: PeerId, to: PeerId, frame: Uint8Array): void {
+  private sendFrame(to: PeerId, frame: Uint8Array): void {
     // A frame to a peer with no authenticated link is dropped, exactly as the other
     // Networks drop to an unknown peer; the Transport's timeout copes with it. With
     // multiple links, stripe frames round-robin so a bulk transfer fans out across

@@ -44,6 +44,11 @@ const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
 // DOMAIN_env (README §6.3, §16.1): "seedkernel-envelope-sig-v1\0". Prepended to
 // the signed preimage before verifying, never transmitted, so an envelope
 // signature cannot double as any other protocol's signature over the same bytes.
+//
+// This is the one hand-copied member of the family: the family lives in
+// host/domains.ts, but this module compiles to wasm as AssemblyScript and cannot
+// import host TS. The literal must stay byte-identical to DOMAIN_ENV there —
+// domains.ts names this file as the copy to follow.
 const DOMAIN_ENV: Uint8Array = domainEnv();
 function domainEnv(): Uint8Array {
   const s = "seedkernel-envelope-sig-v1";

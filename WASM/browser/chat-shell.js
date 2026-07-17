@@ -275,13 +275,13 @@ function registerUiBridge(appId) {
   });
 }
 
+// The §3.2 configure payload: [route_len u8][route ..]. Only the route (this app's
+// UI bridge) crosses — the handler bakes the signer-query name in itself, since it
+// is literal ASCII (§5.1) rather than something only the host can derive.
 function encodeConfigPayload(uiName) {
-  const buf = new Uint8Array(1 + uiName.length + 1 + signatureSignerName.length);
-  let o = 0;
-  buf[o++] = uiName.length;
-  buf.set(uiName, o); o += uiName.length;
-  buf[o++] = signatureSignerName.length;
-  buf.set(signatureSignerName, o); o += signatureSignerName.length;
+  const buf = new Uint8Array(1 + uiName.length);
+  buf[0] = uiName.length;
+  buf.set(uiName, 1);
   return buf;
 }
 
@@ -411,8 +411,8 @@ async function applySealedInstall(sealedBytes) {
     throw new Error("installer rejected the install");
   }
 
-  // One-shot configure (§3.2 helper contract) — tell the WASM the names of
-  // its UI bridge and the signer-query handler.
+  // One-shot configure (§3.2 helper contract) — tell the WASM the name of its
+  // UI bridge, the one name it cannot know (we picked it).
   host.callDynamicExport(handlerName, "configure",
     encodeConfigPayload(appUiBridgeName(meta.id)));
 
@@ -1015,7 +1015,7 @@ const net = new RtcNetwork({
       const wire = host.wrapAndEncode(
         myKeys.privateKey, myKeys.publicKey,
         appHandlerName(lastSentNickBody.appId), payload);
-      net.send(myPkHex, peerId, wire);
+      endpoint.send(peerId, wire);
     }
   },
   onPeerDown: (peerId) => {
@@ -1036,16 +1036,17 @@ const net = new RtcNetwork({
   },
 });
 
-// Every authenticated inbound frame is a kernel envelope — dispatch it. The
-// sink id must be our own identity (RtcNetwork is bound to one key).
-net.register(myPkHex, (_from, frame) => host.dispatch(frame));
+// Our attachment to the fabric — RtcNetwork is bound to our one key, so it vends
+// exactly this endpoint. Every authenticated inbound frame is a kernel envelope.
+const endpoint = net.endpoint(myPkHex);
+endpoint.onFrame((_from, frame) => host.dispatch(frame));
 
 // Broadcast a kernel envelope to every authenticated peer. Returns the peer
-// count so callers can report "offered to N peers". net.send() drops to any
+// count so callers can report "offered to N peers". endpoint.send() drops to any
 // peer we hold no authenticated link to, so iterating linkedPeers() is exact.
 function broadcastWire(wire) {
   const linked = net.linkedPeers();
-  for (const peerId of linked) net.send(myPkHex, peerId, wire);
+  for (const peerId of linked) endpoint.send(peerId, wire);
   return linked.length;
 }
 

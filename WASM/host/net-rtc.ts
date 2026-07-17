@@ -30,7 +30,7 @@
 // module scope, so importing this module under Node (e.g. to unit-test RtcChannel)
 // is safe.
 
-import type { Network, PeerId } from "./net.js";
+import type { Network, Endpoint, PeerId } from "./net.js";
 import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { toHex } from "./util.js";
 
@@ -164,16 +164,16 @@ export class RtcNetwork implements Network {
   }
 
   // ── Network interface ────────────────────────────────────────────────────────
-  register(peerId: PeerId, sink: (from: PeerId, frame: Uint8Array) => void): void {
-    if (peerId !== this.ownId) throw new Error("RtcNetwork is bound to one identity");
-    this.sink = sink; // Transport registers its frame sink here (net.ts)
+  /** A single-identity fabric: it vends exactly one endpoint, its own. */
+  endpoint(id: PeerId): Endpoint {
+    if (id !== this.ownId) throw new Error("RtcNetwork is bound to one identity");
+    return {
+      send: (to, frame) => this.sendFrame(to, frame),
+      onFrame: (sink) => { this.sink = sink; }, // Transport routes its frame sink here (net.ts)
+      close: () => { this.sink = null; this.close(); },
+    };
   }
-  unregister(peerId: PeerId): void {
-    if (peerId !== this.ownId) return;
-    this.sink = null;
-    this.close();
-  }
-  send(_from: PeerId, to: PeerId, frame: Uint8Array): void {
+  private sendFrame(to: PeerId, frame: Uint8Array): void {
     // Links form through signaling/discovery, not lazily on first send. A frame to
     // a peer with no authenticated link is dropped, exactly as Loopback/NodeNetwork
     // drop to an unknown peer; the Transport's timeout copes with the fallout.

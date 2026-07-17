@@ -20,6 +20,7 @@
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
 import { toHex } from "./util.js";
+import { DOMAIN_ENV } from "./domains.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -36,12 +37,11 @@ export const GENESIS_SECRET_KEY_LEN = 64;
 // by the host at bootstrap and serviced with the bundled libsodium (§6.2, §13).
 const SUITE_SLOT_PREFIX = "seedkernel.suite.v1:";
 
-// README §6.3 / §16.1: the envelope-signature domain prefix. The signed preimage is
-// `DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner_envelope` (signer is length-
-// prefixed so the preimage is self-delimiting); the prefix is prepended before
-// signing/verifying but never transmitted, so a signature harvested in one context
-// cannot verify in another.
-const DOMAIN_ENV = new TextEncoder().encode("seedkernel-envelope-sig-v1\0");
+// README §6.3 / §16.1: the signed preimage is `DOMAIN_env ‖ algo_id ‖ signer_len ‖
+// signer ‖ inner_envelope` (signer is length-prefixed so the preimage is
+// self-delimiting). DOMAIN_env comes from the one domain family (domains.ts): it is
+// prepended before signing/verifying but never transmitted, so a signature harvested
+// in one context cannot verify in another.
 
 
 /** Lowercase 4-hex-digit encoding of a u16 algo_id for suite slot names (§6.4). */

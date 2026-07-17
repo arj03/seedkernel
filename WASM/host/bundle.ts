@@ -19,6 +19,7 @@
 // A live update over the relay is an ordinary signed §7.2 install (the wire path).
 
 import { concatBytes, fromHex, toHex } from "./util.js";
+import { DOMAIN_MANIFEST } from "./domains.js";
 import type { ShellPolicy } from "./policy.js";
 
 export interface BundleModule {
@@ -72,11 +73,11 @@ const PK_LEN = 32;
 const SIG_LEN = 64;
 
 // Domain-separation prefix for the manifest signature (README §12.4, §16.1):
-// `"seedkernel-manifest-sig-v1\0"`. Prepended to the manifest JSON before
-// signing/verifying, never stored in the envelope — the disjoint prefix means a
-// manifest signature can never double as an envelope-wrapper (DOMAIN_env, §6.3)
-// or channel-handshake (DOMAIN, §12.6) signature over the same bytes.
-const DOMAIN_MANIFEST = new TextEncoder().encode("seedkernel-manifest-sig-v1\0");
+// `"seedkernel-manifest-sig-v1\0"` — from the one domain family (domains.ts, §16.1).
+// Prepended to the manifest JSON before signing/verifying, never stored in the
+// envelope — the disjoint prefix means a manifest signature can never double as an
+// envelope-wrapper (DOMAIN_env, §6.3) or channel-handshake (DOMAIN_channel, §12.6)
+// signature over the same bytes.
 
 /** Canonical manifest bytes. The signed envelope carries these verbatim, and the
  *  verifier parses the exact bytes it checked, so no separate canonicalisation is

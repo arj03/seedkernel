@@ -69,22 +69,22 @@
   "scripts": {
     "build:kernel": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target release",
     "build:signature": "asc assembly/signature/index.ts --config asconfig.signature.json --target release",
-    "build:forwarder": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release",
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release && node scripts/inline-ws.mjs",
     "build:chat-app-v1": "asc assembly/chat-app-v1/index.ts --config asconfig.chat-app-v1.json --target release && node scripts/embed-ui.mjs build/chat-app-v1.wasm assembly/chat-app-v1/ui.html build/chat-app-v1.wasm && node scripts/embed-meta.mjs build/chat-app-v1.wasm build/chat-app-v1.wasm \"{\\\"id\\\":\\\"chat\\\",\\\"name\\\":\\\"Chat\\\",\\\"version\\\":\\\"v1\\\",\\\"description\\\":\\\"text only\\\"}\"",
     "build:chat-app-v2": "asc assembly/chat-app-v2/index.ts --config asconfig.chat-app-v2.json --target release && node scripts/embed-ui.mjs build/chat-app-v2.wasm assembly/chat-app-v2/ui.html build/chat-app-v2.wasm && node scripts/embed-meta.mjs build/chat-app-v2.wasm build/chat-app-v2.wasm \"{\\\"id\\\":\\\"chat\\\",\\\"name\\\":\\\"Chat\\\",\\\"version\\\":\\\"v2\\\",\\\"description\\\":\\\"text + image + nick\\\"}\"",
     "build:host": "tsc -p host && tsc -p host/tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
-    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-netroute.gen.js \"NodeNetworkCore,Transport,PeerLink,parsePeerSpec,toHex,fromHex\" build/host/util.js build/host/net.js build/host/net-link.js build/host/net-route.js && node scripts/bundle-loader.mjs ../native/host-ws.gen.js \"setWsHandle,WsServerChannel,WsClientChannel\" build/host/util.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/host/net-frame.js && node scripts/bundle-loader.mjs ../native/host-capbridge.gen.js \"createCapBridge,capPreamble,opsForCaps,guestSignScope,CAP,CAP_DOMAINS,toHex,fromHex,concatBytes\" build/host/util.js build/host/cap-bridge.js && node scripts/bundle-loader.mjs ../native/host-installer.gen.js \"setPolicy,onInstall,loadBundleFiles\" build/host/util.js build/host/installer.js build/host/policy.js build/host/bundle.js build/host/native-shim.js",
+    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-netroute.gen.js \"NodeNetworkCore,Transport,PeerLink,parsePeerSpec,toHex,fromHex\" build/host/util.js build/host/domains.js build/host/net.js build/host/net-link.js build/host/net-route.js && node scripts/bundle-loader.mjs ../native/host-ws.gen.js \"setWsHandle,WsServerChannel,WsClientChannel\" build/host/util.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/host/net-frame.js && node scripts/bundle-loader.mjs ../native/host-capbridge.gen.js \"createCapBridge,capPreamble,opsForCaps,guestSignScope,CAP,CAP_DOMAINS,toHex,fromHex,concatBytes\" build/host/util.js build/host/domains.js build/host/cap-bridge.js && node scripts/bundle-loader.mjs ../native/host-installer.gen.js \"setPolicy,onInstall,loadBundleFiles\" build/host/util.js build/host/domains.js build/host/installer.js build/host/policy.js build/host/bundle.js build/host/native-shim.js",
     "build:loader-wasm": "npm run build:kernel && npm run build:signature && npm run build:ws && npm run build:browser-sodium && node scripts/copy-loader-wasm.mjs",
     "build:loader": "npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
-    "build": "npm run build:kernel && npm run build:signature && npm run build:forwarder && npm run build:ws && npm run build:host && npm run build:host:min",
+    "build": "npm run build:kernel && npm run build:signature && npm run build:ws && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:chat-app-v1 && npm run build:chat-app-v2 && npm run build:browser-sodium",
     "build:debug": "asc assembly/kernel/index.ts --config asconfig.kernel.json --target debug && asc assembly/signature/index.ts --config asconfig.signature.json --target debug",
     "chat:relay": "node scripts/relay.mjs",
     "shell": "node build/host/main-node.js",
-    "test": "npm run build && node tests/run.mjs"
+    "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/signer-probe.ts --config asconfig.signer-probe.json --target release",
+    "test": "npm run build && npm run build:fixtures && node tests/run.mjs"
   },
   "dependencies": {
     "@jitl/quickjs-ng-wasmfile-release-asyncify": "^0.32.0",

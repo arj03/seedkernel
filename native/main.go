@@ -492,6 +492,21 @@ func topSigner() (signer, bool) {
 	return sigStack[len(sigStack)-1], true
 }
 
+// serializeSignerStack renders the host-owned signer stack as the `signature.signer`
+// query response (README §6.5): [count u8] ([algo u16 BE][pk_len u16 BE][pk ..])* in
+// push order — outermost signer first, top signer last. An empty stack is [0x00].
+// pk_len is u16 so a post-quantum suite's multi-kilobyte key fits. count is capped at
+// maxSigDepth by handleSignature, so it always fits a u8.
+func serializeSignerStack([]byte) []byte {
+	out := []byte{byte(len(sigStack))}
+	for _, s := range sigStack {
+		out = append(out, byte(s.algo>>8), byte(s.algo))
+		out = append(out, byte(len(s.pk)>>8), byte(len(s.pk)))
+		out = append(out, s.pk...)
+	}
+	return out
+}
+
 // installWasm instantiates handler bytes and binds them to the raw name `n`. The replace is
 // unconditional — the §7.4 policy already ran, and bindHandler releases whatever the name
 // displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §7).
@@ -589,6 +604,12 @@ func boot() {
 	// serviced with libsodium — the reference host's "genesis via SetHandler"
 	// (§6.4). The signature module reaches it by plain kernel.call to this slot.
 	registerNativeAt(suiteSlotName(0), genesisSuiteVerify)
+
+	// The §6.5 signer query: an ordinary (read-only, freely callable) handler that
+	// serializes the host-owned signer stack, so an installed module can ask who
+	// signed the dispatch that reached it. Same wiring as the reference host's
+	// registerSignerQuery — without it, `loadTopSignerPubkey` has nothing to call.
+	registerNative("signature.signer", serializeSignerStack)
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -1014,7 +1035,7 @@ func main() {
 		defer g.close()
 
 		// One-shot client ops through the loaded guest — "the shell runs the app" as
-		// the initiator (README §12.7). Arguments/results cross as raw bytes.
+		// the initiator (README §12.8). Arguments/results cross as raw bytes.
 		if a.put != "" {
 			data, err := os.ReadFile(a.put)
 			if err != nil {
@@ -1055,11 +1076,11 @@ func main() {
 	if !serving {
 		return
 	}
-	// A serving node with an app loaded also holds for the cohort: route incoming
-	// requests to the guest's confined `handle` — no app-specific host code (§12.7).
+	// A serving node with an app loaded also answers for the cohort: route incoming
+	// requests to the guest's confined `handle` — no app-specific host code (§12.8).
 	if g != nil {
-		wireHolder(qc, g)
-		fmt.Println("  holder serving the app's request side from the confined guest")
+		wireServe(qc, g)
+		fmt.Println("  serving the app's request side from the confined guest")
 	}
 	fmt.Println("serving — Ctrl-C to stop")
 	sig := make(chan os.Signal, 1)

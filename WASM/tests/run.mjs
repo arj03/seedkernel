@@ -92,6 +92,7 @@ async function makeHost(approveInstall = () => true) {
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
+const signerProbeBytes = new Uint8Array(readFileSync(join(root, "build/signer-probe.wasm")));
 
 // Encode an install + sign it, returning the wire bytes ready for dispatch.
 function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
@@ -133,6 +134,50 @@ async function testFullLifecycle() {
 
   host.dispatch(host.wrapAndEncode(sk, pk, chatTextName, forwardPayload));
   assertEqual(echoCalls, 1, "echo invoked once via kernel.call");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the signature.signer query (§6.5) ────────────────────────────
+
+async function testSignerQuery() {
+  console.log("Test: signature.signer query (§6.5) reached by a helper-built handler");
+
+  const { host, installName } = await makeHost();
+  const signerQueryName = host.deriveBootstrapName("signature.signer");
+
+  // This name is ABI, not an implementation detail: assembly/seedkernel/handler.ts
+  // bakes the same literal in (bootstrap names are plain ASCII, §5.1) so a handler
+  // built on the helper reaches the query with nothing planted by the host. Drift on
+  // either side silently costs every such handler its signer lookup — pin the string.
+  assertEqual(new TextDecoder().decode(signerQueryName),
+    "seedkernel.bootstrap.v1:signature.signer",
+    "the signer-query name is the literal ASCII the WASM helper bakes in");
+
+  host.registerSignerQuery(signerQueryName);
+  assertEqual([...host.callHandler(signerQueryName, EMPTY)], [0],
+    "an empty signer stack serializes as [0x00]");
+
+  const seq = makeSeq();
+  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const probeName = host.deriveScopedName("signer.probe", pk);
+  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), probeName, signerProbeBytes));
+  assert(host.isRegistered(probeName), "signer-probe installed");
+
+  const routeName = host.deriveBootstrapName("test.route");
+  let routed = null;
+  host.register(routeName, (_n, payload) => { routed = new Uint8Array(payload); return null; });
+
+  // configure() is route-only: [route_len u8][route ..]. Nothing here names the
+  // signer query, so the lookup below can only work off the baked-in name.
+  const cfg = new Uint8Array(1 + routeName.length);
+  cfg[0] = routeName.length;
+  cfg.set(routeName, 1);
+  host.callDynamicExport(probeName, "configure", cfg);
+
+  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array([1])));
+  assertEqual(routed, pk,
+    "loadTopSignerPubkey resolves the top signer with no host-planted name");
 
   console.log("  OK\n");
 }
@@ -959,23 +1004,24 @@ async function testChannelPinning() {
   const netS = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port: 0 } });
   await netS.start();
   let received = 0;
-  netS.register(toHex(idS.publicKey), () => { received++; });
+  netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
 
   const netB = new NodeNetwork({ identity: idB, sodium }); // dials out only
-  netB.register(toHex(idB.publicKey), () => {});
+  const epB = netB.endpoint(toHex(idB.publicKey));
+  epB.onFrame(() => {});
 
   try {
     // Point a made-up peerId at S's real address. S presents its true key, which
     // won't match what B was told to expect → the link must refuse to auth.
     const wrongId = toHex(sodium.randombytes_buf(32));
     netB.addPeerAddr(wrongId, { host: "127.0.0.1", port: netS.port, transport: "tcp" });
-    netB.send(toHex(idB.publicKey), wrongId, new Uint8Array([1, 2, 3]));
+    epB.send(wrongId, new Uint8Array([1, 2, 3]));
     await sleep(200);
     assertEqual(received, 0, "frame to a mismatched identity is never delivered");
 
     // Now address S by its true id: the handshake succeeds and the frame arrives.
     netB.addPeerAddr(toHex(idS.publicKey), { host: "127.0.0.1", port: netS.port, transport: "tcp" });
-    netB.send(toHex(idB.publicKey), toHex(idS.publicKey), new Uint8Array([4, 5, 6]));
+    epB.send(toHex(idS.publicKey), new Uint8Array([4, 5, 6]));
     await sleep(200);
     assertEqual(received, 1, "frame to the correct identity is delivered");
   } finally {
@@ -1423,7 +1469,7 @@ async function testTransportResponseBinding() {
     const reqP = ta.request(B, 7, new Uint8Array());
     // C (an authenticated cohort member in real life) races a spoofed response
     // with the predictable first correlation id. It must be ignored.
-    net.send(C, A, Uint8Array.from([1, 0, 0, 0, 1, 7, 99]));
+    net.endpoint(C).send(A, Uint8Array.from([1, 0, 0, 0, 1, 7, 99]));
     const resp = await reqP;
     assertEqual([...resp], [42], "the real peer's response resolves, not the spoof");
   } finally {
@@ -1480,11 +1526,12 @@ async function testTransportBackstop() {
   // This is the buggy/hostile peer: it withholds THIS response while keeping the wire warm,
   // so silence alone would never fire — only the absolute backstop bounds the request.
   const ta = new Transport(A, net, 50, 3);
+  const epB = net.endpoint(B);
   let alive = true;
   (async () => {
     // A KIND_RES frame for a corr with no pending entry: onFrame stamps lastFrameAt[B]
     // (re-arming every request pending to B) then drops it — nothing ever resolves.
-    while (alive) { net.send(B, A, Uint8Array.from([1, 0, 0, 0, 255, 0])); await sleep(20); }
+    while (alive) { epB.send(A, Uint8Array.from([1, 0, 0, 0, 255, 0])); await sleep(20); }
   })();
 
   try {
@@ -1554,18 +1601,19 @@ async function testRedialAfterFailedDial() {
   await sleep(50);
 
   const netB = new NodeNetwork({ identity: idB, sodium });
-  netB.register(toHex(idB.publicKey), () => {});
+  const epB = netB.endpoint(toHex(idB.publicKey));
+  epB.onFrame(() => {});
   let netS = null;
   try {
     netB.addPeerAddr(toHex(idS.publicKey), { host: "127.0.0.1", port, transport: "tcp" });
-    netB.send(toHex(idB.publicKey), toHex(idS.publicKey), new Uint8Array([1]));
+    epB.send(toHex(idS.publicKey), new Uint8Array([1]));
     await sleep(200); // the dial fails; the stale connecting entry must be cleaned up
 
     netS = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port } });
     await netS.start();
     let received = 0;
-    netS.register(toHex(idS.publicKey), () => { received++; });
-    netB.send(toHex(idB.publicKey), toHex(idS.publicKey), new Uint8Array([2]));
+    netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
+    epB.send(toHex(idS.publicKey), new Uint8Array([2]));
     await sleep(300);
     assertEqual(received, 1, "send() redials after the peer comes back (no permanent blackhole)");
   } finally {
@@ -1629,12 +1677,13 @@ async function testConnsPerPeerFanout() {
   const server = new NodeNetworkCore({ identity: idS, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
   await server.start();
   const got = [];
-  server.register(toHex(idS.publicKey), (_from, frame) => got.push(frame));
+  server.endpoint(toHex(idS.publicKey)).onFrame((_from, frame) => got.push(frame));
 
   const client = new NodeNetworkCore({ identity: idC, sodium, channels: clientFactory, connsPerPeer: 3 });
-  client.register(toHex(idC.publicKey), () => {});
+  const epC = client.endpoint(toHex(idC.publicKey));
+  epC.onFrame(() => {});
   client.addPeerAddr(toHex(idS.publicKey), { host: "x", port: 1, transport: "tcp" });
-  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+  const sendC = (bytes) => epC.send(toHex(idS.publicKey), bytes);
 
   try {
     await client.ready(2000);
@@ -1731,7 +1780,8 @@ async function testWsNetworkFanout() {
     identity: idC, sodium, webSocketFactory: factory, connsPerPeer: 3,
     onPeerUp: () => { ups++; }, onPeerDown: () => { downs++; },
   });
-  const sendC = (bytes) => client.send(toHex(idC.publicKey), toHex(idS.publicKey), bytes);
+  const epC = client.endpoint(toHex(idC.publicKey));
+  const sendC = (bytes) => epC.send(toHex(idS.publicKey), bytes);
 
   try {
     client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
@@ -2234,6 +2284,7 @@ async function testBundleCorruptNewerRollback() {
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
+await testSignerQuery();
 await testInvalidSignatureDropped();
 await testSizeLimitEnforced();
 await testSignatureDepthCap();

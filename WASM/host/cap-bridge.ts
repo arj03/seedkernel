@@ -17,6 +17,7 @@
 import type { Fs } from "./fs.js";
 import type { PeerId } from "./net.js";
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "./util.js";
+import { DOMAIN_GUEST } from "./domains.js";
 import type { SafeRealmBridge } from "./safe-js.js";
 
 /** The generic op catalog — the seam ABI (README §12.2). `capPreamble()` injects
@@ -77,12 +78,6 @@ export const CAP_DOMAINS = {
 } as const;
 
 export type CapDomain = keyof typeof CAP_DOMAINS;
-
-/** Domain-separation prefix for guest-obtainable signatures (README §12.2, §16.1).
- *  Prepended before signing, never transmitted. Disjoint from DOMAIN_env / DOMAIN_
- *  manifest / the channel DOMAIN, so no guest-obtained signature can verify in any
- *  other protocol context. */
-const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
 
 /** The host-derived scope the SIGN op binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
