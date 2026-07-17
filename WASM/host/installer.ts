@@ -22,8 +22,29 @@
 // Optional — deployments that don't want message-driven installation simply
 // skip registerInstaller and the deployment is frozen.
 
-import { nameKey, type Handler, type KernelHost, type Signer } from "./kernel-host.js";
-import { readU32BE, toHex } from "./util.js";
+import type { Handler, Signer } from "./kernel-host.js";
+import { nameKey, readU32BE, toHex } from "./util.js";
+
+/** The host seam the installer runs over (README §7). Deliberately narrower than
+ *  `KernelHost`: instantiating WASM, hashing with the genesis suite and reading the
+ *  signer stack are the only host powers an install needs, and naming them here is
+ *  what lets this module — the protocol — be compiled once and run on every target.
+ *  `KernelHost` satisfies it structurally; the native loader (README §12.9) supplies
+ *  the same five members backed by its Go bridge, so the install rules below are not
+ *  re-derived in a second language. */
+export interface InstallerHost {
+  /** Hash bytes with the genesis suite (SHA-3-256) — a module's `bytes_hash` (§7.1). */
+  genesisHash(data: Uint8Array): Uint8Array;
+  /** Instantiate handler bytes and bind them at `name` (§7.2 step 7). */
+  _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean;
+  /** Unbind `name` (§7.5). */
+  removeHandler(name: Uint8Array): boolean;
+  /** True if `name` already holds a handler — used to refuse overlaying a
+   *  SetHandler-seeded bootstrap slot on a first install (§7.4). */
+  isRegistered(name: Uint8Array): boolean;
+  /** The innermost verified signer, or null when the stack is empty (§6.5). */
+  readonly currentTopSigner: Signer | null;
+}
 
 // Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
 // A public key is one identity, so its seq high-water mark must be a single
@@ -85,7 +106,7 @@ export type FirstInstallPolicy = (
  *
  *  Returns an ApproveInstall the deployer can hand to setApproveInstall. */
 export function referencePolicy(
-  host: KernelHost,
+  host: InstallerHost,
   firstInstall: FirstInstallPolicy,
 ): ApproveInstall {
   return (name, author, bytesHash, _wasm, existing) => {
@@ -116,7 +137,7 @@ export class Installer {
   private _approveInstall: ApproveInstall | null = null;
 
   constructor(
-    private readonly host: KernelHost,
+    private readonly host: InstallerHost,
   ) {}
 
   /** Wire the deployer-supplied install-approval callback (README §7.3).
@@ -189,7 +210,7 @@ export class Installer {
 
   /** Handler the host registers under the install name (§7.2). */
   readonly handler: Handler = (_name, payload, _host) => {
-    this._handle(payload);
+    this.handleInstall(payload);
     return null;
   };
 
@@ -203,7 +224,10 @@ export class Installer {
     return true;
   }
 
-  private _handle(payload: Uint8Array): void {
+  /** Consume a §7.2 install message. Public because a target whose kernel lives
+   *  outside JS (the native loader, README §12.9) routes the install payload here
+   *  directly rather than through a registered `Handler`. */
+  handleInstall(payload: Uint8Array): void {
     // 1. Identify the author (drop unsigned installs).
     const author = this.host.currentTopSigner;
     if (!author) return;

@@ -95,6 +95,7 @@ var sodiumExports = map[string]string{
 	"crypto_stream_xchacha20_xor":          "jm",
 	"crypto_sign_detached":                 "Nh",
 	"crypto_sign_verify_detached":          "Oh",
+	"crypto_core_ed25519_is_valid_point":   "uk",
 	"crypto_sign_keypair":                  "Kh",
 	"crypto_sign_seed_keypair":             "Jh",
 	"crypto_sign_ed25519_pk_to_curve25519": "fi",
@@ -311,6 +312,21 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	sp, in, pkp := s.takeIn(sig), s.takeIn(msg), s.takeIn(pk)
 	lo, hi := lenArgs(len(msg))
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
+}
+
+// isValidPoint gates a public key on crypto_core_ed25519_is_valid_point: canonical
+// encoding, on the curve, prime-order subgroup, not the identity. The genesis suite
+// applies it before verifying (genesisSuiteVerify), matching the JS host's
+// _pubkeyIsValidPoint (kernel-host.ts) — a key one target accepts must be a key the
+// other accepts, or two nodes disagree on whether a message is signed (§6.2).
+func (s *libsodium) isValidPoint(pk []byte) bool {
+	if len(pk) != 32 {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.arenaReset(alignUp(len(pk)))
+	return s.call("crypto_core_ed25519_is_valid_point", uint64(s.takeIn(pk))) == 1
 }
 
 func (s *libsodium) signKeypair() (pk, sk []byte) {

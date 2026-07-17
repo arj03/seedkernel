@@ -1,7 +1,9 @@
 // seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive as
 // signed bundles (README §12) — nothing application-specific lives here. Host
-// orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS
-// (host.js); this Go layer is only the bridge: loads the genesis wasm, supplies the
+// orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS —
+// the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
+// second implementation (README §12.9); this Go layer is only the bridge: loads the
+// genesis wasm, supplies the
 // genesis crypto (Ed25519 + SHA-3), owns the signer stack and drives the signature
 // lifecycle (§6.5) around the stateless signature handler, and exposes byte
 // primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
@@ -35,8 +37,15 @@ var kernelWasm []byte
 //go:embed wasm/signature.wasm
 var sigWasm []byte
 
-//go:embed host.js
-var hostJS string
+// hostInstallerJS is the shared installer + install policy + bundle format/loader,
+// bundled from build/host/{util,installer,policy,bundle,native-shim}.js. It runs in
+// QuickJS over the byte-level `bridge` below and is the ONLY implementation of the
+// §7 install rules and the §12.4 bundle load order — the same compiled TS the Node
+// shell runs, so the protocol is never re-derived in a second language (README §12.9).
+// Regenerate with `npm run build:loader-bundles`; do not hand-edit.
+//
+//go:embed host-installer.gen.js
+var hostInstallerJS string
 
 // ───────────────────────── shell core (bridge) ─────────────────────────
 
@@ -132,6 +141,45 @@ func setHandler(n []byte, id int32) {
 		wasmCall(kn, "set_handler", uint64(p), uint64(len(n)), uint64(uint32(id)))
 		wasmCall(kn, "dealloc", uint64(p))
 	}
+}
+
+// isRegistered answers the kernel's handler-table query for `n` — the same
+// `is_registered` export the JS host uses. The shared §7.4 policy consults it so a
+// first install cannot overlay a SetHandler-seeded bootstrap slot.
+func isRegistered(n []byte) bool {
+	p := wr(kn, n)
+	if p == 0 {
+		return false
+	}
+	r := wasmCall(kn, "is_registered", uint64(p), uint64(len(n)))
+	wasmCall(kn, "dealloc", uint64(p))
+	return len(r) > 0 && r[0] == 1
+}
+
+// removeHandler unbinds `n` (§7.5) — the kernel's remove_handler, mirroring the JS
+// host. On success it also drops the loader-side impl, closing the wasm instance and
+// its compiled code so an uninstall doesn't leak them (installWasm does the same on
+// a same-author replace).
+func removeHandler(n []byte) bool {
+	p := wr(kn, n)
+	if p == 0 {
+		return false
+	}
+	r := wasmCall(kn, "remove_handler", uint64(p), uint64(len(n)))
+	wasmCall(kn, "dealloc", uint64(p))
+	if len(r) == 0 || r[0] != 1 {
+		return false
+	}
+	if h, ok := wasmH[string(n)]; ok {
+		_ = h.mod.Close(ctx)
+		if h.cmod != nil { // the signature wrapper is loaded without a retained CompiledModule
+			_ = h.cmod.Close(ctx)
+		}
+		delete(scrOf, h.mod)
+		delete(wasmH, string(n))
+	}
+	delete(natH, string(n))
+	return true
 }
 
 func load(wasm []byte, modName string) api.Module {
@@ -301,6 +349,13 @@ func genesisSuiteVerify(req []byte) []byte {
 	sig := req[o : o+sigLen]
 	o += sigLen
 	data := req[o:]
+	// Gate on the point check before verifying, as the JS host does: it rejects
+	// non-canonical encodings and small-order/identity keys that crypto_sign_verify_detached
+	// alone would not consistently refuse. Both targets must accept exactly the same key
+	// set, or a signature one node honors another drops (§6.2).
+	if !sd.isValidPoint(pk) {
+		return invalid
+	}
 	if sd.verifyDetached(sig, data, pk) {
 		return []byte{1}
 	}
@@ -335,7 +390,7 @@ func installWasm(n, wasm []byte) bool {
 		return false
 	}
 	s := uint32(g.Get())
-	// approve() permits a same-author re-install (host.js), so this name may
+	// The §7.4 policy permits a same-author re-install, so this name may
 	// already hold a live handler. Close the previous instance + its compiled code and
 	// drop its scrOf key before replacing, or every upgrade leaks one wasm instance
 	// (linear memory + JITed code) and a stale scrOf entry for the process's life.
@@ -351,8 +406,8 @@ func installWasm(n, wasm []byte) bool {
 	return true
 }
 
-// boot wires the wasm host imports, instantiates kernel + signature, and stands
-// up the QuickJS realm running host.js (installer + bundle verification).
+// boot wires the wasm host imports, instantiates kernel + signature, and stands up the
+// QuickJS realm running the shared installer + bundle loader (host-installer.gen.js).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the genesis suite verify routes to it below
@@ -423,9 +478,46 @@ func boot() {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
 	}))
+	// The §7.4 first-install branch refuses to overlay a SetHandler-seeded slot, so the
+	// shared policy needs the kernel's handler-table query.
+	b.SetPropertyStr("isRegistered", fn(func(t *qjs.This) (*qjs.Value, error) {
+		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
+		return t.Context().NewBool(isRegistered(n)), nil
+	}))
+	b.SetPropertyStr("removeHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
+		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
+		return t.Context().NewBool(removeHandler(n)), nil
+	}))
+	// Bundle-freshness persistence (§12.4): the arithmetic is shared JS, the durable
+	// write is ours — a truncated store reads back as "no marks", silently dropping
+	// every downgrade guard, so the write must be atomic.
+	b.SetPropertyStr("readFreshness", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if freshnessStorePath == "" {
+			return t.Context().NewNull(), nil
+		}
+		fb, err := os.ReadFile(freshnessStorePath)
+		if err != nil {
+			return t.Context().NewNull(), nil // absent ⇒ first boot
+		}
+		return t.Context().NewString(string(fb)), nil
+	}))
+	b.SetPropertyStr("writeFreshness", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if freshnessStorePath == "" {
+			return t.Context().NewNull(), nil // no store configured (tests) ⇒ in-memory only
+		}
+		// Logged, not fatal: the in-memory mark still guards the running process; only
+		// the next boot would be unprotected, which the operator must see.
+		if err := writeFileAtomic(freshnessStorePath, []byte(t.Args()[0].String())); err != nil {
+			fmt.Fprintf(os.Stderr, "seedkernel: could not persist freshness mark to %s: %v\n", freshnessStorePath, err)
+		}
+		return t.Context().NewNull(), nil
+	}))
 	qc.Global().SetPropertyStr("bridge", b)
 	exposeSodium(qc, sd) // installs `sodium` (libsodium-wrappers shape) into the realm
-	if _, err := qc.Eval("host.js", qjs.Code(hostJS)); err != nil {
+	// bundle.ts builds its manifest domain prefix with TextEncoder at module scope, so
+	// the polyfills must be in place before the bundle is evaluated.
+	installPolyfills(qc)
+	if _, err := qc.Eval("host-installer.gen.js", qjs.Code(hostInstallerJS)); err != nil {
 		panic(err)
 	}
 
@@ -492,29 +584,31 @@ type loadedBundle struct {
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
 var loaded *loadedBundle
 
-// loadBundle loads a signed app bundle directory (README §12.4): JS verifies the
-// manifest signature + module/guest content hashes, then Go installs each verified
-// module directly under its kernel name (JS installModule synthesizes the record
-// with the manifest author, under the same policy) — no per-module install envelope,
-// so no 64 KB cap and no boot-time seq. On success it records the verified guest
+// loadBundle loads a signed app bundle directory (README §12.4). Reading the directory
+// is all this does: the whole load — manifest signature, policy governance, freshness,
+// per-module and guest integrity, and the order they run in — is the shared JS loader
+// (bundle.ts, via host-installer.gen.js), which installs each verified module through
+// the same install policy as a wire install. On success it records the verified guest
 // source + caps + config in `loaded` for the node.
 func loadBundle(dir string) string {
-	menv, err := os.ReadFile(filepath.Join(dir, "manifest.bundle"))
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "ERROR: " + err.Error()
 	}
 	goFiles := map[string][]byte{}
 	jsFiles := qc.NewObject()
-	entries, _ := os.ReadDir(dir)
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		fb, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		fb, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue // unreadable file ⇒ absent; the loader fails it on the hash it can't match
+		}
 		goFiles[e.Name()] = fb
 		jsFiles.SetPropertyStr(e.Name(), qc.NewArrayBuffer(fb))
 	}
-	res, err := invokeFree("verifyBundle", qc.NewArrayBuffer(menv), jsFiles)
+	res, err := invokeFree("loadBundleFiles", jsFiles)
 	if err != nil {
 		return "ERROR(invoke): " + err.Error()
 	}
@@ -529,103 +623,23 @@ func loadBundle(dir string) string {
 		Caps        []string
 		Guest       string
 		Config      json.RawMessage
-		Modules     []struct{ Name, File, KernelName string }
+		Installed   []string
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
 	}
-	// Freshness (README §12.4 step 3): refuse a version below the persisted (author, app)
-	// high-water mark as a downgrade — nothing lands. The mark is NOT advanced here; that
-	// waits until after the installs so a partial/corrupt newer bundle can't raise it.
-	if err := checkBundleFreshness(m.Author, m.App, m.Version); err != nil {
-		return "ERROR: " + err.Error()
-	}
-	var installed []string
-	for _, mod := range m.Modules {
-		// Install the manifest-verified bytes directly (README §12.4): JS installModule
-		// synthesizes the record with the manifest author and runs the same policy — no
-		// install envelope dispatched, so no seq and no 64 KB cap.
-		if res, _ := invokeFree("installModule", qc.NewString(mod.KernelName), qc.NewArrayBuffer(goFiles[mod.File])); res != nil {
-			res.Free()
-		}
-		kName, _ := hex.DecodeString(mod.KernelName)
-		if _, ok := wasmH[string(kName)]; ok {
-			installed = append(installed, mod.Name)
-		}
-	}
-	// Advance the freshness mark only now, after the modules installed — so it records the
-	// highest version that actually loaded, keeping rollback to a known-good bundle possible.
-	advanceBundleFreshness(m.Author, m.App, m.Version)
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
 		config: m.Config, guestSource: string(goFiles[m.Guest]),
 	}
-	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, installed)
+	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, m.Installed)
 }
 
-// freshnessHW is the persisted per-(author, app) bundle-version high-water mark
-// (README §12.4). Held in memory, seeded from freshnessStorePath at first use and
-// written back on every advance; when the path is empty (tests) it stays purely
-// in-memory, so a fresh process starts with −∞ for every key.
-var (
-	freshnessStorePath string
-	freshnessHW        map[string]int
-)
-
-// loadFreshness reads the persisted marks once (absent/malformed ⇒ empty).
-func loadFreshness() {
-	if freshnessHW != nil {
-		return
-	}
-	freshnessHW = map[string]int{}
-	if freshnessStorePath == "" {
-		return
-	}
-	if b, err := os.ReadFile(freshnessStorePath); err == nil {
-		_ = json.Unmarshal(b, &freshnessHW) // malformed ⇒ start empty
-	}
-}
-
-// checkBundleFreshness enforces the monotonic (author, app) high-water mark WITHOUT
-// mutating it: a version below the mark is a refused downgrade; an equal or newer version
-// is allowed. The mark is advanced only later, by advanceBundleFreshness, after the
-// installs land — so a partial/corrupt newer bundle that fails mid-load cannot raise the
-// mark past the last version that actually ran (README §12.4). The author hex is
-// fixed-length, so the "author:app" key is unambiguous.
-func checkBundleFreshness(authorHex, app string, version int) error {
-	loadFreshness()
-	k := authorHex + ":" + app
-	if hw, ok := freshnessHW[k]; ok && version < hw {
-		return fmt.Errorf("version %d is below the (author, app) freshness high-water mark %d — downgrade refused", version, hw)
-	}
-	return nil
-}
-
-// advanceBundleFreshness records `version` as the new (author, app) high-water mark and
-// persists it, called only after a bundle has fully loaded (README §12.4). Monotonic: an
-// equal or lower version never rewinds the mark. Persistence is atomic (temp file + rename,
-// mirroring fs.go's put) so a crash mid-write can never truncate the JSON — which
-// loadFreshness would silently read as empty, discarding every downgrade mark on the next
-// boot. A persist error is logged, not fatal: the in-memory mark still protects the running
-// process; only the next boot would be left unprotected, which the operator must see.
-func advanceBundleFreshness(authorHex, app string, version int) {
-	loadFreshness()
-	k := authorHex + ":" + app
-	if hw, ok := freshnessHW[k]; ok && version <= hw {
-		return // never rewind; an equal-version reload keeps the mark unchanged
-	}
-	freshnessHW[k] = version
-	if freshnessStorePath == "" {
-		return
-	}
-	b, err := json.Marshal(freshnessHW)
-	if err != nil {
-		return
-	}
-	if err := writeFileAtomic(freshnessStorePath, b); err != nil {
-		fmt.Fprintf(os.Stderr, "seedkernel: could not persist freshness mark to %s: %v\n", freshnessStorePath, err)
-	}
-}
+// freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
+// (README §12.4). The marks and the monotonic rule live in JS (bundle.ts FreshnessMarks);
+// Go owns only the path and the atomic write. Empty (tests) ⇒ purely in-memory, so a
+// fresh process starts with −∞ for every key.
+var freshnessStorePath string
 
 // writeFileAtomic writes b to path via a sibling temp file + rename, so a reader (or a
 // crash) only ever sees the old or the complete new contents — never a truncated write.
@@ -651,14 +665,20 @@ func writeFileAtomic(path string, b []byte) error {
 	return nil
 }
 
-// applyPolicy installs the shell's install policy (host/policy.ts shape) into the
-// JS realm; "" leaves the permissive default. parsePolicy throws on malformed input,
-// which surfaces here as an error (a typo fails the boot loudly, not silently).
+// applyPolicy installs the shell's install policy (host/policy.ts shape) into the JS
+// realm. "" is not "no policy" but the deny-all default — an empty author set, so the
+// node boots and serves and every install is refused (README §14) — resolved by the
+// shared policyFromJson, the same function the Node shell resolves it through. A
+// provided config is parsed strictly: parsePolicy throws on malformed input, which
+// surfaces here as an error, so a typo'd allowed-keys.json fails the boot loudly
+// rather than silently widening trust.
 func applyPolicy(json string) error {
+	arg := qc.NewString(json)
 	if strings.TrimSpace(json) == "" {
-		return nil
+		arg.Free()
+		arg = qc.NewNull()
 	}
-	res, err := invokeFree("setPolicy", qc.NewString(json))
+	res, err := invokeFree("setPolicy", arg)
 	if res != nil {
 		res.Free()
 	}
@@ -702,7 +722,7 @@ func parseCLI() cliArgs {
 	flag.StringVar(&a.bundleDir, "bundle", "../../seedstore/WASM/bundle", "bundle directory (also accepted as a positional argument)")
 	flag.StringVar(&a.dataDir, "dir", "./data", "data directory")
 	flag.StringVar(&a.keyPath, "key", "./seedkernel.key", "identity key file")
-	flag.StringVar(&a.policyPath, "policy", "", "policy JSON file (default: permissive, caps-free)")
+	flag.StringVar(&a.policyPath, "policy", "", "policy JSON file: authors allowed to install (default: deny-all — no install lands)")
 	flag.StringVar(&a.listen, "listen", "", "TCP listen address (host:port)")
 	flag.StringVar(&a.wsListen, "ws-listen", "", "WebSocket listen address (host:port)")
 	flag.StringVar(&a.peers, "peers", "", "cohort peers to dial (pk@host:port,…)")
@@ -732,7 +752,9 @@ func main() {
 	a := parseCLI()
 	boot()
 
-	// Install policy (optional; absent ⇒ the permissive caps-free default).
+	// Install policy. Omitting --policy is not "no policy" but deny-all: the realm boots
+	// with an empty author set, so the node serves and nothing installs — including the
+	// bundle below, whose manifest author must be listed too (README §14).
 	if a.policyPath != "" {
 		pj, err := os.ReadFile(a.policyPath)
 		if err != nil {

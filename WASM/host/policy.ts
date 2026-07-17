@@ -7,8 +7,7 @@
 // carries: everything else — codec, reputation, the storage guest — arrives as
 // signed installs that must clear this gate.
 
-import type { KernelHost } from "./kernel-host.js";
-import type { ApproveInstall } from "./installer.js";
+import type { ApproveInstall, InstallerHost } from "./installer.js";
 import { referencePolicy } from "./installer.js";
 import { toHex } from "./util.js";
 
@@ -44,10 +43,24 @@ export function parsePolicy(json: string): ShellPolicy {
   return policy;
 }
 
+/** The policy a shell runs under given its (optional) config file. A *provided*
+ *  config is parsed strictly by `parsePolicy` — a typo fails the boot loudly rather
+ *  than silently widening trust — and an **omitted** one is deny-all: an empty author
+ *  set, so the node boots and serves but every install is refused (README §14).
+ *
+ *  The default lives here, in the shared core, precisely because it is a security
+ *  posture: every target (the Node shell, the native loader) resolves "no policy
+ *  configured" through this one function, so a target cannot drift into a permissive
+ *  default of its own. */
+export function policyFromJson(json: string | null | undefined): ShellPolicy {
+  return json ? parsePolicy(json) : { authors: [] };
+}
+
 /** Build the §7.4 `ApproveInstall` callback for a policy: a closed author set
  *  gates WHO may bind a name, and an optional module-hash allowlist pins WHICH
- *  binaries (`genesisHash(wasm)`) may land. */
-export function buildApproveInstall(host: KernelHost, policy: ShellPolicy): ApproveInstall {
+ *  binaries (`genesisHash(wasm)`) may land. An empty author set (the omitted-policy
+ *  default) admits nothing — every first install fails the `authors` check below. */
+export function buildApproveInstall(host: InstallerHost, policy: ShellPolicy): ApproveInstall {
   const authors = new Set(policy.authors.map((s) => s.toLowerCase()));
   const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;
 

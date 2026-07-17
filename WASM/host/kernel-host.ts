@@ -19,7 +19,7 @@
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
-import { toHex, writeU32BE } from "./util.js";
+import { nameKey, toHex, writeU32BE } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -108,9 +108,10 @@ interface HandlerEntry {
   wasm: WasmHandlerRef | null;
 }
 
-export function nameKey(name: Uint8Array): string {
-  return toHex(name);
-}
+// nameKey now lives in util.ts, so the installer can key its records without
+// importing this module (README §12.9 — the installer is bundled for the native
+// loader, which has no KernelHost). Re-exported here for existing importers.
+export { nameKey } from "./util.js";
 
 export class KernelHost {
   private kernelExports!: KernelExports;

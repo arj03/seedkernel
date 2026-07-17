@@ -30,7 +30,7 @@ type netHost struct {
 	nextID    int64
 	listeners []net.Listener // bound listeners, closed on network teardown
 
-	// Retained JS dispatchers (host.js-side router into per-channel callbacks).
+	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
 	fnClosed  *qjs.Value
 	fnAccept  *qjs.Value

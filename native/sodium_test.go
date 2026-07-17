@@ -201,3 +201,40 @@ func TestSodiumSealedBox(t *testing.T) {
 		t.Fatal("seal_open succeeded under the wrong keypair")
 	}
 }
+
+// The genesis suite gates every public key on crypto_core_ed25519_is_valid_point before
+// verifying (genesisSuiteVerify), matching the JS host's _pubkeyIsValidPoint. This pins
+// the minified export mapping ("uk") to the function we actually mean: a wrong mapping
+// that returned a constant would still let every signature test pass, so assert both
+// that real keys are accepted AND that the canonical small-order points are refused.
+func TestSodiumIsValidPoint(t *testing.T) {
+	s := newSodium(t)
+
+	// A real Ed25519 public key is on the main subgroup.
+	pk, _ := s.signSeedKeypair(bytes.Repeat([]byte{7}, 32))
+	if !s.isValidPoint(pk) {
+		t.Fatalf("is_valid_point(%x) = false, want true for a genuine public key", pk)
+	}
+
+	// libsodium's small-order blacklist (ed25519_ref10 has_small_order) plus a
+	// non-canonical encoding — every one must be refused.
+	for _, bad := range []string{
+		"0000000000000000000000000000000000000000000000000000000000000000", // 0, order 4
+		"0100000000000000000000000000000000000000000000000000000000000000", // 1, order 1 (identity)
+		"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05", // order 8
+		"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a", // order 8
+		"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p-1, order 2
+		"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p (= 0)
+		"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // p+1 (= 1)
+	} {
+		b, _ := hex.DecodeString(bad)
+		if s.isValidPoint(b) {
+			t.Fatalf("is_valid_point(%s) = true, want false (small order / non-canonical)", bad)
+		}
+	}
+
+	// A wrong-length key is refused without reaching the wasm.
+	if s.isValidPoint(bytes.Repeat([]byte{1}, 31)) {
+		t.Fatal("is_valid_point accepted a 31-byte key")
+	}
+}

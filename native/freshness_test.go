@@ -1,33 +1,50 @@
 package main
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// The bundle-freshness high-water mark must survive a reboot: it is persisted to a file
-// and re-read into an empty in-memory map at next boot (README §12.4). This exercises the
-// persist → forget → reload path directly on checkBundleFreshness/advanceBundleFreshness,
-// so a regression that dropped the write (or left it non-atomic and unreadable) shows up
-// as a downgrade that is wrongly allowed after the "reboot".
+// The bundle-freshness high-water mark must survive a reboot: the marks live in the JS
+// realm (bundle.ts FreshnessMarks) and are persisted through Go's atomic-write seam, so
+// a fresh realm must re-read them from the file (README §12.4). This drives the real
+// load path — boot, load, "reboot", load again — so a regression that dropped the write
+// (or left it non-atomic and unreadable) shows up as a downgrade that is wrongly allowed.
 func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
-	// Isolate the global freshness state and restore it afterwards, so this test neither
-	// sees nor leaks marks to the other tests in the package.
-	savedPath, savedHW := freshnessStorePath, freshnessHW
-	defer func() { freshnessStorePath, freshnessHW = savedPath, savedHW }()
+	// Isolate the global store path and restore it afterwards, so this test neither sees
+	// nor leaks marks to the other tests in the package (which run with it empty).
+	saved := freshnessStorePath
+	defer func() { freshnessStorePath = saved }()
 
 	storeDir := t.TempDir()
 	freshnessStorePath = filepath.Join(storeDir, "data.freshness.json")
-	freshnessHW = nil
 
-	const author, app = "0011223344556677", "myapp"
+	// One author across every "boot": the mark is keyed by (author, app).
+	boot()
+	author, authorPub := testAuthor(t)
+	policyJSON := `{"authors":["` + hex.EncodeToString(authorPub) + `"]}`
+
+	// reboot stands up a fresh realm — the marks are in-realm state, so this is what
+	// forces the next load to re-read them from the file.
+	reboot := func() {
+		boot()
+		if err := applyPolicy(policyJSON); err != nil {
+			t.Fatalf("applyPolicy: %v", err)
+		}
+	}
+	load := func(version int) string {
+		dir, _ := writeTestBundle(t, author, authorPub, "testapp", version)
+		return loadBundle(dir)
+	}
 
 	// First boot: v3 clears the (empty) mark and, once loaded, advances + persists it.
-	if err := checkBundleFreshness(author, app, 3); err != nil {
-		t.Fatalf("v3 check on a fresh store: %v", err)
+	reboot()
+	if status := load(3); !strings.HasPrefix(status, "testapp v3") {
+		t.Fatalf("v3 on a fresh store: %s", status)
 	}
-	advanceBundleFreshness(author, app, 3)
 
 	// The advance must have written the mark to disk (atomically — no temp left behind).
 	if _, err := os.Stat(freshnessStorePath); err != nil {
@@ -38,25 +55,22 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 		t.Fatalf("store dir has %d files, want exactly 1 (a stray temp means the write was not atomic)", len(entries))
 	}
 
-	// Simulate a reboot: forget the in-memory marks so the next check must re-read the file.
-	freshnessHW = nil
-
-	// A v2 downgrade is now refused purely from the persisted mark.
-	if err := checkBundleFreshness(author, app, 2); err == nil {
-		t.Fatal("v2 after reboot: expected a downgrade refusal, got nil (mark did not survive the reboot)")
+	// Reboot: a v2 downgrade is now refused purely from the persisted mark.
+	reboot()
+	if status := load(2); !strings.Contains(status, "downgrade refused") {
+		t.Fatalf("v2 after reboot: expected a downgrade refusal, got: %s (mark did not survive the reboot)", status)
 	}
 	// An equal-version reload (v3) and a newer version (v4) both pass; v4 advances the mark.
-	if err := checkBundleFreshness(author, app, 3); err != nil {
-		t.Fatalf("v3 after reboot: %v", err)
+	if status := load(3); !strings.HasPrefix(status, "testapp v3") {
+		t.Fatalf("v3 after reboot: %s", status)
 	}
-	if err := checkBundleFreshness(author, app, 4); err != nil {
-		t.Fatalf("v4 after reboot: %v", err)
+	if status := load(4); !strings.HasPrefix(status, "testapp v4") {
+		t.Fatalf("v4 after reboot: %s", status)
 	}
-	advanceBundleFreshness(author, app, 4)
 
 	// The v4 advance must persist too: after another reboot, v3 is a refused downgrade.
-	freshnessHW = nil
-	if err := checkBundleFreshness(author, app, 3); err == nil {
-		t.Fatal("v3 after the second reboot: expected a downgrade refusal (mark is 4)")
+	reboot()
+	if status := load(3); !strings.Contains(status, "downgrade refused") {
+		t.Fatalf("v3 after the second reboot: expected a downgrade refusal (mark is 4), got: %s", status)
 	}
 }

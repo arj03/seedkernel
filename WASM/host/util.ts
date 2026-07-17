@@ -14,6 +14,15 @@ export function fromHex(hex: string): Uint8Array {
   return out;
 }
 
+/** Map a raw handler name to the string key the host's name-keyed tables use.
+ *  Lives here rather than in kernel-host.ts so the installer can key its records
+ *  without importing the kernel host — the installer, the policy and the bundle
+ *  loader are the portable core the native loader bundles (README §12.9), and the
+ *  kernel host is a target-specific implementation of the seam they run over. */
+export function nameKey(name: Uint8Array): string {
+  return toHex(name);
+}
+
 export function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;

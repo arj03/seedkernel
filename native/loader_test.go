@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -22,8 +23,12 @@ func TestShellRunsBundle(t *testing.T) {
 		t.Fatalf("signed dispatch → echo = %d, want 1", echo)
 	}
 
-	// A minimal signed bundle: verify the manifest, govern it, install its module.
+	// A minimal signed bundle: verify the manifest, govern it, install its module. The
+	// author must be in the policy — an unconfigured node is deny-all (README §14).
 	author, authorPub := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+		t.Fatalf("applyPolicy: %v", err)
+	}
 	dir, kernelName := writeTestBundle(t, author, authorPub, "testapp", 1)
 	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("bundle load: %s", status)
@@ -40,12 +45,15 @@ func TestShellRunsBundle(t *testing.T) {
 }
 
 // TestWireInstall drives the live-update wire path (README §7.2): a signed install
-// envelope dispatched through the pipeline reaches onInstall, clears the permissive
-// default policy, and binds the module. This path stays after bundles moved to direct
-// installs (§12.4), so it keeps its own coverage here.
+// envelope dispatched through the pipeline reaches onInstall, clears the policy, and
+// binds the module. This path stays after bundles moved to direct installs (§12.4), so
+// it keeps its own coverage here.
 func TestWireInstall(t *testing.T) {
 	boot()
 	author, authorPub := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+		t.Fatalf("applyPolicy: %v", err)
+	}
 	target := name("wire.mod")
 	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
 	if _, ok := wasmH[string(target)]; !ok {
