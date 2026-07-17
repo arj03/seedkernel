@@ -15,11 +15,11 @@
 //     signature module reaches a suite by the same kernel.call to the suite's slot
 //     name (§6.4, §6.6); no bespoke suite-dispatch import
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
-//     instantiating WASM handlers + setHandler, genesis hashing, top-signer access
+//     instantiating WASM handlers, genesis hashing, top-signer access
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
-import { nameKey, toHex, writeU32BE } from "./util.js";
+import { toHex } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -68,7 +68,6 @@ interface KernelExports {
   dealloc(ptr: number): void;
   set_handler(namePtr: number, nameLen: number, handlerId: number): void;
   remove_handler(namePtr: number, nameLen: number): number;
-  is_registered(namePtr: number, nameLen: number): number;
   find_handler(namePtr: number, nameLen: number): number;
   dispatch(bytesPtr: number, bytesLen: number): void;
 }
@@ -108,11 +107,6 @@ interface HandlerEntry {
   wasm: WasmHandlerRef | null;
 }
 
-// nameKey now lives in util.ts, so the installer can key its records without
-// importing this module (README §12.9 — the installer is bundled for the native
-// loader, which has no KernelHost). Re-exported here for existing importers.
-export { nameKey } from "./util.js";
-
 export class KernelHost {
   private kernelExports!: KernelExports;
   private sodium!: Sodium;
@@ -133,9 +127,6 @@ export class KernelHost {
   // Handler id of the `signature` wrapper, set by registerSignature; -1 until
   // then, so no invoke_handler id ever matches it before registration.
   private signatureId = -1;
-  // The signature module's WASM bytes, kept from load() so registerSignature can
-  // instantiate it as an ordinary handler once the host knows its name.
-  private _signatureBytes!: Uint8Array;
   // Name used to build outer signature envelopes in wrap(). Set by
   // registerSignature; null until then.
   private _signatureName: Uint8Array | null = null;
@@ -154,23 +145,20 @@ export class KernelHost {
 
   private constructor() {}
 
-  /** Instantiate the kernel from in-memory bytes and keep the signature module's
-   *  bytes for `registerSignature` to instantiate as an ordinary handler (§4). The
-   *  caller supplies the bytes and an initialized libsodium for Ed25519 +
-   *  SHA-3-256 — keeping the entry point free of Node- or browser-specific I/O is
-   *  what lets the same host run in Node, browsers, Deno, Bun, etc. The thin entry
-   *  points in `node.ts` / `browser.ts` package the loading dance for each
-   *  platform. */
+  /** Instantiate the kernel from in-memory bytes. The kernel alone is a usable
+   *  host (§1): dispatch and `register` work with nothing else wired, and every
+   *  layer above — the signature wrapper (`registerSignature`), the installer
+   *  (`registerInstaller`) — is opt-in on top. The caller supplies the bytes and
+   *  an initialized libsodium for Ed25519 + SHA-3-256 — keeping the entry point
+   *  free of Node- or browser-specific I/O is what lets the same host run in
+   *  Node, browsers, Deno, Bun, etc. The thin entry points in `node.ts` /
+   *  `browser.ts` package the loading dance for each platform. */
   static async load(
     kernelBytes: BufferSource,
-    signatureBytes: BufferSource,
     sodium: Sodium,
   ): Promise<KernelHost> {
     const host = new KernelHost();
     host.sodium = sodium;
-    host._signatureBytes = ArrayBuffer.isView(signatureBytes)
-      ? new Uint8Array(signatureBytes.buffer, signatureBytes.byteOffset, signatureBytes.byteLength)
-      : new Uint8Array(signatureBytes);
 
     // ── load kernel.wasm ──────────────────────────────────────────────
     const kernelImports: WebAssembly.Imports = {
@@ -569,7 +557,7 @@ export class KernelHost {
       crypto_core_ed25519_is_valid_point?: (p: Uint8Array) => boolean;
     }).crypto_core_ed25519_is_valid_point;
     if (typeof isValidPoint !== "function") return true;
-    const key = nameKey(pub);
+    const key = toHex(pub);
     if (this.validatedPubkeys.has(key)) return true;
     if (!isValidPoint(pub)) return false;
     if (this.validatedPubkeys.size >= KernelHost.MAX_VALIDATED_PUBKEYS) {
@@ -628,32 +616,7 @@ export class KernelHost {
     return this.signerStack.map((s) => ({ algoId: s.algoId, publicKey: s.publicKey.slice() }));
   }
 
-  /** Host-level handler management (README §3.1). Installs or replaces a
-   *  handler unconditionally. SetHandler-installed handlers are immune to
-   *  installer state by construction (§8) — any matching install record
-   *  is cleared as a side effect. */
-  setHandler(name: Uint8Array, handlerId: number): void {
-    // Bind an already-registered id under `name`, displacing whatever was there.
-    // Unlike register / _installWasmHandler this does not create the impl — the
-    // entry for `handlerId` is expected to exist already, so merge the name into
-    // it rather than clobbering its handler/wasm ref.
-    const ptr = this.writeToKernel(name);
-    let oldId: number;
-    try {
-      oldId = this.kernelExports.find_handler(ptr, name.length);
-      this.kernelExports.set_handler(ptr, name.length, handlerId);
-    } finally { this.kernelExports.dealloc(ptr); }
-    if (oldId >= 0 && oldId !== handlerId) this.entries.delete(oldId);
-    const entry = this.entries.get(handlerId);
-    if (entry) entry.name = name.slice();
-    else this.entries.set(handlerId, { name: name.slice(), blocked: false, handler: null, wasm: null });
-    // SetHandler entries are bootstrap-only by construction (§3.1) — clear
-    // any stale install record at this slot so a future lookup can't return
-    // stale data for brand-new bytes (§3.1 "Replacing installer-managed names").
-    if (this._installer) this._installer._onKernelSlotMutated(name);
-  }
-
-  /** Remove a handler installed via setHandler (null handler case in §3.1). */
+  /** Remove a handler, the `SetHandler(name, null)` case in §3.1. */
   removeHandler(name: Uint8Array): boolean {
     const ptr = this.writeToKernel(name);
     try {
@@ -681,8 +644,11 @@ export class KernelHost {
    *  path (§9.1). Blocked from `kernel.call` (§4.4): the wrapper establishes the
    *  top signer, so letting a handler invoke it would let it reframe the active
    *  signer mid-chain. */
-  registerSignature(signatureName: Uint8Array): void {
-    if (!this._installWasmHandler(signatureName, this._signatureBytes)) {
+  registerSignature(signatureName: Uint8Array, signatureBytes: BufferSource): void {
+    const bytes = ArrayBuffer.isView(signatureBytes)
+      ? new Uint8Array(signatureBytes.buffer, signatureBytes.byteOffset, signatureBytes.byteLength)
+      : new Uint8Array(signatureBytes);
+    if (!this._installWasmHandler(signatureName, bytes)) {
       throw new Error("registerSignature: failed to instantiate the signature module");
     }
     const id = this.findHandlerId(signatureName);
@@ -735,44 +701,10 @@ export class KernelHost {
     this._installer.setApproveInstall(callback);
   }
 
-  /** Build an install payload (README §7.2):
-   *    [seq u32 BE]
-   *    [name_len u8][name ..]
-   *    [wasm]
-   *
-   *  `seq` is the §4.4 replay-protection sequence number for the signer. */
-  encodeInstallPayload(
-    seq: number,
-    name: Uint8Array,
-    wasmBytes: Uint8Array,
-  ): Uint8Array {
-    if (name.length === 0 || name.length > 255)
-      throw new Error("encodeInstallPayload: name length must be 1..255");
-    if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
-      throw new Error("encodeInstallPayload: seq must fit in u32");
-    const headerLen = 4 + 1 + name.length; // seq + name_len + name
-    const out = new Uint8Array(headerLen + wasmBytes.length);
-    let o = 0;
-    writeU32BE(out, o, seq); o += 4;
-    out[o++] = name.length;
-    out.set(name, o); o += name.length;
-    out.set(wasmBytes, o);
-    return out;
-  }
-
-  /** Test helper: call an arbitrary `(): i32` export on a dynamic WASM handler. */
-  callDynamicHandlerI32(name: Uint8Array, exportName: string): number | null {
-    const hid = this.findHandlerId(name);
-    if (hid < 0) return null;
-    const wasm = this.entries.get(hid)?.wasm;
-    if (!wasm) return null;
-    const fn = (wasm.exports as { [k: string]: unknown })[exportName];
-    if (typeof fn !== "function") return null;
-    return (fn as () => number)();
-  }
-
   /** Call a named export on a dynamic WASM handler, staging `payload` in
-   *  scratch first. Returns the export's i32 return value or null on failure. */
+   *  scratch first. Returns the export's i32 return value or null on failure.
+   *  An export taking no arguments is reached with an empty payload — the JS
+   *  WASM API drops the surplus argument. */
   callDynamicExport(
     name: Uint8Array,
     exportName: string,
@@ -829,10 +761,12 @@ export class KernelHost {
     return id;
   }
 
+  /** True if a handler occupies `name`. A bound name is exactly one the
+   *  kernel's `find_handler` resolves, so this asks that — the same table
+   *  dispatch and kernel.call route through — rather than a second export
+   *  that would answer the same question. */
   isRegistered(name: Uint8Array): boolean {
-    const ptr = this.writeToKernel(name);
-    try { return this.kernelExports.is_registered(ptr, name.length) === 1; }
-    finally { this.kernelExports.dealloc(ptr); }
+    return this.findHandlerId(name) >= 0;
   }
 
   /** Feed raw envelope bytes into the pipeline. */

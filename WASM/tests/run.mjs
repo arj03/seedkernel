@@ -18,6 +18,7 @@ const {
   generateKeyPair,
   ensureSodium,
   referencePolicy,
+  encodeInstallPayload,
 } = await imp("build/host/node.js");
 
 // Transport + WS module surface (moved up from seedstore in the runtime split,
@@ -33,6 +34,10 @@ const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm, createSyncSafeRealm } = await imp("build/host/safe-js.js");
 const { toHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Payload for callDynamicExport against an export that takes no arguments: the
+// JS WASM API drops the surplus argument, so the general helper covers them too.
+const EMPTY = new Uint8Array(0);
 
 await ensureSodium();
 
@@ -74,11 +79,11 @@ const signatureWasm = join(root, "build/signature.wasm");
 // policy accepts every install; tests that need rejection override via
 // host.setApproveInstall.
 async function makeHost(approveInstall = () => true) {
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
+  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
 
-  host.registerSignature(signatureName);
+  host.registerSignature(signatureName, signatureBytes);
   host.registerInstaller(installName);
   host.setApproveInstall(approveInstall);
 
@@ -90,7 +95,7 @@ const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.w
 
 // Encode an install + sign it, returning the wire bytes ready for dispatch.
 function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
-  const payload = host.encodeInstallPayload(seq, targetName, wasm);
+  const payload = encodeInstallPayload(seq, targetName, wasm);
   return host.wrapAndEncode(signSk, signPk, installName, payload);
 }
 
@@ -157,7 +162,8 @@ async function testInvalidSignatureDropped() {
 async function testSizeLimitEnforced() {
   console.log("Test: Oversized envelope rejected (§2.2)");
 
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
+  // The kernel alone (§1) — this test needs no signature wrapper, so it wires none.
+  const { host } = await loadKernelHost(kernelWasm, signatureWasm);
 
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
@@ -183,9 +189,9 @@ async function testSizeLimitEnforced() {
 async function testSignatureDepthCap() {
   console.log("Test: Signature wrapping depth capped at MAX_SIGNATURE_DEPTH=4 (§2.3)");
 
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
+  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName);
+  host.registerSignature(signatureName, signatureBytes);
 
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
@@ -228,10 +234,10 @@ async function testRefuseOverlayBootstrapSlot() {
   // Use the reference policy with an allow-all first-install branch so this
   // test exercises only the bootstrap-slot refusal — not an unrelated first-
   // install rejection.
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
+  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  host.registerSignature(signatureName);
+  host.registerSignature(signatureName, signatureBytes);
   host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
@@ -297,7 +303,7 @@ async function testApproveInstallReceivesBytesHash() {
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   const seq = makeSeq();
-  const payload = host.encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
+  const payload = encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
   host.dispatch(host.wrapAndEncode(sk, pk, installName, payload));
   assert(host.isRegistered(chatTextName), "install accepted");
 
@@ -335,10 +341,10 @@ async function testNoApproveInstallDropsAll() {
 async function testReferencePolicyUpgradeRules() {
   console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
 
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
+  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
   const installName   = host.deriveBootstrapName("install");
-  host.registerSignature(signatureName);
+  host.registerSignature(signatureName, signatureBytes);
   host.registerInstaller(installName);
   host.setApproveInstall(referencePolicy(host, () => true));
 
@@ -571,12 +577,12 @@ async function testBridgeCallerPinning() {
 
   host.dispatch(host.wrapAndEncode(sk, pk, chatOtherName, makeForward(netSendName)));
   assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
-  assertEqual(host.callDynamicHandlerI32(chatOtherName, "last_resp_len"), 0,
+  assertEqual(host.callDynamicExport(chatOtherName, "last_resp_len", EMPTY), 0,
     "unpinned caller: bridge rejected (no response)");
 
   host.dispatch(host.wrapAndEncode(sk, pk, chatPinnedName, makeForward(netSendName)));
   assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
-  assertEqual(host.callDynamicHandlerI32(chatPinnedName, "last_resp_len"), 1,
+  assertEqual(host.callDynamicExport(chatPinnedName, "last_resp_len", EMPTY), 1,
     "pinned caller: bridge returned 1 byte");
 
   console.log("  OK\n");
@@ -614,7 +620,7 @@ async function testBlockFromCall() {
   fwdPayload.set(mutateName, 1);
   host.dispatch(host.wrapAndEncode(sk, pk, fwdName, fwdPayload));
   assertEqual(mutateCalls, 1, "kernel.call to blocked handler did NOT invoke it");
-  assertEqual(host.callDynamicHandlerI32(fwdName, "last_resp_len"), 0,
+  assertEqual(host.callDynamicExport(fwdName, "last_resp_len", EMPTY), 0,
     "kernel.call to blocked handler returned -1 (no response stored)");
 
   console.log("  OK\n");
@@ -625,8 +631,8 @@ async function testBlockFromCall() {
 async function testWrapRejectsInvalidKeySizes() {
   console.log("Test: wrap() rejects invalid Ed25519 key sizes");
 
-  const host = await loadKernelHost(kernelWasm, signatureWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"));
+  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
+  host.registerSignature(host.deriveBootstrapName("signature"), signatureBytes);
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const inner = host.encodeEnvelope(

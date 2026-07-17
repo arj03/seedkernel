@@ -203,17 +203,12 @@ func dropEntry(id int32) {
 	delete(entries, id)
 }
 
-// isRegistered answers the kernel's handler-table query for `n` — the same
-// `is_registered` export the JS host uses. The shared §7.4 policy consults it so a
+// isRegistered answers the kernel's handler-table query for `n`: a name is bound
+// exactly when find_handler resolves it, so this asks that rather than a second
+// export answering the same question. The shared §7.4 policy consults it so a
 // first install cannot overlay a SetHandler-seeded bootstrap slot.
 func isRegistered(n []byte) bool {
-	p := wr(kn, n)
-	if p == 0 {
-		return false
-	}
-	r := wasmCall(kn, "is_registered", uint64(p), uint64(len(n)))
-	wasmCall(kn, "dealloc", uint64(p))
-	return len(r) > 0 && r[0] == 1
+	return findHandlerID(n) >= 0
 }
 
 // removeHandler unbinds `n` via the kernel's remove_handler (§7.5) and drops the entry it

@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { loadKernelHost }
+import { loadKernelHost, encodeInstallPayload }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 
@@ -85,7 +85,7 @@ function bytesToHex(b) {
 }
 
 shellPrint("Loading kernel + bootstrap WASM...", "sys");
-const host = await loadKernelHost(
+const { host, signatureBytes } = await loadKernelHost(
   "../build/kernel.wasm", "../build/signature.wasm", sodium);
 
 // ─── bootstrap: signature wrapper + installer ──────────────────────────
@@ -93,7 +93,7 @@ const signatureName       = host.deriveBootstrapName("signature");
 const signatureSignerName = host.deriveBootstrapName("signature.signer");
 const installName         = host.deriveBootstrapName("install");
 
-host.registerSignature(signatureName);
+host.registerSignature(signatureName, signatureBytes);
 host.registerSignerQuery(signatureSignerName);   // apps query the signer
 host.registerInstaller(installName);
 
@@ -383,7 +383,7 @@ function unwrapSealed(sealedBytes) {
 // ── installing an app (local-authored) ─────────────────────────────────
 async function buildSealedInstall(meta, wasmBytes) {
   const handlerName = appHandlerName(meta.id);
-  const installPayload = host.encodeInstallPayload(
+  const installPayload = encodeInstallPayload(
     nextSeq(), handlerName, wasmBytes);
   return host.wrapAndEncode(
     myKeys.privateKey, myKeys.publicKey, installName, installPayload);

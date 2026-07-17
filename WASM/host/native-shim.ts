@@ -30,7 +30,7 @@ declare const bridge: {
   installWasm(name: Uint8Array, wasm: Uint8Array): boolean;
   /** The innermost verified signer as [algo u16 BE][pk], empty when the stack is. */
   topSigner(): ArrayBuffer;
-  /** The kernel's `is_registered` — does a handler already occupy `name`? */
+  /** Does a handler already occupy `name`? (The kernel's `find_handler`.) */
   isRegistered(name: Uint8Array): boolean;
   /** Unbind `name` (SetHandler(name, null)). */
   removeHandler(name: Uint8Array): boolean;

@@ -6,8 +6,8 @@
 //   alloc, dealloc                — host writes bytes into kernel memory
 //   set_handler                   — host-level handler install/replace (§3.1)
 //   remove_handler                — SetHandler(name, null) — remove (§3.1)
-//   is_registered                 — query handler table
-//   find_handler                  — resolve name → handler id (kernel.call routing)
+//   find_handler                  — resolve name → handler id, -1 if unbound; the
+//                                   table query too (bound ⟺ find_handler >= 0)
 //   dispatch                      — parse envelope + dispatch
 //
 // Imports:
@@ -114,10 +114,6 @@ export function remove_handler(
   if (idx < 0) return 0;
   handlers.splice(idx, 1);
   return 1;
-}
-
-export function is_registered(namePtr: i32, nameLen: i32): i32 {
-  return findIndexAtPtr(namePtr, nameLen) >= 0 ? 1 : 0;
 }
 
 /** Resolve the handler id bound to `name`, or -1 if none is (README §3.1).

@@ -137,9 +137,9 @@ function freshnessPathFor(dir: string): string {
  *  loaded policy, plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
-  const host = await KernelHost.load(opts.kernelBytes as BufferSource, opts.signatureBytes as BufferSource, sodium);
+  const host = await KernelHost.load(opts.kernelBytes as BufferSource, sodium);
 
-  host.registerSignature(host.deriveBootstrapName("signature"));
+  host.registerSignature(host.deriveBootstrapName("signature"), opts.signatureBytes as BufferSource);
   host.registerInstaller(host.deriveBootstrapName("install"));
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts).
   const policy = policyFromJson(opts.policyJson);

@@ -23,7 +23,7 @@
 // skip registerInstaller and the deployment is frozen.
 
 import type { Handler, Signer } from "./kernel-host.js";
-import { nameKey, readU32BE, toHex } from "./util.js";
+import { bytesEqual, readU32BE, toHex, writeU32BE } from "./util.js";
 
 /** The host seam the installer runs over (README §7). Deliberately narrower than
  *  `KernelHost`: instantiating WASM, hashing with the genesis suite and reading the
@@ -46,24 +46,31 @@ export interface InstallerHost {
   readonly currentTopSigner: Signer | null;
 }
 
-// Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
-// A public key is one identity, so its seq high-water mark must be a single
-// monotonic namespace: the same key reused across suites (§6.4 rotation) shares
-// one counter rather than getting a fresh `last_seen == 0` per algo_id that
-// would accept a replay once per suite. algo_id is folded into the signed
-// preimage now (§6.3), so it is authenticated and cannot be flipped on a
-// captured message anyway — but this keying is prior to that: replay state is a
-// property of the key, not the suite (§4.4). The signature layer rejects
-// non-canonical / small-order keys before they reach here, so equal key bytes
-// mean the same identity.
-function signerKey(pubKey: Uint8Array): string {
-  return toHex(pubKey);
-}
-
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
+/** Build an install payload (README §7.2):
+ *    [seq u32 BE]
+ *    [name_len u8][name ..]
+ *    [wasm]
+ *
+ *  `seq` is the §4.4 replay-protection sequence number for the signer. Pure
+ *  sender-side, and here rather than on the host so the encoder sits beside
+ *  `handleInstall`'s matching parse — the two halves of one wire format. */
+export function encodeInstallPayload(
+  seq: number,
+  name: Uint8Array,
+  wasmBytes: Uint8Array,
+): Uint8Array {
+  if (name.length === 0 || name.length > 255)
+    throw new Error("encodeInstallPayload: name length must be 1..255");
+  if (!Number.isSafeInteger(seq) || seq < 0 || seq > 0xffffffff)
+    throw new Error("encodeInstallPayload: seq must fit in u32");
+  const headerLen = 4 + 1 + name.length; // seq + name_len + name
+  const out = new Uint8Array(headerLen + wasmBytes.length);
+  let o = 0;
+  writeU32BE(out, o, seq); o += 4;
+  out[o++] = name.length;
+  out.set(name, o); o += name.length;
+  out.set(wasmBytes, o);
+  return out;
 }
 
 /** A single install record (README §7.1). */
@@ -150,7 +157,7 @@ export class Installer {
    *  there is no wire query (README §7.6); the policy callback already receives
    *  the resolved `existing` record, and bridges pin `kernel.caller`. */
   lookup(name: Uint8Array): InstallRecord | null {
-    return this.installations.get(nameKey(name)) ?? null;
+    return this.installations.get(toHex(name)) ?? null;
   }
 
   /** Host-side `installer.remove(name)` (README §7.5). Clears the record and
@@ -159,7 +166,7 @@ export class Installer {
    *  high-water marks are tombstone-forever (§4.4). Returns true if a record
    *  was removed. */
   remove(name: Uint8Array): boolean {
-    const key = nameKey(name);
+    const key = toHex(name);
     const rec = this.installations.get(key);
     if (!rec) return false;
     this.installations.delete(key);
@@ -167,31 +174,36 @@ export class Installer {
     return true;
   }
 
-  /** Called by KernelHost when a name is rebound via setHandler / register /
-   *  removeHandler. Drops any matching install record so a stale record can't
+  /** Called by KernelHost when a name is rebound via `register` or unbound via
+   *  `removeHandler`. Drops any matching install record so a stale record can't
    *  mislead lookup. Idempotent. */
   _onKernelSlotMutated(name: Uint8Array): void {
-    this.installations.delete(nameKey(name));
+    this.installations.delete(toHex(name));
   }
 
-  /** Install a bundle module directly (README §12.4), synthesizing its install
-   *  record instead of consuming a signed install envelope. The bundle's signed
-   *  manifest already authenticated the coherent set and committed to each
-   *  module's `genesisHash` — the loader verified the bytes against it — so the
-   *  per-module `.install` envelope, a second signature re-proving the same thing
-   *  under the same policy, was redundant; this replaces it. The **same policy
-   *  still runs** (author set, module-hash allowlist, first-install/same-author),
-   *  but there is deliberately **no `seq`**: a bundle's freshness guard is the
+  /** Hash, gate on the policy, instantiate, record — the whole install (§7.2
+   *  steps 3, 5-8), and the **only** path that mutates kernel state. Both callers
+   *  converge here: `handleInstall` after it has parsed a §7.2 envelope and
+   *  consumed its `seq`, and `installBundleModule` for a §12.4 bundle module.
+   *
+   *  The difference between them is `seq` and nothing else. A bundle carries none:
+   *  its signed manifest already authenticated the coherent set and committed to
+   *  each module's `genesisHash` — the loader verified the bytes against it — so
+   *  the per-module `.install` envelope, a second signature re-proving the same
+   *  thing under the same policy, was redundant. A bundle's freshness guard is the
    *  manifest's monotonic `version` (§12.4), so an equal-version reload re-installs
    *  cleanly here rather than being dropped as a replay of an already-consumed seq.
    *  Because it does not go through the kernel's envelope path, a bundled module is
-   *  not bound by the §2.2 64 KB cap. `author` is the manifest author. Wire installs
-   *  (§7.2) are unchanged. Returns true on success, false if no policy is wired or
-   *  the policy refuses. */
+   *  also not bound by the §2.2 64 KB cap.
+   *
+   *  The **same policy runs either way** (author set, module-hash allowlist,
+   *  first-install/same-author). `author` is the top signer for a wire install, the
+   *  manifest author for a bundle. Returns true on success, false if no policy is
+   *  wired or the policy refuses. */
   installDirect(name: Uint8Array, wasm: Uint8Array, author: Signer): boolean {
     if (name.length === 0 || wasm.length === 0) return false;
     const bytesHash = this.host.genesisHash(wasm);
-    const existing = this.installations.get(nameKey(name)) ?? null;
+    const existing = this.installations.get(toHex(name)) ?? null;
     if (!this._approveInstall) return false;
     let approved = false;
     try {
@@ -200,8 +212,11 @@ export class Installer {
       approved = false;
     }
     if (!approved) return false;
+    // Instantiate against the standard handler ABI (§4) and SetHandler, then
+    // record — in that order, so a record never points at a slot we failed to
+    // populate.
     if (!this.host._installWasmHandler(name, wasm)) return false;
-    this.installations.set(nameKey(name), {
+    this.installations.set(toHex(name), {
       author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
       bytesHash,
     });
@@ -215,9 +230,20 @@ export class Installer {
   };
 
   /** Returns true if `seq` is fresh for this signer (strictly greater than
-   *  the last seq accepted from them) and updates the high-water mark. */
+   *  the last seq accepted from them) and updates the high-water mark.
+   *
+   *  Replay identity is the canonical public key ONLY — never (algo_id, pubkey).
+   *  A public key is one identity, so its seq high-water mark must be a single
+   *  monotonic namespace: the same key reused across suites (§6.4 rotation) shares
+   *  one counter rather than getting a fresh `last_seen == 0` per algo_id that
+   *  would accept a replay once per suite. algo_id is folded into the signed
+   *  preimage now (§6.3), so it is authenticated and cannot be flipped on a
+   *  captured message anyway — but this keying is prior to that: replay state is a
+   *  property of the key, not the suite (§4.4). The signature layer rejects
+   *  non-canonical / small-order keys before they reach here, so equal key bytes
+   *  mean the same identity. */
   private _consumeSeq(signer: Signer, seq: number): boolean {
-    const k = signerKey(signer.publicKey);
+    const k = toHex(signer.publicKey);
     const last = this.lastSeen.get(k);
     if (last !== undefined && seq <= last) return false;
     this.lastSeen.set(k, seq);
@@ -232,7 +258,9 @@ export class Installer {
     const author = this.host.currentTopSigner;
     if (!author) return;
 
-    // 2. Parse the payload (§7.2): [seq u32][name_len u8][name][wasm].
+    // 2. Parse the payload (§7.2): [seq u32][name_len u8][name][wasm]. A payload
+    //    that fails to parse is not a §7.2 message at all, so it is dropped
+    //    before `seq` is consumed — an ill-formed one burns nothing.
     if (payload.length < 4) return;
     let o = 0;
     const seq = readU32BE(payload, o); o += 4;
@@ -245,37 +273,14 @@ export class Installer {
     const wasmBytes = payload.slice(o);
     if (wasmBytes.length === 0) return;
 
-    // 3. bytes_hash is the content id of the WASM module (§7.1): genesisHash(wasm),
-    //    the same identifier a manifest's modules[].hash and a policy allowlist use.
-    const bytesHash = this.host.genesisHash(wasmBytes);
-
-    // 4. Consume seq (§4.4 replay protection). Runs before the policy call
-    //    so a single replay can't keep re-running an expensive policy.
+    // 3. Consume seq (§4.4 replay protection). Runs before the hash and the
+    //    policy call so a single replay can't keep re-running either — §4.4
+    //    leaves that ordering to the implementation.
     if (!this._consumeSeq(author, seq)) return;
 
-    // 5. Fetch existing record (if any) for the policy callback.
-    const existing = this.installations.get(nameKey(name)) ?? null;
-
-    // 6. Policy decides. No callback wired = drop.
-    if (!this._approveInstall) return;
-    let approved = false;
-    try {
-      approved = this._approveInstall(name, author, bytesHash, wasmBytes, existing);
-    } catch {
-      approved = false;
-    }
-    if (!approved) return;
-
-    // 7. Instantiate against the standard handler ABI (§4) and SetHandler.
-    //    A suite install (§6.4) is an ordinary handler at its slot name — no
-    //    special-casing; it takes this same path.
-    if (!this.host._installWasmHandler(name, wasmBytes)) return;
-
-    // 8. Record. Stored after the kernel state change so a record never
-    //    points at a slot we failed to populate.
-    this.installations.set(nameKey(name), {
-      author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
-      bytesHash,
-    });
+    // 4. Hash, policy, install, record (§7.2 steps 3, 5-8) — the shared path,
+    //    which a §12.4 bundle module reaches through the same method. A suite
+    //    install (§6.4) is an ordinary handler at its slot name and takes it too.
+    this.installDirect(name, wasmBytes, author);
   }
 }

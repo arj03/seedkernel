@@ -72,7 +72,7 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 }
 
 // A first install must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
-// the reference policy's rule, enforced via the kernel's is_registered. The native
+// the reference policy's rule, enforced via the kernel's handler table. The native
 // approve() had no such check, so a signed install could rebind a seeded slot.
 func TestFirstInstallCannotOverlaySeededSlot(t *testing.T) {
 	boot()
