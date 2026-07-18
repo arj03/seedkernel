@@ -1,13 +1,13 @@
 // seedkernel-shell — the generic runtime entry (README §12).
 // It boots the kernel under an install policy and serves; it knows nothing about
-// storage or any other app. Everything an app needs arrives as signed installs
-// that must clear the --policy gate. The runtime offers raw-byte capabilities —
-// crypto (the bundled sumo), fs.* on --dir, net.* on --listen — and the safe-js
-// confinement host, wired to a bundle's declared cap domains when one loads
-// (§12.4); the kernel itself stays application-neutral.
+// storage or any other app. Everything an app needs arrives as a signed bundle
+// (§12.4) whose manifest author must clear the --policy gate. The runtime offers
+// raw-byte capabilities — crypto (the bundled sumo), fs.* on --dir, net.* on
+// --listen — and the safe-js confinement host, wired to a bundle's declared cap
+// domains when one loads (§12.4); the kernel itself stays application-neutral.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
-//        --listen 0.0.0.0:7000 --install ./codec.install,./reputation.install
+//        --listen 0.0.0.0:7000 --bundle ./app-bundle
 //
 // For a self-contained non-browser binary, the Go/native target (native/,
 // README §12.9) embeds and runs this same shared host JS — no Node install needed.
@@ -80,8 +80,6 @@ export interface Shell {
   readonly peers: Set<PeerId>;
   /** Add a peer to the cohort the guest can reach (and dial, if a NodeNetwork). */
   addPeer(peerId: PeerId): void;
-  /** Dispatch a signed install envelope; the policy decides whether it lands. */
-  installFromEnvelope(bytes: Uint8Array): void;
   /** Load a signed bundle directory: verify the manifest, govern it against the
    *  policy, integrity-check + install the modules, and return the guest source. */
   loadBundle(dir: string): LoadedBundle;
@@ -133,7 +131,7 @@ function freshnessPathFor(dir: string): string {
   return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
 }
 
-/** Assemble the runtime: kernel + signature + installer under the
+/** Assemble the runtime: kernel + signature + module registry under the
  *  loaded policy, plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
@@ -143,7 +141,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // The §6.5 query API: read-only, so it costs a bundle's WASM handlers nothing to
   // have it and they cannot ask "who signed this dispatch?" without it.
   host.registerSignerQuery(host.deriveBootstrapName("signature.signer"));
-  host.registerInstaller(host.deriveBootstrapName("install"));
+  host.registerInstaller();
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts).
   const policy = policyFromJson(opts.policyJson);
   host.setApproveInstall(buildApproveInstall(host, policy));
@@ -209,7 +207,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   return {
     host, net, transport, fs, sodium, policy, peers,
     addPeer(p) { if (p !== peerId) peers.add(p); },
-    installFromEnvelope(bytes) { host.dispatch(bytes); },
     loadBundle(dir) { return (loaded = loadBundle(host, sodium, policy, dir, freshness)); },
     async runGuest(entry, payload) {
       const b = requireLoaded();
@@ -357,13 +354,6 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
   if (args["bundle"]) {
     const b = shell.loadBundle(str(args, "bundle")!);
     console.log(`  bundle ${b.manifest.app} v${b.manifest.version} → installed ${b.installed.join(", ") || "(none)"}`);
-  }
-  // Bare signed installs from disk (each must clear the --policy gate to land).
-  if (args["install"]) {
-    for (const f of str(args, "install")!.split(",").map((s) => s.trim()).filter(Boolean)) {
-      shell.installFromEnvelope(new Uint8Array(readFileSync(f)));
-      console.log(`  install ${f} → dispatched`);
-    }
   }
   // One-shot client ops through the loaded guest — "the shell runs the app" as the
   // *initiator* (README §12.8). The request side is served below once we start

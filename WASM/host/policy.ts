@@ -1,11 +1,11 @@
 // The shell's install policy loader (the runtime split, "the minimal shell:
 // allowed keys + an untrusted relay"). It turns a small JSON config — "which keys
-// you allow" — into the installer's §7.4 `ApproveInstall` callback, narrowing the
+// you allow" — into the registry's §7.4 `ApproveInstall` callback, narrowing the
 // open reference posture (`referencePolicy(host, () => true)`, which accepts any
 // audited author) down to a **closed author-key set** plus an optional
 // **module-hash allowlist**. This is the only governance the generic runtime
-// carries: everything else — codec, reputation, the storage guest — arrives as
-// signed installs that must clear this gate.
+// carries: everything else — codec, reputation, the storage guest — arrives in a
+// signed bundle whose manifest author must clear this gate (§12.4).
 
 import type { ApproveInstall, InstallerHost } from "./installer.js";
 import { referencePolicy } from "./installer.js";

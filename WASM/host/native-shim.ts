@@ -3,13 +3,13 @@
 // scripts/bundle-loader.mjs, exactly like the netroute / ws / cap-bridge bundles.
 //
 // This file is a SEAM, not an implementation: every protocol rule — who may bind a
-// name (§7.4), the §7.2 payload layout, the manifest signature + its domain prefix
-// (§12.4), the freshness arithmetic, the deny-all default — comes from installer.ts,
-// bundle.ts and policy.ts, compiled once and shared. What lives here is only the
-// glue that cannot: the Go bridge is byte-level, so the powers the installer needs
-// (instantiate wasm, hash, read the signer stack, query the handler table, write a
-// file atomically) arrive as `bridge.*` and `sodium.*` and are adapted to the
-// `InstallerHost` / `BundleHost` / `FreshnessStore` interfaces here.
+// name (§7.4), the manifest signature + its domain prefix (§12.4), the freshness
+// arithmetic, the deny-all default — comes from installer.ts, bundle.ts and
+// policy.ts, compiled once and shared. What lives here is only the glue that
+// cannot: the Go bridge is byte-level, so the powers the registry needs
+// (instantiate wasm, hash, query the handler table, write a file atomically)
+// arrive as `bridge.*` and `sodium.*` and are adapted to the `InstallerHost` /
+// `BundleHost` / `FreshnessStore` interfaces here.
 //
 // Because it is TypeScript checked against those same interfaces, the drift that a
 // hand-written mirror accumulates is now a compile error.
@@ -18,7 +18,6 @@ import { Installer, type InstallerHost } from "./installer.js";
 import { buildApproveInstall, policyFromJson, type ShellPolicy } from "./policy.js";
 import { FreshnessMarks, loadBundle, type BundleHost, type BundleSource } from "./bundle.js";
 import { toHex } from "./util.js";
-import type { Signer } from "./kernel-host.js";
 
 /** The genesis signature suite's algo_id (§6.2) — an Ed25519 manifest author. */
 const GENESIS_ALGO_ID = 0x0000;
@@ -28,8 +27,6 @@ const GENESIS_ALGO_ID = 0x0000;
 declare const bridge: {
   /** Instantiate handler bytes against the §4 ABI and SetHandler them at `name`. */
   installWasm(name: Uint8Array, wasm: Uint8Array): boolean;
-  /** The innermost verified signer as [algo u16 BE][pk], empty when the stack is. */
-  topSigner(): ArrayBuffer;
   /** Does a handler already occupy `name`? (The kernel's `find_handler`.) */
   isRegistered(name: Uint8Array): boolean;
   /** Unbind `name` (SetHandler(name, null)). */
@@ -55,12 +52,6 @@ class NativeHost implements InstallerHost, BundleHost {
   _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
   removeHandler(name: Uint8Array): boolean { return bridge.removeHandler(name); }
   isRegistered(name: Uint8Array): boolean { return bridge.isRegistered(name); }
-
-  get currentTopSigner(): Signer | null {
-    const s = new Uint8Array(bridge.topSigner());
-    if (s.length < 3) return null; // empty stack ⇒ unsigned (§6.5)
-    return { algoId: (s[0] << 8) | s[1], publicKey: s.slice(2) };
-  }
 
   installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     return this.installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
@@ -92,12 +83,6 @@ applyPolicy(policy);
  *  default; malformed JSON throws, so a typo fails the loader's boot loudly. */
 function setPolicy(json: string | null): void {
   applyPolicy(policyFromJson(json));
-}
-
-/** The §7.2 install-message handler — Go routes the install envelope's payload here
- *  once the signature layer has established the top signer. */
-function onInstall(payload: ArrayBuffer): void {
-  host.installer.handleInstall(new Uint8Array(payload));
 }
 
 /** Load a signed bundle (README §12.4). Go has already read the directory — it is the
@@ -132,4 +117,4 @@ function loadBundleFiles(files: Record<string, ArrayBuffer>): string {
   }
 }
 
-export { setPolicy, onInstall, loadBundleFiles };
+export { setPolicy, loadBundleFiles };

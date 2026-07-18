@@ -483,15 +483,6 @@ func genesisSuiteVerify(req []byte) []byte {
 	return invalid
 }
 
-// topSigner returns the innermost verified signer (README §6.5), or false if the
-// signer stack is empty. The stack is host-owned (see handleSignature).
-func topSigner() (signer, bool) {
-	if len(sigStack) == 0 {
-		return signer{}, false
-	}
-	return sigStack[len(sigStack)-1], true
-}
-
 // serializeSignerStack renders the host-owned signer stack as the `signature.signer`
 // query response (README §6.5): [count u8] ([algo u16 BE][pk_len u16 BE][pk ..])* in
 // push order — outermost signer first, top signer last. An empty stack is [0x00].
@@ -624,13 +615,6 @@ func boot() {
 		wb, _ := qjs.JsTypedArrayToGo(t.Args()[1])
 		return t.Context().NewBool(installWasm(nm, wb)), nil
 	}))
-	b.SetPropertyStr("topSigner", fn(func(t *qjs.This) (*qjs.Value, error) {
-		s, ok := topSigner()
-		if !ok {
-			return t.Context().NewArrayBuffer(nil), nil
-		}
-		return t.Context().NewArrayBuffer(append([]byte{byte(s.algo >> 8), byte(s.algo)}, s.pk...)), nil
-	}))
 	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
@@ -678,15 +662,9 @@ func boot() {
 		panic(err)
 	}
 
-	// The install handler (§7.2) delegates to JS onInstall; blocked from kernel.call (§4.4)
-	// — it mutates kernel state under the top signer's authority.
-	installID := registerNative("install", func(payload []byte) []byte {
-		if res, _ := invokeFree("onInstall", qc.NewArrayBuffer(payload)); res != nil {
-			res.Free()
-		}
-		return nil
-	})
-	entries[installID].blocked = true
+	// No `install` wire handler: code arrives only as a signed bundle (§12.4), and
+	// loadBundleFiles admits each verified module directly via installWasm. There is
+	// no message-driven install path (§7).
 }
 
 // dispatch feeds raw envelope bytes into the pipeline (README §3).

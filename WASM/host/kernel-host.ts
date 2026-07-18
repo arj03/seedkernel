@@ -600,12 +600,11 @@ export class KernelHost {
   /** Install a bundle module directly under its manifest-declared kernel name
    *  (README §12.4). The signed manifest already authenticated the coherent set
    *  and pinned each module's content hash, so the loader installs verified bytes
-   *  here rather than dispatching a redundant per-module `.install` envelope —
-   *  lifting the §2.2 64 KB envelope cap for bundled modules and removing the
-   *  boot-time `seq` re-dispatch. The install record's author is the manifest
-   *  `authorPubKey` (an Ed25519 genesis key, §12.4); the same install policy still
-   *  gates it (§12.4 "two gates"). Returns true on success, false if no installer
-   *  is wired or the policy refuses. */
+   *  here — bundles are the only way code arrives, so this is the one admission
+   *  path (there is no per-module install envelope, no envelope cap, no `seq`).
+   *  The install record's author is the manifest `authorPubKey` (an Ed25519
+   *  genesis key, §12.4); the same install policy gates it (§12.4). Returns true
+   *  on success, false if no registry is wired or the policy refuses. */
   installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     if (!this._installer) return false;
     return this._installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
@@ -678,21 +677,20 @@ export class KernelHost {
     if (entry) entry.blocked = true;
   }
 
-  /** Register the Installer (README §7). Wires the (blocked) install message
-   *  handler — the installer's whole wire surface. Install records are read
-   *  host-side via `lookupInstall`; there is no `installer.lookup` /
-   *  `installer.caps_of` query message (README §7.6). Without calling this, the
-   *  deployment is frozen — no message-driven installs. Returns the Installer
+  /** Create the module registry (README §7). This is *not* a wire handler —
+   *  there is no `install` message and no dispatch path onto it. It holds the
+   *  install records and the policy callback, and the bundle loader (§12.4) calls
+   *  `installBundleModule` → `installDirect` to admit each verified module.
+   *  Install records are read host-side via `lookupInstall` (README §7.6). Without
+   *  calling this, the deployment can bind no modules. Returns the registry
    *  instance for further configuration. */
-  registerInstaller(installName: Uint8Array): Installer {
+  registerInstaller(): Installer {
     const ih = new Installer(this);
-    const id = this.register(installName, ih.handler);
-    this.blockFromCall(id);
     this._installer = ih;
     return ih;
   }
 
-  /** Convenience: wire the install-approval callback on the installer. Throws
+  /** Convenience: wire the install-approval callback on the registry. Throws
    *  if registerInstaller has not been called. */
   setApproveInstall(callback: ApproveInstall | null): void {
     if (!this._installer) {

@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { loadKernelHost, encodeInstallPayload }
+import { loadKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 
@@ -88,14 +88,13 @@ shellPrint("Loading kernel + bootstrap WASM...", "sys");
 const { host, signatureBytes } = await loadKernelHost(
   "../build/kernel.wasm", "../build/signature.wasm", sodium);
 
-// ─── bootstrap: signature wrapper + installer ──────────────────────────
+// ─── bootstrap: signature wrapper + module registry ────────────────────
 const signatureName       = host.deriveBootstrapName("signature");
 const signatureSignerName = host.deriveBootstrapName("signature.signer");
-const installName         = host.deriveBootstrapName("install");
 
 host.registerSignature(signatureName, signatureBytes);
 host.registerSignerQuery(signatureSignerName);   // apps query the signer
-host.registerInstaller(installName);
+host.registerInstaller();                         // the module registry (§7)
 
 // ── install-approval policy ────────────────────────────────────────────
 //
@@ -103,8 +102,8 @@ host.registerInstaller(installName);
 // record under this name with the same author key) are auto-approved — that is
 // exactly the "trust updates from the same author" guarantee (§7.4, author-only;
 // no parent/lineage gate). First installs require explicit user consent; the
-// UI gates them by adding the install's bytes_hash to `pendingApprovals`
-// before dispatching the signed envelope. Anything else is dropped.
+// UI gates them by adding the app's bytes_hash to `pendingApprovals` before
+// admitting it via installBundleModule. Anything else is refused.
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
 host.setApproveInstall((name, author, bytesHash, _wasm, existing) => {
@@ -187,10 +186,14 @@ function updatePeerPill() {
 
 // ─── app registry ──────────────────────────────────────────────────────
 //
-// An "app" is a signed install envelope (signature wrapper around an inner
-// install envelope §7.2) that carries a WASM payload with two embedded
-// custom sections: "app_meta" (a JSON manifest — id, name, version) and
-// "ui" (HTML rendered in the sandboxed iframe).
+// An "app" is a self-contained signed blob — `[authorPk 32][sig 64][wasm]`,
+// the author's Ed25519 signature over `DOMAIN_chat_install ‖ wasm` — carrying a
+// WASM payload with two embedded custom sections: "app_meta" (a JSON manifest —
+// id, name, version) and "ui" (HTML rendered in the sandboxed iframe). This is
+// a miniature bundle: author-signed content, verified locally and admitted
+// straight into the kernel via installBundleModule (§12.4) under the policy
+// above. There is no wire install path (§7) — the same blob serves the local
+// "add app" flow and the peer-to-peer Offer below.
 //
 // Each app installs under a kernel name derived from its `id`:
 //     handlerName  = SHA-3-256("seedkernel.bootstrap.v1:app:" + id)
@@ -213,13 +216,15 @@ function updatePeerPill() {
 const installedApps = new Map();   // id → AppRecord
 let activeAppId = null;
 
-// Per-signer monotonic seq for installs we author (§4.4). Bumped on every
-// own-signed install we dispatch.
-let installSeq = parseInt(sessionStorage.getItem("apps.installSeq") || "0", 10);
-function nextSeq() {
-  installSeq++;
-  sessionStorage.setItem("apps.installSeq", String(installSeq));
-  return installSeq;
+// Domain-separation prefix for a chat app blob's author signature. Disjoint from
+// the runtime's DOMAIN_* family so a chat-install signature can never verify as
+// an envelope wrapper, manifest, or channel AUTH over the same bytes.
+const CHAT_INSTALL_DOMAIN = new TextEncoder().encode("seedkernel-chat-install-v1\0");
+function chatInstallPreimage(wasm) {
+  const p = new Uint8Array(CHAT_INSTALL_DOMAIN.length + wasm.length);
+  p.set(CHAT_INSTALL_DOMAIN, 0);
+  p.set(wasm, CHAT_INSTALL_DOMAIN.length);
+  return p;
 }
 
 function appHandlerName(id) {
@@ -315,81 +320,43 @@ function promptMeta(defaultId) {
   return { id: trimmed, name, version };
 }
 
-// ── kernel envelope parsing helpers ────────────────────────────────────
+// ── app blob (verify + peek) ───────────────────────────────────────────
 //
-// We use these to peek inside a sealed install (the signature wrapper around
-// an install envelope) without going through kernel dispatch — needed so the
-// Apps UI can surface author + meta before the user accepts an install.
-function parseEnvelope(bytes) {
-  if (bytes.length < 4) return null;
-  if (bytes[0] !== 0x53 || bytes[1] !== 0x44) return null;
-  const version = bytes[2];
-  const nameLen = bytes[3];
-  if (nameLen === 0 || bytes.length < 4 + nameLen) return null;
-  const name = bytes.subarray(4, 4 + nameLen);
-  const payload = bytes.subarray(4 + nameLen);
-  return { version, name, payload };
-}
-
-function parseSignatureWrapperPayload(payload) {
-  if (payload.length < 6) return null;
-  let o = 0;
-  const algo = (payload[o] << 8) | payload[o + 1]; o += 2;
-  const signerLen = (payload[o] << 8) | payload[o + 1]; o += 2;
-  if (payload.length < o + signerLen + 2) return null;
-  const signer = payload.subarray(o, o + signerLen); o += signerLen;
-  const sigLen = (payload[o] << 8) | payload[o + 1]; o += 2;
-  if (payload.length < o + sigLen) return null;
-  const sig = payload.subarray(o, o + sigLen); o += sigLen;
-  const inner = payload.subarray(o);
-  return { algo, signer, sig, inner };
-}
-
-function parseInstallPayload(payload) {
-  if (payload.length < 5) return null;
-  let o = 0;
-  const seq = ((payload[o] << 24) | (payload[o + 1] << 16) |
-               (payload[o + 2] << 8) | payload[o + 3]) >>> 0;
-  o += 4;
-  const nameLen = payload[o++];
-  if (nameLen === 0 || payload.length < o + nameLen) return null;
-  const name = payload.subarray(o, o + nameLen); o += nameLen;
-  const wasm = payload.subarray(o);
-  if (wasm.length === 0) return null;
-  return { seq, name, wasm };
-}
-
+// A sealed app is `[authorPk 32][sig 64][wasm]`. `unwrapSealed` verifies the
+// author signature and returns author + wasm + content id, so the Apps UI can
+// surface author + meta before the user accepts, and a tampered/forged blob is
+// rejected here rather than at some later step.
 function unwrapSealed(sealedBytes) {
-  const outer = parseEnvelope(sealedBytes);
-  if (!outer || !bytesEqual(outer.name, signatureName)) return null;
-  const wrapper = parseSignatureWrapperPayload(outer.payload);
-  if (!wrapper) return null;
-  const inner = parseEnvelope(wrapper.inner);
-  if (!inner || !bytesEqual(inner.name, installName)) return null;
-  const install = parseInstallPayload(inner.payload);
-  if (!install) return null;
+  if (sealedBytes.length < 96) return null;
+  const authorPk = sealedBytes.subarray(0, 32);
+  const sig = sealedBytes.subarray(32, 96);
+  const wasm = sealedBytes.subarray(96);
+  if (wasm.length === 0) return null;
+  if (!sodium.crypto_sign_verify_detached(sig, chatInstallPreimage(wasm), authorPk)) return null;
   return {
-    authorPk: wrapper.signer,
-    authorAlgo: wrapper.algo,
-    installPayload: inner.payload,
-    // bytes_hash is the installer's content id for the module (§7.1):
+    authorPk,
+    authorAlgo: 0,   // Ed25519 genesis suite (§6.2)
+    // bytes_hash is the registry's content id for the module (§7.1):
     // genesisHash(wasm), the same value the approve callback receives — so it
     // keys pendingApprovals and doubles as the artifact's display hash.
-    bytesHash: host.genesisHash(install.wasm),
-    install,
+    bytesHash: host.genesisHash(wasm),
+    install: { wasm },
   };
 }
 
-// ── installing an app (local-authored) ─────────────────────────────────
-async function buildSealedInstall(meta, wasmBytes) {
-  const handlerName = appHandlerName(meta.id);
-  const installPayload = encodeInstallPayload(
-    nextSeq(), handlerName, wasmBytes);
-  return host.wrapAndEncode(
-    myKeys.privateKey, myKeys.publicKey, installName, installPayload);
+// ── sealing an app (local-authored) ─────────────────────────────────────
+// Sign the wasm under the local key: `[authorPk 32][sig 64][wasm]`, the same
+// self-contained blob a peer forwards over an Offer.
+async function buildSealedInstall(wasmBytes) {
+  const sig = sodium.crypto_sign_detached(chatInstallPreimage(wasmBytes), myKeys.privateKey);
+  const out = new Uint8Array(32 + 64 + wasmBytes.length);
+  out.set(myKeys.publicKey, 0);
+  out.set(sig, 32);
+  out.set(wasmBytes, 96);
+  return out;
 }
 
-// Dispatch a sealed install we already trust (the bytesHash has been added to
+// Admit a sealed app we already trust (the bytesHash has been added to
 // pendingApprovals if needed). Returns the AppRecord on success.
 async function applySealedInstall(sealedBytes) {
   const peeked = unwrapSealed(sealedBytes);
@@ -406,9 +373,12 @@ async function applySealedInstall(sealedBytes) {
   // its first configure / message. Idempotent — re-registering replaces.
   registerUiBridge(meta.id);
 
-  host.dispatch(sealedBytes);
-  if (!host.isRegistered(handlerName)) {
-    throw new Error("installer rejected the install");
+  // The author signature is already verified (unwrapSealed). Admit the module
+  // directly under the same policy a bundle module goes through (§12.4) — no
+  // wire envelope, no dispatch. The approve callback gates first installs on
+  // pendingApprovals and updates on same-author.
+  if (!host.installBundleModule(handlerName, peeked.install.wasm, peeked.authorPk)) {
+    throw new Error("install rejected by policy");
   }
 
   // One-shot configure (§3.2 helper contract) — tell the WASM the name of its
@@ -470,7 +440,7 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
       return;
     }
   }
-  const sealedBytes = await buildSealedInstall(meta, wasmBytes);
+  const sealedBytes = await buildSealedInstall(wasmBytes);
   const peeked = unwrapSealed(sealedBytes);
   if (!peeked) throw new Error("internal: just-built sealed install did not parse");
 
@@ -598,10 +568,10 @@ function unmountActiveApp() {
 
 // ── peer-to-peer app offers ────────────────────────────────────────────
 //
-// An offer is a sealed install envelope forwarded over a data channel. Any
-// peer who holds the sealed bytes can forward them (transitive offer) —
-// the original author's signature on the inner install is preserved by the
-// wrapper, so the recipient still authenticates against the author.
+// An offer is a sealed app blob forwarded over a data channel. Any peer who
+// holds the sealed bytes can forward them (transitive offer) — the blob carries
+// the original author's signature over the wasm, so the recipient still
+// authenticates against the author (unwrapSealed verifies it).
 //
 // The wire format: the sender wraps the sealed bytes inside their own
 // signature envelope under the bootstrap name `app.offer`. The outer signature

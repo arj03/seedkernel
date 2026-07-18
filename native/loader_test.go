@@ -45,28 +45,6 @@ func TestShellRunsBundle(t *testing.T) {
 	}
 }
 
-// TestWireInstall drives the live-update wire path (README §7.2): a signed install
-// envelope dispatched through the pipeline reaches onInstall, clears the policy, and
-// binds the module. This path stays after bundles moved to direct installs (§12.4), so
-// it keeps its own coverage here.
-func TestWireInstall(t *testing.T) {
-	boot()
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
-		t.Fatalf("applyPolicy: %v", err)
-	}
-	target := name("wire.mod")
-	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
-	if !boundToWasm(target) {
-		t.Fatal("wire install did not register the module")
-	}
-	// A replay of the same seq is dropped; the module stays bound to the same bytes.
-	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
-	if !boundToWasm(target) {
-		t.Fatal("module unbound after a replayed install")
-	}
-}
-
 // boundToWasm reports whether `n` resolves — through the kernel's own table, the way every
 // call path resolves it — to an installed wasm handler.
 func boundToWasm(n []byte) bool {

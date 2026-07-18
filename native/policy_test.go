@@ -57,38 +57,33 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	boot()
 	author, authorPub := testAuthor(t)
 
-	// A signed bundle from an otherwise-valid author does not load.
+	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
+	// way code arrives (§12.4), so the manifest-author gate is the whole install surface.
 	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
 	if status := loadBundle(dir); !strings.Contains(status, "not in the policy") {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
-
-	// Nor does a signed §7.2 wire install.
-	target := name("nopolicy.mod")
-	dispatch(buildInstall(author, authorPub, target, forwarderWasm, 1))
-	if boundToWasm(target) {
-		t.Fatal("no --policy must deny a wire install, but the module bound")
-	}
 }
 
-// A first install must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
-// the reference policy's rule, enforced via the kernel's handler table. The native
-// approve() had no such check, so a signed install could rebind a seeded slot.
-func TestFirstInstallCannotOverlaySeededSlot(t *testing.T) {
+// A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
+// the reference policy's rule, enforced via the kernel's handler table on the shared
+// installDirect path. `signature.signer` is seeded by boot() as a native handler with no
+// install record, so aiming a bundle module at it must leave the native handler in place.
+func TestBundleCannotOverlaySeededSlot(t *testing.T) {
 	boot()
 	author, authorPub := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	// `install` is seeded by boot() and has no install record, so it is a bootstrap slot.
-	// It is seeded as a native handler, so the slot still holding a non-wasm impl
-	// afterwards is exactly "the install did not overlay it".
-	seeded := name("install")
-	dispatch(buildInstall(author, authorPub, seeded, forwarderWasm, 1))
+	seeded := name("signature.signer")
+	dir, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
+	if status := loadBundle(dir); strings.Contains(status, "installed=[fwd]") {
+		t.Fatalf("a bundle module overlaid the seeded `signature.signer` slot: %s", status)
+	}
 	if boundToWasm(seeded) {
-		t.Fatal("a first install overlaid the SetHandler-seeded `install` slot")
+		t.Fatal("the seeded `signature.signer` slot was overlaid by a bundle module")
 	}
 	if id := findHandlerID(seeded); id < 0 || entries[id].nat == nil {
-		t.Fatal("the seeded `install` handler is gone from its slot")
+		t.Fatal("the seeded `signature.signer` handler is gone from its slot")
 	}
 }

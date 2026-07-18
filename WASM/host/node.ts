@@ -69,7 +69,6 @@ export type { Handler, Signer } from "./kernel-host.js";
 export {
   Installer,
   referencePolicy,
-  encodeInstallPayload,
 } from "./installer.js";
 export type {
   ApproveInstall,

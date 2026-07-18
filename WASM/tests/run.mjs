@@ -18,7 +18,6 @@ const {
   generateKeyPair,
   ensureSodium,
   referencePolicy,
-  encodeInstallPayload,
 } = await imp("build/host/node.js");
 
 // Transport + WS module surface (moved up from seedstore in the runtime split,
@@ -59,45 +58,33 @@ function assertEqual(actual, expected, msg) {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 }
 
-// Per-signer monotonic seq counter for §4.4 replay protection. Each test
-// that builds install payloads instantiates one and calls seq(pubKey) to get
-// a fresh strictly-increasing seq for that signer.
-function makeSeq() {
-  const counters = new Map();
-  return (pubKey) => {
-    const k = [...pubKey].join(",");
-    const next = (counters.get(k) ?? 0) + 1;
-    counters.set(k, next);
-    return next;
-  };
-}
-
 const kernelWasm = join(root, "build/kernel.wasm");
 const signatureWasm = join(root, "build/signature.wasm");
 
-// Standard bootstrap (README §9): signature handler + installer. The default
-// policy accepts every install; tests that need rejection override via
+// Standard bootstrap (README §9): signature handler + the module registry. The
+// default policy accepts every install; tests that need rejection override via
 // host.setApproveInstall.
 async function makeHost(approveInstall = () => true) {
   const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  const installName   = host.deriveBootstrapName("install");
 
   host.registerSignature(signatureName, signatureBytes);
-  host.registerInstaller(installName);
+  host.registerInstaller();
   host.setApproveInstall(approveInstall);
 
-  return { host, signatureName, installName };
+  return { host, signatureName };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const signerProbeBytes = new Uint8Array(readFileSync(join(root, "build/signer-probe.wasm")));
 
-// Encode an install + sign it, returning the wire bytes ready for dispatch.
-function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) {
-  const payload = encodeInstallPayload(seq, targetName, wasm);
-  return host.wrapAndEncode(signSk, signPk, installName, payload);
+// Admit a module directly under `targetName`, authored by `authorPk`, through the
+// same path the bundle loader uses (installBundleModule → installDirect → the policy
+// callback). Bundles are the only way code arrives now (§12.4) — there is no wire
+// install envelope. Returns whether the policy admitted it.
+function installMod(host, targetName, wasm, authorPk) {
+  return host.installBundleModule(targetName, wasm, authorPk);
 }
 
 // ─── Test: Full lifecycle ───────────────────────────────────────────────
@@ -105,17 +92,16 @@ function buildInstall(host, signSk, signPk, installName, seq, targetName, wasm) 
 async function testFullLifecycle() {
   console.log("Test: Full lifecycle (signed install + signed app message)");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
 
-  const seq = makeSeq();
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
   // Install the chat handler under the author's scoped name.
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), chatTextName, forwarderBytes));
+  installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "chat.text installed");
 
-  // The installer should have a record for it.
+  // The registry should have a record for it.
   const rec = host.lookupInstall(chatTextName);
   assert(rec !== null, "install record exists");
   assertEqual(rec.author.publicKey, pk, "record author matches signer");
@@ -143,7 +129,7 @@ async function testFullLifecycle() {
 async function testSignerQuery() {
   console.log("Test: signature.signer query (§6.5) reached by a helper-built handler");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
   const signerQueryName = host.deriveBootstrapName("signature.signer");
 
   // This name is ABI, not an implementation detail: assembly/seedkernel/handler.ts
@@ -158,10 +144,9 @@ async function testSignerQuery() {
   assertEqual([...host.callHandler(signerQueryName, EMPTY)], [0],
     "an empty signer stack serializes as [0x00]");
 
-  const seq = makeSeq();
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const probeName = host.deriveScopedName("signer.probe", pk);
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk), probeName, signerProbeBytes));
+  installMod(host, probeName, signerProbeBytes, pk);
   assert(host.isRegistered(probeName), "signer-probe installed");
 
   const routeName = host.deriveBootstrapName("test.route");
@@ -281,16 +266,13 @@ async function testRefuseOverlayBootstrapSlot() {
   // install rejection.
   const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  const installName   = host.deriveBootstrapName("install");
   host.registerSignature(signatureName, signatureBytes);
-  host.registerInstaller(installName);
+  host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const seq = makeSeq();
   // Try to overlay the signature slot (seeded by SetHandler at bootstrap).
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    signatureName, forwarderBytes));
+  installMod(host, signatureName, forwarderBytes, pk);
 
   // signature must still verify — if it had been overwritten with the
   // forwarder, the next signed message would fail.
@@ -314,14 +296,12 @@ async function testApproveInstallRejects() {
     seen = { name, author, bytesHash, existing };
     return false;
   };
-  const { host, installName } = await makeHost(approve);
+  const { host } = await makeHost(approve);
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, forwarderBytes));
+  installMod(host, chatTextName, forwarderBytes, pk);
 
   assert(!host.isRegistered(chatTextName), "install rejected");
   assert(seen !== null, "approveInstall was called");
@@ -342,14 +322,12 @@ async function testApproveInstallReceivesBytesHash() {
     seenPayloadLen = wasm.length; // for sanity
     return true;
   };
-  const { host, installName } = await makeHost(approve);
+  const { host } = await makeHost(approve);
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
-  const seq = makeSeq();
-  const payload = encodeInstallPayload(seq(pk), chatTextName, forwarderBytes);
-  host.dispatch(host.wrapAndEncode(sk, pk, installName, payload));
+  installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install accepted");
 
   assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
@@ -366,15 +344,13 @@ async function testApproveInstallReceivesBytesHash() {
 async function testNoApproveInstallDropsAll() {
   console.log("Test: install dropped when no approveInstall is wired");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
   host.setApproveInstall(null);
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, forwarderBytes));
+  installMod(host, chatTextName, forwarderBytes, pk);
 
   assert(!host.isRegistered(chatTextName), "install dropped");
 
@@ -388,44 +364,39 @@ async function testReferencePolicyUpgradeRules() {
 
   const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  const installName   = host.deriveBootstrapName("install");
   host.registerSignature(signatureName, signatureBytes);
-  host.registerInstaller(installName);
+  host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
-  const seq = makeSeq();
-  const { publicKey: aPk, privateKey: aSk } = generateKeyPair();
-  const { publicKey: bPk, privateKey: bSk } = generateKeyPair();
+  const { publicKey: aPk } = generateKeyPair();
+  const { publicKey: bPk } = generateKeyPair();
   // Both authors target the same name so we can exercise the upgrade path.
   // (Author-scoped names would partition the space and avoid the rule.)
   const sharedName = host.deriveBootstrapName("test.shared");
 
   // A claims sharedName (first install — accepted).
-  host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, forwarderBytes));
+  installMod(host, sharedName, forwarderBytes, aPk);
   assert(host.isRegistered(sharedName), "A's first install accepted");
   const recA = host.lookupInstall(sharedName);
   assert(recA !== null, "record exists after A's install");
   const aBytesHash = recA.bytesHash;
 
   // B tries to install over the same name — rejected (different author).
-  host.dispatch(buildInstall(host, bSk, bPk, installName, seq(bPk),
-    sharedName, forwarderBytes));
+  installMod(host, sharedName, forwarderBytes, bPk);
   const recAfterB = host.lookupInstall(sharedName);
   assertEqual(recAfterB.author.publicKey, aPk, "different-author install rejected, A still owns");
   assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
 
   // A re-installs (same author) — accepted; record updates in place. There is
   // no parent/lineage gate anymore (§7.4): same author is the whole rule.
-  host.dispatch(buildInstall(host, aSk, aPk, installName, seq(aPk),
-    sharedName, forwarderBytes));
+  installMod(host, sharedName, forwarderBytes, aPk);
   const recAfterUpgrade = host.lookupInstall(sharedName);
   assert(recAfterUpgrade !== null, "upgrade left a record");
   assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
-  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm under a
-  // fresh seq keeps the same content id — the identifier tracks the binary, not the
-  // signed install message. (A different wasm would hash differently; §7.1 makes the
-  // content id, a manifest's modules[].hash, and a policy allowlist all one value.)
+  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm keeps the
+  // same content id — the identifier tracks the binary. (A different wasm would hash
+  // differently; §7.1 makes the content id, a manifest's modules[].hash, and a policy
+  // allowlist all one value.)
   assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
     "bytes_hash unchanged across a same-wasm re-install");
   assertEqual(recAfterUpgrade.bytesHash, host.genesisHash(forwarderBytes),
@@ -434,59 +405,20 @@ async function testReferencePolicyUpgradeRules() {
   console.log("  OK\n");
 }
 
-// ─── Test: install replay rejected by seq (§4.4) ────────────────────────
-
-async function testInstallReplayRejected() {
-  console.log("Test: install handler rejects wire-byte replay (§4.4)");
-
-  let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
-    approveCalls++;
-    return true;
-  });
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
-
-  // Original install with seq=1.
-  const wire = buildInstall(host, sk, pk, installName, 1, chatTextName, forwarderBytes);
-  host.dispatch(wire);
-  assert(host.isRegistered(chatTextName), "first install succeeded");
-  assertEqual(approveCalls, 1, "approve called once");
-
-  // Operator removes the install. Seq must NOT rewind.
-  assert(host.installer.remove(chatTextName), "installer.remove succeeded");
-  assert(!host.isRegistered(chatTextName), "kernel slot cleared");
-
-  // Replay — seq=1 is no longer fresh, must drop before approve runs.
-  host.dispatch(wire);
-  assert(!host.isRegistered(chatTextName), "replayed install did NOT re-install");
-  assertEqual(approveCalls, 1, "approve NOT re-prompted on replay");
-
-  // Fresh install at seq=2 still works.
-  host.dispatch(buildInstall(host, sk, pk, installName, 2, chatTextName, forwarderBytes));
-  assert(host.isRegistered(chatTextName), "fresh higher-seq install succeeded");
-  assertEqual(approveCalls, 2, "approve called for legitimate retry");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: installer.lookup (host-side) returns the install record ───────
+// ─── Test: registry.lookup (host-side) returns the install record ────────
 
 async function testInstallerLookupHostSide() {
   console.log("Test: host-side lookupInstall returns the install record (§7.6)");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, forwarderBytes));
+  installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install ok");
 
-  // The installer is a pure sink: records are read host-side, not via a wire
+  // The registry has no wire surface: records are read host-side, not via a wire
   // query. The policy callback already receives the resolved record; bridges
   // pin kernel.caller instead of consulting a capability index.
   const rec = host.lookupInstall(chatTextName);
@@ -506,20 +438,18 @@ async function testInstallerLookupHostSide() {
 // ─── Test: installer.remove + suite slot removal ────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: installer.remove clears record and kernel slot, replay still blocked");
+  console.log("Test: installer.remove clears the record and the kernel slot (§7.5)");
 
   let approveCalls = 0;
-  const { host, installName } = await makeHost((_n, _a, _h, _w, _e) => {
+  const { host } = await makeHost((_n, _a, _h, _w, _e) => {
     approveCalls++;
     return true;
   });
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
+  const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, forwarderBytes));
+  installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install ok");
   assert(host.lookupInstall(chatTextName) !== null, "record present");
 
@@ -530,9 +460,8 @@ async function testInstallerRemove() {
   // remove() is idempotent — second call returns false.
   assert(!host.installer.remove(chatTextName), "second remove returns false");
 
-  // Fresh install at higher seq succeeds.
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatTextName, forwarderBytes));
+  // Re-installing at the same name after a remove succeeds (no tombstone).
+  installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
@@ -544,14 +473,12 @@ async function testInstallerRemove() {
 async function testCallerStackFormat() {
   console.log("Test: kernel.caller / currentCaller — immediate caller only (§4.2)");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const forwarderName = host.deriveScopedName("test.forwarder", pk);
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    forwarderName, forwarderBytes));
+  installMod(host, forwarderName, forwarderBytes, pk);
   assert(host.isRegistered(forwarderName), "forwarder installed");
 
   // A probe handler reads its immediate caller each time it's called. Only the
@@ -584,18 +511,15 @@ async function testCallerStackFormat() {
 async function testBridgeCallerPinning() {
   console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §8)");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const chatPinnedName = host.deriveScopedName("chat.pinned", pk);
   const chatOtherName  = host.deriveScopedName("chat.other",  pk);
   const netSendName    = host.deriveBootstrapName("cap.net.send");
 
-  const seq = makeSeq();
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatPinnedName, forwarderBytes));
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    chatOtherName, forwarderBytes));
+  installMod(host, chatPinnedName, forwarderBytes, pk);
+  installMod(host, chatOtherName, forwarderBytes, pk);
   assert(host.isRegistered(chatPinnedName), "chat.pinned installed");
   assert(host.isRegistered(chatOtherName), "chat.other installed");
 
@@ -638,7 +562,7 @@ async function testBridgeCallerPinning() {
 async function testBlockFromCall() {
   console.log("Test: blockFromCall makes a deployer handler unreachable via kernel.call (§4.4)");
 
-  const { host, installName } = await makeHost();
+  const { host } = await makeHost();
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const mutateName = host.deriveBootstrapName("test.mutate");
@@ -654,10 +578,8 @@ async function testBlockFromCall() {
   assertEqual(mutateCalls, 1, "direct dispatch still reaches blocked handler");
 
   // Install a forwarder, have it kernel.call the blocked handler. Must drop.
-  const seq = makeSeq();
   const fwdName = host.deriveScopedName("test.forwarder", pk);
-  host.dispatch(buildInstall(host, sk, pk, installName, seq(pk),
-    fwdName, forwarderBytes));
+  installMod(host, fwdName, forwarderBytes, pk);
   assert(host.isRegistered(fwdName), "forwarder installed");
 
   const fwdPayload = new Uint8Array(1 + mutateName.length);
@@ -1059,11 +981,10 @@ async function testPolicy() {
   // Install the forwarder under a freshly-policied host; returns whether it landed
   // and the bytesHash the installer recorded (for the module-allowlist subtest).
   const tryInstall = async (policyJson, author) => {
-    const { host, installName } = await makeHost();
+    const { host } = await makeHost();
     host.setApproveInstall(buildApproveInstall(host, parsePolicy(policyJson)));
-    const seq = makeSeq();
     const name = host.deriveScopedName("mod", author.publicKey);
-    host.dispatch(buildInstall(host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes));
+    installMod(host, name, forwarderBytes, author.publicKey);
     const rec = host.lookupInstall(name);
     return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
   };
@@ -1096,7 +1017,7 @@ async function testPolicy() {
 }
 
 async function testShellBoot() {
-  console.log("Test: seedkernel-shell boots under a policy and accepts an allowed install");
+  console.log("Test: seedkernel-shell boots under a policy and wires its capability backends");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1114,15 +1035,11 @@ async function testShellBoot() {
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
     });
+    // The shell boots under the policy and wires its backends. Admitting an allowed
+    // author's code is the bundle path, covered end-to-end by testBundle (§12.4) — the
+    // only way code arrives now that the wire install path is gone.
     assert(shell.fs.list().length === 0, "fs.* backend is wired over the data dir");
-
-    const seq = makeSeq();
-    const installName = shell.host.deriveBootstrapName("install");
-    const name = shell.host.deriveScopedName("mod", author.publicKey);
-    shell.installFromEnvelope(buildInstall(
-      shell.host, author.privateKey, author.publicKey, installName, seq(author.publicKey), name, forwarderBytes,
-    ));
-    assert(shell.host.isRegistered(name), "an allowed signed install lands on the booted shell");
+    assert(shell.policy.authors.includes(toHex(author.publicKey)), "the policy loaded the allowed author");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1459,11 +1376,11 @@ async function testCapBridgeEnforcement() {
 async function testCallHandlerGuards() {
   console.log("Test: KernelHost.callHandler applies the call-router guards (§4.4)");
 
-  const { host, installName } = await makeHost();
-  // The installer is blockedFromCall — kernel.call refuses it, so the host-side
-  // by-name path must too (a confined guest reaches this via CAP_MODULE_CALL).
-  assert(host.callHandler(installName, new Uint8Array([1])) === null,
-    "callHandler refuses a blocked handler (installer)");
+  const { host } = await makeHost();
+  // The signature wrapper is blockedFromCall — kernel.call refuses it, so the
+  // host-side by-name path must too (a confined guest reaches this via
+  // CAP_MODULE_CALL). It establishes the top signer, so letting a handler reach
+  // it via kernel.call would reframe the active signer mid-chain (§4.4).
   const sigName = host.deriveBootstrapName("signature");
   assert(host.callHandler(sigName, new Uint8Array([1])) === null,
     "callHandler refuses the signature wrapper");
@@ -2323,7 +2240,6 @@ await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
 await testReferencePolicyUpgradeRules();
-await testInstallReplayRejected();
 await testInstallerLookupHostSide();
 await testInstallerRemove();
 await testCallerStackFormat();
