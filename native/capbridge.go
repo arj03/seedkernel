@@ -52,7 +52,6 @@ const capBridgeGlueJS = `
       },
       transport: transport || {
         request: () => Promise.reject(new Error("cap-bridge: net not wired")),
-        sendMany: () => Promise.resolve([]),
       },
       peers: () => peers || [],
       fs,
@@ -71,9 +70,10 @@ const capBridgeGlueJS = `
 
   // The guest realm's seam target. A sync op returns its bytes; a net op returns null
   // and later calls __netDone(callId)/__netFail(callId) (Go fns wired by
-  // installEngineNet) when the Transport promise settles — which loop.resolveCall hands
-  // to the guest's blocked host.call (awaitNetCall). __netDone reads via
-  // JsTypedArrayToGo (view-aware, copies), so the settled value passes straight through.
+  // installEngineNet) when the Transport promise settles — which el.resolveGuestNet
+  // (deliverNet) routes to the guest's pending Promise (__netResolve/__netReject).
+  // __netDone reads via JsTypedArrayToGo (view-aware, copies), so the settled value
+  // passes straight through.
   globalThis.__hostBridgeCall = (op, ab, callId) => {
     const r = __capBridge(op, new Uint8Array(ab));
     if (r && typeof r.then === "function") {

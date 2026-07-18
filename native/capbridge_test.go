@@ -107,21 +107,21 @@ func TestCapBridgeOps(t *testing.T) {
 		t.Fatalf("VERIFY(raw msg) = %v, want [0] (SIGN is scoped, never raw)", v)
 	}
 
-	// CAP.FS_PUT (11) then CAP.FS_GET (10): content-addressed round trip.
+	// CAP.FS_PUT (10) then CAP.FS_GET (9): content-addressed round trip.
 	key := []byte("blk")
 	value := []byte("a content-addressed block")
 	put := make([]byte, 4+len(key)+len(value)) // [klen u32][key][bytes]
 	binary.BigEndian.PutUint32(put, uint32(len(key)))
 	copy(put[4:], key)
 	copy(put[4+len(key):], value)
-	callBytes(11, put)
-	got := callBytes(10, key) // [1][bytes] on hit
+	callBytes(10, put)
+	got := callBytes(9, key) // [1][bytes] on hit
 	if len(got) == 0 || got[0] != 1 || !bytes.Equal(got[1:], value) {
 		t.Fatalf("FS_GET = %v, want [1] ++ %q", got, value)
 	}
 
-	// CAP.CLOCK (17): 8-byte big-endian millis, nonzero.
-	if clk := callBytes(17, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
+	// CAP.CLOCK (16): 8-byte big-endian millis, nonzero.
+	if clk := callBytes(16, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
 		t.Fatalf("CLOCK = %v, want nonzero u64", clk)
 	}
 

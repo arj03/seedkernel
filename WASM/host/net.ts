@@ -196,28 +196,6 @@ export class Transport {
     });
   }
 
-  /** Per-peer scatter-gather: send a *distinct* typed request to each peer and
-   *  gather the responses that arrive before the timeout. A broadcast of one shared
-   *  payload to many peers is just N identical entries. One entry per input request,
-   *  order preserved; an unreachable/timed-out peer comes back `ok:false` with no
-   *  bytes (partial results, never a reject). This is the one concurrency a confined
-   *  safe-js guest cannot do itself — `Promise.all` aborts the VM, so the fan-out
-   *  lives host-side and the sync guest just consumes a finished list (see cap-bridge
-   *  NET_SEND_MANY). */
-  async sendMany(
-    requests: { peer: PeerId; type: number; payload: Uint8Array }[],
-  ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]> {
-    return Promise.all(
-      requests.map(async ({ peer, type, payload }) => {
-        try {
-          return { peer, ok: true, bytes: await this.request(peer, type, payload) };
-        } catch {
-          return { peer, ok: false, bytes: new Uint8Array(0) };
-        }
-      }),
-    );
-  }
-
   close(): void {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error("transport closed")); }
     this.pending.clear();

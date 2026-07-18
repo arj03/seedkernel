@@ -49,20 +49,28 @@ func installEngineNet(qc *qjs.Context, el *eventLoop) error {
 		return fmt.Errorf("node setup glue: %w", err)
 	}
 
-	// Completion callbacks for a guest's blocked net host.call: when the host realm's
-	// Transport promise settles, __hostBridgeCall calls these, and loop.resolveCall
-	// deposits the result in the call's netBlocking slot so awaitNetCall returns it.
+	// Completion callbacks for a guest's net host.call: when the host realm's Transport
+	// promise settles, __hostBridgeCall calls these with the call's id, and
+	// el.resolveGuestNet (the guest realm's deliverNet) resolves the pending guest Promise.
+	// resolveGuestNet is nil when no guest realm is attached (e.g. host-only paths), so a
+	// stray settlement is a harmless no-op.
 	qc.Global().SetPropertyStr("__netDone", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		resp, err := qjs.JsTypedArrayToGo(t.Args()[1])
-		if err != nil {
-			el.resolveCall(t.Args()[0].Int64(), 1, nil, "net result not bytes")
+		if el.resolveGuestNet == nil {
 			return nil, nil
 		}
-		el.resolveCall(t.Args()[0].Int64(), 0, resp, "")
+		resp, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		if err != nil {
+			el.resolveGuestNet(t.Args()[0].Int64(), 1, nil, "net result not bytes")
+			return nil, nil
+		}
+		el.resolveGuestNet(t.Args()[0].Int64(), 0, resp, "")
 		return nil, nil
 	}))
 	qc.Global().SetPropertyStr("__netFail", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		el.resolveCall(t.Args()[0].Int64(), 1, nil, t.Args()[1].String())
+		if el.resolveGuestNet == nil {
+			return nil, nil
+		}
+		el.resolveGuestNet(t.Args()[0].Int64(), 1, nil, t.Args()[1].String())
 		return nil, nil
 	}))
 	return nil

@@ -27,7 +27,7 @@ import {
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
 import { Transport, type Network, type PeerId } from "./net.js";
 import { createCapBridge, capPreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
-import { createSafeRealm, createSyncSafeRealm, type SafeRealm, type SyncSafeRealm, type SafeRealmBridge } from "./safe-js.js";
+import { createSafeRealm, type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { NodeFs } from "./fs-node.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
 
@@ -89,12 +89,12 @@ export interface Shell {
    *  declares — through a generic cap-bridge over the kernel's primitives. Load a
    *  bundle first. This is "the shell runs the app" (README §12.8). */
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  /** Serve the app's request side: build a *synchronous* confined realm from the
-   *  loaded guest and route incoming transport requests to its `handle`
-   *  entrypoint. The sync realm answers from local fs + crypto without yielding,
-   *  so it can respond while the async `runGuest` realm is parked mid-await — this
-   *  is how the runtime answers for a cohort with no app-specific host code
-   *  (README §12.8). Idempotent; load a bundle first. */
+  /** Serve the app's request side: route incoming transport requests to the loaded
+   *  guest's `handle` entrypoint on the *same* confined realm `runGuest` uses. The
+   *  holder path answers from local fs + crypto synchronously (`callSync`) without
+   *  yielding, so it can respond while an initiator `runGuest` call is parked
+   *  mid-await in that realm — this is how the runtime answers for a cohort with no
+   *  app-specific host code (README §12.8). Idempotent; load a bundle first. */
   serve(): Promise<void>;
   close(): void;
 }
@@ -164,15 +164,15 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const peers = new Set<PeerId>(opts.peers ?? []);
 
   let loaded: LoadedBundle | null = null;
-  let realm: SafeRealm | null = null;         // async — the initiator (runGuest)
-  let serveRealm: SyncSafeRealm | null = null; // sync — the request side (handle)
+  let realm: SafeRealm | null = null;         // one confined realm: initiator + holder
+  let served = false;                         // serve() wired transport.onRequest already
 
   const requireLoaded = (): LoadedBundle => {
     if (!loaded) throw new Error("shell: load a bundle first (loadBundle)");
     return loaded;
   };
-  // One cap-bridge shape for both realms — kernel primitives only. The async
-  // realm awaits net; the sync holder realm only ever calls the synchronous ops.
+  // One cap-bridge shape for the realm — kernel primitives only. `runGuest` awaits net;
+  // the holder `handle` path only ever calls the synchronous ops.
   // The bundle's signed manifest declares the capability *domains* it needs
   // (`caps`); the shell expands those to the concrete op set the bridge enforces
   // and wires only the matching backends, so a guest holds exactly what it
@@ -218,18 +218,21 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     },
     async serve() {
       const b = requireLoaded();
-      if (serveRealm) return;
-      const hr = serveRealm = await createSyncSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
+      if (served) return;
+      if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
+      const hr = realm;
+      served = true;
       // arg = [type u8][payload]; the guest's `handle` returns the response bytes
-      // synchronously (admission / store / fetch are local fs + crypto only).
+      // synchronously (admission / store / fetch are local fs + crypto only), so it can
+      // run re-entrantly while an initiator call is parked mid-await in this same realm.
       transport.onRequest((_from, type, payload) => {
         const arg = new Uint8Array(1 + payload.length);
         arg[0] = type & 255;
         arg.set(payload, 1);
-        return hr.call("handle", arg);
+        return hr.callSync("handle", arg);
       });
     },
-    close() { realm?.dispose(); serveRealm?.dispose(); transport.close(); if (ownsNet) (net as NodeNetwork).close(); },
+    close() { realm?.dispose(); transport.close(); if (ownsNet) (net as NodeNetwork).close(); },
   };
 }
 

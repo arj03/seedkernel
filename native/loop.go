@@ -18,7 +18,6 @@ package main
 
 import (
 	"container/heap"
-	"errors"
 	"fmt"
 	"time"
 
@@ -37,12 +36,11 @@ type eventLoop struct {
 	// loop, so a net result that settles on the host realm can resume the guest).
 	extra []*qjs.Context
 
-	// Synchronously-blocked net calls. A guest's host.call(CAP_NET_*) blocks its wasm
-	// stack at the host-import boundary (awaitNetCall) while Go pumps the host realm;
-	// callSeq hands each call a unique id, and __netDone/__netFail deposit the result
-	// in netBlocking[id] when the host realm's Transport promise settles.
-	callSeq     int64
-	netBlocking map[int64]*netOutcome
+	// resolveGuestNet settles a guest's net host.call when the host realm's Transport
+	// promise resolves: __netDone/__netFail (node.go) call it with the call's id, and it
+	// resolves the pending guest Promise (the guest realm's deliverNet). nil when no guest
+	// realm is attached. Set in newGuestRealm, cleared in guestRealm.close.
+	resolveGuestNet func(callID int64, kind int, bytes []byte, msg string)
 
 	// awaitIn installs one persistent __settle per context (tracked here) that routes
 	// into the in-flight await's onSettle, instead of creating — and leaking, since the
@@ -51,27 +49,14 @@ type eventLoop struct {
 	settleInstalled map[*qjs.Context]bool
 	onSettle        func(kind int, bytes []byte, msg string)
 
-	// netDeadline, when non-zero, caps a synchronously-blocked net call (awaitNetCall)
-	// at the in-flight outer await's deadline, so a guest's sync net host.call cannot
-	// outlast the budget runGuest handed awaitIn. Set by awaitIn around its run.
-	netDeadline time.Time
-
 	// runGen tags each bounded run (awaitIn / runUntilSignal). A safety timer captures
 	// the gen it was armed under; if it fires late — after the run completed and a new
 	// one began — its queued stop is ignored, so a stale timeout can't abort the next run.
 	runGen int64
 
 	// stepTimer is one reusable wait timer for step(); reused via Reset instead of a
-	// fresh time.NewTimer per turn, which was per-frame GC churn in awaitNetCall's pump.
+	// fresh time.NewTimer per turn, which was per-frame GC churn in the tight pump loop.
 	stepTimer *time.Timer
-}
-
-// netOutcome is the landing slot for a synchronously-blocked net call's result.
-type netOutcome struct {
-	done   bool
-	bytes  []byte
-	failed bool
-	msg    string
 }
 
 type jsTimer struct {
@@ -101,7 +86,7 @@ func (h *timerHeap) Pop() any {
 // newEventLoop binds a loop to a QuickJS context and installs the browser-like
 // async surface (setTimeout/clearTimeout/queueMicrotask) the shared JS expects.
 func newEventLoop(c *qjs.Context) *eventLoop {
-	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), netBlocking: map[int64]*netOutcome{}, settleInstalled: map[*qjs.Context]bool{}}
+	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), settleInstalled: map[*qjs.Context]bool{}}
 	el.install()
 	return el
 }
@@ -133,64 +118,6 @@ func (el *eventLoop) pumpAll() {
 	for _, c := range el.extra {
 		c.Pump()
 	}
-}
-
-// nextCallID hands out a unique id for an in-flight net host.call — the key both the
-// host realm (via __netDone/__netFail) and the blocked caller (awaitNetCall) agree on.
-func (el *eventLoop) nextCallID() int64 { el.callSeq++; return el.callSeq }
-
-// resolveCall deposits a blocked net call's outcome (kind 0 = resolved with bytes,
-// 1 = rejected with msg) into its netBlocking slot, where awaitNetCall picks it up.
-// __netDone/__netFail (node.go) call this when the host realm's Transport settles.
-func (el *eventLoop) resolveCall(callID int64, kind int, bytes []byte, msg string) {
-	o := el.netBlocking[callID]
-	if o == nil {
-		return
-	}
-	o.done = true
-	if kind == 0 {
-		o.bytes = bytes
-	} else {
-		o.failed, o.msg = true, msg
-	}
-}
-
-// awaitNetCall blocks a guest's synchronous net host.call: it drives the host realm's
-// loop — socket frames (el.tasks) and host timers (the Transport request timeout) —
-// until the net op for callID settles, then returns its bytes (or an error on a
-// rejection/timeout). This is the non-Asyncify stand-in for Bun's Asyncify-blocking
-// host.call: the guest's wasm stack is paused at the host-import boundary while Go
-// pumps the host realm to completion, so an unchanged guest (tier2-guest.js, which
-// calls host.call(CAP_NET_*) with no await) sees net as synchronous. Only the host
-// realm is pumped — the guest realm is suspended mid-call, so running its job queue
-// here would execute its microtasks out of order.
-func (el *eventLoop) awaitNetCall(callID int64, timeout time.Duration) ([]byte, error) {
-	o := &netOutcome{}
-	el.netBlocking[callID] = o
-	defer delete(el.netBlocking, callID)
-	deadline := time.Now().Add(timeout)
-	// Compose with the outer await's budget: a sync guest's host.call runs inside
-	// awaitIn's blocking Eval (before awaitIn's own safety timer is even armed), so
-	// netCallTimeout — not the budget runGuest passed — would otherwise be the only
-	// bound. Honor whichever deadline is sooner so the budget is a real upper bound.
-	if !el.netDeadline.IsZero() && el.netDeadline.Before(deadline) {
-		deadline = el.netDeadline
-	}
-	hostPump := func() { el.c.Pump() } // host realm only — the guest stays suspended
-	for !o.done {
-		el.step(deadline, hostPump, func() bool { return o.done })
-		if !o.done && !time.Now().Before(deadline) {
-			return nil, errors.New("net call: timed out")
-		}
-	}
-	return el.netResult(o)
-}
-
-func (el *eventLoop) netResult(o *netOutcome) ([]byte, error) {
-	if o.failed {
-		return nil, errors.New(o.msg)
-	}
-	return o.bytes, nil
 }
 
 func (el *eventLoop) install() {
@@ -245,7 +172,7 @@ func (el *eventLoop) post(fn func()) { el.tasks <- fn }
 // armTimer (re)arms the loop's single reusable wait timer for duration d and returns
 // its channel. step() runs only on the loop goroutine and never re-entrantly, so one
 // shared timer is safe; reusing it via Reset avoids a fresh time.NewTimer allocation
-// every turn (per-frame GC churn in awaitNetCall's tight pump loop). Go 1.23+ timer
+// every turn (per-frame GC churn in the loop's tight pump). Go 1.23+ timer
 // semantics make Stop/Reset safe without the drain dance.
 func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 	if el.stepTimer == nil {
@@ -267,10 +194,10 @@ func (el *eventLoop) callJS(cb *qjs.Value) {
 // (pumping after each), drains ready microtasks, then — if `until` is still unmet —
 // blocks until a posted task arrives, the next timer comes due, or `deadline` passes,
 // whichever is first, and processes it. `pump` selects which realms advance after a
-// delivered task/timer: the whole loop (pumpAll) for run(), or just the host realm
-// when a guest is suspended mid-call (awaitNetCall). A zero `deadline` means "no
-// deadline" — block only on tasks/timers. `until` is checked between sub-steps so a
-// caller's exit condition (el.stopped, a settled net call) short-circuits promptly.
+// delivered task/timer — run() passes pumpAll so both host and guest realms advance,
+// which is how a net result settling on the host realm resumes a suspended guest. A zero
+// `deadline` means "no deadline" — block only on tasks/timers. `until` is checked between
+// sub-steps so a caller's exit condition (el.stopped) short-circuits promptly.
 func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
 	// Fire every due timer, pumping after each so its reactions run before the next.
 	for len(el.timers) > 0 && !el.timers[0].deadline.After(time.Now()) {
@@ -319,8 +246,8 @@ func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
 	// reasons: a burst of posted socket frames is delivered in this one turn rather than
 	// one per step() (each turn otherwise re-scans timers and rebuilds the select); and a
 	// result that raced <-wait (select picks at random when a task is also ready) is
-	// processed now instead of sitting until the next turn, which would make awaitNetCall
-	// report a false timeout. until() short-circuits so a satisfied caller exits promptly.
+	// processed now instead of sitting until the next turn, which would make a bounded run
+	// (awaitIn) report a false timeout. until() short-circuits so a satisfied caller exits promptly.
 	for {
 		if until() {
 			return
@@ -416,9 +343,10 @@ func (el *eventLoop) ensureSettle(c *qjs.Context) {
 
 // awaitIn is NOT re-entrant: el.onSettle is a single shared slot, and the defer below
 // resets it to nil (not a saved previous value), so a nested awaitIn would orphan the
-// outer await's result sink. The loader never nests it — only one await is in flight at
-// a time, and a guest's net call blocks via netBlocking/awaitNetCall (which does not
-// touch onSettle), not via a second awaitIn.
+// outer await's result sink. The loader never nests it — only one await is in flight at a
+// time. A guest's net host.call settles via el.resolveGuestNet (deliverNet), not a second
+// awaitIn, so it never touches onSettle; the awaited entrypoint's own promise is the one
+// __settle reports here once the guest resumes and returns.
 func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1
 	el.ensureSettle(c)
@@ -437,13 +365,6 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 		`(v) => __settle(0, (v instanceof Uint8Array || v instanceof ArrayBuffer) ? v : new Uint8Array(0)),` +
 		`(e) => __settle(1, String(e && e.message || e))); })();`
 	el.stopped = false
-	if timeout > 0 {
-		// Arm the net budget BEFORE the eval: a sync guest entrypoint's net host.call
-		// blocks inside this Eval (awaitNetCall), which reads netDeadline to cap itself
-		// at this same budget rather than the looser netCallTimeout.
-		el.netDeadline = time.Now().Add(timeout)
-		defer func() { el.netDeadline = time.Time{} }()
-	}
 	if _, err = c.Eval("<await>", qjs.Code(wrap)); err != nil {
 		return
 	}

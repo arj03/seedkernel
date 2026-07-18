@@ -31,8 +31,8 @@ const { CAP, createCapBridge, opsForCaps, guestSignScope } = await imp("build/ho
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
-const { createSafeRealm, createSyncSafeRealm } = await imp("build/host/safe-js.js");
-const { toHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
+const { createSafeRealm } = await imp("build/host/safe-js.js");
+const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Payload for callDynamicExport against an export that takes no arguments: the
@@ -812,19 +812,16 @@ async function testFs() {
   console.log("  OK\n");
 }
 
-// ─── Test: Transport.sendMany + cap-bridge NET_SEND_MANY (op 8) ──────────
+// ─── Test: guest-side net fan-out over NET_SEND (Promise.all) ────────────
 //
-// The per-peer fan-out: a DISTINCT payload per peer, concurrently. This is the
-// primitive the sync storage guest drives for placement/gather (one batched cap
-// per round) instead of a host-side Promise.all. An all-payloads-equal broadcast
-// is just N identical entries.
+// Fan-out is no longer a host op: with real promises at the seam, a confined guest
+// scatters a DISTINCT request per peer itself with Promise.all over NET_SEND and
+// gathers the responses. This is what NET_SEND_MANY used to do host-side. We drive
+// it through the cap-bridge's single-peer NET_SEND op, concurrently, from an async
+// safe-js realm — proving the round trips genuinely overlap in one realm.
 
-async function testSendMany() {
-  console.log("Test: Transport.sendMany + cap-bridge NET_SEND_MANY — per-peer fan-out (op 8)");
-
-  const u32 = (n) => new Uint8Array([(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
-  const rd32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
-  const U = (...xs) => new Uint8Array(xs);
+async function testGuestNetFanout() {
+  console.log("Test: guest-side net fan-out — Promise.all over NET_SEND (no host sendMany)");
 
   const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
   const net = new LoopbackNetwork();
@@ -835,53 +832,72 @@ async function testSendMany() {
   tb.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
   tc.onRequest((_from, type, payload) => new Uint8Array([type, ...payload]));
 
-  try {
-    // 1) Transport.sendMany directly — distinct payloads, one per peer.
-    const dead = toHex(generateKeyPair().publicKey);
-    const results = await ta.sendMany([
-      { peer: toHex(b.publicKey), type: 7, payload: U(1, 1) },
-      { peer: toHex(c.publicKey), type: 7, payload: U(2, 2) },
-      { peer: dead, type: 7, payload: U(9) },
-    ]);
-    assertEqual(results.length, 3, "one result per request, order preserved");
-    assert(bytesEqual(results[0].bytes, U(7, 1, 1)), "peer b got ITS payload (distinct fan-out)");
-    assert(bytesEqual(results[1].bytes, U(7, 2, 2)), "peer c got ITS payload");
-    assert(!results[2].ok && results[2].bytes.length === 0, "the unreachable peer → ok:false, no bytes (partial)");
-
-    // 2) Same fan-out through the cap-bridge NET_SEND_MANY wire (what the guest sees).
-    const id = generateKeyPair();
-    const tBridge = new Transport(toHex(id.publicKey), net, 40);
-    const bridge = createCapBridge({
-      sodium, identity: id, callHandler: () => null,
-      transport: tBridge, peers: () => [], fs: new MemoryFs(),
+  const bId = toHex(b.publicKey), cId = toHex(c.publicKey);
+  const dead = toHex(generateKeyPair().publicKey);
+  const bridge = createCapBridge({
+    sodium, identity: a, callHandler: () => null,
+    transport: ta, peers: () => [], fs: new MemoryFs(),
+  });
+  // The guest fans out over NET_SEND itself: build [peer 32][type u8][payload] per
+  // peer and Promise.all them. NET_SEND returns [ok u8][resp]; an unreachable peer
+  // resolves [0] (ok:false), never rejecting the batch.
+  const src = `
+    register("fanout", async (arg) => {
+      // arg = count u8, then count * (peer 32 | type u8 | plen u8 | payload)
+      const count = arg[0];
+      let o = 1;
+      const reqs = [];
+      for (let i = 0; i < count; i++) {
+        const peer = arg.slice(o, o + 32); o += 32;
+        const type = arg[o]; o += 1;
+        const plen = arg[o]; o += 1;
+        const payload = arg.slice(o, o + plen); o += plen;
+        const frame = new Uint8Array(33 + plen);
+        frame.set(peer, 0); frame[32] = type; frame.set(payload, 33);
+        reqs.push(host.call(CAP_NET_SEND, frame));
+      }
+      const results = await Promise.all(reqs);            // real concurrent round trips
+      // Concatenate [ok u8][len u8][resp] per result, in request order.
+      const parts = [];
+      for (const r of results) {
+        const ok = r[0];
+        const resp = r.slice(1);
+        parts.push(new Uint8Array([ok, resp.length]), resp);
+      }
+      let total = 0; for (const p of parts) total += p.length;
+      const out = new Uint8Array(total); let w = 0;
+      for (const p of parts) { out.set(p, w); w += p.length; }
+      return out;
     });
-    const entry = (peerPk, type, payload) => concatBytes([peerPk, U(type), u32(payload.length), payload]);
-    const req = concatBytes([u32(2), entry(b.publicKey, 7, U(3, 3, 3)), entry(c.publicKey, 7, U(4))]);
-    const sendMany = bridge(CAP.NET_SEND_MANY, req);
-    assert(sendMany instanceof Promise, "CAP_NET_SEND_MANY returns a Promise (real round trips)");
-    const resp = await sendMany;
-    // Decode [count u32]{[peer 32][ok u8][len u32][bytes]}
-    assertEqual(rd32(resp, 0), 2, "response counts both peers");
-    let o = 4;
-    const decoded = [];
-    for (let i = 0; i < 2; i++) {
-      const peer = toHex(resp.slice(o, o + 32)); o += 32;
-      const ok = resp[o] === 1; o += 1;
-      const len = rd32(resp, o); o += 4;
-      decoded.push({ peer, ok, bytes: resp.slice(o, o + len) }); o += len;
+  `;
+  const CAP_NET_SEND = CAP.NET_SEND;
+  const realm = await createSafeRealm({
+    source: `const CAP_NET_SEND = ${CAP_NET_SEND};\n` + src,
+    bridge,
+  });
+  try {
+    const U = (...xs) => new Uint8Array(xs);
+    // Distinct payloads to b and c, plus one unreachable peer, in order.
+    const arg = concatBytes([
+      U(3),
+      fromHex(bId), U(7, 2), U(1, 1),
+      fromHex(cId), U(7, 2), U(2, 2),
+      fromHex(dead), U(7, 1), U(9),
+    ]);
+    const out = await realm.call("fanout", arg);
+    // Decode [ok u8][len u8][resp] × 3, in request order.
+    let o = 0;
+    const dec = [];
+    for (let i = 0; i < 3; i++) {
+      const ok = out[o]; o += 1;
+      const len = out[o]; o += 1;
+      dec.push({ ok, bytes: out.slice(o, o + len) }); o += len;
     }
-    assertEqual(decoded[0].peer, toHex(b.publicKey), "first response is peer b (order preserved)");
-    assert(bytesEqual(decoded[0].bytes, U(7, 3, 3, 3)), "peer b echoed its own payload through the bridge");
-    assert(bytesEqual(decoded[1].bytes, U(7, 4)), "peer c echoed its own payload through the bridge");
-    tBridge.close();
-
-    // 3) A guest-controlled count not backed by bytes is a clean throw, never an
-    //    unbounded host loop.
-    let threw = false;
-    try { await bridge(CAP.NET_SEND_MANY, concatBytes([u32(2), entry(b.publicKey, 7, U(1))])); }
-    catch { threw = true; }
-    assert(threw, "NET_SEND_MANY with count past the backing bytes throws");
+    assert(dec[0].ok === 1 && bytesEqual(dec[0].bytes, U(7, 1, 1)), "peer b got ITS payload (distinct fan-out, order preserved)");
+    assert(dec[1].ok === 1 && bytesEqual(dec[1].bytes, U(7, 2, 2)), "peer c got ITS payload");
+    assert(dec[2].ok === 0 && dec[2].bytes.length === 0, "the unreachable peer → ok:false, no bytes (partial, no reject)");
   } finally {
+    realm.dispose();
     ta.close(); tb.close(); tc.close();
   }
 
@@ -1245,63 +1261,65 @@ async function testSafeJs() {
     realm.dispose();
   }
 
-  // 2. The async seam: a guest reaches a host bridge and bytes round-trip across
-  //    the copy boundary; Asyncify makes the host's async round trip look sync.
+  // 2. The seam: a sync op returns bytes directly (no yield); a net-like op returns a
+  //    real Promise the guest awaits. Bytes round-trip across the copy boundary both ways.
   {
     let bridgeCalls = 0;
-    const bridge = async (op, payload) => {
+    const bridge = (op, payload) => {
       bridgeCalls++;
-      if (op === 1) { await sleep(3); return payload.map((b) => (b + 1) & 0xff); }
+      if (op === 1) return payload.map((b) => (b + 1) & 0xff);                          // sync op — bytes directly
+      if (op === 7) return sleep(3).then(() => payload.map((b) => (b + 1) & 0xff));     // net-like op — a Promise
       return new Uint8Array();
     };
     const src = `
-      register("echo", (arg) => host.call(1, arg));               // sync entrypoint, blocks via Asyncify
-      register("echoAsync", async (arg) => { return await host.call(1, arg); });
+      register("sync", (arg) => host.call(1, arg));                  // sync op: host.call returns bytes, no await
+      register("net", async (arg) => { return await host.call(7, arg); });  // net op: a genuinely awaited Promise
     `;
     const realm = await createSafeRealm({ source: src, bridge });
     const input = new Uint8Array([0, 1, 2, 254, 255]);
-    const sync = await realm.call("echo", input);
-    assertEqual([...sync], [1, 2, 3, 255, 0], "sync entrypoint: bytes crossed in, awaited, crossed back");
-    const asyncR = await realm.call("echoAsync", input);
-    assertEqual([...asyncR], [1, 2, 3, 255, 0], "async entrypoint: await host.call resolves through Asyncify");
+    const sync = await realm.call("sync", input);
+    assertEqual([...sync], [1, 2, 3, 255, 0], "sync op: bytes crossed in and back with no promise");
+    const asyncR = await realm.call("net", input);
+    assertEqual([...asyncR], [1, 2, 3, 255, 0], "net op: await host.call resolves the real Promise");
     assert(bridgeCalls === 2, "the host bridge was invoked for each call");
-    const again = await realm.call("echo", new Uint8Array([10]));
+    const again = await realm.call("sync", new Uint8Array([10]));
     assertEqual([...again], [11], "realm is reusable across calls");
     realm.dispose();
   }
 
-  // 3. Orchestration control-flow shapes run as guest JS (synchronous model over
-  //    the blocking bridge — the load-bearing Tier-2 finding).
+  // 3. Orchestration control-flow shapes run as ordinary async guest JS, including a
+  //    concurrent fan-out with the guest's own Promise.all over a net-like op — the
+  //    real-promise seam is what makes this possible in one realm.
   {
-    const bridge = async (op, payload) => {
+    const bridge = (op, payload) => {
       const peer = payload[0];
-      if (op === 2) { await sleep(1); return new Uint8Array([peer % 2 === 0 ? 1 : 0]); } // offer
-      if (op === 3) { await sleep(1); return new Uint8Array([peer % 3 === 0 ? 1 : 0]); } // have
+      if (op === 2) return sleep(1).then(() => new Uint8Array([peer % 2 === 0 ? 1 : 0])); // offer (async)
+      if (op === 3) return sleep(1).then(() => new Uint8Array([peer % 3 === 0 ? 1 : 0])); // have (async)
       return new Uint8Array();
     };
     const src = `
-      register("orchestrate", (arg) => {
+      register("orchestrate", async (arg) => {
         const count = arg[0], peerCount = arg[1];
-        const used = new Set();
+        // Fan out OFFERs concurrently — the guest's own Promise.all, no host sendMany.
+        const offers = await Promise.all(
+          Array.from({ length: peerCount }, (_, p) => host.call(2, new Uint8Array([p]))),
+        );
         const placed = [];
         for (let p = 0; p < peerCount && placed.length < count; p++) {
-          if (used.has(p)) continue;
-          const accepted = host.call(2, new Uint8Array([p]));    // blocks via Asyncify
-          if (accepted[0] === 1) { placed.push(p); used.add(p); }
+          if (offers[p][0] === 1) placed.push(p);
         }
-        const holders = new Map();
-        for (let p = 0; p < peerCount; p++) {
-          const r = host.call(3, new Uint8Array([p]));
-          if (r[0] === 1) holders.set(p, true);
-        }
-        return new Uint8Array([placed.length, holders.size, ...placed]);
+        const haves = await Promise.all(
+          Array.from({ length: peerCount }, (_, p) => host.call(3, new Uint8Array([p]))),
+        );
+        const holders = haves.filter((h) => h[0] === 1).length;
+        return new Uint8Array([placed.length, holders, ...placed]);
       });
     `;
     const realm = await createSafeRealm({ source: src, bridge });
     const res = await realm.call("orchestrate", new Uint8Array([3, 10]));
     assertEqual(res[0], 3, "loop placed exactly `count` blocks on distinct peers");
     assertEqual([...res.slice(2)], [0, 2, 4], "placement followed peer order and the accept rule");
-    assertEqual(res[1], 4, "sequential have/want fan-out (blocking host calls) collected the right holders");
+    assertEqual(res[1], 4, "concurrent have/want fan-out (Promise.all) collected the right holders");
     realm.dispose();
   }
 
@@ -1326,55 +1344,66 @@ async function testSafeJs() {
   console.log("  OK\n");
 }
 
-// ─── Test: synchronous safe-js realm (the holder side, step 8) ──────────
+// ─── Test: callSync — the holder request side on the one realm (step 8) ──
 //
-// The non-Asyncify realm: host.call resolves synchronously and an entrypoint
-// runs straight through to its bytes without yielding the event loop. This is
-// what lets a confined request handler (storage's holder side) respond while an
-// async orchestration realm — a *different* WASM instance — is parked mid-await.
+// realm.callSync runs a guest entrypoint straight through to its bytes without
+// yielding the event loop or pumping the job queue. This is what lets a confined
+// request handler (storage's holder side) respond synchronously while an initiator
+// call() is parked mid-await *in the same realm* — a suspended async function is
+// just heap state, so re-entering to run a sync handler is ordinary JS.
 
-async function testSyncSafeRealm() {
-  console.log("Test: sync safe-js — synchronous confinement for the request side (step 8)");
+async function testHolderCallSync() {
+  console.log("Test: callSync — synchronous holder side sharing the initiator realm (step 8)");
 
-  // 1. A synchronous bridge round-trips, and the realm is reusable. call()
+  // 1. A synchronous bridge round-trips, and the realm is reusable. callSync()
   //    returns bytes directly (no Promise) — no event-loop turn in between.
   {
     let calls = 0;
     const bridge = (op, payload) => { calls++; return op === 1 ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
-    const realm = await createSyncSafeRealm({
+    const realm = await createSafeRealm({
       source: `register("inc", (arg) => host.call(1, arg));`,
       bridge,
     });
-    const out = realm.call("inc", new Uint8Array([0, 9, 255]));
-    assert(out instanceof Uint8Array && !(out instanceof Promise), "sync call returns bytes directly, not a Promise");
+    const out = realm.callSync("inc", new Uint8Array([0, 9, 255]));
+    assert(out instanceof Uint8Array && !(out instanceof Promise), "callSync returns bytes directly, not a Promise");
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
-    assertEqual([...realm.call("inc", new Uint8Array([41]))], [42], "sync realm is reusable across calls");
+    assertEqual([...realm.callSync("inc", new Uint8Array([41]))], [42], "callSync is reusable across calls");
     assertEqual(calls, 2, "the synchronous bridge was invoked once per call");
     realm.dispose();
   }
 
-  // 2. An async bridge (a Promise return — e.g. a net op) is a hard error in a
-  //    sync realm: it cannot suspend to await one. The guard keeps the two seams
-  //    honest — net stays in the async realm.
+  // 2. A holder can answer re-entrantly while an initiator is parked mid-await on the
+  //    SAME realm — the whole point of the single-realm design. Start a net call() that
+  //    parks, callSync a holder in the meantime, then let the initiator settle.
   {
-    const realm = await createSyncSafeRealm({
-      source: `register("net", () => host.call(7, new Uint8Array()));`,
-      bridge: () => Promise.resolve(new Uint8Array([1])),
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const bridge = (op, payload) => {
+      if (op === 7) return gate.then(() => new Uint8Array([42]));   // net — parks until released
+      if (op === 1) return payload.map((b) => (b + 1) & 0xff);      // sync — holder path
+      return new Uint8Array();
+    };
+    const realm = await createSafeRealm({
+      source: `register("init", async () => host.call(7, new Uint8Array()));
+               register("hold", (arg) => host.call(1, arg));`,
+      bridge,
     });
-    let threw = false;
-    try { realm.call("net", new Uint8Array()); } catch { threw = true; }
-    assert(threw, "a Promise-returning (async) op throws in a sync realm");
+    const initP = realm.call("init", new Uint8Array());            // parks at the net await
+    const held = realm.callSync("hold", new Uint8Array([7]));       // answered while init parks
+    assertEqual([...held], [8], "holder answered synchronously while the initiator was parked mid-await");
+    release();
+    assertEqual([...(await initP)], [42], "the parked initiator resumed and settled after the holder ran");
     realm.dispose();
   }
 
-  // 3. Still airtight — a sync realm is the same zero-authority sandbox.
+  // 3. Still airtight — callSync is the same zero-authority sandbox.
   {
-    const realm = await createSyncSafeRealm({
+    const realm = await createSafeRealm({
       source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
       bridge: () => new Uint8Array(),
     });
-    const r = realm.call("probe", new Uint8Array());
-    assertEqual([...r], [0, 0], "process / fetch are unreachable in the sync realm too");
+    const r = realm.callSync("probe", new Uint8Array());
+    assertEqual([...r], [0, 0], "process / fetch are unreachable under callSync too");
     realm.dispose();
   }
 
@@ -1388,7 +1417,7 @@ async function testCapBridgeEnforcement() {
   console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async () => new Uint8Array(), sendMany: async () => [] };
+  const stubTransport = { request: async () => new Uint8Array() };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
@@ -1411,9 +1440,6 @@ async function testCapBridgeEnforcement() {
   threw = false;
   try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "RANDOM over the cap is refused");
-  threw = false;
-  try { await open(CAP.NET_SEND_MANY, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
-  assert(threw, "NET_SEND_MANY with a count not backed by payload bytes is refused");
 
   // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
   // op set the bridge enforces (the "wire the caps" path). A guest that declared
@@ -1839,12 +1865,16 @@ async function testWsNetworkFanout() {
   console.log("  OK\n");
 }
 
-async function testSafeRealmSerialization() {
-  console.log("Test: concurrent call()s on one safe-js realm serialize (no __arg clobber)");
+async function testSafeRealmConcurrency() {
+  console.log("Test: concurrent call()s on one safe-js realm interleave without __arg clobber");
 
+  // No Asyncify, so overlapping initiator calls are allowed to run concurrently. Each
+  // call stages __arg and consumes it synchronously (before the first await) during its
+  // evalCode, so a second call staging __arg can never corrupt the first's captured arg —
+  // no host-side serialization needed.
   const realm = await createSafeRealm({
-    source: `register("echo", (a) => host.call(1, a));`,
-    bridge: async (_op, p) => { await sleep(10); return p; },
+    source: `register("echo", async (a) => await host.call(7, a));`,
+    bridge: (_op, p) => sleep(10).then(() => p),
   });
   try {
     const [r1, r2] = await Promise.all([
@@ -2301,7 +2331,7 @@ await testBridgeCallerPinning();
 await testBlockFromCall();
 await testWrapRejectsInvalidKeySizes();
 await testFs();
-await testSendMany();
+await testGuestNetFanout();
 await testCapBridge();
 await testPolicy();
 await testShellBoot();
@@ -2313,7 +2343,7 @@ await testRtcNetwork();
 await testRtcNetworkMedia();
 await testWeriftRtcNetwork();
 await testSafeJs();
-await testSyncSafeRealm();
+await testHolderCallSync();
 await testCapBridgeEnforcement();
 await testCallHandlerGuards();
 await testTransportResponseBinding();
@@ -2324,7 +2354,7 @@ await testRedialAfterFailedDial();
 await testConnsPerPeerFanout();
 await testWsNetworkFanout();
 await testRecordLayerIntegrity();
-await testSafeRealmSerialization();
+await testSafeRealmConcurrency();
 await testPerf10k();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

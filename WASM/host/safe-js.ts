@@ -1,61 +1,47 @@
 // safe-js — a zero-authority JavaScript sandbox. It runs untrusted/confined JS
-// inside a QuickJS interpreter compiled to WASM (quickjs-emscripten, Asyncify
-// build), driven from the host. A fresh QuickJS context has *only* the
-// ECMAScript intrinsics, so the guest cannot even name `fs`/`net`/`Bun`/
-// `process`/`fetch` — confinement is the default, not something we lock down
-// (ShadowRealm was disqualified on exactly this; see the ShadowRealm probes).
-// The single seam to the outside is one injected host function, `__host_call`,
-// which funnels every capability access through a copy-model byte boundary, the
-// same shape as the KernelHost handler bridges.
+// inside a QuickJS interpreter compiled to WASM (quickjs-emscripten, the sync
+// non-Asyncify build), driven from the host. A fresh QuickJS context has *only* the
+// ECMAScript intrinsics, so the guest cannot even name `fs`/`net`/`Bun`/`process`/
+// `fetch` — confinement is the default, not something we lock down (ShadowRealm was
+// disqualified on exactly this; see the ShadowRealm probes). The single seam to the
+// outside is one injected host function, `__host_call`, which funnels every capability
+// access through a copy-model byte boundary, the same shape as the KernelHost handler
+// bridges.
 //
-// Async seam: a guest is typically multi-step (each step awaits a host bridge).
-// Asyncify lets the guest call `__host_call` *synchronously* from QuickJS's point
-// of view while the host resolves it asynchronously — the VM stack unwinds on the
-// call and is restored when the promise settles. So guest JS runs unchanged, with
-// no host-driven step loop. The same `quickjs.wasm` is hosted by JSC here
-// (Node/Bun) and by WAMR in the native engine later — one artifact for both
-// runtimes (the runtime split). An app builds its own guest confinement on top
-// of this generic primitive (README §12.3).
-//
-// A second factory, `createSyncSafeRealm`, runs the *non-Asyncify* QuickJS build:
-// same ABI, but `host.call` resolves synchronously with no stack unwind. It exists
-// for confined work that must complete without yielding — notably a request
-// handler that has to run *while* an Asyncify realm is parked mid-await. Since the
-// two are different WASM instances, the sync realm cannot disturb the async one's
-// suspended state (the module-global Asyncify caveat). Its bridge must resolve
-// every op synchronously (no net round trips).
+// Async seam: a guest is typically multi-step, and the net steps genuinely round-trip.
+// `host.call` resolves a **sync op** (crypto/fs/clock/module) to its bytes immediately
+// and a **net op** to a real Promise the guest `await`s — implemented with
+// quickjs-emscripten's deferred promise (`ctx.newPromise()`): the host function returns
+// the deferred's handle and settles it when the bridge promise resolves, pumping
+// `executePendingJobs()` so the guest's awaiting continuation runs. There is no Asyncify
+// and no host-driven step loop: a suspended async guest is just heap state, so the same
+// realm can be re-entered synchronously to serve a request (`callSync`, the holder path)
+// while an initiator (`call`) is parked mid-`await`. One `quickjs.wasm` build serves both
+// roles. An app builds its own guest confinement on top of this generic primitive
+// (README §12.3).
 
 import {
-  newQuickJSAsyncWASMModule,
   newQuickJSWASMModule,
-  type QuickJSAsyncWASMModule,
-  type QuickJSAsyncContext,
   type QuickJSWASMModule,
   type QuickJSContext,
   type QuickJSHandle,
 } from "quickjs-emscripten";
-// Use the actively-maintained quickjs-ng builds rather than quickjs-emscripten's
-// default (original-Bellard) variant. Both the Asyncify and non-Asyncify (sync)
-// flavours exist, so the dual-realm split below is unaffected.
+// Use the actively-maintained quickjs-ng build rather than quickjs-emscripten's default
+// (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed now — net is
+// a real Promise resolved by the host, not an Asyncify stack unwind.
 //
-// These variant packages are CJS, so under `nodenext` TypeScript types their
-// default export as the module namespace, whereas the runtime default import is
-// the variant object itself (verified). Cast to each factory's own parameter
-// type to bridge that interop gap.
-import ngReleaseAsyncMod from "@jitl/quickjs-ng-wasmfile-release-asyncify";
+// This variant package is CJS, so under `nodenext` TypeScript types its default export as
+// the module namespace, whereas the runtime default import is the variant object itself
+// (verified). Cast to the factory's own parameter type to bridge that interop gap.
 import ngReleaseSyncMod from "@jitl/quickjs-ng-wasmfile-release-sync";
-const ngReleaseAsync = ngReleaseAsyncMod as unknown as NonNullable<
-  Parameters<typeof newQuickJSAsyncWASMModule>[0]
->;
 const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModule>[0]
 >;
 
-/** The one capability seam. `op` selects a host capability (net / store / crypto
- *  / clock / rand, mapped by the host); `payload`/return are opaque bytes, exactly
- *  like `kernel.call(name, payload) -> bytes`. The host implementation may be
- *  async (a real network round trip); Asyncify makes that transparent to the
- *  guest. */
+/** The one capability seam. `op` selects a host capability (net / store / crypto / clock /
+ *  rand, mapped by the host); `payload`/return are opaque bytes, exactly like
+ *  `kernel.call(name, payload) -> bytes`. A sync op returns bytes directly; a net op — the
+ *  only genuinely async one — returns a Promise the guest awaits. */
 export type SafeRealmBridge = (op: number, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
 
 export interface SafeRealmOptions {
@@ -74,41 +60,41 @@ export interface SafeRealmOptions {
 }
 
 export interface SafeRealm {
-  /** Invoke a guest entrypoint registered with `register(name, fn)`. The arg and
-   *  result cross as raw bytes (the copy model). Resolves when the guest promise
-   *  settles — including all awaited host bridges. */
+  /** Invoke a guest entrypoint as an *initiator* (may `await` net). The arg and result
+   *  cross as raw bytes (the copy model). Resolves when the guest promise settles —
+   *  including all awaited host bridges. Concurrent `call()`s on one realm are safe: the
+   *  arg is consumed synchronously before the first `await`, so they never clobber. */
   call(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  dispose(): void;
-}
-
-export interface SyncSafeRealm {
-  /** Like SafeRealm.call but fully synchronous: the entrypoint runs to completion
-   *  and returns its bytes directly (no Promise). The bridge it is built with must
-   *  therefore resolve every op synchronously — a Promise (e.g. a net op) is a
-   *  hard error. Used for re-entrant work that must finish without yielding, such
-   *  as serving a request while an async realm is parked mid-await. */
-  call(entry: string, payload: Uint8Array): Uint8Array;
+  /** Invoke a guest entrypoint synchronously — the *holder* request side (README §12.8).
+   *  The entrypoint runs straight through to its bytes without yielding, so it can run
+   *  *while* an initiator `call()` is parked mid-`await` in the same realm (a suspended
+   *  async function is heap state; this is an ordinary re-entrant JS call). The
+   *  entrypoint must reach only sync ops — a net op returns a Promise a sync entrypoint
+   *  cannot resolve, which surfaces as an error here by design. Never pumps the job
+   *  queue, so a re-entrant holder call cannot advance a parked initiator's continuation
+   *  out of order. */
+  callSync(entry: string, payload: Uint8Array): Uint8Array;
   dispose(): void;
 }
 
 // The guest-side preamble. Defines the airtight ABI the guest is written against:
-// `host.call(op, bytes) -> Promise<Uint8Array>` over the single seam, and
-// `register`/`__invoke` for entrypoint dispatch. Pure JS — no authority.
+// `host.call(op, bytes)` over the single seam — bytes for a sync op, a Promise for a net
+// op — and `register`/`__invoke` for entrypoint dispatch. Pure JS — no authority.
 const PREAMBLE = `
 globalThis.host = {
-  // Asyncify makes __host_call *block* the guest until the host promise settles,
-  // returning the result bytes directly — it does NOT return a promise. So this
-  // is synchronous from the guest's point of view. A guest's
-  // 'await host.call(...)' still works unchanged (awaiting a plain value is a
-  // no-op), but a 'Promise.all' fan-out serializes: Asyncify unwinds one VM stack
-  // at a time, so concurrent host calls cannot overlap.
+  // __host_call returns an ArrayBuffer for a sync op (crypto/fs/clock/module) and a
+  // Promise<ArrayBuffer> for a net op (a genuine round trip). So a guest's
+  // 'await host.call(...)' resolves net transparently, while a sync op is returned
+  // directly (awaiting a plain value is a harmless no-op). Real promises mean a fan-out
+  // is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
   call(op, bytes) {
     const ab = bytes instanceof ArrayBuffer
       ? bytes
       : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
         ? bytes.buffer
         : bytes.slice().buffer;
-    return new Uint8Array(__host_call(op, ab));
+    const r = __host_call(op, ab);
+    return r instanceof ArrayBuffer ? new Uint8Array(r) : r.then((b) => new Uint8Array(b));
   },
 };
 globalThis.__entries = Object.create(null);
@@ -124,39 +110,25 @@ function __norm(out) {
 globalThis.__invoke = (name, argBuf) => {
   const fn = globalThis.__entries[name];
   if (typeof fn !== "function") throw new Error("safe-js: no entrypoint '" + name + "'");
-  // A synchronous entrypoint returns bytes directly (no guest promise). Because
-  // host.call blocks via Asyncify, every host call inside a *synchronous* body is
-  // reachable from the single evalCodeAsync expression and is driven correctly.
-  // An async entrypoint returns a promise we settle host-side — but its host calls
-  // must all occur before the first real await (see the note on the seam above).
+  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
+  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
+  // __norm normalizes both to an ArrayBuffer.
   const out = fn(new Uint8Array(argBuf));
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
 
-let modulePromise: Promise<QuickJSAsyncWASMModule> | undefined;
-/** The Asyncify QuickJS WASM module is loaded once and shared by all realms. */
-function getModule(): Promise<QuickJSAsyncWASMModule> {
-  return (modulePromise ??= newQuickJSAsyncWASMModule(ngReleaseAsync));
+let modulePromise: Promise<QuickJSWASMModule> | undefined;
+/** The QuickJS WASM module is loaded once and shared by all realms. */
+function getModule(): Promise<QuickJSWASMModule> {
+  return (modulePromise ??= newQuickJSWASMModule(ngReleaseSync));
 }
-
-// Asyncify's suspend/resume state is MODULE-global, and every async realm shares
-// the one module above — so a host call from one realm cannot overlap a host call
-// from ANOTHER realm without clobbering that shared state (the §2.1 caveat). One
-// process therefore serves at most one node, but the tests (and any host that runs
-// several realms in-process) stand up many. Serialize every async realm's call()
-// through one process-wide chain so their host calls never interleave. A call only
-// ever awaits net, which sync holder realms (a different module) answer without the
-// chain — so this never deadlocks. Sync realms are wholly unaffected.
-let asyncCallChain: Promise<unknown> = Promise.resolve();
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
     ? (u8.buffer as ArrayBuffer)
     : (u8.slice().buffer as ArrayBuffer);
 }
-
-// ── pieces shared by the async and sync factories ────────────────────────────
 
 /** Heap cap + the optional per-call wall-clock deadline. Returns the hook each
  *  `call()` uses to re-arm the deadline. */
@@ -197,108 +169,80 @@ const invokeSrc = (entry: string): string => `__invoke(${JSON.stringify(entry)},
 
 export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
   const mod = await getModule();
-  const ctx: QuickJSAsyncContext = mod.newContext();
-  const armDeadline = configureRealm(ctx, opts);
-
-  // The single seam: an Asyncified host function. QuickJS calls it synchronously;
-  // its stack unwinds while we await the bridge, then resumes with the result.
-  const hostCall = ctx.newAsyncifiedFunction("__host_call", async (opHandle, payloadHandle) => {
-    const op = ctx.getNumber(opHandle);
-    const result = await opts.bridge(op, copyPayload(ctx, payloadHandle));
-    return ctx.newArrayBuffer(toArrayBuffer(result));
-  });
-  ctx.setProp(ctx.global, "__host_call", hostCall);
-  hostCall.dispose();
-
-  // Load the ABI preamble, then the guest. Neither has authority. Each eval's
-  // completion value (the trailing assignment) is an owned handle — dispose it so
-  // nothing leaks past the context (the sync QuickJS build asserts on leaks).
-  ctx.unwrapResult(await ctx.evalCodeAsync(PREAMBLE, "safe-js-preamble.js")).dispose();
-  ctx.unwrapResult(await ctx.evalCodeAsync(opts.source, "safe-js-guest.js")).dispose();
-
-  const callOnce = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
-    armDeadline();
-    stageArg(ctx, payload);
-
-    // evalCodeAsync drives the Asyncify suspensions for every host call that is
-    // synchronously reachable inside the expression. The result is either the
-    // bytes directly (sync entrypoint) or a guest promise (async entrypoint);
-    // resolvePromise normalizes both, but it only settles once the job queue is
-    // pumped — hence resolvePromise → executePendingJobs → await, in that order
-    // (awaiting before the pump would deadlock).
-    const evalResult = ctx.unwrapResult(
-      await ctx.evalCodeAsync(invokeSrc(entry), "safe-js-invoke.js"),
-    );
-    const settledNative = ctx.resolvePromise(evalResult);
-    ctx.runtime.executePendingJobs();
-    const settled = await settledNative;
-    evalResult.dispose();
-
-    return takeBytes(ctx, ctx.unwrapResult(settled));
-  };
-
-  return {
-    call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
-      // Chain on the process-wide queue (see asyncCallChain): no two async realm
-      // calls — this realm's or any other's — may overlap host calls.
-      const run = asyncCallChain.then(() => callOnce(entry, payload));
-      asyncCallChain = run.catch(() => {}); // a failed call must not poison the queue
-      return run;
-    },
-    dispose(): void {
-      ctx.dispose();
-    },
-  };
-}
-
-let syncModulePromise: Promise<QuickJSWASMModule> | undefined;
-/** The synchronous (non-Asyncify) QuickJS WASM module — the smaller ~491 KB
- *  build, loaded once and shared by all sync realms. */
-function getSyncModule(): Promise<QuickJSWASMModule> {
-  return (syncModulePromise ??= newQuickJSWASMModule(ngReleaseSync));
-}
-
-/** A synchronous safe-js realm. Same airtight ABI and copy boundary as
- *  `createSafeRealm`, but with no Asyncify: `host.call` is a plain function and an
- *  entrypoint runs straight through to its bytes. Because there is no suspension,
- *  a `call()` here completes without ever yielding the event loop — so it can run
- *  *while* an Asyncify realm (a different WASM instance) is parked mid-host-call,
- *  the property the storage holder side needs (it answers from local fs + crypto,
- *  never net, so it has nothing to await). The bridge must resolve every op
- *  synchronously; a Promise return means an async op slipped into a sync realm. */
-export async function createSyncSafeRealm(opts: SafeRealmOptions): Promise<SyncSafeRealm> {
-  const mod = await getSyncModule();
   const ctx: QuickJSContext = mod.newContext();
   const armDeadline = configureRealm(ctx, opts);
+  let disposed = false;
 
-  // The single seam — a plain host function. QuickJS calls it synchronously and
-  // gets the result bytes back immediately; there is no stack unwind.
+  // The single seam. QuickJS calls it synchronously: a sync op resolves to its bytes and
+  // we hand the ArrayBuffer straight back; a net op returns a Promise, so we create a
+  // QuickJS deferred, settle it when the bridge promise resolves, and pump pending jobs
+  // so the guest's awaiting continuation runs. Returning the deferred's handle from a
+  // newFunction needs no other cleanup as long as resolve/reject fires (quickjs-emscripten
+  // deferred-promise contract).
   const hostCall = ctx.newFunction("__host_call", (opHandle, payloadHandle) => {
     const op = ctx.getNumber(opHandle);
     const result = opts.bridge(op, copyPayload(ctx, payloadHandle));
-    if (result && typeof (result as Promise<Uint8Array>).then === "function") {
-      throw new Error("sync safe-js: bridge returned a Promise — a sync realm cannot host an async op (e.g. net)");
+    if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
+      // Sync op — return the bytes directly (no promise, no job queue).
+      return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
     }
-    return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
+    // Net op — a genuine round trip. Bridge it through a deferred promise.
+    const deferred = ctx.newPromise();
+    (result as Promise<Uint8Array>).then(
+      (bytes) => {
+        if (disposed || !ctx.alive) return;
+        const ab = ctx.newArrayBuffer(toArrayBuffer(bytes));
+        deferred.resolve(ab);       // borrows ab; does not dispose it, so we do
+        ab.dispose();
+        ctx.runtime.executePendingJobs();
+      },
+      (err) => {
+        if (disposed || !ctx.alive) return;
+        const e = ctx.newError(String((err && (err as Error).message) || err));
+        deferred.reject(e);
+        e.dispose();
+        ctx.runtime.executePendingJobs();
+      },
+    );
+    return deferred.handle;
   });
   ctx.setProp(ctx.global, "__host_call", hostCall);
   hostCall.dispose();
 
-  // Dispose each eval's completion handle so nothing outlives the context — the
-  // sync QuickJS build asserts on a non-empty GC list at runtime teardown.
+  // Load the ABI preamble, then the guest. Neither has authority. Each eval's completion
+  // value (the trailing assignment) is an owned handle — dispose it so nothing leaks past
+  // the context (the QuickJS build asserts on leaks).
   ctx.unwrapResult(ctx.evalCode(PREAMBLE, "safe-js-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
   return {
-    call(entry: string, payload: Uint8Array): Uint8Array {
+    async call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
       armDeadline();
       stageArg(ctx, payload);
-      // A sync entrypoint returns bytes directly; __invoke yields the ArrayBuffer.
-      // (An async entrypoint would return a guest promise here, which a sync realm
-      // cannot settle — getArrayBuffer would then throw, by design.)
+      // evalCode runs the entrypoint synchronously up to its first await; the completion
+      // value is either the bytes (sync entrypoint) or a pending guest promise (async
+      // entrypoint). resolvePromise normalizes both to a native promise, but it settles
+      // only once the job queue is pumped — hence resolvePromise → executePendingJobs →
+      // await, in that order (awaiting before the first pump would stall a sync entrypoint).
+      // Net awaits are then driven by each deferred's own executePendingJobs on settle.
+      const evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js"));
+      const settledNative = ctx.resolvePromise(evalResult);
+      ctx.runtime.executePendingJobs();
+      const settled = await settledNative;
+      evalResult.dispose();
+      return takeBytes(ctx, ctx.unwrapResult(settled));
+    },
+    callSync(entry: string, payload: Uint8Array): Uint8Array {
+      armDeadline();
+      stageArg(ctx, payload);
+      // A sync (holder) entrypoint returns its ArrayBuffer directly. Deliberately no
+      // executePendingJobs: a re-entrant holder call must not advance a parked
+      // initiator's continuation. If a net op slipped in, the result is a guest promise
+      // and getArrayBuffer throws — by design (a holder answers from local fs + crypto).
       return takeBytes(ctx, ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js")));
     },
     dispose(): void {
+      disposed = true;
       ctx.dispose();
     },
   };

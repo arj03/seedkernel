@@ -1,7 +1,7 @@
 // cap-bridge — the capability counterpart to `safe-js` (exported as
 // `seedkernel-wasm/cap-bridge`). Given a safe-js realm, it services the guest's
 // single `host.call(op, bytes)` seam from the kernel's *primitive* capabilities
-// and nothing else: crypto primitives (sumo), net (send / sendMany / peers),
+// and nothing else: crypto primitives (sumo), net (send / peers),
 // fs (raw bytes under an opaque key), an installed-handler call, clock, and
 // identity. Every op is application-neutral — the bridge has no idea it is
 // hosting storage (or chat, or anything). All structure — content addressing,
@@ -24,8 +24,9 @@ import type { SafeRealmBridge } from "./safe-js.js";
  *  these as `const CAP_X = n;` into the guest, and the bridge switch reads them
  *  here, so guest and host can never drift. The numbers are a shared guest↔host
  *  identifier regenerated with the preamble — never a wire value between nodes — so
- *  they form one contiguous block grouped by domain (crypto 1–6, net 7–9, fs 10–15,
- *  module 16, clock 17); new ops are appended. */
+ *  they form one contiguous block grouped by domain (crypto 1–6, net 7–8, fs 9–14,
+ *  module 15, clock 16); new ops are appended. Net fan-out is not an op: with real
+ *  promises the guest fans out itself with `Promise.all` over `NET_SEND`. */
 export const CAP = {
   // crypto (1–6)
   HASH: 1,             // bytes -> 32B generic hash (blake2b / crypto_generichash)
@@ -35,28 +36,22 @@ export const CAP = {
   VERIFY: 4,           // [pk 32][sig 64][msg] -> [valid u8]
   IDENTITY: 5,         // -> this node's 32B public key
   RANDOM: 6,           // [n u32] -> n random bytes
-  // net (7–9)
+  // net (7–8) — NET_SEND is the only async op (a real round trip → a Promise)
   NET_SEND: 7,         // [peer 32][type u8][payload] -> [ok u8][resp]
-  NET_SEND_MANY: 8,    // [count u32]{[peer 32][type u8][plen u32][payload]}
-                       //   -> [count u32]{[peer 32][ok u8][len u32][bytes]}
-                       //   Per-peer fan-out: a DISTINCT request per peer, concurrently.
-                       //   The all-payloads-equal broadcast is just N identical entries.
-                       //   The parallel transport primitive a sync guest drives one
-                       //   batched cap at a time.
-  NET_PEERS: 9,        // -> [count u32][pk 32 …]
-  // fs (10–15)
-  FS_GET: 10,          // key(utf8) -> [0] | [1][bytes]
-  FS_PUT: 11,          // [klen u32][key(utf8)][bytes] -> []
-  FS_LIST: 12,         // prefix(utf8, may be empty) -> [count u32]{[klen u32][key]}
-  FS_DELETE: 13,       // key(utf8) -> []
-  FS_STAT: 14,         // -> [used u64 BE][available u64 BE]
-  FS_SIZE: 15,         // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
+  NET_PEERS: 8,        // -> [count u32][pk 32 …]
+  // fs (9–14)
+  FS_GET: 9,           // key(utf8) -> [0] | [1][bytes]
+  FS_PUT: 10,          // [klen u32][key(utf8)][bytes] -> []
+  FS_LIST: 11,         // prefix(utf8, may be empty) -> [count u32]{[klen u32][key]}
+  FS_DELETE: 12,       // key(utf8) -> []
+  FS_STAT: 13,         // -> [used u64 BE][available u64 BE]
+  FS_SIZE: 14,         // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
                        //   lets a policy layer rebuild a byte budget (quota) without
                        //   reading every value back. Existence is size ≥ 0, so there is
                        //   no separate FS_HAS.
-  // module (16) + clock (17)
-  MODULE_CALL: 16,     // [nameLen u8][name][req] -> installed handler response bytes
-  CLOCK: 17,           // -> now ms (u64 BE)
+  // module (15) + clock (16)
+  MODULE_CALL: 15,     // [nameLen u8][name][req] -> installed handler response bytes
+  CLOCK: 16,           // -> now ms (u64 BE)
 } as const;
 
 /** The generated `const CAP_NAME = n;` block the guest is written against. */
@@ -71,7 +66,7 @@ export function capPreamble(): string {
  *  not a list of 17 op numbers. `caps` is the grant; the preamble is the ABI. */
 export const CAP_DOMAINS = {
   crypto: [CAP.HASH, CAP.STREAM_XOR, CAP.SIGN, CAP.VERIFY, CAP.IDENTITY, CAP.RANDOM],
-  net:    [CAP.NET_SEND, CAP.NET_SEND_MANY, CAP.NET_PEERS],
+  net:    [CAP.NET_SEND, CAP.NET_PEERS],
   fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
   module: [CAP.MODULE_CALL],
   clock:  [CAP.CLOCK],
@@ -127,14 +122,11 @@ export interface CapSodium {
   randombytes_buf(n: number): Uint8Array;
 }
 
-/** The request/response transport the net ops drive. `Transport` satisfies it. */
+/** The request/response transport the net op drives. `Transport` satisfies it. A
+ *  confined guest fans out itself with `Promise.all` over `NET_SEND`, so the bridge
+ *  needs only single-peer request/response — no host-side scatter-gather. */
 export interface CapTransport {
   request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array>;
-  /** Per-peer fan-out — a distinct request per peer (NET_SEND_MANY). A broadcast
-   *  of one shared payload is just N identical entries. */
-  sendMany(
-    requests: { peer: PeerId; type: number; payload: Uint8Array }[],
-  ): Promise<{ peer: PeerId; ok: boolean; bytes: Uint8Array }[]>;
 }
 
 /** Everything a cap-bridge needs — all kernel primitives, zero app knowledge. */
@@ -172,7 +164,6 @@ export interface CapBridgeDeps {
 // the bridge caps them itself (a confined guest must not be able to size a
 // host buffer past these).
 const MAX_RANDOM_BYTES = 1 << 20;     // 1 MiB per CAP_RANDOM call
-const MAX_SEND_MANY_PEERS = 1024;     // fan-out width per CAP_NET_SEND_MANY
 
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
@@ -188,12 +179,11 @@ function u64be(value: number): Uint8Array {
 }
 
 /** Build the single capability funnel for one node. Every op resolves
- *  *synchronously* (returns bytes) except the two net ops, which genuinely
- *  round-trip and return a Promise — Asyncify makes that transparent to the async
- *  orchestration guest. Because the non-net ops are synchronous, the very same
- *  bridge also drives a *sync* (non-Asyncify) realm — the holder side, which never
- *  touches net (it answers purely from local fs + crypto), runs there so it can
- *  respond while the async realm is parked mid-await (the runtime split). */
+ *  *synchronously* (returns bytes) except `NET_SEND`, which genuinely round-trips and
+ *  returns a Promise the initiator guest `await`s. Because the non-net ops are
+ *  synchronous, the very same bridge also drives the holder side — which never touches
+ *  net (it answers purely from local fs + crypto), so it responds synchronously while an
+ *  initiator is parked mid-await in the same realm. */
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
   const { sodium, identity, callHandler, transport } = deps;
   const now = deps.now ?? (() => Date.now());
@@ -237,7 +227,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         return sodium.randombytes_buf(n);
       }
 
-      // ── net (the only async ops — a real round trip → a Promise) ──────────
+      // ── net (NET_SEND is the only async op — a real round trip → a Promise) ──
       case CAP.NET_SEND: {
         const peer = toHex(payload.slice(0, 32));
         const type = payload[32];
@@ -245,38 +235,6 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
           (resp) => concatBytes([ONE, resp]),
           () => ZERO,
         );
-      }
-      case CAP.NET_SEND_MANY: {
-        const count = readU32BE(payload, 0);
-        if (count > MAX_SEND_MANY_PEERS) {
-          throw new Error("cap-bridge: NET_SEND_MANY count over cap");
-        }
-        // `count` is guest-controlled: every entry must be fully backed by payload
-        // bytes (no driving an unbounded host loop with a bare number), validated as
-        // the variable-length entries are walked.
-        const requests: { peer: PeerId; type: number; payload: Uint8Array }[] = [];
-        let o = 4;
-        for (let i = 0; i < count; i++) {
-          if (o + 37 > payload.length) throw new Error("cap-bridge: NET_SEND_MANY truncated entry");
-          const peer = toHex(payload.slice(o, o + 32));
-          const type = payload[o + 32];
-          const plen = readU32BE(payload, o + 33); o += 37;
-          if (o + plen > payload.length) throw new Error("cap-bridge: NET_SEND_MANY truncated payload");
-          requests.push({ peer, type, payload: payload.slice(o, o + plen) }); o += plen;
-        }
-        return transport.sendMany(requests).then((results) => {
-          const head = new Uint8Array(4); writeU32BE(head, 0, results.length);
-          const parts: Uint8Array[] = [head];
-          for (const r of results) {
-            const h = new Uint8Array(32 + 1 + 4);
-            h.set(fromHex(r.peer), 0);
-            h[32] = r.ok ? 1 : 0;
-            writeU32BE(h, 33, r.ok ? r.bytes.length : 0);
-            parts.push(h);
-            if (r.ok) parts.push(r.bytes);
-          }
-          return concatBytes(parts);
-        });
       }
       case CAP.NET_PEERS: {
         const peers = deps.peers();
