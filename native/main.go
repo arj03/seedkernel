@@ -1,11 +1,10 @@
-// seedkernel native shell. The runtime is wasm (kernel + signature); apps arrive as
-// signed bundles (README §12) — nothing application-specific lives here. Host
+// seedkernel native shell. The runtime is wasm (kernel); apps arrive as signed
+// bundles (README §12) — nothing application-specific lives here. Host
 // orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS —
 // the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
 // second implementation (README §12.9); this Go layer is only the bridge: loads the
-// genesis wasm, supplies the
-// genesis crypto (Ed25519 + SHA-3), owns the signer stack and drives the signature
-// lifecycle (§6.5) around the stateless signature handler, and exposes byte
+// kernel wasm, supplies the genesis crypto (Ed25519 + SHA-3), hosts the `signature`
+// wrapper (§6.3) and the single signer it records (§6.5), and exposes byte
 // primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
 // in-repo qjs/wazero bridge) → one static binary.
 package main
@@ -33,9 +32,6 @@ import (
 
 //go:embed wasm/kernel.wasm
 var kernelWasm []byte
-
-//go:embed wasm/signature.wasm
-var sigWasm []byte
 
 // hostInstallerJS is the shared installer + install policy + bundle format/loader,
 // bundled from build/host/{util,installer,policy,bundle,native-shim}.js. It runs in
@@ -82,22 +78,21 @@ var (
 	entries = map[int32]*entry{}      // kernel handler id → impl (the kernel owns name → id)
 	byMod   = map[api.Module]*entry{} // wasm handler module → its entry, for the kernel imports
 	nextID  = int32(10)
-	// The signer stack (README §6.5): keys verified during the current top-level
-	// dispatch, outermost first. Owned here, not in the signature module —
-	// handleSignature pushes a verified signer, dispatches the inner envelope under
-	// it, and pops on return. Dispatch is single-threaded (§4.2), so a plain slice
-	// needs no locking.
-	sigStack []signer
-	sigID    int32 // handler id of the signature wrapper, set in boot()
+	// The verified signer of the current top-level dispatch (README §6.5), or nil
+	// when the message is unsigned. A `signature` wrapper is a single signature —
+	// signatureHandler sets this on a verified wrapper and clears it when the inner
+	// dispatch returns — so there is no stack: nesting is forbidden. Dispatch is
+	// single-threaded (§4.2), so a plain package var needs no locking.
+	curSigner *signer
+	// envDomain is DOMAIN_env (README §6.3, §16.1), read once at boot from the single
+	// definition in the evaluated domains.ts (host-installer.gen.js exports DOMAIN_ENV)
+	// — no hand-copied prefix. signatureHandler prepends it to the signed preimage.
+	envDomain []byte
 	// callerStack tracks the call chain for kernel.caller (§4.2): one frame per
 	// kernel.call in flight, immediate caller last. A nil frame is a host/guest-originated
-	// call, which has no kernel name. Single-threaded like sigStack, so no locking.
+	// call, which has no kernel name. Single-threaded like curSigner, so no locking.
 	callerStack [][]byte
 )
-
-// maxSigDepth caps nested `signature` wrappers per inbound message (README §2.3),
-// enforced host-side because the signer stack lives here.
-const maxSigDepth = 4
 
 // maxCallDepth caps kernel.call re-entrancy (README §10 MAX_CALL_DEPTH, §4.4).
 const maxCallDepth = 8
@@ -324,53 +319,88 @@ func immediateCaller() []byte {
 	return append([]byte{byte(len(n))}, n...)
 }
 
-// env.invoke_handler — kernel matched a name (README §3). sigID = the signature
-// wrapper: run it, then drive the signer-stack lifecycle around its output (§6.5).
+// env.invoke_handler — kernel matched a name (README §3). The `signature` wrapper is
+// an ordinary native handler now (signatureHandler), so there is nothing to
+// special-case: route on the id the kernel matched, like any other handler.
 func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
-	p := rd(km.Memory(), pP, pL)
-	if int32(hid) == sigID {
-		handleSignature(p)
-		return
-	}
 	// The kernel already matched the name to `hid` in its table; route on that id rather
 	// than re-resolving the name. Inbound: the response is dropped.
-	invokeByID(int32(hid), rd(km.Memory(), nP, nL), p)
+	invokeByID(int32(hid), rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL))
 }
 
-// handleSignature drives one accepted `signature` wrapper (README §6.5). The
-// wrapper is a stateless scratch-ABI handler (§4): it returns
-// [algo_id u16][signer_len u16][signer][inner] on a verified wrapper, or nothing
-// to drop. The host owns the signer stack and the push/dispatch/pop lifecycle, so
-// "pushed ⟺ verified" is local and no failure in the module can leak a signer.
-func handleSignature(payload []byte) {
-	// README §2.3: reject before any verify work once the stack is full.
-	if len(sigStack) >= maxSigDepth {
-		return
+// signatureHandler is the `signature` wrapper (README §6.3, §6.5) — an ordinary
+// native host handler, no wasm module and no bespoke ABI. It parses the wrapper,
+// assembles the domain-separated suite request, and verifies it via the suite at the
+// algo's slot (§6.4) with the same callHandler any host code uses. On success it
+// records the single signer of this dispatch, re-dispatches the inner envelope under
+// it, and clears the signer on return, so "signed ⟺ a signer is set" holds by
+// construction. Any malformed field, or a suite reporting invalid, drops the message.
+//
+// One signature per message: if a signer is already set (the inner envelope is itself
+// a `signature` wrapper) the message drops. Forbidding nesting makes verify-
+// amplification unrepresentable rather than merely capped. Registered blocked from
+// kernel.call (§4.4), so it only ever runs at top-level dispatch; its response is
+// always nil (the re-dispatch happens here).
+func signatureHandler(payload []byte) []byte {
+	if curSigner != nil {
+		return nil
 	}
-	out := invokeByID(sigID, name("signature"), payload) // standard scratch ABI (§4)
-	// Malformed wrapper or the suite reported invalid ⇒ no usable output ⇒ drop.
-	if len(out) < 4 {
-		return
+	// Parse [algo_id u16][signer_len u16][signer][sig_len u16][sig][inner].
+	if len(payload) < 4 {
+		return nil
 	}
 	o := 0
-	algo := int(out[o])<<8 | int(out[o+1])
+	algo := int(payload[o])<<8 | int(payload[o+1])
 	o += 2
-	sl := int(out[o])<<8 | int(out[o+1])
+	sl := int(payload[o])<<8 | int(payload[o+1])
 	o += 2
-	if sl <= 0 || o+sl > len(out) {
-		return
+	if sl <= 0 || o+sl > len(payload) {
+		return nil
 	}
-	pk := append([]byte(nil), out[o:o+sl]...)
+	pk := payload[o : o+sl]
 	o += sl
-	inner := out[o:]
-	if len(inner) == 0 {
-		return
+	if o+2 > len(payload) {
+		return nil
 	}
-	// Push the verified signer, dispatch the inner envelope under it, pop. The defer
-	// balances the stack even if dispatch unwinds (§6.5).
-	sigStack = append(sigStack, signer{algo, pk})
-	defer func() { sigStack = sigStack[:len(sigStack)-1] }()
+	sigLen := int(payload[o])<<8 | int(payload[o+1])
+	o += 2
+	if sigLen <= 0 || o+sigLen > len(payload) {
+		return nil
+	}
+	sig := payload[o : o+sigLen]
+	o += sigLen
+	inner := payload[o:]
+	if len(inner) == 0 {
+		return nil
+	}
+	// Suite verify request [pk_len u16][pk][sig_len u16][sig][data], where the signed
+	// preimage data = DOMAIN_env ‖ algo ‖ signer_len ‖ signer ‖ inner (§6.3). Prepending
+	// the domain + outer fields here gives every suite domain separation and outer-field
+	// binding for free — the suite just verifies sig over data.
+	data := make([]byte, 0, len(envDomain)+2+2+sl+len(inner))
+	data = append(data, envDomain...)
+	data = append(data, byte(algo>>8), byte(algo))
+	data = append(data, byte(sl>>8), byte(sl))
+	data = append(data, pk...)
+	data = append(data, inner...)
+	req := make([]byte, 0, 2+sl+2+sigLen+len(data))
+	req = append(req, byte(sl>>8), byte(sl))
+	req = append(req, pk...)
+	req = append(req, byte(sigLen>>8), byte(sigLen))
+	req = append(req, sig...)
+	req = append(req, data...)
+	// Reach the suite at its slot — an unknown algo_id has no handler there, so
+	// callHandler returns nil → drop, the same fail-safe as a suite reporting invalid.
+	resp := callHandler(suiteSlotName(algo), req)
+	if len(resp) < 1 || resp[0] != 1 {
+		return nil
+	}
+	// Verified: record the signer, dispatch the inner envelope under it, clear on
+	// return. The defer clears it even if dispatch unwinds (§6.5).
+	curSigner = &signer{algo, append([]byte(nil), pk...)}
+	defer func() { curSigner = nil }()
 	dispatch(inner)
+	return nil
 }
 
 // kernel.call — one handler reaches another (README §4.4). Returns the response length,
@@ -483,19 +513,16 @@ func genesisSuiteVerify(req []byte) []byte {
 	return invalid
 }
 
-// serializeSignerStack renders the host-owned signer stack as the `signature.signer`
-// query response (README §6.5): [count u8] ([algo u16 BE][pk_len u16 BE][pk ..])* in
-// push order — outermost signer first, top signer last. An empty stack is [0x00].
-// pk_len is u16 so a post-quantum suite's multi-kilobyte key fits. count is capped at
-// maxSigDepth by handleSignature, so it always fits a u8.
-func serializeSignerStack([]byte) []byte {
-	out := []byte{byte(len(sigStack))}
-	for _, s := range sigStack {
-		out = append(out, byte(s.algo>>8), byte(s.algo))
-		out = append(out, byte(len(s.pk)>>8), byte(len(s.pk)))
-		out = append(out, s.pk...)
+// serializeSigner renders the current signer as the `signature.signer` query response
+// (README §6.5): [0x00] when the dispatch is unsigned, or [0x01][algo u16 BE][pk ..]
+// when it is signed — the pubkey runs to the end, so a single signer needs no length
+// prefix and a post-quantum suite's multi-kilobyte key fits without truncation.
+func serializeSigner([]byte) []byte {
+	if curSigner == nil {
+		return []byte{0}
 	}
-	return out
+	out := []byte{1, byte(curSigner.algo >> 8), byte(curSigner.algo)}
+	return append(out, curSigner.pk...)
 }
 
 // installWasm instantiates handler bytes and binds them to the raw name `n`. The replace is
@@ -573,34 +600,26 @@ func boot() {
 	entries = map[int32]*entry{}
 	byMod = map[api.Module]*entry{}
 	callerStack = nil
-	sigStack = nil
+	curSigner = nil
 	kcallDepth = 0
-	// The signature wrapper is an ordinary scratch-ABI handler (§4): stateless, it parses +
-	// verifies and returns [algo][signer_len][signer][inner] (§6.3). So it installs like any
-	// other — own scratch, own kernel-assigned id — and is privileged only in that invoke()
-	// recognizes that id and drives the signer-stack lifecycle (handleSignature), never in
-	// its ABI.
-	if !installWasm(name("signature"), sigWasm) {
-		panic("boot: could not install the signature handler")
-	}
-	sigID = findHandlerID(name("signature"))
-	if sigID < 0 {
-		panic("boot: signature handler id missing after install")
-	}
-	// Blocked from kernel.call (§4.4): the wrapper establishes the top signer, so an
-	// arbitrary handler reaching it via kernel.call could reframe the active signer.
+	// The `signature` wrapper: an ordinary native host handler (no wasm module, no
+	// bespoke ABI). It parses the wrapper, verifies via the suite at its slot, then
+	// records the signer and re-dispatches the inner envelope (README §6.3, §6.5). It
+	// is privileged only in being blocked from kernel.call (§4.4): it establishes the
+	// signer, so an arbitrary handler reaching it via kernel.call could reframe it.
+	sigID := registerNative("signature", signatureHandler)
 	entries[sigID].blocked = true
 
 	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
 	// serviced with libsodium — the reference host's "genesis via SetHandler"
-	// (§6.4). The signature module reaches it by plain kernel.call to this slot.
+	// (§6.4). The signature wrapper reaches it by plain callHandler to this slot.
 	registerNativeAt(suiteSlotName(0), genesisSuiteVerify)
 
 	// The §6.5 signer query: an ordinary (read-only, freely callable) handler that
-	// serializes the host-owned signer stack, so an installed module can ask who
-	// signed the dispatch that reached it. Same wiring as the reference host's
-	// registerSignerQuery — without it, `loadTopSignerPubkey` has nothing to call.
-	registerNative("signature.signer", serializeSignerStack)
+	// serializes the current signer, so an installed module can ask who signed the
+	// dispatch that reached it. Same wiring as the reference host's registerSignerQuery
+	// — without it, `loadTopSignerPubkey` has nothing to call.
+	registerNative("signature.signer", serializeSigner)
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -660,6 +679,17 @@ func boot() {
 	installPolyfills(qc)
 	if _, err := qc.Eval("host-installer.gen.js", qjs.Code(hostInstallerJS)); err != nil {
 		panic(err)
+	}
+
+	// DOMAIN_env (README §6.3, §16.1): read the single definition from the evaluated
+	// domains.ts — host-installer.gen.js exports DOMAIN_ENV onto the realm global — so
+	// signatureHandler prepends the byte-identical prefix every other target signs and
+	// verifies with, no hand-copied constant on the native target.
+	dv := mustEval("globalThis.DOMAIN_ENV")
+	envDomain, err = qjs.JsTypedArrayToGo(dv)
+	dv.Free()
+	if err != nil || len(envDomain) == 0 {
+		panic("boot: could not read DOMAIN_ENV from the realm (regenerate host-installer.gen.js)")
 	}
 
 	// No `install` wire handler: code arrives only as a signed bundle (§12.4), and

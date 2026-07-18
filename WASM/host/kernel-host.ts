@@ -1,21 +1,19 @@
-// Host driver that loads kernel.wasm + the signature module (a stateless,
-// standard scratch-ABI handler, §4) and wires them together.
+// Host driver that loads kernel.wasm and wires the modules around it.
 //
 // The host is the orchestrator:
-//   - Owns the signer stack (§6.5) and drives the push/dispatch/pop lifecycle
-//     around each verified `signature` wrapper:
-//       1. kernel invokes the signature handler
-//       2. host runs it through the standard §4 scratch ABI; a verified wrapper
-//          returns [algo_id][signer_len][signer][inner]
-//       3. host pushes the signer, dispatches the inner envelope, pops on return
-//     so "pushed ⟺ verified" is a three-line host-local invariant.
+//   - Owns the `signature` wrapper (§6.3, §6.5) as an ordinary host handler: it
+//     parses the wrapper, verifies it via the suite at the algo's slot, records the
+//     single verified signer of the dispatch, re-dispatches the inner envelope under
+//     it, and clears the signer on return — all inside its own closure, with no
+//     special-casing anywhere else in the host. "signed ⟺ a signer is set" holds by
+//     construction, and nesting is forbidden (one signature per message).
 //   - Provides libsodium Ed25519 + SHA-3-256 as the genesis suite handler (§6.2)
 //   - Routes invoke_handler callbacks from kernel.wasm to WASM or host-JS handlers
 //   - Provides kernel.call / kernel.caller imports to every handler (§4.2) — the
-//     signature module reaches a suite by the same kernel.call to the suite's slot
-//     name (§6.4, §6.6); no bespoke suite-dispatch import
+//     signature wrapper reaches a suite by the same call to the suite's slot name
+//     (§6.4, §6.6), no bespoke suite-dispatch import
 //   - Exposes primitives the Installer (host/installer.ts) consumes:
-//     instantiating WASM handlers, genesis hashing, top-signer access
+//     instantiating WASM handlers, genesis hashing, the current signer
 
 import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope.js";
 import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
@@ -76,12 +74,6 @@ interface KernelExports {
 
 const MAX_CALL_DEPTH = 8;
 
-// README §2.3: cap nested `signature` wrappers per inbound message. Bounds the
-// per-message verify cost so a single 64 KB envelope cannot force hundreds of
-// crypto verifications on the single-threaded dispatch loop. Enforced here,
-// host-side, because the signer stack lives here (§6.5).
-const MAX_SIGNATURE_DEPTH = 4;
-
 // Default scratch size mirrored by the host — handlers must reserve at least
 // this much I/O space at their `scratch` offset (README §4.1).
 const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
@@ -119,14 +111,12 @@ export class KernelHost {
   // Call-chain tracking for kernel.caller (§4.2). Outermost is first, immediate
   // caller is last (push order).
   private callerStack: (Uint8Array | null)[] = [];
-  // The signer stack (README §6.5): the keys verified during the current
-  // top-level dispatch, outermost first. Owned here, not in the signature module —
-  // _handleSignature pushes a verified signer, dispatches the inner envelope under
-  // it, and pops on return, so the stack is always balanced.
-  private signerStack: Signer[] = [];
-  // Handler id of the `signature` wrapper, set by registerSignature; -1 until
-  // then, so no invoke_handler id ever matches it before registration.
-  private signatureId = -1;
+  // The verified signer of the current top-level dispatch (README §6.5), or null
+  // when the message is unsigned. A `signature` wrapper is a single signature — the
+  // handler sets this on a verified wrapper and clears it when the inner dispatch
+  // returns — so there is no stack: nesting is forbidden (a wrapper whose inner is
+  // itself a wrapper drops), which also makes verify-amplification unrepresentable.
+  private _currentSigner: Signer | null = null;
   // Name used to build outer signature envelopes in wrap(). Set by
   // registerSignature; null until then.
   private _signatureName: Uint8Array | null = null;
@@ -228,7 +218,9 @@ export class KernelHost {
 
   // ─── import implementations ──────────────────────────────────────────
 
-  /** Called by kernel.wasm when a handler matches (§3). */
+  /** Called by kernel.wasm when a handler matches (§3). The `signature` wrapper is
+   *  an ordinary host handler now, so there is nothing to special-case here — it is
+   *  invoked like any other and drives its own re-dispatch (see _signatureHandler). */
   private _onInvokeHandler(
     handlerId: number,
     namePtr: number,
@@ -237,52 +229,10 @@ export class KernelHost {
     payloadLen: number
   ): void {
     const payload = this.readFromKernel(payloadPtr, payloadLen);
-    if (handlerId === this.signatureId) {
-      this._handleSignature(payload);
-      return;
-    }
-
     // Dynamic WASM handler or host-JS handler — response is dropped for
     // inbound dispatch. kernel.call is the path that surfaces responses.
     const name = this.readFromKernel(namePtr, nameLen);
     this._invokeHandlerGetResponse(handlerId, name, payload);
-  }
-
-  /** Drive one accepted `signature` wrapper (README §6.5). The wrapper is a
-   *  stateless standard-ABI handler (§4): it parses + verifies and returns
-   *  `[algo_id u16][signer_len u16][signer][inner]` on success, or nothing to
-   *  drop. The host owns the signer stack and the push/dispatch/pop lifecycle, so
-   *  the "pushed ⟺ verified" invariant is the three lines below and no failure in
-   *  the module can leak a signer onto the stack. */
-  private _handleSignature(payload: Uint8Array): void {
-    // README §2.3: reject before any verify work once the stack is full.
-    if (this.signerStack.length >= MAX_SIGNATURE_DEPTH) return;
-
-    const out = this._invokeHandlerGetResponse(this.signatureId, this._signatureName!, payload);
-    // No output ⇒ malformed wrapper or the suite reported invalid ⇒ drop (§6.3).
-    if (!out) return;
-
-    // Parse [algo_id u16][signer_len u16][signer][inner].
-    let o = 0;
-    if (o + 4 > out.length) return;
-    const algoId = (out[o] << 8) | out[o + 1]; o += 2;
-    const signerLen = (out[o] << 8) | out[o + 1]; o += 2;
-    if (signerLen <= 0 || o + signerLen > out.length) return;
-    const publicKey = out.slice(o, o + signerLen); o += signerLen;
-    const inner = out.slice(o);
-    if (inner.length === 0) return;
-
-    // Push the verified signer, dispatch the inner envelope under it, pop. Any
-    // throw in dispatch unwinds through the finally, so the stack stays balanced.
-    this.signerStack.push({ algoId, publicKey });
-    try {
-      const kPtr = this.writeToKernel(inner);
-      try { this.kernelExports.dispatch(kPtr, inner.length); }
-      catch { /* drop */ }
-      finally { this.kernelExports.dealloc(kPtr); }
-    } finally {
-      this.signerStack.pop();
-    }
   }
 
   /** Core invocation used both by inbound dispatch (response dropped) and by
@@ -326,26 +276,19 @@ export class KernelHost {
     return null;
   }
 
-  /** Serialize the current signer stack as
-   *  `[count u8][algo_id u16 BE][pubkey_len u16 BE][pubkey ..]*` — the format
-   *  the `signature.signer` query handler returns (§6.5). pubkey_len is u16
-   *  BE so post-quantum suites with multi-kilobyte public keys fit. */
-  private _serializeSignerStack(): Uint8Array {
-    const count = this.signerStack.length;
-    if (count === 0) return new Uint8Array([0]);
-    let size = 1;
-    for (const s of this.signerStack) size += 2 + 2 + s.publicKey.length;
-    const out = new Uint8Array(size);
-    let o = 0;
-    out[o++] = count; // capped at MAX_SIGNATURE_DEPTH, fits a u8
-    for (const s of this.signerStack) {
-      out[o++] = (s.algoId >> 8) & 0xff;
-      out[o++] = s.algoId & 0xff;
-      out[o++] = (s.publicKey.length >> 8) & 0xff;
-      out[o++] = s.publicKey.length & 0xff;
-      out.set(s.publicKey, o);
-      o += s.publicKey.length;
-    }
+  /** Serialize the current signer as the `signature.signer` query response
+   *  (README §6.5): `[0x00]` when the dispatch is unsigned, or
+   *  `[0x01][algo_id u16 BE][pubkey ..]` when it is signed — the pubkey runs to the
+   *  end, so a single signer needs no length prefix and a post-quantum suite's
+   *  multi-kilobyte key fits without truncation. */
+  private _serializeSigner(): Uint8Array {
+    const s = this._currentSigner;
+    if (!s) return new Uint8Array([0]);
+    const out = new Uint8Array(3 + s.publicKey.length);
+    out[0] = 1;
+    out[1] = (s.algoId >> 8) & 0xff;
+    out[2] = s.algoId & 0xff;
+    out.set(s.publicKey, 3);
     return out;
   }
 
@@ -437,13 +380,81 @@ export class KernelHost {
     return true;
   }
 
-  /** Top-of-stack signer, or null if the signer stack is empty. */
-  get currentTopSigner(): Signer | null {
-    const n = this.signerStack.length;
-    if (n === 0) return null;
-    const s = this.signerStack[n - 1];
-    return { algoId: s.algoId, publicKey: s.publicKey.slice() };
+  /** The verified signer of the current dispatch, or null if it was unsigned.
+   *  Host-side read of the same value `signature.signer` serializes (§6.5). */
+  get currentSigner(): Signer | null {
+    const s = this._currentSigner;
+    return s ? { algoId: s.algoId, publicKey: s.publicKey.slice() } : null;
   }
+
+  /** The `signature` wrapper handler (README §6.3, §6.5). An ordinary host handler
+   *  registered by `registerSignature` and reached by name through the normal
+   *  dispatch path — nothing in the host special-cases it. It parses the wrapper,
+   *  assembles the domain-separated suite request, and verifies it via the suite at
+   *  the algo's slot (§6.4) using the same `callHandler` any host code uses. On
+   *  success it records the single signer of this dispatch, re-dispatches the inner
+   *  envelope under it, and clears the signer on return, so "signed ⟺ a signer is
+   *  set" holds by construction. Any malformed field, or a suite reporting invalid,
+   *  drops the message (§3).
+   *
+   *  One signature per message: if a signer is already set — the inner envelope is
+   *  itself a `signature` wrapper — the message drops. Forbidding nesting makes the
+   *  verify-amplification vector (a chain of wrappers forcing many verifies from one
+   *  64 KB input) unrepresentable rather than merely capped. */
+  private readonly _signatureHandler: Handler = (_name, payload) => {
+    if (this._currentSigner !== null) return;
+
+    // Parse [algo_id u16][signer_len u16][signer][sig_len u16][sig][inner].
+    let o = 0;
+    if (payload.length < 4) return;
+    const algoId = (payload[o] << 8) | payload[o + 1]; o += 2;
+    const signerLen = (payload[o] << 8) | payload[o + 1]; o += 2;
+    if (signerLen <= 0 || o + signerLen > payload.length) return;
+    const publicKey = payload.slice(o, o + signerLen); o += signerLen;
+    if (o + 2 > payload.length) return;
+    const sigLen = (payload[o] << 8) | payload[o + 1]; o += 2;
+    if (sigLen <= 0 || o + sigLen > payload.length) return;
+    const sig = payload.slice(o, o + sigLen); o += sigLen;
+    const inner = payload.slice(o);
+    if (inner.length === 0) return;
+
+    // Suite verify request `[pk_len u16][pk][sig_len u16][sig][data]`, where the
+    // signed preimage `data = DOMAIN_ENV ‖ algo_id ‖ signer_len ‖ signer ‖ inner`
+    // (§6.3). Prepending the domain and the outer fields here gives every suite
+    // domain separation and outer-field binding for free — the suite just verifies
+    // `sig` over `data`. DOMAIN_ENV is the one domain family (domains.ts), imported;
+    // there is no hand-copied prefix anywhere anymore (§16.1).
+    const dataLen = DOMAIN_ENV.length + 2 + 2 + signerLen + inner.length;
+    const req = new Uint8Array(2 + signerLen + 2 + sigLen + dataLen);
+    let w = 0;
+    req[w++] = (signerLen >> 8) & 0xff; req[w++] = signerLen & 0xff;
+    req.set(publicKey, w); w += signerLen;
+    req[w++] = (sigLen >> 8) & 0xff; req[w++] = sigLen & 0xff;
+    req.set(sig, w); w += sigLen;
+    req.set(DOMAIN_ENV, w); w += DOMAIN_ENV.length;
+    req[w++] = (algoId >> 8) & 0xff; req[w++] = algoId & 0xff;
+    req[w++] = (signerLen >> 8) & 0xff; req[w++] = signerLen & 0xff;
+    req.set(publicKey, w); w += signerLen;
+    req.set(inner, w);
+
+    // Reach the suite at its slot by name — an unknown algo_id has no handler there,
+    // so callHandler returns null → drop, the same fail-safe as a suite reporting
+    // "invalid". The suite is not blocked, so callHandler routes to it normally.
+    const resp = this.callHandler(this.deriveSuiteSlotName(algoId), req);
+    if (!resp || resp.length < 1 || resp[0] !== 1) return;
+
+    // Verified: this is the signer. Dispatch the inner envelope under it, clear on
+    // return — a throw in dispatch still unwinds through the finally.
+    this._currentSigner = { algoId, publicKey };
+    try {
+      const kPtr = this.writeToKernel(inner);
+      try { this.kernelExports.dispatch(kPtr, inner.length); }
+      catch { /* drop */ }
+      finally { this.kernelExports.dealloc(kPtr); }
+    } finally {
+      this._currentSigner = null;
+    }
+  };
 
   /** Host import provided to dynamic handlers as `kernel.call` (README §4.4). */
   private _kernelCallFromHandler(
@@ -610,11 +621,6 @@ export class KernelHost {
     return this._installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 
-  /** Read the current signer stack (§6.5), outermost first. */
-  get currentSigners(): readonly Signer[] {
-    return this.signerStack.map((s) => ({ algoId: s.algoId, publicKey: s.publicKey.slice() }));
-  }
-
   /** Remove a handler, the `SetHandler(name, null)` case in §3.1. */
   removeHandler(name: Uint8Array): boolean {
     const ptr = this.writeToKernel(name);
@@ -629,42 +635,31 @@ export class KernelHost {
     } finally { this.kernelExports.dealloc(ptr); }
   }
 
-  /** Register the signature wrapper handler (§6.5) and seed the genesis suite
-   *  (§6.2) at its slot. Required for any signed message to dispatch: the
-   *  wrapper verifies via the suite installed at the algo's slot (§6.4), and the
-   *  genesis suite (Ed25519 + SHA-3-256) is the one that must exist at boot.
+  /** Register the `signature` wrapper handler (§6.5) and seed the genesis suite
+   *  (§6.2) at its slot. Required for any signed message to dispatch: the wrapper
+   *  verifies via the suite installed at the algo's slot (§6.4), and the genesis
+   *  suite (Ed25519 + SHA-3-256) is the one that must exist at boot.
    *
-   *  The wrapper is an ordinary scratch-ABI WASM handler (§4) — the host
-   *  instantiates it and SetHandler-seeds it here, like any bootstrap handler
-   *  (§9). It is privileged only in that the host recognizes its id and drives
-   *  the signer-stack lifecycle around its output (_handleSignature), never in its
-   *  ABI. Being SetHandler-seeded with no install record, the reference policy
-   *  refuses to overlay it (§6.4) and the host keeps the emergency-replacement
-   *  path (§9.1). Blocked from `kernel.call` (§4.4): the wrapper establishes the
-   *  top signer, so letting a handler invoke it would let it reframe the active
-   *  signer mid-chain. */
-  registerSignature(signatureName: Uint8Array, signatureBytes: BufferSource): void {
-    const bytes = ArrayBuffer.isView(signatureBytes)
-      ? new Uint8Array(signatureBytes.buffer, signatureBytes.byteOffset, signatureBytes.byteLength)
-      : new Uint8Array(signatureBytes);
-    if (!this._installWasmHandler(signatureName, bytes)) {
-      throw new Error("registerSignature: failed to instantiate the signature module");
-    }
-    const id = this.findHandlerId(signatureName);
-    if (id < 0) throw new Error("registerSignature: signature handler id missing");
-    this.signatureId = id;
+   *  The wrapper is an ordinary host handler now — `register`ed here like any
+   *  bootstrap handler (§9), no WASM module and no bespoke ABI. It is privileged
+   *  only in being blocked from `kernel.call` (§4.4): it establishes the signer, so
+   *  letting a handler invoke it would let it reframe the active signer mid-chain.
+   *  Being register-seeded with no install record, the reference policy refuses to
+   *  overlay it (§6.4) and the host keeps the §9.1 emergency-replacement path. */
+  registerSignature(signatureName: Uint8Array): void {
+    const id = this.register(signatureName, this._signatureHandler);
     this._signatureName = signatureName.slice();
     this.blockFromCall(id);
     this.register(this.deriveSuiteSlotName(GENESIS_ALGO_ID), this._genesisSuiteHandler);
   }
 
   /** Register the `signature.signer` query handler (§6.5): an ordinary host
-   *  handler that serializes the host-owned signer stack. Any handler that wants
-   *  to read the current signer stack via `kernel.call(signerQueryName, …)` needs
-   *  this wired. Optional — the wrapper works without it; only apps that
-   *  introspect the author of a dispatch require it. */
+   *  handler that serializes the current signer. Any handler that wants to read who
+   *  signed the current dispatch via `kernel.call(signerQueryName, …)` needs this
+   *  wired. Optional — the wrapper works without it; only apps that introspect the
+   *  author of a dispatch require it. */
   registerSignerQuery(signerQueryName: Uint8Array): void {
-    this.register(signerQueryName, () => this._serializeSignerStack());
+    this.register(signerQueryName, () => this._serializeSigner());
   }
 
   /** Mark a handler as forbidden from `kernel.call` (README §4.4). Use this

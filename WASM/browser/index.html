@@ -17,8 +17,8 @@
 </head>
 <body>
 <h1>SeedKernel WASM — 10k Signature Benchmark</h1>
-<p class="dim">Loads kernel.wasm + signature.wasm, builds 10k signed envelopes,
-then times dispatching them through the full pipeline vs. plain Ed25519 verify.</p>
+<p class="dim">Loads kernel.wasm, builds 10k signed envelopes, then times
+dispatching them through the full pipeline vs. plain Ed25519 verify.</p>
 <button id="run" disabled>Loading...</button>
 <pre id="log"></pre>
 
@@ -44,14 +44,13 @@ async function runBenchmark() {
   btn.textContent = "Running...";
   log.textContent = "";
 
-  print("Loading WASM modules...");
-  const { host: mk, signatureBytes } = await loadKernelHost(
-    "../build/kernel.wasm", "../build/signature.wasm", sodium);
+  print("Loading kernel WASM...");
+  const mk = await loadKernelHost("../build/kernel.wasm", sodium);
 
   // Bootstrap: just the signature wrapper (README §9). The benchmark
   // registers its receiver host-side via mk.register, so no installer is
   // needed — host-side handlers carry no install record, see §3.1.
-  mk.registerSignature(mk.deriveBootstrapName("signature"), signatureBytes);
+  mk.registerSignature(mk.deriveBootstrapName("signature"));
 
   const { publicKey: rootPk, privateKey: rootSk } = sodium.crypto_sign_keypair();
   const chatTextName = mk.deriveBootstrapName("chat.text");
@@ -104,8 +103,7 @@ async function runBenchmark() {
   print(`Overhead: ${((ratio - 1) * 100).toFixed(1)}% over raw verify`);
 
   const kSize = (await (await fetch("../build/kernel.wasm")).arrayBuffer()).byteLength;
-  const bSize = (await (await fetch("../build/signature.wasm")).arrayBuffer()).byteLength;
-  print(`\nWASM modules: kernel.wasm (${kSize} bytes) + signature.wasm (${bSize} bytes)`, "dim");
+  print(`\nWASM module: kernel.wasm (${kSize} bytes)`, "dim");
 
   btn.disabled = false;
   btn.textContent = "Run again";
@@ -115,10 +113,10 @@ btn.disabled = false;
 btn.textContent = "Run benchmark";
 btn.addEventListener("click", runBenchmark);
 print("Ready. Click the button to start.\n", "dim");
-print("Distribution: kernel-host.js + kernel.wasm + signature.wasm", "dim");
-print("Protocol logic (envelope format, signature wrapper, signer stack)", "dim");
-print("lives in WASM. The JS host is pure glue: load modules, bridge", "dim");
-print("memories, route callbacks, provide libsodium.", "dim");
+print("Distribution: kernel-host.js + kernel.wasm", "dim");
+print("The envelope kernel is WASM; the signature wrapper and signer are", "dim");
+print("host code. The JS host loads the kernel, routes callbacks, owns the", "dim");
+print("signature layer, and provides libsodium.", "dim");
 
 </script>
 </body>

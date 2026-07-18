@@ -8,27 +8,20 @@ import { KernelHost } from "./kernel-host.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
-/** Fetch the two WASM modules, await sodium readiness, and instantiate a
- *  KernelHost. Pass URLs as strings or URL objects relative to the page.
- *
- *  Returns the signature module's bytes alongside the host rather than wiring
- *  them in: bootstrap is the host's job (§9), so the caller passes them to
- *  `registerSignature` under whatever name it bootstraps at — exactly as it
- *  does for the installer. This entry point only packages the platform I/O. */
+/** Fetch kernel.wasm, await sodium readiness, and instantiate a KernelHost. Pass
+ *  the URL as a string or URL object relative to the page. The signature wrapper
+ *  and genesis suite are host code now (registered via `host.registerSignature`),
+ *  so this fetches the one WASM blob and only packages the platform I/O —
+ *  bootstrap stays the caller's job (§9). */
 export async function loadKernelHost(
   kernelUrl: string | URL,
-  signatureUrl: string | URL,
   sodium: Sodium,
-): Promise<{ host: KernelHost; signatureBytes: Uint8Array }> {
-  const [kernelBytes, signatureBytes] = await Promise.all([
+): Promise<KernelHost> {
+  const [kernelBytes] = await Promise.all([
     fetch(kernelUrl).then((r) => r.arrayBuffer()),
-    fetch(signatureUrl).then((r) => r.arrayBuffer()),
     sodium.ready,
   ]);
-  return {
-    host: await KernelHost.load(kernelBytes, sodium),
-    signatureBytes: new Uint8Array(signatureBytes),
-  };
+  return KernelHost.load(kernelBytes, sodium);
 }
 
 export {

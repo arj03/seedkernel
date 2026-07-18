@@ -89,48 +89,29 @@ export function isConfigured(): bool {
   return routeLen > 0;
 }
 
-/** Query `signature.signer` for the current message's signer stack and
- *  return a pointer into scratch at the **top** (innermost, last-pushed)
- *  signer's pubkey, or -1 on failure. Needs no configure() — the query's
- *  name is baked in (SIGNER_NAME).
+/** Query `signature.signer` for the current message's signer and return a
+ *  pointer into scratch at the signer's pubkey, or -1 on failure (no signer, or a
+ *  non-Ed25519 suite). Needs no configure() — the query's name is baked in
+ *  (SIGNER_NAME).
  *
- *  Wire format of the response (README §6.5):
- *      [count u8] [algo u16 BE][pk_len u16 BE][pk ..]*   in push order —
- *      outermost first, top signer LAST.
+ *  Wire format of the response (README §6.5): `[0x00]` for an unsigned dispatch,
+ *  or `[0x01][algo u16 BE][pk ..]` where the pubkey runs to the end. A signature
+ *  is a single signature (no stack), so there is exactly one signer to read.
  *
  *  Only Ed25519 (pk_len == PK_LEN) is accepted; anything else yields -1.
- *  Bounds-check every step so a truncated / malformed response never
- *  reads past the kernel.call return length.
+ *  Bounds-check every step so a truncated / malformed response never reads past
+ *  the kernel.call return length.
  *
- *  IMPORTANT: this clobbers scratch with the response. Callers must have
- *  staged any input bytes they still need elsewhere (typically in priv)
- *  before calling. */
+ *  IMPORTANT: this clobbers scratch with the response. Callers must have staged
+ *  any input bytes they still need elsewhere (typically in priv) before calling. */
 export function loadTopSignerPubkey(): i32 {
   const respLen = kernelCall(SIGNER_NAME.dataStart as i32, SIGNER_NAME.length, scratchPtr, 0);
   if (respLen <= 0) return -1;
-  const count = load<u8>(scratchPtr) as i32;
-  if (count == 0) return -1;
-
-  // Walk each [algo u16][pk_len u16][pk ..] entry to find the LAST one.
-  // Header per entry = 4 bytes; bounds checks defend against a malformed
-  // or truncated response.
-  let o: i32 = 1;            // skip count byte
-  let pkPtr: i32 = -1;
-  let pkLen: i32 = 0;
-  for (let i: i32 = 0; i < count; i++) {
-    if (o + 4 > respLen) return -1;
-    o += 2;                  // skip algo
-    pkLen = ((load<u8>(scratchPtr + o) as i32) << 8) |
-            (load<u8>(scratchPtr + o + 1) as i32);
-    o += 2;
-    if (pkLen <= 0 || o + pkLen > respLen) return -1;
-    pkPtr = scratchPtr + o;
-    o += pkLen;
-  }
-  // Only the top signer's algorithm matters for this helper. Apps that need
-  // multi-algorithm awareness can read the signer stack directly.
+  if ((load<u8>(scratchPtr) as i32) != 1) return -1; // [0x00] = unsigned dispatch
+  // [0x01][algo u16][pk ..] — the pubkey is the remainder, so pk_len = respLen - 3.
+  const pkLen = respLen - 3;
   if (pkLen != PK_LEN) return -1;
-  return pkPtr;
+  return scratchPtr + 3;
 }
 
 /** Forward a rendered event to the host-side route schema (the JS bridge

@@ -1,6 +1,6 @@
 // Copy the WASM artifacts the Go loader embeds (//go:embed wasm/*.wasm) from
 // their canonical build outputs into ../native/wasm/ (the top-level Go module).
-// All three are BUILT from this repo's source, so they're gitignored under
+// All are BUILT from this repo's source, so they're gitignored under
 // native/wasm/ and produced here by `npm run build:loader` — go:embed can't reach
 // across the native/ module boundary to WASM/build or WASM/browser, hence the copy.
 // Only native/qjs/qjs.wasm stays committed (vendored upstream, not built here).
@@ -16,7 +16,6 @@ mkdirSync(dst, { recursive: true });
 
 const copies = [
   ["build/kernel.wasm", "kernel.wasm"],
-  ["build/signature.wasm", "signature.wasm"],
   ["build/ws.wasm", "ws.wasm"],
   ["browser/libsodium.wasm", "libsodium.wasm"],
 ];

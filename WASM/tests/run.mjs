@@ -59,16 +59,15 @@ function assertEqual(actual, expected, msg) {
 }
 
 const kernelWasm = join(root, "build/kernel.wasm");
-const signatureWasm = join(root, "build/signature.wasm");
 
 // Standard bootstrap (README §9): signature handler + the module registry. The
 // default policy accepts every install; tests that need rejection override via
 // host.setApproveInstall.
 async function makeHost(approveInstall = () => true) {
-  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
+  const host = await loadKernelHost(kernelWasm);
   const signatureName = host.deriveBootstrapName("signature");
 
-  host.registerSignature(signatureName, signatureBytes);
+  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(approveInstall);
 
@@ -142,7 +141,7 @@ async function testSignerQuery() {
 
   host.registerSignerQuery(signerQueryName);
   assertEqual([...host.callHandler(signerQueryName, EMPTY)], [0],
-    "an empty signer stack serializes as [0x00]");
+    "an unsigned dispatch serializes as [0x00]");
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const probeName = host.deriveScopedName("signer.probe", pk);
@@ -193,7 +192,7 @@ async function testSizeLimitEnforced() {
   console.log("Test: Oversized envelope rejected (§2.2)");
 
   // The kernel alone (§1) — this test needs no signature wrapper, so it wires none.
-  const { host } = await loadKernelHost(kernelWasm, signatureWasm);
+  const host = await loadKernelHost(kernelWasm);
 
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
@@ -214,14 +213,13 @@ async function testSizeLimitEnforced() {
   console.log("  OK\n");
 }
 
-// ─── Test: Signature wrapping depth cap (§2.3) ──────────────────────────
+// ─── Test: one signature per message; nesting is dropped (§6.5) ─────────
 
-async function testSignatureDepthCap() {
-  console.log("Test: Signature wrapping depth capped at MAX_SIGNATURE_DEPTH=4 (§2.3)");
+async function testSingleSignatureNoNesting() {
+  console.log("Test: one signature per message; nested wrappers dropped (§6.5)");
 
-  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName, signatureBytes);
+  const host = await loadKernelHost(kernelWasm);
+  host.registerSignature(host.deriveBootstrapName("signature"));
 
   const chatTextName = host.deriveBootstrapName("chat.text");
   let received = 0;
@@ -229,9 +227,7 @@ async function testSignatureDepthCap() {
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
 
-  // Build N nested signature wrappers around the same chat.text envelope and
-  // dispatch the outermost. wrap() takes raw inner bytes, so we just feed the
-  // previous wrap's output back in.
+  // wrap() takes raw inner bytes, so feeding a wrap's output back in nests it.
   const wrapN = (n, innerBytes) => {
     let bytes = innerBytes;
     for (let i = 0; i < n; i++) bytes = host.wrap(sk, pk, bytes);
@@ -240,18 +236,18 @@ async function testSignatureDepthCap() {
   const inner = host.encodeEnvelope(chatTextName,
     new TextEncoder().encode("hi"));
 
-  // 4 wrappers: signer stack reaches [s4,s3,s2,s1] = length 4 at the innermost
-  // verify; that verify checks length < 4 (currently 3) before pushing, so it
-  // is accepted. Inner handler must run.
+  // One wrapper: verified, so the inner handler runs.
   received = 0;
-  host.dispatch(wrapN(4, inner));
-  assertEqual(received, 1, "4-deep wrap reaches handler");
+  host.dispatch(wrapN(1, inner));
+  assertEqual(received, 1, "a single signature reaches the handler");
 
-  // 5 wrappers: the innermost verify sees signer stack length 4 ≥ 4 and drops
-  // before any verify work. Inner handler must NOT run.
+  // Two wrappers: the outer verifies and re-dispatches its inner, which is itself
+  // a signature wrapper — but a signer is already set, so the inner wrapper drops
+  // before any verify work. The chat handler never runs. This is what makes the
+  // verify-amplification vector (a chain of nested wrappers) unrepresentable.
   received = 0;
-  host.dispatch(wrapN(5, inner));
-  assertEqual(received, 0, "5-deep wrap dropped at innermost wrapper");
+  host.dispatch(wrapN(2, inner));
+  assertEqual(received, 0, "a nested signature wrapper is dropped");
 
   console.log("  OK\n");
 }
@@ -264,9 +260,9 @@ async function testRefuseOverlayBootstrapSlot() {
   // Use the reference policy with an allow-all first-install branch so this
   // test exercises only the bootstrap-slot refusal — not an unrelated first-
   // install rejection.
-  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
+  const host = await loadKernelHost(kernelWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName, signatureBytes);
+  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
@@ -362,9 +358,9 @@ async function testNoApproveInstallDropsAll() {
 async function testReferencePolicyUpgradeRules() {
   console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
 
-  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
+  const host = await loadKernelHost(kernelWasm);
   const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName, signatureBytes);
+  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
@@ -598,8 +594,8 @@ async function testBlockFromCall() {
 async function testWrapRejectsInvalidKeySizes() {
   console.log("Test: wrap() rejects invalid Ed25519 key sizes");
 
-  const { host, signatureBytes } = await loadKernelHost(kernelWasm, signatureWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"), signatureBytes);
+  const host = await loadKernelHost(kernelWasm);
+  host.registerSignature(host.deriveBootstrapName("signature"));
 
   const { publicKey: pk, privateKey: sk } = generateKeyPair();
   const inner = host.encodeEnvelope(
@@ -1030,7 +1026,6 @@ async function testShellBoot() {
   try {
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
@@ -1090,7 +1085,6 @@ async function testBundle() {
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
@@ -1116,7 +1110,6 @@ async function testBundle() {
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(generateKeyPair().publicKey)] }),
       dir: pjoin(dir, "_data2"), identity,
     });
@@ -2196,7 +2189,6 @@ async function testBundleCorruptNewerRollback() {
 
     shell = await boot({
       kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
-      signatureBytes: new Uint8Array(readFileSync(signatureWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
@@ -2234,7 +2226,7 @@ await testFullLifecycle();
 await testSignerQuery();
 await testInvalidSignatureDropped();
 await testSizeLimitEnforced();
-await testSignatureDepthCap();
+await testSingleSignatureNoNesting();
 await testRefuseOverlayBootstrapSlot();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();

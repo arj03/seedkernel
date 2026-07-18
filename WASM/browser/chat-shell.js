@@ -84,15 +84,14 @@ function bytesToHex(b) {
   return Array.from(b).map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
-shellPrint("Loading kernel + bootstrap WASM...", "sys");
-const { host, signatureBytes } = await loadKernelHost(
-  "../build/kernel.wasm", "../build/signature.wasm", sodium);
+shellPrint("Loading kernel WASM...", "sys");
+const host = await loadKernelHost("../build/kernel.wasm", sodium);
 
 // ─── bootstrap: signature wrapper + module registry ────────────────────
 const signatureName       = host.deriveBootstrapName("signature");
 const signatureSignerName = host.deriveBootstrapName("signature.signer");
 
-host.registerSignature(signatureName, signatureBytes);
+host.registerSignature(signatureName);
 host.registerSignerQuery(signatureSignerName);   // apps query the signer
 host.registerInstaller();                         // the module registry (§7)
 
@@ -576,7 +575,7 @@ function unmountActiveApp() {
 // The wire format: the sender wraps the sealed bytes inside their own
 // signature envelope under the bootstrap name `app.offer`. The outer signature
 // identifies the relaying peer — the app.offer handler reads it via
-// signature.signer (host.currentTopSigner) to show who offered the app — while
+// signature.signer (host.currentSigner) to show who offered the app — while
 // the inner sealed bytes, still carrying the original author's signature, are
 // the load-bearing object.
 const appOfferName = host.deriveBootstrapName("app.offer");
@@ -587,7 +586,7 @@ host.register(appOfferName, (_n, payload) => {
   // kernel is single-threaded re-entrantly), and a first-install needs an
   // async user prompt anyway.
   const sealed = new Uint8Array(payload);
-  const fromSigner = host.currentTopSigner;
+  const fromSigner = host.currentSigner;
   const fromPkHex = fromSigner ? bytesToHex(fromSigner.publicKey) : "?";
   queueMicrotask(() => handleOffer(sealed, fromPkHex));
   return null;
