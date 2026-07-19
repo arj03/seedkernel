@@ -67,23 +67,26 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 
 // A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
 // the reference policy's rule, enforced via the kernel's handler table on the shared
-// installDirect path. `signature.signer` is seeded by boot() as a native handler with no
-// install record, so aiming a bundle module at it must leave the native handler in place.
+// installDirect path. A native host handler seeded straight into the table has no install
+// record, so aiming a bundle module at its slot must leave the native handler in place.
 func TestBundleCannotOverlaySeededSlot(t *testing.T) {
 	boot()
 	author, authorPub := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	seeded := name("signature.signer")
+	// Seed a native host handler the way boot()-time services are seeded — bound into the
+	// kernel table via SetHandler, with no install record for the policy to key on.
+	seeded := name("host.seeded")
+	registerNativeAt(seeded, func(p []byte) []byte { return p })
 	dir, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
 	if status := loadBundle(dir); strings.Contains(status, "installed=[fwd]") {
-		t.Fatalf("a bundle module overlaid the seeded `signature.signer` slot: %s", status)
+		t.Fatalf("a bundle module overlaid the seeded `host.seeded` slot: %s", status)
 	}
 	if boundToWasm(seeded) {
-		t.Fatal("the seeded `signature.signer` slot was overlaid by a bundle module")
+		t.Fatal("the seeded `host.seeded` slot was overlaid by a bundle module")
 	}
 	if id := findHandlerID(seeded); id < 0 || entries[id].nat == nil {
-		t.Fatal("the seeded `signature.signer` handler is gone from its slot")
+		t.Fatal("the seeded `host.seeded` handler is gone from its slot")
 	}
 }

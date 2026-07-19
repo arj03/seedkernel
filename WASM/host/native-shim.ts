@@ -108,7 +108,9 @@ function loadBundleFiles(files: Record<string, ArrayBuffer>): string {
       version: b.manifest.version,
       author: toHex(b.author),
       caps: b.manifest.caps,
-      guest: b.manifest.guest.file,
+      // "" for a handler-only bundle that declared no guest; Go builds a realm only
+      // when this names a file (the seedstore bundle always does).
+      guest: b.manifest.guest?.file ?? "",
       config: b.manifest.config ?? {},
       installed: b.installed,
     });

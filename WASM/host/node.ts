@@ -17,9 +17,9 @@ import sodiumDefault from "libsodium-wrappers-sumo";
 const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sumo");
 
 /** Read kernel.wasm from disk, await sodium readiness, and instantiate a
- *  KernelHost. The signature wrapper and genesis suite are host code now
- *  (registered via `host.registerSignature`), so this loads the one WASM blob and
- *  only packages the platform I/O — bootstrap stays the caller's job (§9). */
+ *  KernelHost. The kernel is a named table of pure-transform handlers, so this
+ *  loads the one WASM blob and only packages the platform I/O — installing bundles
+ *  stays the caller's job (§9). */
 export async function loadKernelHost(
   kernelWasmPath: string,
 ): Promise<KernelHost> {
@@ -53,9 +53,6 @@ export function generateKeyPair(): {
 export {
   KernelHost,
   GENESIS_ALGO_ID,
-  GENESIS_PUBKEY_LEN,
-  GENESIS_SIGNATURE_LEN,
-  GENESIS_SECRET_KEY_LEN,
 } from "./kernel-host.js";
 export type { Handler, Signer } from "./kernel-host.js";
 export {
@@ -67,7 +64,3 @@ export type {
   FirstInstallPolicy,
   InstallRecord,
 } from "./installer.js";
-export {
-  MAGIC,
-  CURRENT_VERSION,
-} from "./envelope.js";

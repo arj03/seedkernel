@@ -43,8 +43,11 @@ export interface BundleManifest {
    *  the mark is refused as a downgrade. An integer, not a label. */
   version: number;
   modules: BundleModule[];
-  /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex. */
-  guest: { file: string; hash: string };
+  /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex.
+   *  Optional — a handler-only bundle (app modules bound as handlers, no zero-authority
+   *  realm — e.g. the chat demo) omits it. Present ⇒ the loader integrity-checks the
+   *  source and hands it back for the shell to run in a confined realm (§12.2). */
+  guest?: { file: string; hash: string };
   /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
    *  "module" | "clock") the bundle's guest is granted. The shell expands these to
    *  the concrete allowed op set and wires only the matching backends — so this is
@@ -75,8 +78,8 @@ const SIG_LEN = 64;
 // Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // `"seedkernel-manifest-sig-v1\0"` — from the one domain family (domains.ts, §16.1).
 // Prepended to the manifest JSON before signing/verifying, never stored in the
-// envelope — the disjoint prefix means a manifest signature can never double as an
-// envelope-wrapper (DOMAIN_env, §6.3) or channel-handshake (DOMAIN_channel, §12.6)
+// envelope — the disjoint prefix means a manifest signature can never double as a
+// guest SIGN (DOMAIN_guest, §12.2) or channel-handshake (DOMAIN_channel, §12.6)
 // signature over the same bytes.
 
 /** Canonical manifest bytes. The signed envelope carries these verbatim, and the
@@ -118,9 +121,11 @@ function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof mm.name !== "string" || typeof mm.file !== "string" ||
         typeof mm.hash !== "string" || typeof mm.kernelName !== "string") return false;
   }
-  const g = o.guest as Record<string, unknown> | null;
-  if (typeof g !== "object" || g === null ||
-      typeof g.file !== "string" || typeof g.hash !== "string") return false;
+  if (o.guest !== undefined) {
+    const g = o.guest as Record<string, unknown> | null;
+    if (typeof g !== "object" || g === null ||
+        typeof g.file !== "string" || typeof g.hash !== "string") return false;
+  }
   if (!Array.isArray(o.caps) || o.caps.some((c) => typeof c !== "string")) return false;
   if (o.config !== undefined) {
     if (typeof o.config !== "object" || o.config === null || Array.isArray(o.config)) return false;
@@ -239,6 +244,8 @@ export interface BundleHost {
 export interface LoadedBundle {
   manifest: BundleManifest;
   author: Uint8Array;
+  /** The verified guest source, or `""` for a handler-only bundle that declared no
+   *  guest — the shell runs a realm only when this is non-empty. */
   guestSource: string;
   /** Logical names of the modules that registered on the kernel. */
   installed: string[];
@@ -292,9 +299,15 @@ export function loadBundle(
     if (!contentMatches(wasm, mod.hash, gh)) throw new Error(`bundle: ${mod.name} content hash mismatch`);
     verified.push({ mod, wasm });
   }
-  const guestSource = src.readText(v.manifest.guest.file);
-  if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
-    throw new Error("bundle: guest content hash mismatch");
+  // A handler-only bundle (the chat demo: app modules, no zero-authority realm) omits
+  // the guest — there is nothing to integrity-check and guestSource stays empty. A
+  // bundle that DOES declare a guest is checked exactly as a module is (§12.4).
+  let guestSource = "";
+  if (v.manifest.guest) {
+    guestSource = src.readText(v.manifest.guest.file);
+    if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
+      throw new Error("bundle: guest content hash mismatch");
+    }
   }
   // Everything integrity-checked — install the verified bytes. Each module lands
   // directly under its kernel name, synthesizing the install record with the manifest
@@ -314,4 +327,64 @@ export function loadBundle(
   // record the highest version that actually loaded (README §12.4).
   if (freshness) freshness.set(v.author, v.manifest.app, version);
   return { manifest: v.manifest, author: v.author, guestSource, installed };
+}
+
+// ── Archive: a bundle as a single blob (README §12.4) ────────────────────────
+//
+// On disk a bundle is a directory (a `BundleSource`); to hand one to a peer over a data
+// channel — or stash it in browser storage — it needs a single-blob serialization. This
+// is pure *framing*, not a signed format of its own: the manifest envelope inside still
+// carries the author's signature, and its module hashes still protect the bytes, exactly
+// as in a directory. The container only names the files. Layout (integers big-endian):
+//
+//   "SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
+//
+// `unpackBundle` yields the same `{ file: bytes }` map a `BundleSource` reads, so a
+// packed bundle and a bundle directory load through the identical §12.4 path.
+
+const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
+
+/** Serialize a set of named bundle files into one blob (format above). */
+export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
+  const names = Object.keys(files);
+  const enc = new TextEncoder();
+  const header = new Uint8Array(6);
+  header.set(ARCHIVE_MAGIC, 0);
+  new DataView(header.buffer).setUint16(4, names.length, false);
+  const parts: Uint8Array[] = [header];
+  for (const name of names) {
+    const nameBytes = enc.encode(name);
+    const data = files[name];
+    const rec = new Uint8Array(2 + nameBytes.length + 4);
+    const dv = new DataView(rec.buffer);
+    dv.setUint16(0, nameBytes.length, false);
+    rec.set(nameBytes, 2);
+    dv.setUint32(2 + nameBytes.length, data.length, false);
+    parts.push(rec, data);
+  }
+  return concatBytes(parts);
+}
+
+/** Parse a blob produced by `packBundle` back into its `{ file: bytes }` map. Throws on
+ *  a mis-magicked or truncated blob — a malformed archive is a fail-loud condition, like
+ *  a malformed manifest, not an untrusted input to silently drop. */
+export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
+  if (blob.length < 6 || !ARCHIVE_MAGIC.every((b, i) => blob[i] === b)) {
+    throw new Error("bundle: not a bundle archive");
+  }
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint16(4, false);
+  const dec = new TextDecoder();
+  const files: Record<string, Uint8Array> = {};
+  let off = 6;
+  for (let i = 0; i < count; i++) {
+    if (off + 2 > blob.length) throw new Error("bundle: truncated archive");
+    const nameLen = dv.getUint16(off, false); off += 2;
+    if (off + nameLen + 4 > blob.length) throw new Error("bundle: truncated archive");
+    const name = dec.decode(blob.subarray(off, off + nameLen)); off += nameLen;
+    const dataLen = dv.getUint32(off, false); off += 4;
+    if (off + dataLen > blob.length) throw new Error("bundle: truncated archive");
+    files[name] = blob.slice(off, off + dataLen); off += dataLen;
+  }
+  return files;
 }

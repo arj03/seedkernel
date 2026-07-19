@@ -1,69 +1,78 @@
-# Seed kernel: a tiny message kernel that bootstraps into a sandboxed app runtime
+# Seed kernel: a tiny handler-table kernel that bootstraps into a sandboxed app runtime
 
-*Everything is a message. An auditable-in-one-sitting kernel grows from one trusted key into arbitrary behaviour — untrusted code runs sandboxed (WASM handlers or confined JS), anywhere from a browser tab to a single native binary.*
+*A simple kernel grows from a signed message handler bundle into arbitrary behaviour — untrusted code runs sandboxed (WASM handlers or confined JS), anywhere from a browser tab to a single native binary.*
 
 ## 1. Vision
 
-A minimal runtime where **everything is a message**. The kernel does one thing: parse an envelope and dispatch it to a handler registered under a **name**. Signing, authorization, capability gating, and application logic are **modules** — layers that compose around the kernel like an onion. Installing a handler is nothing more than `handlers[name] = wasm_bytes`; there is no separate "install protocol," just a signature to check and a policy to consult. The system bootstraps from one trusted key (or no key at all, if that's what you want) into arbitrarily complex behaviour without the kernel knowing what any of it means.
+A minimal runtime built around a kernel that does one thing: look up a **name** in `handlers` and run the handler bound there as a **pure transform** — bytes in at a fixed scratch offset, bytes out. Authorization, capability gating, confinement, and application logic are the **host** and its **modules** - layers that compose around the table without the kernel knowing what any of them mean. Installing a handler is nothing more than `handlers[name] = wasm_bytes`; code arrives as a signed **bundle** and the host binds each module into the table under a policy. The system bootstraps from one trusted policy (the authors it will install, or none) into arbitrarily complex behaviour.
+
+Every node-to-node link is an **encrypted, authenticated channel** (§12.6): an authenticated key exchange opens the connection, then each frame rides as a forward-secret, individually-authenticated encrypted record that the transport attributes to a peer's key. Message authenticity is the *channel's* job, not the kernel's. Signing survives only where it must: over the **bundle** that installs code (§12.4), which has to authenticate its author across any number of relays.
 
 **The whole runtime is four components.** Everything after this table is detail:
 
 | Component | Role |
 | --- | --- |
-| **Kernel** | Routes names to handlers — a flat `handlers[name]` table plus dispatch (§3). No signature logic, no install messages, no mutation during dispatch: the table changes only through the host-level `SetHandler` (§3.1). |
-| **Host** | The runtime around the table — the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It provides the `signature` handler as built-in host code — parse the outer wrapper, verify via a WASM suite slot, re-dispatch the inner envelope (§6) — and `loadBundle`, the single admin path that admits new code (§12.4). |
-| **WASM suites** | Pure cryptographic verifiers at conventional slot names (§6.4, §6.6). They know nothing about envelopes, signers, or kernels — bytes in, valid/invalid out. |
-| **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and binds each module into the flat table through the module registry (§7). |
+| **Kernel** | Routes names to handlers: a flat `handlers[name]` table resolved by `find_handler` (§3). Handlers are pure transforms; the kernel has no dispatch loop, no signature logic, no I/O. The table changes only through the host-level `SetHandler` (§3.1). |
+| **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It reaches a handler by name (`callHandler`), does all I/O and authorization itself, and provides `loadBundle`, the single admin path that admits new code (§12.4). |
+| **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import nothing but the AssemblyScript runtime — no kernel seam, no I/O of their own. |
+| **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and binds each module into the flat table through the module registry (§7). |
+
+There are no special cases and exactly one way to do everything: one install path (signed bundles, §12.4), one guest seam (`host.call`, §12.2), one post-handshake frame plane (§12.6).
+
+Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The host-side registry binds names to bytes under a deployer-supplied **policy** that decides who may install what.
+
+Installation flow:
 
 ```
-external world ──► signed bundle (version + manifest + WASM modules + guest)
-                       │
-                       ▼
-                policy check — authorized author? fresh version?     (§12.4–§12.5)
-                       │
-                       ▼
-                installDirect → SetHandler — flat-table update       (§7.2)
-                       │
-       …the node now runs the app; each signed message then flows:
-                       │
-                       ▼
-                host signature handler — parses the wrapper, calls
-                a suite slot, re-dispatches the inner envelope       (§6.3–§6.5)
-                       │
-                       ▼
-                WASM suite slots — pure crypto, no envelope logic    (§6.6)
+signed bundle (manifest + WASM + guest JS + signature)
+        │
+        ▼
+loadBundle (host admin path)                         §12.4
+        │
+        ▼
+policy check — author trusted? version valid?        §12.5
+        │
+        ▼
+registry.installDirect — records (author, bytes_hash) §7
+        │
+        ▼
+SetHandler(name, wasm_bytes) — kernel table updated  §3.1
+        │
+        ▼
+compile & register guest JS in QuickJS realm
+(zero-authority, awaits first invocation)
 ```
 
-There are no special cases and exactly one way to do everything: one install path (signed bundles, §12.4), one signature per message (§2.3), one guest seam (`host.call`, §12.2), one post-handshake frame plane (§12.6).
+Request flow:
 
-Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer who installed it — a record in the registry, invisible to the kernel. The signature module identifies authors; the host-side registry binds names to bytes under a deployer-supplied **policy** that decides who may install what.
+```
+incoming encrypted frame (authenticated channel)      §12.6
+        │
+        ▼
+host extracts target name, stages input bytes
+        │
+        ▼
+kernel.find_handler(name) → WASM instance            §3
+        │
+        ▼
+pure transform at scratch offset → output bytes      §4
+        │
+        ▼
+host frames response & sends over channel
+```
 
-**Design principles:**
-
-- The kernel is small enough to audit in a single sitting — one file, no cryptography, no authorization, no installation logic.
-- The kernel makes one routing decision: look up the name and invoke the handler. Everything else, including how new handlers get installed, is a module concern.
-- Modules form layers. Lower layers (signatures, installation) gate higher layers (apps like chat). Each layer can only see downward.
-- Modules are independently usable — each is a standalone WASM module testable in isolation; nothing forces you to use them together.
-- Untrusted code runs confined — a WASM handler reaches the outside world only through bridges it is pinned to, and logic too dynamic for WASM runs as zero-authority JavaScript in a QuickJS realm whose only reach is a single `host.call` seam.
-- Node-to-node links are confidential by default — the runtime transport opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket, and WebRTC and needing no external TLS or Noise tunnel.
-- The same envelope works for tiny JSON payloads and large binary blobs.
-- Cryptographic algorithms are pluggable; the kernel can survive a post-quantum transition without a protocol rewrite.
-- The kernel compiles to WebAssembly, so the same kernel runs unmodified in every host — browser, server runtime, or a single native binary.
-
-The reference composition stacks the layers as an onion — each layer wraps the one above it and depends only on the layers below (§5 discusses the composition):
+The reference composition stacks the layers so each depends only on the layers below it (§5 discusses the composition):
 
 ```
 ┌──────────────────────────────────┐
-│   App modules                    │
-│   (chat, …)                      │
-│                                  │
-│   handlers dispatched normally   │
+│   App                            │
+│   guest (confined JS) +          │
+│   pure-transform WASM handlers   │
 ├──────────────────────────────────┤
-│   I/O bridges (optional)         │
-│   (net, ui, fs, clock, …)        │
-│                                  │
-│   SetHandler-installed           │
-│   caller-name pinned             │
+│   Cap-bridge (required if guest   │
+│   JS is present; otherwise omitted)│
+│   the guest's host.call seam —   │
+│   its only reach to real I/O     │
 ├──────────────────────────────────┤
 │   Module registry (optional)     │
 │                                  │
@@ -72,36 +81,20 @@ The reference composition stacks the layers as an onion — each layer wraps the
 │   holds (author, bytes_hash)     │
 │         records                  │
 ├──────────────────────────────────┤
-│   Signature                      │
-│                                  │
-│   signature wrapper              │
-│   the current signer             │
-├──────────────────────────────────┤
 │   Kernel                         │
 │                                  │
-│   envelope parsing               │
-│   dispatch by name               │
+│   name → handler table           │
+│   find_handler routing           │
 └──────────────────────────────────┘
 ```
 
----
+**Design principles:**
 
-### 1.1 Concepts at a glance
-
-A reader's-digest mental model; full details follow in §2–§9.
-
-- **Envelope** — `magic | version | name_len | name | payload` (§2). The kernel's only routing decision is `handlers[name]`.
-- **Name** — opaque dispatch key; convention `"seedkernel.bootstrap.v1:" + canonical` (literal ASCII) for bootstrap handlers, free-form for apps under the policy's discretion.
-- **Handler** — a WASM module that exchanges bytes with the host through a fixed scratch offset in its own memory (§4).
-- **Signing is a wrapper, not a header field.** A signed message is an outer envelope with `name = signature` whose payload carries `(algo_id, signer, sig, inner_envelope)` (§6.3). The handler at that name is an ordinary one — no special status in the kernel.
-- **Author** — the signer of the current dispatch, read via `kernel.call(signature.signer, …)` (§6.5).
-- **Module registry** — host-side state that holds install records `(author, bytes_hash)` and runs a deployer-supplied policy callback whenever the bundle loader admits a module (§7). It is state the loader drives, not a wire protocol.
-- **Policy callback** — the only authorization decision point. Reference policy: deployer chooses who may claim a name first; subsequent binds at that name require the same author (§7.4).
-- **Bridges** — `SetHandler`-installed handlers that pin the caller names they serve; the only code that performs real I/O (§8).
-- **Bootstrap** — host wires kernel, signature, and (optionally) the registry; growth then happens by loading a higher-version signed bundle (§9).
-- **Runtime / shell** — the deployable artifact: kernel + signature + the module registry under a policy, plus raw-byte capability backends (`crypto`, `net`, `fs`, `module`, `clock`) and a zero-authority JS confinement host. It loads a **signed bundle** and *becomes* that app — chat (§11) and [seed store](https://github.com/arj03/seedstore) are two (§12).
-- **Bundle** — an app as signed content: an author-signed manifest committing to each module's hash, a guest program, and the capability domains the guest is granted. The loader verifies each module against its committed hash and installs it directly (§12.4) — no per-module install envelope.
-- **Guest** — zero-authority JS confined in a QuickJS realm; its only reach is the `host.call(op, bytes)` seam into the cap-bridge, restricted to the domains its bundle's manifest declares (§12.2–§12.3).
+- The kernel does exactly one thing: name resolution and byte dispatch. No built‑in policies, I/O, or dispatch loop. Every additional capability (installation, confinement, application logic) lives in layers above it. Lower layers gate higher layers; each layer sees only downward.
+- Modules, as untrusted code, run confined. WASM handlers are synchronous pure transforms with no reach beyond the bytes they are handed—they receive a buffer and return a buffer, and that is the full extent of their interaction. JavaScript is reserved for handlers that must await multiple host interactions, handle streaming data, or maintain conversational state across asynchronous turns—QuickJS's native async model makes this straightforward—while maintaining zero ambient authority and exposing only the single host.call seam.
+- Node-to-node links are confidential by default — the runtime transport opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket, and WebRTC and needing no external TLS or Noise tunnel.
+- The channel authenticates one hop, not the whole path. The encrypted link attributes each frame to the peer that sent it (§12.6) — end-to-end for a direct exchange like chat, where every message travels a single hop. An app that **relays** messages through intermediaries — a forum, a feed, store-and-forward gossip — cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top.
+- The kernel compiles to WebAssembly, so the same kernel runs unmodified in every host — browser, server runtime, or a single native binary.
 
 ## Get started
 
@@ -109,7 +102,7 @@ A reader's-digest mental model; full details follow in §2–§9.
 cd WASM
 npm install
 npm run build        # kernel.wasm + ws.wasm + the shared host
-node tests/run.mjs   # end-to-end tests + 10k signed-message benchmark
+node tests/run.mjs   # end-to-end tests
 ```
 
 For the browser P2P chat demo (§11): `npm run build:browser`, serve `WASM/browser/` over HTTPS, and open `chat-shell.html` in two browsers. The worked-example trace in §13 walks the same pipeline byte-by-byte.
@@ -120,9 +113,9 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 
 | Doc | Sections | Contents |
 | --- | --- | --- |
-| [PROTOCOL](docs/PROTOCOL.md) | §2–§6, §16 | The envelope, kernel dispatch, the WASM handler ABI, layering, the signature module and its suites, the protocol constants. |
-| [REGISTRY](docs/REGISTRY.md) | §7–§9 | How code is admitted and wired: the module registry and its policy callback, I/O bridges, the bootstrap sequence. |
-| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Performance, the chat demo, and the shell: capability backends, the guest ABI, zero-authority JS realms, signed bundles, the node↔node transport, the Go/native binary. |
+| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level `SetHandler`, the pure-transform WASM handler ABI, layering, the protocol constants. |
+| [REGISTRY](docs/REGISTRY.md) | §7, §9 | How code is admitted and wired: the module registry and its policy callback, and the bootstrap sequence. |
+| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the chat demo, and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 
 To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,REGISTRY,RUNTIME,SECURITY}.md`.

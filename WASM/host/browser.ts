@@ -9,10 +9,9 @@ import { KernelHost } from "./kernel-host.js";
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
 /** Fetch kernel.wasm, await sodium readiness, and instantiate a KernelHost. Pass
- *  the URL as a string or URL object relative to the page. The signature wrapper
- *  and genesis suite are host code now (registered via `host.registerSignature`),
- *  so this fetches the one WASM blob and only packages the platform I/O —
- *  bootstrap stays the caller's job (§9). */
+ *  the URL as a string or URL object relative to the page. The kernel is a named
+ *  table of pure-transform handlers, so this fetches the one WASM blob and only
+ *  packages the platform I/O — installing bundles stays the caller's job (§9). */
 export async function loadKernelHost(
   kernelUrl: string | URL,
   sodium: Sodium,
@@ -27,9 +26,6 @@ export async function loadKernelHost(
 export {
   KernelHost,
   GENESIS_ALGO_ID,
-  GENESIS_PUBKEY_LEN,
-  GENESIS_SIGNATURE_LEN,
-  GENESIS_SECRET_KEY_LEN,
 } from "./kernel-host.js";
 export type { Handler, Signer } from "./kernel-host.js";
 export {
@@ -41,7 +37,3 @@ export type {
   FirstInstallPolicy,
   InstallRecord,
 } from "./installer.js";
-export {
-  MAGIC,
-  CURRENT_VERSION,
-} from "./envelope.js";

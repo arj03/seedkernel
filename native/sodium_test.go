@@ -202,9 +202,9 @@ func TestSodiumSealedBox(t *testing.T) {
 	}
 }
 
-// The genesis suite gates every public key on crypto_core_ed25519_is_valid_point before
-// verifying (genesisSuiteVerify), matching the JS host's _pubkeyIsValidPoint. This pins
-// the minified export mapping ("uk") to the function we actually mean: a wrong mapping
+// The realm gates every public key on crypto_core_ed25519_is_valid_point before verifying,
+// matching the JS host's _pubkeyIsValidPoint. This pins the minified export mapping ("uk")
+// to the function we actually mean: a wrong mapping
 // that returned a constant would still let every signature test pass, so assert both
 // that real keys are accepted AND that the canonical small-order points are refused.
 func TestSodiumIsValidPoint(t *testing.T) {

@@ -60,23 +60,19 @@ function assertEqual(actual, expected, msg) {
 
 const kernelWasm = join(root, "build/kernel.wasm");
 
-// Standard bootstrap (README §9): signature handler + the module registry. The
+// Standard bootstrap (README §9): the module registry over a fresh kernel. The
 // default policy accepts every install; tests that need rejection override via
-// host.setApproveInstall.
+// host.setApproveInstall. Handlers are pure transforms with no signature/dispatch
+// seam, so there is nothing else to wire.
 async function makeHost(approveInstall = () => true) {
   const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-
-  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(approveInstall);
-
-  return { host, signatureName };
+  return { host };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
-const signerProbeBytes = new Uint8Array(readFileSync(join(root, "build/signer-probe.wasm")));
 
 // Admit a module directly under `targetName`, authored by `authorPk`, through the
 // same path the bundle loader uses (installBundleModule → installDirect → the policy
@@ -86,168 +82,32 @@ function installMod(host, targetName, wasm, authorPk) {
   return host.installBundleModule(targetName, wasm, authorPk);
 }
 
-// ─── Test: Full lifecycle ───────────────────────────────────────────────
+// ─── Test: install a module, reach it by name ───────────────────────────
 
 async function testFullLifecycle() {
-  console.log("Test: Full lifecycle (signed install + signed app message)");
+  console.log("Test: install a bundle module and reach it by name (§4, §7)");
 
   const { host } = await makeHost();
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const { publicKey: pk } = generateKeyPair();
+  const chatName = host.deriveScopedName("chat", pk);
 
-  // Install the chat handler under the author's scoped name.
-  installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "chat.text installed");
+  // Install the chat handler under the author's scoped name, through the same path the
+  // bundle loader uses. It is a pure transform (the forwarder fixture echoes its input).
+  installMod(host, chatName, forwarderBytes, pk);
+  assert(host.isRegistered(chatName), "chat handler installed");
 
   // The registry should have a record for it.
-  const rec = host.lookupInstall(chatTextName);
+  const rec = host.lookupInstall(chatName);
   assert(rec !== null, "install record exists");
   assertEqual(rec.author.publicKey, pk, "record author matches signer");
 
-  // Now send a signed app message. The chat handler is the forwarder fixture,
-  // so we forward to a host-side echo handler to verify it ran.
-  const echoName = host.deriveBootstrapName("test.echo");
-  let echoCalls = 0;
-  host.register(echoName, (_n, payload) => { echoCalls++; return new Uint8Array(payload); });
-
+  // Reach it by name: the host stages input at the handler's scratch, calls handle, and
+  // reads the response back (README §4). A guest reaches the same handler through the
+  // cap-bridge's MODULE_CALL (§12.2); here the host calls it directly.
   const text = new TextEncoder().encode("hello from author");
-  const forwardPayload = new Uint8Array(1 + echoName.length + text.length);
-  forwardPayload[0] = echoName.length;
-  forwardPayload.set(echoName, 1);
-  forwardPayload.set(text, 1 + echoName.length);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName, forwardPayload));
-  assertEqual(echoCalls, 1, "echo invoked once via kernel.call");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: the signature.signer query (§6.5) ────────────────────────────
-
-async function testSignerQuery() {
-  console.log("Test: signature.signer query (§6.5) reached by a helper-built handler");
-
-  const { host } = await makeHost();
-  const signerQueryName = host.deriveBootstrapName("signature.signer");
-
-  // This name is ABI, not an implementation detail: assembly/seedkernel/handler.ts
-  // bakes the same literal in (bootstrap names are plain ASCII, §5.1) so a handler
-  // built on the helper reaches the query with nothing planted by the host. Drift on
-  // either side silently costs every such handler its signer lookup — pin the string.
-  assertEqual(new TextDecoder().decode(signerQueryName),
-    "seedkernel.bootstrap.v1:signature.signer",
-    "the signer-query name is the literal ASCII the WASM helper bakes in");
-
-  host.registerSignerQuery(signerQueryName);
-  assertEqual([...host.callHandler(signerQueryName, EMPTY)], [0],
-    "an unsigned dispatch serializes as [0x00]");
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const probeName = host.deriveScopedName("signer.probe", pk);
-  installMod(host, probeName, signerProbeBytes, pk);
-  assert(host.isRegistered(probeName), "signer-probe installed");
-
-  const routeName = host.deriveBootstrapName("test.route");
-  let routed = null;
-  host.register(routeName, (_n, payload) => { routed = new Uint8Array(payload); return null; });
-
-  // configure() is route-only: [route_len u8][route ..]. Nothing here names the
-  // signer query, so the lookup below can only work off the baked-in name.
-  const cfg = new Uint8Array(1 + routeName.length);
-  cfg[0] = routeName.length;
-  cfg.set(routeName, 1);
-  host.callDynamicExport(probeName, "configure", cfg);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array([1])));
-  assertEqual(routed, pk,
-    "loadTopSignerPubkey resolves the top signer with no host-planted name");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Invalid signature dropped ────────────────────────────────────
-
-async function testInvalidSignatureDropped() {
-  console.log("Test: Invalid signature silently dropped");
-
-  const { host } = await makeHost();
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const wire = host.wrapAndEncode(sk, pk, chatTextName,
-    new TextEncoder().encode("should not arrive"));
-  wire[40] ^= 0xff;
-  host.dispatch(wire);
-  assertEqual(received, 0, "no messages received");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: 64 KB size limit ─────────────────────────────────────────────
-
-async function testSizeLimitEnforced() {
-  console.log("Test: Oversized envelope rejected (§2.2)");
-
-  // The kernel alone (§1) — this test needs no signature wrapper, so it wires none.
-  const host = await loadKernelHost(kernelWasm);
-
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const smallWire = host.encodeEnvelope(chatTextName,
-    new TextEncoder().encode("ok"));
-  const oversized = new Uint8Array(65537);
-  oversized.set(smallWire);
-  host.dispatch(oversized);
-  assertEqual(received, 0, "65537-byte envelope silently dropped");
-
-  // Exactly 65,536 bytes — must not throw.
-  const boundary = new Uint8Array(65536);
-  boundary.set(smallWire);
-  host.dispatch(boundary);
-
-  console.log("  OK\n");
-}
-
-// ─── Test: one signature per message; nesting is dropped (§6.5) ─────────
-
-async function testSingleSignatureNoNesting() {
-  console.log("Test: one signature per message; nested wrappers dropped (§6.5)");
-
-  const host = await loadKernelHost(kernelWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"));
-
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-
-  // wrap() takes raw inner bytes, so feeding a wrap's output back in nests it.
-  const wrapN = (n, innerBytes) => {
-    let bytes = innerBytes;
-    for (let i = 0; i < n; i++) bytes = host.wrap(sk, pk, bytes);
-    return bytes;
-  };
-  const inner = host.encodeEnvelope(chatTextName,
-    new TextEncoder().encode("hi"));
-
-  // One wrapper: verified, so the inner handler runs.
-  received = 0;
-  host.dispatch(wrapN(1, inner));
-  assertEqual(received, 1, "a single signature reaches the handler");
-
-  // Two wrappers: the outer verifies and re-dispatches its inner, which is itself
-  // a signature wrapper — but a signer is already set, so the inner wrapper drops
-  // before any verify work. The chat handler never runs. This is what makes the
-  // verify-amplification vector (a chain of nested wrappers) unrepresentable.
-  received = 0;
-  host.dispatch(wrapN(2, inner));
-  assertEqual(received, 0, "a nested signature wrapper is dropped");
+  const resp = host.callHandler(chatName, text);
+  assert(resp !== null && bytesEqual(resp, text), "handler echoed its input");
 
   console.log("  OK\n");
 }
@@ -257,27 +117,27 @@ async function testSingleSignatureNoNesting() {
 async function testRefuseOverlayBootstrapSlot() {
   console.log("Test: reference policy refuses to overlay a SetHandler-seeded slot (§7.4)");
 
-  // Use the reference policy with an allow-all first-install branch so this
-  // test exercises only the bootstrap-slot refusal — not an unrelated first-
-  // install rejection.
+  // The reference policy with an allow-all first-install branch, so this test exercises
+  // only the seeded-slot refusal — not an unrelated first-install rejection.
   const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  // Try to overlay the signature slot (seeded by SetHandler at bootstrap).
-  installMod(host, signatureName, forwarderBytes, pk);
+  // Seed a host-JS handler straight into the table (no install record) — the converged
+  // stand-in for a bootstrap slot. A bundle module aimed at its name must be refused, so
+  // the seeded handler stays bound and keeps answering.
+  const seededName = host.deriveBootstrapName("host.seeded");
+  let seededCalls = 0;
+  host.register(seededName, () => { seededCalls++; return new Uint8Array([1]); });
 
-  // signature must still verify — if it had been overwritten with the
-  // forwarder, the next signed message would fail.
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName,
-    new TextEncoder().encode("still works")));
-  assertEqual(received, 1, "signature handler still verifying after refused overlay");
+  const { publicKey: pk } = generateKeyPair();
+  installMod(host, seededName, forwarderBytes, pk);
+
+  // Reaching the name still runs the host-JS closure (returns [1] and counts), not an
+  // overlaid forwarder (which would echo the empty input instead).
+  const r = host.callHandler(seededName, EMPTY);
+  assertEqual([...r], [1], "seeded handler still bound after refused overlay");
+  assertEqual(seededCalls, 1, "the seeded host-JS handler ran, not an overlaid module");
 
   console.log("  OK\n");
 }
@@ -359,8 +219,6 @@ async function testReferencePolicyUpgradeRules() {
   console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
 
   const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName);
   host.registerInstaller();
   host.setApproveInstall(referencePolicy(host, () => true));
 
@@ -461,205 +319,6 @@ async function testInstallerRemove() {
   assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
-  console.log("  OK\n");
-}
-
-// ─── Test: caller stack format ──────────────────────────────────────────
-
-async function testCallerStackFormat() {
-  console.log("Test: kernel.caller / currentCaller — immediate caller only (§4.2)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const forwarderName = host.deriveScopedName("test.forwarder", pk);
-
-  installMod(host, forwarderName, forwarderBytes, pk);
-  assert(host.isRegistered(forwarderName), "forwarder installed");
-
-  // A probe handler reads its immediate caller each time it's called. Only the
-  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §8).
-  const probeName = host.deriveBootstrapName("probe.caller");
-  let seenImmediate = null;
-  host.register(probeName, (_n, _payload, h) => {
-    seenImmediate = h.currentCaller ? new Uint8Array(h.currentCaller) : null;
-    return new Uint8Array([0xff]);
-  });
-
-  // forwarder → probe — the probe's immediate caller is the forwarder.
-  const payload = new Uint8Array(1 + probeName.length);
-  payload[0] = probeName.length;
-  payload.set(probeName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, forwarderName, payload));
-  assert(seenImmediate !== null, "probe saw a caller");
-  assertEqual(seenImmediate, forwarderName, "immediate caller is the forwarder");
-
-  // Top-level dispatch directly into the probe — no caller.
-  seenImmediate = null;
-  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array(0)));
-  assert(seenImmediate === null, "no immediate caller for top-level dispatch");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Bridge authorizes by pinning kernel.caller ───────────────────
-
-async function testBridgeCallerPinning() {
-  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §8)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatPinnedName = host.deriveScopedName("chat.pinned", pk);
-  const chatOtherName  = host.deriveScopedName("chat.other",  pk);
-  const netSendName    = host.deriveBootstrapName("cap.net.send");
-
-  installMod(host, chatPinnedName, forwarderBytes, pk);
-  installMod(host, chatOtherName, forwarderBytes, pk);
-  assert(host.isRegistered(chatPinnedName), "chat.pinned installed");
-  assert(host.isRegistered(chatOtherName), "chat.other installed");
-
-  // The bridge pins exactly the caller name it serves (the chat shell's UI-bridge
-  // pattern, generalized): it compares kernel.caller against chatPinnedName and
-  // refuses anyone else. There is no capability index to consult — kernel.caller
-  // is the single bridge-authorization primitive.
-  const bytesEq = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
-  let bridgeCalls = 0;
-  host.register(netSendName, (_n, _p, h) => {
-    bridgeCalls++;
-    if (!bytesEq(h.currentCaller, chatPinnedName)) return null;
-    return new Uint8Array([1]);
-  });
-
-  const forwardData = new TextEncoder().encode("ping");
-  function makeForward(targetName) {
-    const out = new Uint8Array(1 + targetName.length + forwardData.length);
-    out[0] = targetName.length;
-    out.set(targetName, 1);
-    out.set(forwardData, 1 + targetName.length);
-    return out;
-  }
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatOtherName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
-  assertEqual(host.callDynamicExport(chatOtherName, "last_resp_len", EMPTY), 0,
-    "unpinned caller: bridge rejected (no response)");
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatPinnedName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
-  assertEqual(host.callDynamicExport(chatPinnedName, "last_resp_len", EMPTY), 1,
-    "pinned caller: bridge returned 1 byte");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: blockFromCall on deployer-added mutating handler ──────────────
-
-async function testBlockFromCall() {
-  console.log("Test: blockFromCall makes a deployer handler unreachable via kernel.call (§4.4)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const mutateName = host.deriveBootstrapName("test.mutate");
-  let mutateCalls = 0;
-  const id = host.register(mutateName, () => {
-    mutateCalls++;
-    return new Uint8Array([0x42]);
-  });
-  host.blockFromCall(id);
-
-  // Top-level dispatch must still reach the handler.
-  host.dispatch(host.wrapAndEncode(sk, pk, mutateName, new Uint8Array(0)));
-  assertEqual(mutateCalls, 1, "direct dispatch still reaches blocked handler");
-
-  // Install a forwarder, have it kernel.call the blocked handler. Must drop.
-  const fwdName = host.deriveScopedName("test.forwarder", pk);
-  installMod(host, fwdName, forwarderBytes, pk);
-  assert(host.isRegistered(fwdName), "forwarder installed");
-
-  const fwdPayload = new Uint8Array(1 + mutateName.length);
-  fwdPayload[0] = mutateName.length;
-  fwdPayload.set(mutateName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, fwdName, fwdPayload));
-  assertEqual(mutateCalls, 1, "kernel.call to blocked handler did NOT invoke it");
-  assertEqual(host.callDynamicExport(fwdName, "last_resp_len", EMPTY), 0,
-    "kernel.call to blocked handler returned -1 (no response stored)");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: wrap rejects invalid Ed25519 key sizes ───────────────────────
-
-async function testWrapRejectsInvalidKeySizes() {
-  console.log("Test: wrap() rejects invalid Ed25519 key sizes");
-
-  const host = await loadKernelHost(kernelWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"));
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const inner = host.encodeEnvelope(
-    host.deriveBootstrapName("chat.text"),
-    new TextEncoder().encode("ok"));
-
-  let threw = false;
-  try { host.wrap(sk.slice(0, 32), pk, inner); } catch { threw = true; }
-  assert(threw, "wrap rejected 32-byte privateKey");
-
-  threw = false;
-  try { host.wrap(sk, pk.slice(0, 16), inner); } catch { threw = true; }
-  assert(threw, "wrap rejected 16-byte publicKey");
-
-  const wire = host.wrap(sk, pk, inner);
-  assert(wire.length > inner.length, "wrap with valid sizes succeeds");
-
-  console.log("  OK\n");
-}
-
-// ─── Perf: 10k dispatch vs. plain Ed25519 verify ────────────────────────
-
-async function testPerf10k() {
-  console.log("Perf: 10k signed-envelope dispatch vs. plain Ed25519 verify");
-
-  const { host } = await makeHost();
-  const chatTextName = host.deriveBootstrapName("chat.text");
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-
-  let handlerCalls = 0;
-  host.register(chatTextName, () => { handlerCalls++; });
-
-  const N = 10_000;
-  const wireMessages = new Array(N);
-  const signatures   = new Array(N);
-  const payloads     = new Array(N);
-
-  for (let i = 0; i < N; i++) {
-    const payload = new TextEncoder().encode(`message #${i}: hello world benchmark payload data`);
-    wireMessages[i] = host.wrapAndEncode(sk, pk, chatTextName, payload);
-    payloads[i]     = payload;
-    signatures[i]   = sodium.crypto_sign_detached(payload, sk);
-  }
-
-  for (let i = 0; i < 2000; i++) host.dispatch(wireMessages[i % N]);
-  for (let i = 0; i < 2000; i++) sodium.crypto_sign_verify_detached(signatures[i % N], payloads[i % N], pk);
-  handlerCalls = 0;
-
-  const t0 = performance.now();
-  for (let i = 0; i < N; i++) host.dispatch(wireMessages[i]);
-  const kernelMs = performance.now() - t0;
-  const kernelVerified = handlerCalls;
-
-  const t1 = performance.now();
-  for (let i = 0; i < N; i++) sodium.crypto_sign_verify_detached(signatures[i], payloads[i], pk);
-  const plainMs = performance.now() - t1;
-
-  const ratio = kernelMs / plainMs;
-  console.log(`  kernel pipeline  ${N.toLocaleString()} msgs: ${kernelMs.toFixed(0).padStart(6)} ms  (${(kernelMs / N * 1000).toFixed(1)} µs/msg)`);
-  console.log(`  plain Ed25519    ${N.toLocaleString()} msgs: ${plainMs.toFixed(0).padStart(6)} ms  (${(plainMs / N * 1000).toFixed(1)} µs/msg)`);
-  console.log(`  overhead ratio: ${ratio.toFixed(2)}x`);
-
-  assertEqual(kernelVerified, N, `all ${N} messages reached handler`);
   console.log("  OK\n");
 }
 
@@ -1124,6 +783,71 @@ async function testBundle() {
   console.log("  OK\n");
 }
 
+// ─── Test: handler-only bundle (no guest) + archive round-trip ──────────
+//
+// A chat-style app is a one-module bundle with NO guest realm. Proves the shared
+// §12.4 loader accepts a guest-less manifest (guestSource === "") and installs its
+// module, and that packBundle/unpackBundle round-trips a bundle as one blob — the
+// exact path the browser shell uses to carry an app over a data channel.
+async function testGuestlessBundleAndArchive() {
+  console.log("Test: handler-only bundle (no guest) loads + bundle archive round-trip");
+  const { signManifest, verifyManifest, contentMatches, packBundle, unpackBundle }
+    = await imp("build/host/bundle.js");
+  const { boot } = await imp("build/host/main.js");
+  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+
+  const author = generateKeyPair();
+  const identity = generateKeyPair();
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guestless-"));
+  let shell;
+  try {
+    const { host: h } = await makeHost();
+    const kernelName = h.deriveBootstrapName("app:demo");
+    // A manifest with NO `guest` field — the handler-only shape.
+    const manifest = {
+      app: "demo", version: 1,
+      modules: [{
+        name: "demo", file: "app.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
+        kernelName: toHex(kernelName),
+      }],
+      caps: [],
+    };
+    const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+    assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
+
+    // Archive round-trip: pack the bundle to one blob, unpack, and confirm the files
+    // survive byte-for-byte (this is what an Offer carries over a data channel).
+    const packed = packBundle({ "manifest.bundle": manifestEnv, "app.wasm": forwarderBytes });
+    const files = unpackBundle(packed);
+    assert(bytesEqual(files["manifest.bundle"], manifestEnv), "packed manifest round-trips");
+    assert(bytesEqual(files["app.wasm"], forwarderBytes), "packed module round-trips");
+    assert(contentMatches(files["app.wasm"], manifest.modules[0].hash, (b) => h.genesisHash(b)),
+      "unpacked module matches the manifest's declared hash");
+    let badArchive = false;
+    try { unpackBundle(new Uint8Array([1, 2, 3])); } catch { badArchive = true; }
+    assert(badArchive, "a non-archive blob is rejected fail-loud");
+
+    // Load the guest-less bundle through the shared §12.4 loader (directory form).
+    wf(pjoin(dir, "manifest.bundle"), manifestEnv);
+    wf(pjoin(dir, "app.wasm"), forwarderBytes);
+    shell = await boot({
+      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
+      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      dir: pjoin(dir, "_data"), identity,
+    });
+    const loaded = shell.loadBundle(dir);
+    assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
+    assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
+    assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
+  } finally {
+    if (shell) shell.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("  OK\n");
+}
+
 // ─── Test: safe-js zero-authority JS confinement (§2.1) ─────────────────
 //
 // The §2.1 confinement primitive: run zero-authority guest JS over a single
@@ -1367,25 +1091,29 @@ async function testCapBridgeEnforcement() {
 }
 
 async function testCallHandlerGuards() {
-  console.log("Test: KernelHost.callHandler applies the call-router guards (§4.4)");
+  console.log("Test: KernelHost.callHandler resolves by name, or null when unbound (§4)");
 
   const { host } = await makeHost();
-  // The signature wrapper is blockedFromCall — kernel.call refuses it, so the
-  // host-side by-name path must too (a confined guest reaches this via
-  // CAP_MODULE_CALL). It establishes the top signer, so letting a handler reach
-  // it via kernel.call would reframe the active signer mid-chain (§4.4).
-  const sigName = host.deriveBootstrapName("signature");
-  assert(host.callHandler(sigName, new Uint8Array([1])) === null,
-    "callHandler refuses the signature wrapper");
 
-  // A normal handler still works, and sees an *empty* immediate caller — not a
-  // stale frame from some outer dispatch (the §8 confused-deputy check).
-  let sawCaller = "unset";
+  // An unbound name resolves to nothing — null, distinct from an empty response.
+  const missing = host.deriveBootstrapName("nope.missing");
+  assert(host.callHandler(missing, new Uint8Array([1])) === null,
+    "callHandler returns null for an unbound name");
+
+  // A registered host-JS handler is reached by name exactly like a WASM handler — the
+  // kernel table is indifferent to the impl. A confined guest reaches the same handler
+  // through the cap-bridge's MODULE_CALL (§12.2).
   const echoName = host.deriveBootstrapName("test.echo2");
-  host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
+  host.register(echoName, (_n, p) => p);
   const r = host.callHandler(echoName, new Uint8Array([5]));
-  assertEqual([...r], [5], "callHandler still reaches a normal handler");
-  assert(sawCaller === null, "the target sees no installed caller (anonymous frame)");
+  assertEqual([...r], [5], "callHandler reaches a registered host handler");
+
+  // A handler that returns nothing surfaces as null (no response), not an empty array —
+  // handlers are pure transforms and cannot call back, so there is nothing else to guard.
+  const silentName = host.deriveBootstrapName("test.silent");
+  host.register(silentName, () => null);
+  assert(host.callHandler(silentName, EMPTY) === null,
+    "a handler that returns null yields null");
 
   console.log("  OK\n");
 }
@@ -2223,10 +1951,6 @@ async function testBundleCorruptNewerRollback() {
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
-await testSignerQuery();
-await testInvalidSignatureDropped();
-await testSizeLimitEnforced();
-await testSingleSignatureNoNesting();
 await testRefuseOverlayBootstrapSlot();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
@@ -2234,16 +1958,13 @@ await testNoApproveInstallDropsAll();
 await testReferencePolicyUpgradeRules();
 await testInstallerLookupHostSide();
 await testInstallerRemove();
-await testCallerStackFormat();
-await testBridgeCallerPinning();
-await testBlockFromCall();
-await testWrapRejectsInvalidKeySizes();
 await testFs();
 await testGuestNetFanout();
 await testCapBridge();
 await testPolicy();
 await testShellBoot();
 await testBundle();
+await testGuestlessBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testWsFraming();
 await testChannelPinning();
@@ -2263,7 +1984,6 @@ await testConnsPerPeerFanout();
 await testWsNetworkFanout();
 await testRecordLayerIntegrity();
 await testSafeRealmConcurrency();
-await testPerf10k();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

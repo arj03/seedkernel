@@ -2,6 +2,8 @@ import sodium from "./libsodium-wrappers.mjs";
 import { loadKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
+import { signManifest, verifyManifest, contentMatches, packBundle, unpackBundle }
+  from "../build/host/bundle.js";
 
 const RTC_CONFIG = { iceServers: [{ urls: [
   "stun:stun.l.google.com:19302",
@@ -84,15 +86,20 @@ function bytesToHex(b) {
   return Array.from(b).map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
 shellPrint("Loading kernel WASM...", "sys");
 const host = await loadKernelHost("../build/kernel.wasm", sodium);
 
-// ─── bootstrap: signature wrapper + module registry ────────────────────
-const signatureName       = host.deriveBootstrapName("signature");
-const signatureSignerName = host.deriveBootstrapName("signature.signer");
-
-host.registerSignature(signatureName);
-host.registerSignerQuery(signatureSignerName);   // apps query the signer
+// ─── bootstrap: module registry ────────────────────────────────────────
+// The kernel is a named table of pure-transform handlers now — no signature
+// wrapper, no envelopes, no signer. The registry (§7) is the only bootstrap
+// piece: it admits signed bundles. Message authenticity comes from the AKE
+// channel (PeerLink), not a per-message signature.
 host.registerInstaller();                         // the module registry (§7)
 
 // ── install-approval policy ────────────────────────────────────────────
@@ -144,13 +151,13 @@ shellPrint(`I am ${myPkHex.slice(0, 8)}`, "sys");
 
 // ─── channel identity ──────────────────────────────────────────────────
 //
-// Transport identity is the RtcNetwork's job now (see the networking section
-// below). Each data channel runs PeerLink's in-channel HELLO/AUTH challenge,
-// proving the far end holds the kernel private key for the pubkey it claims —
-// a continuous channel binding that subsumes the old SDP a=fingerprint signing
-// and the per-frame signer filter this shell used to do by hand. Frames the
-// RtcNetwork hands us are already attributed to an authenticated peer, so we
-// dispatch them straight into the kernel.
+// Transport identity is the RtcNetwork's job. Each data channel runs PeerLink's
+// in-channel HELLO/AUTH challenge, proving the far end holds the kernel private
+// key for the pubkey it claims — a continuous channel binding that subsumes the
+// old SDP a=fingerprint signing and any per-message signature. Frames the
+// RtcNetwork hands us are already attributed to an authenticated peer, so the
+// sender pubkey (`_from`) is authoritative — we prepend it to the message before
+// running the app transform; there is no envelope signer to verify.
 function bytesEqual(a, b) {
   if (!a || !b || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -185,60 +192,92 @@ function updatePeerPill() {
 
 // ─── app registry ──────────────────────────────────────────────────────
 //
-// An "app" is a self-contained signed blob — `[authorPk 32][sig 64][wasm]`,
-// the author's Ed25519 signature over `DOMAIN_chat_install ‖ wasm` — carrying a
-// WASM payload with two embedded custom sections: "app_meta" (a JSON manifest —
-// id, name, version) and "ui" (HTML rendered in the sandboxed iframe). This is
-// a miniature bundle: author-signed content, verified locally and admitted
-// straight into the kernel via installBundleModule (§12.4) under the policy
-// above. There is no wire install path (§7) — the same blob serves the local
-// "add app" flow and the peer-to-peer Offer below.
+// An "app" is an ordinary signed bundle (§12.4): a signed `manifest.bundle`
+// envelope plus the app's WASM module, packed into one blob for the wire
+// (bundle.ts packBundle/unpackBundle). This is the SAME format seedstore's
+// flagship deployment loads — a chat app is just a handler-only bundle (one
+// module, no guest realm). There is no chat-specific install format, domain, or
+// peek/unwrap code: `verifyManifest` authenticates the author's signature over
+// the manifest, which commits to the module's genesisHash, so the blob survives
+// any number of transitive relays and still authenticates against its original
+// author — exactly the store-and-forward property an Offer needs. The local
+// "add app" flow and the peer-to-peer Offer below carry the identical bundle.
 //
-// Each app installs under a kernel name derived from its `id`:
-//     handlerName  = SHA-3-256("seedkernel.bootstrap.v1:app:" + id)
-//     uiBridgeName = SHA-3-256("app:" + id + ".ui" + myPubKey)        (scoped)
+// The module's WASM carries two embedded custom sections the runtime ignores but
+// this shell reads: "app_meta" (JSON — id, name, version) and "ui" (HTML rendered
+// in the sandboxed iframe). The signed manifest's `app` is the id, and the module
+// binds under a kernel name derived from it:
+//     handlerName = SHA-3-256("seedkernel.bootstrap.v1:app:" + id)
 //
-// `handlerName` is globally derivable so two peers running the same app id
-// route messages to the same name. `uiBridgeName` is scoped to this peer's
-// pubkey: it is a local-only bridge from app WASM → this shell's iframe and
-// must not be reachable by an envelope another peer constructs.
+// `handlerName` is globally derivable so two peers running the same app id route
+// messages to the same name; we derive it from the signed manifest `app` on
+// install rather than trusting the manifest's own bind name, so a forged manifest
+// cannot redirect a handler onto an unexpected name.
+//
+// An app's handler is a PURE TRANSFORM: the shell hands it `senderPk ‖ chatType ‖
+// body` and it returns the render bytes for the iframe. The shell — not the WASM
+// and not the kernel — does all the I/O: it authenticates the sender via the AKE
+// channel, calls the transform with `host.callHandler`, and posts the result to
+// the iframe. (In a headless deployment a zero-authority guest plays this
+// orchestrator role instead; here the browser shell is the natural orchestrator.)
 //
 // `installedApps` keeps the per-app state we need to re-mount the UI, send
-// updates, and re-broadcast the sealed bytes transitively (`sealedBytes` is
-// the original signature-wrapped install envelope — author's signature intact
-// — and is what every "Offer" hands to a peer).
-//
-// The local user authors installs they originate by signing with `myKeys`.
-// Apps received via Offer keep the original author's signature: we never
-// re-sign install content, we only wrap it in our own outer `app.offer`
-// envelope to satisfy the dc per-frame signer check.
+// updates, and re-broadcast the packed bundle transitively (`bundleBytes` is the
+// signed bundle blob — the author's manifest signature intact — and is what every
+// "Offer" hands to a peer). Apps received via Offer keep the original author's
+// manifest signature: we never re-sign a bundle.
 const installedApps = new Map();   // id → AppRecord
 let activeAppId = null;
-
-// Domain-separation prefix for a chat app blob's author signature. Disjoint from
-// the runtime's DOMAIN_* family so a chat-install signature can never verify as
-// an envelope wrapper, manifest, or channel AUTH over the same bytes.
-const CHAT_INSTALL_DOMAIN = new TextEncoder().encode("seedkernel-chat-install-v1\0");
-function chatInstallPreimage(wasm) {
-  const p = new Uint8Array(CHAT_INSTALL_DOMAIN.length + wasm.length);
-  p.set(CHAT_INSTALL_DOMAIN, 0);
-  p.set(wasm, CHAT_INSTALL_DOMAIN.length);
-  return p;
-}
 
 function appHandlerName(id) {
   return host.deriveBootstrapName("app:" + id);
 }
-function appUiBridgeName(id) {
-  return host.deriveScopedName("app:" + id + ".ui", myKeys.publicKey);
+
+// ── shell frame wire format ─────────────────────────────────────────────
+//
+// Without envelopes, the shell frames what it puts on a data channel itself. The
+// sender pubkey is NOT in the frame — the AKE channel already authenticates it and
+// hands it up as `_from`. Two kinds:
+//   CHAT   [0x01][appIdLen u8][appId utf8][chatType u8][body]
+//   OFFER  [0x02][bundle bytes]
+const FRAME_CHAT = 0x01;
+const FRAME_OFFER = 0x02;
+
+function encodeChatFrame(appId, chatBytes) {
+  const idBytes = new TextEncoder().encode(appId);
+  const out = new Uint8Array(2 + idBytes.length + chatBytes.length);
+  out[0] = FRAME_CHAT;
+  out[1] = idBytes.length;
+  out.set(idBytes, 2);
+  out.set(chatBytes, 2 + idBytes.length);
+  return out;
+}
+
+function encodeOfferFrame(bundleBytes) {
+  const out = new Uint8Array(1 + bundleBytes.length);
+  out[0] = FRAME_OFFER;
+  out.set(bundleBytes, 1);
+  return out;
+}
+
+// Run an app's transform for one message and, if it's the active app, render it.
+// `senderPk` is the authenticated peer (or our own key for a local echo);
+// `chatBytes` is [chatType u8][body]. The transform's input is senderPk ‖ chatBytes.
+function deliverChat(appId, senderPk, chatBytes) {
+  const rec = installedApps.get(appId);
+  if (!rec) return;
+  const input = new Uint8Array(senderPk.length + chatBytes.length);
+  input.set(senderPk, 0);
+  input.set(chatBytes, senderPk.length);
+  const render = host.callHandler(rec.handlerName, input);
+  if (render && appId === activeAppId) deliverRender(new Uint8Array(render));
 }
 
 // ── iframe bridge ──────────────────────────────────────────────────────
 //
-// The active app's WASM forwards render events to its uiBridgeName via
-// kernel.call. We forward those to the iframe via postMessage. Renders that
-// arrive before the iframe says "ready" are queued so a hot-swap doesn't
-// drop the first message.
+// The app transform returns render bytes; the shell posts them to the iframe.
+// Renders that arrive before the iframe says "ready" are queued so a hot-swap
+// doesn't drop the first message.
 let iframeReady = false;
 const renderQueue = [];
 
@@ -260,33 +299,6 @@ function deliverSys(text) {
   if (iframeReady && frame.contentWindow) {
     frame.contentWindow.postMessage({ type: "sys", text }, "*");
   }
-}
-
-function registerUiBridge(appId) {
-  const uiName = appUiBridgeName(appId);
-  const handlerName = appHandlerName(appId);
-  host.register(uiName, (_n, payload) => {
-    // Only the active app's handler may drive the UI bridge. The
-    // caller-check defends against a co-installed app calling another app's
-    // bridge — kernel.caller (§4.2) returns the immediate caller; we
-    // compare against the expected handler name for this bridge.
-    if (appId !== activeAppId) return null;
-    const c = host.currentCaller;
-    if (!c || c.length !== handlerName.length) return null;
-    for (let i = 0; i < c.length; i++) if (c[i] !== handlerName[i]) return null;
-    deliverRender(new Uint8Array(payload));
-    return null;
-  });
-}
-
-// The §3.2 configure payload: [route_len u8][route ..]. Only the route (this app's
-// UI bridge) crosses — the handler bakes the signer-query name in itself, since it
-// is literal ASCII (§5.1) rather than something only the host can derive.
-function encodeConfigPayload(uiName) {
-  const buf = new Uint8Array(1 + uiName.length);
-  buf[0] = uiName.length;
-  buf.set(uiName, 1);
-  return buf;
 }
 
 // ── parsing the wasm artifact ──────────────────────────────────────────
@@ -319,104 +331,120 @@ function promptMeta(defaultId) {
   return { id: trimmed, name, version };
 }
 
-// ── app blob (verify + peek) ───────────────────────────────────────────
+// ── build an app bundle (local-authored) ────────────────────────────────
 //
-// A sealed app is `[authorPk 32][sig 64][wasm]`. `unwrapSealed` verifies the
-// author signature and returns author + wasm + content id, so the Apps UI can
-// surface author + meta before the user accepts, and a tampered/forged blob is
-// rejected here rather than at some later step.
-function unwrapSealed(sealedBytes) {
-  if (sealedBytes.length < 96) return null;
-  const authorPk = sealedBytes.subarray(0, 32);
-  const sig = sealedBytes.subarray(32, 96);
-  const wasm = sealedBytes.subarray(96);
-  if (wasm.length === 0) return null;
-  if (!sodium.crypto_sign_verify_detached(sig, chatInstallPreimage(wasm), authorPk)) return null;
+// Turn a WASM module into a signed one-module bundle: read its app_meta for the
+// id, build a manifest binding the module at appHandlerName(id), sign the manifest
+// under the local key (the real §12.4 manifest signature), and pack the manifest
+// envelope + module into one blob. `version` is a nominal 1 — the interactive
+// shell gates installs on user consent (the approve callback), not on a monotonic
+// freshness mark, so a chat bundle carries no meaningful version counter.
+async function buildAppBundle(wasmBytes) {
+  const { meta } = await readWasmSections(wasmBytes);
+  if (!meta || !meta.id) throw new Error("cannot build a bundle: wasm has no app_meta id");
+  const manifest = {
+    app: meta.id,
+    version: 1,
+    modules: [{
+      name: meta.id,
+      file: "app.wasm",
+      hash: bytesToHex(host.genesisHash(wasmBytes)),
+      kernelName: bytesToHex(appHandlerName(meta.id)),
+    }],
+    caps: [],
+  };
+  const manifestEnv = signManifest(sodium, myKeys.privateKey, myKeys.publicKey, manifest);
+  return packBundle({ "manifest.bundle": manifestEnv, "app.wasm": wasmBytes });
+}
+
+// ── verify + peek a received bundle ──────────────────────────────────────
+//
+// Unpack the archive, verify the author's manifest signature (§12.4), and
+// integrity-check the module against the hash the manifest commits to. Returns
+// author + module wasm + content id, so the Apps UI can surface author + meta
+// before the user accepts, and a tampered/forged bundle is rejected here rather
+// than at some later step. Returns null on anything malformed or unauthentic.
+function peekAppBundle(bundleBytes) {
+  let files;
+  try { files = unpackBundle(bundleBytes); }
+  catch { return null; }
+  const env = files["manifest.bundle"];
+  if (!env) return null;
+  let verified;
+  try { verified = verifyManifest(sodium, env); }
+  catch { return null; }   // signed-but-malformed manifest ⇒ reject in the UI
+  if (!verified) return null;
+  const { author, manifest } = verified;
+  // A chat app is a one-module handler-only bundle.
+  if (!Array.isArray(manifest.modules) || manifest.modules.length !== 1) return null;
+  const mod = manifest.modules[0];
+  const wasm = files[mod.file];
+  if (!wasm || wasm.length === 0) return null;
+  if (!contentMatches(wasm, mod.hash, (b) => host.genesisHash(b))) return null;
   return {
-    authorPk,
+    authorPk: author,
     authorAlgo: 0,   // Ed25519 genesis suite (§6.2)
-    // bytes_hash is the registry's content id for the module (§7.1):
-    // genesisHash(wasm), the same value the approve callback receives — so it
-    // keys pendingApprovals and doubles as the artifact's display hash.
+    manifest,
+    // bytes_hash is the registry's content id for the module (§7.1): genesisHash(wasm),
+    // the same value the approve callback receives — so it keys pendingApprovals and
+    // doubles as the artifact's display hash. Equal to fromHex(mod.hash) once the
+    // integrity check above passes.
     bytesHash: host.genesisHash(wasm),
     install: { wasm },
   };
 }
 
-// ── sealing an app (local-authored) ─────────────────────────────────────
-// Sign the wasm under the local key: `[authorPk 32][sig 64][wasm]`, the same
-// self-contained blob a peer forwards over an Offer.
-async function buildSealedInstall(wasmBytes) {
-  const sig = sodium.crypto_sign_detached(chatInstallPreimage(wasmBytes), myKeys.privateKey);
-  const out = new Uint8Array(32 + 64 + wasmBytes.length);
-  out.set(myKeys.publicKey, 0);
-  out.set(sig, 32);
-  out.set(wasmBytes, 96);
-  return out;
-}
-
-// Admit a sealed app we already trust (the bytesHash has been added to
+// Admit a received/authored bundle we already trust (its bytesHash added to
 // pendingApprovals if needed). Returns the AppRecord on success.
-async function applySealedInstall(sealedBytes) {
-  const peeked = unwrapSealed(sealedBytes);
-  if (!peeked) throw new Error("not a valid sealed install");
+async function applyAppBundle(bundleBytes) {
+  const peeked = peekAppBundle(bundleBytes);
+  if (!peeked) throw new Error("not a valid app bundle");
   const { meta, uiHtml } = await readWasmSections(peeked.install.wasm);
-  // If the WASM carries no manifest at all we cannot derive an id. Sealed
-  // installs always come from a path that already chose an id (either the
-  // author embedded it or the local user supplied one before sealing); a
-  // missing manifest here means a malformed bundle.
-  if (!meta || !meta.id) throw new Error("install has no app_meta");
+  if (!meta) throw new Error("bundle module has no app_meta");
 
-  const handlerName = appHandlerName(meta.id);
-  // Make sure the bridge is wired before the WASM tries to call into it on
-  // its first configure / message. Idempotent — re-registering replaces.
-  registerUiBridge(meta.id);
+  // Derive the bind name from the signed manifest `app`, not the manifest's own
+  // kernelName field: a globally-derivable name keeps peer routing consistent and a
+  // forged manifest cannot redirect the handler onto an unexpected name.
+  const id = peeked.manifest.app;
+  const handlerName = appHandlerName(id);
 
-  // The author signature is already verified (unwrapSealed). Admit the module
-  // directly under the same policy a bundle module goes through (§12.4) — no
-  // wire envelope, no dispatch. The approve callback gates first installs on
-  // pendingApprovals and updates on same-author.
+  // The manifest signature is already verified (peekAppBundle). Admit the module
+  // through the same policy a seedstore bundle module goes through (§12.4). The
+  // approve callback gates first installs on pendingApprovals and updates on
+  // same-author. The module is a pure transform — no configure step, nothing to
+  // wire; the shell drives it directly with host.callHandler.
   if (!host.installBundleModule(handlerName, peeked.install.wasm, peeked.authorPk)) {
     throw new Error("install rejected by policy");
   }
 
-  // One-shot configure (§3.2 helper contract) — tell the WASM the name of its
-  // UI bridge, the one name it cannot know (we picked it).
-  host.callDynamicExport(handlerName, "configure",
-    encodeConfigPayload(appUiBridgeName(meta.id)));
-
   const record = {
-    id: meta.id,
-    name: meta.name || meta.id,
+    id,
+    name: meta.name || id,
     version: meta.version || "",
     description: meta.description || "",
     authorPk: peeked.authorPk.slice(),
     authorAlgo: peeked.authorAlgo,
-    // Content hash of the WASM module (§7.1: genesisHash(wasm)). Stable across
-    // re-signings / re-seqs by different authors, so two peers offering the same
-    // compiled artifact display the same hash — it is now the installer's own
-    // bytes_hash, so nothing separate to track.
     bytesHash: peeked.bytesHash,
-    sealedBytes: sealedBytes.slice(),
+    bundleBytes: bundleBytes.slice(),
     handlerName,
     uiHtml,
   };
-  installedApps.set(meta.id, record);
-  // Persist sealed bytes across reloads so transitive offers / updates keep
+  installedApps.set(id, record);
+  // Persist the packed bundle across reloads so transitive offers / updates keep
   // working without re-receiving them.
   persistInstalledApps();
   renderAppList();
   return record;
 }
 
-// Add an app from raw WASM bytes by signing the install with the local key
-// (the local user becomes the author).
+// Add an app from raw WASM bytes by building + signing a bundle with the local
+// key (the local user becomes the author).
 async function addAppFromWasm(wasmBytes, fallbackId) {
   let { meta } = await readWasmSections(wasmBytes);
   if (!meta || !meta.id) {
     meta = promptMeta(fallbackId);
     if (!meta) return;
-    // Re-embed the meta into the wasm so the sealed bundle carries it.
+    // Re-embed the meta into the wasm so the bundle module carries it.
     wasmBytes = embedAppMeta(wasmBytes, meta);
   }
   const handlerName = appHandlerName(meta.id);
@@ -439,13 +467,13 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
       return;
     }
   }
-  const sealedBytes = await buildSealedInstall(wasmBytes);
-  const peeked = unwrapSealed(sealedBytes);
-  if (!peeked) throw new Error("internal: just-built sealed install did not parse");
+  const bundleBytes = await buildAppBundle(wasmBytes);
+  const peeked = peekAppBundle(bundleBytes);
+  if (!peeked) throw new Error("internal: just-built app bundle did not parse");
 
   pendingApprovals.add(bytesToHex(peeked.bytesHash));
   try {
-    const record = await applySealedInstall(sealedBytes);
+    const record = await applyAppBundle(bundleBytes);
     shellPrint(`Installed ${record.name} ${record.version}`, "sys");
     setActiveApp(record.id);
   } catch (err) {
@@ -487,18 +515,18 @@ function embedAppMeta(wasmBytes, meta) {
 }
 
 // ── persistence ────────────────────────────────────────────────────────
-// Sealed bytes are the only piece of app state we need to rebuild — the
+// The packed bundle is the only piece of app state we need to rebuild — the
 // install record on the installer side, the handler in the kernel, and the
-// uiHtml all derive from them. We keep them in sessionStorage so a reload
+// uiHtml all derive from it. We keep them in sessionStorage so a reload
 // within the same tab keeps the user's app set and lets transitive offers
 // continue to work.
 function persistInstalledApps() {
   try {
     const arr = [];
     for (const rec of installedApps.values()) {
-      arr.push(Array.from(rec.sealedBytes));
+      arr.push(Array.from(rec.bundleBytes));
     }
-    sessionStorage.setItem("apps.sealed", JSON.stringify(arr));
+    sessionStorage.setItem("apps.bundles", JSON.stringify(arr));
     if (activeAppId) sessionStorage.setItem("apps.active", activeAppId);
     else sessionStorage.removeItem("apps.active");
   } catch {}
@@ -506,7 +534,7 @@ function persistInstalledApps() {
 
 async function restoreInstalledApps() {
   let arr;
-  try { arr = JSON.parse(sessionStorage.getItem("apps.sealed") || "[]"); }
+  try { arr = JSON.parse(sessionStorage.getItem("apps.bundles") || "[]"); }
   catch { return; }
   if (!Array.isArray(arr)) return;
   for (const raw of arr) {
@@ -514,11 +542,11 @@ async function restoreInstalledApps() {
       // Restored installs were already approved in a prior tab session —
       // wave them through the approveInstall gate the same way an update
       // would be: by adding their bytesHash to pendingApprovals.
-      const sealed = new Uint8Array(raw);
-      const peeked = unwrapSealed(sealed);
+      const bundleBytes = new Uint8Array(raw);
+      const peeked = peekAppBundle(bundleBytes);
       if (!peeked) continue;
       pendingApprovals.add(bytesToHex(peeked.bytesHash));
-      await applySealedInstall(sealed);
+      await applyAppBundle(bundleBytes);
     } catch (err) {
       shellPrint(`Could not restore an app: ${err.message}`, "err");
     }
@@ -567,43 +595,31 @@ function unmountActiveApp() {
 
 // ── peer-to-peer app offers ────────────────────────────────────────────
 //
-// An offer is a sealed app blob forwarded over a data channel. Any peer who
-// holds the sealed bytes can forward them (transitive offer) — the blob carries
-// the original author's signature over the wasm, so the recipient still
-// authenticates against the author (unwrapSealed verifies it).
+// An offer is a packed app bundle forwarded over a data channel in an OFFER frame.
+// Any peer who holds the bundle can forward it (transitive offer) — the manifest
+// inside carries the original author's signature over the module hash, so the
+// recipient still authenticates against the author (peekAppBundle verifies it).
 //
-// The wire format: the sender wraps the sealed bytes inside their own
-// signature envelope under the bootstrap name `app.offer`. The outer signature
-// identifies the relaying peer — the app.offer handler reads it via
-// signature.signer (host.currentSigner) to show who offered the app — while
-// the inner sealed bytes, still carrying the original author's signature, are
-// the load-bearing object.
-const appOfferName = host.deriveBootstrapName("app.offer");
-const pendingOffers = new Map();   // bytesHashHex → { sealedBytes, peeked, fromPkHex }
+// The relaying peer is identified by the AKE channel (`_from`), not a signature —
+// the frame is unsigned; the bundle's own manifest signature is the load-bearing
+// authentication. Inbound OFFER frames are routed here from the network sink.
+const pendingOffers = new Map();   // bytesHashHex → { bundleBytes, peeked, fromPkHex }
 
-host.register(appOfferName, (_n, payload) => {
-  // Defer processing: we cannot dispatch from inside a host handler (the
-  // kernel is single-threaded re-entrantly), and a first-install needs an
-  // async user prompt anyway.
-  const sealed = new Uint8Array(payload);
-  const fromSigner = host.currentSigner;
-  const fromPkHex = fromSigner ? bytesToHex(fromSigner.publicKey) : "?";
-  queueMicrotask(() => handleOffer(sealed, fromPkHex));
-  return null;
-});
-
-async function handleOffer(sealedBytes, fromPkHex) {
-  const peeked = unwrapSealed(sealedBytes);
+async function handleOffer(bundleBytes, fromPkHex) {
+  const peeked = peekAppBundle(bundleBytes);
   if (!peeked) return;
   const { install, authorPk, bytesHash } = peeked;
 
+  const id = peeked.manifest.app;
   let meta = null;
   try { meta = (await readWasmSections(install.wasm)).meta; } catch {}
-  if (!meta || !meta.id) {
-    shellPrint(`Offer from ${fromPkHex.slice(0, 8)} dropped: bundle has no app_meta`, "err");
+  if (!meta) {
+    shellPrint(`Offer from ${fromPkHex.slice(0, 8)} dropped: bundle module has no app_meta`, "err");
     return;
   }
-  const handlerName = appHandlerName(meta.id);
+  // Route + display by the signed manifest id; the wasm's app_meta id is cosmetic.
+  meta = { ...meta, id };
+  const handlerName = appHandlerName(id);
   const existing = host.lookupInstall(handlerName);
 
   // Auto-install path: the author matches an app we already trust. The
@@ -613,7 +629,7 @@ async function handleOffer(sealedBytes, fromPkHex) {
       existing.author.algoId === peeked.authorAlgo &&
       bytesEqual(existing.author.publicKey, authorPk)) {
     try {
-      const rec = await applySealedInstall(sealedBytes);
+      const rec = await applyAppBundle(bundleBytes);
       shellPrint(
         `Auto-updated ${rec.name} → ${rec.version} ` +
         `(from ${fromPkHex.slice(0, 8)}, signed by ${bytesToHex(authorPk).slice(0, 8)})`, "sys");
@@ -630,7 +646,7 @@ async function handleOffer(sealedBytes, fromPkHex) {
   const hex = bytesToHex(bytesHash);
   if (pendingOffers.has(hex)) return;   // duplicate
   pendingOffers.set(hex, {
-    sealedBytes: sealedBytes.slice(),
+    bundleBytes: bundleBytes.slice(),
     peeked: { ...peeked, meta },
     fromPkHex,
   });
@@ -645,7 +661,7 @@ async function acceptOffer(bytesHashHex) {
   if (!offer) return;
   pendingApprovals.add(bytesHashHex);
   try {
-    const rec = await applySealedInstall(offer.sealedBytes);
+    const rec = await applyAppBundle(offer.bundleBytes);
     pendingOffers.delete(bytesHashHex);
     renderOfferList();
     shellPrint(`Installed ${rec.name} ${rec.version} from offer.`, "sys");
@@ -662,14 +678,12 @@ function dismissOffer(bytesHashHex) {
   renderOfferList();
 }
 
-// Broadcast the stored sealed bytes for `id` to every open peer. Anyone who
-// receives this can forward it to others — that's transitivity for free.
+// Broadcast the stored bundle for `id` to every open peer. Anyone who receives
+// this can forward it to others — that's transitivity for free.
 function offerApp(id) {
   const rec = installedApps.get(id);
   if (!rec) return;
-  const offerWire = host.wrapAndEncode(
-    myKeys.privateKey, myKeys.publicKey, appOfferName, rec.sealedBytes);
-  const n = broadcastWire(offerWire);
+  const n = broadcastFrame(encodeOfferFrame(rec.bundleBytes));
   shellPrint(
     n > 0
       ? `Offered ${rec.name} ${rec.version} to ${n} peer${n === 1 ? "" : "s"}.`
@@ -914,14 +928,11 @@ window.addEventListener("message", (ev) => {
   if (msg.type === "send" && typeof msg.chatType === "number" && msg.body) {
     if (!activeAppId) return;
     const body = msg.body instanceof Uint8Array ? msg.body : new Uint8Array(msg.body);
-    const payload = new Uint8Array(1 + body.length);
-    payload[0] = msg.chatType & 0xff;
-    payload.set(body, 1);
-    const wire = host.wrapAndEncode(
-      myKeys.privateKey, myKeys.publicKey,
-      appHandlerName(activeAppId), payload);
-    broadcastWire(wire);
-    host.dispatch(wire);              // local echo
+    const chatBytes = new Uint8Array(1 + body.length);   // [chatType][body]
+    chatBytes[0] = msg.chatType & 0xff;
+    chatBytes.set(body, 1);
+    broadcastFrame(encodeChatFrame(activeAppId, chatBytes));
+    deliverChat(activeAppId, myKeys.publicKey, chatBytes);   // local echo
     if (msg.chatType === 0x02) {
       // Sticky "presence" replay: nick announcements are cached and
       // re-broadcast on every newly-opened dc so peers joining mid-session
@@ -938,12 +949,12 @@ window.addEventListener("message", (ev) => {
 //
 // The WebRTC mesh — perfect negotiation, the relay rendezvous, per-peer
 // identity, the unauthed-peer cap, ICE-restart recovery — all lives in
-// RtcNetwork now. This shell only wires it up: it feeds inbound frames to the
-// kernel, broadcasts outbound envelopes to the linked peers, and mirrors link
-// up/down into the UI. Channel identity is PeerLink's in-channel HELLO/AUTH
-// (host/net-link.ts), so any frame handed to our sink is already attributed to
-// an authenticated peer — no SDP-fingerprint signing or per-frame signer check
-// to do here.
+// RtcNetwork now. This shell only wires it up: it routes inbound shell frames
+// (CHAT / OFFER), broadcasts outbound frames to the linked peers, and mirrors
+// link up/down into the UI. Channel identity is PeerLink's in-channel HELLO/AUTH
+// (host/net-link.ts), so any frame handed to our sink is already attributed to an
+// authenticated peer — `_from` is that peer's pubkey, which we treat as the
+// message author. No per-message signature.
 // ---------------------------------------------------------------------------
 
 let lastSentNickBody = null;   // {appId, body} — replayed to peers that join mid-session
@@ -978,13 +989,10 @@ const net = new RtcNetwork({
     // without us re-sending it (chat v2 uses chatType 0x02 for nick).
     if (lastSentNickBody && installedApps.has(lastSentNickBody.appId)) {
       const body = lastSentNickBody.body;
-      const payload = new Uint8Array(1 + body.length);
-      payload[0] = 0x02;
-      payload.set(body, 1);
-      const wire = host.wrapAndEncode(
-        myKeys.privateKey, myKeys.publicKey,
-        appHandlerName(lastSentNickBody.appId), payload);
-      endpoint.send(peerId, wire);
+      const chatBytes = new Uint8Array(1 + body.length);
+      chatBytes[0] = 0x02;
+      chatBytes.set(body, 1);
+      endpoint.send(peerId, encodeChatFrame(lastSentNickBody.appId, chatBytes));
     }
   },
   onPeerDown: (peerId) => {
@@ -1006,16 +1014,31 @@ const net = new RtcNetwork({
 });
 
 // Our attachment to the fabric — RtcNetwork is bound to our one key, so it vends
-// exactly this endpoint. Every authenticated inbound frame is a kernel envelope.
+// exactly this endpoint. Each inbound frame is a shell frame (CHAT / OFFER); the
+// sender `from` is the authenticated peer's pubkey hex.
 const endpoint = net.endpoint(myPkHex);
-endpoint.onFrame((_from, frame) => host.dispatch(frame));
+endpoint.onFrame((from, frame) => {
+  const bytes = frame instanceof Uint8Array ? frame : new Uint8Array(frame);
+  if (bytes.length < 1) return;
+  const kind = bytes[0];
+  if (kind === FRAME_CHAT) {
+    if (bytes.length < 2) return;
+    const idLen = bytes[1];
+    if (bytes.length < 2 + idLen) return;
+    const appId = new TextDecoder().decode(bytes.subarray(2, 2 + idLen));
+    const chatBytes = bytes.subarray(2 + idLen);   // [chatType][body]
+    deliverChat(appId, hexToBytes(from), chatBytes);
+  } else if (kind === FRAME_OFFER) {
+    handleOffer(bytes.slice(1), from).catch(() => {});
+  }
+});
 
-// Broadcast a kernel envelope to every authenticated peer. Returns the peer
-// count so callers can report "offered to N peers". endpoint.send() drops to any
-// peer we hold no authenticated link to, so iterating linkedPeers() is exact.
-function broadcastWire(wire) {
+// Broadcast a shell frame to every authenticated peer. Returns the peer count so
+// callers can report "offered to N peers". endpoint.send() drops to any peer we
+// hold no authenticated link to, so iterating linkedPeers() is exact.
+function broadcastFrame(frameBytes) {
   const linked = net.linkedPeers();
-  for (const peerId of linked) endpoint.send(peerId, wire);
+  for (const peerId of linked) endpoint.send(peerId, frameBytes);
   return linked.length;
 }
 

@@ -16,13 +16,8 @@
 //   - the deployer-supplied policy callback (README §7.3)
 //   - installDirect: hash → policy → instantiate → SetHandler → record
 //
-// A signature suite is an ordinary module bound at its slot name (§6.4); this
-// helper has no special case for it — it flows through the same installDirect
-// path as any other module.
-//
 // Install records are read host-side via `lookup` (README §7.6) — there is no
-// wire query. Bridges authorize their callers by pinning `kernel.caller`
-// (README §8), not by consulting a capability index.
+// wire query; the policy callback already receives the resolved record.
 
 import type { Signer } from "./kernel-host.js";
 import { bytesEqual, toHex } from "./util.js";
@@ -123,14 +118,13 @@ export class Installer {
 
   /** Read-only access to the install record at `name`, if any. Host-side only —
    *  there is no wire query (README §7.6); the policy callback already receives
-   *  the resolved `existing` record, and bridges pin `kernel.caller`. */
+   *  the resolved `existing` record. */
   lookup(name: Uint8Array): InstallRecord | null {
     return this.installations.get(toHex(name)) ?? null;
   }
 
   /** Host-side `installer.remove(name)` (README §7.5). Clears the record and
-   *  calls SetHandler(name, null). Suite slots (§6.4) are ordinary handler binds
-   *  and take exactly this path. Returns true if a record was removed. */
+   *  calls SetHandler(name, null). Returns true if a record was removed. */
   remove(name: Uint8Array): boolean {
     const key = toHex(name);
     const rec = this.installations.get(key);

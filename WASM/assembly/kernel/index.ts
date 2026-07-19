@@ -1,28 +1,13 @@
-// Kernel WASM module (README §3). Parses envelopes, dispatches by name.
-// No cryptography, no authorization, no installation logic — those live in
-// modules.
+// Kernel WASM module (README §3). A named table of handlers: bind a name to a
+// handler id, resolve a name to its id. No cryptography, no authorization, no
+// installation logic, no message dispatch — the host is the orchestrator and
+// invokes handlers by id itself. Handlers are pure transforms (README §4).
 //
 // Exports:
-//   alloc, dealloc                — host writes bytes into kernel memory
-//   set_handler                   — host-level handler install/replace (§3.1)
-//   remove_handler                — SetHandler(name, null) — remove (§3.1)
-//   find_handler                  — resolve name → handler id, -1 if unbound; the
-//                                   table query too (bound ⟺ find_handler >= 0)
-//   dispatch                      — parse envelope + dispatch
-//
-// Imports:
-//   invoke_handler                — called when a handler matches
-
-import { MAGIC, CURRENT_VERSION, MAX_ENVELOPE_BYTES } from "./envelope";
-
-@external("env", "invoke_handler")
-declare function invokeHandler(
-  handlerId: i32,
-  namePtr: i32,
-  nameLen: i32,
-  payloadPtr: i32,
-  payloadLen: i32
-): void;
+//   alloc, dealloc                — host writes name bytes into kernel memory
+//   set_handler                   — bind / replace a name → handler id (§3.1)
+//   remove_handler                — SetHandler(name, null) — unbind (§3.1)
+//   find_handler                  — resolve name → handler id, -1 if unbound
 
 class Entry {
   name: Uint8Array;
@@ -54,8 +39,8 @@ function findIndex(name: Uint8Array): i32 {
 }
 
 /** Zero-copy variant of findIndex that compares the stored name against raw
- *  bytes at `namePtr`. Used by `dispatch` so the hot path doesn't have to
- *  allocate a Uint8Array for every inbound envelope. */
+ *  bytes at `namePtr`. Used by `find_handler` so a lookup doesn't have to
+ *  allocate a Uint8Array. */
 function findIndexAtPtr(namePtr: i32, nameLen: i32): i32 {
   for (let i = 0; i < handlers.length; i++) {
     const n = handlers[i].name;
@@ -84,11 +69,10 @@ export function dealloc(ptr: i32): void {
   heap.free(ptr);
 }
 
-/** Host-level handler management (README §3.1). Installs or replaces the
- *  handler for the given name. The kernel never holds two entries for the
- *  same name; replace is in-place. SetHandler is the only way handlers enter
- *  the kernel's table — install records and the capability index live in the
- *  installer above the kernel (§7). */
+/** Host-level handler management (README §3.1). Binds or replaces the handler for
+ *  the given name. The kernel never holds two entries for the same name; replace
+ *  is in-place. This is the only way handlers enter the table — install records
+ *  and the policy live in the installer above the kernel (§7). */
 export function set_handler(
   namePtr: i32,
   nameLen: i32,
@@ -116,46 +100,10 @@ export function remove_handler(
   return 1;
 }
 
-/** Resolve the handler id bound to `name`, or -1 if none is (README §3.1).
- *  This is the kernel's single routing decision: top-level `dispatch` and a
- *  handler's `kernel.call` both resolve targets through the same handler table,
- *  so the two paths can never see different worlds. Zero-copy scan over the raw
- *  name bytes at `namePtr` — the host stages the name and reads back the id. */
+/** Resolve the handler id bound to `name`, or -1 if none is (README §3.1). The
+ *  kernel's single routing decision — the host stages the name and reads back the
+ *  id, then invokes the handler itself. Zero-copy scan over the raw name bytes. */
 export function find_handler(namePtr: i32, nameLen: i32): i32 {
   const idx = findIndexAtPtr(namePtr, nameLen);
   return idx < 0 ? -1 : handlers[idx].handlerId;
-}
-
-export function dispatch(bytesPtr: i32, bytesLen: i32): void {
-  if (bytesLen > MAX_ENVELOPE_BYTES) return;
-  // Zero-copy envelope parsing: read directly from the host-staged buffer at
-  // bytesPtr. The buffer is stable for the duration of this call (the host
-  // dealloc's only after dispatch returns), so we can pass pointers into it
-  // straight through to invoke_handler without making a kernel-side copy.
-  if (bytesLen < 4) return;
-
-  const magic: u16 = ((load<u8>(bytesPtr) as u16) << 8) | (load<u8>(bytesPtr + 1) as u16);
-  if (magic != MAGIC) return;
-
-  const version = load<u8>(bytesPtr + 2);
-  if (version != CURRENT_VERSION) return;
-
-  const nameLen = load<u8>(bytesPtr + 3) as i32;
-  if (nameLen == 0) return; // zero-length name is reserved/invalid (§2)
-  if (4 + nameLen > bytesLen) return;
-
-  const namePtr = bytesPtr + 4;
-  const payloadPtr = namePtr + nameLen;
-  const payloadLen = bytesLen - 4 - nameLen;
-
-  const idx = findIndexAtPtr(namePtr, nameLen);
-  if (idx < 0) return;
-
-  invokeHandler(
-    handlers[idx].handlerId,
-    namePtr,
-    nameLen,
-    payloadPtr,
-    payloadLen
-  );
 }

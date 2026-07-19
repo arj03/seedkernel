@@ -11,10 +11,11 @@ import (
 	"testing"
 )
 
-// forwarderWasm is a minimal, valid handler module (WASM/tests/fixtures/forwarder:
-// exports scratch + handle, imports kernel.call). Embedded so the native tests build a
-// self-contained signed bundle right here — no dependency on the seedstore app or any
-// other sibling repo. Refresh it with `cp ../WASM/build/forwarder.wasm testdata/`.
+// forwarderWasm is a minimal, valid pure-transform handler module
+// (WASM/tests/fixtures/forwarder: exports scratch + handle, imports only env.abort,
+// echoes its input). Embedded so the native tests build a self-contained signed bundle
+// right here — no dependency on the seedstore app or any other sibling repo. Refresh it
+// with `cp ../WASM/build/forwarder.wasm testdata/`.
 //
 //go:embed testdata/forwarder.wasm
 var forwarderWasm []byte

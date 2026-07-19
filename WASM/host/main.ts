@@ -138,10 +138,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
   const host = await KernelHost.load(opts.kernelBytes as BufferSource, sodium);
 
-  host.registerSignature(host.deriveBootstrapName("signature"));
-  // The §6.5 query API: read-only, so it costs a bundle's WASM handlers nothing to
-  // have it and they cannot ask "who signed this dispatch?" without it.
-  host.registerSignerQuery(host.deriveBootstrapName("signature.signer"));
   host.registerInstaller();
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts).
   const policy = policyFromJson(opts.policyJson);
