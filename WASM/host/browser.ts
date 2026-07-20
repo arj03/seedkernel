@@ -15,11 +15,8 @@ export async function createKernelHost(sodium: Sodium): Promise<KernelHost> {
   return new KernelHost(sodium);
 }
 
-export {
-  KernelHost,
-  GENESIS_ALGO_ID,
-} from "./kernel-host.js";
-export type { Handler, Signer } from "./kernel-host.js";
+export { KernelHost } from "./kernel-host.js";
+export type { Handler } from "./kernel-host.js";
 export type {
   InstallRecord,
   AdmitPolicy,

@@ -162,7 +162,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // The bundle's signed manifest declares the capability *domains* it needs
   // (`caps`); the shell expands those to the concrete op set the bridge enforces
   // and wires only the matching backends, so a guest holds exactly what it
-  // declared — nothing outside its caps resolves (`ops` only documents the ABI).
+  // declared — nothing outside its caps resolves.
   const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
     const caps = new Set(b.manifest.caps);
     return createCapBridge({

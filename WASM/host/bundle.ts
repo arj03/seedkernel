@@ -1,10 +1,11 @@
 // The app bundle format (README §12.4). A bundle is *signed
 // content* the generic shell loads from a file: a set of WASM handler modules, a
-// zero-authority guest program, and a signed manifest declaring the op catalog +
-// the capabilities the bundle needs. The shell verifies the manifest signature,
-// governs it against its policy (author + module hashes), and installs the
-// modules; the manifest's `caps` describe the seam the app's guest is wired
-// over — honored by the generic cap bridge (README §12.2).
+// zero-authority guest program, and a signed manifest declaring the modules, the
+// kernel names they bind at, and the capabilities the bundle needs. The shell
+// verifies the manifest signature, governs it against its policy (author +
+// module hashes), and installs the modules; the manifest's `caps` describe the
+// seam the app's guest is wired over — honored by the generic cap bridge
+// (README §12.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
 // (its build-bundle script). On disk a bundle is a directory:
@@ -22,7 +23,6 @@
 import { concatBytes, toHex } from "./util.js";
 import { DOMAIN_MANIFEST } from "./domains.js";
 import type { ShellPolicy } from "./policy.js";
-import type { Signer } from "./kernel-host.js";
 
 export interface BundleModule {
   /** Logical name, e.g. "codec". */
@@ -236,7 +236,9 @@ export class FreshnessMarks implements FreshnessStore {
 /** A single install record (README §12.4): who signed the bundle that bound the bytes,
  *  and the bytes' content id. */
 export interface InstallRecord {
-  readonly author: Signer;
+  /** The manifest author's 32-byte Ed25519 public key. The runtime fixes one signing
+   *  algorithm (§16.1), so an author IS a key — there is no algorithm id to carry. */
+  readonly author: Uint8Array;
   /** genesisHash(wasm) (§5.1) — the same id a manifest's `modules[].hash` and a policy
    *  `modules` allowlist carry. */
   readonly bytesHash: Uint8Array;
@@ -249,7 +251,7 @@ export interface InstallRecord {
  *  per module at load time, never on a message path, so it may be arbitrarily expensive. */
 export type AdmitPolicy = (
   name: string,
-  author: Signer,
+  author: Uint8Array,
   bytesHash: Uint8Array,
   wasm: Uint8Array,
   current: InstallRecord | null,
@@ -304,7 +306,7 @@ export class InstallRecords {
    *  authenticated the coherent set and committed to each module's `genesisHash` (§12.4), so
    *  a second per-module proof would be pure redundancy. Returns true on success, false if
    *  no policy is wired or the policy refuses. */
-  admit(name: string, wasm: Uint8Array, author: Signer): boolean {
+  admit(name: string, wasm: Uint8Array, author: Uint8Array): boolean {
     if (name.length === 0 || wasm.length === 0) return false;
     const bytesHash = this.host.genesisHash(wasm);
     const current = this.installations.get(name) ?? null;
@@ -319,10 +321,7 @@ export class InstallRecords {
     // Instantiate + SetHandler first, then record — in that order, so a record never points
     // at a slot we failed to populate.
     if (!this.host._installWasmHandler(name, wasm)) return false;
-    this.installations.set(name, {
-      author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
-      bytesHash,
-    });
+    this.installations.set(name, { author: author.slice(), bytesHash });
     return true;
   }
 }

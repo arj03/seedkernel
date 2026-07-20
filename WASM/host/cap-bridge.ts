@@ -152,10 +152,9 @@ export interface CapBridgeDeps {
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
   /** The allowed op set, expanded from the manifest's declared cap domains
-   *  (README §12.2, `opsForCaps` — not from `ops`, which is documentation-only).
-   *  When present, any op outside the set is refused — the guest analogue of the
-   *  §8 bridge check. Omitted = unrestricted (a trusted host-side caller that
-   *  holds the primitives anyway). */
+   *  (README §12.2, `opsForCaps`). When present, any op outside the set is refused,
+   *  so a guest reaches exactly what its bundle declared. Omitted = unrestricted
+   *  (a trusted host-side caller that holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
 

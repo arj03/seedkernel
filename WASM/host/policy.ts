@@ -72,12 +72,10 @@ export function buildAdmit(policy: ShellPolicy): AdmitPolicy {
   const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;
 
   return (_name, author, bytesHash, _wasm, current) => {
-    if (!authors.has(toHex(author.publicKey))) return false;         // closed author set
+    if (!authors.has(toHex(author))) return false;                   // closed author set
     if (modules && !modules.has(toHex(bytesHash))) return false;     // module-hash allowlist
-    if (current) {                                                   // squat-resistance: only
-      if (current.author.algoId !== author.algoId) return false;     // the recorded author may
-      if (!bytesEqual(current.author.publicKey, author.publicKey)) return false; // update the name
-    }
+    // squat-resistance: only the recorded author may update the name.
+    if (current && !bytesEqual(current.author, author)) return false;
     return true;
   };
 }

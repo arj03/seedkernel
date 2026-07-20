@@ -24,16 +24,6 @@ import { toHex } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
-/** The genesis signing algorithm's algo_id (README §16.1) — the author algo recorded
- *  for a bundle module's install record. Ed25519 is the one verifier and BLAKE2b-256
- *  the one hash (`genesisHash`), both host constants. */
-export const GENESIS_ALGO_ID = 0x0000;
-
-export interface Signer {
-  algoId: number;
-  publicKey: Uint8Array;
-}
-
 export type Handler = (
   name: string,
   payload: Uint8Array,
@@ -51,7 +41,6 @@ interface WasmHandlerRef {
   scratch: number;
   scratchSize: number;
   handle: (input_len: number) => number;
-  exports: WebAssembly.Exports;
 }
 
 /** What the table holds at one name. Exactly one of `handler` / `wasm` is set: a
@@ -179,7 +168,6 @@ export class KernelHost {
         scratch: scratchOffset,
         scratchSize,
         handle: exps.handle,
-        exports: instance.exports,
       },
     });
 
@@ -187,23 +175,6 @@ export class KernelHost {
   }
 
   // ─── public API ──────────────────────────────────────────────────────
-
-  /** Call a named export on a dynamic WASM handler, staging `payload` in
-   *  scratch first. Returns the export's i32 return value or null on failure.
-   *  An export taking no arguments is reached with an empty payload. */
-  callDynamicExport(
-    name: string,
-    exportName: string,
-    payload: Uint8Array,
-  ): number | null | undefined {
-    const wasm = this.handlers.get(name)?.wasm;
-    if (!wasm) return null;
-    const fn = (wasm.exports as { [k: string]: unknown })[exportName];
-    if (typeof fn !== "function") return null;
-    if (payload.length > wasm.scratchSize) return null;
-    new Uint8Array(wasm.memory.buffer, wasm.scratch, payload.length).set(payload);
-    return (fn as (n: number) => number)(payload.length);
-  }
 
   /** Invoke a handler by name with `payload`, returning its response bytes (the
    *  standard `handle` scratch ABI), or null if the name is unbound or the handler
@@ -239,11 +210,11 @@ export class KernelHost {
   /** Admit a bundle module under its manifest-declared kernel name (README §12.4). The
    *  signed manifest already authenticated the coherent set and pinned each module's
    *  content hash, so the loader admits verified bytes here — bundles are the only way
-   *  code arrives. The record's author is the manifest `authorPubKey` (an Ed25519 genesis
+   *  code arrives. The record's author is the manifest `authorPubKey` (a 32-byte Ed25519
    *  key, §12.4), gated by the admission policy. Returns true on success, false if no
    *  policy is wired or it refuses. The bundle loader calls this once per verified module. */
   installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
-    return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
+    return this.records.admit(name, wasm, authorPubKey);
   }
 
   /** Remove a handler, the `SetHandler(name, null)` case in §3.1 — and the loader's

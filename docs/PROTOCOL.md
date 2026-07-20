@@ -156,7 +156,7 @@ These belong to the reference runtime (§12), not the kernel protocol — a diff
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| `GENESIS_ALGO_ID` | `0x0000` | Install record (§12.4) | The author algorithm recorded for a bundle module — Ed25519, the only signing algorithm the runtime uses. The paired genesis hash is BLAKE2b-256, the one system hash (§5.1); together they are the whole genesis — one verifier, one hash, both host constants. |
+| Author key | 32-byte Ed25519 public key | Install record (§12.4) | An author *is* a key: Ed25519 is the only signing algorithm the runtime uses, so a record carries the raw public key and no algorithm id. The paired genesis hash is BLAKE2b-256, the one system hash (§5.1); together they are the whole genesis — one verifier, one hash, both compiled into the host. |
 | Cap op ids | `1`–`16` | cap-bridge (§12.2) | Guest↔host op identifiers, contiguous and grouped by domain (§12.2); regenerated with the guest preamble, never sent between nodes. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§12.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§12.4) | Ed25519 detached signature over `DOMAIN_manifest ‖ json`. |

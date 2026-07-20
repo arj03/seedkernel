@@ -21,9 +21,6 @@ import {
 } from "./bundle.js";
 import { toHex } from "./util.js";
 
-/** The genesis signing algorithm's algo_id (§16.1) — an Ed25519 manifest author. */
-const GENESIS_ALGO_ID = 0x0000;
-
 /** The byte-level primitives the Go loader exposes into the realm (native/main.go).
  *  Only the host powers QuickJS genuinely cannot reach: everything else is JS. */
 declare const bridge: {
@@ -56,7 +53,7 @@ class NativeHost implements BundleHost, RecordHost {
   isRegistered(name: string): boolean { return bridge.isRegistered(name); }
 
   installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
-    return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
+    return this.records.admit(name, wasm, authorPubKey);
   }
 }
 

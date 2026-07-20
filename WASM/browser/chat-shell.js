@@ -114,8 +114,7 @@ const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 host.setAdmitPolicy((name, author, bytesHash, _wasm, existing) => {
   const hex = bytesToHex(bytesHash);
   if (existing) {
-    if (existing.author.algoId !== author.algoId) return false;
-    if (!bytesEqual(existing.author.publicKey, author.publicKey)) return false;
+    if (!bytesEqual(existing.author, author)) return false;
     pendingApprovals.delete(hex);   // consume even if not strictly needed
     return true;
   }
@@ -382,7 +381,6 @@ function peekAppBundle(bundleBytes) {
   if (!contentMatches(wasm, mod.hash, (b) => host.genesisHash(b))) return null;
   return {
     authorPk: author,
-    authorAlgo: 0,   // Ed25519 genesis signing algorithm (§16.1)
     manifest,
     // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
     // the same value the approve callback receives — so it keys pendingApprovals and
@@ -422,7 +420,6 @@ async function applyAppBundle(bundleBytes) {
     version: meta.version || "",
     description: meta.description || "",
     authorPk: peeked.authorPk.slice(),
-    authorAlgo: peeked.authorAlgo,
     bytesHash: peeked.bytesHash,
     bundleBytes: bundleBytes.slice(),
     handlerName,
@@ -453,9 +450,8 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
   // not supported from this path — those arrive via Offer from the original
   // author.
   if (existing) {
-    if (existing.author.algoId !== 0 ||
-        !bytesEqual(existing.author.publicKey, myKeys.publicKey)) {
-      const authorHex = bytesToHex(existing.author.publicKey).slice(0, 8);
+    if (!bytesEqual(existing.author, myKeys.publicKey)) {
+      const authorHex = bytesToHex(existing.author).slice(0, 8);
       const msg =
         `Cannot install "${meta.id}": already installed and authored by ` +
         `${authorHex}, not you. Updates have to come from that author ` +
@@ -624,9 +620,7 @@ async function handleOffer(bundleBytes, fromPkHex) {
   // Auto-install path: the author matches an app we already trust. The
   // admission policy in setAdmitPolicy verifies the same facts (§12.5,
   // author-only), so dispatching is safe — no extra approval needed.
-  if (existing &&
-      existing.author.algoId === peeked.authorAlgo &&
-      bytesEqual(existing.author.publicKey, authorPk)) {
+  if (existing && bytesEqual(existing.author, authorPk)) {
     try {
       const rec = await applyAppBundle(bundleBytes);
       shellPrint(

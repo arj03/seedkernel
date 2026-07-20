@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# §8 interop — the definition of "done" for the Go/native loader target.
+# §12.9 interop — the definition of "done" for the Go/native loader target.
 #
 # A Go loader node and JS (node + bun) nodes share one seedstore cohort over real
 # loopback TCP, exercising the same signed bundle on the byte-identical genesis. It

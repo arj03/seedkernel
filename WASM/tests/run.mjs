@@ -33,8 +33,7 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Payload for callDynamicExport against an export that takes no arguments: the
-// JS WASM API drops the surplus argument, so the general helper covers them too.
+// The empty payload — a handler whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
 
 await ensureSodium();
@@ -96,7 +95,7 @@ async function testFullLifecycle() {
   // The loader should have an install record for it.
   const rec = host.lookupInstall(chatName);
   assert(rec !== null, "install record exists");
-  assertEqual(rec.author.publicKey, pk, "record author matches signer");
+  assertEqual(rec.author, pk, "record author matches signer");
 
   // Reach it by name: the host stages input at the handler's scratch, calls handle, and
   // reads the response back (README §4). A guest reaches the same handler through the
@@ -158,7 +157,7 @@ async function testApproveInstallRejects() {
   assert(!host.isRegistered(chatTextName), "install rejected");
   assert(seen !== null, "the admit policy was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
-  assertEqual(seen.author.publicKey, pk, "callback saw the author pubkey");
+  assertEqual(seen.author, pk, "callback saw the author pubkey");
   assert(seen.existing === null, "no existing record for first install");
 
   console.log("  OK\n");
@@ -218,9 +217,7 @@ async function testReferencePolicyUpgradeRules() {
   // when the new author matches the recorded one. This is the same-author rule the
   // shell's buildAdmit and the chat shell enforce, expressed inline.
   const { host } = await makeHost((_name, author, _hash, _wasm, existing) =>
-    !existing ||
-    (existing.author.algoId === author.algoId &&
-      bytesEqual(existing.author.publicKey, author.publicKey)));
+    !existing || bytesEqual(existing.author, author));
 
   const { publicKey: aPk } = generateKeyPair();
   const { publicKey: bPk } = generateKeyPair();
@@ -238,7 +235,7 @@ async function testReferencePolicyUpgradeRules() {
   // B tries to install over the same name — rejected (different author).
   installMod(host, sharedName, forwarderBytes, bPk);
   const recAfterB = host.lookupInstall(sharedName);
-  assertEqual(recAfterB.author.publicKey, aPk, "different-author install rejected, A still owns");
+  assertEqual(recAfterB.author, aPk, "different-author install rejected, A still owns");
   assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
 
   // A re-installs (same author) — accepted; record updates in place. There is
@@ -246,7 +243,7 @@ async function testReferencePolicyUpgradeRules() {
   installMod(host, sharedName, forwarderBytes, aPk);
   const recAfterUpgrade = host.lookupInstall(sharedName);
   assert(recAfterUpgrade !== null, "upgrade left a record");
-  assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
+  assertEqual(recAfterUpgrade.author, aPk, "A still owns after upgrade");
   // bytes_hash is genesisHash(wasm) (§5.1), so re-installing the SAME wasm keeps the
   // same content id — the identifier tracks the binary. (A different wasm would hash
   // differently; §5.1 makes the content id, a manifest's modules[].hash, and a policy
@@ -277,7 +274,7 @@ async function testInstallerLookupHostSide() {
   // pin kernel.caller instead of consulting a capability index.
   const rec = host.lookupInstall(chatTextName);
   assert(rec !== null, "record present for an installed name");
-  assertEqual(rec.author.publicKey, pk, "record author matches signer");
+  assertEqual(rec.author, pk, "record author matches signer");
   assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
 
   // Unknown / SetHandler-seeded names have no record.
