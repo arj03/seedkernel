@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// boundToWasm reports whether `n` resolves — through the kernel's own table, the way every
-// call path resolves it — to an installed wasm handler.
-func boundToWasm(n []byte) bool {
-	id := findHandlerID(n)
-	return id >= 0 && entries[id] != nil && entries[id].wasm != nil
+// boundToWasm reports whether `n` resolves — through the handler table, the way every call
+// path resolves it — to an installed wasm handler.
+func boundToWasm(n string) bool {
+	e := handlers[n]
+	return e != nil && e.wasm != nil
 }
 
 // TestScratchRegion covers the §4.1 reservation on this target: a handler that declares no
@@ -26,7 +26,7 @@ func TestScratchRegion(t *testing.T) {
 	if !installWasm(n, forwarderWasm) {
 		t.Fatal("installWasm(forwarder) refused")
 	}
-	w := entries[findHandlerID(n)].wasm
+	w := handlers[n].wasm
 	if w.size != defaultScratchSize {
 		t.Fatalf("a handler exporting no scratchSize should get the %d B default, got %d",
 			defaultScratchSize, w.size)

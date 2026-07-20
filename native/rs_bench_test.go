@@ -33,7 +33,7 @@ const (
 
 var (
 	rsOnce      sync.Once
-	rsCodecName []byte
+	rsCodecName string
 	rsEncodeReq []byte // [OP_ENCODE][k][m][bs BE][640 KB data]
 	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks] — block 0 lost
 	rsReady     bool

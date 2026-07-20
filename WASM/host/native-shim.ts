@@ -28,11 +28,11 @@ const GENESIS_ALGO_ID = 0x0000;
  *  Only the host powers QuickJS genuinely cannot reach: everything else is JS. */
 declare const bridge: {
   /** Instantiate handler bytes against the §4 ABI and SetHandler them at `name`. */
-  installWasm(name: Uint8Array, wasm: Uint8Array): boolean;
-  /** Does a handler already occupy `name`? (The kernel's `find_handler`.) */
-  isRegistered(name: Uint8Array): boolean;
+  installWasm(name: string, wasm: Uint8Array): boolean;
+  /** Does a handler already occupy `name`? (A lookup in the Go host's table.) */
+  isRegistered(name: string): boolean;
   /** Unbind `name` (SetHandler(name, null)). Exposed for operator revocation. */
-  removeHandler(name: Uint8Array): boolean;
+  removeHandler(name: string): boolean;
   /** The persisted freshness store's contents, or null on first boot. */
   readFreshness(): string | null;
   /** Write the freshness store atomically (temp file + rename). */
@@ -52,10 +52,10 @@ class NativeHost implements BundleHost, RecordHost {
   readonly records = new InstallRecords(this);
 
   genesisHash(data: Uint8Array): Uint8Array { return sodium.crypto_generichash(32, data); }
-  _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
-  isRegistered(name: Uint8Array): boolean { return bridge.isRegistered(name); }
+  _installWasmHandler(name: string, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
+  isRegistered(name: string): boolean { return bridge.isRegistered(name); }
 
-  installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
+  installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 }

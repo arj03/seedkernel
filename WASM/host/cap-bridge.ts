@@ -50,7 +50,7 @@ export const CAP = {
                        //   reading every value back. Existence is size ≥ 0, so there is
                        //   no separate FS_HAS.
   // module (15) + clock (16)
-  MODULE_CALL: 15,     // [nameLen u8][name][req] -> installed handler response bytes
+  MODULE_CALL: 15,     // [nameLen u8][name utf8][req] -> installed handler response bytes
   CLOCK: 16,           // -> now ms (u64 BE)
 } as const;
 
@@ -143,7 +143,7 @@ export interface CapBridgeDeps {
    *  is never raw). A host-side caller that never exposes SIGN may omit it. */
   signScope?: Uint8Array;
   /** Reach an installed WASM handler by name (KernelHost.callHandler). */
-  callHandler: (name: Uint8Array, payload: Uint8Array) => Uint8Array | null;
+  callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
   transport: CapTransport;
   /** The peers this node can reach (its cohort / connected set). */
   peers: () => PeerId[];
@@ -281,8 +281,10 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
 
       // ── installed-handler call + clock ───────────────────────────────────
       case CAP.MODULE_CALL: {
+        // The handler name is a string (README §5.1), so it crosses the seam as its
+        // UTF-8 bytes — a bootstrap name reads plainly, a scoped name is its hex.
         const nameLen = payload[0];
-        const name = payload.slice(1, 1 + nameLen);
+        const name = dec.decode(payload.slice(1, 1 + nameLen));
         const r = callHandler(name, payload.slice(1 + nameLen));
         return r ?? NONE;
       }

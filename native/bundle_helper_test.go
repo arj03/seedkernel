@@ -33,11 +33,11 @@ func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
 
 // writeTestBundle assembles a minimal signed bundle directory (README §12.4) in a fresh
 // temp dir: one forwarder module + a stub guest, under an author-signed manifest at the
-// given (app, version). Returns the dir and the module's raw kernel name. Requires boot()
+// given (app, version). Returns the dir and the module's kernel name. Requires boot()
 // first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle. The
 // module binds at name("fwd") unless a `kernelOverride` is passed — a test uses that to
 // aim a module at a seeded slot and prove the §12.5 overlay refusal.
-func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, kernelOverride ...[]byte) (string, []byte) {
+func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, kernelOverride ...string) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	kernelName := name("fwd")
@@ -63,7 +63,7 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		Version: version,
 		Modules: []mod{{
 			Name: "fwd", File: "fwd.wasm", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
-			KernelName: hex.EncodeToString(kernelName),
+			KernelName: kernelName,
 		}},
 		Guest: map[string]string{"file": "guest.js", "hash": hex.EncodeToString(sd.genericHash(32, []byte(guestSrc)))},
 		Caps:  []string{},

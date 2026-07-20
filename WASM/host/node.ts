@@ -1,8 +1,6 @@
-// Node entry point — bridges the portable KernelHost to Node's filesystem
-// and libsodium-wrappers. Use this when running on Node / Bun / Deno (with
-// Node compat); for the browser see ./browser.ts.
-
-import { readFile } from "node:fs/promises";
+// Node entry point — bridges the portable KernelHost to libsodium-wrappers. Use
+// this when running on Node / Bun / Deno (with Node compat); for the browser see
+// ./browser.ts.
 
 import { KernelHost } from "./kernel-host.js";
 
@@ -12,22 +10,16 @@ import { KernelHost } from "./kernel-host.js";
 // import (not createRequire) so `bun build --compile` bundles the package into
 // the standalone shell binary — a dynamic require resolves to nothing there. The
 // default export is the wrapper object; cast it to the module-namespace type the
-// rest of the host (and KernelHost.load) is written against.
+// rest of the host (and the KernelHost constructor) is written against.
 import sodiumDefault from "libsodium-wrappers-sumo";
 const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sumo");
 
-/** Read kernel.wasm from disk, await sodium readiness, and instantiate a
- *  KernelHost. The kernel is a named table of pure-transform handlers, so this
- *  loads the one WASM blob and only packages the platform I/O — installing bundles
- *  stays the caller's job (§9). */
-export async function loadKernelHost(
-  kernelWasmPath: string,
-): Promise<KernelHost> {
-  const [kernelBytes] = await Promise.all([
-    readFile(kernelWasmPath),
-    sodium.ready,
-  ]);
-  return KernelHost.load(kernelBytes, sodium);
+/** Await sodium readiness and stand up a KernelHost. The handler table is host
+ *  state — there is no kernel blob to load — so booting is "ready libsodium, done"
+ *  (§9); installing bundles stays the caller's job. */
+export async function createKernelHost(): Promise<KernelHost> {
+  await sodium.ready;
+  return new KernelHost(sodium);
 }
 
 export async function ensureSodium(): Promise<void> {

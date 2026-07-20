@@ -10,17 +10,17 @@
 
 ## 2. The message model
 
-The kernel parses nothing off the wire. Its entire state is a table mapping a **name** to a **handler**, and its entire job is to resolve a name to the handler bound there. There is no envelope format, no message header, no dispatch loop — the routing decision is one lookup, `find_handler(name)` (§3).
+The kernel parses nothing off the wire. Its entire state is a table mapping a **name** to a **handler**, and its entire job is to resolve a name to the handler bound there. There is no envelope format, no message header, no dispatch loop — the routing decision is one lookup in `handlers` (§3).
 
 A "message," at the boundary the runtime cares about, is just a `(name, input bytes)` pair the **host** assembles. The host is the orchestrator: it receives bytes from the transport (already decrypted and attributed to a peer key, §12.6), decides which name to route them to, resolves that name through the kernel, and invokes the handler — a **pure transform** (§4) — with the input, reading its output back. The kernel never sees where the bytes came from, who sent them, or what they mean.
 
 That leaves three orthogonal pieces in every binding, none of which the kernel interprets:
 
-- **Name** — an opaque dispatch key. Its meaning is a convention (§5.1), not a kernel concern; the kernel compares name bytes and nothing more.
+- **Name** — an opaque dispatch key, a string. Its meaning is a convention (§5.1), not a kernel concern; the kernel matches names and nothing more.
 - **Bytes** — the WASM handler held at that name, a pure transform the host stages input into and reads output from (§4).
 - **Author** — the signer of the bundle that installed the bytes, recorded host-side in the loader's install record (§12.4). The kernel never learns it.
 
-**No wire format means no kernel-level size cap.** The old envelope's 64 KB ceiling is gone with the envelope; the two bounds that remain live where the bytes actually flow — the transport caps a single frame at `MAX_FRAME_BYTES` (16 MiB, §12.6), and a handler caps its own I/O region at its `scratch` size (128 KB default, §4.1). The kernel imposes neither; it only ever holds a name and an id.
+**No wire format means no kernel-level size cap.** The old envelope's 64 KB ceiling is gone with the envelope; the two bounds that remain live where the bytes actually flow — the transport caps a single frame at `MAX_FRAME_BYTES` (16 MiB, §12.6), and a handler caps its own I/O region at its `scratch` size (128 KB default, §4.1). The kernel imposes neither; it only ever holds a name and a handler.
 
 **Authenticity is the channel's, not the kernel's.** Because the transport hands the host frames already authenticated to a peer key (§12.6), there is no per-message signature to check and no signature logic anywhere in the kernel or its handlers. Signing survives in exactly two host-side places, both off the message path: the **bundle manifest** that installs code (§12.4) and the channel **AUTH** that opens a link (§12.6). An app that needs to attribute a *relayed* message to its original author — a forum or feed, where the channel only authenticates the immediate hop — carries its own per-message signature and backlinks on top (§5.1, §14); that is an app concern, not a kernel one.
 
@@ -28,34 +28,34 @@ That leaves three orthogonal pieces in every binding, none of which the kernel i
 
 ## 3. The kernel
 
-The kernel is a **named table of handlers**: bind a name to a handler id, resolve a name to its id. It holds no cryptography, no authorization, no installation logic, and — unlike earlier revisions — no message dispatch. The host resolves a name to an id and invokes the handler itself.
+The kernel is a **named table of handlers**: bind a name to a handler, resolve a name to the handler bound there. It holds no cryptography, no authorization, no installation logic, and no message dispatch. The host resolves a name and invokes the handler itself.
 
-Its whole export surface:
+The kernel is a **contract, not an artifact**. It is this section — the table, the pure-transform ABI (§4), and the `SetHandler` semantics (§3.1) — and each host implements it as one map:
 
 ```
-alloc(size) → ptr           host writes name bytes into kernel memory
-dealloc(ptr)                free them
-set_handler(name, id)       bind / replace a name → handler id   (§3.1)
-remove_handler(name)        unbind a name — SetHandler(name, null) (§3.1)
-find_handler(name) → id     resolve name → handler id, -1 if none
+handlers[name] → handler    bind / replace / resolve / remove   (§3.1)
 ```
 
-`find_handler` is the kernel's single routing decision: a zero-copy byte-wise scan over the table for a matching name, returning the handler id the host then invokes (or `-1`, which the host treats as "unbound — drop"). The table is a linear scan over a small set of entries; a hashmap keyed by the name was measured slower at the sizes actually run, because building the key cost more than the compare. The kernel imports nothing back into the host — there is no callback, no `invoke_handler`, no `kernel.call` seam. It stores function-pointer ids and answers lookups.
+`Map<string, handler>` in the JS host, `map[string]*entry` in the Go host. There is no kernel module to instantiate, no handler-id indirection, no memory staging across a boundary, and no second table to keep in step with a first. §1's vision sentence — "installing a handler is nothing more than `handlers[name] = wasm_bytes`" — is literally the implementation.
 
-**"Drop" semantics.** Throughout this document, **drop** means "silently ignore: no response is generated, no error is propagated to the sender." A name that resolves to `-1` is dropped by the host. The kernel never produces unsolicited output; every reply an app sends travels as a fresh frame under that app's own logic.
+**Why the table is not itself a WASM module.** Compiling it would buy "one kernel binary, every host" — but the table is two operations, and the handler *instances* it points at are per-target regardless (a `WebAssembly.Instance` in JS, a wazero `api.Module` in Go), so it could never be self-contained: each host would keep a parallel map beside it, keyed by an id invented to cross the boundary, plus the alloc/copy/call/dealloc round trip per lookup. What genuinely must not diverge between hosts is the bundle **load order** and the **admission rules**, and those *are* shared — as compiled TypeScript evaluated on every target (§12.9), where sharing pays.
+
+**Name resolution** is one map lookup. Names are strings (§5.1), so a bootstrap name reads plainly in a log and a scoped name is the hex a manifest already carries. A name that is not a key in the table is unbound.
+
+**"Drop" semantics.** Throughout this document, **drop** means "silently ignore: no response is generated, no error is propagated to the sender." An unbound name is dropped by the host. The kernel never produces unsolicited output; every reply an app sends travels as a fresh frame under that app's own logic.
 
 **No re-entrancy to reason about.** A handler is a pure transform that runs to completion and returns before anything else runs (§4). Handlers cannot call one another, so there is no call stack, no depth limit, no current-signer or caller state living across a call — all of which earlier revisions carried and none of which exists now. Concurrency is the host's concern: it drives one transform at a time, typically on a single event loop.
 
 ### 3.1 Host-level handler management (`SetHandler`)
 
-The host manages the table through two direct methods on the kernel:
+The host manages the table through two operations:
 
 ```
-set_handler(name, id)     install or replace the handler for name
-remove_handler(name)      remove it (the SetHandler(name, null) case)
+SetHandler(name, handler)    install or replace the handler for name
+SetHandler(name, null)       remove it
 ```
 
-`set_handler` installs or replaces in place, so the kernel never holds two entries for one name. Together these are the **only** way handlers enter or leave the table — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host wraps them as `register(name, jsHandler)` / `installBundleModule(...)` / `removeHandler(name)`, which allocate a host-side handler id and track the per-id implementation (a JS closure or an instantiated WASM handler) while the kernel owns only the name → id map.
+`SetHandler` installs or replaces in place, so the table never holds two entries for one name. Together these are the **only** way handlers enter or leave it — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host exposes them as `register(name, jsHandler)` / `installBundleModule(...)` / `removeHandler(name)`. What sits at a name is either a JS closure or an instantiated WASM handler; the table is indifferent, because both are reached the same way — by name, through `callHandler`.
 
 `SetHandler` is internal to the host process — a direct method call, never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it. Handlers seeded this way directly (rare — most deployments install nothing by hand and grow only through bundles, §9) have **no install record** — the loader's records (§12.4) cover only bundle-admitted modules.
 
@@ -65,7 +65,7 @@ The same call the host uses during bootstrap (§9) stays available afterward for
 
 ### 3.2 Growth is the loader's job, not the kernel's
 
-Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module — a policy decision (§12.5) followed by `set_handler` — and holds the install records `(author, bytes_hash)` that back it. None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting `set_handler` call. Frozen-config deployments load no bundles and grow no further.
+Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module — a policy decision (§12.5) followed by `SetHandler` — and holds the install records `(author, bytes_hash)` that back it. None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting bind. Frozen-config deployments load no bundles and grow no further.
 
 Because the loader verifies the manifest signature before it admits anything, "who authored this code" is already settled by an ordinary signature check (§12.4). Installation is not a special operation; it is `handlers[name] = wasm_bytes`, gated by the author + hash policy (§12.5).
 
@@ -95,7 +95,7 @@ Memory outside the scratch region is the handler's private state — statics, gl
 A handler imports **nothing from the runtime** — no `kernel.*` seam, no host functions. The only imports it carries are its own language runtime's shims (for AssemblyScript, `env.abort` / `seed` / `trace`), which are not a route to the outside world. Concretely, a handler **cannot**:
 
 - reach the filesystem, network, clock, or any I/O;
-- call another handler, or resolve a name — it has no `find_handler`, no cross-module call;
+- call another handler, or resolve a name — it cannot reach the table, and has no cross-module call;
 - ask who sent the input, who signed anything, or who called it — there is no signer, no caller, no author query.
 
 Everything a transform needs arrives **in its input**, and everything it produces leaves **in its output**. When a message must carry the sender's identity to the handler, the orchestrator prepends it to the input from the authenticated channel (§12.6) — as the chat app does, staging `senderPk ‖ body` (§11). This is the boundary that makes the sandbox trivial to reason about: a handler that can only read its input and write its output has no confused-deputy surface, no ambient authority, nothing to revoke.
@@ -124,7 +124,7 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 
 | Layer | Modules | What lives there |
 | --- | --- | --- |
-| **Kernel** | `kernel.wasm` | The name → handler-id table and `find_handler` routing (§3). No crypto, no I/O, no dispatch. |
+| **Kernel** | the host's `handlers` map | The name → handler table and its one lookup (§3). No crypto, no I/O, no dispatch. |
 | **Cap-bridge** (optional) | Cap-bridge (host-side) | The `host.call(op, bytes)` seam a confined guest reaches its I/O through — the only outward reach the guest has (§12.2). |
 | **App** | Chat (§11), [seed store](https://github.com/arj03/seedstore) | Pure-transform WASM handlers plus, optionally, a zero-authority JS guest — delivered as a signed bundle (§12.4). |
 
@@ -132,9 +132,9 @@ Each layer is testable standalone: the kernel is exercised on its own, the loade
 
 **The hash function used for id derivation.** A few places hash: `bytes_hash` (§12.4), the app-name derivations a policy may choose (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **BLAKE2b-256** — the *genesis hash*, computed host-side by `genesisHash` (libsodium's core `crypto_generichash`). There is exactly one hash across the whole system: the same BLAKE2b-256 backs the guest `HASH` op (§12.2), the AKE KDF and transcript hash (§12.6), and the block-id path. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
 
-**Naming convention for bootstrap handlers:** `name = "seedkernel.bootstrap.v1:" + canonical_name` — a readable string (opaque bytes, so nothing forces a hash) that reads plainly in logs. These names are host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand, not admitted through the loader, so there is no install record to mix in. The chat shell uses the same helper (`deriveBootstrapName`) to derive an *app's* kernel name from its id, so two peers running the same app route to the same name (§11).
+**Names are strings.** A name is an opaque string the kernel only ever matches — nothing forces a hash, so a name can read plainly in a log and in a manifest. **Bootstrap handlers:** `name = "seedkernel.bootstrap.v1:" + canonical_name`. These names are host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand, not admitted through the loader, so there is no install record to mix in. The chat shell uses the same helper (`deriveBootstrapName`) to derive an *app's* kernel name from its id, so two peers running the same app route to the same name (§11).
 
-**Naming convention for app handlers:** free-form within whatever the policy approves. The default policy (§12.5) places no constraint on names beyond uniqueness — the first author to bind a name owns it, and only that author can update it. Deployers who want author-scoped namespaces (so two parties can each have their own `chat` without conflict) can require names of the form `hash(canonical ‖ author_pubkey)` in their admission policy (the host's `deriveScopedName` computes exactly that). The kernel is indifferent.
+**Naming convention for app handlers:** free-form within whatever the policy approves. The default policy (§12.5) places no constraint on names beyond uniqueness — the first author to bind a name owns it, and only that author can update it. Deployers who want author-scoped namespaces (so two parties can each have their own `chat` without conflict) can require names of the form `hex(hash(canonical ‖ author_pubkey))` in their admission policy (the host's `deriveScopedName` computes exactly that — a hash rendered as hex, since a name is a string). The kernel is indifferent.
 
 **Relayed-message apps layer their own authenticity.** The channel authenticates one hop (§12.6). An app whose messages pass through intermediaries — a feed, a forum, store-and-forward gossip — cannot let the channel speak for the *original* author, so it becomes its own layer: a per-message signature naming the author, plus **backlinks** (a hash-chain, à la [SSB](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` or [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s lipmaa links) to order the history and make equivocation detectable. Signed bundles (§12.4) already do the author half for relayed *code*; a relayed-message app does the same one layer up, and it is a distinct app from chat, whose every message travels a single hop (§14 has the register-vs-log rationale).
 
@@ -148,7 +148,7 @@ All limits and reserved values in one place. Multi-byte integers are big-endian 
 | --- | --- | --- | --- |
 | `DEFAULT_SCRATCH_SIZE` | `131072` (128 KB) | Handler instantiation | Per-handler I/O region at `scratch`; a handler may declare more via `scratchSize` (§4.1). |
 
-A name that `find_handler` does not resolve returns `-1`, which the host treats as **drop** (§3). The kernel enforces nothing else — no magic, no version, no size cap; the transport and the handler own those bounds (§2).
+A name absent from the table is **dropped** by the host (§3). The kernel enforces nothing else — no magic, no version, no size cap; the transport and the handler own those bounds (§2).
 
 ### 16.1 Runtime (shell) constants
 

@@ -1,22 +1,26 @@
-// Host driver that loads kernel.wasm and wires the modules around it.
+// The host and the handler table it owns (README §3, §4).
 //
-// The kernel is a named table of PURE-TRANSFORM handlers (README §3, §4). A
-// handler exports `memory`, a `scratch` global, and `handle(input_len)`; the host
-// stages input at `scratch`, calls `handle`, and reads the response back from
-// `scratch`. Handlers import nothing — there is no kernel.call, no caller, no
-// signer, no envelope dispatch. The host is the orchestrator: it reaches a handler
-// by name with `callHandler` (the counterpart a guest reaches through the
-// cap-bridge's MODULE_CALL, README §12.2), and does all I/O and authorization
-// itself. The loader's install records live here too (README §12.4): the host binds
-// handlers, so it holds the `InstallRecords` store and forgets a slot's record when a
-// raw SetHandler mutates it — the host powers admission needs (instantiating WASM
-// handlers, genesis hashing, querying the table) are all its own methods.
+// The kernel is a **contract, not an artifact**: the table (`handlers[name] → handler`),
+// the pure-transform handler ABI (§4), and the `SetHandler` semantics (§3.1). Its whole
+// implementation is the one `Map` below. §1's vision sentence — "installing a handler is
+// nothing more than `handlers[name] = wasm_bytes`" — is literally this map, so there is no
+// kernel module to instantiate, no handler-id indirection, and no second table to keep in
+// sync with a first.
 //
-// Authenticity is the transport's job now (the AKE channel attributes every
-// frame), not a per-message signature — so there is no signature wrapper, no
-// signer scoping, and no §8/§4.4 authority machinery in the kernel at all.
+// A handler is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
+// `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
+// response back from `scratch`. Handlers import nothing — no kernel seam, no I/O, no
+// callback — so the host is the sole orchestrator: it reaches a handler by name with
+// `callHandler` (the counterpart a guest reaches through the cap-bridge's MODULE_CALL,
+// README §12.2), and does all I/O and authorization itself. The loader's install records
+// live here too (README §12.4): the host binds handlers, so it holds the `InstallRecords`
+// store and forgets a slot's record when a raw SetHandler mutates it.
+//
+// Authenticity is the transport's job (the AKE channel attributes every frame), not a
+// per-message signature — so there is no signature wrapper and no signer scoping here.
 
 import { InstallRecords, type AdmitPolicy, type InstallRecord } from "./bundle.js";
+import { toHex } from "./util.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -31,21 +35,10 @@ export interface Signer {
 }
 
 export type Handler = (
-  name: Uint8Array,
+  name: string,
   payload: Uint8Array,
   host: KernelHost
 ) => Uint8Array | void | null;
-
-// ─── kernel.wasm exports ─────────────────────────────────────────────────
-
-interface KernelExports {
-  memory: WebAssembly.Memory;
-  alloc(size: number): number;
-  dealloc(ptr: number): void;
-  set_handler(namePtr: number, nameLen: number, handlerId: number): void;
-  remove_handler(namePtr: number, nameLen: number): number;
-  find_handler(namePtr: number, nameLen: number): number;
-}
 
 // ─── handler routing ─────────────────────────────────────────────────────
 
@@ -61,115 +54,48 @@ interface WasmHandlerRef {
   exports: WebAssembly.Exports;
 }
 
-// Everything the host tracks about one handler, keyed by the kernel's handler id.
-// The kernel owns the name → id table (its `find_handler` export is the one
-// routing decision); the host owns only the per-id impl. Exactly one of
-// `handler` / `wasm` is set: a host-JS handler or a dynamic WASM handler.
+/** What the table holds at one name. Exactly one of `handler` / `wasm` is set: a
+ *  host-JS handler or an installed WASM handler. The table is indifferent to which —
+ *  both are reached the same way, by name through `callHandler`. */
 interface HandlerEntry {
-  name: Uint8Array;
   handler: Handler | null;
   wasm: WasmHandlerRef | null;
 }
 
 export class KernelHost {
-  private kernelExports!: KernelExports;
-  private sodium!: Sodium;
-  // Host-side handler state, keyed by the kernel's handler id. The kernel owns
-  // the name → id table (find_handler); the host owns only per-id metadata.
-  private entries = new Map<number, HandlerEntry>();
-  private nextHandlerId = 1;
+  /** The handler table (README §3). A name is bound exactly when it is a key here, so
+   *  the §3.1 SetHandler / remove / resolve operations are `set` / `delete` / `get` and
+   *  nothing else can disagree about what a name resolves to. */
+  private readonly handlers = new Map<string, HandlerEntry>();
+  private readonly sodium: Sodium;
   // The loader's install records + admission step (README §12.4). Intrinsic to the host
   // (it binds handlers), so a raw register/removeHandler can forget a stale record. No
   // admission policy is wired until setAdmitPolicy runs, so it refuses every bind by
   // default (deny-all, README §14).
   private readonly records = new InstallRecords(this);
 
-  private constructor() {}
-
-  /** Instantiate the kernel from in-memory bytes. The kernel alone is a usable
-   *  host (§1): `register` and `callHandler` work with nothing else wired, and loading
-   *  signed bundles is opt-in on top (wire an admission policy with setAdmitPolicy). The
-   *  caller supplies the bytes and an initialized libsodium (BLAKE2b-256 for content
-   *  hashing) —
-   *  keeping the entry point free of Node- or browser-specific I/O is what lets the
-   *  same host run in Node, browsers, Deno, Bun, etc. The thin entry points in
-   *  `node.ts` / `browser.ts` package the loading dance for each platform. */
-  static async load(
-    kernelBytes: BufferSource,
-    sodium: Sodium,
-  ): Promise<KernelHost> {
-    const host = new KernelHost();
-    host.sodium = sodium;
-
-    // ── load kernel.wasm ──────────────────────────────────────────────
-    // The kernel imports nothing but the AssemblyScript runtime shims — it no
-    // longer calls back into the host (there is no dispatch/invoke_handler path).
-    const kernelImports: WebAssembly.Imports = {
-      env: {
-        abort: (_msgPtr: number, _filePtr: number, line: number, col: number) => {
-          throw new Error(`kernel.wasm abort at ${line}:${col}`);
-        },
-        seed: () => Date.now(),
-        trace: () => {},
-      },
-    };
-    const kernelResult = await WebAssembly.instantiate(kernelBytes, kernelImports);
-    host.kernelExports = kernelResult.instance.exports as unknown as KernelExports;
-
-    return host;
-  }
-
-  // ─── kernel memory helpers ───────────────────────────────────────────
-
-  private writeToKernel(data: Uint8Array): number {
-    const ptr = this.kernelExports.alloc(data.length);
-    new Uint8Array(this.kernelExports.memory.buffer, ptr, data.length).set(data);
-    return ptr;
-  }
-
-  private readFromKernel(ptr: number, len: number): Uint8Array {
-    return new Uint8Array(this.kernelExports.memory.buffer, ptr, len).slice();
-  }
-
-  /** Resolve the handler id bound to `name` via the kernel's find_handler
-   *  export, or -1 if none. The single name → id lookup used by every host path
-   *  so they can never disagree. */
-  private findHandlerId(name: Uint8Array): number {
-    const ptr = this.writeToKernel(name);
-    try { return this.kernelExports.find_handler(ptr, name.length); }
-    finally { this.kernelExports.dealloc(ptr); }
-  }
-
-  /** Bind `name` to `id` in the kernel table and record `entry` host-side,
-   *  dropping whatever entry the name was previously bound to. Centralizes the
-   *  "one name ⇒ one handler id" bookkeeping so register / _installWasmHandler
-   *  can't leave a stale entry behind. */
-  private bindHandler(name: Uint8Array, id: number, entry: HandlerEntry): void {
-    const ptr = this.writeToKernel(name);
-    let oldId: number;
-    try {
-      oldId = this.kernelExports.find_handler(ptr, name.length);
-      this.kernelExports.set_handler(ptr, name.length, id);
-    } finally {
-      this.kernelExports.dealloc(ptr);
-    }
-    if (oldId >= 0 && oldId !== id) this.entries.delete(oldId);
-    this.entries.set(id, entry);
+  /** The host needs nothing but a hash to stand up: hand it an initialized libsodium
+   *  (BLAKE2b-256 for content hashing) and the table is live — `register` and
+   *  `callHandler` work with nothing else wired (§1), and loading signed bundles is
+   *  opt-in on top (wire an admission policy with `setAdmitPolicy`). Keeping the
+   *  constructor free of Node- or browser-specific I/O is what lets the same host run in
+   *  Node, browsers, Deno, Bun and QuickJS; the thin entry points in `node.ts` /
+   *  `browser.ts` package readying sodium for each platform. */
+  constructor(sodium: Sodium) {
+    this.sodium = sodium;
   }
 
   // ─── invocation ──────────────────────────────────────────────────────
 
-  /** Invoke the handler at `handlerId` with `payload`, returning its response
-   *  bytes, or null if no response / no handler. For a WASM handler this is the
-   *  scratch-region contract (README §4): write input at the handler's scratch
-   *  offset, call handle(input_len), read the response from the same offset. */
-  private _invokeHandlerGetResponse(
-    handlerId: number,
-    name: Uint8Array,
+  /** Run `entry` with `payload`, returning its response bytes, or null if it produced
+   *  none. For a WASM handler this is the scratch-region contract (README §4): write
+   *  input at the handler's scratch offset, call handle(input_len), read the response
+   *  from the same offset. */
+  private invoke(
+    entry: HandlerEntry,
+    name: string,
     payload: Uint8Array
   ): Uint8Array | null {
-    const entry = this.entries.get(handlerId);
-    if (!entry) return null;
     const wasm = entry.wasm;
     if (wasm) {
       if (payload.length > wasm.scratchSize) return null;
@@ -201,11 +127,10 @@ export class KernelHost {
    *  §12.4). A handler is a pure transform: it imports only the AssemblyScript
    *  runtime shims (`env.*`) — no `kernel.*` seam — and exports `memory`, a
    *  `scratch` global, and `handle`. Returns false on any structural failure. */
-  _installWasmHandler(targetName: Uint8Array, wasmBytes: Uint8Array): boolean {
+  _installWasmHandler(targetName: string, wasmBytes: Uint8Array): boolean {
     if (targetName.length === 0) return false;
     if (wasmBytes.length === 0) return false;
 
-    const handlerId = this.nextHandlerId++;
     let instance: WebAssembly.Instance;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);
@@ -244,11 +169,10 @@ export class KernelHost {
       }
     }
 
-    // SetHandler is unconditional at the kernel level — replace whatever is
-    // there (bindHandler drops the displaced id's host entry). The admission
-    // policy was applied before this method was called.
-    this.bindHandler(targetName, handlerId, {
-      name: targetName.slice(),
+    // SetHandler is unconditional at the table level — replace whatever is there. The
+    // admission policy was applied before this method was called. The displaced entry
+    // is simply dropped: the instance it held is unreachable and collectable.
+    this.handlers.set(targetName, {
       handler: null,
       wasm: {
         memory: exps.memory,
@@ -268,13 +192,11 @@ export class KernelHost {
    *  scratch first. Returns the export's i32 return value or null on failure.
    *  An export taking no arguments is reached with an empty payload. */
   callDynamicExport(
-    name: Uint8Array,
+    name: string,
     exportName: string,
     payload: Uint8Array,
   ): number | null | undefined {
-    const hid = this.findHandlerId(name);
-    if (hid < 0) return null;
-    const wasm = this.entries.get(hid)?.wasm;
+    const wasm = this.handlers.get(name)?.wasm;
     if (!wasm) return null;
     const fn = (wasm.exports as { [k: string]: unknown })[exportName];
     if (typeof fn !== "function") return null;
@@ -288,24 +210,17 @@ export class KernelHost {
    *  produced no response. The generic "run a transform" primitive: the host uses
    *  it directly, and a guest reaches it through the cap-bridge's MODULE_CALL
    *  (README §12.2). Handlers cannot call back, so there is no re-entrancy. */
-  callHandler(name: Uint8Array, payload: Uint8Array): Uint8Array | null {
-    const hid = this.findHandlerId(name);
-    if (hid < 0) return null;
-    return this._invokeHandlerGetResponse(hid, name, payload);
+  callHandler(name: string, payload: Uint8Array): Uint8Array | null {
+    const entry = this.handlers.get(name);
+    return entry ? this.invoke(entry, name, payload) : null;
   }
 
-  /** Register a host-side handler (a JS closure bound at `name`). Returns the
-   *  assigned id. Reachable exactly like a WASM handler — by name through
-   *  `callHandler` — since the kernel table is indifferent to the impl. */
-  register(name: Uint8Array, handler: Handler): number {
-    const id = this.nextHandlerId++;
-    this.bindHandler(name, id, {
-      name: name.slice(),
-      handler,
-      wasm: null,
-    });
+  /** Register a host-side handler (a JS closure bound at `name`) — the `SetHandler`
+   *  path of §3.1. Reachable exactly like a WASM handler, by name through
+   *  `callHandler`, since the table is indifferent to the impl. */
+  register(name: string, handler: Handler): void {
+    this.handlers.set(name, { handler, wasm: null });
     this.records.forget(name);
-    return id;
   }
 
   /** Wire the admission policy the loader gates bundle modules with (README §12.5).
@@ -317,7 +232,7 @@ export class KernelHost {
 
   /** Read-only access to the install record at `name`, or null. Host-side read of the
    *  loader's records (README §12.4) — there is no wire query. */
-  lookupInstall(name: Uint8Array): InstallRecord | null {
+  lookupInstall(name: string): InstallRecord | null {
     return this.records.lookup(name);
   }
 
@@ -327,38 +242,30 @@ export class KernelHost {
    *  code arrives. The record's author is the manifest `authorPubKey` (an Ed25519 genesis
    *  key, §12.4), gated by the admission policy. Returns true on success, false if no
    *  policy is wired or it refuses. The bundle loader calls this once per verified module. */
-  installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
+  installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 
   /** Remove a handler, the `SetHandler(name, null)` case in §3.1 — and the loader's
    *  `remove(name)` revocation path (§12.5): it clears the slot's install record too, so
    *  the same key cannot later be misattributed onto brand-new bytes. */
-  removeHandler(name: Uint8Array): boolean {
-    const ptr = this.writeToKernel(name);
-    try {
-      const id = this.kernelExports.find_handler(ptr, name.length);
-      const ok = this.kernelExports.remove_handler(ptr, name.length) === 1;
-      if (ok) {
-        if (id >= 0) this.entries.delete(id);
-        this.records.forget(name);
-      }
-      return ok;
-    } finally { this.kernelExports.dealloc(ptr); }
+  removeHandler(name: string): boolean {
+    if (!this.handlers.delete(name)) return false;
+    this.records.forget(name);
+    return true;
   }
 
-  /** True if a handler occupies `name`. A bound name is exactly one the kernel's
-   *  `find_handler` resolves, so this asks that rather than a second export. The loader's
-   *  admission consults it (via `InstallRecords`) to refuse overlaying a hand-seeded slot. */
-  isRegistered(name: Uint8Array): boolean {
-    return this.findHandlerId(name) >= 0;
+  /** True if a handler occupies `name`. The loader's admission consults it (via
+   *  `InstallRecords`) to refuse overlaying a hand-seeded slot. */
+  isRegistered(name: string): boolean {
+    return this.handlers.has(name);
   }
 
   /** A bootstrap handler name (README §5.1): the literal-ASCII
    *  `"seedkernel.bootstrap.v1:" + canonical`. Bootstrap names are plain ASCII,
    *  not genesis-hash-derived — so names read plainly in logs. */
-  deriveBootstrapName(canonical: string): Uint8Array {
-    return new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical);
+  deriveBootstrapName(canonical: string): string {
+    return "seedkernel.bootstrap.v1:" + canonical;
   }
 
   /** Hash the raw bytes of `data` with the genesis hash (BLAKE2b-256) — the one system
@@ -370,15 +277,15 @@ export class KernelHost {
     return this.sodium.crypto_generichash(32, data, null);
   }
 
-  /** Derive a deterministic name as `BLAKE2b-256(canonical || authorPubKey)`. Useful
+  /** Derive a deterministic name as `hex(BLAKE2b-256(canonical || authorPubKey))`. Useful
    *  for deployer policies that want author-scoped names so two parties can each
-   *  hold their own `chat` without conflict (§5.1). The kernel is indifferent to
+   *  hold their own `chat` without conflict (§5.1). The table is indifferent to
    *  derivation — this is just a convenience. */
-  deriveScopedName(canonical: string, authorPubKey: Uint8Array): Uint8Array {
+  deriveScopedName(canonical: string, authorPubKey: Uint8Array): string {
     const nameBytes = new TextEncoder().encode(canonical);
     const buf = new Uint8Array(nameBytes.length + authorPubKey.length);
     buf.set(nameBytes, 0);
     buf.set(authorPubKey, nameBytes.length);
-    return this.sodium.crypto_generichash(32, buf, null);
+    return toHex(this.sodium.crypto_generichash(32, buf, null));
   }
 }

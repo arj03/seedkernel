@@ -14,7 +14,7 @@ const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 const {
-  loadKernelHost,
+  createKernelHost,
   generateKeyPair,
   ensureSodium,
 } = await imp("build/host/node.js");
@@ -57,14 +57,12 @@ function assertEqual(actual, expected, msg) {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 }
 
-const kernelWasm = join(root, "build/kernel.wasm");
-
-// Standard bootstrap (README §9): a fresh kernel with the loader's admission
+// Standard bootstrap (README §9): a fresh handler table with the loader's admission
 // policy wired. The default policy admits every module; tests that need rejection
 // override via host.setAdmitPolicy. Handlers are pure transforms with no
 // signature/dispatch seam, so there is nothing else to wire.
 async function makeHost(admit = () => true) {
-  const host = await loadKernelHost(kernelWasm);
+  const host = await createKernelHost();
   host.setAdmitPolicy(admit);
   return { host };
 }
@@ -556,9 +554,11 @@ async function testCapBridge() {
     const peers = await bridge(CAP.NET_PEERS, U());
     assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "CAP_NET_PEERS counts the cohort");
 
-    // module-call reaches an installed handler by name
-    const mc = new Uint8Array(1 + echoName.length + 2);
-    mc[0] = echoName.length; mc.set(echoName, 1); mc.set(U(8, 9), 1 + echoName.length);
+    // module-call reaches an installed handler by name — the name crosses the seam as
+    // its UTF-8 bytes (§12.2 MODULE_CALL: [nameLen u8][name utf8][req]).
+    const echoNameBytes = new TextEncoder().encode(echoName);
+    const mc = new Uint8Array(1 + echoNameBytes.length + 2);
+    mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
     assertEqual([...await bridge(CAP.MODULE_CALL, mc)], [2, 8, 9], "CAP_MODULE_CALL invokes the named handler");
   } finally {
     transport.close();
@@ -686,7 +686,6 @@ async function testShellBoot() {
   let shell;
   try {
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
@@ -728,7 +727,7 @@ async function testBundle() {
       app: "test", version: 1,
       modules: [{
         name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName: toHex(kernelName),
+        kernelName,
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
       caps: [],
@@ -745,7 +744,6 @@ async function testBundle() {
 
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
@@ -770,7 +768,6 @@ async function testBundle() {
 
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(generateKeyPair().publicKey)] }),
       dir: pjoin(dir, "_data2"), identity,
     });
@@ -812,7 +809,7 @@ async function testGuestlessBundleAndArchive() {
       app: "demo", version: 1,
       modules: [{
         name: "demo", file: "app.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName: toHex(kernelName),
+        kernelName,
       }],
       caps: [],
     };
@@ -835,7 +832,6 @@ async function testGuestlessBundleAndArchive() {
     wf(pjoin(dir, "manifest.bundle"), manifestEnv);
     wf(pjoin(dir, "app.wasm"), forwarderBytes);
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
@@ -1908,7 +1904,7 @@ async function testBundleCorruptNewerRollback() {
       app: "rollback", version,
       modules: [{
         name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName: toHex(kernelName),
+        kernelName,
       }],
       guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
       caps: [],
@@ -1918,7 +1914,6 @@ async function testBundleCorruptNewerRollback() {
       wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));
 
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });

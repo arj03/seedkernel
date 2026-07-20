@@ -12,7 +12,7 @@ Every node-to-node link is an **encrypted, authenticated channel** (§12.6): an 
 
 | Component | Role |
 | --- | --- |
-| **Kernel** | Routes names to handlers: a flat `handlers[name]` table resolved by `find_handler` (§3). Handlers are pure transforms; the kernel has no dispatch loop, no signature logic, no I/O. The table changes only through the host-level `SetHandler` (§3.1). |
+| **Kernel** | Routes names to handlers: a flat `handlers[name]` table (§3). It is a *contract*, not an artifact — the table, the handler ABI, and `SetHandler` semantics — implemented as one map inside each host. Handlers are pure transforms; there is no dispatch loop, no signature logic, no I/O. |
 | **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It reaches a handler by name (`callHandler`), does all I/O and authorization itself, and provides `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import nothing but the AssemblyScript runtime — no kernel seam, no I/O of their own. |
 | **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits each module into the flat table — a policy decision, then `SetHandler`. |
@@ -36,7 +36,7 @@ policy check — author trusted? version valid?        §12.5
 admit each module — policy ok? record (author, hash) §12.4
         │
         ▼
-SetHandler(name, wasm_bytes) — kernel table updated  §3.1
+SetHandler(name, wasm_bytes) — handler table updated §3.1
         │
         ▼
 compile & register guest JS in QuickJS realm
@@ -52,7 +52,7 @@ incoming encrypted frame (authenticated channel)      §12.6
 host extracts target name, stages input bytes
         │
         ▼
-kernel.find_handler(name) → WASM instance            §3
+handlers[name] → handler (one map lookup)            §3
         │
         ▼
 pure transform at scratch offset → output bytes      §4
@@ -76,8 +76,8 @@ The reference composition stacks the layers so each depends only on the layers b
 ├──────────────────────────────────┤
 │   Kernel                         │
 │                                  │
-│   name → handler table           │
-│   find_handler routing           │
+│   handlers[name] → handler       │
+│   one map, held by the host      │
 └──────────────────────────────────┘
 ```
 
@@ -87,14 +87,14 @@ The reference composition stacks the layers so each depends only on the layers b
 - Modules, as untrusted code, run confined. WASM handlers are synchronous pure transforms with no reach beyond the bytes they are handed—they receive a buffer and return a buffer, and that is the full extent of their interaction. JavaScript is reserved for handlers that must await multiple host interactions, handle streaming data, or maintain conversational state across asynchronous turns—QuickJS's native async model makes this straightforward—while maintaining zero ambient authority and exposing only the single host.call seam.
 - Node-to-node links are confidential by default — the runtime transport opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket, and WebRTC and needing no external TLS or Noise tunnel.
 - The channel authenticates one hop, not the whole path. The encrypted link attributes each frame to the peer that sent it (§12.6) — end-to-end for a direct exchange like chat, where every message travels a single hop. An app that **relays** messages through intermediaries — a forum, a feed, store-and-forward gossip — cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top.
-- The kernel compiles to WebAssembly, so the same kernel runs unmodified in every host — browser, server runtime, or a single native binary.
+- The kernel is a specification, not a binary. A name→handler table is too small a thing to ship as an artifact — and the handler instances it points at are per-target anyway — so each host implements it as a plain map. What must not drift between hosts is the bundle load order and the admission rules, and those are shared as one compiled implementation on every target (§12.9).
 
 ## Get started
 
 ```sh
 cd WASM
 npm install
-npm run build        # kernel.wasm + ws.wasm + the shared host
+npm run build        # ws.wasm + the shared host
 node tests/run.mjs   # end-to-end tests
 ```
 
@@ -107,7 +107,7 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 | Doc | Sections | Contents |
 | --- | --- | --- |
 | [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level `SetHandler`, the pure-transform WASM handler ABI, layering, the protocol constants. |
-| [BOOTSTRAP](docs/BOOTSTRAP.md) | §9 | The bootstrap sequence that composes the onion — kernel, admission policy, and the first signed bundles. |
+| [BOOTSTRAP](docs/BOOTSTRAP.md) | §9 | The bootstrap sequence that composes the onion — the table, admission policy, and the first signed bundles. |
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the chat demo, and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 

@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { loadKernelHost }
+import { createKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 import { signManifest, verifyManifest, contentMatches, packBundle, unpackBundle }
@@ -92,12 +92,12 @@ function hexToBytes(hex) {
   return out;
 }
 
-shellPrint("Loading kernel WASM...", "sys");
-const host = await loadKernelHost("../build/kernel.wasm", sodium);
+shellPrint("Starting the handler table...", "sys");
+const host = await createKernelHost(sodium);
 
 // ─── admission policy ──────────────────────────────────────────────────
-// The kernel is a named table of pure-transform handlers now — no signature
-// wrapper, no envelopes, no signer. The loader (§12.4) is the only bootstrap
+// The kernel is a named table of pure-transform handlers, held by the host — no
+// signature wrapper, no envelopes, no signer. The loader (§12.4) is the only bootstrap
 // piece: it admits signed bundles under the admission policy below. Message
 // authenticity comes from the AKE channel (PeerLink), not a per-message signature.
 //
@@ -348,7 +348,7 @@ async function buildAppBundle(wasmBytes) {
       name: meta.id,
       file: "app.wasm",
       hash: bytesToHex(host.genesisHash(wasmBytes)),
-      kernelName: bytesToHex(appHandlerName(meta.id)),
+      kernelName: appHandlerName(meta.id),
     }],
     caps: [],
   };

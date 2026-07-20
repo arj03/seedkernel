@@ -1,11 +1,11 @@
-// seedkernel native shell. The runtime is wasm (kernel); apps arrive as signed
-// bundles (README §12) — nothing application-specific lives here. Host
-// orchestration (bundle verification + admission §12.4/§12.5) is JavaScript in QuickJS —
-// the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
-// second implementation (README §12.9); this Go layer is only the bridge: loads the
-// kernel wasm, supplies the crypto primitives (Ed25519 via libsodium, BLAKE2b native) the
-// realm verifies bundles with, and exposes byte primitives to the realm. Pure Go, no
-// cgo (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero bridge) → one static binary.
+// seedkernel native shell. Apps arrive as signed bundles (README §12) — nothing
+// application-specific lives here. Host orchestration (bundle verification + admission
+// §12.4/§12.5) is JavaScript in QuickJS — the shared host TS, compiled and bundled to the
+// embedded host-*.gen.js, never a second implementation (README §12.9); this Go layer is
+// only the bridge: it owns the handler table (§3), supplies the crypto primitives
+// (Ed25519 via libsodium, BLAKE2b native) the realm verifies bundles with, and exposes
+// byte primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
+// in-repo qjs/wazero bridge) → one static binary.
 package main
 
 import (
@@ -29,9 +29,6 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-//go:embed wasm/kernel.wasm
-var kernelWasm []byte
-
 // hostInstallerJS is the shared bundle loader + admission policy + bundle format,
 // bundled from build/host/{util,domains,bundle,policy,native-shim}.js. It runs in
 // QuickJS over the byte-level `bridge` below and is the ONLY implementation of the
@@ -52,23 +49,26 @@ type wasmHandler struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// entry is what the loader tracks per installed handler, keyed by the kernel's handler id.
-// The kernel owns name → id (find_handler) — the one routing decision every path resolves
-// through — so keying by id here leaves no second name table to drift from it. Exactly one
-// of nat (a native host service) / wasm (an installed module) is set.
+// entry is what the loader holds at one bound name. Exactly one of nat (a native host
+// service) / wasm (an installed module) is set.
 type entry struct {
 	nat  func([]byte) []byte
 	wasm *wasmHandler
 }
 
 var (
-	ctx     = context.Background()
-	rt      wazero.Runtime
-	kn      api.Module
-	qc      *qjs.Context
-	qrt     *qjs.Runtime
-	entries = map[int32]*entry{} // kernel handler id → impl (the kernel owns name → id)
-	nextID  = int32(10)
+	ctx = context.Background()
+	rt  wazero.Runtime
+	qc  *qjs.Context
+	qrt *qjs.Runtime
+	// handlers is the handler table (README §3): the whole kernel, which is a contract
+	// rather than an artifact. A name is bound exactly when it is a key here, so the §3.1
+	// SetHandler / remove / resolve operations are map assignment, delete and lookup —
+	// there is no id indirection and no second table to drift from this one.
+	handlers = map[string]*entry{}
+	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
+	// module name; it is not an identity anything resolves through.
+	modSeq = 0
 )
 
 // defaultScratchSize is the I/O region a handler reserves at `scratch` when it declares
@@ -77,135 +77,55 @@ var (
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
-// wasmCall invokes a wasm export, returning nil if it's missing or the call failed —
-// so a missing ABI function degrades instead of panicking the host.
-func wasmCall(m api.Module, name string, args ...uint64) []uint64 {
-	if fn := m.ExportedFunction(name); fn != nil {
-		if r, err := fn.Call(ctx, args...); err == nil {
-			return r
-		}
-	}
-	return nil
-}
-
-func wr(m api.Module, data []byte) uint32 {
-	r := wasmCall(m, "alloc", uint64(len(data)))
-	// alloc can fail two ways: the call itself faults (len(r)==0) or it returns a NULL
-	// pointer (r[0]==0) when the module is out of memory. Either is a 0 return here —
-	// writing at address 0 would scribble the module's low memory, and callers key off 0.
-	if len(r) == 0 || r[0] == 0 {
-		return 0
-	}
-	p := uint32(r[0])
-	if !m.Memory().Write(p, data) {
-		wasmCall(m, "dealloc", uint64(p)) // hand the block back rather than leak it
-		return 0
-	}
-	return p
-}
-
 // name is a bootstrap handler name (README §5.1): the literal-ASCII
 // "seedkernel.bootstrap.v1:" + canonical. Bootstrap names are plain ASCII, not
 // genesis-hash-derived — swapping the genesis hash no longer re-derives the
 // bootstrap namespace (only bytes_hash still depends on the genesis hash).
-func name(canonical string) []byte {
-	return []byte("seedkernel.bootstrap.v1:" + canonical)
+func name(canonical string) string {
+	return "seedkernel.bootstrap.v1:" + canonical
 }
 
-// findHandlerID resolves the id bound to `n` through the kernel's find_handler export, or
-// -1. The single name → id lookup every loader path goes through (callHandler, install,
-// boot), so none can resolve a name differently (§3.1).
-func findHandlerID(n []byte) int32 {
-	p := wr(kn, n)
-	if p == 0 {
-		return -1
-	}
-	r := wasmCall(kn, "find_handler", uint64(p), uint64(len(n)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if len(r) == 0 {
-		return -1
-	}
-	return int32(r[0])
+// bind binds `n` to `e`, releasing whatever the name held before — SetHandler's
+// replace-in-place (§3.1). The one place a displaced wasm instance is closed: Go frees
+// neither the instance nor its compiled code on its own, so dropping the map value alone
+// would leak one linear memory + its JITed code per replace for the process's life.
+func bind(n string, e *entry) {
+	closeEntry(handlers[n])
+	handlers[n] = e
 }
 
-// bindHandler binds `n` to `id` in the kernel's table and records `e` under that id,
-// dropping whatever the name was bound to before. The one place "one name ⇒ one handler id"
-// is maintained, so no install path leaves a stale entry — or a leaked wasm instance —
-// behind. The displaced id is resolved before the rebind, so it sees the pre-rebind table.
-func bindHandler(n []byte, id int32, e *entry) bool {
-	old := findHandlerID(n)
-	p := wr(kn, n)
-	if p == 0 {
-		return false
-	}
-	wasmCall(kn, "set_handler", uint64(p), uint64(len(n)), uint64(uint32(id)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if old >= 0 && old != id {
-		dropEntry(old)
-	}
-	entries[id] = e
-	return true
-}
-
-// dropEntry forgets the entry at `id`, closing its wasm instance and compiled code. Go
-// frees neither on its own, so dropping the map key alone would leak one linear memory +
-// its JITed code per replace/uninstall for the process's life.
-func dropEntry(id int32) {
-	e := entries[id]
-	if e == nil {
+// closeEntry releases an entry's wasm instance and compiled code. nil-safe, so callers
+// can hand it whatever a lookup returned.
+func closeEntry(e *entry) {
+	if e == nil || e.wasm == nil {
 		return
 	}
-	if w := e.wasm; w != nil {
-		_ = w.mod.Close(ctx)
-		_ = w.cmod.Close(ctx)
-	}
-	delete(entries, id)
+	_ = e.wasm.mod.Close(ctx)
+	_ = e.wasm.cmod.Close(ctx)
 }
 
-// isRegistered answers the kernel's handler-table query for `n`: a name is bound
-// exactly when find_handler resolves it, so this asks that rather than a second
-// export answering the same question. The shared §12.5 admission consults it so a
-// first install cannot overlay a SetHandler-seeded bootstrap slot.
-func isRegistered(n []byte) bool {
-	return findHandlerID(n) >= 0
+// isRegistered answers the handler-table query for `n` — a name is bound exactly when the
+// table holds it. The shared §12.5 admission consults it so a first install cannot overlay
+// a SetHandler-seeded bootstrap slot.
+func isRegistered(n string) bool {
+	return handlers[n] != nil
 }
 
-// removeHandler unbinds `n` via the kernel's remove_handler (§12.5) and drops the entry it
-// resolved to. The id is read before the removal, since afterwards the name maps to nothing.
-func removeHandler(n []byte) bool {
-	id := findHandlerID(n)
-	p := wr(kn, n)
-	if p == 0 {
+// removeHandler unbinds `n` (§12.5) and releases what it held.
+func removeHandler(n string) bool {
+	e := handlers[n]
+	if e == nil {
 		return false
 	}
-	r := wasmCall(kn, "remove_handler", uint64(p), uint64(len(n)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if len(r) == 0 || r[0] != 1 {
-		return false
-	}
-	if id >= 0 {
-		dropEntry(id)
-	}
+	closeEntry(e)
+	delete(handlers, n)
 	return true
 }
 
-func load(wasm []byte, modName string) api.Module {
-	cm, _ := rt.CompileModule(ctx, wasm)
-	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(modName))
-	if err != nil {
-		panic(err)
-	}
-	return m
-}
-
-// invokeByID runs the handler bound to `id` (README §4 scratch ABI) and returns its
-// response. Routing already happened, by id against the kernel's table, so `n` is only
-// passed through to native handlers. The one invocation path, reached through callHandler.
-func invokeByID(id int32, n, payload []byte) []byte {
-	e := entries[id]
-	if e == nil {
-		return nil
-	}
+// invoke runs `e` (README §4 scratch ABI) and returns its response. Routing already
+// happened — the caller resolved the name against the table — so this is purely the
+// transform. The one invocation path, reached through callHandler.
+func invoke(e *entry, payload []byte) []byte {
 	if w := e.wasm; w != nil {
 		// §4: write input at the scratch offset, call handle(input_len), read the response
 		// back from the same offset. Both copies are clamped to what the handler reserved
@@ -247,23 +167,24 @@ func invokeByID(id int32, n, payload []byte) []byte {
 // nil if the name is unbound or the handler produced nothing. The one way into an installed
 // module: the host uses it directly and the cap-bridge routes MODULE_CALL (§12.2) through
 // it. Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
-func callHandler(n, payload []byte) []byte {
-	id := findHandlerID(n)
-	if id < 0 {
+func callHandler(n string, payload []byte) []byte {
+	e := handlers[n]
+	if e == nil {
 		return nil
 	}
-	return invokeByID(id, n, payload)
+	return invoke(e, payload)
 }
 
-// installWasm instantiates handler bytes and binds them to the raw name `n`. The replace is
-// unconditional — the §12.5 admission already ran, and bindHandler releases whatever the name
+// installWasm instantiates handler bytes and binds them at the name `n`. The replace is
+// unconditional — the §12.5 admission already ran, and bind releases whatever the name
 // displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §12.4).
-func installWasm(n, wasm []byte) bool {
+func installWasm(n string, wasm []byte) bool {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return false
 	}
-	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", nextID)))
+	modSeq++
+	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	if err != nil {
 		_ = cm.Close(ctx) // instantiation failed — release the compiled code
 		return false
@@ -294,27 +215,25 @@ func installWasm(n, wasm []byte) bool {
 			size = d
 		}
 	}
-	id := nextID
-	nextID++
-	bound = bindHandler(n, id, &entry{wasm: &wasmHandler{m, cm, fn, s, size}})
-	return bound
+	bind(n, &entry{wasm: &wasmHandler{m, cm, fn, s, size}})
+	bound = true
+	return true
 }
 
-// boot wires the wasm host imports, instantiates kernel + signature, and stands up the
-// QuickJS realm running the shared bundle loader + admission policy (host-installer.gen.js).
+// boot wires the wasm host imports and stands up the QuickJS realm running the shared
+// bundle loader + admission policy (host-installer.gen.js).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the genesis verify routes to it below
-	// The kernel and every installed handler are pure transforms (README §4): the only
-	// host import they take is the AssemblyScript `env.abort` shim. There is no kernel.call
-	// / kernel.caller seam and no env.invoke_handler dispatch callback any more.
+	// Every installed handler is a pure transform (README §4): the only host import it
+	// takes is the AssemblyScript `env.abort` shim. There is no kernel.call / kernel.caller
+	// seam and no env.invoke_handler dispatch callback.
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
 	env.Instantiate(ctx)
-	kn = load(kernelWasm, "kernelmod")
-	// The runtime above is fresh, so its kernel table is empty: drop entries a previous boot
-	// left behind (the tests boot repeatedly) rather than keep ids from a dead runtime.
-	entries = map[int32]*entry{}
+	// The runtime above is fresh, so every handler from a previous boot points into a dead
+	// one (the tests boot repeatedly): start from an empty table rather than keep them.
+	handlers = map[string]*entry{}
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -325,23 +244,20 @@ func boot() {
 	b := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 	b.SetPropertyStr("installWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		nm, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		wb, _ := qjs.JsTypedArrayToGo(t.Args()[1])
-		return t.Context().NewBool(installWasm(nm, wb)), nil
+		return t.Context().NewBool(installWasm(t.Args()[0].String(), wb)), nil
 	}))
 	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
 	}))
 	// The §12.5 admission refuses to overlay a SetHandler-seeded slot, so the
-	// shared policy needs the kernel's handler-table query.
+	// shared policy needs the handler-table query.
 	b.SetPropertyStr("isRegistered", fn(func(t *qjs.This) (*qjs.Value, error) {
-		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
-		return t.Context().NewBool(isRegistered(n)), nil
+		return t.Context().NewBool(isRegistered(t.Args()[0].String())), nil
 	}))
 	b.SetPropertyStr("removeHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
-		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
-		return t.Context().NewBool(removeHandler(n)), nil
+		return t.Context().NewBool(removeHandler(t.Args()[0].String())), nil
 	}))
 	// Bundle-freshness persistence (§12.4): the arithmetic is shared JS, the durable
 	// write is ours — a truncated store reads back as "no marks", silently dropping
@@ -381,18 +297,15 @@ func boot() {
 	// no message-driven install path (§12.4).
 }
 
-// registerNativeAt binds a native host service (a Go closure) at the raw kernel name `n`,
+// registerNativeAt binds a native host service (a Go closure) at the kernel name `n`,
 // reachable by name through callHandler exactly like an installed module — the native
-// counterpart of the JS host's `register`. Returns the id the kernel now has it under.
-func registerNativeAt(n []byte, fn func([]byte) []byte) int32 {
-	id := nextID
-	nextID++
-	bindHandler(n, id, &entry{nat: fn})
-	return id
+// counterpart of the JS host's `register`.
+func registerNativeAt(n string, fn func([]byte) []byte) {
+	bind(n, &entry{nat: fn})
 }
 
-func registerNative(canonical string, fn func([]byte) []byte) int32 {
-	return registerNativeAt(name(canonical), fn)
+func registerNative(canonical string, fn func([]byte) []byte) {
+	registerNativeAt(name(canonical), fn)
 }
 
 // invokeFree calls the named global function as global.name(args...), then frees the
@@ -531,15 +444,11 @@ func applyPolicy(json string) error {
 // modules: codec, reputation). null when the handler is absent or returns nothing.
 func wireModuleCall() {
 	qc.Global().SetPropertyStr("__moduleCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		nm, err := qjs.JsTypedArrayToGo(t.Args()[0])
-		if err != nil {
-			return t.Context().NewNull(), nil
-		}
 		pl, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return t.Context().NewNull(), nil
 		}
-		resp := callHandler(nm, pl)
+		resp := callHandler(t.Args()[0].String(), pl)
 		if resp == nil {
 			return t.Context().NewNull(), nil
 		}

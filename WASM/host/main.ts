@@ -1,6 +1,6 @@
 // seedkernel-shell — the generic runtime entry (README §12).
-// It boots the kernel under an install policy and serves; it knows nothing about
-// storage or any other app. Everything an app needs arrives as a signed bundle
+// It stands up the handler table under an install policy and serves; it knows
+// nothing about storage or any other app. Everything an app needs arrives as a signed bundle
 // (§12.4) whose manifest author must clear the --policy gate. The runtime offers
 // raw-byte capabilities — crypto (the bundled sumo), fs.* on --dir, net.* on
 // --listen — and the safe-js confinement host, wired to a bundle's declared cap
@@ -12,10 +12,8 @@
 // For a self-contained non-browser binary, the Go/native target (native/,
 // README §12.9) embeds and runs this same shared host JS — no Node install needed.
 
-import { readFile } from "node:fs/promises";
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
@@ -34,14 +32,7 @@ import { toHex, fromHex, concatBytes } from "./util.js";
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
 type Identity = { publicKey: Uint8Array; privateKey: Uint8Array };
 
-/** The genesis module the runtime always loads. The genesis verifier (Ed25519) and
- *  hash (BLAKE2b-256) are host code now (kernel-host.ts), so kernel.wasm is the one
- *  WASM blob the shell itself loads. */
-export interface KernelWasm {
-  kernelBytes: Uint8Array;
-}
-
-export interface ShellOptions extends KernelWasm {
+export interface ShellOptions {
   /** allowed-keys.json contents (see policy.ts). Omit ⇒ a deny-all policy (no
    *  authors), so the node boots and serves but accepts no installs — handy for
    *  just bringing a node online (e.g. to test connectivity). */
@@ -136,7 +127,7 @@ function freshnessPathFor(dir: string): string {
  *  plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
-  const host = await KernelHost.load(opts.kernelBytes as BufferSource, sodium);
+  const host = new KernelHost(sodium);
 
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts). Wiring the
   // admission policy is what lets the loader admit bundle modules (README §12.4–§12.5).
@@ -246,13 +237,6 @@ export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy
   return loadBundleFrom(host, sodium, policy, dirSource(dir), freshness);
 }
 
-/** Default node loader: read kernel.wasm from the build dir. */
-export async function loadKernelWasmNode(): Promise<KernelWasm> {
-  const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
-  const k = await readFile(join(root, "build/kernel.wasm"));
-  return { kernelBytes: new Uint8Array(k) };
-}
-
 // ── CLI ────────────────────────────────────────────────────────────────────
 
 interface Args { [k: string]: string | boolean; }
@@ -297,7 +281,7 @@ function loadIdentity(sodium: Sodium, keyPath: string): Identity {
   return { privateKey: kp.privateKey, publicKey: kp.publicKey };
 }
 
-export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmNode): Promise<void> {
+export async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   // --policy is optional: omit it for a deny-all node (boots + serves, no installs).
@@ -308,7 +292,6 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
 
   const sodium = await loadSodium();
   const identity = loadIdentity(sodium, keyPath);
-  const { kernelBytes } = await loadWasm();
 
   // Operator-supplied app config (e.g. a storage node's quota), merged over the
   // bundle's author-signed config. Opaque JSON the shell forwards into `const APP`.
@@ -317,7 +300,7 @@ export async function main(loadWasm: () => Promise<KernelWasm> = loadKernelWasmN
     : undefined;
 
   const shell = await boot({
-    kernelBytes, policyJson, dir, identity,
+    policyJson, dir, identity,
     listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
     wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
     timeoutMs: args["timeout"] ? Number(str(args, "timeout")) : undefined,
