@@ -17,7 +17,6 @@ const {
   loadKernelHost,
   generateKeyPair,
   ensureSodium,
-  referencePolicy,
 } = await imp("build/host/node.js");
 
 // Transport + WS module surface (moved up from seedstore in the runtime split,
@@ -60,14 +59,13 @@ function assertEqual(actual, expected, msg) {
 
 const kernelWasm = join(root, "build/kernel.wasm");
 
-// Standard bootstrap (README §9): the module registry over a fresh kernel. The
-// default policy accepts every install; tests that need rejection override via
-// host.setApproveInstall. Handlers are pure transforms with no signature/dispatch
-// seam, so there is nothing else to wire.
-async function makeHost(approveInstall = () => true) {
+// Standard bootstrap (README §9): a fresh kernel with the loader's admission
+// policy wired. The default policy admits every module; tests that need rejection
+// override via host.setAdmitPolicy. Handlers are pure transforms with no
+// signature/dispatch seam, so there is nothing else to wire.
+async function makeHost(admit = () => true) {
   const host = await loadKernelHost(kernelWasm);
-  host.registerInstaller();
-  host.setApproveInstall(approveInstall);
+  host.setAdmitPolicy(admit);
   return { host };
 }
 
@@ -75,9 +73,9 @@ const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
 // Admit a module directly under `targetName`, authored by `authorPk`, through the
-// same path the bundle loader uses (installBundleModule → installDirect → the policy
-// callback). Bundles are the only way code arrives now (§12.4) — there is no wire
-// install envelope. Returns whether the policy admitted it.
+// same path the bundle loader uses (installBundleModule → records.admit → the admit
+// policy callback). Bundles are the only way code arrives now (§12.4) — there is no
+// wire install envelope. Returns whether the policy admitted it.
 function installMod(host, targetName, wasm, authorPk) {
   return host.installBundleModule(targetName, wasm, authorPk);
 }
@@ -85,7 +83,7 @@ function installMod(host, targetName, wasm, authorPk) {
 // ─── Test: install a module, reach it by name ───────────────────────────
 
 async function testFullLifecycle() {
-  console.log("Test: install a bundle module and reach it by name (§4, §7)");
+  console.log("Test: install a bundle module and reach it by name (§4, §12.4)");
 
   const { host } = await makeHost();
 
@@ -97,7 +95,7 @@ async function testFullLifecycle() {
   installMod(host, chatName, forwarderBytes, pk);
   assert(host.isRegistered(chatName), "chat handler installed");
 
-  // The registry should have a record for it.
+  // The loader should have an install record for it.
   const rec = host.lookupInstall(chatName);
   assert(rec !== null, "install record exists");
   assertEqual(rec.author.publicKey, pk, "record author matches signer");
@@ -115,13 +113,13 @@ async function testFullLifecycle() {
 // ─── Test: SetHandler-seeded slot is not overlaid ────────────────────────
 
 async function testRefuseOverlayBootstrapSlot() {
-  console.log("Test: reference policy refuses to overlay a SetHandler-seeded slot (§7.4)");
+  console.log("Test: the loader refuses to overlay a SetHandler-seeded slot (§12.5)");
 
-  // The reference policy with an allow-all first-install branch, so this test exercises
-  // only the seeded-slot refusal — not an unrelated first-install rejection.
-  const host = await loadKernelHost(kernelWasm);
-  host.registerInstaller();
-  host.setApproveInstall(referencePolicy(host, () => true));
+  // An allow-all admit policy, so this test exercises only the structural seeded-slot
+  // refusal — not an unrelated policy rejection. The guard lives in the loader's
+  // admission (a first install onto an already-registered name is refused), so it holds
+  // regardless of which AdmitPolicy is wired.
+  const { host } = await makeHost(() => true);
 
   // Seed a host-JS handler straight into the table (no install record) — the converged
   // stand-in for a bootstrap slot. A bundle module aimed at its name must be refused, so
@@ -142,17 +140,17 @@ async function testRefuseOverlayBootstrapSlot() {
   console.log("  OK\n");
 }
 
-// ─── Test: approveInstall is the sole authorization gate ────────────────
+// ─── Test: the admit policy is the sole authorization gate ──────────────
 
 async function testApproveInstallRejects() {
-  console.log("Test: approveInstall can reject an install");
+  console.log("Test: the admit policy can reject an install");
 
   let seen = null;
-  const approve = (name, author, bytesHash, _wasm, existing) => {
+  const admit = (name, author, bytesHash, _wasm, existing) => {
     seen = { name, author, bytesHash, existing };
     return false;
   };
-  const { host } = await makeHost(approve);
+  const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
@@ -160,7 +158,7 @@ async function testApproveInstallRejects() {
   installMod(host, chatTextName, forwarderBytes, pk);
 
   assert(!host.isRegistered(chatTextName), "install rejected");
-  assert(seen !== null, "approveInstall was called");
+  assert(seen !== null, "the admit policy was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
   assertEqual(seen.author.publicKey, pk, "callback saw the author pubkey");
   assert(seen.existing === null, "no existing record for first install");
@@ -169,16 +167,16 @@ async function testApproveInstallRejects() {
 }
 
 async function testApproveInstallReceivesBytesHash() {
-  console.log("Test: approveInstall receives genesisHash(wasm) as bytes_hash (§7.1)");
+  console.log("Test: the admit policy receives genesisHash(wasm) as bytes_hash (§5.1)");
 
   let seenHash = null;
   let seenPayloadLen = 0;
-  const approve = (_n, _a, bytesHash, wasm, _e) => {
+  const admit = (_n, _a, bytesHash, wasm, _e) => {
     seenHash = bytesHash;
     seenPayloadLen = wasm.length; // for sanity
     return true;
   };
-  const { host } = await makeHost(approve);
+  const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
@@ -188,7 +186,7 @@ async function testApproveInstallReceivesBytesHash() {
 
   assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
   // The hash is the content id of the WASM module — the same identifier a
-  // manifest's modules[].hash and a policy allowlist use (§7.1), independent of
+  // manifest's modules[].hash and a policy allowlist use (§5.1), independent of
   // seq or the install framing.
   const expected = host.genesisHash(forwarderBytes);
   assertEqual(seenHash, expected, "bytes_hash = genesisHash(wasm)");
@@ -198,10 +196,10 @@ async function testApproveInstallReceivesBytesHash() {
 }
 
 async function testNoApproveInstallDropsAll() {
-  console.log("Test: install dropped when no approveInstall is wired");
+  console.log("Test: install dropped when no admit policy is wired (deny-all)");
 
   const { host } = await makeHost();
-  host.setApproveInstall(null);
+  host.setAdmitPolicy(null);
 
   const { publicKey: pk } = generateKeyPair();
   const chatTextName = host.deriveScopedName("chat.text", pk);
@@ -213,14 +211,18 @@ async function testNoApproveInstallDropsAll() {
   console.log("  OK\n");
 }
 
-// ─── Test: reference policy upgrade rules (§7.4) ────────────────────────
+// ─── Test: admit policy upgrade rules (§12.5) ───────────────────────────
 
 async function testReferencePolicyUpgradeRules() {
-  console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
+  console.log("Test: admit policy enforces same-author on upgrade (§12.5)");
 
-  const host = await loadKernelHost(kernelWasm);
-  host.registerInstaller();
-  host.setApproveInstall(referencePolicy(host, () => true));
+  // A same-author admit policy: a first install is admitted; an update is admitted only
+  // when the new author matches the recorded one. This is the same-author rule the
+  // shell's buildAdmit and the chat shell enforce, expressed inline.
+  const { host } = await makeHost((_name, author, _hash, _wasm, existing) =>
+    !existing ||
+    (existing.author.algoId === author.algoId &&
+      bytesEqual(existing.author.publicKey, author.publicKey)));
 
   const { publicKey: aPk } = generateKeyPair();
   const { publicKey: bPk } = generateKeyPair();
@@ -242,14 +244,14 @@ async function testReferencePolicyUpgradeRules() {
   assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
 
   // A re-installs (same author) — accepted; record updates in place. There is
-  // no parent/lineage gate anymore (§7.4): same author is the whole rule.
+  // no parent/lineage gate anymore (§12.5): same author is the whole rule.
   installMod(host, sharedName, forwarderBytes, aPk);
   const recAfterUpgrade = host.lookupInstall(sharedName);
   assert(recAfterUpgrade !== null, "upgrade left a record");
   assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
-  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm keeps the
+  // bytes_hash is genesisHash(wasm) (§5.1), so re-installing the SAME wasm keeps the
   // same content id — the identifier tracks the binary. (A different wasm would hash
-  // differently; §7.1 makes the content id, a manifest's modules[].hash, and a policy
+  // differently; §5.1 makes the content id, a manifest's modules[].hash, and a policy
   // allowlist all one value.)
   assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
     "bytes_hash unchanged across a same-wasm re-install");
@@ -259,10 +261,10 @@ async function testReferencePolicyUpgradeRules() {
   console.log("  OK\n");
 }
 
-// ─── Test: registry.lookup (host-side) returns the install record ────────
+// ─── Test: lookupInstall (host-side) returns the install record ─────────
 
 async function testInstallerLookupHostSide() {
-  console.log("Test: host-side lookupInstall returns the install record (§7.6)");
+  console.log("Test: host-side lookupInstall returns the install record (§12.4)");
 
   const { host } = await makeHost();
 
@@ -272,8 +274,8 @@ async function testInstallerLookupHostSide() {
   installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install ok");
 
-  // The registry has no wire surface: records are read host-side, not via a wire
-  // query. The policy callback already receives the resolved record; bridges
+  // The loader's records have no wire surface: they are read host-side, not via a
+  // wire query. The admit policy already receives the resolved record; bridges
   // pin kernel.caller instead of consulting a capability index.
   const rec = host.lookupInstall(chatTextName);
   assert(rec !== null, "record present for an installed name");
@@ -289,10 +291,10 @@ async function testInstallerLookupHostSide() {
   console.log("  OK\n");
 }
 
-// ─── Test: installer.remove + suite slot removal ────────────────────────
+// ─── Test: removeHandler + suite slot removal ───────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: installer.remove clears the record and the kernel slot (§7.5)");
+  console.log("Test: removeHandler clears the record and the kernel slot (§12.5)");
 
   let approveCalls = 0;
   const { host } = await makeHost((_n, _a, _h, _w, _e) => {
@@ -307,12 +309,12 @@ async function testInstallerRemove() {
   assert(host.isRegistered(chatTextName), "install ok");
   assert(host.lookupInstall(chatTextName) !== null, "record present");
 
-  assert(host.installer.remove(chatTextName), "remove returned true");
+  assert(host.removeHandler(chatTextName), "remove returned true");
   assert(!host.isRegistered(chatTextName), "kernel slot cleared");
   assert(host.lookupInstall(chatTextName) === null, "record cleared");
 
-  // remove() is idempotent — second call returns false.
-  assert(!host.installer.remove(chatTextName), "second remove returns false");
+  // removeHandler is idempotent — a second call on an empty slot returns false.
+  assert(!host.removeHandler(chatTextName), "second remove returns false");
 
   // Re-installing at the same name after a remove succeeds (no tombstone).
   installMod(host, chatTextName, forwarderBytes, pk);
@@ -628,7 +630,7 @@ async function testChannelPinning() {
 
 async function testPolicy() {
   console.log("Test: shell install policy — closed author set + module-hash allowlist");
-  const { parsePolicy, buildApproveInstall } = await imp("build/host/policy.js");
+  const { parsePolicy, buildAdmit } = await imp("build/host/policy.js");
 
   const good = generateKeyPair();
   const bad = generateKeyPair();
@@ -637,7 +639,7 @@ async function testPolicy() {
   // and the bytesHash the installer recorded (for the module-allowlist subtest).
   const tryInstall = async (policyJson, author) => {
     const { host } = await makeHost();
-    host.setApproveInstall(buildApproveInstall(host, parsePolicy(policyJson)));
+    host.setAdmitPolicy(buildAdmit(parsePolicy(policyJson)));
     const name = host.deriveScopedName("mod", author.publicKey);
     installMod(host, name, forwarderBytes, author.publicKey);
     const rec = host.lookupInstall(name);

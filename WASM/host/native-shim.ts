@@ -3,20 +3,22 @@
 // scripts/bundle-loader.mjs, exactly like the netroute / ws / cap-bridge bundles.
 //
 // This file is a SEAM, not an implementation: every protocol rule — who may bind a
-// name (§7.4), the manifest signature + its domain prefix (§12.4), the freshness
-// arithmetic, the deny-all default — comes from installer.ts, bundle.ts and
-// policy.ts, compiled once and shared. What lives here is only the glue that
-// cannot: the Go bridge is byte-level, so the powers the registry needs
-// (instantiate wasm, hash, query the handler table, write a file atomically)
-// arrive as `bridge.*` and `sodium.*` and are adapted to the `InstallerHost` /
-// `BundleHost` / `FreshnessStore` interfaces here.
+// name (§12.5), the admit-then-SetHandler step (§12.4), the manifest signature + its
+// domain prefix (§12.4), the freshness arithmetic, the deny-all default — comes from
+// bundle.ts and policy.ts, compiled once and shared. What lives here is only the glue
+// that cannot: the Go bridge is byte-level, so the powers the loader's admission needs
+// (instantiate wasm, hash, query the handler table, write a file atomically) arrive as
+// `bridge.*` and `sodium.*` and are adapted to the `BundleHost` / `RecordHost` /
+// `FreshnessStore` interfaces here.
 //
 // Because it is TypeScript checked against those same interfaces, the drift that a
 // hand-written mirror accumulates is now a compile error.
 
-import { Installer, type InstallerHost } from "./installer.js";
-import { buildApproveInstall, policyFromJson, type ShellPolicy } from "./policy.js";
-import { FreshnessMarks, loadBundle, type BundleHost, type BundleSource } from "./bundle.js";
+import { buildAdmit, policyFromJson, type ShellPolicy } from "./policy.js";
+import {
+  FreshnessMarks, InstallRecords, loadBundle,
+  type BundleHost, type BundleSource, type RecordHost,
+} from "./bundle.js";
 import { toHex } from "./util.js";
 
 /** The genesis signature suite's algo_id (§6.2) — an Ed25519 manifest author. */
@@ -29,7 +31,7 @@ declare const bridge: {
   installWasm(name: Uint8Array, wasm: Uint8Array): boolean;
   /** Does a handler already occupy `name`? (The kernel's `find_handler`.) */
   isRegistered(name: Uint8Array): boolean;
-  /** Unbind `name` (SetHandler(name, null)). */
+  /** Unbind `name` (SetHandler(name, null)). Exposed for operator revocation. */
   removeHandler(name: Uint8Array): boolean;
   /** The persisted freshness store's contents, or null on first boot. */
   readFreshness(): string | null;
@@ -43,18 +45,18 @@ declare const sodium: {
   crypto_sign_verify_detached(sig: Uint8Array, msg: Uint8Array, pk: Uint8Array): boolean;
 };
 
-/** The Go loader as an `InstallerHost` + `BundleHost`. Every member is a one-line
- *  forward to the bridge — if one grows logic, it belongs in the shared core instead. */
-class NativeHost implements InstallerHost, BundleHost {
-  readonly installer = new Installer(this);
+/** The Go loader as a `BundleHost` + `RecordHost`. Every member is a one-line forward to
+ *  the bridge — if one grows logic, it belongs in the shared core instead. The loader's
+ *  install records live in the `InstallRecords` store it owns, exactly as on the JS host. */
+class NativeHost implements BundleHost, RecordHost {
+  readonly records = new InstallRecords(this);
 
   genesisHash(data: Uint8Array): Uint8Array { return sodium.crypto_hash_sha3256(data); }
   _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
-  removeHandler(name: Uint8Array): boolean { return bridge.removeHandler(name); }
   isRegistered(name: Uint8Array): boolean { return bridge.isRegistered(name); }
 
   installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
-    return this.installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
+    return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 }
 
@@ -75,11 +77,11 @@ let freshness: NativeFreshnessStore | null = null;
 let policy: ShellPolicy = policyFromJson(null);
 const applyPolicy = (p: ShellPolicy): void => {
   policy = p;
-  host.installer.setApproveInstall(buildApproveInstall(host, p));
+  host.records.setPolicy(buildAdmit(p));
 };
 applyPolicy(policy);
 
-/** Narrow the realm's trust to a policy config (§7.4). `null` restores the deny-all
+/** Narrow the realm's trust to a policy config (§12.5). `null` restores the deny-all
  *  default; malformed JSON throws, so a typo fails the loader's boot loudly. */
 function setPolicy(json: string | null): void {
   applyPolicy(policyFromJson(json));

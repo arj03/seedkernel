@@ -55,12 +55,7 @@ export {
   GENESIS_ALGO_ID,
 } from "./kernel-host.js";
 export type { Handler, Signer } from "./kernel-host.js";
-export {
-  Installer,
-  referencePolicy,
-} from "./installer.js";
 export type {
-  ApproveInstall,
-  FirstInstallPolicy,
   InstallRecord,
-} from "./installer.js";
+  AdmitPolicy,
+} from "./bundle.js";

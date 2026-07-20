@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
-import { policyFromJson, buildApproveInstall, type ShellPolicy } from "./policy.js";
+import { policyFromJson, buildAdmit, type ShellPolicy } from "./policy.js";
 import {
   FreshnessMarks, loadBundle as loadBundleFrom,
   type BundleManifest, type BundleSource, type FreshnessStore, type LoadedBundle,
@@ -132,16 +132,16 @@ function freshnessPathFor(dir: string): string {
   return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
 }
 
-/** Assemble the runtime: kernel + signature + module registry under the
- *  loaded policy, plus the fs/net capability backends. Application-neutral. */
+/** Assemble the runtime: the kernel and the bundle loader under its admission policy,
+ *  plus the fs/net capability backends. Application-neutral. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
   const host = await KernelHost.load(opts.kernelBytes as BufferSource, sodium);
 
-  host.registerInstaller();
-  // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts).
+  // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts). Wiring the
+  // admission policy is what lets the loader admit bundle modules (README §12.4–§12.5).
   const policy = policyFromJson(opts.policyJson);
-  host.setApproveInstall(buildApproveInstall(host, policy));
+  host.setAdmitPolicy(buildAdmit(policy));
 
   // Capability backends — all application-neutral primitives. The cap-bridge
   // (built lazily in runGuest) exposes exactly these to a loaded bundle's guest:

@@ -95,24 +95,23 @@ function hexToBytes(hex) {
 shellPrint("Loading kernel WASM...", "sys");
 const host = await loadKernelHost("../build/kernel.wasm", sodium);
 
-// ─── bootstrap: module registry ────────────────────────────────────────
+// ─── admission policy ──────────────────────────────────────────────────
 // The kernel is a named table of pure-transform handlers now — no signature
-// wrapper, no envelopes, no signer. The registry (§7) is the only bootstrap
-// piece: it admits signed bundles. Message authenticity comes from the AKE
-// channel (PeerLink), not a per-message signature.
-host.registerInstaller();                         // the module registry (§7)
-
-// ── install-approval policy ────────────────────────────────────────────
+// wrapper, no envelopes, no signer. The loader (§12.4) is the only bootstrap
+// piece: it admits signed bundles under the admission policy below. Message
+// authenticity comes from the AKE channel (PeerLink), not a per-message signature.
 //
-// Updates from an author we already trust (= we already hold an install
-// record under this name with the same author key) are auto-approved — that is
-// exactly the "trust updates from the same author" guarantee (§7.4, author-only;
-// no parent/lineage gate). First installs require explicit user consent; the
-// UI gates them by adding the app's bytes_hash to `pendingApprovals` before
-// admitting it via installBundleModule. Anything else is refused.
+// This is the multi-app shell's own `admit` (§12.5): a first install needs explicit
+// user consent, an update from the recorded author is trusted. Updates from an author
+// we already trust (= we already hold an install record under this name with the same
+// author key) are auto-approved — the "trust the original author" rule (§12.5, author-
+// only; no parent/lineage gate). First installs require explicit user consent; the UI
+// gates them by adding the app's bytes_hash to `pendingApprovals` before admitting it
+// via installBundleModule. Anything else is refused. (The refusal to overlay a hand-
+// seeded slot is structural in the loader, so this callback need not check it.)
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
-host.setApproveInstall((name, author, bytesHash, _wasm, existing) => {
+host.setAdmitPolicy((name, author, bytesHash, _wasm, existing) => {
   const hex = bytesToHex(bytesHash);
   if (existing) {
     if (existing.author.algoId !== author.algoId) return false;
@@ -449,7 +448,7 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
   }
   const handlerName = appHandlerName(meta.id);
   const existing = host.lookupInstall(handlerName);
-  // Updating something WE authored is a plain same-author re-install (§7.4 —
+  // Updating something WE authored is a plain same-author re-install (§12.5 —
   // no parent/lineage gate). Updates to an app authored by someone else are
   // not supported from this path — those arrive via Offer from the original
   // author.
@@ -516,8 +515,8 @@ function embedAppMeta(wasmBytes, meta) {
 
 // ── persistence ────────────────────────────────────────────────────────
 // The packed bundle is the only piece of app state we need to rebuild — the
-// install record on the installer side, the handler in the kernel, and the
-// uiHtml all derive from it. We keep them in sessionStorage so a reload
+// loader's install record, the handler in the kernel, and the uiHtml all
+// derive from it. We keep them in sessionStorage so a reload
 // within the same tab keeps the user's app set and lets transitive offers
 // continue to work.
 function persistInstalledApps() {
@@ -623,7 +622,7 @@ async function handleOffer(bundleBytes, fromPkHex) {
   const existing = host.lookupInstall(handlerName);
 
   // Auto-install path: the author matches an app we already trust. The
-  // reference policy in setApproveInstall verifies the same facts (§7.4,
+  // admission policy in setAdmitPolicy verifies the same facts (§12.5,
   // author-only), so dispatching is safe — no extra approval needed.
   if (existing &&
       existing.author.algoId === peeked.authorAlgo &&
@@ -793,7 +792,9 @@ function removeApp(id) {
   const rec = installedApps.get(id);
   if (!rec) return;
   if (!confirm(`Remove ${rec.name} ${rec.version}? The kernel handler will be uninstalled.`)) return;
-  if (host.installer) host.installer.remove(rec.handlerName);
+  // Revocation (§12.5): removeHandler empties the kernel slot AND clears its install
+  // record, so the same name is free to re-admit later with no stale attribution.
+  host.removeHandler(rec.handlerName);
   installedApps.delete(id);
   if (activeAppId === id) unmountActiveApp();
   persistInstalledApps();

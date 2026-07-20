@@ -7,14 +7,16 @@
 // signer, no envelope dispatch. The host is the orchestrator: it reaches a handler
 // by name with `callHandler` (the counterpart a guest reaches through the
 // cap-bridge's MODULE_CALL, README §12.2), and does all I/O and authorization
-// itself. The only host powers a handler bind needs are exposed to the Installer
-// (host/installer.ts): instantiating WASM handlers and genesis hashing.
+// itself. The loader's install records live here too (README §12.4): the host binds
+// handlers, so it holds the `InstallRecords` store and forgets a slot's record when a
+// raw SetHandler mutates it — the host powers admission needs (instantiating WASM
+// handlers, genesis hashing, querying the table) are all its own methods.
 //
 // Authenticity is the transport's job now (the AKE channel attributes every
 // frame), not a per-message signature — so there is no signature wrapper, no
 // signer scoping, and no §8/§4.4 authority machinery in the kernel at all.
 
-import { Installer, type ApproveInstall, type InstallRecord } from "./installer.js";
+import { InstallRecords, type AdmitPolicy, type InstallRecord } from "./bundle.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -75,15 +77,19 @@ export class KernelHost {
   // the name → id table (find_handler); the host owns only per-id metadata.
   private entries = new Map<number, HandlerEntry>();
   private nextHandlerId = 1;
-  // The installer instance, if registerInstaller was called.
-  private _installer: Installer | null = null;
+  // The loader's install records + admission step (README §12.4). Intrinsic to the host
+  // (it binds handlers), so a raw register/removeHandler can forget a stale record. No
+  // admission policy is wired until setAdmitPolicy runs, so it refuses every bind by
+  // default (deny-all, README §14).
+  private readonly records = new InstallRecords(this);
 
   private constructor() {}
 
   /** Instantiate the kernel from in-memory bytes. The kernel alone is a usable
-   *  host (§1): `register` and `callHandler` work with nothing else wired, and the
-   *  installer (`registerInstaller`) is opt-in on top. The caller supplies the
-   *  bytes and an initialized libsodium (SHA-3-256 for install-record hashing) —
+   *  host (§1): `register` and `callHandler` work with nothing else wired, and loading
+   *  signed bundles is opt-in on top (wire an admission policy with setAdmitPolicy). The
+   *  caller supplies the bytes and an initialized libsodium (SHA-3-256 for record
+   *  hashing) —
    *  keeping the entry point free of Node- or browser-specific I/O is what lets the
    *  same host run in Node, browsers, Deno, Bun, etc. The thin entry points in
    *  `node.ts` / `browser.ts` package the loading dance for each platform. */
@@ -191,7 +197,7 @@ export class KernelHost {
   // ─── installing WASM handlers ─────────────────────────────────────────
 
   /** Instantiate handler `wasmBytes` and bind them at `targetName` (README §4,
-   *  §7.2). A handler is a pure transform: it imports only the AssemblyScript
+   *  §12.4). A handler is a pure transform: it imports only the AssemblyScript
    *  runtime shims (`env.*`) — no `kernel.*` seam — and exports `memory`, a
    *  `scratch` global, and `handle`. Returns false on any structural failure. */
   _installWasmHandler(targetName: Uint8Array, wasmBytes: Uint8Array): boolean {
@@ -238,8 +244,8 @@ export class KernelHost {
     }
 
     // SetHandler is unconditional at the kernel level — replace whatever is
-    // there (bindHandler drops the displaced id's host entry). The installer's
-    // replacement policy was applied before this method was called.
+    // there (bindHandler drops the displaced id's host entry). The admission
+    // policy was applied before this method was called.
     this.bindHandler(targetName, handlerId, {
       name: targetName.slice(),
       handler: null,
@@ -297,48 +303,36 @@ export class KernelHost {
       handler,
       wasm: null,
     });
-    if (this._installer) this._installer._onKernelSlotMutated(name);
+    this.records.forget(name);
     return id;
   }
 
-  /** Create the module registry (README §7). It holds the install records and the
-   *  policy callback; the bundle loader (§12.4) calls `installBundleModule` →
-   *  `installDirect` to admit each verified module. Without it, no modules bind.
-   *  Returns the registry instance for further configuration. */
-  registerInstaller(): Installer {
-    const ih = new Installer(this);
-    this._installer = ih;
-    return ih;
+  /** Wire the admission policy the loader gates bundle modules with (README §12.5).
+   *  Null (the default) refuses every bind, so a host that never calls this loads no
+   *  app at all — deny-all (README §14). */
+  setAdmitPolicy(admit: AdmitPolicy | null): void {
+    this.records.setPolicy(admit);
   }
 
-  /** Convenience: wire the install-approval callback on the registry. Throws
-   *  if registerInstaller has not been called. */
-  setApproveInstall(callback: ApproveInstall | null): void {
-    if (!this._installer) {
-      throw new Error("setApproveInstall: registerInstaller must be called first");
-    }
-    this._installer.setApproveInstall(callback);
-  }
-
-  /** Read-only access to the install record at `name`, or null. Host-side
-   *  read of the installer's records (README §7.6). */
+  /** Read-only access to the install record at `name`, or null. Host-side read of the
+   *  loader's records (README §12.4) — there is no wire query. */
   lookupInstall(name: Uint8Array): InstallRecord | null {
-    return this._installer ? this._installer.lookup(name) : null;
+    return this.records.lookup(name);
   }
 
-  /** Install a bundle module directly under its manifest-declared kernel name
-   *  (README §12.4). The signed manifest already authenticated the coherent set
-   *  and pinned each module's content hash, so the loader installs verified bytes
-   *  here — bundles are the only way code arrives. The install record's author is
-   *  the manifest `authorPubKey` (an Ed25519 genesis key, §12.4); the same install
-   *  policy gates it. Returns true on success, false if no registry is wired or the
-   *  policy refuses. */
+  /** Admit a bundle module under its manifest-declared kernel name (README §12.4). The
+   *  signed manifest already authenticated the coherent set and pinned each module's
+   *  content hash, so the loader admits verified bytes here — bundles are the only way
+   *  code arrives. The record's author is the manifest `authorPubKey` (an Ed25519 genesis
+   *  key, §12.4), gated by the admission policy. Returns true on success, false if no
+   *  policy is wired or it refuses. The bundle loader calls this once per verified module. */
   installBundleModule(name: Uint8Array, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
-    if (!this._installer) return false;
-    return this._installer.installDirect(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
+    return this.records.admit(name, wasm, { algoId: GENESIS_ALGO_ID, publicKey: authorPubKey });
   }
 
-  /** Remove a handler, the `SetHandler(name, null)` case in §3.1. */
+  /** Remove a handler, the `SetHandler(name, null)` case in §3.1 — and the loader's
+   *  `remove(name)` revocation path (§12.5): it clears the slot's install record too, so
+   *  the same key cannot later be misattributed onto brand-new bytes. */
   removeHandler(name: Uint8Array): boolean {
     const ptr = this.writeToKernel(name);
     try {
@@ -346,22 +340,17 @@ export class KernelHost {
       const ok = this.kernelExports.remove_handler(ptr, name.length) === 1;
       if (ok) {
         if (id >= 0) this.entries.delete(id);
-        if (this._installer) this._installer._onKernelSlotMutated(name);
+        this.records.forget(name);
       }
       return ok;
     } finally { this.kernelExports.dealloc(ptr); }
   }
 
   /** True if a handler occupies `name`. A bound name is exactly one the kernel's
-   *  `find_handler` resolves, so this asks that rather than a second export. */
+   *  `find_handler` resolves, so this asks that rather than a second export. The loader's
+   *  admission consults it (via `InstallRecords`) to refuse overlaying a hand-seeded slot. */
   isRegistered(name: Uint8Array): boolean {
     return this.findHandlerId(name) >= 0;
-  }
-
-  /** Direct host-side access to the installer (read-only). Most code should
-   *  go through the `lookupInstall` convenience wrapper. */
-  get installer(): Installer | null {
-    return this._installer;
   }
 
   /** A bootstrap handler name (README §5.1): the literal-ASCII
@@ -371,9 +360,9 @@ export class KernelHost {
     return new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical);
   }
 
-  /** Hash the raw bytes of `data` with the genesis suite (SHA-3-256). Used by the
-   *  installer to compute install-record hashes and exposed so deployers can
-   *  compute the same hash off-line for allowlists. */
+  /** Hash the raw bytes of `data` with the genesis suite (SHA-3-256). Used by the loader's
+   *  admission to compute a module's install-record `bytesHash` (§12.4), and exposed so
+   *  deployers can compute the same hash off-line for policy allowlists. */
   genesisHash(data: Uint8Array): Uint8Array {
     return this.sodium.crypto_hash_sha3256(data);
   }

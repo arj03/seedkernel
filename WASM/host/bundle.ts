@@ -14,13 +14,15 @@
 //   <guest>.js          the safe-js guest program
 //
 // The manifest commits to every module's genesisHash and the shell verifies the
-// bytes against it, so the loader installs the verified module directly under its
+// bytes against it, so the loader admits the verified module directly under its
 // declared kernel name (§12.4) — there is no separate per-module install envelope.
-// A live update over the relay is an ordinary signed §7.2 install (the wire path).
+// A live update is not a separate mechanism: it is a bundle whose manifest `version`
+// is higher, which freshness requires and the same-author rule (§12.5) admits.
 
 import { concatBytes, fromHex, toHex } from "./util.js";
 import { DOMAIN_MANIFEST } from "./domains.js";
 import type { ShellPolicy } from "./policy.js";
+import type { Signer } from "./kernel-host.js";
 
 export interface BundleModule {
   /** Logical name, e.g. "codec". */
@@ -28,11 +30,11 @@ export interface BundleModule {
   /** The module's filename within the bundle (`<name>.wasm`). */
   file: string;
   /** genesisHash(wasm) hex — content integrity for the .wasm file, and the
-   *  module's `bytes_hash` in the synthesized install record (§7.1, §12.4). */
+   *  module's `bytes_hash` in the loader's install record (§5.1, §12.4). */
   hash: string;
   /** Kernel name the loader binds the module at via SetHandler
    *  (deriveBootstrapName/deriveScopedName hex). The manifest is the authoritative
-   *  source of the bind name now that modules install directly (§12.4). */
+   *  source of the bind name now that the loader admits modules directly (§12.4). */
   kernelName: string;
 }
 
@@ -217,6 +219,111 @@ export class FreshnessMarks implements FreshnessStore {
     if (cur !== undefined && cur >= version) return; // monotonic: never rewound
     this.marks.set(k, version);
     this.persist(this.serialize());
+  }
+}
+
+// ── Admission: the loader's install records (README §12.4) ───────────────────
+//
+// Binding a module IS the loader's job — there is no separate "module registry". The
+// store below holds one host-side table, `installations[name] → {author, bytesHash}`,
+// read only here and never over the wire, and drives the one admission step: hash the
+// verified bytes, consult the admission policy (§12.5), and on approval instantiate +
+// SetHandler the module and record `(author, bytesHash)`. A raw SetHandler that mutates a
+// slot (the host's own `register` / `removeHandler`, §3.1) forgets that slot's record
+// first, so an old author is never carried onto brand-new bytes.
+
+/** A single install record (README §12.4): who signed the bundle that bound the bytes,
+ *  and the bytes' content id. */
+export interface InstallRecord {
+  readonly author: Signer;
+  /** genesisHash(wasm) (§5.1) — the same id a manifest's `modules[].hash` and a policy
+   *  `modules` allowlist carry. */
+  readonly bytesHash: Uint8Array;
+}
+
+/** The admission decision (README §12.5): given a verified module and the record already
+ *  at its name (or null), return true to bind it, false to refuse. The default is
+ *  `buildAdmit` (policy.ts); a deployment that needs more — an M-of-N quorum, an HSM
+ *  console, bytecode validation over `wasm` — supplies its own in its place. It runs once
+ *  per module at load time, never on a message path, so it may be arbitrarily expensive. */
+export type AdmitPolicy = (
+  name: Uint8Array,
+  author: Signer,
+  bytesHash: Uint8Array,
+  wasm: Uint8Array,
+  current: InstallRecord | null,
+) => boolean;
+
+/** The host powers the record store runs over (README §12.4): hash with the genesis suite,
+ *  instantiate + bind a verified handler, and ask whether a name is already bound.
+ *  `KernelHost` satisfies it; the native loader supplies the same three over its Go bridge
+ *  (README §12.9), so the admission below is not re-derived in a second language. */
+export interface RecordHost {
+  genesisHash(data: Uint8Array): Uint8Array;
+  /** Instantiate handler bytes against the §4 ABI and bind them at `name`. */
+  _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean;
+  /** True if a handler already occupies `name` — used to refuse overlaying a hand-seeded
+   *  slot on a first install (README §12.4). */
+  isRegistered(name: Uint8Array): boolean;
+}
+
+/** The loader's install records + admission step (README §12.4). Held by the host that
+ *  binds handlers (KernelHost, the native loader), so a raw SetHandler over a recorded name
+ *  can `forget` its record. This is NOT a wire surface: there is no install message, no
+ *  seq, no replay table — the signed manifest is the one authentication and `admit` the one
+ *  authorization. */
+export class InstallRecords {
+  private readonly installations = new Map<string, InstallRecord>();
+  private admitPolicy: AdmitPolicy | null = null;
+
+  constructor(private readonly host: RecordHost) {}
+
+  /** Wire the admission policy (README §12.5). Null (the boot default) refuses every bind,
+   *  so admission is opt-in for the deployment (README §14). */
+  setPolicy(admit: AdmitPolicy | null): void { this.admitPolicy = admit; }
+
+  /** The install record at `name`, or null. Host-side only — there is no wire query; the
+   *  admission policy already receives the resolved `current` record. */
+  lookup(name: Uint8Array): InstallRecord | null {
+    return this.installations.get(toHex(name)) ?? null;
+  }
+
+  /** Drop any record at `name`. The host calls it when a raw SetHandler (re)binds or unbinds
+   *  the slot (§3.1), so a stale `(author, bytesHash)` can't misattribute brand-new bytes.
+   *  Idempotent. */
+  forget(name: Uint8Array): void { this.installations.delete(toHex(name)); }
+
+  /** Admit one verified module (README §12.4): hash the bytes, refuse to overlay a
+   *  hand-seeded slot, consult the policy, then instantiate + bind and record
+   *  `(author, bytesHash)`. The whole admission, and the only path that mutates the kernel
+   *  table with a record behind it — the bundle loader calls it once per module through
+   *  `host.installBundleModule`, with the manifest author.
+   *
+   *  A bundle carries no per-module signature or seq: the signed manifest already
+   *  authenticated the coherent set and committed to each module's `genesisHash` (§12.4), so
+   *  a second per-module proof would be pure redundancy. Returns true on success, false if
+   *  no policy is wired or the policy refuses. */
+  admit(name: Uint8Array, wasm: Uint8Array, author: Signer): boolean {
+    if (name.length === 0 || wasm.length === 0) return false;
+    const bytesHash = this.host.genesisHash(wasm);
+    const key = toHex(name);
+    const current = this.installations.get(key) ?? null;
+    // Refuse to overlay a hand-seeded slot: no record but the kernel already resolves the
+    // name means a deliberately wired handler the loader will not silently replace (§12.4).
+    if (current == null && this.host.isRegistered(name)) return false;
+    if (!this.admitPolicy) return false;
+    let approved = false;
+    try { approved = this.admitPolicy(name, author, bytesHash, wasm, current); }
+    catch { approved = false; }
+    if (!approved) return false;
+    // Instantiate + SetHandler first, then record — in that order, so a record never points
+    // at a slot we failed to populate.
+    if (!this.host._installWasmHandler(name, wasm)) return false;
+    this.installations.set(key, {
+      author: { algoId: author.algoId, publicKey: author.publicKey.slice() },
+      bytesHash,
+    });
+    return true;
   }
 }
 

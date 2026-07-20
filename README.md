@@ -15,11 +15,11 @@ Every node-to-node link is an **encrypted, authenticated channel** (§12.6): an 
 | **Kernel** | Routes names to handlers: a flat `handlers[name]` table resolved by `find_handler` (§3). Handlers are pure transforms; the kernel has no dispatch loop, no signature logic, no I/O. The table changes only through the host-level `SetHandler` (§3.1). |
 | **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It reaches a handler by name (`callHandler`), does all I/O and authorization itself, and provides `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import nothing but the AssemblyScript runtime — no kernel seam, no I/O of their own. |
-| **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and binds each module into the flat table through the module registry (§7). |
+| **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits each module into the flat table — a policy decision, then `SetHandler`. |
 
 There are no special cases and exactly one way to do everything: one install path (signed bundles, §12.4), one guest seam (`host.call`, §12.2), one post-handshake frame plane (§12.6).
 
-Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The host-side registry binds names to bytes under a deployer-supplied **policy** that decides who may install what.
+Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The loader binds names to bytes under a deployer-supplied **policy** that decides who may install what (§12.5).
 
 Installation flow:
 
@@ -33,7 +33,7 @@ loadBundle (host admin path)                         §12.4
 policy check — author trusted? version valid?        §12.5
         │
         ▼
-registry.installDirect — records (author, bytes_hash) §7
+admit each module — policy ok? record (author, hash) §12.4
         │
         ▼
 SetHandler(name, wasm_bytes) — kernel table updated  §3.1
@@ -74,13 +74,6 @@ The reference composition stacks the layers so each depends only on the layers b
 │   the guest's host.call seam —   │
 │   its only reach to real I/O     │
 ├──────────────────────────────────┤
-│   Module registry (optional)     │
-│                                  │
-│   host-side, not a wire layer    │
-│   runs policy callback           │
-│   holds (author, bytes_hash)     │
-│         records                  │
-├──────────────────────────────────┤
 │   Kernel                         │
 │                                  │
 │   name → handler table           │
@@ -114,11 +107,11 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 | Doc | Sections | Contents |
 | --- | --- | --- |
 | [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level `SetHandler`, the pure-transform WASM handler ABI, layering, the protocol constants. |
-| [REGISTRY](docs/REGISTRY.md) | §7, §9 | How code is admitted and wired: the module registry and its policy callback, and the bootstrap sequence. |
-| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the chat demo, and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles, the node↔node transport, the Go/native binary. |
+| [BOOTSTRAP](docs/BOOTSTRAP.md) | §9 | The bootstrap sequence that composes the onion — kernel, admission policy, and the first signed bundles. |
+| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the chat demo, and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 
-To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,REGISTRY,RUNTIME,SECURITY}.md`.
+To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,BOOTSTRAP,RUNTIME,SECURITY}.md`.
 
 ## 15. Background
 

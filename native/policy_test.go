@@ -65,9 +65,9 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
-// the reference policy's rule, enforced via the kernel's handler table on the shared
-// installDirect path. A native host handler seeded straight into the table has no install
+// A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §12.5) —
+// the loader's structural admission rule, enforced via the kernel's handler table on the
+// shared admission path. A native host handler seeded straight into the table has no install
 // record, so aiming a bundle module at its slot must leave the native handler in place.
 func TestBundleCannotOverlaySeededSlot(t *testing.T) {
 	boot()

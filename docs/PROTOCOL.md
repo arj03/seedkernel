@@ -4,7 +4,7 @@
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
-> [README](../README.md) §1 · **PROTOCOL §2–§5, §16** · [REGISTRY](REGISTRY.md) §7, §9 · [RUNTIME](RUNTIME.md) §10–§12 · [SECURITY](SECURITY.md) §13–§14
+> [README](../README.md) §1 · **PROTOCOL §2–§5, §16** · [BOOTSTRAP](BOOTSTRAP.md) §9 · [RUNTIME](RUNTIME.md) §10–§12 · [SECURITY](SECURITY.md) §13–§14
 
 ---
 
@@ -18,7 +18,7 @@ That leaves three orthogonal pieces in every binding, none of which the kernel i
 
 - **Name** — an opaque dispatch key. Its meaning is a convention (§5.1), not a kernel concern; the kernel compares name bytes and nothing more.
 - **Bytes** — the WASM handler held at that name, a pure transform the host stages input into and reads output from (§4).
-- **Author** — the signer of the bundle that installed the bytes, recorded host-side in the install record (§7.1). The kernel never learns it.
+- **Author** — the signer of the bundle that installed the bytes, recorded host-side in the loader's install record (§12.4). The kernel never learns it.
 
 **No wire format means no kernel-level size cap.** The old envelope's 64 KB ceiling is gone with the envelope; the two bounds that remain live where the bytes actually flow — the transport caps a single frame at `MAX_FRAME_BYTES` (16 MiB, §12.6), and a handler caps its own I/O region at its `scratch` size (128 KB default, §4.1). The kernel imposes neither; it only ever holds a name and an id.
 
@@ -57,22 +57,17 @@ remove_handler(name)      remove it (the SetHandler(name, null) case)
 
 `set_handler` installs or replaces in place, so the kernel never holds two entries for one name. Together these are the **only** way handlers enter or leave the table — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host wraps them as `register(name, jsHandler)` / `installBundleModule(...)` / `removeHandler(name)`, which allocate a host-side handler id and track the per-id implementation (a JS closure or an instantiated WASM handler) while the kernel owns only the name → id map.
 
-`SetHandler` is internal to the host process — a direct method call, never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it. Handlers seeded this way directly (rare — most deployments install nothing by hand and grow only through bundles, §9) have **no install record** and are invisible to the registry (§7).
+`SetHandler` is internal to the host process — a direct method call, never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it. Handlers seeded this way directly (rare — most deployments install nothing by hand and grow only through bundles, §9) have **no install record** — the loader's records (§12.4) cover only bundle-admitted modules.
 
 The same call the host uses during bootstrap (§9) stays available afterward for emergency replacement of any handler. Ordinary growth loads a signed bundle (§12.4); the host-level `SetHandler` path is the emergency fallback for cases the message pipeline can't reach.
 
-**Replacing registry-managed names.** The kernel never touches an install record — it does not know records exist (§7.1). But a stale `(author, bytes_hash)` left behind by a raw replacement would misattribute the slot: the old author would apply to brand-new bytes, so the reference policy would treat the next same-name install as a same-author upgrade of code it never signed. So the host's handler-management path auto-clears any record when it (re)binds or removes a slot — `register` / `installBundleModule` and `removeHandler` all do. A `SetHandler` replacement thus always runs with no record (a later bundle load may wire a fresh one), needing no separate `installer.remove(name)` first; `installer.remove` (§7.5) remains the path for operator revocation, where clearing the record is the point.
+**Replacing recorded names.** The kernel never touches an install record — it does not know records exist (§12.4). But a stale `(author, bytes_hash)` left behind by a raw replacement would misattribute the slot: the old author would apply to brand-new bytes, so the default policy would treat the next same-name install as a same-author upgrade of code it never signed. So the host's handler-management path auto-clears any record when it (re)binds or removes a slot — `register` / `installBundleModule` and `removeHandler` all do. A `SetHandler` replacement thus always runs with no record (a later bundle load may wire a fresh one), needing no separate `remove(name)` first; the loader's `remove(name)` (§12.5) remains the path for operator revocation, where clearing the record is the point.
 
-### 3.2 The module registry (optional)
+### 3.2 Growth is the loader's job, not the kernel's
 
-Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module through a small host-side **module registry**: it holds the install records `(author, bytes_hash)` and runs a deployer-supplied policy callback before each `set_handler` call. The registry is not part of the kernel — it is host-side state (`host/installer.ts`) the loader calls, not a wire protocol. Frozen-config deployments simply skip it and grow no further.
+Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module — a policy decision (§12.5) followed by `set_handler` — and holds the install records `(author, bytes_hash)` that back it. None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting `set_handler` call. Frozen-config deployments load no bundles and grow no further.
 
-The registry is described in detail in §7. Its surface is two ideas:
-
-- **`installDirect(name, wasm, author)`** binds a `name` to WASM bytes. The bundle loader calls it once per module, with the manifest author.
-- **A policy callback** decides whether to honor each bind. The reference policy is in §7.4.
-
-Because the manifest signature is verified by the loader before it ever calls `installDirect`, "who authored this code" is already settled by an ordinary signature check (§12.4). Installation is not a special operation; it is `handlers[name] = wasm_bytes`, gated by author + hash policy.
+Because the loader verifies the manifest signature before it admits anything, "who authored this code" is already settled by an ordinary signature check (§12.4). Installation is not a special operation; it is `handlers[name] = wasm_bytes`, gated by the author + hash policy (§12.5).
 
 ---
 
@@ -115,7 +110,7 @@ What a handler **cannot** do, restated as guarantees:
 - **No cross-handler corruption.** A buggy or malicious handler can scribble anywhere in its own memory but cannot touch the host, the kernel, or another handler — each runs in its own WASM instance, and the host copies bytes between scratch regions rather than sharing pointers.
 - **No pointers cross the boundary.** There is no allocator contract; the host never holds a pointer into a handler's memory across a return and never writes outside the scratch region.
 
-> **Compute and memory exhaustion are the host's problem.** WASM engines on the JS platform expose no fuel/timeout mechanism, so this protocol specifies none. Nothing on the message path does asymmetric crypto or recurses, but an installed handler can still infinite-loop or declare a huge linear memory and OOM the single-threaded host — and a permissive registry (§7.4) multiplies that across many installs. Deployers exposed to runaway handlers should run the host in a Worker with a watchdog and pre-validate bytecode in the policy callback (cap declared memory, forbid unbounded loops) before installing.
+> **Compute and memory exhaustion are the host's problem.** WASM engines on the JS platform expose no fuel/timeout mechanism, so this protocol specifies none. Nothing on the message path does asymmetric crypto or recurses, but an installed handler can still infinite-loop or declare a huge linear memory and OOM the single-threaded host — and a permissive policy (§12.5) multiplies that across many installs. Deployers exposed to runaway handlers should run the host in a Worker with a watchdog and pre-validate bytecode in the admission policy (cap declared memory, forbid unbounded loops) before installing.
 
 **Replay and ordering are settled off the handler.** A handler is stateless-by-input, so it has no notion of "seen this before." Where that matters, the defence lives at the layer that owns the bytes: live-traffic replay is closed by the transport's strict per-direction counter (§12.6), and an older install is refused by bundle freshness (§12.4). An app that **relays** messages through intermediaries — where neither of those applies to the original author — adds its own per-message signature and backlink chain (§5.1, §14). None of it is the kernel's or the handler's concern.
 
@@ -130,17 +125,16 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 | Layer | Modules | What lives there |
 | --- | --- | --- |
 | **Kernel** | `kernel.wasm` | The name → handler-id table and `find_handler` routing (§3). No crypto, no I/O, no dispatch. |
-| **Module registry** (optional) | Registry (host-side) | The install records `(author, bytes_hash)` and the policy callback. `installDirect` binds a verified bundle module; no wire message (§7). |
 | **Cap-bridge** (optional) | Cap-bridge (host-side) | The `host.call(op, bytes)` seam a confined guest reaches its I/O through — the only outward reach the guest has (§12.2). |
 | **App** | Chat (§11), [seed store](https://github.com/arj03/seedstore) | Pure-transform WASM handlers plus, optionally, a zero-authority JS guest — delivered as a signed bundle (§12.4). |
 
-Each layer is testable standalone: the kernel is exercised on its own, the registry without any bundle, chat as a handful of pure transforms with no crypto in sight. Composition across layers is the host's or the guest's, through `callHandler` / `MODULE_CALL` (§4.2) — never a handler reaching sideways.
+Each layer is testable standalone: the kernel is exercised on its own, the loader against a bundle with no live transport, chat as a handful of pure transforms with no crypto in sight. Composition across layers is the host's or the guest's, through `callHandler` / `MODULE_CALL` (§4.2) — never a handler reaching sideways.
 
-**The hash function used for id derivation.** A few places hash: `bytes_hash` (§7.1), the app-name derivations a policy may choose (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **SHA-3-256** — the *genesis hash*, computed host-side by `genesisHash` over bundled libsodium, the one hash guaranteed at boot. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
+**The hash function used for id derivation.** A few places hash: `bytes_hash` (§12.4), the app-name derivations a policy may choose (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **SHA-3-256** — the *genesis hash*, computed host-side by `genesisHash` over bundled libsodium, the one hash guaranteed at boot. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
 
-**Naming convention for bootstrap handlers:** `name = "seedkernel.bootstrap.v1:" + canonical_name` — a readable string (opaque bytes, so nothing forces a hash) that reads plainly in logs. These names are host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand, not admitted through the registry, so there is no install record to mix in. The chat shell uses the same helper (`deriveBootstrapName`) to derive an *app's* kernel name from its id, so two peers running the same app route to the same name (§11).
+**Naming convention for bootstrap handlers:** `name = "seedkernel.bootstrap.v1:" + canonical_name` — a readable string (opaque bytes, so nothing forces a hash) that reads plainly in logs. These names are host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand, not admitted through the loader, so there is no install record to mix in. The chat shell uses the same helper (`deriveBootstrapName`) to derive an *app's* kernel name from its id, so two peers running the same app route to the same name (§11).
 
-**Naming convention for app handlers:** free-form within whatever the policy approves. The reference policy (§7.4) places no constraint on names beyond uniqueness — the first author to bind a name owns it, and only that author can update it. Deployers who want author-scoped namespaces (so two parties can each have their own `chat` without conflict) can require names of the form `hash(canonical ‖ author_pubkey)` in their policy callback (the host's `deriveScopedName` computes exactly that). The kernel is indifferent.
+**Naming convention for app handlers:** free-form within whatever the policy approves. The default policy (§12.5) places no constraint on names beyond uniqueness — the first author to bind a name owns it, and only that author can update it. Deployers who want author-scoped namespaces (so two parties can each have their own `chat` without conflict) can require names of the form `hash(canonical ‖ author_pubkey)` in their admission policy (the host's `deriveScopedName` computes exactly that). The kernel is indifferent.
 
 **Relayed-message apps layer their own authenticity.** The channel authenticates one hop (§12.6). An app whose messages pass through intermediaries — a feed, a forum, store-and-forward gossip — cannot let the channel speak for the *original* author, so it becomes its own layer: a per-message signature naming the author, plus **backlinks** (a hash-chain, à la [SSB](https://ssbc.github.io/scuttlebutt-protocol-guide/)'s `previous` or [Bamboo](https://github.com/AljoschaMeyer/bamboo)'s lipmaa links) to order the history and make equivocation detectable. Signed bundles (§12.4) already do the author half for relayed *code*; a relayed-message app does the same one layer up, and it is a distinct app from chat, whose every message travels a single hop (§14 has the register-vs-log rationale).
 
@@ -162,7 +156,7 @@ These belong to the reference runtime (§12), not the kernel protocol — a diff
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| `GENESIS_ALGO_ID` | `0x0000` | Install record (§7.1) | The author algorithm recorded for a bundle module — Ed25519, the only signing algorithm the runtime uses. |
+| `GENESIS_ALGO_ID` | `0x0000` | Install record (§12.4) | The author algorithm recorded for a bundle module — Ed25519, the only signing algorithm the runtime uses. |
 | Cap op ids | `1`–`16` | cap-bridge (§12.2) | Guest↔host op identifiers, contiguous and grouped by domain (§12.2); regenerated with the guest preamble, never sent between nodes. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§12.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§12.4) | Ed25519 detached signature over `DOMAIN_manifest ‖ json`. |

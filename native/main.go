@@ -1,6 +1,6 @@
 // seedkernel native shell. The runtime is wasm (kernel); apps arrive as signed
 // bundles (README §12) — nothing application-specific lives here. Host
-// orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS —
+// orchestration (bundle verification + admission §12.4/§12.5) is JavaScript in QuickJS —
 // the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
 // second implementation (README §12.9); this Go layer is only the bridge: loads the
 // kernel wasm, supplies the crypto primitives (Ed25519 + SHA-3, via libsodium) the
@@ -32,10 +32,10 @@ import (
 //go:embed wasm/kernel.wasm
 var kernelWasm []byte
 
-// hostInstallerJS is the shared installer + install policy + bundle format/loader,
-// bundled from build/host/{util,installer,policy,bundle,native-shim}.js. It runs in
+// hostInstallerJS is the shared bundle loader + admission policy + bundle format,
+// bundled from build/host/{util,domains,bundle,policy,native-shim}.js. It runs in
 // QuickJS over the byte-level `bridge` below and is the ONLY implementation of the
-// §7 install rules and the §12.4 bundle load order — the same compiled TS the Node
+// §12.5 admission rules and the §12.4 bundle load order — the same compiled TS the Node
 // shell runs, so the protocol is never re-derived in a second language (README §12.9).
 // Regenerate with `npm run build:loader-bundles`; do not hand-edit.
 //
@@ -164,13 +164,13 @@ func dropEntry(id int32) {
 
 // isRegistered answers the kernel's handler-table query for `n`: a name is bound
 // exactly when find_handler resolves it, so this asks that rather than a second
-// export answering the same question. The shared §7.4 policy consults it so a
+// export answering the same question. The shared §12.5 admission consults it so a
 // first install cannot overlay a SetHandler-seeded bootstrap slot.
 func isRegistered(n []byte) bool {
 	return findHandlerID(n) >= 0
 }
 
-// removeHandler unbinds `n` via the kernel's remove_handler (§7.5) and drops the entry it
+// removeHandler unbinds `n` via the kernel's remove_handler (§12.5) and drops the entry it
 // resolved to. The id is read before the removal, since afterwards the name maps to nothing.
 func removeHandler(n []byte) bool {
 	id := findHandlerID(n)
@@ -256,8 +256,8 @@ func callHandler(n, payload []byte) []byte {
 }
 
 // installWasm instantiates handler bytes and binds them to the raw name `n`. The replace is
-// unconditional — the §7.4 policy already ran, and bindHandler releases whatever the name
-// displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §7).
+// unconditional — the §12.5 admission already ran, and bindHandler releases whatever the name
+// displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §12.4).
 func installWasm(n, wasm []byte) bool {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
@@ -301,7 +301,7 @@ func installWasm(n, wasm []byte) bool {
 }
 
 // boot wires the wasm host imports, instantiates kernel + signature, and stands up the
-// QuickJS realm running the shared installer + bundle loader (host-installer.gen.js).
+// QuickJS realm running the shared bundle loader + admission policy (host-installer.gen.js).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the genesis suite verify routes to it below
@@ -333,7 +333,7 @@ func boot() {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
 	}))
-	// The §7.4 first-install branch refuses to overlay a SetHandler-seeded slot, so the
+	// The §12.5 admission refuses to overlay a SetHandler-seeded slot, so the
 	// shared policy needs the kernel's handler-table query.
 	b.SetPropertyStr("isRegistered", fn(func(t *qjs.This) (*qjs.Value, error) {
 		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
@@ -378,7 +378,7 @@ func boot() {
 
 	// No `install` wire handler: code arrives only as a signed bundle (§12.4), and
 	// loadBundleFiles admits each verified module directly via installWasm. There is
-	// no message-driven install path (§7).
+	// no message-driven install path (§12.4).
 }
 
 // registerNativeAt binds a native host service (a Go closure) at the raw kernel name `n`,
@@ -428,8 +428,8 @@ var loaded *loadedBundle
 // loadBundle loads a signed app bundle directory (README §12.4). Reading the directory
 // is all this does: the whole load — manifest signature, policy governance, freshness,
 // per-module and guest integrity, and the order they run in — is the shared JS loader
-// (bundle.ts, via host-installer.gen.js), which installs each verified module through
-// the same install policy as a wire install. On success it records the verified guest
+// (bundle.ts, via host-installer.gen.js), which admits each verified module through
+// the shared §12.5 policy. On success it records the verified guest
 // source + caps + config in `loaded` for the node.
 func loadBundle(dir string) string {
 	entries, err := os.ReadDir(dir)

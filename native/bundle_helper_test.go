@@ -36,7 +36,7 @@ func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
 // given (app, version). Returns the dir and the module's raw kernel name. Requires boot()
 // first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle. The
 // module binds at name("fwd") unless a `kernelOverride` is passed — a test uses that to
-// aim a module at a seeded slot and prove the §7.4 overlay refusal.
+// aim a module at a seeded slot and prove the §12.5 overlay refusal.
 func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, kernelOverride ...[]byte) (string, []byte) {
 	t.Helper()
 	dir := t.TempDir()
