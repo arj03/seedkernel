@@ -130,7 +130,7 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 
 Each layer is testable standalone: the kernel is exercised on its own, the loader against a bundle with no live transport, chat as a handful of pure transforms with no crypto in sight. Composition across layers is the host's or the guest's, through `callHandler` / `MODULE_CALL` (§4.2) — never a handler reaching sideways.
 
-**The hash function used for id derivation.** A few places hash: `bytes_hash` (§12.4), the app-name derivations a policy may choose (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **SHA-3-256** — the *genesis hash*, computed host-side by `genesisHash` over bundled libsodium, the one hash guaranteed at boot. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
+**The hash function used for id derivation.** A few places hash: `bytes_hash` (§12.4), the app-name derivations a policy may choose (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **BLAKE2b-256** — the *genesis hash*, computed host-side by `genesisHash` (libsodium's core `crypto_generichash`). There is exactly one hash across the whole system: the same BLAKE2b-256 backs the guest `HASH` op (§12.2), the AKE KDF and transcript hash (§12.6), and the block-id path. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
 
 **Naming convention for bootstrap handlers:** `name = "seedkernel.bootstrap.v1:" + canonical_name` — a readable string (opaque bytes, so nothing forces a hash) that reads plainly in logs. These names are host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand, not admitted through the loader, so there is no install record to mix in. The chat shell uses the same helper (`deriveBootstrapName`) to derive an *app's* kernel name from its id, so two peers running the same app route to the same name (§11).
 
@@ -156,7 +156,7 @@ These belong to the reference runtime (§12), not the kernel protocol — a diff
 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
-| `GENESIS_ALGO_ID` | `0x0000` | Install record (§12.4) | The author algorithm recorded for a bundle module — Ed25519, the only signing algorithm the runtime uses. |
+| `GENESIS_ALGO_ID` | `0x0000` | Install record (§12.4) | The author algorithm recorded for a bundle module — Ed25519, the only signing algorithm the runtime uses. The paired genesis hash is BLAKE2b-256, the one system hash (§5.1); together they are the whole genesis — one verifier, one hash, both host constants. |
 | Cap op ids | `1`–`16` | cap-bridge (§12.2) | Guest↔host op identifiers, contiguous and grouped by domain (§12.2); regenerated with the guest preamble, never sent between nodes. |
 | Capability domains | `crypto`, `net`, `fs`, `module`, `clock` | manifest `caps` (§12.4) | An unknown domain throws when the guest realm is built. |
 | Manifest envelope | `[pk 32][sig 64][json]` | `loadBundle` (§12.4) | Ed25519 detached signature over `DOMAIN_manifest ‖ json`. |

@@ -20,8 +20,9 @@ import { InstallRecords, type AdmitPolicy, type InstallRecord } from "./bundle.j
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
-/** The genesis signature suite's algo_id (README §6.2) — the author algo recorded
- *  for a bundle module's install record. */
+/** The genesis signing algorithm's algo_id (README §16.1) — the author algo recorded
+ *  for a bundle module's install record. Ed25519 is the one verifier and BLAKE2b-256
+ *  the one hash (`genesisHash`), both host constants. */
 export const GENESIS_ALGO_ID = 0x0000;
 
 export interface Signer {
@@ -88,7 +89,7 @@ export class KernelHost {
   /** Instantiate the kernel from in-memory bytes. The kernel alone is a usable
    *  host (§1): `register` and `callHandler` work with nothing else wired, and loading
    *  signed bundles is opt-in on top (wire an admission policy with setAdmitPolicy). The
-   *  caller supplies the bytes and an initialized libsodium (SHA-3-256 for record
+   *  caller supplies the bytes and an initialized libsodium (BLAKE2b-256 for content
    *  hashing) —
    *  keeping the entry point free of Node- or browser-specific I/O is what lets the
    *  same host run in Node, browsers, Deno, Bun, etc. The thin entry points in
@@ -360,14 +361,16 @@ export class KernelHost {
     return new TextEncoder().encode("seedkernel.bootstrap.v1:" + canonical);
   }
 
-  /** Hash the raw bytes of `data` with the genesis suite (SHA-3-256). Used by the loader's
-   *  admission to compute a module's install-record `bytesHash` (§12.4), and exposed so
-   *  deployers can compute the same hash off-line for policy allowlists. */
+  /** Hash the raw bytes of `data` with the genesis hash (BLAKE2b-256) — the one system
+   *  hash (the guest `HASH` op, the AKE KDF/transcript, and the block-id path all use it
+   *  too, §12.1). Used by the loader's admission to compute a module's install-record
+   *  `bytesHash` (§12.4), and exposed so deployers can compute the same hash off-line for
+   *  policy allowlists. */
   genesisHash(data: Uint8Array): Uint8Array {
-    return this.sodium.crypto_hash_sha3256(data);
+    return this.sodium.crypto_generichash(32, data, null);
   }
 
-  /** Derive a deterministic name as `SHA-3-256(canonical || authorPubKey)`. Useful
+  /** Derive a deterministic name as `BLAKE2b-256(canonical || authorPubKey)`. Useful
    *  for deployer policies that want author-scoped names so two parties can each
    *  hold their own `chat` without conflict (§5.1). The kernel is indifferent to
    *  derivation — this is just a convenience. */
@@ -376,6 +379,6 @@ export class KernelHost {
     const buf = new Uint8Array(nameBytes.length + authorPubKey.length);
     buf.set(nameBytes, 0);
     buf.set(authorPubKey, nameBytes.length);
-    return this.sodium.crypto_hash_sha3256(buf);
+    return this.sodium.crypto_generichash(32, buf, null);
   }
 }

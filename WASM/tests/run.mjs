@@ -184,7 +184,7 @@ async function testApproveInstallReceivesBytesHash() {
   installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install accepted");
 
-  assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
+  assertEqual(seenHash.length, 32, "bytes_hash is BLAKE2b-256 (32 bytes)");
   // The hash is the content id of the WASM module — the same identifier a
   // manifest's modules[].hash and a policy allowlist use (§5.1), independent of
   // seq or the install framing.

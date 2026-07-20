@@ -34,8 +34,8 @@ import { toHex, fromHex, concatBytes } from "./util.js";
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
 type Identity = { publicKey: Uint8Array; privateKey: Uint8Array };
 
-/** The genesis module the runtime always loads. The signature wrapper and the
- *  genesis suite are host code now (kernel-host.ts), so kernel.wasm is the one
+/** The genesis module the runtime always loads. The genesis verifier (Ed25519) and
+ *  hash (BLAKE2b-256) are host code now (kernel-host.ts), so kernel.wasm is the one
  *  WASM blob the shell itself loads. */
 export interface KernelWasm {
   kernelBytes: Uint8Array;

@@ -3,7 +3,7 @@
 // orchestration (bundle verification + admission §12.4/§12.5) is JavaScript in QuickJS —
 // the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
 // second implementation (README §12.9); this Go layer is only the bridge: loads the
-// kernel wasm, supplies the crypto primitives (Ed25519 + SHA-3, via libsodium) the
+// kernel wasm, supplies the crypto primitives (Ed25519 via libsodium, BLAKE2b native) the
 // realm verifies bundles with, and exposes byte primitives to the realm. Pure Go, no
 // cgo (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero bridge) → one static binary.
 package main
@@ -106,7 +106,7 @@ func wr(m api.Module, data []byte) uint32 {
 
 // name is a bootstrap handler name (README §5.1): the literal-ASCII
 // "seedkernel.bootstrap.v1:" + canonical. Bootstrap names are plain ASCII, not
-// genesis-hash-derived — swapping the genesis suite no longer re-derives the
+// genesis-hash-derived — swapping the genesis hash no longer re-derives the
 // bootstrap namespace (only bytes_hash still depends on the genesis hash).
 func name(canonical string) []byte {
 	return []byte("seedkernel.bootstrap.v1:" + canonical)
@@ -304,7 +304,7 @@ func installWasm(n, wasm []byte) bool {
 // QuickJS realm running the shared bundle loader + admission policy (host-installer.gen.js).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd = bootSodium(rt) // crypto primitive; the genesis suite verify routes to it below
+	sd = bootSodium(rt) // crypto primitive; the genesis verify routes to it below
 	// The kernel and every installed handler are pure transforms (README §4): the only
 	// host import they take is the AssemblyScript `env.abort` shim. There is no kernel.call
 	// / kernel.caller seam and no env.invoke_handler dispatch callback any more.

@@ -62,10 +62,10 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		App:     app,
 		Version: version,
 		Modules: []mod{{
-			Name: "fwd", File: "fwd.wasm", Hash: hex.EncodeToString(sd.hashSha3256(forwarderWasm)),
+			Name: "fwd", File: "fwd.wasm", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
 			KernelName: hex.EncodeToString(kernelName),
 		}},
-		Guest: map[string]string{"file": "guest.js", "hash": hex.EncodeToString(sd.hashSha3256([]byte(guestSrc)))},
+		Guest: map[string]string{"file": "guest.js", "hash": hex.EncodeToString(sd.genericHash(32, []byte(guestSrc)))},
 		Caps:  []string{},
 	}
 	mjson, err := json.Marshal(manifest)

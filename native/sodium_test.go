@@ -9,7 +9,6 @@ import (
 	"github.com/tetratelabs/wazero"
 	"golang.org/x/crypto/blake2b"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/sha3"
 )
 
 // newSodium stands up an isolated libsodium instance (its own runtime) so the
@@ -21,28 +20,10 @@ func newSodium(t *testing.T) *libsodium {
 	return bootSodium(rt)
 }
 
-// SHA3-256 must be FIPS-202 (so a Go node's names/hashes match a Bun node's) — the
-// known-answer for "" guards against a legacy-Keccak padding build, and the
-// per-input cross-check pins it to an independent oracle (golang.org/x/crypto/sha3).
-// This is the only crypto the build keeps outside libsodium — and only in tests, as
-// an oracle; the shipped binary's hashing (incl. name()) goes through libsodium.
-func TestSodiumSha3256(t *testing.T) {
-	s := newSodium(t)
-	for _, msg := range [][]byte{nil, []byte("abc"), bytes.Repeat([]byte{0x5a}, 1000)} {
-		got, want := s.hashSha3256(msg), sha3.Sum256(msg)
-		if !bytes.Equal(got, want[:]) {
-			t.Fatalf("sha3256(%q): got %x want %x", msg, got, want)
-		}
-	}
-	const wantEmpty = "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
-	if g := hex.EncodeToString(s.hashSha3256(nil)); g != wantEmpty {
-		t.Fatalf("sha3256(\"\") = %s, want %s (Keccak vs FIPS-202?)", g, wantEmpty)
-	}
-}
-
 // genericHash (no key, 32-byte out) is plain BLAKE2b-256, and runs on native Go rather
-// than libsodium (sodium.go header). Since it's the content-address block-id hash, a Go
-// node and a Bun node MUST agree on it — so beyond the x/crypto cross-check, pin it to
+// than libsodium (sodium.go header). It is the one system hash — the block-id, the guest
+// HASH op, and the loader's genesis/content hash all route here — so a Go node and a Bun
+// node MUST agree on it. Beyond the x/crypto cross-check, pin it to
 // known-answer vectors captured from the libsodium.wasm this build embeds. If native Go
 // ever diverged from that exact binary, these fail rather than silently forking storage.
 func TestSodiumGenericHash(t *testing.T) {

@@ -254,7 +254,7 @@ export type AdmitPolicy = (
   current: InstallRecord | null,
 ) => boolean;
 
-/** The host powers the record store runs over (README §12.4): hash with the genesis suite,
+/** The host powers the record store runs over (README §12.4): hash with the genesis hash,
  *  instantiate + bind a verified handler, and ask whether a name is already bound.
  *  `KernelHost` satisfies it; the native loader supplies the same three over its Go bridge
  *  (README §12.9), so the admission below is not re-derived in a second language. */
@@ -340,7 +340,7 @@ export interface BundleSource {
   readText(file: string): string;
 }
 
-/** The host powers loading a bundle needs: hash bytes with the genesis suite, and
+/** The host powers loading a bundle needs: hash bytes with the genesis hash, and
  *  land a verified module under the install policy. `KernelHost` satisfies it; the
  *  native loader supplies the same two members over its Go bridge (README §12.9). */
 export interface BundleHost {

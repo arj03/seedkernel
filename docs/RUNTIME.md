@@ -18,7 +18,7 @@ So the costs worth measuring are the three places real cryptography lives, all o
 
 - **Per connection:** the AKE handshake (§12.6) — one Ed25519 sign + verify and one X25519 exchange, amortised across the whole session.
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6) — symmetric, fast, the steady-state transport cost.
-- **Per bundle load:** one Ed25519 manifest verify plus a SHA-3-256 content hash per module (§12.4) — once, at install.
+- **Per bundle load:** one Ed25519 manifest verify plus a BLAKE2b-256 content hash per module (§12.4) — once, at install.
 
 The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (net round-trip, fs, the crypto primitives, the record layer); `WASM/tests/run.mjs` exercises the same paths end-to-end on the JS target, and seed store's `WASM/tests/bench.mjs` measures storage throughput. There is no signed-message microbenchmark anymore because there is no signed message — a chat frame crosses the WASM boundary only for its handler's single pure-transform call.
 
@@ -28,12 +28,12 @@ The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (
 |---|---|
 | kernel.wasm | ~6 KB |
 | host/*.js — minified (`build/host-min`; ~29 KB gzipped) | ~117 KB |
-| libsodium.wasm (sumo build: Ed25519 + SHA-3-256, plus the §12.1 BLAKE2b / XChaCha20 backends) | 278 KB |
+| libsodium.wasm (sumo build: Ed25519 + BLAKE2b + XChaCha20, the §12.1 backends) | 278 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 152 KB |
 | **Total browser deployment** | **~553 KB** |
 | QuickJS realm engine (the single release-sync build, from `quickjs-emscripten`) — only loaded when a bundle's guest runs (§12.3) | ~750 KB |
 
-The kernel is pure protocol logic — no cryptographic code, no dispatch, no signature layer — at ~6 KB of WASM. The `host/*.js` layer is the runtime around it: it loads the kernel, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — net, fs, the cap-bridge, safe-js, bundle verification, policy, and the entire node↔node transport stack (§12.6), which now lives in shared JS rather than a per-target reimplementation. That transport is the bulk of why the host is larger than a kernel-only driver would be. libsodium is the host's crypto library (SHA-3-256 for content hashing, Ed25519 for manifests and the handshake, ChaCha20 / BLAKE2b / XChaCha20 for the record layer and the §12.1 backends); the sumo build is larger than a sign-only build because it backs all of them. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
+The kernel is pure protocol logic — no cryptographic code, no dispatch, no signature layer — at ~6 KB of WASM. The `host/*.js` layer is the runtime around it: it loads the kernel, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — net, fs, the cap-bridge, safe-js, bundle verification, policy, and the entire node↔node transport stack (§12.6), which now lives in shared JS rather than a per-target reimplementation. That transport is the bulk of why the host is larger than a kernel-only driver would be. libsodium is the host's crypto library (BLAKE2b for content hashing and the §12.1 hash backend, Ed25519 for manifests and the handshake, ChaCha20 / XChaCha20 for the record layer and the §12.1 backends); the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
 
 `npm run build` emits the host twice: the readable `build/host` (~203 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (~117 KB, ~29 KB gzipped) for shipping. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does the cut — no bundler, no new dependencies. The table's host figure is the shipped, minified build.
 
@@ -265,7 +265,7 @@ This is enforced mechanically: the shared modules are compiled by `tsc` and conc
 Concretely the binary embeds and drives, over [wazero](https://wazero.io) (a pure-Go, cgo-free wasm runtime):
 
 - **`kernel.wasm`** — the same §3 handler-table module every target runs.
-- **`libsodium.wasm`** — the *same* crypto blob as the browser/Node build, which is exactly what makes a Go node's sealed boxes, XChaCha20 blocks, and Ed25519→Curve25519 conversions byte-identical to a JS node's. Wire/crypto parity is free when it is literally the same code (§6.6).
+- **`libsodium.wasm`** — the *same* crypto blob as the browser/Node build, which is exactly what makes a Go node's sealed boxes, XChaCha20 blocks, and Ed25519→Curve25519 conversions byte-identical to a JS node's. Wire/crypto parity is free when it is literally the same code.
 - **a prebuilt QuickJS** (quickjs-ng, `native/qjs`) — so the shared host JS runs unmodified with no native JS-engine dependency. QuickJS is synchronous, so Go owns the event loop (timers, the JS job queue, socket delivery). A net `host.call` returns a real Promise to the guest: Go kicks off the host realm's Transport request under a call id and, when it settles, resolves the guest's pending Promise (`deliverNet`), and the shared loop pumps the guest realm so the awaiting entrypoint resumes — the same real-promise seam the Node/Bun build uses, driven by Go's loop instead of quickjs-emscripten's job pump. The confined guest runs in a second, zero-authority QuickJS realm whose only seam is `host.call`.
 - **`ws.wasm`** — the *same* RFC 6455 framing blob the browser/Node targets use (`host/ws/ws-wasm-backend.ts`), driven over wazero and exposed to QuickJS as `__ws`. WebSocket framing is a no-capability byte transform (§12.1), not host code, so it is the identical module on every target; the handshake/codec state machine stays shared host JS (`ws-codec.ts` + `net-frame.ts`) running in QuickJS over a raw Go socket. Instantiated lazily on first WS use, so a pure node↔node TCP deployment never pays for it.
 

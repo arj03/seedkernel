@@ -7,7 +7,7 @@ import { readFile } from "node:fs/promises";
 import { KernelHost } from "./kernel-host.js";
 
 // The runtime bundles the sumo build so apps that need symbols beyond the
-// kernel's own Ed25519 + SHA-3 (e.g. seedstore's crypto_stream_xchacha20_xor)
+// kernel's own Ed25519 + BLAKE2b (e.g. seedstore's crypto_stream_xchacha20_xor)
 // reuse one libsodium rather than shipping a second (README §12.1). A *static*
 // import (not createRequire) so `bun build --compile` bundles the package into
 // the standalone shell binary — a dynamic require resolves to nothing there. The

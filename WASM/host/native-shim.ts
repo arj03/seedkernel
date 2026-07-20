@@ -21,7 +21,7 @@ import {
 } from "./bundle.js";
 import { toHex } from "./util.js";
 
-/** The genesis signature suite's algo_id (§6.2) — an Ed25519 manifest author. */
+/** The genesis signing algorithm's algo_id (§16.1) — an Ed25519 manifest author. */
 const GENESIS_ALGO_ID = 0x0000;
 
 /** The byte-level primitives the Go loader exposes into the realm (native/main.go).
@@ -41,7 +41,7 @@ declare const bridge: {
 
 /** libsodium, in libsodium-wrappers method names (native/sodium.go exposeSodium). */
 declare const sodium: {
-  crypto_hash_sha3256(data: Uint8Array): Uint8Array;
+  crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
   crypto_sign_verify_detached(sig: Uint8Array, msg: Uint8Array, pk: Uint8Array): boolean;
 };
 
@@ -51,7 +51,7 @@ declare const sodium: {
 class NativeHost implements BundleHost, RecordHost {
   readonly records = new InstallRecords(this);
 
-  genesisHash(data: Uint8Array): Uint8Array { return sodium.crypto_hash_sha3256(data); }
+  genesisHash(data: Uint8Array): Uint8Array { return sodium.crypto_generichash(32, data); }
   _installWasmHandler(name: Uint8Array, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
   isRegistered(name: Uint8Array): boolean { return bridge.isRegistered(name); }
 

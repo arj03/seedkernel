@@ -206,7 +206,7 @@ function updatePeerPill() {
 // this shell reads: "app_meta" (JSON — id, name, version) and "ui" (HTML rendered
 // in the sandboxed iframe). The signed manifest's `app` is the id, and the module
 // binds under a kernel name derived from it:
-//     handlerName = SHA-3-256("seedkernel.bootstrap.v1:app:" + id)
+//     handlerName = "seedkernel.bootstrap.v1:app:" + id   (literal ASCII, §5.1)
 //
 // `handlerName` is globally derivable so two peers running the same app id route
 // messages to the same name; we derive it from the signed manifest `app` on
@@ -382,9 +382,9 @@ function peekAppBundle(bundleBytes) {
   if (!contentMatches(wasm, mod.hash, (b) => host.genesisHash(b))) return null;
   return {
     authorPk: author,
-    authorAlgo: 0,   // Ed25519 genesis suite (§6.2)
+    authorAlgo: 0,   // Ed25519 genesis signing algorithm (§16.1)
     manifest,
-    // bytes_hash is the registry's content id for the module (§7.1): genesisHash(wasm),
+    // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
     // the same value the approve callback receives — so it keys pendingApprovals and
     // doubles as the artifact's display hash. Equal to fromHex(mod.hash) once the
     // integrity check above passes.
