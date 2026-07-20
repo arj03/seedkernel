@@ -35,10 +35,14 @@ type guestRealm struct {
 }
 
 // newGuestRealm builds a confined realm running guestSource, fronted by the cap op
-// preamble (capPreamble) and the app config (`const APP = …`), with host.call wired
-// to the host realm's cap-bridge over the shared loop. The host realm (host.c) must
-// already have the cap-bridge installed (exposeCapBridge + a __buildCapBridge call).
-func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, error) {
+// preamble (capPreamble), the admitted bundle's facts (`const BUNDLE = …`, from
+// bundleFactsJSON) and the app config (`const APP = …`), with host.call wired to the
+// host realm's cap-bridge over the shared loop. The host realm (host.c) must already
+// have the cap-bridge installed (exposeCapBridge + a __buildCapBridge call).
+//
+// An empty bundleFactsJSON injects no BUNDLE at all — for a caller with no admitted
+// manifest behind it (the tests driving a guest directly).
+func newGuestRealm(host *eventLoop, bundleFactsJSON, appJSON, guestSource string) (*guestRealm, error) {
 	hostQc := host.c
 	rt, err := qjs.New()
 	if err != nil {
@@ -101,7 +105,8 @@ func newGuestRealm(host *eventLoop, appJSON, guestSource string) (*guestRealm, e
 		rt.Close()
 		return nil, fmt.Errorf("guest preamble: %w", err)
 	}
-	full := hostCapPreamble(hostQc) + "const APP = " + appJSON + ";\n" + guestSource
+	full := hostCapPreamble(hostQc) + hostBundlePreamble(hostQc, bundleFactsJSON) +
+		"const APP = " + appJSON + ";\n" + guestSource
 	if _, err := g.qc.Eval("guest.js", qjs.Code(full)); err != nil {
 		rt.Close()
 		return nil, fmt.Errorf("guest source: %w", err)
@@ -153,6 +158,26 @@ func hostCapPreamble(hostQc *qjs.Context) string {
 	fn.Free()
 	if err != nil {
 		panic(fmt.Sprintf("capPreamble: %v", err))
+	}
+	defer v.Free()
+	return v.String()
+}
+
+// hostBundlePreamble asks the host realm for bundlePreamble(facts) — the `const BUNDLE`
+// block holding what the runtime derived from the admitted manifest. Deriving it in the
+// host realm keeps the signing-prefix construction in the one place that owns it
+// (cap-bridge.ts), so Go never assembles those bytes itself. Empty facts ⇒ no block.
+func hostBundlePreamble(hostQc *qjs.Context, factsJSON string) string {
+	if factsJSON == "" {
+		return ""
+	}
+	fn := hostQc.Global().GetPropertyStr("__bundlePreamble")
+	arg := hostQc.NewString(factsJSON)
+	v, err := hostQc.Invoke(fn, hostQc.NewUndefined(), arg)
+	fn.Free()
+	arg.Free()
+	if err != nil {
+		panic(fmt.Sprintf("bundlePreamble: %v", err))
 	}
 	defer v.Free()
 	return v.String()

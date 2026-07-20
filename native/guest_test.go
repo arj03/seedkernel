@@ -54,7 +54,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 		t.Fatal("build bridge:", err)
 	}
 
-	g, err := newGuestRealm(el, "{}", storeGuestSource)
+	g, err := newGuestRealm(el, "", "{}", storeGuestSource)
 	if err != nil {
 		t.Fatal("guest realm:", err)
 	}

@@ -1,35 +1,48 @@
-// The app bundle format (README §12.4). A bundle is *signed
-// content* the generic shell loads from a file: a set of WASM handler modules, a
+// The app bundle format (README §12.4). A bundle is *signed content* the generic
+// shell loads from a single file: a set of WASM handler modules, an optional
 // zero-authority guest program, and a signed manifest declaring the modules, the
-// kernel names they bind at, and the capabilities the bundle needs. The shell
-// verifies the manifest signature, governs it against its policy (author +
-// module hashes), and installs the modules; the manifest's `caps` describe the
-// seam the app's guest is wired over — honored by the generic cap bridge
-// (README §12.2).
+// kernel names they bind at, and — when there is a guest — the capabilities it holds.
+// The shell verifies the manifest signature, governs it against its policy (author +
+// module hashes), and installs the modules; the guest's `caps` describe the seam it is
+// wired over, honored by the generic cap bridge (README §12.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
-// (its build-bundle script). On disk a bundle is a directory:
+// (its build-bundle script). A bundle is ONE blob — the container below — holding:
 //
 //   manifest.bundle    signed manifest envelope [authorPk(32)][sig(64)][utf8 json]
-//   <module>.wasm       each handler module
-//   <guest>.js          the safe-js guest program
+//   <name>.wasm        each handler module, named by its manifest `name`
+//   guest.js           the safe-js guest program, if the manifest declares one
 //
-// The manifest commits to every module's genesisHash and the shell verifies the
-// bytes against it, so the loader admits the verified module directly under its
-// declared kernel name (§12.4) — there is no separate per-module install envelope.
-// A live update is not a separate mechanism: it is a bundle whose manifest `version`
-// is higher, which freshness requires and the same-author rule (§12.5) admits.
+// There is no directory form: a bundle is a value, not a path. That is what lets the
+// same bytes be read from disk, carried over a data channel, and stashed in browser
+// storage without a second format or a second load path — and it is why the manifest
+// names no filenames (a signed name would be one more thing every target must
+// validate). The file a module lives in is `<name>.wasm`, by construction.
+//
+// The manifest commits to every module's genesisHash and the loader verifies the bytes
+// against it, so a verified module is admitted directly under its declared kernel name
+// (§12.4) — there is no separate per-module install envelope. A live update is not a
+// separate mechanism: it is a bundle whose manifest `version` is higher, which
+// freshness requires and the same-author rule (§12.5) admits.
 
 import { concatBytes, toHex } from "./util.js";
 import { DOMAIN_MANIFEST } from "./domains.js";
 import type { ShellPolicy } from "./policy.js";
 
+/** The manifest envelope's name inside the container. */
+export const MANIFEST_FILE = "manifest.bundle";
+/** The guest program's name inside the container (§12.4 — fixed, never declared). */
+export const GUEST_FILE = "guest.js";
+/** A module's name inside the container, derived from its logical name. */
+export function moduleFile(name: string): string { return name + ".wasm"; }
+
 export interface BundleModule {
-  /** Logical name, e.g. "codec". */
+  /** Logical name, e.g. "codec". Three jobs, one value: the module's file in the
+   *  container (`<name>.wasm`), the key the guest addresses it by (`BUNDLE.modules`),
+   *  and how the loader reports it. Unique within a manifest, and restricted to
+   *  `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
   name: string;
-  /** The module's filename within the bundle (`<name>.wasm`). */
-  file: string;
-  /** genesisHash(wasm) hex — content integrity for the .wasm file, and the
+  /** genesisHash(wasm) hex — content integrity for the module bytes, and the
    *  module's `bytes_hash` in the loader's install record (§5.1, §12.4). */
   hash: string;
   /** Kernel name the loader binds the module at via SetHandler — the name itself
@@ -39,6 +52,34 @@ export interface BundleModule {
   kernelName: string;
 }
 
+/** The zero-authority guest program and everything about it. `caps` and `config` live
+ *  HERE rather than at the top level because both are the guest's alone: the manifest's
+ *  caps are the guest's entire authority (§12.2) and config only ever becomes its
+ *  injected `APP`. WASM handlers carry no authority and read no config, so a
+ *  handler-only bundle (the chat demo) simply omits this object — and "no guest ⇒ zero
+ *  authority" is then the schema's shape rather than a rule prose has to state. */
+export interface BundleGuest {
+  /** genesisHash(utf8(source)) hex of `guest.js`. */
+  hash: string;
+  /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
+   *  "module" | "clock") granted to the guest. The shell expands these to the concrete
+   *  allowed op set and wires only the matching backends — so this is the enforced
+   *  capability declaration, not just documentation. Required whenever a guest exists;
+   *  an empty array is a guest with no authority at all. */
+  caps: string[];
+  /** App-structural constants the guest needs as injected globals (e.g. storage
+   *  k/m/blockSize). Opaque to the runtime — the shell forwards it verbatim into the
+   *  guest preamble as `const APP = …`.
+   *
+   *  NB what does NOT belong here: anything the runtime already derives from the
+   *  admitted manifest. The author's key, the app name, the guest signing prefix and
+   *  the modules' kernel names all arrive as `const BUNDLE` (cap-bridge
+   *  `bundlePreamble`). Restating one of those here would be a build-time copy of a
+   *  load-time fact — and a copy that silently disagrees is a verify mismatch with
+   *  nothing pointing at the cause. */
+  config?: Record<string, string | number>;
+}
+
 export interface BundleManifest {
   app: string;
   /** Monotonic version of the coherent set (README §12.4). Enforced at load against
@@ -46,20 +87,11 @@ export interface BundleManifest {
    *  the mark is refused as a downgrade. An integer, not a label. */
   version: number;
   modules: BundleModule[];
-  /** The safe-js guest program: its filename + genesisHash(utf8(source)) hex.
-   *  Optional — a handler-only bundle (app modules bound as handlers, no zero-authority
-   *  realm — e.g. the chat demo) omits it. Present ⇒ the loader integrity-checks the
-   *  source and hands it back for the shell to run in a confined realm (§12.2). */
-  guest?: { file: string; hash: string };
-  /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
-   *  "module" | "clock") the bundle's guest is granted. The shell expands these to
-   *  the concrete allowed op set and wires only the matching backends — so this is
-   *  the enforced capability declaration, not just documentation. */
-  caps: string[];
-  /** App-specific constants the guest needs as injected globals (e.g. storage
-   *  k/m/blockSize + the codec/reputation kernel names). Opaque to the runtime —
-   *  the shell forwards it verbatim into the guest preamble as `const APP = …`. */
-  config?: Record<string, string | number>;
+  /** The guest program, or absent for a handler-only bundle (app modules bound as
+   *  handlers, no zero-authority realm — e.g. the chat demo). Present ⇒ the loader
+   *  integrity-checks `guest.js` and hands the source back for the shell to run in a
+   *  confined realm (§12.2). */
+  guest?: BundleGuest;
 }
 
 /** The surface *verifying* a manifest needs (a subset of libsodium). Deliberately
@@ -77,6 +109,12 @@ export interface ManifestCrypto extends ManifestVerifier {
 
 const PK_LEN = 32;
 const SIG_LEN = 64;
+
+/** Module names double as filenames and as the guest's module keys, so they are held
+ *  to an unambiguous charset. With the container keyed by name (never joined to a
+ *  path) a traversal name could not escape anything, but a name that needs quoting or
+ *  normalizing to be used as either is a name the format should not accept at all. */
+const NAME_RE = /^[A-Za-z0-9_-]+$/;
 
 // Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // `"seedkernel-manifest-sig-v1\0"` — from the one domain family (domains.ts, §16.1).
@@ -110,30 +148,36 @@ export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Ar
  *  signed but got wrong (a missing/mistyped field) into a clean, loud rejection
  *  instead of a raw TypeError surfacing deep in the loader, and lets the rest of
  *  the runtime treat every field as present and correctly typed (matching the
- *  fail-loud posture of parsePolicy). `caps` is required here — the enforced
- *  capability declaration is never optional. */
+ *  fail-loud posture of parsePolicy). Note `caps` is required *inside* `guest`: the
+ *  enforced capability declaration is never optional where a guest exists, and never
+ *  present where one doesn't. */
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
   const o = m as Record<string, unknown>;
   if (typeof o.app !== "string") return false;
   if (typeof o.version !== "number" || !Number.isInteger(o.version)) return false;
   if (!Array.isArray(o.modules)) return false;
+  const seen = new Set<string>();
   for (const mod of o.modules) {
     if (typeof mod !== "object" || mod === null) return false;
     const mm = mod as Record<string, unknown>;
-    if (typeof mm.name !== "string" || typeof mm.file !== "string" ||
-        typeof mm.hash !== "string" || typeof mm.kernelName !== "string") return false;
+    if (typeof mm.name !== "string" || !NAME_RE.test(mm.name)) return false;
+    if (typeof mm.hash !== "string" || typeof mm.kernelName !== "string") return false;
+    // Names key both the container and the guest's module map, so a duplicate is
+    // ambiguous rather than merely redundant.
+    if (seen.has(mm.name)) return false;
+    seen.add(mm.name);
   }
   if (o.guest !== undefined) {
     const g = o.guest as Record<string, unknown> | null;
-    if (typeof g !== "object" || g === null ||
-        typeof g.file !== "string" || typeof g.hash !== "string") return false;
-  }
-  if (!Array.isArray(o.caps) || o.caps.some((c) => typeof c !== "string")) return false;
-  if (o.config !== undefined) {
-    if (typeof o.config !== "object" || o.config === null || Array.isArray(o.config)) return false;
-    for (const v of Object.values(o.config as Record<string, unknown>)) {
-      if (typeof v !== "string" && typeof v !== "number") return false;
+    if (typeof g !== "object" || g === null || Array.isArray(g)) return false;
+    if (typeof g.hash !== "string") return false;
+    if (!Array.isArray(g.caps) || g.caps.some((c) => typeof c !== "string")) return false;
+    if (g.config !== undefined) {
+      if (typeof g.config !== "object" || g.config === null || Array.isArray(g.config)) return false;
+      for (const v of Object.values(g.config as Record<string, unknown>)) {
+        if (typeof v !== "string" && typeof v !== "number") return false;
+      }
     }
   }
   return true;
@@ -161,12 +205,68 @@ export function contentMatches(bytes: Uint8Array, declaredHex: string, genesisHa
   return toHex(genesisHash(bytes)) === declaredHex.toLowerCase();
 }
 
+// ── The container (README §12.4) ─────────────────────────────────────────────
+//
+// A bundle is one blob. This is pure *framing*, not a signed format of its own: the
+// manifest envelope inside carries the author's signature and its module hashes
+// protect the bytes, so the container only names the files and can be repacked by
+// anyone without weakening anything. Layout (integers big-endian):
+//
+//   "SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
+
+const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
+
+/** Serialize a set of named bundle files into one bundle blob (format above). */
+export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
+  const names = Object.keys(files);
+  const enc = new TextEncoder();
+  const header = new Uint8Array(6);
+  header.set(ARCHIVE_MAGIC, 0);
+  new DataView(header.buffer).setUint16(4, names.length, false);
+  const parts: Uint8Array[] = [header];
+  for (const name of names) {
+    const nameBytes = enc.encode(name);
+    const data = files[name];
+    const rec = new Uint8Array(2 + nameBytes.length + 4);
+    const dv = new DataView(rec.buffer);
+    dv.setUint16(0, nameBytes.length, false);
+    rec.set(nameBytes, 2);
+    dv.setUint32(2 + nameBytes.length, data.length, false);
+    parts.push(rec, data);
+  }
+  return concatBytes(parts);
+}
+
+/** Parse a bundle blob back into its `{ file: bytes }` map. Throws on a mis-magicked
+ *  or truncated blob — a malformed container is a fail-loud condition, like a
+ *  malformed manifest, not an untrusted input to silently drop. */
+export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
+  if (blob.length < 6 || !ARCHIVE_MAGIC.every((b, i) => blob[i] === b)) {
+    throw new Error("bundle: not a bundle blob");
+  }
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint16(4, false);
+  const dec = new TextDecoder();
+  const files: Record<string, Uint8Array> = {};
+  let off = 6;
+  for (let i = 0; i < count; i++) {
+    if (off + 2 > blob.length) throw new Error("bundle: truncated blob");
+    const nameLen = dv.getUint16(off, false); off += 2;
+    if (off + nameLen + 4 > blob.length) throw new Error("bundle: truncated blob");
+    const name = dec.decode(blob.subarray(off, off + nameLen)); off += nameLen;
+    const dataLen = dv.getUint32(off, false); off += 4;
+    if (off + dataLen > blob.length) throw new Error("bundle: truncated blob");
+    files[name] = blob.slice(off, off + dataLen); off += dataLen;
+  }
+  return files;
+}
+
 // ── Freshness (README §12.4 step 3) ──────────────────────────────────────────
 
 /** The persisted bundle-freshness high-water mark per `(author, app)` (README §12.4).
- *  Host-local state that survives reboots, so an older signed bundle directory cannot
- *  silently replace a newer one — the guest is loaded wholesale from the directory at
- *  every boot and carries no `seq` of its own. */
+ *  Host-local state that survives reboots, so an older signed bundle cannot silently
+ *  replace a newer one — the guest is loaded wholesale from the bundle at every boot
+ *  and carries no `seq` of its own. */
 export interface FreshnessStore {
   /** The highest `version` ever loaded for this `(author, app)`, or −Infinity if none. */
   get(author: Uint8Array, app: string): number;
@@ -327,16 +427,30 @@ export class InstallRecords {
 }
 
 // ── Loading (README §12.4) ───────────────────────────────────────────────────
+//
+// The load is two halves, and they are separate functions because they have genuinely
+// different powers:
+//
+//   verifyBundle   authenticity + integrity. Pure: no host, no policy, no persistence,
+//                  nothing lands. Given a blob it either yields every verified byte or
+//                  throws.
+//   installBundle  governance + effect. Takes what verifyBundle proved, applies the
+//                  deployment's policy and freshness, and binds modules.
+//
+// Splitting them is what lets a shell INSPECT a bundle before consenting to it — the
+// browser shows an app's author and metadata and waits for the user (§12.4) — without
+// hand-rolling a second copy of the verification order, which is exactly the drift the
+// shared loader exists to prevent. `loadBundle` is the two composed, and is what a
+// non-interactive target calls.
 
-/** The bundle directory as the loader sees it: named files it can read. The fs is a
- *  platform seam — Node reads the directory, the native loader hands in bytes its Go
- *  bridge already read — so the *order* of checks below (the security-relevant part)
- *  is written once for both. */
-export interface BundleSource {
-  /** Raw bytes of `file`. Throws if absent. */
-  read(file: string): Uint8Array;
-  /** UTF-8 text of `file`. Throws if absent. */
-  readText(file: string): string;
+export interface VerifiedBundle {
+  /** The manifest author's public key (the signature verified under it). */
+  author: Uint8Array;
+  manifest: BundleManifest;
+  /** Every module's verified bytes, in manifest order. */
+  modules: { mod: BundleModule; wasm: Uint8Array }[];
+  /** The verified guest source, or `""` for a handler-only bundle that declared none. */
+  guestSource: string;
 }
 
 /** The host powers loading a bundle needs: hash bytes with the genesis hash, and
@@ -357,32 +471,73 @@ export interface LoadedBundle {
   installed: string[];
 }
 
-/** Load a signed bundle: verify the manifest signature, require its author to be in
- *  the policy, enforce version freshness, integrity-check each module against its
- *  declared content hash, install each verified module directly under its declared
- *  kernel name (synthesizing the record with the manifest author, under the same
- *  install policy — §12.4), and integrity-check the guest. Returns the parsed
- *  manifest + guest source + which modules registered.
+/** Authenticate and integrity-check a bundle blob (README §12.4 steps 1, 4a, 5a).
+ *  Verifies the manifest signature, then hashes every module and the guest against
+ *  what the manifest commits to. Throws on anything that does not check out.
  *
- *  This is the whole §12.4 load order in one place, over the `BundleSource` /
- *  `BundleHost` seams — the checks and their sequence are the protocol, so no target
- *  restates them (README §12.9). */
-export function loadBundle(
+ *  This function has no host and no policy by construction, so "nothing has landed"
+ *  is a property of its type rather than of reading it carefully. A caller may show
+ *  the result to a user, or hand it straight to `installBundle`. */
+export function verifyBundle(sodium: ManifestVerifier, blob: Uint8Array): VerifiedBundle {
+  const files = unpackBundle(blob);
+  const env = files[MANIFEST_FILE];
+  if (!env) throw new Error("bundle: no manifest in the blob");
+  const v = verifyManifest(sodium, env);
+  if (!v) throw new Error("bundle: manifest signature invalid");
+
+  const read = (file: string): Uint8Array => {
+    const b = files[file];
+    if (!b) throw new Error(`bundle: missing file ${file}`);
+    return b;
+  };
+  return {
+    author: v.author,
+    manifest: v.manifest,
+    modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
+    guestSource: v.manifest.guest ? new TextDecoder().decode(read(GUEST_FILE)) : "",
+  };
+}
+
+/** The integrity half of `verifyBundle`, split out so the hashing runs against a host's
+ *  genesis hash (which `verifyBundle` has no access to). Called by `installBundle`
+ *  before anything lands, and callable on its own by a shell that wants to show a
+ *  content id before consenting. Throws on the first mismatch. */
+export function checkBundleIntegrity(v: VerifiedBundle, genesisHash: (b: Uint8Array) => Uint8Array): void {
+  for (const { mod, wasm } of v.modules) {
+    if (!contentMatches(wasm, mod.hash, genesisHash)) {
+      throw new Error(`bundle: ${mod.name} content hash mismatch`);
+    }
+  }
+  // A handler-only bundle has nothing to check here; one that DOES declare a guest is
+  // checked exactly as a module is (§12.4).
+  if (v.manifest.guest) {
+    if (!contentMatches(new TextEncoder().encode(v.guestSource), v.manifest.guest.hash, genesisHash)) {
+      throw new Error("bundle: guest content hash mismatch");
+    }
+  }
+}
+
+/** Govern a verified bundle and land it (README §12.4 steps 2, 3, 4b): require the
+ *  author to be in the policy, enforce version freshness, integrity-check every module
+ *  and the guest against the host's genesis hash, then install each verified module
+ *  directly under its declared kernel name (synthesizing the install record with the
+ *  manifest author, under the same policy — §12.4).
+ *
+ *  The integrity check runs before any install, so a mismatch anywhere throws with
+ *  nothing bound — a bad file can never leave a partial bundle on the kernel. */
+export function installBundle(
   host: BundleHost,
-  sodium: ManifestVerifier,
   policy: ShellPolicy,
-  src: BundleSource,
+  v: VerifiedBundle,
   freshness?: FreshnessStore,
 ): LoadedBundle {
-  const v = verifyManifest(sodium, src.read("manifest.bundle"));
-  if (!v) throw new Error("bundle: manifest signature invalid");
   if (!policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
     throw new Error("bundle: manifest author is not in the policy's allowed set");
   }
   // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
   // (verifyManifest already shape-checked it). Refuse a load below the persisted
   // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
-  // the mark. Equal versions reload (an ordinary reboot re-reads the same directory);
+  // the mark. Equal versions reload (an ordinary reboot re-reads the same bundle);
   // the mark is never rewound.
   const version = v.manifest.version;
   if (freshness) {
@@ -393,104 +548,36 @@ export function loadBundle(
     // NB: the mark is advanced at the *end* of this function, only after every module
     // and the guest have integrity-checked and installed — not here. See below.
   }
-  const gh = (b: Uint8Array) => host.genesisHash(b);
-  // Verify everything, then land anything (README §12.4 "mismatch ⇒ reject; nothing
-  // has landed"). Read + integrity-check every module and the guest FIRST, holding
-  // the verified bytes in memory; only once the whole set checks out do we install.
-  // A mismatch anywhere throws before any SetHandler runs, so a bad file can never
-  // leave a partial bundle installed on the kernel.
-  const verified: { mod: BundleModule; wasm: Uint8Array }[] = [];
-  for (const mod of v.manifest.modules) {
-    const wasm = src.read(mod.file);
-    if (!contentMatches(wasm, mod.hash, gh)) throw new Error(`bundle: ${mod.name} content hash mismatch`);
-    verified.push({ mod, wasm });
-  }
-  // A handler-only bundle (the chat demo: app modules, no zero-authority realm) omits
-  // the guest — there is nothing to integrity-check and guestSource stays empty. A
-  // bundle that DOES declare a guest is checked exactly as a module is (§12.4).
-  let guestSource = "";
-  if (v.manifest.guest) {
-    guestSource = src.readText(v.manifest.guest.file);
-    if (!contentMatches(new TextEncoder().encode(guestSource), v.manifest.guest.hash, gh)) {
-      throw new Error("bundle: guest content hash mismatch");
-    }
-  }
+  checkBundleIntegrity(v, (b) => host.genesisHash(b));
   // Everything integrity-checked — install the verified bytes. Each module lands
   // directly under its kernel name, synthesizing the install record with the manifest
   // author (§12.4). No per-module `.install` envelope means no 64 KB envelope cap and
   // no boot-time seq — an equal-version reload just re-installs. A module the policy
   // refuses does not abort the load: it is simply reported as not installed.
   const installed: string[] = [];
-  for (const { mod, wasm } of verified) {
+  for (const { mod, wasm } of v.modules) {
     if (host.installBundleModule(mod.kernelName, wasm, v.author)) installed.push(mod.name);
   }
   // Advance the freshness mark only now — after a fully successful load. Advancing it
-  // during the downgrade check above (before the per-module and guest hash checks) would
-  // brick rollback: a partially written or corrupt *newer* bundle — manifest intact and
-  // signed, but one module or the guest file wrong — would raise the mark to the new
-  // version, then throw. Nothing runs, yet reloading the known-good older directory is now
-  // refused as a downgrade until an operator hand-edits the freshness file. The mark must
-  // record the highest version that actually loaded (README §12.4).
+  // during the downgrade check above (before the integrity checks) would brick rollback:
+  // a partially written or corrupt *newer* bundle — manifest intact and signed, but one
+  // module or the guest wrong — would raise the mark to the new version, then throw.
+  // Nothing runs, yet reloading the known-good older bundle is now refused as a
+  // downgrade until an operator hand-edits the freshness file. The mark must record the
+  // highest version that actually loaded (README §12.4).
   if (freshness) freshness.set(v.author, v.manifest.app, version);
-  return { manifest: v.manifest, author: v.author, guestSource, installed };
+  return { manifest: v.manifest, author: v.author, guestSource: v.guestSource, installed };
 }
 
-// ── Archive: a bundle as a single blob (README §12.4) ────────────────────────
-//
-// On disk a bundle is a directory (a `BundleSource`); to hand one to a peer over a data
-// channel — or stash it in browser storage — it needs a single-blob serialization. This
-// is pure *framing*, not a signed format of its own: the manifest envelope inside still
-// carries the author's signature, and its module hashes still protect the bytes, exactly
-// as in a directory. The container only names the files. Layout (integers big-endian):
-//
-//   "SKB1" (4) │ count u16 │ count× ( nameLen u16 │ name utf8 │ dataLen u32 │ data )
-//
-// `unpackBundle` yields the same `{ file: bytes }` map a `BundleSource` reads, so a
-// packed bundle and a bundle directory load through the identical §12.4 path.
-
-const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
-
-/** Serialize a set of named bundle files into one blob (format above). */
-export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
-  const names = Object.keys(files);
-  const enc = new TextEncoder();
-  const header = new Uint8Array(6);
-  header.set(ARCHIVE_MAGIC, 0);
-  new DataView(header.buffer).setUint16(4, names.length, false);
-  const parts: Uint8Array[] = [header];
-  for (const name of names) {
-    const nameBytes = enc.encode(name);
-    const data = files[name];
-    const rec = new Uint8Array(2 + nameBytes.length + 4);
-    const dv = new DataView(rec.buffer);
-    dv.setUint16(0, nameBytes.length, false);
-    rec.set(nameBytes, 2);
-    dv.setUint32(2 + nameBytes.length, data.length, false);
-    parts.push(rec, data);
-  }
-  return concatBytes(parts);
-}
-
-/** Parse a blob produced by `packBundle` back into its `{ file: bytes }` map. Throws on
- *  a mis-magicked or truncated blob — a malformed archive is a fail-loud condition, like
- *  a malformed manifest, not an untrusted input to silently drop. */
-export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
-  if (blob.length < 6 || !ARCHIVE_MAGIC.every((b, i) => blob[i] === b)) {
-    throw new Error("bundle: not a bundle archive");
-  }
-  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
-  const count = dv.getUint16(4, false);
-  const dec = new TextDecoder();
-  const files: Record<string, Uint8Array> = {};
-  let off = 6;
-  for (let i = 0; i < count; i++) {
-    if (off + 2 > blob.length) throw new Error("bundle: truncated archive");
-    const nameLen = dv.getUint16(off, false); off += 2;
-    if (off + nameLen + 4 > blob.length) throw new Error("bundle: truncated archive");
-    const name = dec.decode(blob.subarray(off, off + nameLen)); off += nameLen;
-    const dataLen = dv.getUint32(off, false); off += 4;
-    if (off + dataLen > blob.length) throw new Error("bundle: truncated archive");
-    files[name] = blob.slice(off, off + dataLen); off += dataLen;
-  }
-  return files;
+/** Load a signed bundle blob: `verifyBundle` then `installBundle`. This is the whole
+ *  §12.4 load order in one call — the checks and their sequence are the protocol, so no
+ *  target restates them (README §12.9). */
+export function loadBundle(
+  host: BundleHost,
+  sodium: ManifestVerifier,
+  policy: ShellPolicy,
+  blob: Uint8Array,
+  freshness?: FreshnessStore,
+): LoadedBundle {
+  return installBundle(host, policy, verifyBundle(sodium, blob), freshness);
 }

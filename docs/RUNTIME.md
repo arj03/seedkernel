@@ -64,7 +64,7 @@ Chat (§11) is a browser shell wired by hand. The same onion ships as a **genera
 
 "Capabilities" from here on mean one thing: the **bundle cap domains** (§12.2, §12.4) — five coarse names (`crypto`, `net`, `fs`, `module`, `clock`) that a bundle's signed manifest grants to the app's confined JS *guest*. They answer "may this *app's guest* reach this backend at all?" (WASM handlers, by contrast, carry no capabilities at all — a pure transform reaches nothing but the input it is handed and the output it returns, §4.2.)
 
-The manifest's `caps` field is the guest's *entire* authority — which is why it lives inside the signed manifest and nowhere else. It has to: the guest is not a kernel handler — it has no name in the kernel's table and no install record, so nothing below the signed manifest could carry its authority.
+The manifest's `guest.caps` field is the guest's *entire* authority — which is why it lives inside the signed manifest, nested under `guest`, and nowhere else. It has to: the guest is not a kernel handler — it has no name in the kernel's table and no install record, so nothing below the signed manifest could carry its authority.
 
 ### 12.1 Raw-byte capability backends
 
@@ -118,7 +118,7 @@ The **capability domains** a manifest declares (§12.4) expand to fixed op sets 
 
 An op outside the granted domains does not resolve — the bridge refuses it, and the shell never wired the backing resource in the first place (an `fs`-less bundle gets no fs backend at all, not an fs backend behind a check). An unknown domain name in a manifest throws when the realm is built — a typo fails loudly rather than silently granting nothing, or, worse, everything.
 
-**Relation to WASI.** The cap-bridge is deliberately WASI-shaped at the seam: a small syscall table, a zero-authority guest, capability by non-wiring rather than runtime check. The differences justify a bespoke ABI. The ops are identity-centric, not POSIX — `net` is addressed by peer pubkey over a channel bound to that key (§12.6), not by socket; `fs` is a flat opaque blob store with no paths; `SIGN`/`IDENTITY` surface the node's identity, which WASI has no notion of (and every guest signature is domain-scoped). And the grant is *signed content*: the guest's authority is the `caps` field of an author-signed manifest (§12.4) admitted by operator policy (§12.5), where WASI's grants are host-local instantiation choices with no authorship. WASI begins after who authored the code and who may install it are settled; §9 and §12.4–§12.5 settle them. What keeps this from drifting into a worse WASI: ops stay structureless bytes, anything with structure becomes a no-capability module (§12.1), and the table grows by appending sparingly.
+**Relation to WASI.** The cap-bridge is deliberately WASI-shaped at the seam: a small syscall table, a zero-authority guest, capability by non-wiring rather than runtime check. The differences justify a bespoke ABI. The ops are identity-centric, not POSIX — `net` is addressed by peer pubkey over a channel bound to that key (§12.6), not by socket; `fs` is a flat opaque blob store with no paths; `SIGN`/`IDENTITY` surface the node's identity, which WASI has no notion of (and every guest signature is domain-scoped). And the grant is *signed content*: the guest's authority is the `guest.caps` field of an author-signed manifest (§12.4) admitted by operator policy (§12.5), where WASI's grants are host-local instantiation choices with no authorship. WASI begins after who authored the code and who may install it are settled; §9 and §12.4–§12.5 settle them. What keeps this from drifting into a worse WASI: ops stay structureless bytes, anything with structure becomes a no-capability module (§12.1), and the table grows by appending sparingly.
 
 ### 12.3 Zero-authority JS realms
 
@@ -126,22 +126,26 @@ Logic that is inherently async or awkward as a *synchronous* WASM handler runs a
 
 ### 12.4 Signed bundles
 
-An app is delivered as a **bundle** (`host/bundle.ts`, `./bundle`) — a directory of signed content:
+An app is delivered as a **bundle** (`host/bundle.ts`, `./bundle`) — one blob of signed content, holding:
 
 ```
 manifest.bundle     the signed manifest envelope (below)
-<module>.wasm       each WASM handler module
-<guest>.js          the zero-authority guest program (§12.3) — optional
+<name>.wasm         each WASM handler module, named by its manifest `name`
+guest.js            the zero-authority guest program (§12.3) — optional
 ```
+
+A bundle is a **value, not a path**: one blob is read from disk, carried in an `OFFER` over a data channel, and stashed in browser storage without a second format or a second load path. The container framing is `"SKB1" │ count u16 │ count× (nameLen u16 │ name │ dataLen u32 │ data)`, all big-endian — pure naming, with no security properties of its own: the manifest envelope inside carries the author's signature and its module hashes protect the bytes, so anyone may repack a bundle without weakening it.
+
+**Nothing in the manifest names a file.** A module lives in `<name>.wasm` and the guest in `guest.js`, by construction. A signed filename would be one more field every target must validate (and, where a target resolves it against a directory, one more chance to escape it); deriving it removes the field and the obligation together.
 
 **What a bundle carries beyond the modules.** The loader binds exactly one kind of thing: WASM handlers into the kernel's table. A bundle wraps everything else an app is made of:
 
 - **The guest is not a kernel handler.** It is JS source for a QuickJS realm, not WASM — the loader's path ends in "instantiate WASM, `SetHandler`." Without the manifest it would have no signed identity at all.
-- **The guest's authority has no other home.** A WASM handler is a pure transform with no capabilities of its own (§4.2); the guest, by contrast, *does* reach I/O — through the cap-bridge — yet has no kernel name and no install record, so the manifest's `caps` is its entire capability declaration.
+- **The guest's authority has no other home.** A WASM handler is a pure transform with no capabilities of its own (§4.2); the guest, by contrast, *does* reach I/O — through the cap-bridge — yet has no kernel name and no install record, so the manifest's `guest.caps` is its entire capability declaration.
 - **Version coherence.** Module binds are per-name and independent; nothing at the bind level says "codec at hash X, reputation at hash Y, and guest at hash Z together constitute app v1.2." The manifest is the author's signed statement of the coherent set — without it a node can hold a mix of individually-valid module versions that were never meant to run together.
 - **Operator/author separation.** The shell is one fixed, auditable artifact; the app arrives as content signed by a third-party key the operator's policy admits. Verification is channel-independent: a bundle read from a USB stick verifies exactly like one fetched from a mirror or pushed over a relay.
 
-**One authenticated statement, one authorization.** The bundle is the *only* way code arrives. The signed manifest commits to every module's `genesisHash` (§5.1), and the loader verifies each `.wasm`'s bytes against it, then admits each verified module under its declared `kernelName` — a policy decision (§12.5) followed by `SetHandler`, recording `(author, bytes_hash)` where the author is the manifest author and the hash is the verified one. Admission touches no replay state, so an equal-version reload just re-binds cleanly — a reboot re-reading the same directory installs the same modules again with no collision. A **live update** is not a separate mechanism: it is delivering a bundle whose manifest `version` is higher, which the freshness guard (below) requires and the same-author rule (§12.5) admits.
+**One authenticated statement, one authorization.** The bundle is the *only* way code arrives. The signed manifest commits to every module's `genesisHash` (§5.1), and the loader verifies each `.wasm`'s bytes against it, then admits each verified module under its declared `kernelName` — a policy decision (§12.5) followed by `SetHandler`, recording `(author, bytes_hash)` where the author is the manifest author and the hash is the verified one. Admission touches no replay state, so an equal-version reload just re-binds cleanly — a reboot re-reading the same bundle installs the same modules again with no collision. A **live update** is not a separate mechanism: it is delivering a bundle whose manifest `version` is higher, which the freshness guard (below) requires and the same-author rule (§12.5) admits.
 
 **Manifest envelope.** `[author_pk: 32][sig: 64][manifest: UTF-8 JSON to end]` — an Ed25519 detached signature over `DOMAIN_manifest ‖ json`, where `DOMAIN_manifest` is `"seedkernel-manifest-sig-v1\0"` (§16.1), prepended before signing but not stored. The disjoint prefix means a manifest signature can never double as a guest `SIGN` or channel-handshake signature over the same bytes (§14). There is deliberately no canonical-JSON step: the envelope carries the exact signed bytes and the verifier parses exactly what it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
 
@@ -151,19 +155,36 @@ manifest.bundle     the signed manifest envelope (below)
 | --- | --- | --- | --- |
 | `app` | string | key | Display name for the coherent set; with `author_pk` it forms the `(author, app)` freshness key (see freshness below). |
 | `version` | integer | **yes** | Monotonic version of the coherent set. A load whose `version` is below the persisted `(author, app)` high-water mark is refused as a downgrade (see freshness below). |
-| `modules[]` | `{name, file, hash, kernelName}` | yes | One entry per WASM module: logical name, filename, `genesisHash(wasm)` hex (the *same* value the loader records as the module's `bytes_hash` and a policy `modules` allowlist matches, §5.1), and the kernel name the loader binds the module at via `SetHandler` — the name itself, carried verbatim into the table (a bootstrap name reads plainly; a scoped name is its hex, §5.1). The manifest is the authoritative source of the bind name. |
-| `guest` | `{file, hash}` | if present | Optional. The guest program: filename + `genesisHash(utf8(source))` hex. A handler-only bundle (the chat demo — WASM handlers, no zero-authority realm) omits it entirely. |
-| `caps` | string[] | **yes** | The capability domains (§12.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants raw node-identity signing — the `crypto` domain's `SIGN` is scoped to this app's namespace, §12.2, §14). |
-| `config` | map (string → string \| number) | no | App constants injected into the guest as `const APP = {…}`. Opaque to the runtime. |
+| `modules[]` | `{name, hash, kernelName}` | yes | One entry per WASM module. `name` does three jobs at once: the module's file in the container (`<name>.wasm`), the key the guest addresses it by (`BUNDLE.modules`, below), and how the loader reports it — so it is unique within a manifest and restricted to `[A-Za-z0-9_-]`. `hash` is `genesisHash(wasm)` hex (the *same* value the loader records as the module's `bytes_hash` and a policy `modules` allowlist matches, §5.1). `kernelName` is the name the loader binds the module at via `SetHandler`, carried verbatim into the table (a bootstrap name reads plainly; a scoped name is its hex, §5.1). The manifest is the authoritative source of the bind name. |
+| `guest` | `{hash, caps, config?}` | if present | Optional — the zero-authority guest program and **everything about it**. A handler-only bundle (the chat demo — WASM handlers, no realm) omits the whole object, which is the same statement as "this bundle holds no authority": there is no empty `caps` list to write. |
+| `guest.hash` | string | yes | `genesisHash(utf8(source))` hex of `guest.js`. |
+| `guest.caps` | string[] | **yes** | The capability domains (§12.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants raw node-identity signing — the `crypto` domain's `SIGN` is scoped to this app's namespace, §12.2, §14). |
+| `guest.config` | map (string → string \| number) | no | App-structural constants injected into the guest as `const APP = {…}`. Opaque to the runtime. Facts the runtime already derives do **not** belong here — see `BUNDLE` below. |
 
-**Load algorithm** (`loadBundle`). The shell is host code, so failures here **throw to the operator** — the §3 "drop" semantics apply to wire messages, not to loading a local directory:
+**Why `caps` and `config` live inside `guest`.** Both are the guest's alone: `caps` is the guest's entire authority (§12.2) and `config` only ever becomes its injected `APP`. WASM handlers carry no authority and read no config, so at the top level `caps` would be a mandatory field that a handler-only bundle must fill in with a meaningless `[]`. Nested, "no guest ⇒ zero authority" is the schema's shape rather than a rule prose has to state and every target has to honour.
 
-1. Read `manifest.bundle` and verify the envelope signature. Invalid ⇒ reject; nothing has landed.
-2. Require `author_pk` to be in the policy's `authors` (§12.5).
-3. **Freshness.** Read the persisted high-water mark for `(author_pk, app)` (absent ⇒ −∞). Refuse if `version < high_water` — a downgrade, nothing lands. Otherwise persist `high_water := max(high_water, version)`. Equal versions reload (an ordinary reboot); a newer version advances the mark; the mark is monotonic and never rewound, so once version N loads, nothing older ever loads again on this node.
-4. For each manifest module, in order: read the `.wasm` and require `genesisHash(bytes) == hash` (mismatch ⇒ reject); **admit** the verified bytes at `kernelName` (below). A module the policy refuses does not abort the load — the loader reports which modules were admitted, and the operator decides.
-5. If the manifest declares a `guest`, read its source and require `genesisHash(utf8) == guest.hash` (mismatch ⇒ reject). A handler-only bundle declares none and skips this.
-6. Only now, and only if a guest was declared, may it run (§12.8): a realm (§12.3) over a cap-bridge restricted to `caps`' op set, loaded with `op preamble ‖ const APP = merge(manifest.config, operator config) ‖ guest source`.
+**Load algorithm** (`loadBundle`). The shell is host code, so failures here **throw to the operator** — the §3 "drop" semantics apply to wire messages, not to loading a local file.
+
+The load is two halves, and they are separate functions because they hold genuinely different powers. **`verifyBundle`** is authenticity + integrity: no host, no policy, no persistence, so "nothing has landed" is a property of its type rather than of reading it carefully. **`installBundle`** is governance + effect: it takes what `verifyBundle` proved and applies the deployment's policy, freshness, and binds. `loadBundle` is the two composed.
+
+*verify* — pure, nothing lands:
+
+1. Unpack the blob, read `manifest.bundle`, and verify the envelope signature. Invalid ⇒ reject.
+2. Read each module's `<name>.wasm` and, if a `guest` is declared, `guest.js`. A missing file ⇒ reject.
+
+*install* — governance, then effect:
+
+3. Require `author_pk` to be in the policy's `authors` (§12.5).
+4. **Freshness.** Read the persisted high-water mark for `(author_pk, app)` (absent ⇒ −∞). Refuse if `version < high_water` — a downgrade, nothing lands. Otherwise the mark advances at the *end* of a fully successful load (see freshness below). Equal versions reload (an ordinary reboot); the mark is monotonic and never rewound, so once version N loads, nothing older ever loads again on this node.
+5. Integrity-check **everything** before binding anything: each module against its `hash`, and the guest against `guest.hash` (§5.1). A mismatch anywhere ⇒ reject with nothing bound, so a bad file can never leave a partial bundle on the kernel.
+6. **Admit** each verified module at its `kernelName` (below). A module the policy refuses does not abort the load — the loader reports which modules were admitted, and the operator decides.
+7. Only now, and only if a guest was declared, may it run (§12.8): a realm (§12.3) over a cap-bridge restricted to `guest.caps`' op set, loaded with `op preamble ‖ const BUNDLE ‖ const APP = merge(guest.config, operator config) ‖ guest source`.
+
+**Splitting verify from install is what makes consent possible.** An interactive shell must show a bundle's author and metadata and wait for the user *before* anything binds — the browser shell's `OFFER` flow (§11) is exactly that. With one monolithic `loadBundle` such a shell has to hand-roll its own copy of the signature-and-integrity order, which is the drift the shared loader exists to prevent; with the seam it calls `verifyBundle` and stops. (User consent is that deployment's admission policy: it carries no policy file and no freshness marks, so it never reaches `installBundle`.)
+
+**The runtime's facts reach the guest as `BUNDLE`, never as hand-written config.** Alongside `APP`, the shell injects `const BUNDLE = { app, author, signPrefix, modules }` — everything it derived from the admitted manifest: the app name, the author's key, the guest signing prefix `DOMAIN_guest ‖ guestSignScope(author, app)` (§12.2), and the map from each module's logical `name` to the `kernelName` it actually landed at. An author who instead baked these into `config` would be restating a load-time fact at build time, and a copy that silently disagrees fails as signatures that verify nowhere with nothing naming the cause — the same one-file rule the `DOMAIN_*` family follows (§16.1). This is also what gives `modules[].name` a job beyond reporting: it is the key a guest calls its own modules by.
+
+`BUNDLE` is deliberately a *separate* const from `APP`. Operator config merges over `APP` (below), so anything living there is operator-writable — including, if `signPrefix` were there, the guest's own signing namespace. Nothing in `BUNDLE` can be overridden at boot.
 
 **Admission is a step inside the loader, not a separate component.** Binding a module *is* the loader's job. The loader keeps one host-side table — the install records `installations[name] → {author, bytes_hash}` — read only here, never over the wire. For each verified module it calls the admission policy `admit(name, author, bytes_hash, wasm, current?) → bool` (§12.5), where `current` is the record already at `name`, or null; on `true` it writes the record and calls `SetHandler(name, instance)`, on `false` it binds nothing. `bytes_hash` is `genesisHash(wasm)` (§5.1) — the same id the manifest's `modules[].hash` and the policy's `modules` allowlist carry — computed from the bytes, never from a caller's claim, so it survives re-signings. Handlers hand-seeded by a raw `SetHandler` (§3.1) have no record; a raw `SetHandler` over a recorded name clears the stale record first, so an old author is never carried onto new bytes.
 
@@ -171,7 +192,7 @@ manifest.bundle     the signed manifest envelope (below)
 
 **Operator config wins.** The shell merges the operator's `--app-config` *over* the manifest's `config` before injection. The split is intentional: author-signed `config` carries content-structural constants (a storage app's k/m/blockSize), the operator's carries per-node policy (a quota). The merge is opaque — the shell never inspects a key — so the operator can even override a structural constant. That fits the trust model (the operator's host *is* the TCB, §14), but bundle authors should not assume their `config` reaches the guest unmodified.
 
-**Bundle freshness.** `version` is an enforced monotonic integer, not a label: step 3 refuses any directory whose `version` is below the persisted `(author, app)` high-water mark, so an older signed bundle — a stale relay copy, or a confused provisioning step handing over yesterday's build — is rejected as a downgrade. The whole bundle loads wholesale from the directory every boot, and neither guest nor modules carries a per-item version, so `version` is the single downgrade guard for the set. The mark is host-local persisted state; a deliberate rollback is an out-of-band operator action (the operator is the TCB, §14). See §14.
+**Bundle freshness.** `version` is an enforced monotonic integer, not a label: step 4 refuses any bundle whose `version` is below the persisted `(author, app)` high-water mark, so an older signed bundle — a stale relay copy, or a confused provisioning step handing over yesterday's build — is rejected as a downgrade. The whole bundle loads wholesale every boot, and neither guest nor modules carries a per-item version, so `version` is the single downgrade guard for the set. The mark is host-local persisted state; a deliberate rollback is an out-of-band operator action (the operator is the TCB, §14). See §14.
 
 ### 12.5 The admission policy
 

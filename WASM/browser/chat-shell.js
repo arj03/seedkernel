@@ -2,7 +2,8 @@ import sodium from "./libsodium-wrappers.mjs";
 import { createKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
-import { signManifest, verifyManifest, contentMatches, packBundle, unpackBundle }
+import { signManifest, verifyBundle, checkBundleIntegrity, packBundle,
+         MANIFEST_FILE, moduleFile }
   from "../build/host/bundle.js";
 
 const RTC_CONFIG = { iceServers: [{ urls: [
@@ -191,15 +192,15 @@ function updatePeerPill() {
 // ─── app registry ──────────────────────────────────────────────────────
 //
 // An "app" is an ordinary signed bundle (§12.4): a signed `manifest.bundle`
-// envelope plus the app's WASM module, packed into one blob for the wire
-// (bundle.ts packBundle/unpackBundle). This is the SAME format seedstore's
-// flagship deployment loads — a chat app is just a handler-only bundle (one
-// module, no guest realm). There is no chat-specific install format, domain, or
-// peek/unwrap code: `verifyManifest` authenticates the author's signature over
-// the manifest, which commits to the module's genesisHash, so the blob survives
-// any number of transitive relays and still authenticates against its original
-// author — exactly the store-and-forward property an Offer needs. The local
-// "add app" flow and the peer-to-peer Offer below carry the identical bundle.
+// envelope plus the app's WASM module in one blob. That blob IS the bundle format —
+// the same bytes seedstore's flagship deployment loads from disk, so a chat app is
+// just a handler-only bundle (one module, no guest realm) and needs no chat-specific
+// install format, domain, or peek/unwrap code. `verifyBundle` (the shared loader)
+// authenticates the author's signature over the manifest, which commits to the
+// module's genesisHash, so the blob survives any number of transitive relays and
+// still authenticates against its original author — exactly the store-and-forward
+// property an Offer needs. The local "add app" flow and the peer-to-peer Offer below
+// carry the identical bundle.
 //
 // The module's WASM carries two embedded custom sections the runtime ignores but
 // this shell reads: "app_meta" (JSON — id, name, version) and "ui" (HTML rendered
@@ -318,8 +319,11 @@ function promptMeta(defaultId) {
   const id = prompt("App id (lowercase, no spaces — used as the kernel name):", defaultId);
   if (!id) return null;
   const trimmed = id.trim();
-  if (!/^[a-z0-9._-]+$/i.test(trimmed)) {
-    const msg = "App id must be alphanumeric / . _ -";
+  // The same charset a manifest module name is held to (§12.4): the id becomes the
+  // module's name, and so its file in the bundle. Reject it here rather than let the
+  // user sign a manifest their own shell would then refuse as malformed.
+  if (!/^[A-Za-z0-9_-]+$/.test(trimmed)) {
+    const msg = "App id must be alphanumeric / _ -";
     shellPrint(msg, "err");
     showAppsNotice(msg, "err");
     return null;
@@ -337,6 +341,10 @@ function promptMeta(defaultId) {
 // envelope + module into one blob. `version` is a nominal 1 — the interactive
 // shell gates installs on user consent (the approve callback), not on a monotonic
 // freshness mark, so a chat bundle carries no meaningful version counter.
+//
+// A chat app is a HANDLER-ONLY bundle: it declares no `guest`, and since caps live
+// inside `guest` (§12.4) that is the same statement as "this app holds no authority".
+// There is no empty caps list to write — the shape says it.
 async function buildAppBundle(wasmBytes) {
   const { meta } = await readWasmSections(wasmBytes);
   if (!meta || !meta.id) throw new Error("cannot build a bundle: wasm has no app_meta id");
@@ -345,47 +353,47 @@ async function buildAppBundle(wasmBytes) {
     version: 1,
     modules: [{
       name: meta.id,
-      file: "app.wasm",
       hash: bytesToHex(host.genesisHash(wasmBytes)),
       kernelName: appHandlerName(meta.id),
     }],
-    caps: [],
   };
   const manifestEnv = signManifest(sodium, myKeys.privateKey, myKeys.publicKey, manifest);
-  return packBundle({ "manifest.bundle": manifestEnv, "app.wasm": wasmBytes });
+  return packBundle({
+    [MANIFEST_FILE]: manifestEnv,
+    [moduleFile(meta.id)]: wasmBytes,
+  });
 }
 
 // ── verify + peek a received bundle ──────────────────────────────────────
 //
-// Unpack the archive, verify the author's manifest signature (§12.4), and
-// integrity-check the module against the hash the manifest commits to. Returns
-// author + module wasm + content id, so the Apps UI can surface author + meta
-// before the user accepts, and a tampered/forged bundle is rejected here rather
-// than at some later step. Returns null on anything malformed or unauthentic.
+// Authenticate + integrity-check a received bundle through the SHARED §12.4 loader
+// (bundle.ts verifyBundle + checkBundleIntegrity) — the same code the Node shell and
+// the native loader run. This shell only needs the verify half: it must show the
+// author and the app's metadata and wait for the user to accept before anything binds,
+// which is exactly the seam `verifyBundle` is split at. It carries no policy file and
+// no freshness marks — user consent is this deployment's admission policy — so it
+// stops short of `installBundle` and drives `installBundleModule` itself once the user
+// agrees.
+//
+// Returns null on anything malformed or unauthentic, so the UI can decline quietly.
 function peekAppBundle(bundleBytes) {
-  let files;
-  try { files = unpackBundle(bundleBytes); }
-  catch { return null; }
-  const env = files["manifest.bundle"];
-  if (!env) return null;
-  let verified;
-  try { verified = verifyManifest(sodium, env); }
-  catch { return null; }   // signed-but-malformed manifest ⇒ reject in the UI
-  if (!verified) return null;
-  const { author, manifest } = verified;
-  // A chat app is a one-module handler-only bundle.
-  if (!Array.isArray(manifest.modules) || manifest.modules.length !== 1) return null;
-  const mod = manifest.modules[0];
-  const wasm = files[mod.file];
-  if (!wasm || wasm.length === 0) return null;
-  if (!contentMatches(wasm, mod.hash, (b) => host.genesisHash(b))) return null;
+  let v;
+  try {
+    v = verifyBundle(sodium, bundleBytes);
+    checkBundleIntegrity(v, (b) => host.genesisHash(b));
+  } catch { return null; }   // unauthentic, malformed, or a hash mismatch ⇒ decline
+  // A chat app is a one-module handler-only bundle: a `guest` would mean authority
+  // this shell has no realm to confine.
+  if (v.modules.length !== 1 || v.manifest.guest) return null;
+  const wasm = v.modules[0].wasm;
+  if (wasm.length === 0) return null;
   return {
-    authorPk: author,
-    manifest,
+    authorPk: v.author,
+    manifest: v.manifest,
     // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
     // the same value the approve callback receives — so it keys pendingApprovals and
-    // doubles as the artifact's display hash. Equal to fromHex(mod.hash) once the
-    // integrity check above passes.
+    // doubles as the artifact's display hash. Equal to fromHex(modules[0].hash) now
+    // that the integrity check above has passed.
     bytesHash: host.genesisHash(wasm),
     install: { wasm },
   };

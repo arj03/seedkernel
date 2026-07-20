@@ -99,6 +99,42 @@ export function guestSignPrefix(scope: Uint8Array): Uint8Array {
   return concatBytes([DOMAIN_GUEST, scope]);
 }
 
+/** The facts a guest learns about the bundle it is running as, all of them derived by
+ *  the runtime at admission from the signed manifest. */
+export interface BundleFacts {
+  /** The manifest `app`. */
+  app: string;
+  /** The manifest author's public key — the key the signature verified under. */
+  author: Uint8Array;
+  /** Logical module name → the kernel name it was bound at, from `modules[]`. This is
+   *  what gives a manifest module `name` a job: the key a guest MODULE_CALLs its own
+   *  modules by, without knowing how the name was derived. */
+  modules: Record<string, string>;
+}
+
+/** The generated `const BUNDLE = {…};` block injected alongside `capPreamble()`, holding
+ *  what the runtime knows about the admitted bundle (README §12.4).
+ *
+ *  Every field here is a fact the runtime DERIVES, so no author ever restates one by
+ *  hand: the signing prefix in particular is `DOMAIN_guest ‖ guestSignScope(author, app)`
+ *  — precisely what the SIGN op prepends — and a hand-baked copy that disagrees with the
+ *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
+ *  cause. This is the same one-file rule the DOMAIN_* family follows.
+ *
+ *  Kept deliberately separate from the app's `const APP`: APP is author config that a
+ *  deployment's operator config merges over, so anything living there is operator-
+ *  writable. Nothing in BUNDLE is. */
+export function bundlePreamble(f: BundleFacts): string {
+  const bundle = {
+    app: f.app,
+    author: toHex(f.author),
+    // The prefix a guest prepends before CAP_VERIFY to rebuild what CAP_SIGN signed.
+    signPrefix: toHex(guestSignPrefix(guestSignScope(f.author, f.app))),
+    modules: f.modules,
+  };
+  return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
+}
+
 /** Expand declared capability domains to the concrete op numbers a bridge allows.
  *  Throws on an unknown domain so a typo in a manifest fails loudly rather than
  *  silently granting nothing (or, worse, everything). */

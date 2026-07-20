@@ -17,7 +17,7 @@
 import { buildAdmit, policyFromJson, type ShellPolicy } from "./policy.js";
 import {
   FreshnessMarks, InstallRecords, loadBundle,
-  type BundleHost, type BundleSource, type RecordHost,
+  type BundleHost, type RecordHost,
 } from "./bundle.js";
 import { toHex } from "./util.js";
 
@@ -84,33 +84,31 @@ function setPolicy(json: string | null): void {
   applyPolicy(policyFromJson(json));
 }
 
-/** Load a signed bundle (README §12.4). Go has already read the directory — it is the
- *  fs seam — and passes `{ filename: ArrayBuffer }`; every check and its order comes
- *  from the shared loader. Returns a slim JSON descriptor of what Go must act on, or
- *  an `ERROR: …` string (the loader reports, it does not throw across the bridge). */
-function loadBundleFiles(files: Record<string, ArrayBuffer>): string {
-  const src: BundleSource = {
-    read: (file) => {
-      const b = files[file];
-      if (!b) throw new Error(`bundle: missing file ${file}`);
-      return new Uint8Array(b);
-    },
-    readText: (file) => new TextDecoder().decode(src.read(file)),
-  };
+/** Load a signed bundle (README §12.4). Go has read the one bundle file — that is the
+ *  whole fs seam — and passes its bytes; every check and its order comes from the shared
+ *  loader. Returns a JSON descriptor of what Go must act on, or an `ERROR: …` string (the
+ *  loader reports, it does not throw across the bridge).
+ *
+ *  The descriptor carries the guest SOURCE, not a filename: the source it returns is the
+ *  one this loader hashed against the manifest, so Go runs exactly the bytes that were
+ *  verified rather than looking a name up in a copy of its own. */
+function loadBundleBlob(blob: ArrayBuffer): string {
   // Built on first use, not at module scope: Go learns its data directory (and so the
   // store's path) from the CLI *after* it evaluates this bundle.
   if (!freshness) freshness = new NativeFreshnessStore();
   try {
-    const b = loadBundle(host, sodium, policy, src, freshness);
+    const b = loadBundle(host, sodium, policy, new Uint8Array(blob), freshness);
     return JSON.stringify({
       app: b.manifest.app,
       version: b.manifest.version,
       author: toHex(b.author),
-      caps: b.manifest.caps,
-      // "" for a handler-only bundle that declared no guest; Go builds a realm only
-      // when this names a file (the seedstore bundle always does).
-      guest: b.manifest.guest?.file ?? "",
-      config: b.manifest.config ?? {},
+      // Authority and config live inside `guest` — a handler-only bundle has neither
+      // (§12.4). `guestSource` is "" in that case and Go builds no realm.
+      caps: b.manifest.guest?.caps ?? [],
+      config: b.manifest.guest?.config ?? {},
+      guestSource: b.guestSource,
+      // Logical name → kernel name, for the guest's `const BUNDLE.modules`.
+      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, m.kernelName])),
       installed: b.installed,
     });
   } catch (e) {
@@ -118,4 +116,4 @@ function loadBundleFiles(files: Record<string, ArrayBuffer>): string {
   }
 }
 
-export { setPolicy, loadBundleFiles };
+export { setPolicy, loadBundleBlob };

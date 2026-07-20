@@ -13,8 +13,8 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }
@@ -26,8 +26,8 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	author, authorPub := testAuthor(t)
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "manifest author is not in the policy's allowed set") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "manifest author is not in the policy's allowed set") {
 		t.Fatalf("expected foreign-author rejection, got: %s", status)
 	}
 }
@@ -44,8 +44,8 @@ func TestPolicyMalformed(t *testing.T) {
 	// is deny-all, so nothing installs (README §14). Before, a realm whose policy failed
 	// to parse kept a permissive default and loaded any signed bundle.
 	author, authorPub := testAuthor(t)
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "not in the policy") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
 		t.Fatalf("after rejected policies the realm must stay deny-all: %s", status)
 	}
 }
@@ -59,8 +59,8 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 
 	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
 	// way code arrives (§12.4), so the manifest-author gate is the whole install surface.
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "not in the policy") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
 }
@@ -79,8 +79,8 @@ func TestBundleCannotOverlaySeededSlot(t *testing.T) {
 	// handler table via SetHandler, with no install record for the policy to key on.
 	seeded := name("host.seeded")
 	registerNativeAt(seeded, func(p []byte) []byte { return p })
-	dir, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
-	if status := loadBundle(dir); strings.Contains(status, "installed=[fwd]") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
+	if status := loadBundle(bundlePath); strings.Contains(status, "installed=[fwd]") {
 		t.Fatalf("a bundle module overlaid the seeded `host.seeded` slot: %s", status)
 	}
 	if boundToWasm(seeded) {

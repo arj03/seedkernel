@@ -7,24 +7,24 @@
 // domains when one loads (§12.4); the kernel itself stays application-neutral.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
-//        --listen 0.0.0.0:7000 --bundle ./app-bundle
+//        --listen 0.0.0.0:7000 --bundle ./app.skb
 //
 // For a self-contained non-browser binary, the Go/native target (native/,
 // README §12.9) embeds and runs this same shared host JS — no Node install needed.
 
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
 import { policyFromJson, buildAdmit, type ShellPolicy } from "./policy.js";
 import {
-  FreshnessMarks, loadBundle as loadBundleFrom,
-  type BundleManifest, type BundleSource, type FreshnessStore, type LoadedBundle,
+  FreshnessMarks, loadBundle as loadBundleBlob,
+  type BundleManifest, type FreshnessStore, type LoadedBundle,
 } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
 import { Transport, type Network, type PeerId } from "./net.js";
-import { createCapBridge, capPreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
+import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
 import { createSafeRealm, type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { NodeFs } from "./fs-node.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
@@ -72,9 +72,9 @@ export interface Shell {
   readonly peers: Set<PeerId>;
   /** Add a peer to the cohort the guest can reach (and dial, if a NodeNetwork). */
   addPeer(peerId: PeerId): void;
-  /** Load a signed bundle directory: verify the manifest, govern it against the
-   *  policy, integrity-check + install the modules, and return the guest source. */
-  loadBundle(dir: string): LoadedBundle;
+  /** Load a signed bundle file: verify the manifest, govern it against the policy,
+   *  integrity-check + install the modules, and return the guest source. */
+  loadBundle(file: string): LoadedBundle;
   /** Run one of a loaded bundle's guest entrypoints — whichever names the app
    *  declares — through a generic cap-bridge over the kernel's primitives. Load a
    *  bundle first. This is "the shell runs the app" (README §12.8). */
@@ -164,7 +164,9 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // and wires only the matching backends, so a guest holds exactly what it
   // declared — nothing outside its caps resolves.
   const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
-    const caps = new Set(b.manifest.caps);
+    // No guest ⇒ no caps at all: authority is declared inside `guest` precisely so a
+    // handler-only bundle cannot hold any (§12.4).
+    const caps = new Set(b.manifest.guest?.caps ?? []);
     return createCapBridge({
       // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
       // bridge's minimal crypto surface (its crypto_generichash types the key as
@@ -182,20 +184,34 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
       signScope: guestSignScope(b.author, b.manifest.app),
     });
   };
-  // The guest source as signed content, fronted by the generic op preamble and the
-  // app constants (`const APP = …`). The author's manifest `config` carries the
-  // content-structural constants; the operator's `opts.config` merges over it (and
-  // wins) for per-node policy like a storage quota. The shell treats both as opaque.
+  // The guest source as signed content, fronted by three injected blocks:
+  //
+  //   capPreamble()     the generic op ABI (`const CAP_X = n`).
+  //   bundlePreamble()  `const BUNDLE` — what the RUNTIME derived from the admitted
+  //                     manifest: author, app, the signing prefix, and the kernel names
+  //                     its modules landed at. No author writes these by hand.
+  //   const APP         author config from the signed manifest, with the operator's
+  //                     `opts.config` merged OVER it (and winning) for per-node policy
+  //                     like a storage quota. Opaque to the shell.
+  //
+  // BUNDLE and APP are separate consts on purpose: operator config merges into APP, so
+  // anything that lived there would be operator-writable — including, before this split,
+  // the guest's own signing prefix. Nothing in BUNDLE can be overridden at boot.
   // Both realms load the byte-identical program.
   const guestFullSource = (b: LoadedBundle): string =>
     capPreamble()
-    + `const APP = ${JSON.stringify({ ...(b.manifest.config ?? {}), ...(opts.config ?? {}) })};\n`
+    + bundlePreamble({
+      app: b.manifest.app,
+      author: b.author,
+      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, m.kernelName])),
+    })
+    + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
     + b.guestSource;
 
   return {
     host, net, transport, fs, sodium, policy, peers,
     addPeer(p) { if (p !== peerId) peers.add(p); },
-    loadBundle(dir) { return (loaded = loadBundle(host, sodium, policy, dir, freshness)); },
+    loadBundle(file) { return (loaded = loadBundle(host, sodium, policy, file, freshness)); },
     async runGuest(entry, payload) {
       const b = requireLoaded();
       if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
@@ -221,20 +237,12 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   };
 }
 
-/** A bundle directory on the Node filesystem — the platform seam under the shared
- *  §12.4 load order in bundle.ts. */
-function dirSource(dir: string): BundleSource {
-  return {
-    read: (file) => new Uint8Array(readFileSync(join(dir, file))),
-    readText: (file) => readFileSync(join(dir, file), "utf8"),
-  };
-}
-
-/** Load a signed bundle *directory* onto a host — the Node binding of the shared
- *  loader (bundle.ts `loadBundle`), which owns the verify → govern → freshness →
- *  integrity → install order. */
-export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, dir: string, freshness?: FreshnessStore): LoadedBundle {
-  return loadBundleFrom(host, sodium, policy, dirSource(dir), freshness);
+/** Load a signed bundle *file* onto a host — the Node binding of the shared loader
+ *  (bundle.ts `loadBundle`), which owns the verify → govern → freshness → integrity →
+ *  install order. Reading the file is the whole platform seam: a bundle is one blob, so
+ *  there is no directory walk and no filename to resolve. */
+export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, file: string, freshness?: FreshnessStore): LoadedBundle {
+  return loadBundleBlob(host, sodium, policy, new Uint8Array(readFileSync(file)), freshness);
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────

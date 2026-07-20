@@ -324,45 +324,39 @@ func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
 }
 
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
-// its guest: the declared cap domains, the manifest config (author-signed
-// structural constants), and the verified guest source. `author` (hex) + `app` key
-// bundle freshness and derive the guest-signing scope (README §12.2, §12.4).
+// its guest: the guest's declared cap domains, its config (author-signed structural
+// constants), the kernel names its modules landed at, and the verified guest source.
+// `author` (hex) + `app` key bundle freshness and derive the guest-signing scope
+// (README §12.2, §12.4).
 type loadedBundle struct {
 	app, author string
 	version     int
 	caps        []string
-	config      json.RawMessage // manifest `config` object (merged under operator config)
+	config      json.RawMessage   // guest `config` object (merged under operator config)
+	modules     map[string]string // logical name → kernel name, for the guest's BUNDLE
 	guestSource string
 }
 
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
 var loaded *loadedBundle
 
-// loadBundle loads a signed app bundle directory (README §12.4). Reading the directory
-// is all this does: the whole load — manifest signature, policy governance, freshness,
+// loadBundle loads a signed app bundle file (README §12.4). Reading the one file is all
+// this does: the whole load — manifest signature, policy governance, freshness,
 // per-module and guest integrity, and the order they run in — is the shared JS loader
 // (bundle.ts, via host-installer.gen.js), which admits each verified module through
-// the shared §12.5 policy. On success it records the verified guest
-// source + caps + config in `loaded` for the node.
-func loadBundle(dir string) string {
-	entries, err := os.ReadDir(dir)
+// the shared §12.5 policy. On success it records the verified guest source + caps +
+// config + module names in `loaded` for the node.
+//
+// The guest source comes back ACROSS the bridge rather than being re-read here: the
+// shared loader hashed those exact bytes against the manifest, so running them is
+// running what was verified. Go holding its own copy to look up by name would be a
+// second path to the same bytes, which is the drift this seam exists to prevent.
+func loadBundle(path string) string {
+	blob, err := os.ReadFile(path)
 	if err != nil {
 		return "ERROR: " + err.Error()
 	}
-	goFiles := map[string][]byte{}
-	jsFiles := qc.NewObject()
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		fb, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue // unreadable file ⇒ absent; the loader fails it on the hash it can't match
-		}
-		goFiles[e.Name()] = fb
-		jsFiles.SetPropertyStr(e.Name(), qc.NewArrayBuffer(fb))
-	}
-	res, err := invokeFree("loadBundleFiles", jsFiles)
+	res, err := invokeFree("loadBundleBlob", qc.NewArrayBuffer(blob))
 	if err != nil {
 		return "ERROR(invoke): " + err.Error()
 	}
@@ -375,8 +369,9 @@ func loadBundle(dir string) string {
 		App, Author string
 		Version     int
 		Caps        []string
-		Guest       string
 		Config      json.RawMessage
+		Modules     map[string]string
+		GuestSource string
 		Installed   []string
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
@@ -384,7 +379,7 @@ func loadBundle(dir string) string {
 	}
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
-		config: m.Config, guestSource: string(goFiles[m.Guest]),
+		config: m.Config, modules: m.Modules, guestSource: m.GuestSource,
 	}
 	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, m.Installed)
 }
@@ -621,7 +616,19 @@ func main() {
 			fatal("app-config", err)
 			return
 		}
-		if g, err = newGuestRealm(el, appJSON, loaded.guestSource); err != nil {
+		// `const BUNDLE` — the facts the runtime derived from the admitted manifest
+		// (author, app, signing prefix, module kernel names). Built in the host realm
+		// from the one derivation (cap-bridge bundlePreamble), never restated here.
+		factsJSON, err := json.Marshal(struct {
+			App     string            `json:"app"`
+			Author  string            `json:"author"`
+			Modules map[string]string `json:"modules"`
+		}{loaded.app, loaded.author, loaded.modules})
+		if err != nil {
+			fatal("bundle-facts", err)
+			return
+		}
+		if g, err = newGuestRealm(el, string(factsJSON), appJSON, loaded.guestSource); err != nil {
 			fatal("guest", err)
 			return
 		}

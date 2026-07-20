@@ -55,8 +55,8 @@ func TestBundleModuleRuns(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	dir, kernelName := writeTestBundle(t, author, authorPub, "runapp", 1)
-	if status := loadBundle(dir); !strings.HasPrefix(status, "runapp v1  installed=[fwd]") {
+	bundlePath, kernelName := writeTestBundle(t, author, authorPub, "runapp", 1)
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  installed=[fwd]") {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")

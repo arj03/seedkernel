@@ -703,7 +703,8 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
+  const { signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -712,26 +713,31 @@ async function testBundle() {
   const author = generateKeyPair();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-bundle-"));
+  const bundlePath = pjoin(dir, "app.skb");
   let shell, shell2;
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
     // throwaway host to derive the kernel name and hash content. Modules install
-    // directly from the manifest (§12.4) — no per-module .install envelope.
+    // directly from the manifest (§12.4) — no per-module .install envelope. Neither
+    // the module nor the guest names a file: they are `<name>.wasm` and `guest.js`.
     const { host: h } = await makeHost();
     const kernelName = h.deriveScopedName("codec", author.publicKey);
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
-      modules: [{
-        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName,
-      }],
-      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      caps: [],
+      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
+      // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
+      guest: {
+        hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
+        caps: [],
+      },
     };
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    wf(pjoin(dir, "guest.js"), guestText);
-    wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest));
+    const writeBundle = (m) => wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, m),
+      [moduleFile("codec")]: forwarderBytes,
+      [GUEST_FILE]: new TextEncoder().encode(guestText),
+    }));
+    writeBundle(manifest);
 
     // sign / verify / tamper
     const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
@@ -739,12 +745,23 @@ async function testBundle() {
     const tampered = env.slice(); tampered[tampered.length - 1] ^= 1;
     assert(verifyManifest(sodium, tampered) === null, "a tampered manifest fails verification");
 
+    // A manifest whose module names collide is ambiguous (the name keys both the
+    // container and the guest's module map), so it is refused even though it is
+    // validly signed (§12.4).
+    const dupEnv = signManifest(sodium, author.privateKey, author.publicKey, {
+      ...manifest,
+      modules: [manifest.modules[0], { ...manifest.modules[0] }],
+    });
+    let dupRefused = false;
+    try { verifyManifest(sodium, dupEnv); } catch { dupRefused = true; }
+    assert(dupRefused, "a manifest with duplicate module names is refused as malformed");
+
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = shell.loadBundle(dir);
+    const loaded = shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
     assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
@@ -752,16 +769,15 @@ async function testBundle() {
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
     // version and reloading through the same shell exercises the downgrade gate.
-    const remanifest = (version) =>
-      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, { ...manifest, version }));
-    remanifest(1); shell.loadBundle(dir); // equal version reloads (an ordinary reboot)
-    remanifest(2); shell.loadBundle(dir); // newer version advances the mark to 2
-    remanifest(1);                          // now a downgrade
+    const remanifest = (version) => writeBundle({ ...manifest, version });
+    remanifest(1); shell.loadBundle(bundlePath); // equal version reloads (an ordinary reboot)
+    remanifest(2); shell.loadBundle(bundlePath); // newer version advances the mark to 2
+    remanifest(1);                                // now a downgrade
     let downgradeRefused = false;
-    try { shell.loadBundle(dir); } catch { downgradeRefused = true; }
+    try { shell.loadBundle(bundlePath); } catch { downgradeRefused = true; }
     assert(downgradeRefused, "a version below the (author, app) high-water mark is refused as a downgrade");
-    remanifest(2); shell.loadBundle(dir);   // the mark held at 2, so v2 still loads
-    remanifest(1);                          // restore the original manifest for the shell2 check below
+    remanifest(2); shell.loadBundle(bundlePath);  // the mark held at 2, so v2 still loads
+    remanifest(1);                                // restore the original for the shell2 check below
 
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
@@ -769,7 +785,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data2"), identity,
     });
     let refused = false;
-    try { shell2.loadBundle(dir); } catch { refused = true; }
+    try { shell2.loadBundle(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a non-allowed author is refused");
   } finally {
     if (shell) shell.close();
@@ -779,15 +795,18 @@ async function testBundle() {
   console.log("  OK\n");
 }
 
-// ─── Test: handler-only bundle (no guest) + archive round-trip ──────────
+// ─── Test: handler-only bundle (no guest) + the verify/install split ────
 //
-// A chat-style app is a one-module bundle with NO guest realm. Proves the shared
-// §12.4 loader accepts a guest-less manifest (guestSource === "") and installs its
-// module, and that packBundle/unpackBundle round-trips a bundle as one blob — the
-// exact path the browser shell uses to carry an app over a data channel.
+// A chat-style app is a one-module bundle with NO guest realm — and because caps
+// live inside `guest` (§12.4), omitting it IS declaring zero authority; there is no
+// empty caps list to write. Proves the shared §12.4 loader accepts that shape
+// (guestSource === ""), that a bundle blob round-trips as one value, and that
+// `verifyBundle` authenticates + integrity-checks WITHOUT a host or a policy — the
+// seam the browser shell peeks a received Offer through before asking for consent.
 async function testGuestlessBundleAndArchive() {
-  console.log("Test: handler-only bundle (no guest) loads + bundle archive round-trip");
-  const { signManifest, verifyManifest, contentMatches, packBundle, unpackBundle }
+  console.log("Test: handler-only bundle (no guest) loads + verify/install split");
+  const { signManifest, verifyManifest, verifyBundle, checkBundleIntegrity,
+          packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -797,42 +816,56 @@ async function testGuestlessBundleAndArchive() {
   const author = generateKeyPair();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guestless-"));
+  const bundlePath = pjoin(dir, "demo.skb");
   let shell;
   try {
     const { host: h } = await makeHost();
     const kernelName = h.deriveBootstrapName("app:demo");
-    // A manifest with NO `guest` field — the handler-only shape.
+    // A manifest with NO `guest` field — the handler-only shape, and so no caps.
     const manifest = {
       app: "demo", version: 1,
-      modules: [{
-        name: "demo", file: "app.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName,
-      }],
-      caps: [],
+      modules: [{ name: "demo", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
     };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
 
-    // Archive round-trip: pack the bundle to one blob, unpack, and confirm the files
-    // survive byte-for-byte (this is what an Offer carries over a data channel).
-    const packed = packBundle({ "manifest.bundle": manifestEnv, "app.wasm": forwarderBytes });
+    // Blob round-trip: a bundle IS one blob, and this is what an Offer carries over a
+    // data channel and what the loader reads from disk — one format, one path.
+    const packed = packBundle({
+      [MANIFEST_FILE]: manifestEnv,
+      [moduleFile("demo")]: forwarderBytes,
+    });
     const files = unpackBundle(packed);
-    assert(bytesEqual(files["manifest.bundle"], manifestEnv), "packed manifest round-trips");
-    assert(bytesEqual(files["app.wasm"], forwarderBytes), "packed module round-trips");
-    assert(contentMatches(files["app.wasm"], manifest.modules[0].hash, (b) => h.genesisHash(b)),
-      "unpacked module matches the manifest's declared hash");
+    assert(bytesEqual(files[MANIFEST_FILE], manifestEnv), "packed manifest round-trips");
+    assert(bytesEqual(files[moduleFile("demo")], forwarderBytes), "packed module round-trips");
     let badArchive = false;
     try { unpackBundle(new Uint8Array([1, 2, 3])); } catch { badArchive = true; }
-    assert(badArchive, "a non-archive blob is rejected fail-loud");
+    assert(badArchive, "a non-bundle blob is rejected fail-loud");
 
-    // Load the guest-less bundle through the shared §12.4 loader (directory form).
-    wf(pjoin(dir, "manifest.bundle"), manifestEnv);
-    wf(pjoin(dir, "app.wasm"), forwarderBytes);
+    // The verify half on its own: no host, no policy, no freshness — the browser
+    // shell's peek path. It authenticates and yields every verified byte.
+    const v = verifyBundle(sodium, packed);
+    assert(bytesEqual(v.author, author.publicKey), "verifyBundle returns the signing author");
+    assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
+    assertEqual(v.guestSource, "", "a guest-less bundle verifies with an empty guest source");
+    checkBundleIntegrity(v, (b) => h.genesisHash(b)); // throws on mismatch
+    // Corrupting a module must fail integrity even though the manifest still verifies.
+    const corrupt = packBundle({
+      [MANIFEST_FILE]: manifestEnv,
+      [moduleFile("demo")]: forwarderBytes.slice(0, forwarderBytes.length - 1),
+    });
+    let integrityFailed = false;
+    try { checkBundleIntegrity(verifyBundle(sodium, corrupt), (b) => h.genesisHash(b)); }
+    catch { integrityFailed = true; }
+    assert(integrityFailed, "a module that does not match its declared hash fails integrity");
+
+    // Load the guest-less bundle through the shared §12.4 loader.
+    wf(bundlePath, packed);
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = shell.loadBundle(dir);
+    const loaded = shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
     assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
     assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
@@ -1877,13 +1910,14 @@ async function testRecordLayerIntegrity() {
 // ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
 //
 // Finding guard: the freshness high-water mark must record only versions that fully
-// loaded. A newer bundle whose manifest is intact and signed but whose module file is
+// loaded. A newer bundle whose manifest is intact and signed but whose module bytes are
 // corrupt (a half-landed upgrade) must fail the content check WITHOUT raising the mark —
-// otherwise reloading the known-good older directory would be refused as a downgrade,
+// otherwise reloading the known-good older bundle would be refused as a downgrade,
 // bricking rollback (README §12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { signManifest } = await imp("build/host/bundle.js");
+  const { signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1892,6 +1926,7 @@ async function testBundleCorruptNewerRollback() {
   const author = generateKeyPair();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-rollback-"));
+  const bundlePath = pjoin(dir, "rollback.skb");
   let shell;
   try {
     const { host: h } = await makeHost();
@@ -1899,16 +1934,19 @@ async function testBundleCorruptNewerRollback() {
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
-      modules: [{
-        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName,
-      }],
-      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      caps: [],
+      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
+      guest: {
+        hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
+        caps: [],
+      },
     });
-    wf(pjoin(dir, "guest.js"), guestText);
-    const writeManifest = (version) =>
-      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));
+    // `wasm` is the module's actual bytes — passed corrupt below to model a
+    // half-written upgrade whose manifest is nonetheless intact and signed.
+    const writeBundle = (version, wasm = forwarderBytes) => wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
+      [moduleFile("codec")]: wasm,
+      [GUEST_FILE]: new TextEncoder().encode(guestText),
+    }));
 
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
@@ -1916,24 +1954,21 @@ async function testBundleCorruptNewerRollback() {
     });
 
     // 1. Good v4 loads and sets the mark to 4.
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    writeManifest(4);
-    shell.loadBundle(dir);
+    writeBundle(4);
+    shell.loadBundle(bundlePath);
 
-    // 2. A corrupt v5: validly signed at version 5, but the on-disk module no longer
-    //    matches its declared hash. The load must throw on the content check.
-    writeManifest(5);
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes.slice(0, forwarderBytes.length - 1));
+    // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
+    //    match their declared hash. The load must throw on the content check.
+    writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
-    try { shell.loadBundle(dir); } catch { v5Failed = true; }
+    try { shell.loadBundle(bundlePath); } catch { v5Failed = true; }
     assert(v5Failed, "a corrupt v5 bundle fails to load");
 
-    // 3. Restore the good v4 directory and reload. If the failed v5 load had advanced the
+    // 3. Restore the good v4 bundle and reload. If the failed v5 load had advanced the
     //    mark to 5, this would now be refused as a downgrade. It must still load.
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    writeManifest(4);
+    writeBundle(4);
     let v4Reloaded = true;
-    try { shell.loadBundle(dir); } catch { v4Reloaded = false; }
+    try { shell.loadBundle(bundlePath); } catch { v4Reloaded = false; }
     assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
   } finally {
     if (shell) shell.close();
