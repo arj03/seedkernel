@@ -77,14 +77,6 @@ var (
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
-// name is a bootstrap handler name (README §5.1): the literal-ASCII
-// "seedkernel.bootstrap.v1:" + canonical. Bootstrap names are plain ASCII, not
-// genesis-hash-derived — swapping the genesis hash no longer re-derives the
-// bootstrap namespace (only bytes_hash still depends on the genesis hash).
-func name(canonical string) string {
-	return "seedkernel.bootstrap.v1:" + canonical
-}
-
 // bind binds `n` to `e`, releasing whatever the name held before — SetHandler's
 // replace-in-place (§3.1). The one place a displaced wasm instance is closed: Go frees
 // neither the instance nor its compiled code on its own, so dropping the map value alone
@@ -299,13 +291,12 @@ func boot() {
 
 // registerNativeAt binds a native host service (a Go closure) at the kernel name `n`,
 // reachable by name through callHandler exactly like an installed module — the native
-// counterpart of the JS host's `register`.
+// counterpart of the JS host's `register`, and the §3.1 hand-seeded slot a deployment
+// wires without going through the loader (§9). No in-repo deployment seeds one today;
+// the seam stays because the spec has hosts do this, and the §12.5 overlay-refusal test
+// exercises it.
 func registerNativeAt(n string, fn func([]byte) []byte) {
 	bind(n, &entry{nat: fn})
-}
-
-func registerNative(canonical string, fn func([]byte) []byte) {
-	registerNativeAt(name(canonical), fn)
 }
 
 // invokeFree calls the named global function as global.name(args...), then frees the

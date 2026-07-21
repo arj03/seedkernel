@@ -52,10 +52,18 @@ func packBundle(files [][2]any) []byte {
 	return out
 }
 
-// kernelNameFor is the loader's bind-name derivation (§5.1), mirroring bundle.ts so a test
-// can predict where a module lands. Go never derives this in production — the shared JS
-// loader hands the native host the finished name → this exists only to assert on it.
+// The two name derivations of §5.1, mirrored here so a test can predict where a handler
+// lands. Both are test-side only: the native host derives neither in production — the
+// shared JS loader hands it a module's finished kernel name, and no in-repo deployment
+// hand-seeds a bootstrap slot.
+
+// kernelNameFor is the loader's bind-name derivation, mirroring bundle.ts.
 func kernelNameFor(app, moduleName string) string { return app + ":" + moduleName }
+
+// name is a bootstrap handler name: the literal-ASCII "seedkernel.bootstrap.v1:" +
+// canonical. Bootstrap names are plain ASCII, not genesis-hash-derived — swapping the
+// genesis hash does not re-derive the bootstrap namespace (only bytes_hash depends on it).
+func name(canonical string) string { return "seedkernel.bootstrap.v1:" + canonical }
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest, under an author-signed manifest at the given
