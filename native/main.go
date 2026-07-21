@@ -49,13 +49,6 @@ type wasmHandler struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// entry is what the loader holds at one bound name. Exactly one of nat (a native host
-// service) / wasm (an installed module) is set.
-type entry struct {
-	nat  func([]byte) []byte
-	wasm *wasmHandler
-}
-
 var (
 	ctx = context.Background()
 	rt  wazero.Runtime
@@ -64,8 +57,9 @@ var (
 	// handlers is the handler table (README §3): the whole kernel, which is a contract
 	// rather than an artifact. A name is bound exactly when it is a key here, so the §3.1
 	// SetHandler / remove / resolve operations are map assignment, delete and lookup —
-	// there is no id indirection and no second table to drift from this one.
-	handlers = map[string]*entry{}
+	// there is no id indirection and no second table to drift from this one. Every value
+	// is an installed module: bundles are the one way code arrives (§12.4).
+	handlers = map[string]*wasmHandler{}
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
@@ -77,82 +71,34 @@ var (
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
-// bind binds `n` to `e`, releasing whatever the name held before — SetHandler's
+// bind binds `n` to `w`, releasing whatever the name held before — SetHandler's
 // replace-in-place (§3.1). The one place a displaced wasm instance is closed: Go frees
 // neither the instance nor its compiled code on its own, so dropping the map value alone
 // would leak one linear memory + its JITed code per replace for the process's life.
-func bind(n string, e *entry) {
-	closeEntry(handlers[n])
-	handlers[n] = e
+func bind(n string, w *wasmHandler) {
+	closeHandler(handlers[n])
+	handlers[n] = w
 }
 
-// closeEntry releases an entry's wasm instance and compiled code. nil-safe, so callers
+// closeHandler releases a handler's wasm instance and compiled code. nil-safe, so callers
 // can hand it whatever a lookup returned.
-func closeEntry(e *entry) {
-	if e == nil || e.wasm == nil {
+func closeHandler(w *wasmHandler) {
+	if w == nil {
 		return
 	}
-	_ = e.wasm.mod.Close(ctx)
-	_ = e.wasm.cmod.Close(ctx)
-}
-
-// isRegistered answers the handler-table query for `n` — a name is bound exactly when the
-// table holds it. The shared §12.5 admission consults it so a first install cannot overlay
-// a SetHandler-seeded bootstrap slot.
-func isRegistered(n string) bool {
-	return handlers[n] != nil
+	_ = w.mod.Close(ctx)
+	_ = w.cmod.Close(ctx)
 }
 
 // removeHandler unbinds `n` (§12.5) and releases what it held.
 func removeHandler(n string) bool {
-	e := handlers[n]
-	if e == nil {
+	w := handlers[n]
+	if w == nil {
 		return false
 	}
-	closeEntry(e)
+	closeHandler(w)
 	delete(handlers, n)
 	return true
-}
-
-// invoke runs `e` (README §4 scratch ABI) and returns its response. Routing already
-// happened — the caller resolved the name against the table — so this is purely the
-// transform. The one invocation path, reached through callHandler.
-func invoke(e *entry, payload []byte) []byte {
-	if w := e.wasm; w != nil {
-		// §4: write input at the scratch offset, call handle(input_len), read the response
-		// back from the same offset. Both copies are clamped to what the handler reserved
-		// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
-		if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
-			return nil
-		}
-		r, err := w.fn.Call(ctx, uint64(len(payload)))
-		// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
-		// length is a failure. A 0-length result is a valid EMPTY response, not a
-		// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
-		// from "no handler / trap" (nil).
-		if err != nil || len(r) == 0 {
-			return nil
-		}
-		outLen := int32(r[0])
-		if outLen < 0 || uint32(outLen) > w.size {
-			return nil
-		}
-		out := make([]byte, outLen)
-		if len(out) > 0 {
-			// A returned length past the module's own memory is as bogus as an
-			// oversized payload above — fail rather than return zero-filled bytes.
-			b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
-			if !ok {
-				return nil
-			}
-			copy(out, b)
-		}
-		return out
-	}
-	if e.nat != nil {
-		return e.nat(payload)
-	}
-	return nil
 }
 
 // callHandler invokes an installed handler by name (README §4), returning its response or
@@ -160,11 +106,39 @@ func invoke(e *entry, payload []byte) []byte {
 // module: the host uses it directly and the cap-bridge routes MODULE_CALL (§12.2) through
 // it. Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
 func callHandler(n string, payload []byte) []byte {
-	e := handlers[n]
-	if e == nil {
+	w := handlers[n]
+	if w == nil {
 		return nil
 	}
-	return invoke(e, payload)
+	// §4: write input at the scratch offset, call handle(input_len), read the response
+	// back from the same offset. Both copies are clamped to what the handler reserved
+	// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
+	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
+		return nil
+	}
+	r, err := w.fn.Call(ctx, uint64(len(payload)))
+	// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
+	// length is a failure. A 0-length result is a valid EMPTY response, not a
+	// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
+	// from "no handler / trap" (nil).
+	if err != nil || len(r) == 0 {
+		return nil
+	}
+	outLen := int32(r[0])
+	if outLen < 0 || uint32(outLen) > w.size {
+		return nil
+	}
+	out := make([]byte, outLen)
+	if len(out) > 0 {
+		// A returned length past the module's own memory is as bogus as an
+		// oversized payload above — fail rather than return zero-filled bytes.
+		b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
+		if !ok {
+			return nil
+		}
+		copy(out, b)
+	}
+	return out
 }
 
 // installWasm instantiates handler bytes and binds them at the name `n`. The replace is
@@ -207,7 +181,7 @@ func installWasm(n string, wasm []byte) bool {
 			size = d
 		}
 	}
-	bind(n, &entry{wasm: &wasmHandler{m, cm, fn, s, size}})
+	bind(n, &wasmHandler{m, cm, fn, s, size})
 	bound = true
 	return true
 }
@@ -225,7 +199,7 @@ func boot() {
 	env.Instantiate(ctx)
 	// The runtime above is fresh, so every handler from a previous boot points into a dead
 	// one (the tests boot repeatedly): start from an empty table rather than keep them.
-	handlers = map[string]*entry{}
+	handlers = map[string]*wasmHandler{}
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -242,11 +216,6 @@ func boot() {
 	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
-	}))
-	// The §12.5 admission refuses to overlay a SetHandler-seeded slot, so the
-	// shared policy needs the handler-table query.
-	b.SetPropertyStr("isRegistered", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(isRegistered(t.Args()[0].String())), nil
 	}))
 	b.SetPropertyStr("removeHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(removeHandler(t.Args()[0].String())), nil
@@ -287,16 +256,6 @@ func boot() {
 	// No `install` wire handler: code arrives only as a signed bundle (§12.4), and
 	// loadBundleFiles admits each verified module directly via installWasm. There is
 	// no message-driven install path (§12.4).
-}
-
-// registerNativeAt binds a native host service (a Go closure) at the kernel name `n`,
-// reachable by name through callHandler exactly like an installed module — the native
-// counterpart of the JS host's `register`, and the §3.1 hand-seeded slot a deployment
-// wires without going through the loader (§9). No in-repo deployment seeds one today;
-// the seam stays because the spec has hosts do this, and the §12.5 overlay-refusal test
-// exercises it.
-func registerNativeAt(n string, fn func([]byte) []byte) {
-	bind(n, &entry{nat: fn})
 }
 
 // invokeFree calls the named global function as global.name(args...), then frees the

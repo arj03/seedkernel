@@ -56,7 +56,7 @@ function assertEqual(actual, expected, msg) {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 }
 
-// Standard bootstrap (README §9): a fresh handler table with the loader's admission
+// Standard bootstrap (README §3): a fresh handler table with the loader's admission
 // policy wired. The default policy admits every module; tests that need rejection
 // override via host.setAdmitPolicy. Handlers are pure transforms with no
 // signature/dispatch seam, so there is nothing else to wire.
@@ -77,6 +77,11 @@ function installMod(host, targetName, wasm, authorPk) {
   return host.installBundleModule(targetName, wasm, authorPk);
 }
 
+// The §5.1 bind name a bundle module lands at (`"<app>:<module>"`, kernelNameFor),
+// mirrored here so a test can name a slot without packing a whole bundle — `installMod`
+// admits under exactly the name the loader would derive.
+const modName = (app, mod) => `${app}:${mod}`;
+
 // ─── Test: install a module, reach it by name ───────────────────────────
 
 async function testFullLifecycle() {
@@ -85,9 +90,9 @@ async function testFullLifecycle() {
   const { host } = await makeHost();
 
   const { publicKey: pk } = generateKeyPair();
-  const chatName = host.deriveScopedName("chat", pk);
+  const chatName = modName("chat", "chat");
 
-  // Install the chat handler under the author's scoped name, through the same path the
+  // Install the chat handler under its derived kernel name, through the same path the
   // bundle loader uses. It is a pure transform (the forwarder fixture echoes its input).
   installMod(host, chatName, forwarderBytes, pk);
   assert(host.isRegistered(chatName), "chat handler installed");
@@ -107,36 +112,6 @@ async function testFullLifecycle() {
   console.log("  OK\n");
 }
 
-// ─── Test: SetHandler-seeded slot is not overlaid ────────────────────────
-
-async function testRefuseOverlayBootstrapSlot() {
-  console.log("Test: the loader refuses to overlay a SetHandler-seeded slot (§12.5)");
-
-  // An allow-all admit policy, so this test exercises only the structural seeded-slot
-  // refusal — not an unrelated policy rejection. The guard lives in the loader's
-  // admission (a first install onto an already-registered name is refused), so it holds
-  // regardless of which AdmitPolicy is wired.
-  const { host } = await makeHost(() => true);
-
-  // Seed a host-JS handler straight into the table (no install record) — the converged
-  // stand-in for a bootstrap slot. A bundle module aimed at its name must be refused, so
-  // the seeded handler stays bound and keeps answering.
-  const seededName = host.deriveBootstrapName("host.seeded");
-  let seededCalls = 0;
-  host.register(seededName, () => { seededCalls++; return new Uint8Array([1]); });
-
-  const { publicKey: pk } = generateKeyPair();
-  installMod(host, seededName, forwarderBytes, pk);
-
-  // Reaching the name still runs the host-JS closure (returns [1] and counts), not an
-  // overlaid forwarder (which would echo the empty input instead).
-  const r = host.callHandler(seededName, EMPTY);
-  assertEqual([...r], [1], "seeded handler still bound after refused overlay");
-  assertEqual(seededCalls, 1, "the seeded host-JS handler ran, not an overlaid module");
-
-  console.log("  OK\n");
-}
-
 // ─── Test: the admit policy is the sole authorization gate ──────────────
 
 async function testApproveInstallRejects() {
@@ -150,7 +125,7 @@ async function testApproveInstallRejects() {
   const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName("chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
@@ -176,7 +151,7 @@ async function testApproveInstallReceivesBytesHash() {
   const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName("chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install accepted");
@@ -199,7 +174,7 @@ async function testNoApproveInstallDropsAll() {
   host.setAdmitPolicy(null);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName("chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
@@ -223,7 +198,7 @@ async function testReferencePolicyUpgradeRules() {
   const { publicKey: bPk } = generateKeyPair();
   // Both authors target the same name so we can exercise the upgrade path.
   // (Author-scoped names would partition the space and avoid the rule.)
-  const sharedName = host.deriveBootstrapName("test.shared");
+  const sharedName = modName("shared", "fwd");
 
   // A claims sharedName (first install — accepted).
   installMod(host, sharedName, forwarderBytes, aPk);
@@ -264,7 +239,7 @@ async function testInstallerLookupHostSide() {
   const { host } = await makeHost();
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName("chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install ok");
@@ -277,11 +252,9 @@ async function testInstallerLookupHostSide() {
   assertEqual(rec.author, pk, "record author matches signer");
   assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
 
-  // Unknown / SetHandler-seeded names have no record.
-  assert(host.lookupInstall(host.deriveBootstrapName("does.not.exist")) === null,
+  // An unbound name has no record.
+  assert(host.lookupInstall(modName("nope", "missing")) === null,
     "unknown name has no record");
-  assert(host.lookupInstall(host.deriveBootstrapName("signature")) === null,
-    "SetHandler-seeded bootstrap handler has no record");
 
   console.log("  OK\n");
 }
@@ -298,7 +271,7 @@ async function testInstallerRemove() {
   });
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName("chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
   assert(host.isRegistered(chatTextName), "install ok");
@@ -492,10 +465,11 @@ async function testCapBridge() {
   const net = new LoopbackNetwork();
   const transport = new Transport(toHex(id.publicKey), net, 40);
 
-  // A host handler reachable by name, to exercise CAP_MODULE_CALL.
+  // A handler reachable by name, to exercise CAP_MODULE_CALL. The forwarder fixture
+  // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
-  const echoName = host.deriveBootstrapName("test.echo");
-  host.register(echoName, (_n, p) => new Uint8Array([p.length, ...p]));
+  const echoName = modName("testapp", "echo");
+  installMod(host, echoName, forwarderBytes, id.publicKey);
 
   // A host-derived signing scope binds the guest's SIGN op to a bundle namespace
   // (README §12.2); a real node derives it from the manifest's (author, app).
@@ -556,7 +530,7 @@ async function testCapBridge() {
     const echoNameBytes = new TextEncoder().encode(echoName);
     const mc = new Uint8Array(1 + echoNameBytes.length + 2);
     mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
-    assertEqual([...await bridge(CAP.MODULE_CALL, mc)], [2, 8, 9], "CAP_MODULE_CALL invokes the named handler");
+    assertEqual([...await bridge(CAP.MODULE_CALL, mc)], [8, 9], "CAP_MODULE_CALL invokes the named handler");
   } finally {
     transport.close();
   }
@@ -637,7 +611,7 @@ async function testPolicy() {
   const tryInstall = async (policyJson, author) => {
     const { host } = await makeHost();
     host.setAdmitPolicy(buildAdmit(parsePolicy(policyJson)));
-    const name = host.deriveScopedName("mod", author.publicKey);
+    const name = modName("mod", "fwd");
     installMod(host, name, forwarderBytes, author.publicKey);
     const rec = host.lookupInstall(name);
     return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
@@ -1124,26 +1098,26 @@ async function testCallHandlerGuards() {
   console.log("Test: KernelHost.callHandler resolves by name, or null when unbound (§4)");
 
   const { host } = await makeHost();
+  const { publicKey: pk } = generateKeyPair();
 
   // An unbound name resolves to nothing — null, distinct from an empty response.
-  const missing = host.deriveBootstrapName("nope.missing");
+  const missing = modName("nope", "missing");
   assert(host.callHandler(missing, new Uint8Array([1])) === null,
     "callHandler returns null for an unbound name");
 
-  // A registered host-JS handler is reached by name exactly like a WASM handler — the
-  // kernel table is indifferent to the impl. A confined guest reaches the same handler
+  // An installed handler is reached by name. A confined guest reaches the same handler
   // through the cap-bridge's MODULE_CALL (§12.2).
-  const echoName = host.deriveBootstrapName("test.echo2");
-  host.register(echoName, (_n, p) => p);
+  const echoName = modName("guards", "echo");
+  installMod(host, echoName, forwarderBytes, pk);
   const r = host.callHandler(echoName, new Uint8Array([5]));
-  assertEqual([...r], [5], "callHandler reaches a registered host handler");
+  assertEqual([...r], [5], "callHandler reaches an installed handler");
 
-  // A handler that returns nothing surfaces as null (no response), not an empty array —
-  // handlers are pure transforms and cannot call back, so there is nothing else to guard.
-  const silentName = host.deriveBootstrapName("test.silent");
-  host.register(silentName, () => null);
-  assert(host.callHandler(silentName, EMPTY) === null,
-    "a handler that returns null yields null");
+  // A 0-length response is a valid EMPTY answer, NOT the null of an unbound name — the
+  // two are distinct at this seam, so a caller can tell "handler ran, said nothing" from
+  // "nothing there". The forwarder echoes, so an empty input produces an empty response.
+  const empty = host.callHandler(echoName, EMPTY);
+  assert(empty !== null && empty.length === 0,
+    "an empty response is an empty array, distinct from null");
 
   console.log("  OK\n");
 }
@@ -2125,7 +2099,6 @@ async function testBundleCorruptNewerRollback() {
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
-await testRefuseOverlayBootstrapSlot();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();

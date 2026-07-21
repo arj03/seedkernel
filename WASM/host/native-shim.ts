@@ -26,8 +26,6 @@ import { toHex } from "./util.js";
 declare const bridge: {
   /** Instantiate handler bytes against the §4 ABI and SetHandler them at `name`. */
   installWasm(name: string, wasm: Uint8Array): boolean;
-  /** Does a handler already occupy `name`? (A lookup in the Go host's table.) */
-  isRegistered(name: string): boolean;
   /** Unbind `name` (SetHandler(name, null)). Exposed for operator revocation. */
   removeHandler(name: string): boolean;
   /** The persisted freshness store's contents, or null on first boot. */
@@ -50,7 +48,6 @@ class NativeHost implements BundleHost, RecordHost {
 
   genesisHash(data: Uint8Array): Uint8Array { return sodium.crypto_generichash(32, data); }
   _installWasmHandler(name: string, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); }
-  isRegistered(name: string): boolean { return bridge.isRegistered(name); }
 
   installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
     return this.records.admit(name, wasm, authorPubKey);

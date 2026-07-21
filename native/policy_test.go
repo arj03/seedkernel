@@ -65,30 +65,36 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §12.5) —
-// the loader's structural admission rule, enforced via the kernel's handler table on the
-// shared admission path. A native host handler seeded straight into the table has no install
-// record, so aiming a bundle module at its slot must leave the native handler in place.
-func TestBundleCannotOverlaySeededSlot(t *testing.T) {
+// A different author cannot take over a name another author's bundle already owns
+// (README §12.5): the policy's same-author rule keys on the install record the first
+// bundle left behind, so the second bundle's module must not land.
+func TestBundleCannotHijackAnotherAuthorsName(t *testing.T) {
 	boot()
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+	authorA, authorAPub := testAuthor(t)
+	authorB, authorBPub := testAuthor(t)
+	// Both authors are allowed to install — this test is about the per-name ownership
+	// rule, not the closed author set.
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorAPub) + `","` + hex.EncodeToString(authorBPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	// Seed a native host handler the way boot()-time services are seeded — bound into the
-	// handler table via SetHandler, with no install record for the policy to key on. A
-	// bundle module's name is derived, not declared (§5.1), so the way to aim one at an
-	// occupied slot is to occupy the slot it will derive: `<app>:fwd`.
-	seeded := kernelNameFor("overlayapp", "fwd")
-	registerNativeAt(seeded, func(p []byte) []byte { return p })
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1)
-	if status := loadBundle(bundlePath); strings.Contains(status, "installed=[fwd]") {
-		t.Fatalf("a bundle module overlaid the seeded `%s` slot: %s", seeded, status)
+	// A module's name is derived from the manifest `app` (§5.1), so two bundles declaring
+	// the same app aim at the same slot: `<app>:fwd`.
+	name := kernelNameFor("ownedapp", "fwd")
+	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
+	if status := loadBundle(bundleA); !strings.Contains(status, "installed=[fwd]") {
+		t.Fatalf("author A's first install should be admitted: %s", status)
 	}
-	if boundToWasm(seeded) {
-		t.Fatalf("the seeded `%s` slot was overlaid by a bundle module", seeded)
+	if !boundToWasm(name) {
+		t.Fatalf("author A's module is not bound at `%s`", name)
 	}
-	if e := handlers[seeded]; e == nil || e.nat == nil {
-		t.Fatalf("the seeded `%s` handler is gone from its slot", seeded)
+	// B's bundle is well-formed and its author is allowed, so it verifies and loads — the
+	// refusal is the per-module admission, leaving an empty installed set rather than an
+	// error. A's handler must still be the one bound at the name.
+	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
+	if status := loadBundle(bundleB); !strings.Contains(status, "installed=[]") {
+		t.Fatalf("author B hijacked author A's `%s` slot: %s", name, status)
+	}
+	if !boundToWasm(name) {
+		t.Fatalf("the refused install unbound `%s`", name)
 	}
 }

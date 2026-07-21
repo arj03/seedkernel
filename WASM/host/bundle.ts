@@ -58,10 +58,7 @@ export interface BundleModule {
  *  handler: a peer sends an app id or a protocol opcode and the receiving host resolves
  *  it through its own table, and a guest reaches its own modules by logical name through
  *  `BUNDLE.modules`. So this needs to be collision-free within one node, not agreed
- *  across a deployment — scoping by `app` is exactly that much. It is deliberately NOT
- *  in the `"seedkernel.bootstrap.v1:"` namespace: those names are hand-seeded via
- *  SetHandler (§9), and keeping the two disjoint is what stops an admitted bundle from
- *  landing on a bootstrap slot. */
+ *  across a deployment — scoping by `app` is exactly that much. */
 export function kernelNameFor(app: string, moduleName: string): string {
   return app + ":" + moduleName;
 }
@@ -364,9 +361,9 @@ export class FreshnessMarks implements FreshnessStore {
 // store below holds one host-side table, `installations[name] → {author, bytesHash}`,
 // read only here and never over the wire, and drives the one admission step: hash the
 // verified bytes, consult the admission policy (§12.5), and on approval instantiate +
-// SetHandler the module and record `(author, bytesHash)`. A raw SetHandler that mutates a
-// slot (the host's own `register` / `removeHandler`, §3.1) forgets that slot's record
-// first, so an old author is never carried onto brand-new bytes.
+// SetHandler the module and record `(author, bytesHash)`. Revoking a slot
+// (`removeHandler`, §12.5) forgets its record, so an old author is never carried onto
+// brand-new bytes.
 
 /** A single install record (README §12.4): who signed the bundle that bound the bytes,
  *  and the bytes' content id. */
@@ -393,16 +390,13 @@ export type AdmitPolicy = (
 ) => boolean;
 
 /** The host powers the record store runs over (README §12.4): hash with the genesis hash,
- *  instantiate + bind a verified handler, and ask whether a name is already bound.
- *  `KernelHost` satisfies it; the native loader supplies the same three over its Go bridge
- *  (README §12.9), so the admission below is not re-derived in a second language. */
+ *  and instantiate + bind a verified handler. `KernelHost` satisfies it; the native loader
+ *  supplies the same two over its Go bridge (README §12.9), so the admission below is not
+ *  re-derived in a second language. */
 export interface RecordHost {
   genesisHash(data: Uint8Array): Uint8Array;
   /** Instantiate handler bytes against the §4 ABI and bind them at `name`. */
   _installWasmHandler(name: string, wasm: Uint8Array): boolean;
-  /** True if a handler already occupies `name` — used to refuse overlaying a hand-seeded
-   *  slot on a first install (README §12.4). */
-  isRegistered(name: string): boolean;
 }
 
 /** The loader's install records + admission step (README §12.4). Held by the host that
@@ -426,16 +420,15 @@ export class InstallRecords {
     return this.installations.get(name) ?? null;
   }
 
-  /** Drop any record at `name`. The host calls it when a raw SetHandler (re)binds or unbinds
-   *  the slot (§3.1), so a stale `(author, bytesHash)` can't misattribute brand-new bytes.
-   *  Idempotent. */
+  /** Drop any record at `name`. The host calls it when `removeHandler` unbinds the slot
+   *  (§12.5 revocation), so a stale `(author, bytesHash)` can't later misattribute
+   *  brand-new bytes to the revoked author. Idempotent. */
   forget(name: string): void { this.installations.delete(name); }
 
-  /** Admit one verified module (README §12.4): hash the bytes, refuse to overlay a
-   *  hand-seeded slot, consult the policy, then instantiate + bind and record
-   *  `(author, bytesHash)`. The whole admission, and the only path that mutates the kernel
-   *  table with a record behind it — the bundle loader calls it once per module through
-   *  `host.installBundleModule`, with the manifest author.
+  /** Admit one verified module (README §12.4): hash the bytes, consult the policy, then
+   *  instantiate + bind and record `(author, bytesHash)`. The whole admission, and the
+   *  only path that mutates the kernel table — the bundle loader calls it once per module
+   *  through `host.installBundleModule`, with the manifest author.
    *
    *  A bundle carries no per-module signature or seq: the signed manifest already
    *  authenticated the coherent set and committed to each module's `genesisHash` (§12.4), so
@@ -445,9 +438,6 @@ export class InstallRecords {
     if (name.length === 0 || wasm.length === 0) return false;
     const bytesHash = this.host.genesisHash(wasm);
     const current = this.installations.get(name) ?? null;
-    // Refuse to overlay a hand-seeded slot: no record but the kernel already resolves the
-    // name means a deliberately wired handler the loader will not silently replace (§12.4).
-    if (current == null && this.host.isRegistered(name)) return false;
     if (!this.admitPolicy) return false;
     let approved = false;
     try { approved = this.admitPolicy(name, author, bytesHash, wasm, current); }

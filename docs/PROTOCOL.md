@@ -4,7 +4,7 @@
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
-> [README](../README.md) §1 · **PROTOCOL §2–§5, §16** · [BOOTSTRAP](BOOTSTRAP.md) §9 · [RUNTIME](RUNTIME.md) §10–§12 · [SECURITY](SECURITY.md) §13–§14
+> [README](../README.md) §1 · **PROTOCOL §2–§5, §16** · [RUNTIME](RUNTIME.md) §10–§12 · [SECURITY](SECURITY.md) §13–§14
 
 ---
 
@@ -36,7 +36,7 @@ The kernel is a **contract, not an artifact**. It is this section — the table,
 handlers[name] → handler    bind / replace / resolve / remove   (§3.1)
 ```
 
-`Map<string, handler>` in the JS host, `map[string]*entry` in the Go host. There is no kernel module to instantiate, no handler-id indirection, no memory staging across a boundary, and no second table to keep in step with a first. §1's vision sentence — "installing a handler is nothing more than `handlers[name] = wasm_bytes`" — is literally the implementation.
+`Map<string, handler>` in the JS host, `map[string]*wasmHandler` in the Go host. There is no kernel module to instantiate, no handler-id indirection, no memory staging across a boundary, and no second table to keep in step with a first. §1's vision sentence — "installing a handler is nothing more than `handlers[name] = wasm_bytes`" — is literally the implementation.
 
 **Why the table is not itself a WASM module.** Compiling it would buy "one kernel binary, every host" — but the table is two operations, and the handler *instances* it points at are per-target regardless (a `WebAssembly.Instance` in JS, a wazero `api.Module` in Go), so it could never be self-contained: each host would keep a parallel map beside it, keyed by an id invented to cross the boundary, plus the alloc/copy/call/dealloc round trip per lookup. What genuinely must not diverge between hosts is the bundle **load order** and the **admission rules**, and those *are* shared — as compiled TypeScript evaluated on every target (§12.9), where sharing pays.
 
@@ -55,17 +55,19 @@ SetHandler(name, handler)    install or replace the handler for name
 SetHandler(name, null)       remove it
 ```
 
-`SetHandler` installs or replaces in place, so the table never holds two entries for one name. Together these are the **only** way handlers enter or leave it — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host exposes them as `register(name, jsHandler)` / `installBundleModule(...)` / `removeHandler(name)`. What sits at a name is either a JS closure or an instantiated WASM handler; the table is indifferent, because both are reached the same way — by name, through `callHandler`.
+`SetHandler` installs or replaces in place, so the table never holds two entries for one name. Together these are the **only** way handlers enter or leave it — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host exposes them as `installBundleModule(name, wasm, author)` and `removeHandler(name)`.
 
-`SetHandler` is internal to the host process — a direct method call, never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it. Handlers seeded this way directly (rare — most deployments install nothing by hand and grow only through bundles, §9) have **no install record** — the loader's records (§12.4) cover only bundle-admitted modules.
+**The bind is not a public host method.** Nothing hands the host a ready-made handler to drop into a slot: the only caller of the bind is the loader's admission (§12.4), which reaches it after the manifest signature and the policy have both passed. So every entry in the table is a bundle module with an install record behind it — there is no second kind of occupant, no record-less slot, and no question of what a name resolves to. That is what makes "one install path" (§1) literally true rather than nearly true.
 
-The same call the host uses during bootstrap (§9) stays available afterward for emergency replacement of any handler. Ordinary growth loads a signed bundle (§12.4); the host-level `SetHandler` path is the emergency fallback for cases the message pipeline can't reach.
+`SetHandler` is internal to the host process — never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it.
 
-**Replacing recorded names.** The kernel never touches an install record — it does not know records exist (§12.4). But a stale `(author, bytes_hash)` left behind by a raw replacement would misattribute the slot: the old author would apply to brand-new bytes, so the default policy would treat the next same-name install as a same-author upgrade of code it never signed. So the host's handler-management path auto-clears any record when it (re)binds or removes a slot — `register` / `installBundleModule` and `removeHandler` all do. A `SetHandler` replacement thus always runs with no record (a later bundle load may wire a fresh one), needing no separate `remove(name)` first; the loader's `remove(name)` (§12.5) remains the path for operator revocation, where clearing the record is the point.
+**Removing a name clears its record.** The kernel never touches an install record — it does not know records exist (§12.4). But a stale `(author, bytes_hash)` left behind by a removal would misattribute the slot: the old author would apply to brand-new bytes, so the default policy would treat the next same-name install as a same-author upgrade of code it never signed. So `removeHandler` clears the slot's record along with its binding — which is exactly the point of the loader's `remove(name)` revocation path (§12.5).
 
 ### 3.2 Growth is the loader's job, not the kernel's
 
 Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module — a policy decision (§12.5) followed by `SetHandler` — and holds the install records `(author, bytes_hash)` that back it. None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting bind. Frozen-config deployments load no bundles and grow no further.
+
+**Standing a host up.** Because the kernel is a map rather than an artifact, there is no bootstrap sequence to speak of: ready libsodium, construct the host, and the table is live — empty, resolving nothing. Growth is then two ordered steps, and the order is the only constraint: wire an admission policy (§12.5), then load a bundle (§12.4). A host whose policy is never wired is not misconfigured but *frozen* — deny-all is the default, so it boots, serves, and admits nothing (§14). There is no step for instantiating a kernel module, seeding a signature handler, or wiring a slot by hand; each was a step in an earlier revision, and none survives.
 
 Because the loader verifies the manifest signature before it admits anything, "who authored this code" is already settled by an ordinary signature check (§12.4). Installation is not a special operation; it is `handlers[name] = wasm_bytes`, gated by the author + hash policy (§12.5).
 
@@ -130,18 +132,13 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 
 Each layer is testable standalone: the kernel is exercised on its own, the loader against a bundle with no live transport, chat as a handful of pure transforms with no crypto in sight. Composition across layers is the host's or the guest's, through `callHandler` / `MODULE_CALL` (§4.2) — never a handler reaching sideways.
 
-**The hash function used for id derivation.** A few places hash: `bytes_hash` (§12.4), the optional author-scoped name for a hand-seeded slot (`hash(canonical ‖ author_pubkey)`, below), and any allowlist that pins a binary. Throughout, `hash(…)` means **BLAKE2b-256** — the *genesis hash*, computed host-side by `genesisHash` (libsodium's core `crypto_generichash`). There is exactly one hash across the whole system: the same BLAKE2b-256 backs the guest `HASH` op (§12.2), the AKE KDF and transcript hash (§12.6), and the block-id path. Swapping it shifts every `bytes_hash` — but the **bootstrap names are literal ASCII, not hashes**, so they do *not* shift, and the §9 seeds survive the swap untouched. Pick the genesis hash once and treat it as a deployment-wide constant.
+**The hash function used for id derivation.** Two places hash: `bytes_hash` (§12.4) and any allowlist that pins a binary. Both mean **BLAKE2b-256** — the *genesis hash*, computed host-side by `genesisHash` (libsodium's core `crypto_generichash`). There is exactly one hash across the whole system: the same BLAKE2b-256 backs the guest `HASH` op (§12.2), the AKE KDF and transcript hash (§12.6), and the block-id path. Swapping it shifts every `bytes_hash` — but **kernel names are literal ASCII, not hashes**, so no name shifts with it. Pick the genesis hash once and treat it as a deployment-wide constant.
 
 **Names are strings.** A name is an opaque string the kernel only ever matches — nothing forces a hash, so a name reads plainly in a log and in a manifest.
 
 **A name is node-local.** Nothing on the wire ever names another node's handler. A peer sends an application-level id or opcode — the chat demo's frame carries an *app id* (§11), a storage message carries its protocol op — and the receiving host resolves that through its own table; a confined guest reaches its own modules by logical name through `BUNDLE.modules` (§12.4). So a name must be collision-free within one node, not agreed across a deployment. Two hosts that bound the same code under different names interoperate fine.
 
-Names come from exactly two places, in disjoint namespaces so that an admitted bundle can never land on a hand-wired slot:
-
-| | Name | Who binds it |
-| --- | --- | --- |
-| **Bootstrap handlers** | `"seedkernel.bootstrap.v1:" + canonical_name` | Host-seeded via `SetHandler` (§3.1) when a deployment wires a handler by hand (§9), not admitted through the loader — so there is no install record to mix in. `deriveBootstrapName` computes it. A deployment that hand-wires one canonical handler for several parties, and wants each to hold its own without collision, can name the slots `hex(hash(canonical ‖ author_pubkey))` instead (`deriveScopedName`); the table is indifferent to either. |
-| **Bundle modules** | `"<app>:<module name>"` | Derived by the loader from the signed manifest (§12.4), never declared in it. Both halves are already covered by the author's signature, so what binds is what the author authenticated, and a manifest holds no bind-name field to forge. |
+**Names come from exactly one place.** Every name is `"<app>:<module name>"`, derived by the loader from the signed manifest (§12.4) and never declared in it. Both halves are already covered by the author's signature, so what binds is what the author authenticated, and a manifest holds no bind-name field to forge. There is no second namespace to keep disjoint from this one, because there is no second way to bind (§3.1).
 
 **Ownership, not namespacing, is what keeps apps apart.** The default policy (§12.5) constrains nothing about a name — the first author to bind one owns it, and only that author can update it. Because a module's name is derived rather than declared, a policy has no name to constrain anyway: it decides *who* may install, and the `app` scope does the rest.
 

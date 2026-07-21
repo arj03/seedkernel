@@ -65,8 +65,7 @@ export function policyFromJson(json: string | null | undefined): ShellPolicy {
  *       allowed author cannot hijack the slot (squat-resistance, the reason the loader keeps
  *       a record per name).
  *  An empty author set (the omitted-policy default) admits nothing — every bind fails
- *  check 1. The refusal to overlay a hand-seeded slot is structural in the loader
- *  (`InstallRecords.admit`), so it holds regardless of which `AdmitPolicy` is wired. */
+ *  check 1. */
 export function buildAdmit(policy: ShellPolicy): AdmitPolicy {
   const authors = new Set(policy.authors.map((s) => s.toLowerCase()));
   const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;

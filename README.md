@@ -118,12 +118,11 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 
 | Doc | Sections | Contents |
 | --- | --- | --- |
-| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level `SetHandler`, the pure-transform WASM handler ABI, layering, the protocol constants. |
-| [BOOTSTRAP](docs/BOOTSTRAP.md) | §9 | The bootstrap sequence that composes the onion — the table, admission policy, and the first signed bundles. |
+| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level `SetHandler`, standing a host up, the pure-transform WASM handler ABI, layering, the protocol constants. |
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the chat demo, and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 
-To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,BOOTSTRAP,RUNTIME,SECURITY}.md`.
+To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`.
 
 ## 15. Background
 

@@ -16,7 +16,7 @@ const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sum
 
 /** Await sodium readiness and stand up a KernelHost. The handler table is host
  *  state — there is no kernel blob to load — so booting is "ready libsodium, done"
- *  (§9); installing bundles stays the caller's job. */
+ *  (§3); installing bundles stays the caller's job. */
 export async function createKernelHost(): Promise<KernelHost> {
   await sodium.ready;
   return new KernelHost(sodium);
@@ -43,7 +43,6 @@ export function generateKeyPair(): {
 }
 
 export { KernelHost } from "./kernel-host.js";
-export type { Handler } from "./kernel-host.js";
 export type {
   InstallRecord,
   AdmitPolicy,

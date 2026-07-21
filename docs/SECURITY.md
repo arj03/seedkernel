@@ -4,7 +4,7 @@
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
-> [README](../README.md) §1 · [PROTOCOL](PROTOCOL.md) §2–§5, §16 · [BOOTSTRAP](BOOTSTRAP.md) §9 · [RUNTIME](RUNTIME.md) §10–§12 · **SECURITY §13–§14**
+> [README](../README.md) §1 · [PROTOCOL](PROTOCOL.md) §2–§5, §16 · [RUNTIME](RUNTIME.md) §10–§12 · **SECURITY §13–§14**
 
 ---
 
@@ -34,7 +34,7 @@ That is the entire steady-state pipeline: one AEAD open, one name lookup, one pu
 
 The security properties are introduced where they arise (§3.1, §4.2–§4.3, §12.4–§12.6); this section collects the trust assumptions and the load-bearing invariants in one place so an implementer or auditor can see the whole model at once.
 
-**Trust boundary / TCB.** The host *is* the trusted computing base. Anyone with `SetHandler` access (§3.1) owns everything: they can replace any handler with no ceremony, and the loader's install records are host-side state they already own. The kernel enforces no access control on `SetHandler` — guarding it is the host's job (process permissions, operator console, HSM). The bundled crypto library (libsodium) and the shipped host JS are part of that TCB; there is no separately-loaded, hash-pinned crypto module to trust anymore. Everything *above* the host is sandboxed WASM (pure-transform handlers) or a zero-authority JS guest, and neither reaches the outside world except through what the host hands it.
+**Trust boundary / TCB.** The host *is* the trusted computing base. Anyone with host-process access owns everything: the bind (§3.1), the loader's install records, and the admission policy that gates them are all host-side state they already control, so the signature checks a bundle passes constrain what an *author* can do, never what the host operator can. The kernel enforces no access control on `SetHandler` — guarding it is the host's job (process permissions, operator console, HSM). The bundled crypto library (libsodium) and the shipped host JS are part of that TCB; there is no separately-loaded, hash-pinned crypto module to trust anymore. Everything *above* the host is sandboxed WASM (pure-transform handlers) or a zero-authority JS guest, and neither reaches the outside world except through what the host hands it.
 
 **Authenticity is the channel's, per hop.** The runtime carries no per-message signature. The node↔node transport (§12.6) opens each link with an authenticated key exchange and then attributes every frame to the peer that sent it — so "who sent this frame" is answered by the channel, cryptographically, for the *immediate* peer. That is end-to-end for a direct exchange like chat, where a message travels one hop (§11). It is **not** end-to-end across relays: a node that forwards another peer's message can only be authenticated as the forwarder, not the origin. An application that relays messages — a feed, a forum, store-and-forward gossip — therefore authenticates the original author itself, with a per-message signature plus backlinks (a hash-chain, §5.1); the runtime does not do this for it, and doing it in the kernel would be the wrong layer.
 

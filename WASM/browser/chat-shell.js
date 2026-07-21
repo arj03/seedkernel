@@ -108,8 +108,7 @@ const host = await createKernelHost(sodium);
 // author key) are auto-approved — the "trust the original author" rule (§12.5, author-
 // only; no parent/lineage gate). First installs require explicit user consent; the UI
 // gates them by adding the app's bytes_hash to `pendingApprovals` before admitting it
-// via installBundleModule. Anything else is refused. (The refusal to overlay a hand-
-// seeded slot is structural in the loader, so this callback need not check it.)
+// via installBundleModule. Anything else is refused.
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
 host.setAdmitPolicy((name, author, bytesHash, _wasm, existing) => {
