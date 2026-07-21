@@ -94,10 +94,15 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Manifest envelope: [author_pk 32][sig 64][json]. The Ed25519 detached sig is over
-	// DOMAIN_manifest ‖ json (§12.4) — the prefix is signed but not stored in the envelope.
-	sig := ed25519.Sign(priv, append([]byte("seedkernel-manifest-sig-v1\x00"), mjson...))
-	menv := append(append(append([]byte{}, pub...), sig...), mjson...)
+	// Manifest envelope: [suite 1][author_pk 32][sig 64][json]. The Ed25519 detached sig is
+	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
+	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
+	// that tells it the field widths and then checks a signature committing to that same
+	// byte (§14.1). suiteManifestGenesis mirrors SUITE_MANIFEST_GENESIS in domains.ts.
+	const suiteManifestGenesis = 0x01
+	preimage := append([]byte("seedkernel-manifest-sig-v1\x00"), suiteManifestGenesis)
+	sig := ed25519.Sign(priv, append(preimage, mjson...))
+	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
 
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
 	blob := packBundle([][2]any{

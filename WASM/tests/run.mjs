@@ -1907,6 +1907,149 @@ async function testRecordLayerIntegrity() {
   console.log("  OK\n");
 }
 
+// ─── Test: manifest suite byte — signed, so it cannot be edited in flight ────────
+//
+// The §12.4 envelope is `[suite 1][pk 32][sig 64][json]` and the suite byte is part of
+// the signed preimage `DOMAIN_manifest ‖ suite ‖ json`. That is what makes it safe to
+// read the byte *before* verifying: a verifier needs it to know the field widths, and
+// the signature it then checks commits to the same byte, so rewriting it only breaks the
+// manifest. Algorithm confusion between two suites is unrepresentable (§14.1).
+async function testManifestSuiteByte() {
+  console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
+  const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
+
+  const author = generateKeyPair();
+  const manifest = { app: "suite-probe", version: 1, modules: [] };
+  const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+
+  // Layout: the suite byte leads, and the author key follows it (not at offset 0).
+  assertEqual(env[0], 0x01, "the envelope opens with the genesis manifest suite id");
+  assertEqual(toHex(env.slice(1, 33)), toHex(author.publicKey), "the author key follows the suite byte");
+
+  // 1. Untouched, it verifies and returns the author + manifest.
+  {
+    const v = verifyManifest(sodium, env);
+    assert(v !== null, "an untouched manifest verifies");
+    assertEqual(toHex(v.author), toHex(author.publicKey), "the author key round-trips");
+    assertEqual(v.manifest.app, "suite-probe", "the manifest round-trips");
+  }
+
+  // 2. An unknown suite is refused as a legibility failure, with its own message —
+  //    not silently reported as a bad signature, which would misdirect an operator
+  //    whose real problem is a bundle built for a newer host.
+  {
+    const bad = env.slice(); bad[0] = 0x7f;
+    let msg = "";
+    try { verifyManifest(sodium, bad); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("unsupported manifest suite"), `unknown suite reports itself (got: ${msg || "no throw"})`);
+    assert(!msg.includes("signature"), "an unknown suite is not reported as a signature failure");
+  }
+
+  // 3. The load-bearing property: the suite byte is inside the signed preimage, so an
+  //    attacker who rewrites it to a suite the verifier DOES accept still fails — the
+  //    preimage no longer matches what was signed. (0x01 signed, re-presented as 0x01
+  //    after tampering the json proves the same binding from the other direction.)
+  {
+    const forged = env.slice();
+    forged[33] ^= 0x01; // flip a signature byte → must not verify
+    assert(verifyManifest(sodium, forged) === null, "a tampered signature does not verify");
+  }
+  {
+    // Re-sign under a preimage WITHOUT the suite byte (the pre-§14.1 construction) and
+    // present it as suite 0x01: the verifier computes the suite-bound preimage, so the
+    // legacy signature fails. A signature is bound to the suite it was made under.
+    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const legacyPre = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), json]);
+    const legacySig = sodium.crypto_sign_detached(legacyPre, author.privateKey);
+    const legacyEnv = concatBytes([Uint8Array.of(0x01), author.publicKey, legacySig, json]);
+    assert(verifyManifest(sodium, legacyEnv) === null,
+      "a signature made without the suite byte does not verify as suite 0x01");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: HELLO suite byte — unknown suite refused, flipped suite cannot downgrade ──
+//
+// The §12.6 suite byte makes HELLO self-describing so a future (post-quantum) handshake
+// is a negotiated rollout rather than a network-wide flag day. Two properties carry it:
+// an unrecognised suite is refused cleanly, and — because the byte lives inside the
+// signed transcript — an in-path flip cannot force a peer onto another suite, it only
+// breaks AUTH. The second is the load-bearing one: a suite is *chosen* by endpoints,
+// never *forced* by the network.
+async function testHelloSuiteByte() {
+  console.log("Test: HELLO suite byte — unknown suite refused, flipped suite breaks AUTH (no downgrade)");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // In-memory pair; `hook.fn` may rewrite any message A sends before B sees it.
+  function pair(hook) {
+    const mk = () => ({
+      msg: null, cls: null, closed: false, twin: null,
+      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
+      close() {
+        if (this.closed) return;
+        this.closed = true;
+        queueMicrotask(() => this.cls && this.cls());
+        const t = this.twin;
+        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a;
+    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
+    a.send = (bytes) => { const m = hook.fn ? hook.fn(bytes.slice()) : bytes.slice(); if (m) deliver(b, m); };
+    b.send = (bytes) => deliver(a, bytes.slice());
+    return { a, b };
+  }
+
+  // Teardown is observed on the channel: a PeerLink that closes *itself* sets `closed`
+  // before closing the channel, so its own onClose opt does not re-fire (onChannelClose
+  // reports only externally-originated closes). The channel flag is the unambiguous signal.
+  async function run(hookFn) {
+    const hook = { fn: hookFn };
+    const { a: chA, b: chB } = pair(hook);
+    const idA = generateKeyPair(), idB = generateKeyPair();
+    const st = { aAuthed: false, bAuthed: false, get bClosed() { return chB.closed; } };
+    const linkB = new PeerLink({
+      channel: chB, identity: idB, sodium, weDialed: false,
+      onAuth: () => { st.bAuthed = true; }, onFrame: () => {}, onClose: () => {},
+    });
+    const linkA = new PeerLink({
+      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
+      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => {},
+    });
+    void linkA; void linkB;
+    for (let i = 0; i < 25 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
+    return st;
+  }
+
+  // 0. Control: untouched, the genesis suite handshake completes.
+  {
+    const st = await run(null);
+    assert(st.aAuthed && st.bAuthed, "an untouched genesis-suite handshake authenticates");
+  }
+
+  // 1. An unknown suite id in HELLO is refused outright — the link never authenticates.
+  //    This is the clean-failure property: a node meeting a handshake it does not speak
+  //    closes, instead of parsing another format's bytes at this format's offsets.
+  {
+    const st = await run((m) => { if (m[0] === 1 /* MSG_HELLO */) m[1] = 0x7f; return m; });
+    assert(!st.bAuthed, "a HELLO carrying an unknown suite id never authenticates");
+    assert(st.bClosed, "an unknown suite closes the link");
+  }
+
+  // 2. Downgrade: flipping the suite byte in flight does not select another suite — B
+  //    now hashes a different half into its transcript than A signed, so AUTH fails.
+  //    (Here the flip is to a byte B rejects outright; the point is that even if a
+  //    future B *did* accept it, the transcript mismatch still denies the attacker a
+  //    completed session.) The byte is authenticated, so it cannot be forced.
+  {
+    const st = await run((m) => { if (m[0] === 1) m[1] = 0x02; return m; });
+    assert(!st.aAuthed && !st.bAuthed, "a suite byte flipped in flight yields no authenticated session");
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
 //
 // Finding guard: the freshness high-water mark must record only versions that fully
@@ -2012,6 +2155,8 @@ await testRedialAfterFailedDial();
 await testConnsPerPeerFanout();
 await testWsNetworkFanout();
 await testRecordLayerIntegrity();
+await testHelloSuiteByte();
+await testManifestSuiteByte();
 await testSafeRealmConcurrency();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

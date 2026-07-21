@@ -26,7 +26,7 @@
 // freshness requires and the same-author rule (§12.5) admits.
 
 import { concatBytes, toHex } from "./util.js";
-import { DOMAIN_MANIFEST } from "./domains.js";
+import { DOMAIN_MANIFEST, SUITE_MANIFEST_GENESIS } from "./domains.js";
 import type { ShellPolicy } from "./policy.js";
 
 /** The manifest envelope's name inside the container. */
@@ -107,8 +107,10 @@ export interface ManifestCrypto extends ManifestVerifier {
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
 }
 
+const SUITE_LEN = 1;
 const PK_LEN = 32;
 const SIG_LEN = 64;
+const OFF_PK = SUITE_LEN, OFF_SIG = OFF_PK + PK_LEN, OFF_JSON = OFF_SIG + SIG_LEN;
 
 /** Module names double as filenames and as the guest's module keys, so they are held
  *  to an unambiguous charset. With the container keyed by name (never joined to a
@@ -130,17 +132,22 @@ export function encodeManifest(m: BundleManifest): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(m));
 }
 
-/** The signed preimage: `DOMAIN_manifest ‖ json`. The prefix is signed but not
- *  stored — the envelope carries only the raw json. */
-function manifestPreimage(json: Uint8Array): Uint8Array {
-  return concatBytes([DOMAIN_MANIFEST, json]);
+/** The signed preimage: `DOMAIN_manifest ‖ suite ‖ json`. The prefix is signed but not
+ *  stored; the suite byte is signed *and* stored (envelope byte 0), which is the point —
+ *  a verifier reads it to know the field widths, and the signature it then checks
+ *  commits to the same byte, so an attacker who rewrites it only invalidates the
+ *  manifest. Algorithm confusion between two suites is unrepresentable rather than
+ *  merely unlikely (§14.1). */
+function manifestPreimage(suite: number, json: Uint8Array): Uint8Array {
+  return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(suite), json]);
 }
 
-/** Sign a manifest → envelope `[authorPk(32)][sig(64)][utf8 json]`. */
+/** Sign a manifest → envelope `[suite(1)][authorPk(32)][sig(64)][utf8 json]`. */
 export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Array, m: BundleManifest): Uint8Array {
   const json = encodeManifest(m);
-  const sig = sodium.crypto_sign_detached(manifestPreimage(json), sk);
-  return concatBytes([pk, sig, json]);
+  const suite = SUITE_MANIFEST_GENESIS;
+  const sig = sodium.crypto_sign_detached(manifestPreimage(suite, json), sk);
+  return concatBytes([Uint8Array.of(suite), pk, sig, json]);
 }
 
 /** Structural check on a parsed manifest. Runs only *after* the signature
@@ -188,11 +195,22 @@ function isValidManifest(m: unknown): m is BundleManifest {
  *  validly signed but is not parseable JSON of the expected shape — a signed-but-
  *  broken manifest is a fail-loud condition, not an untrusted input to drop. */
 export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): { author: Uint8Array; manifest: BundleManifest } | null {
-  if (env.length < PK_LEN + SIG_LEN) return null;
-  const author = env.slice(0, PK_LEN);
-  const sig = env.slice(PK_LEN, PK_LEN + SIG_LEN);
-  const json = env.slice(PK_LEN + SIG_LEN);
-  if (!sodium.crypto_sign_verify_detached(sig, manifestPreimage(json), author)) return null;
+  if (env.length < OFF_JSON) return null;
+  // Suite before offsets: another suite's key and signature are other widths, so
+  // parsing first would read its bytes at this suite's positions. Unlike a bad
+  // signature this is not an authenticity verdict but a legibility one — "this bundle
+  // wants a host I am not" — so it throws with its own message rather than returning
+  // null, which would surface to the operator as `manifest signature invalid` and send
+  // them hunting the wrong problem. Nothing secret is revealed by the distinction: the
+  // suite byte is attacker-chosen and public either way.
+  const suite = env[0];
+  if (suite !== SUITE_MANIFEST_GENESIS) {
+    throw new Error(`bundle: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
+  }
+  const author = env.slice(OFF_PK, OFF_SIG);
+  const sig = env.slice(OFF_SIG, OFF_JSON);
+  const json = env.slice(OFF_JSON);
+  if (!sodium.crypto_sign_verify_detached(sig, manifestPreimage(suite, json), author)) return null;
   let parsed: unknown;
   try { parsed = JSON.parse(new TextDecoder().decode(json)); }
   catch { throw new Error("bundle: malformed manifest (not JSON)"); }
