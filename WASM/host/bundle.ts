@@ -48,19 +48,67 @@ export interface BundleModule {
   hash: string;
 }
 
-/** The kernel name a bundle module binds at: `"<app>:<module name>"` (§5.1). Derived,
- *  never declared — the manifest carries no bind-name field, so there is nothing in it
- *  to forge. Both inputs are already signed, so what the loader binds is exactly what
- *  the author authenticated, and the derivation is unambiguous because a module name
- *  cannot contain `:` (NAME_RE) — the last colon always separates the two.
+/** An app's identity: `"<author hex>:<app>"` (§12.4). One value, three jobs — the
+ *  freshness high-water key (FreshnessMarks below), the prefix of every one of the app's
+ *  kernel names (`kernelNameFor`), and what a shell's protocol bindings point at (§12.10).
+ *  Both halves are signed, so an app key is derived from the manifest and never declared.
+ *
+ *  The author hex is fixed-length, so the key parses unambiguously even though `app` is
+ *  free to contain `:` itself. */
+export function appKeyFor(author: Uint8Array, app: string): string {
+  return toHex(author) + ":" + app;
+}
+
+/** The kernel name a bundle module binds at: `"<author hex>:<app>:<module name>"` — the
+ *  app key plus the module (§5.1). Derived, never declared: the manifest carries no
+ *  bind-name field, so there is nothing in it to forge, and all three components are
+ *  already covered by the author's signature.
+ *
+ *  **Ownership is structural.** Because the author's key leads the name, one author's
+ *  names are unreachable to another: a second author shipping an app called `chat` derives
+ *  entirely different names and binds alongside, never over. Squat-resistance is a property
+ *  of the namespace rather than a rule the admission policy has to enforce, which is why
+ *  the loader keeps no ownership register and `AdmitPolicy` has no "who holds this name"
+ *  clause (§12.5). The author is the FULL hex, never truncated — a short prefix would be
+ *  grindable, and an admitted author could generate a key matching another's first bytes
+ *  and land on their names, which is exactly the collision this derivation exists to make
+ *  unrepresentable.
+ *
+ *  The name parses from both ends: the author is fixed-length hex and a module name cannot
+ *  contain `:` (NAME_RE), so the last colon always separates the module and everything
+ *  between the two is the `app`.
  *
  *  Kernel names are node-local table keys. Nothing on the wire names another node's
- *  handler: a peer sends an app id or a protocol opcode and the receiving host resolves
- *  it through its own table, and a guest reaches its own modules by logical name through
- *  `BUNDLE.modules`. So this needs to be collision-free within one node, not agreed
- *  across a deployment — scoping by `app` is exactly that much. */
-export function kernelNameFor(app: string, moduleName: string): string {
-  return app + ":" + moduleName;
+ *  handler: a peer sends a protocol id or an opcode and the receiving host resolves it
+ *  through its own bindings (§12.10) to whichever app it holds, and a guest reaches its own
+ *  modules by logical name through `BUNDLE.modules`. So this needs to be collision-free
+ *  within one node, not agreed across a deployment. */
+export function kernelNameFor(author: Uint8Array, app: string, moduleName: string): string {
+  return appKeyFor(author, app) + ":" + moduleName;
+}
+
+/** The crypto a bundle load needs, in libsodium-wrappers method names so a raw libsodium
+ *  satisfies it directly (as does the native loader's Go-backed `sodium`, §12.9): verify
+ *  the manifest signature, and hash content with the genesis hash. */
+export interface BundleCrypto extends ManifestVerifier {
+  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+}
+
+/** The genesis hash (BLAKE2b-256, §5.1) — the one system hash. A module's `bytesHash`,
+ *  a manifest's `modules[].hash`, and a policy `modules` allowlist entry are all this
+ *  value over the same bytes.
+ *
+ *  A free function taking the crypto, not a method on the host: hashing is the loader's
+ *  business, and routing it through the handler table's owner would put a crypto
+ *  dependency inside a component that is otherwise a `Map` (§3). */
+export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
+  return sodium.crypto_generichash(32, data, null);
+}
+
+/** The protocol ids a manifest offers to serve (README §12.10), defaulting to `[app]`.
+ *  One place applies the default so a shell never has to remember it. */
+export function handlesOf(manifest: BundleManifest): string[] {
+  return manifest.handles && manifest.handles.length > 0 ? manifest.handles : [manifest.app];
 }
 
 /** The zero-authority guest program and everything about it. `caps` and `config` live
@@ -97,6 +145,15 @@ export interface BundleManifest {
    *  a persisted per-`(author, app)` high-water mark: a load whose `version` is below
    *  the mark is refused as a downgrade. An integer, not a label. */
   version: number;
+  /** Protocol ids this app can serve (README §12.10). Absent ⇒ `[app]`, so an app that
+   *  speaks only its own protocol declares nothing.
+   *
+   *  A DECLARATION, not a claim. It makes the app *eligible* for a binding and confers no
+   *  traffic on its own: delivery follows the shell's user-owned `protocol id → app key`
+   *  table, so any number of bundles may declare the same id without contending for
+   *  anything. That separation — landing code is authorized by policy, receiving messages
+   *  is chosen by the user — is what lets the loader hold no ownership state at all. */
+  handles?: string[];
   modules: BundleModule[];
   /** The guest program, or absent for a handler-only bundle (app modules bound as
    *  handlers, no zero-authority realm — e.g. the chat demo). Present ⇒ the loader
@@ -177,6 +234,13 @@ function isValidManifest(m: unknown): m is BundleManifest {
   // kernel name (kernelNameFor). An empty one would yield the bind name ":codec".
   if (typeof o.app !== "string" || o.app.length === 0) return false;
   if (typeof o.version !== "number" || !Number.isInteger(o.version)) return false;
+  // `handles` is optional (absent ⇒ [app], see handlesOf). Present, it must be a list of
+  // non-empty strings — it is only ever compared against a protocol id off the wire, so
+  // the shape is the whole check: an id confers nothing until a user binds it (§12.10).
+  if (o.handles !== undefined) {
+    if (!Array.isArray(o.handles)) return false;
+    for (const h of o.handles) if (typeof h !== "string" || h.length === 0) return false;
+  }
   if (!Array.isArray(o.modules)) return false;
   const seen = new Set<string>();
   for (const mod of o.modules) {
@@ -339,7 +403,7 @@ export class FreshnessMarks implements FreshnessStore {
    *  downgrade guard). */
   protected persist(_json: string): void {}
 
-  private key(author: Uint8Array, app: string): string { return toHex(author) + ":" + app; }
+  private key(author: Uint8Array, app: string): string { return appKeyFor(author, app); }
 
   get(author: Uint8Array, app: string): number {
     const v = this.marks.get(this.key(author, app));
@@ -357,98 +421,67 @@ export class FreshnessMarks implements FreshnessStore {
 
 // ── Admission: the loader's install records (README §12.4) ───────────────────
 //
-// Binding a module IS the loader's job — there is no separate "module registry". The
-// store below holds one host-side table, `installations[name] → {author, bytesHash}`,
-// read only here and never over the wire, and drives the one admission step: hash the
-// verified bytes, consult the admission policy (§12.5), and on approval instantiate +
-// SetHandler the module and record `(author, bytesHash)`. Revoking a slot
-// (`removeHandler`, §12.5) forgets its record, so an old author is never carried onto
-// brand-new bytes.
+// Binding a module IS the loader's job — there is no separate "module registry", and no
+// ownership register either. `admit` below is a pure function of the bundle in front of
+// it: hash the verified bytes, ask the policy, and on approval instantiate + SetHandler.
+//
+// What a register would once have answered — "who owns this name?" — has no content now
+// that the author is derived INTO the name (`kernelNameFor`, §5.1). A name is reachable
+// only to the key that derives it, so the only bundle that can re-bind a name is one
+// signed by the author whose name it is. The kernel table is the host's only install
+// state, so nothing can drift out of step with it.
 
-/** A single install record (README §12.4): who signed the bundle that bound the bytes,
- *  and the bytes' content id. */
-export interface InstallRecord {
-  /** The manifest author's 32-byte Ed25519 public key. The runtime fixes one signing
-   *  algorithm (§16.1), so an author IS a key — there is no algorithm id to carry. */
-  readonly author: Uint8Array;
-  /** genesisHash(wasm) (§5.1) — the same id a manifest's `modules[].hash` and a policy
-   *  `modules` allowlist carry. */
-  readonly bytesHash: Uint8Array;
-}
-
-/** The admission decision (README §12.5): given a verified module and the record already
- *  at its name (or null), return true to bind it, false to refuse. The default is
- *  `buildAdmit` (policy.ts); a deployment that needs more — an M-of-N quorum, an HSM
- *  console, bytecode validation over `wasm` — supplies its own in its place. It runs once
- *  per module at load time, never on a message path, so it may be arbitrarily expensive. */
+/** The admission decision (README §12.5): given a verified module, return true to bind it,
+ *  false to refuse. The default is `buildAdmit` (policy.ts); a deployment that needs more —
+ *  an M-of-N quorum, an HSM console, bytecode validation over `wasm`, a user-consent
+ *  prompt — supplies its own in its place. It runs once per module at load time, never on
+ *  a message path, so it may be arbitrarily expensive.
+ *
+ *  It takes no "current holder" argument because there is nothing to contest: `name`
+ *  already encodes `author`, so a policy cannot be handed a slot belonging to anyone else. */
 export type AdmitPolicy = (
   name: string,
   author: Uint8Array,
   bytesHash: Uint8Array,
   wasm: Uint8Array,
-  current: InstallRecord | null,
 ) => boolean;
 
-/** The host powers the record store runs over (README §12.4): hash with the genesis hash,
- *  and instantiate + bind a verified handler. `KernelHost` satisfies it; the native loader
- *  supplies the same two over its Go bridge (README §12.9), so the admission below is not
- *  re-derived in a second language. */
-export interface RecordHost {
-  genesisHash(data: Uint8Array): Uint8Array;
-  /** Instantiate handler bytes against the §4 ABI and bind them at `name`. */
-  _installWasmHandler(name: string, wasm: Uint8Array): boolean;
+/** The one host power a bundle load needs: instantiate handler bytes against the §4 ABI
+ *  and bind them at `name`. `KernelHost` satisfies it; the native loader forwards the same
+ *  single call over its Go bridge (README §12.9).
+ *
+ *  Hashing is deliberately NOT here — it is `genesisHash(sodium, …)`, so the component
+ *  that owns the handler table needs no crypto at all (§3). */
+export interface BundleHost {
+  installWasmHandler(name: string, wasm: Uint8Array): boolean;
 }
 
-/** The loader's install records + admission step (README §12.4). Held by the host that
- *  binds handlers (KernelHost, the native loader), so a raw SetHandler over a recorded name
- *  can `forget` its record. This is NOT a wire surface: there is no install message, no
- *  seq, no replay table — the signed manifest is the one authentication and `admit` the one
- *  authorization. */
-export class InstallRecords {
-  private readonly installations = new Map<string, InstallRecord>();
-  private admitPolicy: AdmitPolicy | null = null;
-
-  constructor(private readonly host: RecordHost) {}
-
-  /** Wire the admission policy (README §12.5). Null (the boot default) refuses every bind,
-   *  so admission is opt-in for the deployment (README §14). */
-  setPolicy(admit: AdmitPolicy | null): void { this.admitPolicy = admit; }
-
-  /** The install record at `name`, or null. Host-side only — there is no wire query; the
-   *  admission policy already receives the resolved `current` record. */
-  lookup(name: string): InstallRecord | null {
-    return this.installations.get(name) ?? null;
-  }
-
-  /** Drop any record at `name`. The host calls it when `removeHandler` unbinds the slot
-   *  (§12.5 revocation), so a stale `(author, bytesHash)` can't later misattribute
-   *  brand-new bytes to the revoked author. Idempotent. */
-  forget(name: string): void { this.installations.delete(name); }
-
-  /** Admit one verified module (README §12.4): hash the bytes, consult the policy, then
-   *  instantiate + bind and record `(author, bytesHash)`. The whole admission, and the
-   *  only path that mutates the kernel table — the bundle loader calls it once per module
-   *  through `host.installBundleModule`, with the manifest author.
-   *
-   *  A bundle carries no per-module signature or seq: the signed manifest already
-   *  authenticated the coherent set and committed to each module's `genesisHash` (§12.4), so
-   *  a second per-module proof would be pure redundancy. Returns true on success, false if
-   *  no policy is wired or the policy refuses. */
-  admit(name: string, wasm: Uint8Array, author: Uint8Array): boolean {
-    if (name.length === 0 || wasm.length === 0) return false;
-    const bytesHash = this.host.genesisHash(wasm);
-    const current = this.installations.get(name) ?? null;
-    if (!this.admitPolicy) return false;
-    let approved = false;
-    try { approved = this.admitPolicy(name, author, bytesHash, wasm, current); }
-    catch { approved = false; }
-    if (!approved) return false;
-    // Instantiate + SetHandler first, then record — in that order, so a record never points
-    // at a slot we failed to populate.
-    if (!this.host._installWasmHandler(name, wasm)) return false;
-    this.installations.set(name, { author: author.slice(), bytesHash });
-    return true;
-  }
+/** Admit one verified module (README §12.4): hash the bytes, consult the policy, then
+ *  instantiate + bind. The whole admission, and the only path that mutates the kernel
+ *  table — `installBundle` calls it once per module with the manifest author.
+ *
+ *  A bundle carries no per-module signature or seq: the signed manifest already
+ *  authenticated the coherent set and committed to each module's `genesisHash` (§12.4),
+ *  so a second per-module proof would be pure redundancy.
+ *
+ *  Exported because an interactive shell drives its own install (it must show a bundle's
+ *  author and wait for consent before anything binds, so it stops short of
+ *  `installBundle`) and should run THIS step rather than a hand-rolled copy of it. */
+export function admitModule(
+  host: BundleHost,
+  sodium: BundleCrypto,
+  admit: AdmitPolicy,
+  name: string,
+  wasm: Uint8Array,
+  author: Uint8Array,
+): boolean {
+  if (name.length === 0 || wasm.length === 0) return false;
+  const bytesHash = genesisHash(sodium, wasm);
+  let approved = false;
+  try { approved = admit(name, author, bytesHash, wasm); }
+  catch { approved = false; }
+  if (!approved) return false;
+  return host.installWasmHandler(name, wasm);
 }
 
 // ── Loading (README §12.4) ───────────────────────────────────────────────────
@@ -476,14 +509,6 @@ export interface VerifiedBundle {
   modules: { mod: BundleModule; wasm: Uint8Array }[];
   /** The verified guest source, or `""` for a handler-only bundle that declared none. */
   guestSource: string;
-}
-
-/** The host powers loading a bundle needs: hash bytes with the genesis hash, and
- *  land a verified module under the install policy. `KernelHost` satisfies it; the
- *  native loader supplies the same two members over its Go bridge (README §12.9). */
-export interface BundleHost {
-  genesisHash(data: Uint8Array): Uint8Array;
-  installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean;
 }
 
 export interface LoadedBundle {
@@ -544,16 +569,22 @@ export function checkBundleIntegrity(v: VerifiedBundle, genesisHash: (b: Uint8Ar
 
 /** Govern a verified bundle and land it (README §12.4 steps 2, 3, 4b): require the
  *  author to be in the policy, enforce version freshness, integrity-check every module
- *  and the guest against the host's genesis hash, then install each verified module
- *  under the kernel name derived from the manifest's signed `(app, name)` pair
- *  (synthesizing the install record with the manifest author, under the same policy —
- *  §12.4).
+ *  and the guest against the genesis hash, then install each verified module under the
+ *  kernel name derived from the manifest's signed `(author, app, name)` triple (§5.1),
+ *  each gated by `admit`.
+ *
+ *  `policy` and `admit` gate different things and both are load-bearing: `policy.authors`
+ *  gates the BUNDLE (step 3 — a stranger's bundle fails the whole load with a clear
+ *  error), `admit` gates each MODULE (step 6 — a refused module is reported, not fatal).
+ *  The common case passes `buildAdmit(policy)`; an interactive shell passes its own.
  *
  *  The integrity check runs before any install, so a mismatch anywhere throws with
  *  nothing bound — a bad file can never leave a partial bundle on the kernel. */
 export function installBundle(
   host: BundleHost,
+  sodium: BundleCrypto,
   policy: ShellPolicy,
+  admit: AdmitPolicy,
   v: VerifiedBundle,
   freshness?: FreshnessStore,
 ): LoadedBundle {
@@ -574,17 +605,17 @@ export function installBundle(
     // NB: the mark is advanced at the *end* of this function, only after every module
     // and the guest have integrity-checked and installed — not here. See below.
   }
-  checkBundleIntegrity(v, (b) => host.genesisHash(b));
-  // Everything integrity-checked — install the verified bytes. Each module lands under
-  // the kernel name DERIVED from the signed `(app, name)` pair, synthesizing the install
-  // record with the manifest author (§12.4). No per-module `.install` envelope means no
-  // 64 KB envelope cap and no boot-time seq — an equal-version reload just re-installs. A
-  // module the policy refuses does not abort the load: it is simply reported as not
-  // installed.
+  checkBundleIntegrity(v, (b) => genesisHash(sodium, b));
+  // Everything integrity-checked — install the verified bytes. Each module lands under the
+  // kernel name DERIVED from the signed `(author, app, name)` triple (§5.1). No per-module
+  // `.install` envelope means no 64 KB envelope cap and no boot-time seq — an equal-version
+  // reload just re-installs, and a higher-version bundle from the same author lands on the
+  // same names because the same key derives them. A module the policy refuses does not
+  // abort the load: it is simply reported as not installed.
   const installed: string[] = [];
   for (const { mod, wasm } of v.modules) {
-    const kernelName = kernelNameFor(v.manifest.app, mod.name);
-    if (host.installBundleModule(kernelName, wasm, v.author)) installed.push(mod.name);
+    const kernelName = kernelNameFor(v.author, v.manifest.app, mod.name);
+    if (admitModule(host, sodium, admit, kernelName, wasm, v.author)) installed.push(mod.name);
   }
   // Advance the freshness mark only now — after a fully successful load. Advancing it
   // during the downgrade check above (before the integrity checks) would brick rollback:
@@ -602,10 +633,11 @@ export function installBundle(
  *  target restates them (README §12.9). */
 export function loadBundle(
   host: BundleHost,
-  sodium: ManifestVerifier,
+  sodium: BundleCrypto,
   policy: ShellPolicy,
+  admit: AdmitPolicy,
   blob: Uint8Array,
   freshness?: FreshnessStore,
 ): LoadedBundle {
-  return installBundle(host, policy, verifyBundle(sodium, blob), freshness);
+  return installBundle(host, sodium, policy, admit, verifyBundle(sodium, blob), freshness);
 }

@@ -21,7 +21,7 @@ func boundToWasm(n string) bool {
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 func TestScratchRegion(t *testing.T) {
 	boot()
-	n := kernelNameFor("scratchapp", "fwd")
+	n := kernelNameFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp", "fwd")
 	if !installWasm(n, forwarderWasm) {
 		t.Fatal("installWasm(forwarder) refused")
 	}

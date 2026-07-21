@@ -19,7 +19,7 @@ const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sum
  *  (§3); installing bundles stays the caller's job. */
 export async function createKernelHost(): Promise<KernelHost> {
   await sodium.ready;
-  return new KernelHost(sodium);
+  return new KernelHost();
 }
 
 export async function ensureSodium(): Promise<void> {
@@ -43,7 +43,4 @@ export function generateKeyPair(): {
 }
 
 export { KernelHost } from "./kernel-host.js";
-export type {
-  InstallRecord,
-  AdmitPolicy,
-} from "./bundle.js";
+export type { AdmitPolicy } from "./bundle.js";

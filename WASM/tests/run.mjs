@@ -31,6 +31,12 @@ const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
+// The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
+// code path a bundle load does rather than a parallel copy of it.
+const { admitModule, appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor }
+  = await imp("build/host/bundle.js");
+const { buildAdmit: buildAdmitPolicy, policyFromJson } = await imp("build/host/policy.js");
+const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // The empty payload — a handler whose `handle` takes no meaningful input.
@@ -56,31 +62,34 @@ function assertEqual(actual, expected, msg) {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 }
 
-// Standard bootstrap (README §3): a fresh handler table with the loader's admission
-// policy wired. The default policy admits every module; tests that need rejection
-// override via host.setAdmitPolicy. Handlers are pure transforms with no
-// signature/dispatch seam, so there is nothing else to wire.
+// Standard bootstrap (README §3): a fresh handler table. The host holds no policy — it is
+// the §3 map and nothing else — so the admit function lives with the test and is handed to
+// the loader's admission step per install, exactly as `installBundle` does. The default
+// admits every module; tests that need rejection pass their own. Handlers are pure
+// transforms with no signature/dispatch seam, so there is nothing else to wire.
 async function makeHost(admit = () => true) {
   const host = await createKernelHost();
-  host.setAdmitPolicy(admit);
+  host._testAdmit = admit;   // harness-only: what `installMod` below hands the loader
   return { host };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
-// Admit a module directly under `targetName`, authored by `authorPk`, through the
-// same path the bundle loader uses (installBundleModule → records.admit → the admit
-// policy callback). Bundles are the only way code arrives now (§12.4) — there is no
-// wire install envelope. Returns whether the policy admitted it.
+// Admit a module directly under `targetName`, authored by `authorPk`, through the very
+// function a bundle load calls (`admitModule` — hash the bytes, ask the policy, bind).
+// Bundles are the only way code arrives (§12.4); there is no wire install envelope.
+// Returns whether the policy admitted it.
 function installMod(host, targetName, wasm, authorPk) {
-  return host.installBundleModule(targetName, wasm, authorPk);
+  return admitModule(host, sodium, host._testAdmit ?? (() => false), targetName, wasm, authorPk);
 }
 
-// The §5.1 bind name a bundle module lands at (`"<app>:<module>"`, kernelNameFor),
-// mirrored here so a test can name a slot without packing a whole bundle — `installMod`
-// admits under exactly the name the loader would derive.
-const modName = (app, mod) => `${app}:${mod}`;
+// The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real
+// derivation, not a mirror of it, so a test can name a slot without packing a whole
+// bundle and still land exactly where the loader would put it. Note the author: two
+// authors using the same `app` get different names, which is what makes ownership
+// structural rather than a rule anything has to enforce.
+const modName = (authorPk, app, mod) => bundleKernelNameFor(authorPk, app, mod);
 
 // ─── Test: install a module, reach it by name ───────────────────────────
 
@@ -90,17 +99,16 @@ async function testFullLifecycle() {
   const { host } = await makeHost();
 
   const { publicKey: pk } = generateKeyPair();
-  const chatName = modName("chat", "chat");
+  const chatName = modName(pk, "chat", "chat");
 
   // Install the chat handler under its derived kernel name, through the same path the
   // bundle loader uses. It is a pure transform (the forwarder fixture echoes its input).
   installMod(host, chatName, forwarderBytes, pk);
-  assert(host.isRegistered(chatName), "chat handler installed");
+  assert(host.isBound(chatName), "chat handler installed");
 
-  // The loader should have an install record for it.
-  const rec = host.lookupInstall(chatName);
-  assert(rec !== null, "install record exists");
-  assertEqual(rec.author, pk, "record author matches signer");
+  // There is no install record to consult: the author is IN the name (§5.1), so the
+  // table itself says who authored what it holds.
+  assert(chatName.startsWith(toHex(pk) + ":"), "kernel name leads with the author");
 
   // Reach it by name: the host stages input at the handler's scratch, calls handle, and
   // reads the response back (README §4). A guest reaches the same handler through the
@@ -119,21 +127,20 @@ async function testApproveInstallRejects() {
 
   let seen = null;
   const admit = (name, author, bytesHash, _wasm, existing) => {
-    seen = { name, author, bytesHash, existing };
+    seen = { name, author, bytesHash };
     return false;
   };
   const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName("chat", "text");
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
-  assert(!host.isRegistered(chatTextName), "install rejected");
+  assert(!host.isBound(chatTextName), "install rejected");
   assert(seen !== null, "the admit policy was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
   assertEqual(seen.author, pk, "callback saw the author pubkey");
-  assert(seen.existing === null, "no existing record for first install");
 
   console.log("  OK\n");
 }
@@ -143,7 +150,7 @@ async function testApproveInstallReceivesBytesHash() {
 
   let seenHash = null;
   let seenPayloadLen = 0;
-  const admit = (_n, _a, bytesHash, wasm, _e) => {
+  const admit = (_n, _a, bytesHash, wasm) => {
     seenHash = bytesHash;
     seenPayloadLen = wasm.length; // for sanity
     return true;
@@ -151,16 +158,16 @@ async function testApproveInstallReceivesBytesHash() {
   const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName("chat", "text");
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install accepted");
+  assert(host.isBound(chatTextName), "install accepted");
 
   assertEqual(seenHash.length, 32, "bytes_hash is BLAKE2b-256 (32 bytes)");
   // The hash is the content id of the WASM module — the same identifier a
   // manifest's modules[].hash and a policy allowlist use (§5.1), independent of
   // seq or the install framing.
-  const expected = host.genesisHash(forwarderBytes);
+  const expected = gHash(forwarderBytes);
   assertEqual(seenHash, expected, "bytes_hash = genesisHash(wasm)");
   assert(seenPayloadLen === forwarderBytes.length, "wasm bytes passed to callback are unchanged");
 
@@ -168,93 +175,79 @@ async function testApproveInstallReceivesBytesHash() {
 }
 
 async function testNoApproveInstallDropsAll() {
-  console.log("Test: install dropped when no admit policy is wired (deny-all)");
+  console.log("Test: an omitted policy is deny-all, not 'no policy' (§12.5, §14)");
 
-  const { host } = await makeHost();
-  host.setAdmitPolicy(null);
+  // `policyFromJson(null)` is the boot default every target shares: an EMPTY author set,
+  // which admits nothing. The absence of a decision is never permission.
+  const { host } = await makeHost(buildAdmitPolicy(policyFromJson(null)));
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName("chat", "text");
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
-  assert(!host.isRegistered(chatTextName), "install dropped");
+  assert(!host.isBound(chatTextName), "install dropped under the deny-all default");
 
   console.log("  OK\n");
 }
 
-// ─── Test: admit policy upgrade rules (§12.5) ───────────────────────────
+// ─── Test: ownership is structural (§5.1, §12.5) ────────────────────────
 
-async function testReferencePolicyUpgradeRules() {
-  console.log("Test: admit policy enforces same-author on upgrade (§12.5)");
+async function testDerivedNamesKeepAuthorsApart() {
+  console.log("Test: derived names keep two authors' same-named apps apart (§5.1)");
 
-  // A same-author admit policy: a first install is admitted; an update is admitted only
-  // when the new author matches the recorded one. This is the same-author rule the
-  // shell's buildAdmit and the chat shell enforce, expressed inline.
-  const { host } = await makeHost((_name, author, _hash, _wasm, existing) =>
-    !existing || bytesEqual(existing.author, author));
+  // An admit that approves EVERYTHING — the point is that even a maximally permissive
+  // policy cannot let one author land on another's name, because there is no shared name
+  // to land on. Squat-resistance is a property of the namespace, not of this function.
+  const { host } = await makeHost(() => true);
 
   const { publicKey: aPk } = generateKeyPair();
   const { publicKey: bPk } = generateKeyPair();
-  // Both authors target the same name so we can exercise the upgrade path.
-  // (Author-scoped names would partition the space and avoid the rule.)
-  const sharedName = modName("shared", "fwd");
 
-  // A claims sharedName (first install — accepted).
-  installMod(host, sharedName, forwarderBytes, aPk);
-  assert(host.isRegistered(sharedName), "A's first install accepted");
-  const recA = host.lookupInstall(sharedName);
-  assert(recA !== null, "record exists after A's install");
-  const aBytesHash = recA.bytesHash;
+  // Both authors ship an app called "shared" with a module called "fwd".
+  const aName = modName(aPk, "shared", "fwd");
+  const bName = modName(bPk, "shared", "fwd");
+  assert(aName !== bName, "same (app, module) under different authors derives distinct names");
+  assert(aName.startsWith(toHex(aPk) + ":"), "A's name leads with A's key");
+  assert(bName.startsWith(toHex(bPk) + ":"), "B's name leads with B's key");
 
-  // B tries to install over the same name — rejected (different author).
-  installMod(host, sharedName, forwarderBytes, bPk);
-  const recAfterB = host.lookupInstall(sharedName);
-  assertEqual(recAfterB.author, aPk, "different-author install rejected, A still owns");
-  assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
+  // Both install. Neither displaces the other — they coexist.
+  installMod(host, aName, forwarderBytes, aPk);
+  installMod(host, bName, forwarderBytes, bPk);
+  assert(host.isBound(aName), "A's app is bound");
+  assert(host.isBound(bName), "B's app is bound — it did not have to contend for a name");
 
-  // A re-installs (same author) — accepted; record updates in place. There is
-  // no parent/lineage gate anymore (§12.5): same author is the whole rule.
-  installMod(host, sharedName, forwarderBytes, aPk);
-  const recAfterUpgrade = host.lookupInstall(sharedName);
-  assert(recAfterUpgrade !== null, "upgrade left a record");
-  assertEqual(recAfterUpgrade.author, aPk, "A still owns after upgrade");
-  // bytes_hash is genesisHash(wasm) (§5.1), so re-installing the SAME wasm keeps the
-  // same content id — the identifier tracks the binary. (A different wasm would hash
-  // differently; §5.1 makes the content id, a manifest's modules[].hash, and a policy
-  // allowlist all one value.)
-  assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
-    "bytes_hash unchanged across a same-wasm re-install");
-  assertEqual(recAfterUpgrade.bytesHash, host.genesisHash(forwarderBytes),
-    "bytes_hash = genesisHash(wasm)");
+  // A re-install by the SAME author lands on the SAME name: an update, in place, with no
+  // ownership rule consulted anywhere.
+  assert(installMod(host, aName, forwarderBytes, aPk), "A's update re-admitted");
+  assertEqual(modName(aPk, "shared", "fwd"), aName, "the same key derives the same name");
+
+  // The app key is the first two components of the kernel name (§12.4) — one identity
+  // the freshness marks, the bindings and the names all share.
+  assert(aName.startsWith(appKeyFor(aPk, "shared") + ":"), "kernel name extends the app key");
 
   console.log("  OK\n");
 }
 
-// ─── Test: lookupInstall (host-side) returns the install record ─────────
+// ─── Test: the `handles` declaration is inert (§12.10) ──────────────────
 
-async function testInstallerLookupHostSide() {
-  console.log("Test: host-side lookupInstall returns the install record (§12.4)");
+async function testHandlesIsADeclarationNotAClaim() {
+  console.log("Test: `handles` is a declaration, not a claim (§12.10)");
 
-  const { host } = await makeHost();
+  const { handlesOf } = await imp("build/host/bundle.js");
 
-  const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName("chat", "text");
+  // Absent ⇒ [app]: an app that speaks only its own protocol declares nothing.
+  assertEqual(JSON.stringify(handlesOf({ app: "chat", version: 1, modules: [] })),
+    JSON.stringify(["chat"]), "absent handles defaults to [app]");
 
-  installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install ok");
-
-  // The loader's records have no wire surface: they are read host-side, not via a
-  // wire query. The admit policy already receives the resolved record; bridges
-  // pin kernel.caller instead of consulting a capability index.
-  const rec = host.lookupInstall(chatTextName);
-  assert(rec !== null, "record present for an installed name");
-  assertEqual(rec.author, pk, "record author matches signer");
-  assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
-
-  // An unbound name has no record.
-  assert(host.lookupInstall(modName("nope", "missing")) === null,
-    "unknown name has no record");
+  // Any number of apps may declare the same protocol. Nothing in the loader arbitrates
+  // between them, because declaring confers no traffic — a binding does, and that is the
+  // shell's user-owned table (§12.10), not loader state.
+  const mine  = { app: "chat", version: 1, modules: [], handles: ["chat"] };
+  const yours = { app: "natter", version: 1, modules: [], handles: ["chat"] };
+  assertEqual(JSON.stringify(handlesOf(mine)), JSON.stringify(["chat"]), "explicit handles kept");
+  assertEqual(JSON.stringify(handlesOf(yours)), JSON.stringify(["chat"]),
+    "a second app may declare the same protocol");
 
   console.log("  OK\n");
 }
@@ -262,31 +255,31 @@ async function testInstallerLookupHostSide() {
 // ─── Test: removeHandler + suite slot removal ───────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: removeHandler clears the record and the kernel slot (§12.5)");
+  console.log("Test: removeHandler frees the kernel slot (§12.5)");
 
   let approveCalls = 0;
-  const { host } = await makeHost((_n, _a, _h, _w, _e) => {
+  const { host } = await makeHost((_n, _a, _h, _w) => {
     approveCalls++;
     return true;
   });
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName("chat", "text");
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install ok");
-  assert(host.lookupInstall(chatTextName) !== null, "record present");
+  assert(host.isBound(chatTextName), "install ok");
 
   assert(host.removeHandler(chatTextName), "remove returned true");
-  assert(!host.isRegistered(chatTextName), "kernel slot cleared");
-  assert(host.lookupInstall(chatTextName) === null, "record cleared");
+  assert(!host.isBound(chatTextName), "kernel slot cleared");
+  // Nothing else to clear: a freed name can only be re-occupied by the author whose key
+  // derives it (§5.1), so there is no stale ownership to misattribute onto new bytes.
 
   // removeHandler is idempotent — a second call on an empty slot returns false.
   assert(!host.removeHandler(chatTextName), "second remove returns false");
 
   // Re-installing at the same name after a remove succeeds (no tombstone).
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
+  assert(host.isBound(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
   console.log("  OK\n");
@@ -609,12 +602,12 @@ async function testPolicy() {
   // Install the forwarder under a freshly-policied host; returns whether it landed
   // and the bytesHash the installer recorded (for the module-allowlist subtest).
   const tryInstall = async (policyJson, author) => {
-    const { host } = await makeHost();
-    host.setAdmitPolicy(buildAdmit(parsePolicy(policyJson)));
-    const name = modName("mod", "fwd");
+    const { host } = await makeHost(buildAdmit(parsePolicy(policyJson)));
+    const name = modName(author.publicKey, "mod", "fwd");
     installMod(host, name, forwarderBytes, author.publicKey);
-    const rec = host.lookupInstall(name);
-    return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
+    // bytesHash is genesisHash(wasm) (§5.1) — computed from the bytes, not read back
+    // from a record, because there is no record to read.
+    return { landed: host.isBound(name), bytesHash: toHex(gHash(forwarderBytes)) };
   };
 
   // ── author allowlist ───────────────────────────────────────────────────
@@ -697,14 +690,14 @@ async function testBundle() {
     // Neither the module nor the guest names a file: they are `<name>.wasm` and
     // `guest.js`.
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor("test", "codec");
+    const kernelName = kernelNameFor(author.publicKey, "test", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
-      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)) }],
+      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
       // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
-        hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
+        hash: toHex(gHash(new TextEncoder().encode(guestText))),
         caps: [],
       },
     };
@@ -739,7 +732,7 @@ async function testBundle() {
     });
     const loaded = shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
-    assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
+    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
@@ -796,11 +789,11 @@ async function testGuestlessBundleAndArchive() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor("demo", "demo");
+    const kernelName = kernelNameFor(author.publicKey, "demo", "demo");
     // A manifest with NO `guest` field — the handler-only shape, and so no caps.
     const manifest = {
       app: "demo", version: 1,
-      modules: [{ name: "demo", hash: toHex(h.genesisHash(forwarderBytes)) }],
+      modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }],
     };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
@@ -824,14 +817,14 @@ async function testGuestlessBundleAndArchive() {
     assert(bytesEqual(v.author, author.publicKey), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
     assertEqual(v.guestSource, "", "a guest-less bundle verifies with an empty guest source");
-    checkBundleIntegrity(v, (b) => h.genesisHash(b)); // throws on mismatch
+    checkBundleIntegrity(v, (b) => gHash(b)); // throws on mismatch
     // Corrupting a module must fail integrity even though the manifest still verifies.
     const corrupt = packBundle({
       [MANIFEST_FILE]: manifestEnv,
       [moduleFile("demo")]: forwarderBytes.slice(0, forwarderBytes.length - 1),
     });
     let integrityFailed = false;
-    try { checkBundleIntegrity(verifyBundle(sodium, corrupt), (b) => h.genesisHash(b)); }
+    try { checkBundleIntegrity(verifyBundle(sodium, corrupt), (b) => gHash(b)); }
     catch { integrityFailed = true; }
     assert(integrityFailed, "a module that does not match its declared hash fails integrity");
 
@@ -843,7 +836,7 @@ async function testGuestlessBundleAndArchive() {
     });
     const loaded = shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
-    assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
+    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
   } finally {
     if (shell) shell.close();
@@ -2049,13 +2042,13 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor("rollback", "codec");
+    const kernelName = kernelNameFor(author.publicKey, "rollback", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
-      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)) }],
+      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
-        hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
+        hash: toHex(gHash(new TextEncoder().encode(guestText))),
         caps: [],
       },
     });
@@ -2102,8 +2095,8 @@ await testFullLifecycle();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
-await testReferencePolicyUpgradeRules();
-await testInstallerLookupHostSide();
+await testDerivedNamesKeepAuthorsApart();
+await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();
 await testFs();
 await testGuestNetFanout();

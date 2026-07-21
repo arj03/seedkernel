@@ -285,6 +285,10 @@ type loadedBundle struct {
 	config      json.RawMessage   // guest `config` object (merged under operator config)
 	modules     map[string]string // logical name → kernel name, for the guest's BUNDLE
 	guestSource string
+	// Protocol ids the app offers to serve (README §12.10), defaulted by the shared
+	// loader. The native target is a single-bundle runner, so it has no binding table to
+	// consult — it reports them so an operator can see what the app answers for.
+	handles []string
 }
 
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
@@ -322,6 +326,7 @@ func loadBundle(path string) string {
 		Config      json.RawMessage
 		Modules     map[string]string
 		GuestSource string
+		Handles     []string
 		Installed   []string
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
@@ -330,8 +335,9 @@ func loadBundle(path string) string {
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
 		config: m.Config, modules: m.Modules, guestSource: m.GuestSource,
+		handles: m.Handles,
 	}
-	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, m.Installed)
+	return fmt.Sprintf("%s v%d  installed=%v  handles=%v", m.App, m.Version, m.Installed, m.Handles)
 }
 
 // freshnessStorePath is where the shared loader's bundle-freshness marks are persisted

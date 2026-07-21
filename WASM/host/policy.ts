@@ -1,14 +1,14 @@
 // The shell's admission policy (README §12.5). It turns a small JSON config — "which
 // keys you allow" — into the loader's `AdmitPolicy`: a **closed author-key set** plus an
-// optional **module-hash allowlist**, with a same-author rule on updates that makes names
-// squat-resistant (the first admitted author to bind a name owns it; only that key may
-// update it). This is the only governance the generic runtime carries: everything else —
+// optional **module-hash allowlist**. It needs no name rule: kernel names derive from the
+// author's key (§5.1), so squat-resistance is structural and a policy has no name to
+// arbitrate. This is the only governance the generic runtime carries: everything else —
 // codec, reputation, the storage guest — arrives in a signed bundle whose manifest author
 // must clear this gate (§12.4). A deployment that needs more replaces the whole `AdmitPolicy`
 // (a quorum, an HSM console, bytecode validation); the file is the declarative common case.
 
 import type { AdmitPolicy } from "./bundle.js";
-import { bytesEqual, toHex } from "./util.js";
+import { toHex } from "./util.js";
 
 export interface ShellPolicy {
   /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle manifest
@@ -58,23 +58,22 @@ export function policyFromJson(json: string | null | undefined): ShellPolicy {
 
 /** The default admission decision (README §12.5): the loader's `admit` derived from a
  *  policy file. Three conjoined checks —
- *    1. `author ∈ authors` — the closed author set gates WHO may bind a name;
- *    2. `bytesHash ∈ modules` if that field is present — pins WHICH binaries may land;
- *    3. when a record already exists at the name, the new author equals the recorded one —
- *       *trust the original author*: the first author to bind a name owns it, so a second
- *       allowed author cannot hijack the slot (squat-resistance, the reason the loader keeps
- *       a record per name).
+ *    1. `author ∈ authors` — the closed author set gates WHO may install;
+ *    2. `bytesHash ∈ modules` if that field is present — pins WHICH binaries may land.
+ *
+ *  Nothing about the name is checked, because a name is not contestable: it derives from
+ *  the author's own key (§5.1), so no admitted author can bind over another's. Squat
+ *  resistance costs no clause here and no state anywhere.
+ *
  *  An empty author set (the omitted-policy default) admits nothing — every bind fails
  *  check 1. */
 export function buildAdmit(policy: ShellPolicy): AdmitPolicy {
   const authors = new Set(policy.authors.map((s) => s.toLowerCase()));
   const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;
 
-  return (_name, author, bytesHash, _wasm, current) => {
+  return (_name, author, bytesHash, _wasm) => {
     if (!authors.has(toHex(author))) return false;                   // closed author set
     if (modules && !modules.has(toHex(bytesHash))) return false;     // module-hash allowlist
-    // squat-resistance: only the recorded author may update the name.
-    if (current && !bytesEqual(current.author, author)) return false;
     return true;
   };
 }

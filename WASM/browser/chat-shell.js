@@ -3,6 +3,7 @@ import { createKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 import { signManifest, verifyBundle, checkBundleIntegrity, packBundle,
+         admitModule, appKeyFor, genesisHash, handlesOf,
          kernelNameFor, MANIFEST_FILE, moduleFile }
   from "../build/host/bundle.js";
 
@@ -102,28 +103,23 @@ const host = await createKernelHost(sodium);
 // piece: it admits signed bundles under the admission policy below. Message
 // authenticity comes from the AKE channel (PeerLink), not a per-message signature.
 //
-// This is the multi-app shell's own `admit` (§12.5): a first install needs explicit
-// user consent, an update from the recorded author is trusted. Updates from an author
-// we already trust (= we already hold an install record under this name with the same
-// author key) are auto-approved — the "trust the original author" rule (§12.5, author-
-// only; no parent/lineage gate). First installs require explicit user consent; the UI
-// gates them by adding the app's bytes_hash to `pendingApprovals` before admitting it
-// via installBundleModule. Anything else is refused.
+// This is the multi-app shell's own `admit` (§12.5), and it has exactly one question to
+// answer: has the user consented to running THESE bytes? It needs no author or name
+// clause — a kernel name derives from its author's key (§5.1), so an author can only ever
+// bind over their own app, and two authors shipping an app called "chat" simply coexist.
+// The UI gates a consent by adding the app's bytes_hash to `pendingApprovals` before
+// admitting it. Anything else is refused.
+//
+// Consent decides whether the code RUNS. Which app receives a given protocol's messages
+// is the separate, freely revisable question `bindings` answers below (§12.10).
 const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
 
-host.setAdmitPolicy((name, author, bytesHash, _wasm, existing) => {
+const admit = (_name, _author, bytesHash, _wasm) => {
   const hex = bytesToHex(bytesHash);
-  if (existing) {
-    if (!bytesEqual(existing.author, author)) return false;
-    pendingApprovals.delete(hex);   // consume even if not strictly needed
-    return true;
-  }
-  if (pendingApprovals.has(hex)) {
-    pendingApprovals.delete(hex);
-    return true;
-  }
-  return false;
-});
+  if (!pendingApprovals.has(hex)) return false;
+  pendingApprovals.delete(hex);
+  return true;
+};
 
 // ─── per-tab Ed25519 identity ──────────────────────────────────────────
 let myKeys;
@@ -209,9 +205,10 @@ function updatePeerPill() {
 // could point at an unexpected handler; the shell calls the same derivation the
 // loader does rather than keeping its own.
 //
-// The name is node-local. Two peers need not agree on it: a CHAT frame carries the
-// app *id*, and each side resolves that through its own `installedApps` to whatever
-// name its loader bound.
+// The name is node-local. Two peers need not agree on it: a CHAT frame carries a
+// *protocol id*, and each side resolves that through its own `bindings` to whichever
+// app it holds — so two peers running different authors' chat apps interoperate as
+// long as both speak the protocol.
 //
 // An app's handler is a PURE TRANSFORM: the shell hands it `senderPk ‖ chatType ‖
 // body` and it returns the render bytes for the iframe. The shell — not the WASM
@@ -225,15 +222,70 @@ function updatePeerPill() {
 // signed bundle blob — the author's manifest signature intact — and is what every
 // "Offer" hands to a peer). Apps received via Offer keep the original author's
 // manifest signature: we never re-sign a bundle.
-const installedApps = new Map();   // id → AppRecord
-let activeAppId = null;
+// Keyed by APP KEY — `"<author hex>:<app>"` (§12.4), the same key the loader's freshness
+// marks use. Not by the bare app id: two authors may both ship a "chat", and under
+// derived names (§5.1) they coexist rather than contend, so the id alone is not an
+// identity. `rec.id` remains the display/manifest name.
+const installedApps = new Map();   // appKey → AppRecord
+let activeAppKey = null;
 
-// The bind name for a locally-authored app: buildAppBundle names the single module
-// for the app id, so this is the loader's own derivation applied to that pair. For a
-// bundle we RECEIVED, use `peekAppBundle`'s `handlerName` instead — it reads the
-// module name off the verified manifest rather than assuming this shell built it.
-function appHandlerName(id) {
-  return kernelNameFor(id, id);
+// ── protocol bindings (§12.10) ─────────────────────────────────────────
+//
+// Which installed app receives a given protocol's messages. This is a user PREFERENCE,
+// not a permission: it cannot make unadmitted code run, cannot widen anyone's authority,
+// and is freely rewritable — the worst a wrong binding does is deliver to the wrong app
+// the user already chose to install. That is exactly why it lives here in the shell and
+// not in the loader's policy.
+//
+// A manifest's `handles` (defaulting to `[app]`) says what an app is WILLING to serve;
+// this table says what it actually does. Declaring is free and confers nothing, so any
+// number of apps may offer "chat" without contending for it.
+//
+// One app per protocol. A second handler would be a fan-out, and today it would be a
+// no-op: WASM handlers are pure transforms with zero authority (§4.2), so a would-be
+// logger bound alongside could only return bytes the shell discards. The component that
+// could genuinely act is a capability-holding guest, and binding one is an authority
+// grant needing its own approval — a different question from "which chat app do I want",
+// so it is deliberately not what this single-valued table expresses.
+const bindings = new Map();        // protocol id → appKey
+
+// Session-storage namespace for the app state below. VERSIONED because `apps.active` and
+// the `installedApps` keys hold app keys (§12.4) where they once held bare app ids: a tab
+// carrying the older shape would restore its bundles, fail to match its saved active app,
+// and sit on the empty-state placeholder as though nothing had installed. Bump this
+// whenever the shape of anything under it changes — sessionStorage is per-tab, so the
+// stale entries die with the tab and there is nothing to migrate.
+const STORE = "apps.v2";
+
+/** The app bound to `proto`, or null. */
+function boundApp(proto) {
+  const key = bindings.get(proto);
+  return key ? (installedApps.get(key) ?? null) : null;
+}
+
+/** Bind `proto` to `key`, replacing whatever held it. */
+function bindProtocol(proto, key) {
+  bindings.set(proto, key);
+  persistInstalledApps();
+  renderAppList();
+}
+
+/** Auto-bind on install, into VACANCIES only (§12.10): the first app to offer a protocol
+ *  takes it — there is no decision to surface because there is no alternative — while an
+ *  app offering an already-bound protocol lands installed-but-unbound, leaving the choice
+ *  to the user. An update (same app key) keeps what it already held and any NEWLY declared
+ *  protocol lands unbound, so a v2 cannot inherit traffic on the strength of v1's consent. */
+function autoBind(rec) {
+  for (const proto of rec.handles) {
+    if (!bindings.has(proto)) bindings.set(proto, rec.key);
+  }
+}
+
+/** Protocols currently pointing at this app. */
+function boundProtocols(key) {
+  const out = [];
+  for (const [proto, k] of bindings) if (k === key) out.push(proto);
+  return out;
 }
 
 // ── shell frame wire format ─────────────────────────────────────────────
@@ -241,13 +293,17 @@ function appHandlerName(id) {
 // Without envelopes, the shell frames what it puts on a data channel itself. The
 // sender pubkey is NOT in the frame — the AKE channel already authenticates it and
 // hands it up as `_from`. Two kinds:
-//   CHAT   [0x01][appIdLen u8][appId utf8][chatType u8][body]
+//   CHAT   [0x01][protoLen u8][protocol id utf8][chatType u8][body]
 //   OFFER  [0x02][bundle bytes]
+//
+// The CHAT frame names a PROTOCOL, never an app, an author or a kernel name — those are
+// node-local (§5.1), and a wire that named them would make one peer's install choices
+// everyone else's business.
 const FRAME_CHAT = 0x01;
 const FRAME_OFFER = 0x02;
 
-function encodeChatFrame(appId, chatBytes) {
-  const idBytes = new TextEncoder().encode(appId);
+function encodeChatFrame(proto, chatBytes) {
+  const idBytes = new TextEncoder().encode(proto);
   const out = new Uint8Array(2 + idBytes.length + chatBytes.length);
   out[0] = FRAME_CHAT;
   out[1] = idBytes.length;
@@ -266,14 +322,16 @@ function encodeOfferFrame(bundleBytes) {
 // Run an app's transform for one message and, if it's the active app, render it.
 // `senderPk` is the authenticated peer (or our own key for a local echo);
 // `chatBytes` is [chatType u8][body]. The transform's input is senderPk ‖ chatBytes.
-function deliverChat(appId, senderPk, chatBytes) {
-  const rec = installedApps.get(appId);
+function deliverChat(proto, senderPk, chatBytes) {
+  // Resolve the wire's protocol id through OUR bindings (§12.10). An unbound protocol
+  // drops — the sender got no say in which app runs, or whose code that is.
+  const rec = boundApp(proto);
   if (!rec) return;
   const input = new Uint8Array(senderPk.length + chatBytes.length);
   input.set(senderPk, 0);
   input.set(chatBytes, senderPk.length);
   const render = host.callHandler(rec.handlerName, input);
-  if (render && appId === activeAppId) deliverRender(new Uint8Array(render));
+  if (render && rec.key === activeAppKey) deliverRender(new Uint8Array(render));
 }
 
 // ── iframe bridge ──────────────────────────────────────────────────────
@@ -358,7 +416,7 @@ async function buildAppBundle(wasmBytes) {
     version: 1,
     modules: [{
       name: meta.id,
-      hash: bytesToHex(host.genesisHash(wasmBytes)),
+      hash: bytesToHex(genesisHash(sodium, wasmBytes)),
     }],
   };
   const manifestEnv = signManifest(sodium, myKeys.privateKey, myKeys.publicKey, manifest);
@@ -376,15 +434,15 @@ async function buildAppBundle(wasmBytes) {
 // author and the app's metadata and wait for the user to accept before anything binds,
 // which is exactly the seam `verifyBundle` is split at. It carries no policy file and
 // no freshness marks — user consent is this deployment's admission policy — so it
-// stops short of `installBundle` and drives `installBundleModule` itself once the user
-// agrees.
+// stops short of `installBundle` and drives `admitModule` — the loader's own
+// hash-then-policy-then-bind step — itself once the user agrees.
 //
 // Returns null on anything malformed or unauthentic, so the UI can decline quietly.
 function peekAppBundle(bundleBytes) {
   let v;
   try {
     v = verifyBundle(sodium, bundleBytes);
-    checkBundleIntegrity(v, (b) => host.genesisHash(b));
+    checkBundleIntegrity(v, (b) => genesisHash(sodium, b));
   } catch { return null; }   // unauthentic, malformed, or a hash mismatch ⇒ decline
   // A chat app is a one-module handler-only bundle: a `guest` would mean authority
   // this shell has no realm to confine.
@@ -394,15 +452,19 @@ function peekAppBundle(bundleBytes) {
   return {
     authorPk: v.author,
     manifest: v.manifest,
-    // The name the loader would bind this module at, from the signed `(app, name)`
-    // pair — the shell drives installBundleModule itself here, so it derives the name
-    // the same way rather than second-guessing it.
-    handlerName: kernelNameFor(v.manifest.app, v.modules[0].mod.name),
+    // This app's identity (§12.4) and the name the loader would bind its module at,
+    // both from the signed `(author, app, name)` triple — the shell drives the admission
+    // itself here, so it derives them the same way rather than second-guessing.
+    key: appKeyFor(v.author, v.manifest.app),
+    handlerName: kernelNameFor(v.author, v.manifest.app, v.modules[0].mod.name),
+    // The protocol ids this app offers to serve (§12.10), defaulted by the loader.
+    // An offer, not a claim: it takes a binding below before a single byte reaches it.
+    handles: handlesOf(v.manifest),
     // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
     // the same value the approve callback receives — so it keys pendingApprovals and
     // doubles as the artifact's display hash. Equal to fromHex(modules[0].hash) now
     // that the integrity check above has passed.
-    bytesHash: host.genesisHash(wasm),
+    bytesHash: genesisHash(sodium, wasm),
     install: { wasm },
   };
 }
@@ -415,22 +477,24 @@ async function applyAppBundle(bundleBytes) {
   const { meta, uiHtml } = await readWasmSections(peeked.install.wasm);
   if (!meta) throw new Error("bundle module has no app_meta");
 
-  // Route + display by the signed manifest id, and bind at the name derived from it
-  // (peekAppBundle) — the manifest carries no bind name of its own to disagree with.
+  // Identify by the app KEY — `(author, app)` — not the bare id: two authors may each
+  // ship a "chat" and they coexist under distinct derived names (§5.1).
   const id = peeked.manifest.app;
+  const key = peeked.key;
   const handlerName = peeked.handlerName;
 
-  // The manifest signature is already verified (peekAppBundle). Admit the module
-  // through the same policy a seedstore bundle module goes through (§12.4). The
-  // approve callback gates first installs on pendingApprovals and updates on
-  // same-author. The module is a pure transform — no configure step, nothing to
-  // wire; the shell drives it directly with host.callHandler.
-  if (!host.installBundleModule(handlerName, peeked.install.wasm, peeked.authorPk)) {
+  // The manifest signature is already verified (peekAppBundle). Admit the module through
+  // the loader's own admission step (§12.4) — hash the bytes, ask `admit`, then bind — so
+  // this shell runs the same code path a seedstore bundle module does rather than a
+  // parallel copy. The module is a pure transform: no configure step, nothing to wire;
+  // the shell drives it directly with host.callHandler.
+  if (!admitModule(host, sodium, admit, handlerName, peeked.install.wasm, peeked.authorPk)) {
     throw new Error("install rejected by policy");
   }
 
   const record = {
     id,
+    key,
     name: meta.name || id,
     version: meta.version || "",
     description: meta.description || "",
@@ -438,9 +502,14 @@ async function applyAppBundle(bundleBytes) {
     bytesHash: peeked.bytesHash,
     bundleBytes: bundleBytes.slice(),
     handlerName,
+    handles: peeked.handles,
     uiHtml,
   };
-  installedApps.set(id, record);
+  installedApps.set(key, record);
+  // Bind any protocol nobody holds yet (§12.10). An update keeps the bindings it already
+  // had — they point at this same app key — while a protocol this app newly declares, or
+  // one another app already holds, lands unbound for the user to decide.
+  autoBind(record);
   // Persist the packed bundle across reloads so transitive offers / updates keep
   // working without re-receiving them.
   persistInstalledApps();
@@ -458,25 +527,10 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
     // Re-embed the meta into the wasm so the bundle module carries it.
     wasmBytes = embedAppMeta(wasmBytes, meta);
   }
-  const handlerName = appHandlerName(meta.id);
-  const existing = host.lookupInstall(handlerName);
-  // Updating something WE authored is a plain same-author re-install (§12.5 —
-  // no parent/lineage gate). Updates to an app authored by someone else are
-  // not supported from this path — those arrive via Offer from the original
-  // author.
-  if (existing) {
-    if (!bytesEqual(existing.author, myKeys.publicKey)) {
-      const authorHex = bytesToHex(existing.author).slice(0, 8);
-      const msg =
-        `Cannot install "${meta.id}": already installed and authored by ` +
-        `${authorHex}, not you. Updates have to come from that author ` +
-        `(e.g. via an Offer). Remove the existing app first if you want ` +
-        `to author a different one under the same id.`;
-      shellPrint(msg, "err");
-      showAppsNotice(msg, "err");
-      return;
-    }
-  }
+  // No name conflict is possible here. We sign under OUR key, so the bundle derives
+  // names in our own namespace (§5.1): this either updates the app we already hold at
+  // `(us, meta.id)`, or lands beside somebody else's same-named app without touching it.
+  // There is nothing to refuse and no existing install to interrogate.
   const bundleBytes = await buildAppBundle(wasmBytes);
   const peeked = peekAppBundle(bundleBytes);
   if (!peeked) throw new Error("internal: just-built app bundle did not parse");
@@ -485,7 +539,7 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
   try {
     const record = await applyAppBundle(bundleBytes);
     shellPrint(`Installed ${record.name} ${record.version}`, "sys");
-    setActiveApp(record.id);
+    setActiveApp(record.key);
   } catch (err) {
     pendingApprovals.delete(bytesToHex(peeked.bytesHash));
     shellPrint(`Install failed: ${err.message}`, "err");
@@ -536,17 +590,34 @@ function persistInstalledApps() {
     for (const rec of installedApps.values()) {
       arr.push(Array.from(rec.bundleBytes));
     }
-    sessionStorage.setItem("apps.bundles", JSON.stringify(arr));
-    if (activeAppId) sessionStorage.setItem("apps.active", activeAppId);
-    else sessionStorage.removeItem("apps.active");
+    sessionStorage.setItem(STORE + ".bundles", JSON.stringify(arr));
+    // Bindings are ordinary user preference (§12.10) — they persist beside the apps and
+    // carry no security property, so a hand-edited store can misroute a message and
+    // nothing more.
+    sessionStorage.setItem(STORE + ".bindings", JSON.stringify(Array.from(bindings)));
+    if (activeAppKey) sessionStorage.setItem(STORE + ".active", activeAppKey);
+    else sessionStorage.removeItem(STORE + ".active");
   } catch {}
 }
 
 async function restoreInstalledApps() {
   let arr;
-  try { arr = JSON.parse(sessionStorage.getItem("apps.bundles") || "[]"); }
+  try { arr = JSON.parse(sessionStorage.getItem(STORE + ".bundles") || "[]"); }
   catch { return; }
   if (!Array.isArray(arr)) return;
+  // Bindings BEFORE apps: `autoBind` only fills vacancies, so restoring the user's
+  // choices first is what keeps a reload from silently re-binding a protocol to
+  // whichever app happens to come back first.
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(STORE + ".bindings") || "[]");
+    if (Array.isArray(saved)) {
+      for (const pair of saved) {
+        if (Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") {
+          bindings.set(pair[0], pair[1]);
+        }
+      }
+    }
+  } catch {}
   for (const raw of arr) {
     try {
       // Restored installs were already approved in a prior tab session —
@@ -561,19 +632,25 @@ async function restoreInstalledApps() {
       shellPrint(`Could not restore an app: ${err.message}`, "err");
     }
   }
-  const saved = sessionStorage.getItem("apps.active");
+  // Drop bindings pointing at an app that did not restore — a binding is only meaningful
+  // while its app is installed — then let the vacancies that leaves be filled by whatever
+  // remains. Without the second pass a protocol whose app is gone would stay unbound even
+  // with an installed app offering to serve it.
+  for (const [proto, key] of bindings) if (!installedApps.has(key)) bindings.delete(proto);
+  for (const rec of installedApps.values()) autoBind(rec);
+  const saved = sessionStorage.getItem(STORE + ".active");
   if (saved && installedApps.has(saved)) setActiveApp(saved);
 }
 
 // ── active-app iframe mount ────────────────────────────────────────────
-function setActiveApp(id) {
-  const rec = installedApps.get(id);
+function setActiveApp(key) {
+  const rec = installedApps.get(key);
   if (!rec) return;
   if (!rec.uiHtml) {
     shellPrint(`${rec.name} has no UI; cannot mount.`, "err");
     return;
   }
-  activeAppId = id;
+  activeAppKey = key;
   iframeReady = false;
   renderQueue.length = 0;
   if (frame.dataset.blobUrl) URL.revokeObjectURL(frame.dataset.blobUrl);
@@ -589,7 +666,7 @@ function setActiveApp(id) {
 }
 
 function unmountActiveApp() {
-  activeAppId = null;
+  activeAppKey = null;
   iframeReady = false;
   renderQueue.length = 0;
   frame.src = "about:blank";
@@ -629,19 +706,21 @@ async function handleOffer(bundleBytes, fromPkHex) {
   }
   // Route + display by the signed manifest id; the wasm's app_meta id is cosmetic.
   meta = { ...meta, id };
-  const existing = host.lookupInstall(peeked.handlerName);
+  // "Is this an update to something we already hold?" is now a plain map lookup: the
+  // app key contains the author (§12.4), so a match IS same-author — there is no key
+  // comparison to get wrong, and a stranger's bundle simply misses and falls through to
+  // the consent path below. An auto-update also inherits only the bindings it already
+  // had (§12.10), so an offer can never take over a protocol by arriving.
+  const existing = installedApps.get(peeked.key);
 
-  // Auto-install path: the author matches an app we already trust. The
-  // admission policy in setAdmitPolicy verifies the same facts (§12.5,
-  // author-only), so dispatching is safe — no extra approval needed.
-  if (existing && bytesEqual(existing.author, authorPk)) {
+  if (existing) {
     try {
       const rec = await applyAppBundle(bundleBytes);
       shellPrint(
         `Auto-updated ${rec.name} → ${rec.version} ` +
         `(from ${fromPkHex.slice(0, 8)}, signed by ${bytesToHex(authorPk).slice(0, 8)})`, "sys");
       // If this was the active app, re-mount the new UI.
-      if (activeAppId === rec.id) setActiveApp(rec.id);
+      if (activeAppKey === rec.key) setActiveApp(rec.key);
     } catch (err) {
       shellPrint(`Auto-update failed: ${err.message}`, "err");
     }
@@ -672,7 +751,7 @@ async function acceptOffer(bytesHashHex) {
     pendingOffers.delete(bytesHashHex);
     renderOfferList();
     shellPrint(`Installed ${rec.name} ${rec.version} from offer.`, "sys");
-    setActiveApp(rec.id);
+    setActiveApp(rec.key);
   } catch (err) {
     pendingApprovals.delete(bytesHashHex);
     shellPrint(`Install from offer failed: ${err.message}`, "err");
@@ -687,8 +766,8 @@ function dismissOffer(bytesHashHex) {
 
 // Broadcast the stored bundle for `id` to every open peer. Anyone who receives
 // this can forward it to others — that's transitivity for free.
-function offerApp(id) {
-  const rec = installedApps.get(id);
+function offerApp(key) {
+  const rec = installedApps.get(key);
   if (!rec) return;
   const n = broadcastFrame(encodeOfferFrame(rec.bundleBytes));
   shellPrint(
@@ -716,7 +795,7 @@ function renderAppList() {
 function buildAppRow(rec) {
   const li = document.createElement("li");
   li.className = "app-row";
-  if (rec.id === activeAppId) li.classList.add("active");
+  if (rec.key === activeAppKey) li.classList.add("active");
 
   const head = document.createElement("div");
   head.className = "app-row-head";
@@ -749,15 +828,44 @@ function buildAppRow(rec) {
     ` · <b>wasm</b> ${bytesToHex(rec.bytesHash).slice(0, 12)}`;
   li.appendChild(meta);
 
+  // Protocol bindings (§12.10). One row per protocol this app offers to serve, each a
+  // plain toggle: binding is a preference, so switching is one click and reversible.
+  // "Handles" is what the author declared; the checkbox is what the user decided.
+  const protos = document.createElement("div");
+  protos.className = "app-row-meta";
+  for (const proto of rec.handles) {
+    const holder = bindings.get(proto);
+    const mine = holder === rec.key;
+    const label = document.createElement("label");
+    label.className = "app-row-proto";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = mine;
+    cb.addEventListener("change", () => {
+      if (cb.checked) bindProtocol(proto, rec.key);
+      else { bindings.delete(proto); persistInstalledApps(); renderAppList(); }
+    });
+    label.appendChild(cb);
+    const txt = document.createElement("span");
+    // Name the app currently holding a contested protocol, so "why am I not getting
+    // messages" has a visible answer rather than being silent.
+    const other = holder && !mine ? installedApps.get(holder) : null;
+    txt.textContent = ` handles “${proto}”` +
+      (mine ? "" : other ? ` — bound to ${other.name}` : " — unbound");
+    label.appendChild(txt);
+    protos.appendChild(label);
+  }
+  li.appendChild(protos);
+
   const btns = document.createElement("div");
   btns.className = "app-row-buttons";
   if (rec.uiHtml) {
     const openBtn = document.createElement("button");
     openBtn.className = "icon primary";
-    openBtn.textContent = rec.id === activeAppId ? "Active" : "Open";
-    openBtn.disabled = rec.id === activeAppId;
+    openBtn.textContent = rec.key === activeAppKey ? "Active" : "Open";
+    openBtn.disabled = rec.key === activeAppKey;
     openBtn.addEventListener("click", () => {
-      setActiveApp(rec.id);
+      setActiveApp(rec.key);
       showTab("app");
     });
     btns.appendChild(openBtn);
@@ -783,28 +891,31 @@ function buildAppRow(rec) {
   const offerBtn = document.createElement("button");
   offerBtn.className = "icon";
   offerBtn.textContent = "Offer to peers";
-  offerBtn.addEventListener("click", () => offerApp(rec.id));
+  offerBtn.addEventListener("click", () => offerApp(rec.key));
   btns.appendChild(offerBtn);
 
   const removeBtn = document.createElement("button");
   removeBtn.className = "icon danger";
   removeBtn.textContent = "Remove";
-  removeBtn.addEventListener("click", () => removeApp(rec.id));
+  removeBtn.addEventListener("click", () => removeApp(rec.key));
   btns.appendChild(removeBtn);
 
   li.appendChild(btns);
   return li;
 }
 
-function removeApp(id) {
-  const rec = installedApps.get(id);
+function removeApp(key) {
+  const rec = installedApps.get(key);
   if (!rec) return;
   if (!confirm(`Remove ${rec.name} ${rec.version}? The kernel handler will be uninstalled.`)) return;
   // Revocation (§12.5): removeHandler empties the kernel slot AND clears its install
   // record, so the same name is free to re-admit later with no stale attribution.
   host.removeHandler(rec.handlerName);
-  installedApps.delete(id);
-  if (activeAppId === id) unmountActiveApp();
+  installedApps.delete(key);
+  // Drop every protocol this app held (§12.10). Removing an app unbinds it; it does not
+  // hand its protocols to anyone else, so the user chooses again from what remains.
+  for (const proto of boundProtocols(key)) bindings.delete(proto);
+  if (activeAppKey === key) unmountActiveApp();
   persistInstalledApps();
   renderAppList();
 }
@@ -935,20 +1046,26 @@ window.addEventListener("message", (ev) => {
   }
 
   if (msg.type === "send" && typeof msg.chatType === "number" && msg.body) {
-    if (!activeAppId) return;
+    const active = activeAppKey ? installedApps.get(activeAppKey) : null;
+    if (!active) return;
+    // Send under a protocol the active app is actually BOUND to, so our own echo
+    // (and a peer that binds the same protocol to a different implementation) routes
+    // to the right place. An app the user has unbound sends nothing.
+    const proto = boundProtocols(active.key)[0];
+    if (!proto) return;
     const body = msg.body instanceof Uint8Array ? msg.body : new Uint8Array(msg.body);
     const chatBytes = new Uint8Array(1 + body.length);   // [chatType][body]
     chatBytes[0] = msg.chatType & 0xff;
     chatBytes.set(body, 1);
-    broadcastFrame(encodeChatFrame(activeAppId, chatBytes));
-    deliverChat(activeAppId, myKeys.publicKey, chatBytes);   // local echo
+    broadcastFrame(encodeChatFrame(proto, chatBytes));
+    deliverChat(proto, myKeys.publicKey, chatBytes);   // local echo
     if (msg.chatType === 0x02) {
       // Sticky "presence" replay: nick announcements are cached and
       // re-broadcast on every newly-opened dc so peers joining mid-session
       // pick up our identity without us having to send it again. The chat
       // app uses chatType=0x02 for this; other apps that don't use the
       // same convention simply never set the cache.
-      lastSentNickBody = { appId: activeAppId, body };
+      lastSentNickBody = { proto, body };
     }
   }
 });
@@ -966,7 +1083,7 @@ window.addEventListener("message", (ev) => {
 // message author. No per-message signature.
 // ---------------------------------------------------------------------------
 
-let lastSentNickBody = null;   // {appId, body} — replayed to peers that join mid-session
+let lastSentNickBody = null;   // {proto, body} — replayed to peers that join mid-session
 
 // Reconnectable relay signaling. RtcNetwork takes a Signaling at construction;
 // we hand it one whose underlying WebSocket can be (re)pointed at a relay URL
@@ -996,12 +1113,12 @@ const net = new RtcNetwork({
     updatePeerPill();
     // Replay our last nick so a peer joining mid-session learns our identity
     // without us re-sending it (chat v2 uses chatType 0x02 for nick).
-    if (lastSentNickBody && installedApps.has(lastSentNickBody.appId)) {
+    if (lastSentNickBody && bindings.has(lastSentNickBody.proto)) {
       const body = lastSentNickBody.body;
       const chatBytes = new Uint8Array(1 + body.length);
       chatBytes[0] = 0x02;
       chatBytes.set(body, 1);
-      endpoint.send(peerId, encodeChatFrame(lastSentNickBody.appId, chatBytes));
+      endpoint.send(peerId, encodeChatFrame(lastSentNickBody.proto, chatBytes));
     }
   },
   onPeerDown: (peerId) => {
@@ -1034,9 +1151,9 @@ endpoint.onFrame((from, frame) => {
     if (bytes.length < 2) return;
     const idLen = bytes[1];
     if (bytes.length < 2 + idLen) return;
-    const appId = new TextDecoder().decode(bytes.subarray(2, 2 + idLen));
+    const proto = new TextDecoder().decode(bytes.subarray(2, 2 + idLen));
     const chatBytes = bytes.subarray(2 + idLen);   // [chatType][body]
-    deliverChat(appId, hexToBytes(from), chatBytes);
+    deliverChat(proto, hexToBytes(from), chatBytes);
   } else if (kind === FRAME_OFFER) {
     handleOffer(bytes.slice(1), from).catch(() => {});
   }

@@ -55,7 +55,11 @@ func packBundle(files [][2]any) []byte {
 // kernelNameFor is the §5.1 bind-name derivation, mirroring bundle.ts, so a test can
 // predict where a bundle's module lands. Test-side only: the native host derives no name
 // in production — the shared JS loader hands it a module's finished kernel name.
-func kernelNameFor(app, moduleName string) string { return app + ":" + moduleName }
+// The author leads the name, which is what makes ownership structural: two authors
+// shipping the same app name never collide, so nothing has to arbitrate between them.
+func kernelNameFor(author []byte, app, moduleName string) string {
+	return hex.EncodeToString(author) + ":" + app + ":" + moduleName
+}
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest, under an author-signed manifest at the given
@@ -64,7 +68,7 @@ func kernelNameFor(app, moduleName string) string { return app + ":" + moduleNam
 // first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle.
 func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
 	t.Helper()
-	kernelName := kernelNameFor(app, "fwd")
+	kernelName := kernelNameFor(pub, app, "fwd")
 	guestSrc := "register('ping', () => new Uint8Array([1]));"
 
 	type mod struct {

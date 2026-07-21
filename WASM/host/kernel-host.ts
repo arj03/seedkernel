@@ -14,16 +14,16 @@
 // `callHandler` (the counterpart a guest reaches through the cap-bridge's MODULE_CALL,
 // README §12.2), and does all I/O and authorization itself. Every entry is an installed
 // WASM handler: a bundle is the one way code arrives (§12.4), so the table holds one kind
-// of thing and `callHandler` has one path through it. The loader's install records live
-// here too (README §12.4): the host binds handlers, so it holds the `InstallRecords`
-// store and forgets a slot's record when `removeHandler` revokes it.
+// of thing and `callHandler` has one path through it.
+//
+// The table is the host's ONLY install state. There is no ownership register beside it,
+// because a kernel name derives from its author's key (§5.1) — so who may bind a name is
+// answered by the name, and nothing can fall out of step with the table. That is also why
+// nothing here touches crypto: hashing belongs to the loader (`genesisHash`, bundle.ts),
+// and this component is the `Map` §3 says it is.
 //
 // Authenticity is the transport's job (the AKE channel attributes every frame), not a
 // per-message signature — so there is no signature wrapper and no signer scoping here.
-
-import { InstallRecords, type AdmitPolicy, type InstallRecord } from "./bundle.js";
-
-type Sodium = typeof import("libsodium-wrappers-sumo");
 
 // ─── handler routing ─────────────────────────────────────────────────────
 
@@ -45,30 +45,17 @@ export class KernelHost {
    *  the §3.1 SetHandler / remove / resolve operations are `set` / `delete` / `get` and
    *  nothing else can disagree about what a name resolves to. */
   private readonly handlers = new Map<string, WasmHandlerRef>();
-  private readonly sodium: Sodium;
-  // The loader's install records + admission step (README §12.4). Intrinsic to the host
-  // (it binds handlers), so `removeHandler` can forget a stale record. No admission
-  // policy is wired until setAdmitPolicy runs, so it refuses every bind by default
-  // (deny-all, README §14).
-  private readonly records = new InstallRecords(this);
-
-  /** The host needs nothing but a hash to stand up: hand it an initialized libsodium
-   *  (BLAKE2b-256 for content hashing) and the table is live — an empty one, which grows
-   *  only by loading signed bundles (wire an admission policy with `setAdmitPolicy`,
-   *  §12.4). Keeping the constructor free of Node- or browser-specific I/O is what lets
-   *  the same host run in Node, browsers, Deno, Bun and QuickJS; the thin entry points in
-   *  `node.ts` / `browser.ts` package readying sodium for each platform. */
-  constructor(sodium: Sodium) {
-    this.sodium = sodium;
-  }
 
   // ─── installing WASM handlers ─────────────────────────────────────────
 
   /** Instantiate handler `wasmBytes` and bind them at `targetName` (README §4,
    *  §12.4). A handler is a pure transform: it imports only the AssemblyScript
    *  runtime shims (`env.*`) — no `kernel.*` seam — and exports `memory`, a
-   *  `scratch` global, and `handle`. Returns false on any structural failure. */
-  _installWasmHandler(targetName: string, wasmBytes: Uint8Array): boolean {
+   *  `scratch` global, and `handle`. Returns false on any structural failure.
+   *
+   *  This is the §3.1 bind, and the loader's admission (`installBundle`, §12.4) is its
+   *  only caller — the policy has already run by the time control reaches here. */
+  installWasmHandler(targetName: string, wasmBytes: Uint8Array): boolean {
     if (targetName.length === 0) return false;
     if (wasmBytes.length === 0) return false;
 
@@ -147,50 +134,17 @@ export class KernelHost {
     return new Uint8Array(w.memory.buffer, w.scratch, responseLen).slice();
   }
 
-  /** Wire the admission policy the loader gates bundle modules with (README §12.5).
-   *  Null (the default) refuses every bind, so a host that never calls this loads no
-   *  app at all — deny-all (README §14). */
-  setAdmitPolicy(admit: AdmitPolicy | null): void {
-    this.records.setPolicy(admit);
-  }
-
-  /** Read-only access to the install record at `name`, or null. Host-side read of the
-   *  loader's records (README §12.4) — there is no wire query. */
-  lookupInstall(name: string): InstallRecord | null {
-    return this.records.lookup(name);
-  }
-
-  /** Admit a bundle module under its manifest-declared kernel name (README §12.4). The
-   *  signed manifest already authenticated the coherent set and pinned each module's
-   *  content hash, so the loader admits verified bytes here — bundles are the only way
-   *  code arrives. The record's author is the manifest `authorPubKey` (a 32-byte Ed25519
-   *  key, §12.4), gated by the admission policy. Returns true on success, false if no
-   *  policy is wired or it refuses. The bundle loader calls this once per verified module. */
-  installBundleModule(name: string, wasm: Uint8Array, authorPubKey: Uint8Array): boolean {
-    return this.records.admit(name, wasm, authorPubKey);
-  }
-
   /** Remove a handler, the `SetHandler(name, null)` case in §3.1 — and the loader's
-   *  `remove(name)` revocation path (§12.5): it clears the slot's install record too, so
-   *  the same key cannot later be misattributed onto brand-new bytes. */
+   *  `remove(name)` revocation path (§12.5). It frees the name and nothing else: there is
+   *  no side table to keep in step, and a freed name can only ever be re-occupied by the
+   *  author whose key derives it (§5.1), so a removal can never hand a slot to anyone. */
   removeHandler(name: string): boolean {
-    if (!this.handlers.delete(name)) return false;
-    this.records.forget(name);
-    return true;
+    return this.handlers.delete(name);
   }
 
   /** True if a handler occupies `name` — the §3.1 resolve, as a predicate. A shell uses
    *  it to check that the modules it expects a bundle to have landed are bound. */
-  isRegistered(name: string): boolean {
+  isBound(name: string): boolean {
     return this.handlers.has(name);
-  }
-
-  /** Hash the raw bytes of `data` with the genesis hash (BLAKE2b-256) — the one system
-   *  hash (the guest `HASH` op, the AKE KDF/transcript, and the block-id path all use it
-   *  too, §12.1). Used by the loader's admission to compute a module's install-record
-   *  `bytesHash` (§12.4), and exposed so deployers can compute the same hash off-line for
-   *  policy allowlists. */
-  genesisHash(data: Uint8Array): Uint8Array {
-    return this.sodium.crypto_generichash(32, data, null);
   }
 }

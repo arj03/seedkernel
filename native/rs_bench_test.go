@@ -110,8 +110,9 @@ func setupRS() {
 		return
 	}
 	// Where the loader bound the bundle's `codec` module: derived from the manifest's
-	// signed (app, name) pair (§5.1), not declared anywhere.
-	rsCodecName = kernelNameFor("seedstore", "codec")
+	// signed (author, app, name) triple (§5.1), not declared anywhere. `author` is the
+	// key we just authorized, so this is the name that bundle's module landed at.
+	rsCodecName = kernelNameFor(author, "seedstore", "codec")
 
 	// 640 KB of deterministic data (content is irrelevant to RS timing; this is the
 	// same cheap fill bench.mjs uses).

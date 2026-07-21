@@ -65,36 +65,42 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// A different author cannot take over a name another author's bundle already owns
-// (README §12.5): the policy's same-author rule keys on the install record the first
-// bundle left behind, so the second bundle's module must not land.
-func TestBundleCannotHijackAnotherAuthorsName(t *testing.T) {
+// Two authors shipping an app under the SAME name coexist (README §5.1): a kernel name
+// is derived from its author's key, so B never aims at A's slot in the first place. There
+// is no ownership register and no same-author clause — the collision the old register
+// existed to refuse is unrepresentable, and both modules land.
+func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	boot()
 	authorA, authorAPub := testAuthor(t)
 	authorB, authorBPub := testAuthor(t)
-	// Both authors are allowed to install — this test is about the per-name ownership
-	// rule, not the closed author set.
+	// Both authors are allowed to install: this test is about the namespace, not the
+	// closed author set. A permissive policy is exactly the interesting case — even with
+	// nothing refusing anyone, neither author can reach the other's names.
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorAPub) + `","` + hex.EncodeToString(authorBPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	// A module's name is derived from the manifest `app` (§5.1), so two bundles declaring
-	// the same app aim at the same slot: `<app>:fwd`.
-	name := kernelNameFor("ownedapp", "fwd")
+	nameA := kernelNameFor(authorAPub, "ownedapp", "fwd")
+	nameB := kernelNameFor(authorBPub, "ownedapp", "fwd")
+	if nameA == nameB {
+		t.Fatal("the same app name under two authors must derive distinct kernel names")
+	}
 	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
 	if status := loadBundle(bundleA); !strings.Contains(status, "installed=[fwd]") {
-		t.Fatalf("author A's first install should be admitted: %s", status)
+		t.Fatalf("author A's install should be admitted: %s", status)
 	}
-	if !boundToWasm(name) {
-		t.Fatalf("author A's module is not bound at `%s`", name)
+	if !boundToWasm(nameA) {
+		t.Fatalf("author A's module is not bound at `%s`", nameA)
 	}
-	// B's bundle is well-formed and its author is allowed, so it verifies and loads — the
-	// refusal is the per-module admission, leaving an empty installed set rather than an
-	// error. A's handler must still be the one bound at the name.
+	// B's bundle declares the same app name and installs too — beside A, never over it.
 	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
-	if status := loadBundle(bundleB); !strings.Contains(status, "installed=[]") {
-		t.Fatalf("author B hijacked author A's `%s` slot: %s", name, status)
+	if status := loadBundle(bundleB); !strings.Contains(status, "installed=[fwd]") {
+		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}
-	if !boundToWasm(name) {
-		t.Fatalf("the refused install unbound `%s`", name)
+	if !boundToWasm(nameB) {
+		t.Fatalf("author B's module is not bound at `%s`", nameB)
+	}
+	// The decisive assertion: A's slot is untouched by B's install.
+	if !boundToWasm(nameA) {
+		t.Fatalf("author B's install displaced author A at `%s`", nameA)
 	}
 }
