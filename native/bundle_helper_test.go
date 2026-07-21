@@ -52,24 +52,24 @@ func packBundle(files [][2]any) []byte {
 	return out
 }
 
+// kernelNameFor is the loader's bind-name derivation (§5.1), mirroring bundle.ts so a test
+// can predict where a module lands. Go never derives this in production — the shared JS
+// loader hands the native host the finished name → this exists only to assert on it.
+func kernelNameFor(app, moduleName string) string { return app + ":" + moduleName }
+
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest, under an author-signed manifest at the given
-// (app, version). Returns the bundle's path and the module's kernel name. Requires boot()
-// first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle. The
-// module binds at name("fwd") unless a `kernelOverride` is passed — a test uses that to
-// aim a module at a seeded slot and prove the §12.5 overlay refusal.
-func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, kernelOverride ...string) (string, string) {
+// (app, version). Returns the bundle's path and the kernel name the module will bind at —
+// derived from `(app, "fwd")`, since the manifest declares no bind name. Requires boot()
+// first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle.
+func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
 	t.Helper()
-	kernelName := name("fwd")
-	if len(kernelOverride) > 0 {
-		kernelName = kernelOverride[0]
-	}
+	kernelName := kernelNameFor(app, "fwd")
 	guestSrc := "register('ping', () => new Uint8Array([1]));"
 
 	type mod struct {
-		Name       string `json:"name"`
-		Hash       string `json:"hash"`
-		KernelName string `json:"kernelName"`
+		Name string `json:"name"`
+		Hash string `json:"hash"`
 	}
 	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's.
 	type guest struct {
@@ -86,7 +86,6 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		Version: version,
 		Modules: []mod{{
 			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
-			KernelName: kernelName,
 		}},
 		Guest: guest{Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))), Caps: []string{}},
 	}

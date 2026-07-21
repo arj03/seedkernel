@@ -234,7 +234,12 @@ export class KernelHost {
 
   /** A bootstrap handler name (README §5.1): the literal-ASCII
    *  `"seedkernel.bootstrap.v1:" + canonical`. Bootstrap names are plain ASCII,
-   *  not genesis-hash-derived — so names read plainly in logs. */
+   *  not genesis-hash-derived — so names read plainly in logs.
+   *
+   *  For HAND-SEEDED slots only (`register`, §9). Bundle modules never come through
+   *  here: the loader derives their names from the signed manifest (`kernelNameFor`),
+   *  and the two namespaces are disjoint so an admitted bundle cannot land on a
+   *  bootstrap slot. */
   deriveBootstrapName(canonical: string): string {
     return "seedkernel.bootstrap.v1:" + canonical;
   }
@@ -248,10 +253,13 @@ export class KernelHost {
     return this.sodium.crypto_generichash(32, data, null);
   }
 
-  /** Derive a deterministic name as `hex(BLAKE2b-256(canonical || authorPubKey))`. Useful
-   *  for deployer policies that want author-scoped names so two parties can each
-   *  hold their own `chat` without conflict (§5.1). The table is indifferent to
-   *  derivation — this is just a convenience. */
+  /** Derive a deterministic name as `hex(BLAKE2b-256(canonical || authorPubKey))`.
+   *
+   *  A convenience for HAND-SEEDED slots (`register`, §9) in a deployment that wires the
+   *  same canonical handler for several parties and wants each to hold its own — two
+   *  `chat` slots that do not collide. Like `deriveBootstrapName`, it plays no part in
+   *  bundle admission: a bundle module's name is derived from its signed manifest, so a
+   *  policy has no name to constrain. The table is indifferent to derivation. */
   deriveScopedName(canonical: string, authorPubKey: Uint8Array): string {
     const nameBytes = new TextEncoder().encode(canonical);
     const buf = new Uint8Array(nameBytes.length + authorPubKey.length);

@@ -16,7 +16,7 @@
 
 import { buildAdmit, policyFromJson, type ShellPolicy } from "./policy.js";
 import {
-  FreshnessMarks, InstallRecords, loadBundle,
+  FreshnessMarks, InstallRecords, kernelNameFor, loadBundle,
   type BundleHost, type RecordHost,
 } from "./bundle.js";
 import { toHex } from "./util.js";
@@ -107,8 +107,10 @@ function loadBundleBlob(blob: ArrayBuffer): string {
       caps: b.manifest.guest?.caps ?? [],
       config: b.manifest.guest?.config ?? {},
       guestSource: b.guestSource,
-      // Logical name → kernel name, for the guest's `const BUNDLE.modules`.
-      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, m.kernelName])),
+      // Logical name → kernel name, for the guest's `const BUNDLE.modules`. Derived from
+      // the same signed `(app, name)` pair the loader bound at, so this map can never
+      // disagree with the table.
+      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.manifest.app, m.name)])),
       installed: b.installed,
     });
   } catch (e) {

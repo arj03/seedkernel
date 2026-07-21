@@ -76,17 +76,19 @@ func TestBundleCannotOverlaySeededSlot(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	// Seed a native host handler the way boot()-time services are seeded — bound into the
-	// handler table via SetHandler, with no install record for the policy to key on.
-	seeded := name("host.seeded")
+	// handler table via SetHandler, with no install record for the policy to key on. A
+	// bundle module's name is derived, not declared (§5.1), so the way to aim one at an
+	// occupied slot is to occupy the slot it will derive: `<app>:fwd`.
+	seeded := kernelNameFor("overlayapp", "fwd")
 	registerNativeAt(seeded, func(p []byte) []byte { return p })
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1)
 	if status := loadBundle(bundlePath); strings.Contains(status, "installed=[fwd]") {
-		t.Fatalf("a bundle module overlaid the seeded `host.seeded` slot: %s", status)
+		t.Fatalf("a bundle module overlaid the seeded `%s` slot: %s", seeded, status)
 	}
 	if boundToWasm(seeded) {
-		t.Fatal("the seeded `host.seeded` slot was overlaid by a bundle module")
+		t.Fatalf("the seeded `%s` slot was overlaid by a bundle module", seeded)
 	}
 	if e := handlers[seeded]; e == nil || e.nat == nil {
-		t.Fatal("the seeded `host.seeded` handler is gone from its slot")
+		t.Fatalf("the seeded `%s` handler is gone from its slot", seeded)
 	}
 }

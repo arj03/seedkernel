@@ -19,7 +19,7 @@ import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
 import { policyFromJson, buildAdmit, type ShellPolicy } from "./policy.js";
 import {
-  FreshnessMarks, loadBundle as loadBundleBlob,
+  FreshnessMarks, kernelNameFor, loadBundle as loadBundleBlob,
   type BundleManifest, type FreshnessStore, type LoadedBundle,
 } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
@@ -203,7 +203,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     + bundlePreamble({
       app: b.manifest.app,
       author: b.author,
-      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, m.kernelName])),
+      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.manifest.app, m.name)])),
     })
     + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
     + b.guestSource;

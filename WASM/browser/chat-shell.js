@@ -3,7 +3,7 @@ import { createKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 import { signManifest, verifyBundle, checkBundleIntegrity, packBundle,
-         MANIFEST_FILE, moduleFile }
+         kernelNameFor, MANIFEST_FILE, moduleFile }
   from "../build/host/bundle.js";
 
 const RTC_CONFIG = { iceServers: [{ urls: [
@@ -204,14 +204,15 @@ function updatePeerPill() {
 //
 // The module's WASM carries two embedded custom sections the runtime ignores but
 // this shell reads: "app_meta" (JSON — id, name, version) and "ui" (HTML rendered
-// in the sandboxed iframe). The signed manifest's `app` is the id, and the module
-// binds under a kernel name derived from it:
-//     handlerName = "seedkernel.bootstrap.v1:app:" + id   (literal ASCII, §5.1)
+// in the sandboxed iframe). The signed manifest's `app` is the id, and the loader
+// binds the module at `kernelNameFor(app, moduleName)` — `"<id>:<module>"` (§5.1).
+// The manifest declares no bind name, so there is nothing in it a forged manifest
+// could point at an unexpected handler; the shell calls the same derivation the
+// loader does rather than keeping its own.
 //
-// `handlerName` is globally derivable so two peers running the same app id route
-// messages to the same name; we derive it from the signed manifest `app` on
-// install rather than trusting the manifest's own bind name, so a forged manifest
-// cannot redirect a handler onto an unexpected name.
+// The name is node-local. Two peers need not agree on it: a CHAT frame carries the
+// app *id*, and each side resolves that through its own `installedApps` to whatever
+// name its loader bound.
 //
 // An app's handler is a PURE TRANSFORM: the shell hands it `senderPk ‖ chatType ‖
 // body` and it returns the render bytes for the iframe. The shell — not the WASM
@@ -228,8 +229,12 @@ function updatePeerPill() {
 const installedApps = new Map();   // id → AppRecord
 let activeAppId = null;
 
+// The bind name for a locally-authored app: buildAppBundle names the single module
+// for the app id, so this is the loader's own derivation applied to that pair. For a
+// bundle we RECEIVED, use `peekAppBundle`'s `handlerName` instead — it reads the
+// module name off the verified manifest rather than assuming this shell built it.
 function appHandlerName(id) {
-  return host.deriveBootstrapName("app:" + id);
+  return kernelNameFor(id, id);
 }
 
 // ── shell frame wire format ─────────────────────────────────────────────
@@ -336,9 +341,10 @@ function promptMeta(defaultId) {
 // ── build an app bundle (local-authored) ────────────────────────────────
 //
 // Turn a WASM module into a signed one-module bundle: read its app_meta for the
-// id, build a manifest binding the module at appHandlerName(id), sign the manifest
-// under the local key (the real §12.4 manifest signature), and pack the manifest
-// envelope + module into one blob. `version` is a nominal 1 — the interactive
+// id, build a manifest declaring the module under that id, sign the manifest under
+// the local key (the real §12.4 manifest signature), and pack the manifest envelope
+// + module into one blob. The manifest names no kernel name — the loader derives it
+// from the signed `(app, name)` pair. `version` is a nominal 1 — the interactive
 // shell gates installs on user consent (the approve callback), not on a monotonic
 // freshness mark, so a chat bundle carries no meaningful version counter.
 //
@@ -354,7 +360,6 @@ async function buildAppBundle(wasmBytes) {
     modules: [{
       name: meta.id,
       hash: bytesToHex(host.genesisHash(wasmBytes)),
-      kernelName: appHandlerName(meta.id),
     }],
   };
   const manifestEnv = signManifest(sodium, myKeys.privateKey, myKeys.publicKey, manifest);
@@ -390,6 +395,10 @@ function peekAppBundle(bundleBytes) {
   return {
     authorPk: v.author,
     manifest: v.manifest,
+    // The name the loader would bind this module at, from the signed `(app, name)`
+    // pair — the shell drives installBundleModule itself here, so it derives the name
+    // the same way rather than second-guessing it.
+    handlerName: kernelNameFor(v.manifest.app, v.modules[0].mod.name),
     // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
     // the same value the approve callback receives — so it keys pendingApprovals and
     // doubles as the artifact's display hash. Equal to fromHex(modules[0].hash) now
@@ -407,11 +416,10 @@ async function applyAppBundle(bundleBytes) {
   const { meta, uiHtml } = await readWasmSections(peeked.install.wasm);
   if (!meta) throw new Error("bundle module has no app_meta");
 
-  // Derive the bind name from the signed manifest `app`, not the manifest's own
-  // kernelName field: a globally-derivable name keeps peer routing consistent and a
-  // forged manifest cannot redirect the handler onto an unexpected name.
+  // Route + display by the signed manifest id, and bind at the name derived from it
+  // (peekAppBundle) — the manifest carries no bind name of its own to disagree with.
   const id = peeked.manifest.app;
-  const handlerName = appHandlerName(id);
+  const handlerName = peeked.handlerName;
 
   // The manifest signature is already verified (peekAppBundle). Admit the module
   // through the same policy a seedstore bundle module goes through (§12.4). The
@@ -622,8 +630,7 @@ async function handleOffer(bundleBytes, fromPkHex) {
   }
   // Route + display by the signed manifest id; the wasm's app_meta id is cosmetic.
   meta = { ...meta, id };
-  const handlerName = appHandlerName(id);
-  const existing = host.lookupInstall(handlerName);
+  const existing = host.lookupInstall(peeked.handlerName);
 
   // Auto-install path: the author matches an app we already trust. The
   // admission policy in setAdmitPolicy verifies the same facts (§12.5,

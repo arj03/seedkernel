@@ -37,19 +37,33 @@ export const GUEST_FILE = "guest.js";
 export function moduleFile(name: string): string { return name + ".wasm"; }
 
 export interface BundleModule {
-  /** Logical name, e.g. "codec". Three jobs, one value: the module's file in the
+  /** Logical name, e.g. "codec". Four jobs, one value: the module's file in the
    *  container (`<name>.wasm`), the key the guest addresses it by (`BUNDLE.modules`),
-   *  and how the loader reports it. Unique within a manifest, and restricted to
+   *  how the loader reports it, and — with the manifest `app` — the kernel name it
+   *  binds at (`kernelNameFor`). Unique within a manifest, and restricted to
    *  `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
   name: string;
   /** genesisHash(wasm) hex — content integrity for the module bytes, and the
    *  module's `bytes_hash` in the loader's install record (§5.1, §12.4). */
   hash: string;
-  /** Kernel name the loader binds the module at via SetHandler — the name itself
-   *  (`deriveBootstrapName`'s ASCII, or `deriveScopedName`'s hex), carried verbatim
-   *  into the table. The manifest is the authoritative source of the bind name now
-   *  that the loader admits modules directly (§12.4). */
-  kernelName: string;
+}
+
+/** The kernel name a bundle module binds at: `"<app>:<module name>"` (§5.1). Derived,
+ *  never declared — the manifest carries no bind-name field, so there is nothing in it
+ *  to forge. Both inputs are already signed, so what the loader binds is exactly what
+ *  the author authenticated, and the derivation is unambiguous because a module name
+ *  cannot contain `:` (NAME_RE) — the last colon always separates the two.
+ *
+ *  Kernel names are node-local table keys. Nothing on the wire names another node's
+ *  handler: a peer sends an app id or a protocol opcode and the receiving host resolves
+ *  it through its own table, and a guest reaches its own modules by logical name through
+ *  `BUNDLE.modules`. So this needs to be collision-free within one node, not agreed
+ *  across a deployment — scoping by `app` is exactly that much. It is deliberately NOT
+ *  in the `"seedkernel.bootstrap.v1:"` namespace: those names are hand-seeded via
+ *  SetHandler (§9), and keeping the two disjoint is what stops an admitted bundle from
+ *  landing on a bootstrap slot. */
+export function kernelNameFor(app: string, moduleName: string): string {
+  return app + ":" + moduleName;
 }
 
 /** The zero-authority guest program and everything about it. `caps` and `config` live
@@ -161,7 +175,10 @@ export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Ar
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
   const o = m as Record<string, unknown>;
-  if (typeof o.app !== "string") return false;
+  // `app` is load-bearing beyond reporting: it scopes the guest's signing namespace
+  // (guestSignScope), keys the freshness high-water mark, and is half of every module's
+  // kernel name (kernelNameFor). An empty one would yield the bind name ":codec".
+  if (typeof o.app !== "string" || o.app.length === 0) return false;
   if (typeof o.version !== "number" || !Number.isInteger(o.version)) return false;
   if (!Array.isArray(o.modules)) return false;
   const seen = new Set<string>();
@@ -169,7 +186,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof mod !== "object" || mod === null) return false;
     const mm = mod as Record<string, unknown>;
     if (typeof mm.name !== "string" || !NAME_RE.test(mm.name)) return false;
-    if (typeof mm.hash !== "string" || typeof mm.kernelName !== "string") return false;
+    if (typeof mm.hash !== "string") return false;
     // Names key both the container and the guest's module map, so a duplicate is
     // ambiguous rather than merely redundant.
     if (seen.has(mm.name)) return false;
@@ -538,8 +555,9 @@ export function checkBundleIntegrity(v: VerifiedBundle, genesisHash: (b: Uint8Ar
 /** Govern a verified bundle and land it (README §12.4 steps 2, 3, 4b): require the
  *  author to be in the policy, enforce version freshness, integrity-check every module
  *  and the guest against the host's genesis hash, then install each verified module
- *  directly under its declared kernel name (synthesizing the install record with the
- *  manifest author, under the same policy — §12.4).
+ *  under the kernel name derived from the manifest's signed `(app, name)` pair
+ *  (synthesizing the install record with the manifest author, under the same policy —
+ *  §12.4).
  *
  *  The integrity check runs before any install, so a mismatch anywhere throws with
  *  nothing bound — a bad file can never leave a partial bundle on the kernel. */
@@ -567,14 +585,16 @@ export function installBundle(
     // and the guest have integrity-checked and installed — not here. See below.
   }
   checkBundleIntegrity(v, (b) => host.genesisHash(b));
-  // Everything integrity-checked — install the verified bytes. Each module lands
-  // directly under its kernel name, synthesizing the install record with the manifest
-  // author (§12.4). No per-module `.install` envelope means no 64 KB envelope cap and
-  // no boot-time seq — an equal-version reload just re-installs. A module the policy
-  // refuses does not abort the load: it is simply reported as not installed.
+  // Everything integrity-checked — install the verified bytes. Each module lands under
+  // the kernel name DERIVED from the signed `(app, name)` pair, synthesizing the install
+  // record with the manifest author (§12.4). No per-module `.install` envelope means no
+  // 64 KB envelope cap and no boot-time seq — an equal-version reload just re-installs. A
+  // module the policy refuses does not abort the load: it is simply reported as not
+  // installed.
   const installed: string[] = [];
   for (const { mod, wasm } of v.modules) {
-    if (host.installBundleModule(mod.kernelName, wasm, v.author)) installed.push(mod.name);
+    const kernelName = kernelNameFor(v.manifest.app, mod.name);
+    if (host.installBundleModule(kernelName, wasm, v.author)) installed.push(mod.name);
   }
   // Advance the freshness mark only now — after a fully successful load. Advancing it
   // during the downgrade check above (before the integrity checks) would brick rollback:

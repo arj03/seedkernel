@@ -703,7 +703,7 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+  const { signManifest, verifyManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -717,15 +717,17 @@ async function testBundle() {
   let shell, shell2;
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
-    // throwaway host to derive the kernel name and hash content. Modules install
-    // directly from the manifest (§12.4) — no per-module .install envelope. Neither
-    // the module nor the guest names a file: they are `<name>.wasm` and `guest.js`.
+    // throwaway host to hash content. Modules install directly from the manifest
+    // (§12.4) — no per-module .install envelope — under a kernel name the loader
+    // DERIVES from the signed `(app, name)` pair, so the manifest declares none.
+    // Neither the module nor the guest names a file: they are `<name>.wasm` and
+    // `guest.js`.
     const { host: h } = await makeHost();
-    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const kernelName = kernelNameFor("test", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
-      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
+      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)) }],
       // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
         hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
@@ -806,7 +808,7 @@ async function testBundle() {
 async function testGuestlessBundleAndArchive() {
   console.log("Test: handler-only bundle (no guest) loads + verify/install split");
   const { signManifest, verifyManifest, verifyBundle, checkBundleIntegrity,
-          packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
+          packBundle, unpackBundle, kernelNameFor, MANIFEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -820,11 +822,11 @@ async function testGuestlessBundleAndArchive() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = h.deriveBootstrapName("app:demo");
+    const kernelName = kernelNameFor("demo", "demo");
     // A manifest with NO `guest` field — the handler-only shape, and so no caps.
     const manifest = {
       app: "demo", version: 1,
-      modules: [{ name: "demo", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
+      modules: [{ name: "demo", hash: toHex(h.genesisHash(forwarderBytes)) }],
     };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
@@ -2059,7 +2061,7 @@ async function testHelloSuiteByte() {
 // bricking rollback (README §12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+  const { signManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -2073,11 +2075,11 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const kernelName = kernelNameFor("rollback", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
-      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)), kernelName }],
+      modules: [{ name: "codec", hash: toHex(h.genesisHash(forwarderBytes)) }],
       guest: {
         hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))),
         caps: [],

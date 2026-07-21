@@ -39,7 +39,7 @@ var (
 	rsReady     bool
 )
 
-// setupRS loads the seedstore bundle (installing seedstore.codec) and stages a fixed
+// setupRS loads the seedstore bundle (installing seedstore:codec) and stages a fixed
 // encode request plus a "one data block lost" decode request — the §21 single-loss
 // read path, identical to bench.mjs's decode case (surviving data rows 1..k-1 plus
 // the first parity row). Both requests are validated once before timing.
@@ -63,7 +63,9 @@ func setupRS() {
 	if !strings.HasPrefix(loadBundle(dir), "seedstore v") {
 		return // rsReady stays false → the benchmarks Skip
 	}
-	rsCodecName = name("seedstore.codec")
+	// Where the loader bound the bundle's `codec` module: derived from the manifest's
+	// signed (app, name) pair (§5.1), not declared anywhere.
+	rsCodecName = kernelNameFor("seedstore", "codec")
 
 	// 640 KB of deterministic data (content is irrelevant to RS timing; this is the
 	// same cheap fill bench.mjs uses).
