@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"seedloader/qjs"
@@ -91,5 +92,45 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 	if len(leaked) != 0 {
 		t.Fatalf("guest realm leaked host globals: %s", leaked)
+	}
+}
+
+// The realm's heap cap (guestMemoryLimit) is a confinement property, not a tuning knob:
+// the admission policy decides WHICH guest runs, but an admitted guest that runs away must
+// exhaust its own realm rather than the host — including on the serveHandle path, which a
+// remote peer drives. Asserted on the real newGuestRealm path, since the cap can only be
+// set at runtime creation and is easy to drop there silently. The modest allocation is the
+// control: without it a realm that was simply broken would pass the same test.
+func TestGuestRealmHeapCapped(t *testing.T) {
+	hostQc, el, done := capBridgeRealm(t)
+	defer done()
+
+	if _, err := hostQc.Eval("build.js", qjs.Code(`
+		globalThis.__id = sodium.crypto_sign_keypair();
+		__buildCapBridge(["crypto"], __id, null, []);
+	`)); err != nil {
+		t.Fatal("build bridge:", err)
+	}
+
+	src := fmt.Sprintf(`
+		register("ok",  () => new Uint8Array(1 << 20));  // well under the cap
+		register("hog", () => new Uint8Array(%d));       // twice the cap
+	`, 2*guestMemoryLimit)
+	g, err := newGuestRealm(el, "", "{}", src)
+	if err != nil {
+		t.Fatal("guest realm:", err)
+	}
+	defer g.close()
+
+	out, err := g.runGuest("ok", nil)
+	if err != nil {
+		t.Fatal("guest refused a 1 MiB allocation under its cap:", err)
+	}
+	if len(out) != 1<<20 {
+		t.Fatalf("guest returned %d bytes, want %d", len(out), 1<<20)
+	}
+
+	if _, err := g.runGuest("hog", nil); err == nil {
+		t.Fatal("guest allocated past its heap cap — the realm is not confined")
 	}
 }

@@ -22,6 +22,14 @@ import (
 	"seedloader/qjs"
 )
 
+// guestMemoryLimit caps the confined realm's heap, matching safe-js.ts's default on the
+// node/browser target so the same signed guest meets the same ceiling on either. It is a
+// confinement property, not a tuning knob: the admission policy (§12.5) decides *which*
+// guest runs, but an admitted guest that runs away must exhaust its own realm rather than
+// the host — including on the serveHandle path, which a remote peer drives. QuickJS takes
+// it at runtime creation only, hence qjs.WithMemoryLimit rather than a setter.
+const guestMemoryLimit = 64 << 20 // 64 MiB
+
 type guestRealm struct {
 	hostQc         *qjs.Context
 	rt             *qjs.Runtime
@@ -44,7 +52,7 @@ type guestRealm struct {
 // manifest behind it (the tests driving a guest directly).
 func newGuestRealm(host *eventLoop, bundleFactsJSON, appJSON, guestSource string) (*guestRealm, error) {
 	hostQc := host.c
-	rt, err := qjs.New()
+	rt, err := qjs.New(qjs.WithMemoryLimit(guestMemoryLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +109,7 @@ func newGuestRealm(host *eventLoop, bundleFactsJSON, appJSON, guestSource string
 		return t.Context().NewArrayBuffer(out), nil
 	}))
 
-	if _, err := g.qc.Eval("guest-preamble.js", qjs.Code(guestPreambleJS)); err != nil {
+	if _, err := g.qc.Eval("guest-preamble.js", qjs.Code(hostGuestPreamble(hostQc))); err != nil {
 		rt.Close()
 		return nil, fmt.Errorf("guest preamble: %w", err)
 	}
@@ -148,6 +156,23 @@ func (g *guestRealm) deliverNet(callID int64, kind int, bytes []byte, msg string
 	if err != nil {
 		fmt.Println("guest: net delivery error:", err)
 	}
+}
+
+// hostGuestPreamble asks the host realm for guestPreamble() — the guest-side ABI
+// (host.call over the single seam, register/__invoke for dispatch). Fetched rather than
+// restated for the same reason capPreamble is: a bundle ships one guest.js that runs
+// byte-identical here and on the node/browser host (safe-js.ts), so the preamble is a
+// contract with signed content, not a per-target detail. Go's side of that contract is
+// the __host_call installed above (null ⇒ async under callId) plus deliverNet.
+func hostGuestPreamble(hostQc *qjs.Context) string {
+	fn := hostQc.Global().GetPropertyStr("guestPreamble")
+	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
+	fn.Free()
+	if err != nil {
+		panic(fmt.Sprintf("guestPreamble: %v", err))
+	}
+	defer v.Free()
+	return v.String()
 }
 
 // hostCapPreamble asks the host realm for capPreamble() — the `const CAP_X = n;`
@@ -229,52 +254,3 @@ func (g *guestRealm) close() {
 	g.rt.Close()
 	g.rt = nil
 }
-
-// guestPreambleJS is the guest-side ABI (safe-js.ts PREAMBLE): host.call over the
-// single seam, plus register/__invoke for entrypoint dispatch. Pure JS, no authority.
-// A sync op returns its bytes directly; a net op returns null from __host_call (Go kicked
-// off the Transport request under callId) and host.call hands back a Promise registered in
-// __pending, which deliverNet resolves via __netResolve/__netReject when the round-trip
-// settles. So a guest `await host.call(CAP_NET_*)` suspends and resumes on real promises,
-// and a fan-out is just Promise.all. __host_call reads the payload via JsTypedArrayToGo
-// (view-aware, copies on read), so the buffer is handed across as-is.
-const guestPreambleJS = `
-"use strict";
-let __callSeq = 0;
-const __pending = Object.create(null);
-globalThis.__netResolve = (callId, bytes) => {
-  const p = __pending[callId];
-  if (!p) return;
-  delete __pending[callId];
-  p.resolve(new Uint8Array(bytes));
-};
-globalThis.__netReject = (callId, msg) => {
-  const p = __pending[callId];
-  if (!p) return;
-  delete __pending[callId];
-  p.reject(new Error(msg));
-};
-globalThis.host = {
-  call(op, bytes) {
-    const callId = ++__callSeq;
-    const r = __host_call(op, callId, bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes);
-    if (r !== null) return new Uint8Array(r);          // sync op — bytes directly
-    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net op
-  },
-};
-globalThis.__entries = Object.create(null);
-globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
-function __norm(out) {
-  if (out instanceof ArrayBuffer) return out;
-  if (out instanceof Uint8Array) {
-    return (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength) ? out.buffer : out.slice().buffer;
-  }
-  throw new Error("safe-js: entrypoint must return Uint8Array | ArrayBuffer");
-}
-globalThis.__invoke = (name, argBuf) => {
-  const fn = globalThis.__entries[name];
-  if (typeof fn !== "function") throw new Error("safe-js: no entrypoint '" + name + "'");
-  const out = fn(new Uint8Array(argBuf));
-  return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
-};
-`

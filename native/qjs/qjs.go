@@ -102,8 +102,28 @@ func (r *Runtime) CallbackCount() int {
 // as it observes live wasm state. See qjs/leak_test.go and the loader soak tests.
 func (r *Runtime) MemorySize() uint32 { return r.mem.Size() }
 
+// Option configures a Runtime at creation. Options exist for limits that QuickJS can
+// only take at JS_NewRuntime time, so they cannot be applied to a live runtime.
+type Option func(*config)
+
+type config struct {
+	memoryLimit uint64 // bytes; 0 = engine default (unbounded)
+}
+
+// WithMemoryLimit caps the runtime's total heap. An allocation past the cap fails
+// inside QuickJS and surfaces as a catchable JS "out of memory" error, so a runaway
+// realm hits its own ceiling instead of the host's. Used for the confined guest realm
+// (guest.go), which mirrors safe-js.ts's setMemoryLimit on the node/browser target.
+func WithMemoryLimit(bytes uint64) Option {
+	return func(c *config) { c.memoryLimit = bytes }
+}
+
 // New instantiates a fresh QuickJS runtime + context.
-func New() (rt *Runtime, err error) {
+func New(opts ...Option) (rt *Runtime, err error) {
+	var cfg config
+	for _, o := range opts {
+		o(&cfg)
+	}
 	ctx := context.Background()
 	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPool: map[string][]api.Function{}}
 
@@ -168,7 +188,7 @@ func New() (rt *Runtime, err error) {
 	// first (a throw), but the guard also needs the stack top calibrated to the wasm
 	// SP — see QJS_UpdateStackTop below. Headroom left for the C frames between the
 	// check and the deepest alloca.
-	rt.qjs = rt.call("New_QJS", 0, maxStackSize, 0, 0)
+	rt.qjs = rt.call("New_QJS", cfg.memoryLimit, maxStackSize, 0, 0)
 	rt.ctxt = &Context{rt: rt, handle: rt.call("QJS_GetContext", rt.qjs)}
 	// Calibrate QuickJS's stack_top to the actual wasm shadow-SP. JS_NewRuntime
 	// captured it deep inside New_QJS; recording it here (a shallow Go→wasm entry, the

@@ -89,6 +89,18 @@ The reference composition stacks the layers so each depends only on the layers b
 - The channel authenticates one hop, not the whole path. The encrypted link attributes each frame to the peer that sent it (§12.6) — end-to-end for a direct exchange like chat, where every message travels a single hop. An app that **relays** messages through intermediaries — a forum, a feed, store-and-forward gossip — cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top.
 - The kernel is a specification, not a binary. A name→handler table is too small a thing to ship as an artifact — and the handler instances it points at are per-target anyway — so each host implements it as a plain map. What must not drift between hosts is the bundle load order and the admission rules, and those are shared as one compiled implementation on every target (§12.9).
 
+## One implementation, three targets
+
+The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target.
+
+| Layer | Where it lives | Size |
+| --- | --- | --- |
+| **Shared logic** — the transport, PeerLink and routing (§12.6); the bundle format and admission policy (§12.4, §12.5); the cap-bridge and the guest ABI preamble (§12.2); the WebSocket codec | `WASM/host/*.ts`, compiled once — the native loader embeds that same output and runs it in QuickJS (§12.9) | ~2,500 lines |
+| **Shared binaries** — crypto, and the RFC 6455 framer | `libsodium.wasm`, `ws.wasm` — byte-identical on every target | ~280 KB, ~6 KB |
+| **Per-target host** — sockets, files, the crypto FFI, the JS engine embedding, the event loop | `native/*.go` | ~4,500 lines of Go |
+
+The Go host is the larger of the two hosts only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing, and no policy logic lives in Go.
+
 ## Get started
 
 ```sh

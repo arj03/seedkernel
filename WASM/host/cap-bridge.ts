@@ -59,6 +59,93 @@ export function capPreamble(): string {
   return Object.entries(CAP).map(([k, v]) => `const CAP_${k} = ${v};`).join("\n") + "\n";
 }
 
+/** The guest-side ABI preamble: `host.call(op, bytes)` over the single seam, plus
+ *  `register`/`__invoke` for entrypoint dispatch. Pure JS — it names no authority, so
+ *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
+ *  shape to call through.
+ *
+ *  ONE definition for every target, for the same reason `bundlePreamble` is one: a bundle
+ *  ships a single `guest.js` that runs byte-identical on the node/browser host (safe-js.ts)
+ *  and inside the native loader's confined realm (guest.go). The preamble is therefore a
+ *  contract between the runtime and signed content, not a host implementation detail — a
+ *  per-target copy is a wire format maintained in two places.
+ *
+ *  HOST CONTRACT — a host embedding this must inject one function:
+ *
+ *    __host_call(op, callId, payload: ArrayBuffer) -> ArrayBuffer | null
+ *
+ *  Returning bytes completes a **sync** op (crypto/fs/clock/module) inline. Returning
+ *  `null` means the host started an **async** (net) op under `callId`; the guest parks a
+ *  Promise here and the host later calls `__netResolve(callId, bytes)` or
+ *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync op that ever returned
+ *  null/undefined would be read as async and leave a Promise pending forever.
+ *
+ *  The async half is deliberately plain ECMAScript rather than a host-created deferred:
+ *  the guest builds its own Promise, so the seam needs no promise primitive from the
+ *  embedding engine. That is what lets one preamble serve both a host holding
+ *  quickjs-emscripten's `newPromise()` and one driving quickjs-ng over wazero, which has
+ *  no such primitive. */
+export function guestPreamble(): string {
+  return GUEST_PREAMBLE;
+}
+
+const GUEST_PREAMBLE = `
+"use strict";
+let __callSeq = 0;
+const __pending = Object.create(null);
+globalThis.__netResolve = (callId, bytes) => {
+  const p = __pending[callId];
+  if (!p) return;
+  delete __pending[callId];
+  p.resolve(new Uint8Array(bytes));
+};
+globalThis.__netReject = (callId, msg) => {
+  const p = __pending[callId];
+  if (!p) return;
+  delete __pending[callId];
+  p.reject(new Error(msg));
+};
+globalThis.host = {
+  // A sync op resolves to its bytes directly; a net op returns a real Promise, so a
+  // guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op) and a
+  // fan-out is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
+  //
+  // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
+  // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
+  // but quickjs-emscripten's getArrayBuffer accepts only a true ArrayBuffer. A subarray is
+  // copied to its own buffer so the host never sees more bytes than the caller passed.
+  call(op, bytes) {
+    const callId = ++__callSeq;
+    const ab = bytes instanceof ArrayBuffer
+      ? bytes
+      : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
+        ? bytes.buffer
+        : bytes.slice().buffer;
+    const r = __host_call(op, callId, ab);
+    if (r !== null) return new Uint8Array(r);          // sync op — bytes directly
+    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net op
+  },
+};
+globalThis.__entries = Object.create(null);
+globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
+function __norm(out) {
+  if (out instanceof ArrayBuffer) return out;
+  if (out instanceof Uint8Array) {
+    return (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength) ? out.buffer : out.slice().buffer;
+  }
+  throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
+}
+globalThis.__invoke = (name, argBuf) => {
+  const fn = globalThis.__entries[name];
+  if (typeof fn !== "function") throw new Error("guest: no entrypoint '" + name + "'");
+  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
+  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
+  // __norm normalizes both to an ArrayBuffer.
+  const out = fn(new Uint8Array(argBuf));
+  return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
+};
+`;
+
 /** Capability *domains* — named groups of ops. A bundle's signed manifest declares
  *  the domains its guest needs (its `caps`), and the shell expands them to the
  *  concrete op set it enforces (`allowedOps`) and to which backends it wires. This
