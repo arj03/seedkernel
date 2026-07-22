@@ -20,4 +20,3 @@ export async function createKernelHost(sodium: Sodium): Promise<KernelHost> {
 }
 
 export { KernelHost } from "./kernel-host.js";
-export type { AdmitPolicy } from "./bundle.js";

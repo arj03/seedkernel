@@ -17,10 +17,10 @@ import { resolve } from "node:path";
 
 import { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
-import { policyFromJson, buildAdmit, type ShellPolicy } from "./policy.js";
+import { policyFromJson, type ShellPolicy } from "./policy.js";
 import {
   FreshnessMarks, kernelNameFor, loadBundle as loadBundleBlob,
-  type AdmitPolicy, type BundleManifest, type FreshnessStore, type LoadedBundle,
+  type BundleManifest, type FreshnessStore, type LoadedBundle,
 } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
 import { Transport, type Network, type PeerId } from "./net.js";
@@ -130,9 +130,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const host = new KernelHost();
 
   // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts). Wiring the
-  // admission policy is what lets the loader admit bundle modules (README §12.4–§12.5).
+  // admission policy is what lets the loader govern bundle loads (README §12.4–§12.5).
   const policy = policyFromJson(opts.policyJson);
-  const admit = buildAdmit(policy);
 
   // Capability backends — all application-neutral primitives. The cap-bridge
   // (built lazily in runGuest) exposes exactly these to a loaded bundle's guest:
@@ -211,7 +210,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   return {
     host, net, transport, fs, sodium, policy, peers,
     addPeer(p) { if (p !== peerId) peers.add(p); },
-    loadBundle(file) { return (loaded = loadBundle(host, sodium, policy, admit, file, freshness)); },
+    loadBundle(file) { return (loaded = loadBundle(host, sodium, policy, file, freshness)); },
     async runGuest(entry, payload) {
       const b = requireLoaded();
       if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
@@ -241,8 +240,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
  *  (bundle.ts `loadBundle`), which owns the verify → govern → freshness → integrity →
  *  install order. Reading the file is the whole platform seam: a bundle is one blob, so
  *  there is no directory walk and no filename to resolve. */
-export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, admit: AdmitPolicy, file: string, freshness?: FreshnessStore): LoadedBundle {
-  return loadBundleBlob(host, sodium, policy, admit, new Uint8Array(readFileSync(file)), freshness);
+export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, file: string, freshness?: FreshnessStore): LoadedBundle {
+  return loadBundleBlob(host, sodium, policy, new Uint8Array(readFileSync(file)), freshness);
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────

@@ -43,4 +43,3 @@ export function generateKeyPair(): {
 }
 
 export { KernelHost } from "./kernel-host.js";
-export type { AdmitPolicy } from "./bundle.js";

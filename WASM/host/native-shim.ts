@@ -13,11 +13,12 @@
 // Because it is TypeScript checked against those same interfaces, the drift that a
 // hand-written mirror accumulates is now a compile error.
 
-import { buildAdmit, policyFromJson, type ShellPolicy } from "./policy.js";
+import { policyFromJson, type ShellPolicy } from "./policy.js";
 import {
   FreshnessMarks, handlesOf, kernelNameFor, loadBundle,
-  type AdmitPolicy, type BundleHost,
+  type BundleHost,
 } from "./bundle.js";
+import { bundlePreamble } from "./cap-bridge.js";
 import { toHex } from "./util.js";
 
 /** The byte-level primitives the Go loader exposes into the realm (native/main.go).
@@ -61,11 +62,7 @@ let freshness: NativeFreshnessStore | null = null;
 // empty and every install is refused. A permissive default here would be a silent
 // second posture — the whole reason this file is generated rather than written.
 let policy: ShellPolicy = policyFromJson(null);
-let admit: AdmitPolicy = buildAdmit(policy);
-const applyPolicy = (p: ShellPolicy): void => {
-  policy = p;
-  admit = buildAdmit(p);
-};
+const applyPolicy = (p: ShellPolicy): void => { policy = p; };
 
 /** Narrow the realm's trust to a policy config (§12.5). `null` restores the deny-all
  *  default; malformed JSON throws, so a typo fails the loader's boot loudly. */
@@ -86,7 +83,9 @@ function loadBundleBlob(blob: ArrayBuffer): string {
   // store's path) from the CLI *after* it evaluates this bundle.
   if (!freshness) freshness = new NativeFreshnessStore();
   try {
-    const b = loadBundle(host, sodium, policy, admit, new Uint8Array(blob), freshness);
+    const b = loadBundle(host, sodium, policy, new Uint8Array(blob), freshness);
+    const modMap = Object.fromEntries(b.manifest.modules.map((m) =>
+      [m.name, kernelNameFor(b.author, b.manifest.app, m.name)]));
     return JSON.stringify({
       app: b.manifest.app,
       version: b.manifest.version,
@@ -100,10 +99,10 @@ function loadBundleBlob(blob: ArrayBuffer): string {
       caps: b.manifest.guest?.caps ?? [],
       config: b.manifest.guest?.config ?? {},
       guestSource: b.guestSource,
-      // Logical name → kernel name, for the guest's `const BUNDLE.modules`. Derived from
-      // the same signed `(author, app, name)` triple the loader bound at, so this map can
-      // never disagree with the table.
-      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)])),
+      // The "const BUNDLE = {…};\n" preamble this bundle's guest runs under. Built here
+      // from the admitted manifest so Go never re-derives the signing prefix or the kernel
+      // names — the one derivation (cap-bridge bundlePreamble) runs once.
+      bundlePreamble: bundlePreamble({ app: b.manifest.app, author: b.author, modules: modMap }),
       installed: b.installed,
     });
   } catch (e) {

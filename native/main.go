@@ -283,7 +283,7 @@ type loadedBundle struct {
 	version     int
 	caps        []string
 	config      json.RawMessage   // guest `config` object (merged under operator config)
-	modules     map[string]string // logical name → kernel name, for the guest's BUNDLE
+	bundlePreamble string          // pre-built "const BUNDLE = {…};\n" from the shared loader
 	guestSource string
 	// Protocol ids the app offers to serve (README §12.10), defaulted by the shared
 	// loader. The native target is a single-bundle runner, so it has no binding table to
@@ -324,8 +324,8 @@ func loadBundle(path string) string {
 		Version     int
 		Caps        []string
 		Config      json.RawMessage
-		Modules     map[string]string
-		GuestSource string
+		BundlePreamble string `json:"bundlePreamble"`
+		GuestSource    string
 		Handles     []string
 		Installed   []string
 	}
@@ -334,7 +334,7 @@ func loadBundle(path string) string {
 	}
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
-		config: m.Config, modules: m.Modules, guestSource: m.GuestSource,
+		config: m.Config, bundlePreamble: m.BundlePreamble, guestSource: m.GuestSource,
 		handles: m.Handles,
 	}
 	return fmt.Sprintf("%s v%d  installed=%v  handles=%v", m.App, m.Version, m.Installed, m.Handles)
@@ -573,18 +573,10 @@ func main() {
 			return
 		}
 		// `const BUNDLE` — the facts the runtime derived from the admitted manifest
-		// (author, app, signing prefix, module kernel names). Built in the host realm
-		// from the one derivation (cap-bridge bundlePreamble), never restated here.
-		factsJSON, err := json.Marshal(struct {
-			App     string            `json:"app"`
-			Author  string            `json:"author"`
-			Modules map[string]string `json:"modules"`
-		}{loaded.app, loaded.author, loaded.modules})
-		if err != nil {
-			fatal("bundle-facts", err)
-			return
-		}
-		if g, err = newGuestRealm(el, string(factsJSON), appJSON, loaded.guestSource); err != nil {
+		// (author, app, signing prefix, module kernel names). Built in the shared JS
+		// loader (loadBundleBlob returns the pre-built preamble), so Go never
+		// re-derives the signing scope or kernel names.
+		if g, err = newGuestRealm(el, loaded.bundlePreamble, appJSON, loaded.guestSource); err != nil {
 			fatal("guest", err)
 			return
 		}

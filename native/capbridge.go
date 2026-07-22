@@ -61,15 +61,6 @@ const capBridgeGlueJS = `
     });
   };
 
-  // The "const BUNDLE = ..." block for a loaded bundle's guest (README §12.4). Go hands
-  // the admitted manifest's facts as JSON (author as hex, the wire-friendly form); the
-  // shared bundlePreamble derives the signing prefix from them, so those bytes are
-  // built in exactly one place for every target.
-  globalThis.__bundlePreamble = function (factsJson) {
-    const f = JSON.parse(factsJson);
-    return bundlePreamble({ app: f.app, author: fromHex(f.author), modules: f.modules });
-  };
-
   // Direct synchronous invocation helper (Go passes an ArrayBuffer; the bridge wants
   // a Uint8Array). Returns the bytes for a sync op, or the Promise for an async (net)
   // op — the guest realm's __host_call handles the async case. The sync result is

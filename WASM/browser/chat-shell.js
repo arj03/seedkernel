@@ -2,8 +2,8 @@ import sodium from "./libsodium-wrappers.mjs";
 import { createKernelHost }
   from "../build/host/browser.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
-import { signManifest, verifyBundle, checkBundleIntegrity, packBundle,
-         admitModule, appKeyFor, genesisHash, handlesOf,
+import { signManifest, verifyBundle, packBundle,
+         appKeyFor, genesisHash, handlesOf,
          kernelNameFor, MANIFEST_FILE, moduleFile }
   from "../build/host/bundle.js";
 
@@ -112,14 +112,14 @@ const host = await createKernelHost(sodium);
 //
 // Consent decides whether the code RUNS. Which app receives a given protocol's messages
 // is the separate, freely revisable question `bindings` answers below (§12.10).
-const pendingApprovals = new Set();   // hex bytesHash → awaiting policy call
+const pendingApprovals = new Set();   // hex bytesHash → user has consented
 
-const admit = (_name, _author, bytesHash, _wasm) => {
+function userConsented(bytesHash) {
   const hex = bytesToHex(bytesHash);
   if (!pendingApprovals.has(hex)) return false;
   pendingApprovals.delete(hex);
   return true;
-};
+}
 
 // ─── per-tab Ed25519 identity ──────────────────────────────────────────
 let myKeys;
@@ -429,20 +429,18 @@ async function buildAppBundle(wasmBytes) {
 // ── verify + peek a received bundle ──────────────────────────────────────
 //
 // Authenticate + integrity-check a received bundle through the SHARED §12.4 loader
-// (bundle.ts verifyBundle + checkBundleIntegrity) — the same code the Node shell and
-// the native loader run. This shell only needs the verify half: it must show the
-// author and the app's metadata and wait for the user to accept before anything binds,
-// which is exactly the seam `verifyBundle` is split at. It carries no policy file and
+// (bundle.ts verifyBundle) — the same code the Node shell and the native loader run.
+// This shell only needs the verify half: it must show the author and the app's metadata
+// and wait for the user to accept before anything binds. It carries no policy file and
 // no freshness marks — user consent is this deployment's admission policy — so it
-// stops short of `installBundle` and drives `admitModule` — the loader's own
-// hash-then-policy-then-bind step — itself once the user agrees.
+// stops short of `installBundle` and drives `host.installWasmHandler` — the
+// kernel's own bind step — itself once the user agrees.
 //
 // Returns null on anything malformed or unauthentic, so the UI can decline quietly.
 function peekAppBundle(bundleBytes) {
   let v;
   try {
     v = verifyBundle(sodium, bundleBytes);
-    checkBundleIntegrity(v, (b) => genesisHash(sodium, b));
   } catch { return null; }   // unauthentic, malformed, or a hash mismatch ⇒ decline
   // A chat app is a one-module handler-only bundle: a `guest` would mean authority
   // this shell has no realm to confine.
@@ -483,14 +481,13 @@ async function applyAppBundle(bundleBytes) {
   const key = peeked.key;
   const handlerName = peeked.handlerName;
 
-  // The manifest signature is already verified (peekAppBundle). Admit the module through
-  // the loader's own admission step (§12.4) — hash the bytes, ask `admit`, then bind — so
-  // this shell runs the same code path a seedstore bundle module does rather than a
-  // parallel copy. The module is a pure transform: no configure step, nothing to wire;
-  // the shell drives it directly with host.callHandler.
-  if (!admitModule(host, sodium, admit, handlerName, peeked.install.wasm, peeked.authorPk)) {
-    throw new Error("install rejected by policy");
+  // The manifest signature and module hashes are already verified (peekAppBundle calls
+  // verifyBundle, which does both). The user already consented (pendingApprovals).
+  // Install the handler directly — there is no separate per-module admission gate.
+  if (!userConsented(peeked.bytesHash)) {
+    throw new Error("install rejected: user has not consented to this app");
   }
+  host.installWasmHandler(handlerName, peeked.install.wasm);
 
   const record = {
     id,

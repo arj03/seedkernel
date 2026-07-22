@@ -1,23 +1,17 @@
-// The shell's admission policy (README §12.5). It turns a small JSON config — "which
-// keys you allow" — into the loader's `AdmitPolicy`: a **closed author-key set** plus an
-// optional **module-hash allowlist**. It needs no name rule: kernel names derive from the
-// author's key (§5.1), so squat-resistance is structural and a policy has no name to
-// arbitrate. This is the only governance the generic runtime carries: everything else —
-// codec, reputation, the storage guest — arrives in a signed bundle whose manifest author
-// must clear this gate (§12.4). A deployment that needs more replaces the whole `AdmitPolicy`
-// (a quorum, an HSM console, bytecode validation); the file is the declarative common case.
-
-import type { AdmitPolicy } from "./bundle.js";
-import { toHex } from "./util.js";
+// The shell's admission policy (README §12.5): a closed set of author keys permitted
+// to sign a bundle manifest (§12.4). It needs no name rule and no per-module gate:
+// kernel names derive from the author's key (§5.1), so squat-resistance is structural,
+// and the signed manifest's `modules[].hash` is the definitive declaration of which
+// bytes are authorized. Trusting an author means trusting everything they sign.
+//
+// This is the only governance the generic runtime carries: everything else — codec,
+// reputation, the storage guest — arrives in a signed bundle whose manifest author
+// must clear this gate (§12.4).
 
 export interface ShellPolicy {
-  /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle manifest
-   *  (§12.4 step 2) and bind a name (§12.5). */
+  /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle
+   *  manifest and bind names (§12.4–§12.5). */
   authors: string[];
-  /** Optional allowlist of module `bytesHash`es (hex — `genesisHash(wasm)`, the
-   *  same id a manifest's `modules[].hash` uses). Omitted ⇒ any module from an
-   *  allowed author is accepted; present ⇒ the admitted hash must be listed. */
-  modules?: string[];
 }
 
 /** Parse + validate a policy config. Throws on malformed input so a typo in the
@@ -30,17 +24,12 @@ export function parsePolicy(json: string): ShellPolicy {
     throw new Error("policy: expected a JSON object");
   }
   const o = raw as Record<string, unknown>;
-  const hexList = (v: unknown, field: string): string[] => {
-    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
-      throw new Error(`policy: "${field}" must be an array of hex strings`);
-    }
-    return (v as string[]).map((s) => s.toLowerCase());
-  };
-  const authors = hexList(o.authors, "authors");
+  if (!Array.isArray(o.authors) || o.authors.some((x) => typeof x !== "string")) {
+    throw new Error('policy: "authors" must be an array of hex strings');
+  }
+  const authors = (o.authors as string[]).map((s) => s.toLowerCase());
   if (authors.length === 0) throw new Error('policy: "authors" must list at least one allowed author key');
-  const policy: ShellPolicy = { authors };
-  if (o.modules !== undefined) policy.modules = hexList(o.modules, "modules");
-  return policy;
+  return { authors };
 }
 
 /** The policy a shell runs under given its (optional) config file. A *provided*
@@ -54,26 +43,4 @@ export function parsePolicy(json: string): ShellPolicy {
  *  default of its own. */
 export function policyFromJson(json: string | null | undefined): ShellPolicy {
   return json ? parsePolicy(json) : { authors: [] };
-}
-
-/** The default admission decision (README §12.5): the loader's `admit` derived from a
- *  policy file. Three conjoined checks —
- *    1. `author ∈ authors` — the closed author set gates WHO may install;
- *    2. `bytesHash ∈ modules` if that field is present — pins WHICH binaries may land.
- *
- *  Nothing about the name is checked, because a name is not contestable: it derives from
- *  the author's own key (§5.1), so no admitted author can bind over another's. Squat
- *  resistance costs no clause here and no state anywhere.
- *
- *  An empty author set (the omitted-policy default) admits nothing — every bind fails
- *  check 1. */
-export function buildAdmit(policy: ShellPolicy): AdmitPolicy {
-  const authors = new Set(policy.authors.map((s) => s.toLowerCase()));
-  const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;
-
-  return (_name, author, bytesHash, _wasm) => {
-    if (!authors.has(toHex(author))) return false;                   // closed author set
-    if (modules && !modules.has(toHex(bytesHash))) return false;     // module-hash allowlist
-    return true;
-  };
 }
