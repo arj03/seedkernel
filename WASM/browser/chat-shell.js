@@ -1,10 +1,9 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { createKernelHost }
-  from "../build/host/browser.js";
+import { createShell, openPolicy } from "../build/host/shell-core.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
-import { signManifest, verifyBundle, packBundle,
-         appKeyFor, genesisHash, handlesOf,
-         kernelNameFor, MANIFEST_FILE, moduleFile }
+import { signManifest, packBundle,
+         genesisHash, kernelNameFor, appKeyFor, handlesOf,
+         unpackBundle, verifyManifest, FreshnessMarks, MANIFEST_FILE, moduleFile }
   from "../build/host/bundle.js";
 
 const RTC_CONFIG = { iceServers: [{ urls: [
@@ -95,31 +94,20 @@ function hexToBytes(hex) {
 }
 
 shellPrint("Starting the handler table...", "sys");
-const host = await createKernelHost(sodium);
+// libsodium instantiates its wasm asynchronously; every crypto call below — identity
+// generation, manifest signing, genesis hashing — needs it ready first.
+await sodium.ready;
 
-// ─── admission policy ──────────────────────────────────────────────────
-// The kernel is a named table of pure-transform handlers, held by the host — no
-// signature wrapper, no envelopes, no signer. The loader (§12.4) is the only bootstrap
-// piece: it admits signed bundles under the admission policy below. Message
-// authenticity comes from the AKE channel (PeerLink), not a per-message signature.
+// The shell (kernel host + admission policy + bundle loader) is assembled once the
+// identity and the RtcNetwork exist — see the boot sequence in the networking section
+// below. It is declared here because handlers defined above reach it through `shell`.
 //
-// This is the multi-app shell's own `admit` (§12.5), and it has exactly one question to
-// answer: has the user consented to running THESE bytes? It needs no author or name
-// clause — a kernel name derives from its author's key (§5.1), so an author can only ever
-// bind over their own app, and two authors shipping an app called "chat" simply coexist.
-// The UI gates a consent by adding the app's bytes_hash to `pendingApprovals` before
-// admitting it. Anything else is refused.
-//
-// Consent decides whether the code RUNS. Which app receives a given protocol's messages
-// is the separate, freely revisable question `bindings` answers below (§12.10).
-const pendingApprovals = new Set();   // hex bytesHash → user has consented
-
-function userConsented(bytesHash) {
-  const hex = bytesToHex(bytesHash);
-  if (!pendingApprovals.has(hex)) return false;
-  pendingApprovals.delete(hex);
-  return true;
-}
+// Ongoing-consent admission (§12.4): the user approves each unique bundle before it
+// runs. `pendingApprovals` holds the module hashes the user has consented to; the
+// shell's `admit` callback consumes one (one-shot) on install. The shell runs under an
+// open policy, so consent — not a static author allow-list — is this shell's gate.
+const pendingApprovals = new Set();
+let shell;
 
 // ─── per-tab Ed25519 identity ──────────────────────────────────────────
 let myKeys;
@@ -330,7 +318,7 @@ function deliverChat(proto, senderPk, chatBytes) {
   const input = new Uint8Array(senderPk.length + chatBytes.length);
   input.set(senderPk, 0);
   input.set(chatBytes, senderPk.length);
-  const render = host.callHandler(rec.handlerName, input);
+  const render = shell.host.callHandler(rec.handlerName, input);
   if (render && rec.key === activeAppKey) deliverRender(new Uint8Array(render));
 }
 
@@ -426,89 +414,66 @@ async function buildAppBundle(wasmBytes) {
   });
 }
 
-// ── verify + peek a received bundle ──────────────────────────────────────
+// ── extract metadata from a bundle blob ──────────────────────────────────
 //
-// Authenticate + integrity-check a received bundle through the SHARED §12.4 loader
-// (bundle.ts verifyBundle) — the same code the Node shell and the native loader run.
-// This shell only needs the verify half: it must show the author and the app's metadata
-// and wait for the user to accept before anything binds. It carries no policy file and
-// no freshness marks — user consent is this deployment's admission policy — so it
-// stops short of `installBundle` and drives `host.installWasmHandler` — the
-// kernel's own bind step — itself once the user agrees.
-//
-// Returns null on anything malformed or unauthentic, so the UI can decline quietly.
-function peekAppBundle(bundleBytes) {
-  let v;
-  try {
-    v = verifyBundle(sodium, bundleBytes);
-  } catch { return null; }   // unauthentic, malformed, or a hash mismatch ⇒ decline
+// Read app + module metadata off a bundle for the UI and the approval gate,
+// through the SHARED §12.4 manifest parser (bundle.ts verifyManifest): it reads the
+// envelope suite, verifies the author signature, and returns the parsed manifest +
+// the author key. So this shell never hand-parses envelope offsets — the layout stays
+// private to bundle.ts, where the suite-first parse lives. (Module-byte integrity is
+// still loadBundleBlob's job at install; this only needs the manifest.) Returns null on
+// anything malformed, unauthentic, or not a single-module handler-only app.
+function peekMeta(bundleBytes) {
+  let files;
+  try { files = unpackBundle(bundleBytes); }
+  catch { return null; }
+  const env = files[MANIFEST_FILE];
+  if (!env) return null;
+  let vm;
+  try { vm = verifyManifest(sodium, env); }   // throws on an unsupported suite / malformed body
+  catch { return null; }
+  if (!vm) return null;                        // bad signature ⇒ decline quietly
+  const { author, manifest } = vm;
   // A chat app is a one-module handler-only bundle: a `guest` would mean authority
   // this shell has no realm to confine.
-  if (v.modules.length !== 1 || v.manifest.guest) return null;
-  const wasm = v.modules[0].wasm;
-  if (wasm.length === 0) return null;
-  return {
-    authorPk: v.author,
-    manifest: v.manifest,
-    // This app's identity (§12.4) and the name the loader would bind its module at,
-    // both from the signed `(author, app, name)` triple — the shell drives the admission
-    // itself here, so it derives them the same way rather than second-guessing.
-    key: appKeyFor(v.author, v.manifest.app),
-    handlerName: kernelNameFor(v.author, v.manifest.app, v.modules[0].mod.name),
-    // The protocol ids this app offers to serve (§12.10), defaulted by the loader.
-    // An offer, not a claim: it takes a binding below before a single byte reaches it.
-    handles: handlesOf(v.manifest),
-    // bytes_hash is the loader's content id for the module (§12.4): genesisHash(wasm),
-    // the same value the approve callback receives — so it keys pendingApprovals and
-    // doubles as the artifact's display hash. Equal to fromHex(modules[0].hash) now
-    // that the integrity check above has passed.
-    bytesHash: genesisHash(sodium, wasm),
-    install: { wasm },
-  };
+  if (manifest.modules.length !== 1 || manifest.guest) return null;
+  const mod = manifest.modules[0];
+  const wasm = files[moduleFile(mod.name)];
+  if (!wasm || wasm.length === 0) return null;
+  return { app: manifest.app, moduleName: mod.name, moduleHash: mod.hash, wasm, authorPk: author };
 }
 
-// Admit a received/authored bundle we already trust (its bytesHash added to
-// pendingApprovals if needed). Returns the AppRecord on success.
+// Admit a bundle the user has already consented to. Calls the shared
+// §12.4 loadBundleBlob which verifies the manifest signature, checks the
+// admit gate, and installs the module. Returns the UI AppRecord.
 async function applyAppBundle(bundleBytes) {
-  const peeked = peekAppBundle(bundleBytes);
+  // Pre-peek metadata for the UI record: app_meta, ui, handler name, app key.
+  const peeked = peekMeta(bundleBytes);
   if (!peeked) throw new Error("not a valid app bundle");
-  const { meta, uiHtml } = await readWasmSections(peeked.install.wasm);
+  const { meta, uiHtml } = await readWasmSections(peeked.wasm);
   if (!meta) throw new Error("bundle module has no app_meta");
 
-  // Identify by the app KEY — `(author, app)` — not the bare id: two authors may each
-  // ship a "chat" and they coexist under distinct derived names (§5.1).
-  const id = peeked.manifest.app;
-  const key = peeked.key;
-  const handlerName = peeked.handlerName;
-
-  // The manifest signature and module hashes are already verified (peekAppBundle calls
-  // verifyBundle, which does both). The user already consented (pendingApprovals).
-  // Install the handler directly — there is no separate per-module admission gate.
-  if (!userConsented(peeked.bytesHash)) {
-    throw new Error("install rejected: user has not consented to this app");
-  }
-  host.installWasmHandler(handlerName, peeked.install.wasm);
+  const loaded = await shell.loadBundleBlob(bundleBytes);
+  const author = loaded.author;
+  const handlerName = kernelNameFor(author, peeked.app, peeked.moduleName);
+  const key = appKeyFor(author, peeked.app);
+  const handles = handlesOf(loaded.manifest);
 
   const record = {
-    id,
+    id: peeked.app,
     key,
-    name: meta.name || id,
+    name: meta.name || peeked.app,
     version: meta.version || "",
     description: meta.description || "",
-    authorPk: peeked.authorPk.slice(),
-    bytesHash: peeked.bytesHash,
+    authorPk: author.slice(),
+    bytesHash: genesisHash(sodium, peeked.wasm),
     bundleBytes: bundleBytes.slice(),
     handlerName,
-    handles: peeked.handles,
+    handles,
     uiHtml,
   };
   installedApps.set(key, record);
-  // Bind any protocol nobody holds yet (§12.10). An update keeps the bindings it already
-  // had — they point at this same app key — while a protocol this app newly declares, or
-  // one another app already holds, lands unbound for the user to decide.
   autoBind(record);
-  // Persist the packed bundle across reloads so transitive offers / updates keep
-  // working without re-receiving them.
   persistInstalledApps();
   renderAppList();
   return record;
@@ -521,24 +486,20 @@ async function addAppFromWasm(wasmBytes, fallbackId) {
   if (!meta || !meta.id) {
     meta = promptMeta(fallbackId);
     if (!meta) return;
-    // Re-embed the meta into the wasm so the bundle module carries it.
     wasmBytes = embedAppMeta(wasmBytes, meta);
   }
-  // No name conflict is possible here. We sign under OUR key, so the bundle derives
-  // names in our own namespace (§5.1): this either updates the app we already hold at
-  // `(us, meta.id)`, or lands beside somebody else's same-named app without touching it.
-  // There is nothing to refuse and no existing install to interrogate.
   const bundleBytes = await buildAppBundle(wasmBytes);
-  const peeked = peekAppBundle(bundleBytes);
+  const peeked = peekMeta(bundleBytes);
   if (!peeked) throw new Error("internal: just-built app bundle did not parse");
 
-  pendingApprovals.add(bytesToHex(peeked.bytesHash));
+  // Auto-approve locally-authored bundles and load through the shared shell.
+  pendingApprovals.add(peeked.moduleHash);
   try {
     const record = await applyAppBundle(bundleBytes);
     shellPrint(`Installed ${record.name} ${record.version}`, "sys");
     setActiveApp(record.key);
   } catch (err) {
-    pendingApprovals.delete(bytesToHex(peeked.bytesHash));
+    pendingApprovals.delete(peeked.moduleHash);
     shellPrint(`Install failed: ${err.message}`, "err");
     showAppsNotice(`Install failed: ${err.message}`, "err");
   }
@@ -602,9 +563,7 @@ async function restoreInstalledApps() {
   try { arr = JSON.parse(sessionStorage.getItem(STORE + ".bundles") || "[]"); }
   catch { return; }
   if (!Array.isArray(arr)) return;
-  // Bindings BEFORE apps: `autoBind` only fills vacancies, so restoring the user's
-  // choices first is what keeps a reload from silently re-binding a protocol to
-  // whichever app happens to come back first.
+  // Bindings BEFORE apps: `autoBind` only fills vacancies.
   try {
     const saved = JSON.parse(sessionStorage.getItem(STORE + ".bindings") || "[]");
     if (Array.isArray(saved)) {
@@ -617,22 +576,16 @@ async function restoreInstalledApps() {
   } catch {}
   for (const raw of arr) {
     try {
-      // Restored installs were already approved in a prior tab session —
-      // wave them through the approveInstall gate the same way an update
-      // would be: by adding their bytesHash to pendingApprovals.
       const bundleBytes = new Uint8Array(raw);
-      const peeked = peekAppBundle(bundleBytes);
+      const peeked = peekMeta(bundleBytes);
       if (!peeked) continue;
-      pendingApprovals.add(bytesToHex(peeked.bytesHash));
+      // Restored apps were previously approved — wave through the admit gate.
+      pendingApprovals.add(peeked.moduleHash);
       await applyAppBundle(bundleBytes);
     } catch (err) {
       shellPrint(`Could not restore an app: ${err.message}`, "err");
     }
   }
-  // Drop bindings pointing at an app that did not restore — a binding is only meaningful
-  // while its app is installed — then let the vacancies that leaves be filled by whatever
-  // remains. Without the second pass a protocol whose app is gone would stay unbound even
-  // with an installed app offering to serve it.
   for (const [proto, key] of bindings) if (!installedApps.has(key)) bindings.delete(proto);
   for (const rec of installedApps.values()) autoBind(rec);
   const saved = sessionStorage.getItem(STORE + ".active");
@@ -690,47 +643,33 @@ function unmountActiveApp() {
 const pendingOffers = new Map();   // bytesHashHex → { bundleBytes, peeked, fromPkHex }
 
 async function handleOffer(bundleBytes, fromPkHex) {
-  const peeked = peekAppBundle(bundleBytes);
+  const peeked = peekMeta(bundleBytes);
   if (!peeked) return;
-  const { install, authorPk, bytesHash } = peeked;
+  const { wasm, app: id, moduleHash, authorPk } = peeked;
+  const bytesHash = hexToBytes(moduleHash);
 
-  const id = peeked.manifest.app;
   let meta = null;
-  try { meta = (await readWasmSections(install.wasm)).meta; } catch {}
+  try { meta = (await readWasmSections(wasm)).meta; } catch {}
   if (!meta) {
     shellPrint(`Offer from ${fromPkHex.slice(0, 8)} dropped: bundle module has no app_meta`, "err");
     return;
   }
-  // Route + display by the signed manifest id; the wasm's app_meta id is cosmetic.
   meta = { ...meta, id };
-  // "Is this an update to something we already hold?" is now a plain map lookup: the
-  // app key contains the author (§12.4), so a match IS same-author — there is no key
-  // comparison to get wrong, and a stranger's bundle simply misses and falls through to
-  // the consent path below. An auto-update also inherits only the bindings it already
-  // had (§12.10), so an offer can never take over a protocol by arriving.
-  const existing = installedApps.get(peeked.key);
 
-  if (existing) {
-    try {
-      const rec = await applyAppBundle(bundleBytes);
-      shellPrint(
-        `Auto-updated ${rec.name} → ${rec.version} ` +
-        `(from ${fromPkHex.slice(0, 8)}, signed by ${bytesToHex(authorPk).slice(0, 8)})`, "sys");
-      // If this was the active app, re-mount the new UI.
-      if (activeAppKey === rec.key) setActiveApp(rec.key);
-    } catch (err) {
-      shellPrint(`Auto-update failed: ${err.message}`, "err");
-    }
-    return;
-  }
-
-  // Hand the user the decision. We don't dispatch yet — installation only
-  // happens after they click Install in the offer row.
   const hex = bytesToHex(bytesHash);
-  if (pendingOffers.has(hex)) return;   // duplicate
+  // Already running these exact bytes ⇒ nothing to offer. An update ships a new module
+  // hash, so it still surfaces for consent (installs are consent-gated, §12.4); only a
+  // redundant re-offer of what the user already has installed is dropped, so it never
+  // shows a pointless Install row.
+  for (const rec of installedApps.values()) {
+    if (rec.bytesHash && bytesToHex(rec.bytesHash) === hex) return;
+  }
+  if (pendingOffers.has(hex)) return;
   pendingOffers.set(hex, {
     bundleBytes: bundleBytes.slice(),
-    peeked: { ...peeked, meta },
+    // Keep the fields buildOfferRow renders (author + module hash) plus the moduleHash
+    // acceptOffer adds to pendingApprovals.
+    peeked: { moduleHash, meta, authorPk, bytesHash },
     fromPkHex,
   });
   renderOfferList();
@@ -742,7 +681,7 @@ async function handleOffer(bundleBytes, fromPkHex) {
 async function acceptOffer(bytesHashHex) {
   const offer = pendingOffers.get(bytesHashHex);
   if (!offer) return;
-  pendingApprovals.add(bytesHashHex);
+  pendingApprovals.add(offer.peeked.moduleHash);
   try {
     const rec = await applyAppBundle(offer.bundleBytes);
     pendingOffers.delete(bytesHashHex);
@@ -750,7 +689,7 @@ async function acceptOffer(bytesHashHex) {
     shellPrint(`Installed ${rec.name} ${rec.version} from offer.`, "sys");
     setActiveApp(rec.key);
   } catch (err) {
-    pendingApprovals.delete(bytesHashHex);
+    pendingApprovals.delete(offer.peeked.moduleHash);
     shellPrint(`Install from offer failed: ${err.message}`, "err");
     showAppsNotice(`Install from offer failed: ${err.message}`, "err");
   }
@@ -907,7 +846,7 @@ function removeApp(key) {
   if (!confirm(`Remove ${rec.name} ${rec.version}? The kernel handler will be uninstalled.`)) return;
   // Revocation (§12.5): removeHandler empties the kernel slot AND clears its install
   // record, so the same name is free to re-admit later with no stale attribution.
-  host.removeHandler(rec.handlerName);
+  shell.host.removeHandler(rec.handlerName);
   installedApps.delete(key);
   // Drop every protocol this app held (§12.10). Removing an app unbinds it; it does not
   // hand its protocols to anyone else, so the user chooses again from what remains.
@@ -1016,14 +955,6 @@ dropzone.addEventListener("drop", async (e) => {
   for (const f of dt.files) await loadDroppedFile(f);
 });
 openAppsBtn.addEventListener("click", () => showTab("apps"));
-
-renderAppList();
-renderOfferList();
-// Pull back anything we installed earlier in this session before any peer
-// link comes up — so once peers connect, transitive Offer works straight
-// away with the saved sealed bytes.
-restoreInstalledApps().catch((err) =>
-  shellPrint(`Restore failed: ${err.message}`, "err"));
 
 // ─── iframe protocol: handshake + outgoing messages ────────────────────
 window.addEventListener("message", (ev) => {
@@ -1136,6 +1067,30 @@ const net = new RtcNetwork({
   },
 });
 
+// Assemble the shared shell now that the identity and the RtcNetwork exist. The
+// platform is a browser seam: sodium, our identity, an in-memory freshness store, and
+// the RtcNetwork as the Network backend — no fs (a chat app is handler-only). An open
+// policy defers admission to `admit` (user consent).
+//
+// This MUST run before endpoint.onFrame below. createShell builds a Transport that
+// registers a frame sink on this same RtcNetwork; the RtcNetwork keeps a single sink
+// (last write wins), and we want the chat sink set just below to be the survivor.
+shell = createShell({
+  platform: {
+    sodium,
+    identity: myKeys,
+    freshnessStore: new FreshnessMarks(),
+    network: net,
+  },
+  policy: openPolicy(),
+  admit(v) {
+    const bytesHashHex = v.modules.length > 0 ? v.modules[0].mod.hash : "";
+    if (!pendingApprovals.has(bytesHashHex)) return false;
+    pendingApprovals.delete(bytesHashHex);
+    return true;
+  },
+});
+
 // Our attachment to the fabric — RtcNetwork is bound to our one key, so it vends
 // exactly this endpoint. Each inbound frame is a shell frame (CHAT / OFFER); the
 // sender `from` is the authenticated peer's pubkey hex.
@@ -1164,6 +1119,14 @@ function broadcastFrame(frameBytes) {
   for (const peerId of linked) endpoint.send(peerId, frameBytes);
   return linked.length;
 }
+
+// Boot the app registry now that the shell and the endpoint are wired: render the
+// (empty) lists, then pull back anything installed earlier this session so a
+// transitive Offer works the moment peers connect, from the saved signed bytes.
+renderAppList();
+renderOfferList();
+restoreInstalledApps().catch((err) =>
+  shellPrint(`Restore failed: ${err.message}`, "err"));
 
 // ─── live audio/video calls ────────────────────────────────────────────
 //

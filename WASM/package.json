@@ -60,6 +60,10 @@
       "types": "./build/host/main.d.ts",
       "default": "./build/host/main.js"
     },
+    "./shell-core": {
+      "types": "./build/host/shell-core.d.ts",
+      "default": "./build/host/shell-core.js"
+    },
     "./bundle": {
       "types": "./build/host/bundle.d.ts",
       "default": "./build/host/bundle.js"

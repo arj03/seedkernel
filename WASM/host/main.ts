@@ -15,22 +15,21 @@
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { KernelHost } from "./kernel-host.js";
+import type { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
 import { policyFromJson, type ShellPolicy } from "./policy.js";
 import {
-  FreshnessMarks, kernelNameFor, loadBundle as loadBundleBlob,
+  FreshnessMarks, loadBundle as loadBundleBlob,
   type BundleManifest, type FreshnessStore, type LoadedBundle,
 } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
-import { Transport, type Network, type PeerId } from "./net.js";
-import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
-import { createSafeRealm, type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
+import { type Network, type PeerId, type Transport } from "./net.js";
 import { NodeFs } from "./fs-node.js";
+import type { Fs } from "./fs.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
+import { createShell, type Shell as CoreShell, type KernelTable, type ShellSodium } from "./shell-core.js";
 
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
-type Identity = { publicKey: Uint8Array; privateKey: Uint8Array };
 
 export interface ShellOptions {
   /** allowed-keys.json contents (see policy.ts). Omit ⇒ a deny-all policy (no
@@ -40,7 +39,7 @@ export interface ShellOptions {
   /** Directory backing the fs.* capability. */
   dir: string;
   /** This node's kernel keypair (README §12.6). */
-  identity: Identity;
+  identity: { publicKey: Uint8Array; privateKey: Uint8Array };
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
   /** Inject a Network (tests). Defaults to a NodeNetwork on listen/wsListen — the
@@ -61,30 +60,30 @@ export interface ShellOptions {
 
 export type { LoadedBundle, FreshnessStore };
 
+/** The Node-side Shell — the platform-neutral core plus a file-backed
+ *  `loadBundle`. Kept as its own interface so a caller using the CLI shape
+ *  (which wants the file loader) sees both; cross-platform callers use CoreShell
+ *  directly from shell-core. */
 export interface Shell {
-  host: KernelHost;
+  /** The handler table: callHandler + isBound, without installWasmHandler.
+   *  The bind is solely the bundle loader's job (§12.4). */
+  host: KernelTable;
   net: Network;
   transport: Transport;
-  fs: NodeFs;
-  sodium: Sodium;
+  fs: Fs;
+  sodium: ShellSodium;
   policy: ShellPolicy;
-  /** Cohort peers the guest reaches via net.peers (CAP_NET_PEERS). */
   readonly peers: Set<PeerId>;
-  /** Add a peer to the cohort the guest can reach (and dial, if a NodeNetwork). */
   addPeer(peerId: PeerId): void;
-  /** Load a signed bundle file: verify the manifest, govern it against the policy,
-   *  integrity-check + install the modules, and return the guest source. */
-  loadBundle(file: string): LoadedBundle;
-  /** Run one of a loaded bundle's guest entrypoints — whichever names the app
-   *  declares — through a generic cap-bridge over the kernel's primitives. Load a
-   *  bundle first. This is "the shell runs the app" (README §12.8). */
+  /** Load a signed bundle *file*: read it from disk then delegate to the shared
+   *  §12.4 loader. This is the Node convenience wrapper; cross-platform callers
+   *  use `loadBundleBlob`. */
+  loadBundle(file: string): Promise<LoadedBundle>;
+  /** Load a signed bundle blob: verify the manifest, govern it against the
+   *  policy, integrity-check + install the modules, and return the guest source.
+   *  The §12.4 load order — the ONE install path. */
+  loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  /** Serve the app's request side: route incoming transport requests to the loaded
-   *  guest's `handle` entrypoint on the *same* confined realm `runGuest` uses. The
-   *  holder path answers from local fs + crypto synchronously (`callSync`) without
-   *  yielding, so it can respond while an initiator `runGuest` call is parked
-   *  mid-await in that realm — this is how the runtime answers for a cohort with no
-   *  app-specific host code (README §12.8). Idempotent; load a bundle first. */
   serve(): Promise<void>;
   close(): void;
 }
@@ -123,116 +122,47 @@ function freshnessPathFor(dir: string): string {
   return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
 }
 
-/** Assemble the runtime: the kernel and the bundle loader under its admission policy,
- *  plus the fs/net capability backends. Application-neutral. */
+/** Assemble the runtime on Node: create the Node platform (NodeFs, FileFreshnessStore,
+ *  NodeNetwork) and hand it to the shared createShell(). The Node shell is the platform-
+ *  neutral core plus a file-backed `loadBundle` — that is the whole platform seam. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
   const sodium = await loadSodium();
-  const host = new KernelHost();
 
-  // Omitted policy ⇒ deny-all; a provided one is parsed strictly (policy.ts). Wiring the
-  // admission policy is what lets the loader govern bundle loads (README §12.4–§12.5).
-  const policy = policyFromJson(opts.policyJson);
-
-  // Capability backends — all application-neutral primitives. The cap-bridge
-  // (built lazily in runGuest) exposes exactly these to a loaded bundle's guest:
-  // crypto (sumo), net (this transport), fs (this dir), the installed handlers,
-  // clock, and identity. The kernel itself never learns what app it is running.
+  // ── Node platform seam ─────────────────────────────────────────────────────
   const fs = new NodeFs(opts.dir);
   const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
   const ownsNet = !opts.network;
-  const net: Network = opts.network ??
-    new NodeNetwork({ identity: opts.identity, sodium, listen: opts.listen, wsListen: opts.wsListen });
+  const net: Network = opts.network ?? new NodeNetwork({
+    identity: opts.identity, sodium, listen: opts.listen, wsListen: opts.wsListen,
+  });
   if (ownsNet) await (net as NodeNetwork).start();
 
-  const peerId = toHex(opts.identity.publicKey);
-  const transport = new Transport(peerId, net, opts.timeoutMs ?? 2000);
-  const peers = new Set<PeerId>(opts.peers ?? []);
+  // ── Assemble the shared shell ───────────────────────────────────────────────
+  const core = createShell({
+    platform: { sodium: sodium as unknown as ShellSodium, identity: opts.identity, fs, freshnessStore: freshness, network: net },
+    policy: policyFromJson(opts.policyJson),
+    peers: opts.peers,
+    timeoutMs: opts.timeoutMs,
+    config: opts.config,
+  });
 
-  let loaded: LoadedBundle | null = null;
-  let realm: SafeRealm | null = null;         // one confined realm: initiator + holder
-  let served = false;                         // serve() wired transport.onRequest already
-
-  const requireLoaded = (): LoadedBundle => {
-    if (!loaded) throw new Error("shell: load a bundle first (loadBundle)");
-    return loaded;
-  };
-  // One cap-bridge shape for the realm — kernel primitives only. `runGuest` awaits net;
-  // the holder `handle` path only ever calls the synchronous ops.
-  // The bundle's signed manifest declares the capability *domains* it needs
-  // (`caps`); the shell expands those to the concrete op set the bridge enforces
-  // and wires only the matching backends, so a guest holds exactly what it
-  // declared — nothing outside its caps resolves.
-  const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
-    // No guest ⇒ no caps at all: authority is declared inside `guest` precisely so a
-    // handler-only bundle cannot hold any (§12.4).
-    const caps = new Set(b.manifest.guest?.caps ?? []);
-    return createCapBridge({
-      // The bundled sumo's overloaded .d.ts isn't structurally assignable to the
-      // bridge's minimal crypto surface (its crypto_generichash types the key as
-      // required) — narrow it with a cast; the bundled sumo build satisfies the
-      // surface at runtime.
-      sodium: sodium as unknown as CapSodium,
-      identity: opts.identity,
-      callHandler: (name, p) => host.callHandler(name, p),
-      transport, peers: () => [...peers],
-      fs: caps.has("fs") ? fs : undefined,   // only hand over the fs backend if declared
-      now: () => Date.now(),
-      allowedOps: opsForCaps(caps),
-      // Scope the guest's SIGN op to this bundle's namespace (README §12.2): the host
-      // signs `DOMAIN_guest ‖ scope ‖ msg`, never the raw node key over guest bytes.
-      signScope: guestSignScope(b.author, b.manifest.app),
-    });
-  };
-  // The guest source as signed content, fronted by three injected blocks:
-  //
-  //   capPreamble()     the generic op ABI (`const CAP_X = n`).
-  //   bundlePreamble()  `const BUNDLE` — what the RUNTIME derived from the admitted
-  //                     manifest: author, app, the signing prefix, and the kernel names
-  //                     its modules landed at. No author writes these by hand.
-  //   const APP         author config from the signed manifest, with the operator's
-  //                     `opts.config` merged OVER it (and winning) for per-node policy
-  //                     like a storage quota. Opaque to the shell.
-  //
-  // BUNDLE and APP are separate consts on purpose: operator config merges into APP, so
-  // anything that lived there would be operator-writable — including, before this split,
-  // the guest's own signing prefix. Nothing in BUNDLE can be overridden at boot.
-  // Both realms load the byte-identical program.
-  const guestFullSource = (b: LoadedBundle): string =>
-    capPreamble()
-    + bundlePreamble({
-      app: b.manifest.app,
-      author: b.author,
-      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)])),
-    })
-    + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
-    + b.guestSource;
-
+  // ── Node wrapper: add file-backed loadBundle ───────────────────────────────
   return {
-    host, net, transport, fs, sodium, policy, peers,
-    addPeer(p) { if (p !== peerId) peers.add(p); },
-    loadBundle(file) { return (loaded = loadBundle(host, sodium, policy, file, freshness)); },
-    async runGuest(entry, payload) {
-      const b = requireLoaded();
-      if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
-      return realm.call(entry, payload);
+    host: core.host,
+    net: core.net,
+    transport: core.transport,
+    fs: core.fs!,
+    sodium: core.sodium,
+    policy: core.policy,
+    peers: core.peers,
+    addPeer: core.addPeer,
+    loadBundleBlob: core.loadBundleBlob,
+    async loadBundle(file) {
+      return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
     },
-    async serve() {
-      const b = requireLoaded();
-      if (served) return;
-      if (!realm) realm = await createSafeRealm({ source: guestFullSource(b), bridge: buildBridge(b) });
-      const hr = realm;
-      served = true;
-      // arg = [type u8][payload]; the guest's `handle` returns the response bytes
-      // synchronously (admission / store / fetch are local fs + crypto only), so it can
-      // run re-entrantly while an initiator call is parked mid-await in this same realm.
-      transport.onRequest((_from, type, payload) => {
-        const arg = new Uint8Array(1 + payload.length);
-        arg[0] = type & 255;
-        arg.set(payload, 1);
-        return hr.callSync("handle", arg);
-      });
-    },
-    close() { realm?.dispose(); transport.close(); if (ownsNet) (net as NodeNetwork).close(); },
+    runGuest: core.runGuest,
+    serve: core.serve,
+    close() { core.close(); if (ownsNet) (net as NodeNetwork).close(); },
   };
 }
 
@@ -240,9 +170,16 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
  *  (bundle.ts `loadBundle`), which owns the verify → govern → freshness → integrity →
  *  install order. Reading the file is the whole platform seam: a bundle is one blob, so
  *  there is no directory walk and no filename to resolve. */
-export function loadBundle(host: KernelHost, sodium: Sodium, policy: ShellPolicy, file: string, freshness?: FreshnessStore): LoadedBundle {
+export function loadBundle(
+  host: KernelHost, sodium: Sodium, policy: ShellPolicy, file: string,
+  freshness?: FreshnessStore,
+): LoadedBundle {
   return loadBundleBlob(host, sodium, policy, new Uint8Array(readFileSync(file)), freshness);
 }
+
+// Re-export the shared types so callers get everything from one import.
+export { createShell, type KernelTable } from "./shell-core.js";
+export type { ShellPlatform } from "./shell-core.js";
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -277,7 +214,7 @@ function parseHostPort(s: string): { host: string; port: number } {
 
 /** Load the identity from --key, or mint one and persist it. The libsodium
  *  ed25519 secret key is seed‖pubkey, so the 32-byte public key is its tail. */
-function loadIdentity(sodium: Sodium, keyPath: string): Identity {
+function loadIdentity(sodium: Sodium, keyPath: string): { publicKey: Uint8Array; privateKey: Uint8Array } {
   if (existsSync(keyPath)) {
     const sk = fromHex(readFileSync(keyPath, "utf8").trim());
     if (sk.length !== 64) throw new Error(`--key must hold a 64-byte secret key (got ${sk.length})`);
@@ -336,7 +273,7 @@ export async function main(): Promise<void> {
   // A signed bundle from disk (the file-first path; relay delivery is the next
   // step). The shell verifies + governs it before anything lands.
   if (args["bundle"]) {
-    const b = shell.loadBundle(str(args, "bundle")!);
+    const b = await shell.loadBundle(str(args, "bundle")!);
     console.log(`  bundle ${b.manifest.app} v${b.manifest.version} → installed ${b.installed.join(", ") || "(none)"}`);
   }
   // One-shot client ops through the loaded guest — "the shell runs the app" as the
@@ -371,4 +308,3 @@ export async function main(): Promise<void> {
   console.log("serving — Ctrl-C to stop");
   process.on("SIGINT", () => { shell.close(); process.exit(0); });
 }
-

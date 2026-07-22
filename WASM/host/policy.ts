@@ -10,8 +10,26 @@
 
 export interface ShellPolicy {
   /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle
-   *  manifest and bind names (§12.4–§12.5). */
+   *  manifest and bind names (§12.4–§12.5). Not consulted when `open` is set. */
   authors: string[];
+  /** When set, ANY author is admitted — the `authors` allow-list is bypassed.
+   *  For deployments where admission is decided somewhere other than a static key
+   *  set: an interactive shell that gates each install on user consent (createShell's
+   *  `admit`, the browser path), and a node that loads exactly the one signed bundle
+   *  its operator handed it (a StorageNode's seedstore.skb) — there the choice of
+   *  bundle IS the trust decision. Deny-all stays the default for an omitted policy;
+   *  `open` is opt-in and never the result of parsing a config file. */
+  open?: boolean;
+}
+
+/** An open admission policy: any author is admitted. Use where a static author
+ *  allow-list is the wrong shape — an interactive shell whose real gate is per-bundle
+ *  user consent, or a node that only ever loads the single bundle it was configured
+ *  with. The author's manifest signature and the module hashes are still verified
+ *  (that is `verifyBundle`, not policy); `open` only waives the *who-signed-it*
+ *  allow-list, not authenticity or integrity. */
+export function openPolicy(): ShellPolicy {
+  return { authors: [], open: true };
 }
 
 /** Parse + validate a policy config. Throws on malformed input so a typo in the

@@ -534,7 +534,7 @@ export function installBundle(
   v: VerifiedBundle,
   freshness?: FreshnessStore,
 ): LoadedBundle {
-  if (!policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
+  if (!policy.open && !policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
     throw new Error("bundle: manifest author is not in the policy's allowed set");
   }
   // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer

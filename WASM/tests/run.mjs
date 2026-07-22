@@ -754,7 +754,7 @@ async function testBundle() {
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = shell.loadBundle(bundlePath);
+    const loaded = await shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
     assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
@@ -763,13 +763,13 @@ async function testBundle() {
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
     // version and reloading through the same shell exercises the downgrade gate.
     const remanifest = (version) => writeBundle({ ...manifest, version });
-    remanifest(1); shell.loadBundle(bundlePath); // equal version reloads (an ordinary reboot)
-    remanifest(2); shell.loadBundle(bundlePath); // newer version advances the mark to 2
+    remanifest(1); await shell.loadBundle(bundlePath); // equal version reloads (an ordinary reboot)
+    remanifest(2); await shell.loadBundle(bundlePath); // newer version advances the mark to 2
     remanifest(1);                                // now a downgrade
     let downgradeRefused = false;
-    try { shell.loadBundle(bundlePath); } catch { downgradeRefused = true; }
+    try { await shell.loadBundle(bundlePath); } catch { downgradeRefused = true; }
     assert(downgradeRefused, "a version below the (author, app) high-water mark is refused as a downgrade");
-    remanifest(2); shell.loadBundle(bundlePath);  // the mark held at 2, so v2 still loads
+    remanifest(2); await shell.loadBundle(bundlePath);  // the mark held at 2, so v2 still loads
     remanifest(1);                                // restore the original for the shell2 check below
 
     // a shell whose policy does NOT allow the author refuses the bundle
@@ -778,7 +778,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data2"), identity,
     });
     let refused = false;
-    try { shell2.loadBundle(bundlePath); } catch { refused = true; }
+    try { await shell2.loadBundle(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a non-allowed author is refused");
   } finally {
     if (shell) shell.close();
@@ -857,7 +857,7 @@ async function testGuestlessBundleAndArchive() {
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = shell.loadBundle(bundlePath);
+    const loaded = await shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
     assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
@@ -2090,20 +2090,20 @@ async function testBundleCorruptNewerRollback() {
 
     // 1. Good v4 loads and sets the mark to 4.
     writeBundle(4);
-    shell.loadBundle(bundlePath);
+    await shell.loadBundle(bundlePath);
 
     // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
     //    match their declared hash. The load must throw on the content check.
     writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
-    try { shell.loadBundle(bundlePath); } catch { v5Failed = true; }
+    try { await shell.loadBundle(bundlePath); } catch { v5Failed = true; }
     assert(v5Failed, "a corrupt v5 bundle fails to load");
 
     // 3. Restore the good v4 bundle and reload. If the failed v5 load had advanced the
     //    mark to 5, this would now be refused as a downgrade. It must still load.
     writeBundle(4);
     let v4Reloaded = true;
-    try { shell.loadBundle(bundlePath); } catch { v4Reloaded = false; }
+    try { await shell.loadBundle(bundlePath); } catch { v4Reloaded = false; }
     assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
   } finally {
     if (shell) shell.close();
