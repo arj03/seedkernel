@@ -95,9 +95,10 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 | Layer | Where it lives | Size |
 | --- | --- | --- |
-| **Shared logic** — the transport, PeerLink and routing (§12.6); the bundle format and admission policy (§12.4, §12.5); the cap-bridge and the guest ABI preamble (§12.2); the WebSocket codec | `WASM/host/*.ts`, compiled once — the native loader embeds that same output and runs it in QuickJS (§12.9) | ~2,500 lines |
+| **Shared logic** — the transport, PeerLink and routing (§12.6); the bundle format and admission policy (§12.4, §12.5); the cap-bridge and the guest ABI preamble (§12.2); the WebSocket codec | 13 `.ts` files in `WASM/host/`, compiled once — the native loader embeds that same output and runs it in QuickJS (§12.9) | ~2,500 lines |
+| **Browser/Node runtime** — the `KernelHost` class, RTC/WS server transports, safe-js guest evaluator, platform entry points | remaining `WASM/host/*.ts` (17 files) — not needed by the Go native host | ~1,800 lines |
 | **Shared binaries** — crypto, and the RFC 6455 framer | `libsodium.wasm`, `ws.wasm` — byte-identical on every target | ~280 KB, ~6 KB |
-| **Per-target host** — sockets, files, the crypto FFI, the JS engine embedding, the event loop | `native/*.go` | ~4,500 lines of Go |
+| **Per-target host** — sockets, files, the crypto FFI, the JS engine embedding, the event loop | `native/*.go` | ~4,100 lines of Go |
 
 The Go host is the larger of the two hosts only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing, and no policy logic lives in Go.
 
