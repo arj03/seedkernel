@@ -1,8 +1,9 @@
-// The Node platform binding for the routing core (net-route.ts) — node↔node over
-// TCP and browser↔node over WebSocket. It implements ChannelFactory: it knows how
-// to open node:net sockets and wrap them as RawChannels, and nothing else. The
-// routing, the PeerLink handshake, and the double-connect rule live in
-// NodeNetworkCore and are shared with every other target (the engine build swaps
+// The Node platform binding for the TCP/WS transport (net-route.ts) — node↔node
+// over TCP and browser↔node over WebSocket. It implements ChannelFactory: it knows
+// how to open node:net sockets and wrap them as RawChannels, and nothing else. The
+// transport bookkeeping and PeerLink handshake live in NodeNetworkCore; the
+// authenticated routing and the double-connect rule live in the shared LinkRouter
+// (link-router.ts) — both shared with every other target (the engine build swaps
 // this file for a factory over its native __net binding).
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so it is handled as
@@ -14,6 +15,7 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 
 import { NodeNetworkCore, type ChannelFactory, type PeerAddr } from "./net-route.js";
 import { MAX_FRAME_BYTES, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { BufferedChannel } from "./net-channel.js";
 import { WsServerChannel, WsClientChannel, type RawByteStream } from "./net-frame.js";
 import { installWasmWsBackend } from "./ws/ws-wasm-backend.js";
 import { writeU32BE, readU32BE, ByteQueue } from "./util.js";
@@ -46,40 +48,28 @@ export interface NodeNetworkOptions {
 
 // ── RawChannel: length-prefixed frames over a TCP socket ──────────────────────
 //   [len u32 BE][bytes]   one PeerLink message per record.
-class TcpChannel implements RawChannel {
-  private onMsg: ((bytes: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
+// BufferedChannel (net-channel.ts) carries the shared adapter machinery; this adds
+// the length-prefix framing on write and its reassembly on receive. node:net buffers
+// writes issued before connect, so the channel is writable from birth — open() is
+// called straight away and the base's pre-open queue stays unused.
+class TcpChannel extends BufferedChannel {
   private readonly q = new ByteQueue();
-  private dead = false;
 
   constructor(private readonly socket: Socket) {
+    super();
+    this.open();
     socket.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
     socket.on("close", () => this.fail());
     socket.on("error", () => this.fail());
   }
 
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
+  protected write(bytes: Uint8Array): void {
     const out = new Uint8Array(4 + bytes.length);
     writeU32BE(out, 0, bytes.length);
     out.set(bytes, 4);
     this.socket.write(out);
   }
-  onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; this.socket.destroy(); } }
-
-  /** Failure teardown: destroy the socket AND notify onClose. close() (the
-   *  deliberate path) sets `dead` first, so a fail() that follows it stays
-   *  silent — but an error/'close' event on a live channel must always reach
-   *  onClose, or the owning PeerLink is never forgotten from the routing maps
-   *  and the peer is blackholed until restart. */
-  private fail(): void {
-    if (this.dead) return;
-    this.dead = true;
-    this.socket.destroy();
-    this.onCls?.();
-  }
+  protected stop(): void { this.socket.destroy(); }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -91,7 +81,7 @@ class TcpChannel implements RawChannel {
       if (len > MAX_FRAME_BYTES) { this.fail(); return; }
       if (this.q.length < 4 + len) break;
       this.q.drop(4);
-      this.onMsg?.(this.q.take(len)!);
+      this.deliver(this.q.take(len)!);
     }
   }
 }

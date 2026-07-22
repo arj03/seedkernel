@@ -3,8 +3,8 @@ package main
 import _ "embed"
 
 // hostNetRouteJS is the shared transport + routing core (net.ts Transport +
-// net-route.ts NodeNetworkCore + net-link.ts PeerLink), bundled from
-// build/host/{util,net,net-link,net-route}.js. It runs in QuickJS over a Go-backed
+// net-route.ts NodeNetworkCore + net-link.ts PeerLink + link-router.ts LinkRouter),
+// bundled from build/host/{util,net,net-link,link-router,net-route}.js. It runs in QuickJS over a Go-backed
 // ChannelFactory (engineNetworkJS, sock.go) that opens sockets through __net. This
 // is the routing that used to live in net.go's NodeNetwork + Transport.
 //

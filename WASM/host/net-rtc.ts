@@ -31,52 +31,34 @@
 // is safe.
 
 import type { Network, Endpoint, PeerId } from "./net.js";
-import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { PeerLink, type Identity, type TransportCrypto } from "./net-link.js";
+import { BufferedChannel } from "./net-channel.js";
+import { LinkRouter } from "./link-router.js";
 import { toHex } from "./util.js";
 
 // ── RawChannel over one RTCDataChannel ────────────────────────────────────────
 // An RTCDataChannel is already an ordered, whole-message binary pipe (WebRTC does
-// framing + ordering), so this is a thin adapter. Its one job beyond shuffling
-// bytes: buffer sends issued before the channel reaches "open", because PeerLink
-// emits its HELLO the instant it is constructed — the same pre-open queueing the
-// WS channel does in net-node.ts.
-export class RtcChannel implements RawChannel {
-  private onMsg: ((b: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
-  private readonly pending: Uint8Array[] = [];
-  private dead = false;
-
+// framing + ordering), so this is a thin adapter over BufferedChannel (net-channel.ts) —
+// the twin of net-ws.ts's WsChannel, with the same pre-open send buffer PeerLink
+// needs because it emits its HELLO the instant the link is constructed.
+export class RtcChannel extends BufferedChannel {
   constructor(private readonly dc: RTCDataChannel) {
+    super();
     dc.binaryType = "arraybuffer";
     dc.addEventListener("message", (ev: MessageEvent) => {
-      // String frames are not ours (a host may multiplex renegotiation signaling
-      // over the same channel — see chat-shell.js); only binary frames are
-      // PeerLink messages.
-      if (!this.dead && typeof ev.data !== "string") this.onMsg?.(new Uint8Array(ev.data as ArrayBuffer));
+      // String frames are not ours (a host may multiplex renegotiation signaling over
+      // the same channel — see chat-shell.js); only binary frames are PeerLink messages.
+      if (typeof ev.data !== "string") this.deliver(new Uint8Array(ev.data as ArrayBuffer));
     });
-    dc.addEventListener("open", () => {
-      // The DOM types RTCDataChannel.send as requiring an ArrayBuffer-backed view
-      // (not SharedArrayBuffer). PeerLink frames are always plain Uint8Arrays over
-      // a real ArrayBuffer, so the narrowing cast is sound.
-      for (const b of this.pending) dc.send(b as Uint8Array<ArrayBuffer>);
-      this.pending.length = 0;
-    });
+    dc.addEventListener("open", () => this.open());
     dc.addEventListener("close", () => this.fail());
     dc.addEventListener("error", () => this.fail());
   }
-
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
-    if (this.dc.readyState === "open") this.dc.send(bytes as Uint8Array<ArrayBuffer>);
-    else this.pending.push(bytes);
-  }
-  onMessage(cb: (b: Uint8Array) => void): void { this.onMsg = cb; }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; try { this.dc.close(); } catch { /* already gone */ } } }
-
-  // Failure teardown notifies onClose so the owning PeerLink is forgotten from the
-  // routing maps (see net-node.ts TcpChannel.fail for why this must always fire).
-  private fail(): void { if (!this.dead) { this.dead = true; this.onCls?.(); } }
+  // The DOM types RTCDataChannel.send as requiring an ArrayBuffer-backed view (not
+  // SharedArrayBuffer); PeerLink frames are always plain Uint8Arrays over a real
+  // ArrayBuffer, so the narrowing cast is sound.
+  protected write(bytes: Uint8Array): void { this.dc.send(bytes as Uint8Array<ArrayBuffer>); }
+  protected stop(): void { this.dc.close(); }
 }
 
 // ── Signaling: a pluggable rendezvous for the SDP/ICE exchange ─────────────────
@@ -145,13 +127,9 @@ interface PeerEntry {
 }
 
 export class RtcNetwork implements Network {
-  /** Diagnostics, mirroring LoopbackNetwork / NodeNetwork. */
-  framesDelivered = 0;
-
   private readonly opts: RtcNetworkOptions;
   private readonly ownId: PeerId;
-  private sink: ((from: PeerId, frame: Uint8Array) => void) | null = null;
-  private readonly links = new Map<PeerId, PeerLink>();  // authenticated, routable
+  private readonly router: LinkRouter;
   private readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-auth)
   // Local media tracks to publish to every peer (now and as new ones connect).
   // Empty unless the app started a call via addLocalTrack().
@@ -160,24 +138,30 @@ export class RtcNetwork implements Network {
   constructor(opts: RtcNetworkOptions) {
     this.opts = opts;
     this.ownId = toHex(opts.identity.publicKey);
+    // Authenticated-pool routing, the roster gate, and the up/down edges the storage
+    // cohort mirrors are the shared LinkRouter (link-router.ts). WebRTC opens exactly
+    // one channel per pair, so each pool is size ≤1 and the tie-break never fires.
+    this.router = new LinkRouter({
+      ownPubkey: opts.identity.publicKey, ownId: this.ownId,
+      admit: opts.admit, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
+    });
     opts.signaling.onMessage((m) => this.onSignal(m));
   }
+
+  /** Frames delivered to the Transport's sink — a diagnostic mirroring LoopbackNetwork. */
+  get framesDelivered(): number { return this.router.framesDelivered; }
 
   // ── Network interface ────────────────────────────────────────────────────────
   /** A single-identity fabric: it vends exactly one endpoint, its own. */
   endpoint(id: PeerId): Endpoint {
     if (id !== this.ownId) throw new Error("RtcNetwork is bound to one identity");
-    return {
-      send: (to, frame) => this.sendFrame(to, frame),
-      onFrame: (sink) => { this.sink = sink; }, // Transport routes its frame sink here (net.ts)
-      close: () => { this.sink = null; this.close(); },
-    };
+    return this.router.endpoint((to, frame) => this.sendFrame(to, frame), () => this.close());
   }
   private sendFrame(to: PeerId, frame: Uint8Array): void {
     // Links form through signaling/discovery, not lazily on first send. A frame to
     // a peer with no authenticated link is dropped, exactly as Loopback/NodeNetwork
     // drop to an unknown peer; the Transport's timeout copes with the fallout.
-    this.links.get(to)?.send(frame);
+    this.router.send(to, frame);
   }
 
   /** Announce ourselves into the room so present peers begin the WebRTC dance.
@@ -186,7 +170,7 @@ export class RtcNetwork implements Network {
   join(): void { this.opts.signaling.send({ type: "hello", from: this.ownId }); }
 
   /** The peers we currently hold an authenticated link to (for broadcast / UI). */
-  linkedPeers(): PeerId[] { return [...this.links.keys()]; }
+  linkedPeers(): PeerId[] { return this.router.linkedPeers(); }
 
   // ── live media (audio/video) ──────────────────────────────────────────────────
   // Calls ride the same RTCPeerConnections as the data channel. addTrack triggers
@@ -234,9 +218,8 @@ export class RtcNetwork implements Network {
 
   /** Tear down every connection, link, and the signaling channel. */
   close(): void {
-    for (const l of this.links.values()) l.close();
+    this.router.closeAll(); // authenticated links (also held as e.link); double-close is a no-op
     for (const e of this.peers.values()) { try { e.pc.close(); } catch { /* ignore */ } }
-    this.links.clear();
     this.peers.clear();
     this.opts.signaling.close();
   }
@@ -303,33 +286,27 @@ export class RtcNetwork implements Network {
       sodium: this.opts.sodium,
       weDialed,
       expectPeerId: peerId, // PeerLink pins the far key to who signaling said it is
-      onAuth: (pid, l) => this.promote(pid, l, e),
-      onFrame: (pid, frame) => this.deliver(pid, frame),
+      onAuth: (pid, l) => this.onAuth(pid, l, e),
+      onFrame: (pid, frame) => this.router.deliver(pid, frame),
       onClose: () => this.forget(peerId),
     });
   }
 
-  private promote(peerId: PeerId, link: PeerLink, e: PeerEntry): void {
-    // Final gate: even a peer that finished the WebRTC + PeerLink handshake is
-    // dropped if it is not on the roster. Identity is now proven, so this is a
-    // trustworthy decision.
-    if (this.opts.admit && !this.opts.admit(peerId)) { link.close(); return; }
-    e.authed = true;
-    this.links.set(peerId, link);
-    this.opts.onPeerUp?.(peerId);
-  }
-
-  private deliver(peerId: PeerId, frame: Uint8Array): void {
-    if (!this.sink || peerId === this.ownId) return;
-    this.framesDelivered++;
-    this.sink(peerId, frame); // PeerLink only delivers post-auth, tagged with the authenticated id
+  // A link authenticated: hand it to the router (which applies the roster gate and
+  // fires onPeerUp). If the router declines it (off-roster), tear the whole peer
+  // connection down — WebRTC has nothing to keep once its one channel is rejected.
+  private onAuth(peerId: PeerId, link: PeerLink, e: PeerEntry): void {
+    if (this.router.promote(peerId, link)) e.authed = true;
+    else this.forget(peerId);
   }
 
   private forget(peerId: PeerId): void {
-    const had = this.links.delete(peerId);
     const e = this.peers.get(peerId);
+    // remove() fires onPeerDown iff this peer had an authenticated link; a peer torn
+    // down before its channel authenticated (or after the roster declined it) never
+    // entered the router, so no spurious down edge is emitted.
+    if (e?.link) this.router.remove(e.link);
     if (e) { try { e.pc.close(); } catch { /* ignore */ } this.peers.delete(peerId); }
-    if (had) this.opts.onPeerDown?.(peerId);
   }
 
   // ── signaling handlers: hello / sdp / ice (perfect negotiation) ───────────────

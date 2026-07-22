@@ -21,7 +21,9 @@
 // (which expose a global WebSocket) for headless testing.
 
 import type { Network, Endpoint, PeerId } from "./net.js";
-import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { PeerLink, type Identity, type TransportCrypto } from "./net-link.js";
+import { BufferedChannel } from "./net-channel.js";
+import { LinkRouter } from "./link-router.js";
 import { toHex } from "./util.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
@@ -36,47 +38,25 @@ export interface WsLike {
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
 }
 
-const WS_OPEN = 1; // WebSocket.OPEN
-
 // ── RawChannel over one WebSocket ─────────────────────────────────────────────
 // A WebSocket delivers whole binary messages in order, so this is a thin adapter —
-// the role RtcChannel plays for an RTCDataChannel. Its one job beyond shuffling
-// bytes: buffer sends issued before "open", because PeerLink emits its HELLO the
-// instant the link is constructed.
-export class WsChannel implements RawChannel {
-  private onMsg: ((b: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
-  private readonly pending: Uint8Array[] = [];
-  private dead = false;
-
+// the role RtcChannel plays for an RTCDataChannel. BufferedChannel (net-channel.ts)
+// carries the shared machinery, including the pre-open send buffer PeerLink needs
+// because it emits its HELLO the instant the link is constructed.
+export class WsChannel extends BufferedChannel {
   constructor(private readonly ws: WsLike) {
+    super();
     ws.binaryType = "arraybuffer";
     ws.addEventListener("message", (ev: { data: unknown }) => {
       // Only binary frames are PeerLink messages; a string frame is never ours.
-      const d = ev.data;
-      if (this.dead || typeof d === "string") return;
-      this.onMsg?.(new Uint8Array(d as ArrayBuffer));
+      if (typeof ev.data !== "string") this.deliver(new Uint8Array(ev.data as ArrayBuffer));
     });
-    ws.addEventListener("open", () => {
-      for (const b of this.pending) ws.send(b);
-      this.pending.length = 0;
-    });
+    ws.addEventListener("open", () => this.open());
     ws.addEventListener("close", () => this.fail());
     ws.addEventListener("error", () => this.fail());
   }
-
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
-    if (this.ws.readyState === WS_OPEN) this.ws.send(bytes);
-    else this.pending.push(bytes);
-  }
-  onMessage(cb: (b: Uint8Array) => void): void { this.onMsg = cb; }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; try { this.ws.close(); } catch { /* already gone */ } } }
-
-  // Failure teardown notifies onClose so the owning PeerLink is forgotten from the
-  // routing maps (same contract as RtcChannel / TcpChannel).
-  private fail(): void { if (!this.dead) { this.dead = true; this.onCls?.(); } }
+  protected write(bytes: Uint8Array): void { this.ws.send(bytes); }
+  protected stop(): void { this.ws.close(); }
 }
 
 export interface WsNetworkOptions {
@@ -103,46 +83,40 @@ export interface WsNetworkOptions {
 }
 
 export class WsNetwork implements Network {
-  /** Diagnostics, mirroring LoopbackNetwork / RtcNetwork. */
-  framesDelivered = 0;
-
   private readonly opts: WsNetworkOptions;
   private readonly ownId: PeerId;
   private readonly mkWs: (url: string) => WsLike;
   private readonly conns: number;
-  private sink: ((from: PeerId, frame: Uint8Array) => void) | null = null;
-  private readonly links = new Map<PeerId, PeerLink[]>();    // authenticated, routable (1..connsPerPeer)
+  private readonly router: LinkRouter;
   private readonly dialing = new Map<PeerId, PeerLink[]>();  // every link we have dialed to a peer
-  private readonly rr = new Map<PeerId, number>();           // round-robin send cursor per peer
 
   constructor(opts: WsNetworkOptions) {
     this.opts = opts;
     this.ownId = toHex(opts.identity.publicKey);
     this.mkWs = opts.webSocketFactory ?? ((url: string) => new WebSocket(url) as unknown as WsLike);
     this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
+    // Authenticated-pool routing, the roster gate, and the up/down edges the cohort
+    // mirrors are all the shared LinkRouter (link-router.ts). All links here are
+    // outbound (weDialed = true), so its double-connect tie-break never fires.
+    this.router = new LinkRouter({
+      ownPubkey: opts.identity.publicKey, ownId: this.ownId,
+      admit: opts.admit, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
+    });
   }
+
+  /** Frames delivered to the Transport's sink — a diagnostic mirroring LoopbackNetwork. */
+  get framesDelivered(): number { return this.router.framesDelivered; }
 
   // ── Network interface ──────────────────────────────────────────────────────────
   /** A single-identity fabric: it vends exactly one endpoint, its own. */
   endpoint(id: PeerId): Endpoint {
     if (id !== this.ownId) throw new Error("WsNetwork is bound to one identity");
-    return {
-      send: (to, frame) => this.sendFrame(to, frame),
-      onFrame: (sink) => { this.sink = sink; }, // Transport routes its frame sink here (net.ts)
-      close: () => { this.sink = null; this.close(); },
-    };
+    return this.router.endpoint((to, frame) => this.sendFrame(to, frame), () => this.close());
   }
   private sendFrame(to: PeerId, frame: Uint8Array): void {
-    // A frame to a peer with no authenticated link is dropped, exactly as the other
-    // Networks drop to an unknown peer; the Transport's timeout copes with it. With
-    // multiple links, stripe frames round-robin so a bulk transfer fans out across
-    // every parallel flow (each is its own record session; the peer's Transport
-    // correlates the reply by corr id, not by which link delivered it).
-    const pool = this.links.get(to);
-    if (!pool || pool.length === 0) return;
-    const i = (this.rr.get(to) ?? 0) % pool.length;
-    this.rr.set(to, i + 1);
-    pool[i].send(frame);
+    // The router stripes across the peer's flows, or drops if it has no authenticated
+    // link — the Transport's timeout copes, exactly as the other Networks' drops.
+    this.router.send(to, frame);
   }
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
@@ -170,8 +144,11 @@ export class WsNetwork implements Network {
         sodium: this.opts.sodium,
         weDialed: true,
         expectPeerId: peerId, // pin the far key to the address we dialed
-        onAuth: (pid, l) => this.promote(pid, l),
-        onFrame: (pid, frame) => this.deliver(pid, frame),
+        // On auth the router installs the link and fires onPeerUp; if it declines
+        // (off-roster), drop the link from `dialing` too so it isn't counted as a
+        // live flow — a rejected link never fires its channel-close forget().
+        onAuth: (pid, l) => { if (!this.router.promote(pid, l)) this.forget(peerId, l); },
+        onFrame: (pid, frame) => this.router.deliver(pid, frame),
         onClose: () => this.forget(peerId, link),
       });
       arr.push(link);
@@ -180,43 +157,23 @@ export class WsNetwork implements Network {
   }
 
   /** The peers we currently hold at least one authenticated link to (for UI / cohort). */
-  linkedPeers(): PeerId[] { return [...this.links.keys()]; }
+  linkedPeers(): PeerId[] { return this.router.linkedPeers(); }
 
   /** Tear down every link. */
   close(): void {
     for (const arr of this.dialing.values()) for (const l of arr) l.close();
-    this.links.clear();
     this.dialing.clear();
-    this.rr.clear();
+    this.router.closeAll(); // authenticated links also live in `dialing`; double-close is a no-op
   }
 
-  private promote(peerId: PeerId, link: PeerLink): void {
-    // Final gate: even a peer that completed the identity handshake is dropped if it
-    // is not on the roster. Identity is proven now, so this is a trustworthy call.
-    if (this.opts.admit && !this.opts.admit(peerId)) { link.close(); return; }
-    let pool = this.links.get(peerId);
-    const first = !pool || pool.length === 0;
-    if (!pool) { pool = []; this.links.set(peerId, pool); }
-    pool.push(link);
-    if (first) this.opts.onPeerUp?.(peerId); // fire once, when the peer first becomes reachable
-  }
-
-  private deliver(peerId: PeerId, frame: Uint8Array): void {
-    if (!this.sink || peerId === this.ownId) return;
-    this.framesDelivered++;
-    this.sink(peerId, frame); // PeerLink only delivers post-auth, tagged with the proven id
-  }
-
+  // A link died (channel close) or was declined by the roster: remove it from the
+  // outbound `dialing` pool, then from the router (which fires onPeerDown when the
+  // peer's LAST authenticated link goes — losing one of several parallel flows
+  // leaves the peer reachable, so the cohort must not evict it).
   private forget(peerId: PeerId, link: PeerLink): void {
     const dl = this.dialing.get(peerId);
     if (dl) { const i = dl.indexOf(link); if (i >= 0) dl.splice(i, 1); if (dl.length === 0) this.dialing.delete(peerId); }
-    const pool = this.links.get(peerId);
-    if (!pool) return;
-    const i = pool.indexOf(link);
-    if (i >= 0) pool.splice(i, 1);
-    // onPeerDown only when the LAST link to the peer drops — losing one of several
-    // parallel flows leaves the peer reachable, so the cohort must not evict it.
-    if (pool.length === 0) { this.links.delete(peerId); this.rr.delete(peerId); this.opts.onPeerDown?.(peerId); }
+    this.router.remove(link);
   }
 }
 
