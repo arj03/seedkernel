@@ -1,22 +1,22 @@
-// The shell's install policy loader (the runtime split, "the minimal shell:
-// allowed keys + an untrusted relay"). It turns a small JSON config — "which keys
-// you allow" — into the registry's §7.4 `ApproveInstall` callback, narrowing the
-// open reference posture (`referencePolicy(host, () => true)`, which accepts any
-// audited author) down to a **closed author-key set** plus an optional
-// **module-hash allowlist**. This is the only governance the generic runtime
-// carries: everything else — codec, reputation, the storage guest — arrives in a
-// signed bundle whose manifest author must clear this gate (§12.4).
+// The shell's admission policy (README §12.5). It turns a small JSON config — "which
+// keys you allow" — into the loader's `AdmitPolicy`: a **closed author-key set** plus an
+// optional **module-hash allowlist**. It needs no name rule: kernel names derive from the
+// author's key (§5.1), so squat-resistance is structural and a policy has no name to
+// arbitrate. This is the only governance the generic runtime carries: everything else —
+// codec, reputation, the storage guest — arrives in a signed bundle whose manifest author
+// must clear this gate (§12.4). A deployment that needs more replaces the whole `AdmitPolicy`
+// (a quorum, an HSM console, bytecode validation); the file is the declarative common case.
 
-import type { ApproveInstall, InstallerHost } from "./installer.js";
-import { referencePolicy } from "./installer.js";
+import type { AdmitPolicy } from "./bundle.js";
 import { toHex } from "./util.js";
 
 export interface ShellPolicy {
-  /** Closed set of author Ed25519 public keys (hex) permitted to bind a name. */
+  /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle manifest
+   *  (§12.4 step 2) and bind a name (§12.5). */
   authors: string[];
   /** Optional allowlist of module `bytesHash`es (hex — `genesisHash(wasm)`, the
    *  same id a manifest's `modules[].hash` uses). Omitted ⇒ any module from an
-   *  allowed author is accepted; present ⇒ the install's hash must be listed. */
+   *  allowed author is accepted; present ⇒ the admitted hash must be listed. */
   modules?: string[];
 }
 
@@ -56,20 +56,24 @@ export function policyFromJson(json: string | null | undefined): ShellPolicy {
   return json ? parsePolicy(json) : { authors: [] };
 }
 
-/** Build the §7.4 `ApproveInstall` callback for a policy: a closed author set
- *  gates WHO may bind a name, and an optional module-hash allowlist pins WHICH
- *  binaries (`genesisHash(wasm)`) may land. An empty author set (the omitted-policy
- *  default) admits nothing — every first install fails the `authors` check below. */
-export function buildApproveInstall(host: InstallerHost, policy: ShellPolicy): ApproveInstall {
+/** The default admission decision (README §12.5): the loader's `admit` derived from a
+ *  policy file. Three conjoined checks —
+ *    1. `author ∈ authors` — the closed author set gates WHO may install;
+ *    2. `bytesHash ∈ modules` if that field is present — pins WHICH binaries may land.
+ *
+ *  Nothing about the name is checked, because a name is not contestable: it derives from
+ *  the author's own key (§5.1), so no admitted author can bind over another's. Squat
+ *  resistance costs no clause here and no state anywhere.
+ *
+ *  An empty author set (the omitted-policy default) admits nothing — every bind fails
+ *  check 1. */
+export function buildAdmit(policy: ShellPolicy): AdmitPolicy {
   const authors = new Set(policy.authors.map((s) => s.toLowerCase()));
   const modules = policy.modules ? new Set(policy.modules.map((s) => s.toLowerCase())) : null;
 
-  return referencePolicy(
-    host,
-    (_name, author, bytesHash) => {
-      if (!authors.has(toHex(author.publicKey))) return false;       // closed author set
-      if (modules && !modules.has(toHex(bytesHash))) return false;   // module-hash allowlist
-      return true;
-    },
-  );
+  return (_name, author, bytesHash, _wasm) => {
+    if (!authors.has(toHex(author))) return false;                   // closed author set
+    if (modules && !modules.has(toHex(bytesHash))) return false;     // module-hash allowlist
+    return true;
+  };
 }

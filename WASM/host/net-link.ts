@@ -11,13 +11,13 @@
 // PeerLink is transport-agnostic: it drives any RawChannel that delivers whole
 // messages (TCP gets message framing from a length prefix; WebSocket already has
 // message boundaries). Three short message types ride the channel:
-//   HELLO = pubkey(32) ‖ nonce(32) ‖ eph(32)   sent by both ends immediately
-//   AUTH  = sign(transcript)(64)               binds both pubkeys, nonces + ephs
-//   FRAME = ChaCha20-Poly1305 record           only after both ends authenticate
+//   HELLO = suite(1) ‖ pubkey(32) ‖ nonce(32) ‖ eph(32)  sent by both ends immediately
+//   AUTH  = sign(transcript)(64)                         binds both halves entire
+//   FRAME = ChaCha20-Poly1305 record                     only after both authenticate
 //
 // `eph` is a fresh ephemeral X25519 public key, generated per connection. AUTH
-// signs the whole transcript — DOMAIN_CHANNEL ‖ the two (pubkey ‖ nonce ‖ eph) triples in
-// a canonical order — not just the peer's nonce. Signing the nonce alone would
+// signs the whole transcript — DOMAIN_CHANNEL ‖ the two (suite ‖ pubkey ‖ nonce ‖ eph)
+// halves in a canonical order — not just the peer's nonce. Signing the nonce alone would
 // make a node a signing oracle: an attacker could relay a victim's outstanding
 // nonce as its own HELLO, collect the node's signature, and replay it on another
 // connection to impersonate the node. Binding both identities, both nonces, and
@@ -36,7 +36,7 @@
 // takes a DH role.
 
 import { concatBytes, toHex, writeU32BE } from "./util.js";
-import { DOMAIN_CHANNEL } from "./domains.js";
+import { DOMAIN_CHANNEL, SUITE_CHANNEL_GENESIS } from "./domains.js";
 
 /** A peer identity — the node's kernel ed25519 keypair (README §12.6). */
 export interface Identity {
@@ -75,8 +75,16 @@ export interface RawChannel {
 }
 
 const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
+// Cipher-suite id — the first byte of HELLO and of each transcript half; see domains.ts
+// for why it exists and why it is not negotiated. A link speaks exactly one suite: an
+// unrecognised id closes the connection, and because the byte sits inside the signed
+// transcript, an in-path attacker who flips it only makes the two ends sign different
+// bytes, so both AUTHs fail. The suite is chosen by the endpoints, never forced by the
+// network (§12.6, §14.1).
+const SUITE_LEN = 1;
 const PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
-const HELLO_LEN = PK_LEN + NONCE_LEN + EPH_LEN;
+const OFF_PK = SUITE_LEN, OFF_NONCE = OFF_PK + PK_LEN, OFF_EPH = OFF_NONCE + NONCE_LEN;
+const HELLO_LEN = OFF_EPH + EPH_LEN;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
 // Directional session-key labels (README §12.6): the `lo` end encrypts with
 // k_lo→hi and decrypts with k_hi→lo; the `hi` end mirrors. Distinct constants so
@@ -130,8 +138,9 @@ export class PeerLink {
   private readonly myEph: { publicKey: Uint8Array; privateKey: Uint8Array };
   private readonly queue: Uint8Array[] = [];
   private queuedBytes = 0;
-  private peerNonce: Uint8Array | null = null;
   private peerEph: Uint8Array | null = null;
+  /** The peer's HELLO body, verbatim — it *is* their transcript half (see myHalf). */
+  private peerHello: Uint8Array | null = null;
   private closed = false;
   // Directional record-layer state, set once the session key is derived (onAuth).
   private sendKey: Uint8Array | null = null;
@@ -184,36 +193,35 @@ export class PeerLink {
   }
 
   private sendHello(): void {
-    const hello = new Uint8Array(HELLO_LEN);
-    hello.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
-    hello.set(this.myNonce, PK_LEN);
-    hello.set(this.myEph.publicKey.subarray(0, EPH_LEN), PK_LEN + NONCE_LEN);
-    this.ch.send(this.tag(MSG_HELLO, hello));
+    this.ch.send(this.tag(MSG_HELLO, this.myHalf()));
   }
 
-  /** My (pubkey ‖ nonce ‖ eph) triple — one side of the transcript. */
-  private myTriple(): Uint8Array {
-    const t = new Uint8Array(HELLO_LEN);
-    t.set(this.opts.identity.publicKey.subarray(0, PK_LEN), 0);
-    t.set(this.myNonce, PK_LEN);
-    t.set(this.myEph.publicKey.subarray(0, EPH_LEN), PK_LEN + NONCE_LEN);
-    return t;
+  /** My half of the transcript — `suite ‖ pubkey ‖ nonce ‖ eph`.
+   *
+   *  This is *exactly* the HELLO body: the bytes we put on the wire and the bytes we
+   *  sign are one construction, so they cannot drift apart. That equality is what makes
+   *  the suite byte load-bearing rather than decorative — everything a peer declares
+   *  about the handshake is, by construction, inside what both ends sign. */
+  private myHalf(): Uint8Array {
+    const h = new Uint8Array(HELLO_LEN);
+    h[0] = SUITE_CHANNEL_GENESIS;
+    h.set(this.opts.identity.publicKey.subarray(0, PK_LEN), OFF_PK);
+    h.set(this.myNonce, OFF_NONCE);
+    h.set(this.myEph.publicKey.subarray(0, EPH_LEN), OFF_EPH);
+    return h;
   }
 
-  /** The peer's (pubkey ‖ nonce ‖ eph) triple. Requires peerPubkey/Nonce/Eph. */
-  private peerTriple(): Uint8Array {
-    const t = new Uint8Array(HELLO_LEN);
-    t.set(this.peerPubkey!, 0);
-    t.set(this.peerNonce!, PK_LEN);
-    t.set(this.peerEph!, PK_LEN + NONCE_LEN);
-    return t;
+  /** The peer's half — their HELLO body verbatim, kept rather than reassembled from
+   *  parsed fields so we sign the bytes they actually sent. Requires onHello to have run. */
+  private peerHalf(): Uint8Array {
+    return this.peerHello!;
   }
 
-  /** The bytes both ends sign and verify: DOMAIN_CHANNEL followed by the two triples
+  /** The bytes both ends sign and verify: DOMAIN_CHANNEL followed by the two halves
    *  ordered by their bytes so both ends derive an identical transcript regardless
    *  of who dialed. */
   private transcript(): Uint8Array {
-    const mine = this.myTriple(), theirs = this.peerTriple();
+    const mine = this.myHalf(), theirs = this.peerHalf();
     const [lo, hi] = bytesCompare(mine, theirs) <= 0 ? [mine, theirs] : [theirs, mine];
     return concatBytes([DOMAIN_CHANNEL, lo, hi]);
   }
@@ -228,8 +236,16 @@ export class PeerLink {
   }
 
   private onHello(body: Uint8Array): void {
-    if (this.peerPubkey || body.length < HELLO_LEN) { this.close(); return; }
-    const pubkey = body.slice(0, PK_LEN);
+    // Exact length, not a minimum: for a given suite the HELLO width is fixed, so a
+    // longer body is malformed rather than forward-compatible. Accepting a tail would
+    // be the dangerous kind of extension point — trailing bytes that ride along
+    // *outside* what the transcript covers, and so outside what AUTH signs. Extensions
+    // belong in a new suite, whose bytes are covered like every other field.
+    if (this.peerPubkey || body.length !== HELLO_LEN) { this.close(); return; }
+    // Suite first: a different suite means different field widths below, so parsing
+    // before checking would be reading another format's bytes at this one's offsets.
+    if (body[0] !== SUITE_CHANNEL_GENESIS) { this.close(); return; }
+    const pubkey = body.slice(OFF_PK, OFF_PK + PK_LEN);
     // Reflection guard: a peer presenting OUR own kernel key is either our own HELLO
     // echoed back or an attacker replaying it. Because the transcript is canonically
     // ordered, both ends sign identical AUTH bytes, so echoing our HELLO+AUTH would
@@ -237,13 +253,12 @@ export class PeerLink {
     // to ourselves in the routing tables (visible to linkedPeers()/cohort logic).
     // expectPeerId only guards the dialing side; a node never links to itself — drop it.
     if (bytesCompare(pubkey, this.opts.identity.publicKey.subarray(0, PK_LEN)) === 0) { this.close(); return; }
-    const peerNonce = body.slice(PK_LEN, PK_LEN + NONCE_LEN);
-    const peerEph = body.slice(PK_LEN + NONCE_LEN, HELLO_LEN);
+    const peerEph = body.slice(OFF_EPH, OFF_EPH + EPH_LEN);
     const peerId = toHex(pubkey);
     if (this.opts.expectPeerId && peerId !== this.opts.expectPeerId) { this.close(); return; }
     this.peerPubkey = pubkey;
-    this.peerNonce = peerNonce;
     this.peerEph = peerEph;
+    this.peerHello = body.slice(0, HELLO_LEN);
     this.peerId = peerId;
     // Authenticate over the full transcript — both pubkeys, both nonces, both
     // ephemeral keys — so this signature is bound to this exchange (and this key
@@ -282,7 +297,7 @@ export class PeerLink {
     const kdf = (label: Uint8Array): Uint8Array =>
       this.sodium.crypto_generichash(KEY_LEN, concatBytes([dh, th, label]), null);
     const kLoHi = kdf(LABEL_LO2HI), kHiLo = kdf(LABEL_HI2LO);
-    const iAmLo = bytesCompare(this.myTriple(), this.peerTriple()) <= 0;
+    const iAmLo = bytesCompare(this.myHalf(), this.peerHalf()) <= 0;
     this.sendKey = iAmLo ? kLoHi : kHiLo;
     this.recvKey = iAmLo ? kHiLo : kLoHi;
   }

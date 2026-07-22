@@ -1,11 +1,10 @@
-// seedkernel native shell. The runtime is wasm (kernel); apps arrive as signed
-// bundles (README §12) — nothing application-specific lives here. Host
-// orchestration (installer §7, bundle verification §12) is JavaScript in QuickJS —
-// the shared host TS, compiled and bundled to the embedded host-*.gen.js, never a
-// second implementation (README §12.9); this Go layer is only the bridge: loads the
-// kernel wasm, supplies the genesis crypto (Ed25519 + SHA-3), hosts the `signature`
-// wrapper (§6.3) and the single signer it records (§6.5), and exposes byte
-// primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
+// seedkernel native shell. Apps arrive as signed bundles (README §12) — nothing
+// application-specific lives here. Host orchestration (bundle verification + admission
+// §12.4/§12.5) is JavaScript in QuickJS — the shared host TS, compiled and bundled to the
+// embedded host-*.gen.js, never a second implementation (README §12.9); this Go layer is
+// only the bridge: it owns the handler table (§3), supplies the crypto primitives
+// (Ed25519 via libsodium, BLAKE2b native) the realm verifies bundles with, and exposes
+// byte primitives to the realm. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the
 // in-repo qjs/wazero bridge) → one static binary.
 package main
 
@@ -30,13 +29,10 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-//go:embed wasm/kernel.wasm
-var kernelWasm []byte
-
-// hostInstallerJS is the shared installer + install policy + bundle format/loader,
-// bundled from build/host/{util,installer,policy,bundle,native-shim}.js. It runs in
+// hostInstallerJS is the shared bundle loader + admission policy + bundle format,
+// bundled from build/host/{util,domains,bundle,policy,native-shim}.js. It runs in
 // QuickJS over the byte-level `bridge` below and is the ONLY implementation of the
-// §7 install rules and the §12.4 bundle load order — the same compiled TS the Node
+// §12.5 admission rules and the §12.4 bundle load order — the same compiled TS the Node
 // shell runs, so the protocol is never re-derived in a second language (README §12.9).
 // Regenerate with `npm run build:loader-bundles`; do not hand-edit.
 //
@@ -53,49 +49,21 @@ type wasmHandler struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// entry is what the loader tracks per installed handler, keyed by the kernel's handler id.
-// The kernel owns name → id (find_handler) — the one routing decision, shared by dispatch
-// and kernel.call — so keying by id here leaves no second name table to drift from it.
-// Exactly one of nat / wasm is set.
-type entry struct {
-	name    []byte // the §4.2 caller name reported to handlers it calls
-	blocked bool   // refused via kernel.call (§4.4)
-	nat     func([]byte) []byte
-	wasm    *wasmHandler
-}
-
-type signer struct {
-	algo int
-	pk   []byte
-}
-
 var (
-	ctx     = context.Background()
-	rt      wazero.Runtime
-	kn      api.Module
-	qc      *qjs.Context
-	qrt     *qjs.Runtime
-	entries = map[int32]*entry{}      // kernel handler id → impl (the kernel owns name → id)
-	byMod   = map[api.Module]*entry{} // wasm handler module → its entry, for the kernel imports
-	nextID  = int32(10)
-	// The verified signer of the current top-level dispatch (README §6.5), or nil
-	// when the message is unsigned. A `signature` wrapper is a single signature —
-	// signatureHandler sets this on a verified wrapper and clears it when the inner
-	// dispatch returns — so there is no stack: nesting is forbidden. Dispatch is
-	// single-threaded (§4.2), so a plain package var needs no locking.
-	curSigner *signer
-	// envDomain is DOMAIN_env (README §6.3, §16.1), read once at boot from the single
-	// definition in the evaluated domains.ts (host-installer.gen.js exports DOMAIN_ENV)
-	// — no hand-copied prefix. signatureHandler prepends it to the signed preimage.
-	envDomain []byte
-	// callerStack tracks the call chain for kernel.caller (§4.2): one frame per
-	// kernel.call in flight, immediate caller last. A nil frame is a host/guest-originated
-	// call, which has no kernel name. Single-threaded like curSigner, so no locking.
-	callerStack [][]byte
+	ctx = context.Background()
+	rt  wazero.Runtime
+	qc  *qjs.Context
+	qrt *qjs.Runtime
+	// handlers is the handler table (README §3): the whole kernel, which is a contract
+	// rather than an artifact. A name is bound exactly when it is a key here, so the §3.1
+	// SetHandler / remove / resolve operations are map assignment, delete and lookup —
+	// there is no id indirection and no second table to drift from this one. Every value
+	// is an installed module: bundles are the one way code arrives (§12.4).
+	handlers = map[string]*wasmHandler{}
+	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
+	// module name; it is not an identity anything resolves through.
+	modSeq = 0
 )
-
-// maxCallDepth caps kernel.call re-entrancy (README §10 MAX_CALL_DEPTH, §4.4).
-const maxCallDepth = 8
 
 // defaultScratchSize is the I/O region a handler reserves at `scratch` when it declares
 // none (README §4.1). One needing more exports a `scratchSize` global — seedstore's codec
@@ -103,437 +71,86 @@ const maxCallDepth = 8
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
-// kcallDepth bounds re-entrant kernel.call recursion (§4.4). Dispatch is single-threaded
-// (§4.2), so a plain package var needs no locking.
-var kcallDepth int
-
-// wasmCall invokes a wasm export, returning nil if it's missing or the call failed —
-// so a missing ABI function degrades instead of panicking the host.
-func wasmCall(m api.Module, name string, args ...uint64) []uint64 {
-	if fn := m.ExportedFunction(name); fn != nil {
-		if r, err := fn.Call(ctx, args...); err == nil {
-			return r
-		}
-	}
-	return nil
+// bind binds `n` to `w`, releasing whatever the name held before — SetHandler's
+// replace-in-place (§3.1). The one place a displaced wasm instance is closed: Go frees
+// neither the instance nor its compiled code on its own, so dropping the map value alone
+// would leak one linear memory + its JITed code per replace for the process's life.
+func bind(n string, w *wasmHandler) {
+	closeHandler(handlers[n])
+	handlers[n] = w
 }
 
-func rd(m api.Memory, p, n uint32) []byte { x, _ := m.Read(p, n); return append([]byte(nil), x...) }
-
-func wr(m api.Module, data []byte) uint32 {
-	r := wasmCall(m, "alloc", uint64(len(data)))
-	// alloc can fail two ways: the call itself faults (len(r)==0) or it returns a NULL
-	// pointer (r[0]==0) when the module is out of memory. Either is a 0 return here —
-	// writing at address 0 would scribble the module's low memory, and callers key off 0.
-	if len(r) == 0 || r[0] == 0 {
-		return 0
-	}
-	p := uint32(r[0])
-	if !m.Memory().Write(p, data) {
-		wasmCall(m, "dealloc", uint64(p)) // hand the block back rather than leak it
-		return 0
-	}
-	return p
-}
-
-// name is a bootstrap handler name (README §5.1): the literal-ASCII
-// "seedkernel.bootstrap.v1:" + canonical. Bootstrap names are plain ASCII, not
-// genesis-hash-derived — swapping the genesis suite no longer re-derives the
-// bootstrap namespace (only bytes_hash still depends on the genesis hash).
-func name(canonical string) []byte {
-	return []byte("seedkernel.bootstrap.v1:" + canonical)
-}
-
-// findHandlerID resolves the id bound to `n` through the kernel's find_handler export, or
-// -1. The single name → id lookup every loader path goes through (the kernel.call router,
-// callHandler, boot), so none can resolve a name differently from dispatch (§3.1, §4.4).
-func findHandlerID(n []byte) int32 {
-	p := wr(kn, n)
-	if p == 0 {
-		return -1
-	}
-	r := wasmCall(kn, "find_handler", uint64(p), uint64(len(n)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if len(r) == 0 {
-		return -1
-	}
-	return int32(r[0])
-}
-
-// bindHandler binds `n` to `id` in the kernel's table and records `e` under that id,
-// dropping whatever the name was bound to before. The one place "one name ⇒ one handler id"
-// is maintained, so no install path leaves a stale entry — or a leaked wasm instance —
-// behind. The displaced id is resolved before the rebind, so it sees the pre-rebind table.
-func bindHandler(n []byte, id int32, e *entry) bool {
-	old := findHandlerID(n)
-	p := wr(kn, n)
-	if p == 0 {
-		return false
-	}
-	wasmCall(kn, "set_handler", uint64(p), uint64(len(n)), uint64(uint32(id)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if old >= 0 && old != id {
-		dropEntry(old)
-	}
-	entries[id] = e
-	if e.wasm != nil {
-		byMod[e.wasm.mod] = e
-	}
-	return true
-}
-
-// dropEntry forgets the entry at `id`, closing its wasm instance and compiled code. Go
-// frees neither on its own, so dropping the map key alone would leak one linear memory +
-// its JITed code per replace/uninstall for the process's life.
-func dropEntry(id int32) {
-	e := entries[id]
-	if e == nil {
+// closeHandler releases a handler's wasm instance and compiled code. nil-safe, so callers
+// can hand it whatever a lookup returned.
+func closeHandler(w *wasmHandler) {
+	if w == nil {
 		return
 	}
-	if w := e.wasm; w != nil {
-		_ = w.mod.Close(ctx)
-		_ = w.cmod.Close(ctx)
-		delete(byMod, w.mod)
-	}
-	delete(entries, id)
+	_ = w.mod.Close(ctx)
+	_ = w.cmod.Close(ctx)
 }
 
-// isRegistered answers the kernel's handler-table query for `n`: a name is bound
-// exactly when find_handler resolves it, so this asks that rather than a second
-// export answering the same question. The shared §7.4 policy consults it so a
-// first install cannot overlay a SetHandler-seeded bootstrap slot.
-func isRegistered(n []byte) bool {
-	return findHandlerID(n) >= 0
-}
-
-// removeHandler unbinds `n` via the kernel's remove_handler (§7.5) and drops the entry it
-// resolved to. The id is read before the removal, since afterwards the name maps to nothing.
-func removeHandler(n []byte) bool {
-	id := findHandlerID(n)
-	p := wr(kn, n)
-	if p == 0 {
+// removeHandler unbinds `n` (§12.5) and releases what it held.
+func removeHandler(n string) bool {
+	w := handlers[n]
+	if w == nil {
 		return false
 	}
-	r := wasmCall(kn, "remove_handler", uint64(p), uint64(len(n)))
-	wasmCall(kn, "dealloc", uint64(p))
-	if len(r) == 0 || r[0] != 1 {
-		return false
-	}
-	if id >= 0 {
-		dropEntry(id)
-	}
+	closeHandler(w)
+	delete(handlers, n)
 	return true
 }
 
-func load(wasm []byte, modName string) api.Module {
-	cm, _ := rt.CompileModule(ctx, wasm)
-	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(modName))
-	if err != nil {
-		panic(err)
-	}
-	return m
-}
-
-// invokeByID runs the handler bound to `id` (README §4 scratch ABI) and returns its
-// response. Routing already happened, by id against the kernel's table, so `n` is only
-// passed through to native handlers. Used by inbound dispatch (response dropped) and by
-// kernel.call (response returned).
-func invokeByID(id int32, n, payload []byte) []byte {
-	e := entries[id]
-	if e == nil {
+// callHandler invokes an installed handler by name (README §4), returning its response or
+// nil if the name is unbound or the handler produced nothing. The one way into an installed
+// module: the host uses it directly and the cap-bridge routes MODULE_CALL (§12.2) through
+// it. Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
+func callHandler(n string, payload []byte) []byte {
+	w := handlers[n]
+	if w == nil {
 		return nil
 	}
-	if w := e.wasm; w != nil {
-		// §4: write input at the scratch offset, call handle(input_len), read the response
-		// back from the same offset. Both copies are clamped to what the handler reserved
-		// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
-		if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
+	// §4: write input at the scratch offset, call handle(input_len), read the response
+	// back from the same offset. Both copies are clamped to what the handler reserved
+	// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
+	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
+		return nil
+	}
+	r, err := w.fn.Call(ctx, uint64(len(payload)))
+	// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
+	// length is a failure. A 0-length result is a valid EMPTY response, not a
+	// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
+	// from "no handler / trap" (nil).
+	if err != nil || len(r) == 0 {
+		return nil
+	}
+	outLen := int32(r[0])
+	if outLen < 0 || uint32(outLen) > w.size {
+		return nil
+	}
+	out := make([]byte, outLen)
+	if len(out) > 0 {
+		// A returned length past the module's own memory is as bogus as an
+		// oversized payload above — fail rather than return zero-filled bytes.
+		b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
+		if !ok {
 			return nil
 		}
-		r, err := w.fn.Call(ctx, uint64(len(payload)))
-		// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
-		// length is a failure. A 0-length result is a valid EMPTY response, not a
-		// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
-		// from "no handler / trap" (nil).
-		if err != nil || len(r) == 0 {
-			return nil
-		}
-		outLen := int32(r[0])
-		if outLen < 0 || uint32(outLen) > w.size {
-			return nil
-		}
-		out := make([]byte, outLen)
-		if len(out) > 0 {
-			// A returned length past the module's own memory is as bogus as an
-			// oversized payload above — fail rather than return zero-filled bytes.
-			b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
-			if !ok {
-				return nil
-			}
-			copy(out, b)
-		}
-		return out
+		copy(out, b)
 	}
-	if e.nat != nil {
-		return e.nat(payload)
-	}
-	return nil
+	return out
 }
 
-// callHandler invokes an installed handler by name from the loader side (the cap-bridge's
-// way into installed wasm), or nil if the name is unbound, refused, or produced nothing.
-// The host counterpart of a handler's kernel.call, under the same §4.4 guards — a handler
-// the call router refuses must not become reachable by name through this path either.
-func callHandler(n, payload []byte) []byte {
-	id := findHandlerID(n)
-	if id < 0 {
-		return nil
-	}
-	e := entries[id]
-	if e == nil || e.blocked || kcallDepth >= maxCallDepth {
-		return nil
-	}
-	// An anonymous frame: the host/guest caller has no kernel name, so the target (and any
-	// bridge pinning on §8.1) must see "no installed caller", not a stale outer frame.
-	callerStack = append(callerStack, nil)
-	kcallDepth++
-	defer func() {
-		kcallDepth--
-		callerStack = callerStack[:len(callerStack)-1]
-	}()
-	return invokeByID(id, n, payload)
-}
-
-// immediateCaller serializes the immediate caller as the [name_len u8][name] buffer
-// kernel.caller returns (§4.2); no caller — top-level dispatch, or a host/guest frame — is
-// the single byte [0x00]. Only the immediate caller is exposed: the deeper chain stays
-// unreachable, so a bridge cannot authorize on a non-immediate frame (§8.1).
-func immediateCaller() []byte {
-	if len(callerStack) == 0 {
-		return []byte{0}
-	}
-	n := callerStack[len(callerStack)-1]
-	if len(n) == 0 {
-		return []byte{0}
-	}
-	return append([]byte{byte(len(n))}, n...)
-}
-
-// env.invoke_handler — kernel matched a name (README §3). The `signature` wrapper is
-// an ordinary native handler now (signatureHandler), so there is nothing to
-// special-case: route on the id the kernel matched, like any other handler.
-func invoke(_ context.Context, km api.Module, hid, nP, nL, pP, pL uint32) {
-	// The kernel already matched the name to `hid` in its table; route on that id rather
-	// than re-resolving the name. Inbound: the response is dropped.
-	invokeByID(int32(hid), rd(km.Memory(), nP, nL), rd(km.Memory(), pP, pL))
-}
-
-// signatureHandler is the `signature` wrapper (README §6.3, §6.5) — an ordinary
-// native host handler, no wasm module and no bespoke ABI. It parses the wrapper,
-// assembles the domain-separated suite request, and verifies it via the suite at the
-// algo's slot (§6.4) with the same callHandler any host code uses. On success it
-// records the single signer of this dispatch, re-dispatches the inner envelope under
-// it, and clears the signer on return, so "signed ⟺ a signer is set" holds by
-// construction. Any malformed field, or a suite reporting invalid, drops the message.
-//
-// One signature per message: if a signer is already set (the inner envelope is itself
-// a `signature` wrapper) the message drops. Forbidding nesting makes verify-
-// amplification unrepresentable rather than merely capped. Registered blocked from
-// kernel.call (§4.4), so it only ever runs at top-level dispatch; its response is
-// always nil (the re-dispatch happens here).
-func signatureHandler(payload []byte) []byte {
-	if curSigner != nil {
-		return nil
-	}
-	// Parse [algo_id u16][signer_len u16][signer][sig_len u16][sig][inner].
-	if len(payload) < 4 {
-		return nil
-	}
-	o := 0
-	algo := int(payload[o])<<8 | int(payload[o+1])
-	o += 2
-	sl := int(payload[o])<<8 | int(payload[o+1])
-	o += 2
-	if sl <= 0 || o+sl > len(payload) {
-		return nil
-	}
-	pk := payload[o : o+sl]
-	o += sl
-	if o+2 > len(payload) {
-		return nil
-	}
-	sigLen := int(payload[o])<<8 | int(payload[o+1])
-	o += 2
-	if sigLen <= 0 || o+sigLen > len(payload) {
-		return nil
-	}
-	sig := payload[o : o+sigLen]
-	o += sigLen
-	inner := payload[o:]
-	if len(inner) == 0 {
-		return nil
-	}
-	// Suite verify request [pk_len u16][pk][sig_len u16][sig][data], where the signed
-	// preimage data = DOMAIN_env ‖ algo ‖ signer_len ‖ signer ‖ inner (§6.3). Prepending
-	// the domain + outer fields here gives every suite domain separation and outer-field
-	// binding for free — the suite just verifies sig over data.
-	data := make([]byte, 0, len(envDomain)+2+2+sl+len(inner))
-	data = append(data, envDomain...)
-	data = append(data, byte(algo>>8), byte(algo))
-	data = append(data, byte(sl>>8), byte(sl))
-	data = append(data, pk...)
-	data = append(data, inner...)
-	req := make([]byte, 0, 2+sl+2+sigLen+len(data))
-	req = append(req, byte(sl>>8), byte(sl))
-	req = append(req, pk...)
-	req = append(req, byte(sigLen>>8), byte(sigLen))
-	req = append(req, sig...)
-	req = append(req, data...)
-	// Reach the suite at its slot — an unknown algo_id has no handler there, so
-	// callHandler returns nil → drop, the same fail-safe as a suite reporting invalid.
-	resp := callHandler(suiteSlotName(algo), req)
-	if len(resp) < 1 || resp[0] != 1 {
-		return nil
-	}
-	// Verified: record the signer, dispatch the inner envelope under it, clear on
-	// return. The defer clears it even if dispatch unwinds (§6.5).
-	curSigner = &signer{algo, append([]byte(nil), pk...)}
-	defer func() { curSigner = nil }()
-	dispatch(inner)
-	return nil
-}
-
-// kernel.call — one handler reaches another (README §4.4). Returns the response length,
-// or -1 (^uint32(0)) on every error: bogus pointers, unbound or blocked name, depth
-// exceeded, missing handler / trap, or a response too large for the caller's scratch.
-func kcall(_ context.Context, cm api.Module, nP, nL, pP, pL uint32) uint32 {
-	// byMod holds an entry only for modules installed as handlers. A module that reaches
-	// kernel.call without one has no scratch region the loader knows of, so there is
-	// nowhere to put a response — refuse rather than clobber its low memory.
-	ce := byMod[cm]
-	if ce == nil || ce.wasm == nil {
-		return ^uint32(0)
-	}
-	// Bound re-entrant recursion (§4.4): two mutually-recursive handlers get a clean -1
-	// here instead of overflowing the Go stack and crashing the whole node.
-	if kcallDepth >= maxCallDepth {
-		return ^uint32(0)
-	}
-	// The pointers come straight from the calling handler and may run past its memory;
-	// §4.4 wants a clean -1 for that, not a read of whatever is there. Copy out, since
-	// the target's handle() may grow its own memory and invalidate a borrowed view.
-	nb, nok := cm.Memory().Read(nP, nL)
-	pb, pok := cm.Memory().Read(pP, pL)
-	if !nok || !pok {
-		return ^uint32(0)
-	}
-	n, payload := append([]byte(nil), nb...), append([]byte(nil), pb...)
-	// Route through the kernel's find_handler — the same table top-level dispatch resolves
-	// against — so the two paths can never resolve a name differently (§4.4).
-	id := findHandlerID(n)
-	if id < 0 {
-		return ^uint32(0)
-	}
-	t := entries[id]
-	if t == nil || t.blocked {
-		return ^uint32(0)
-	}
-	// Push the caller's name so kernel.caller resolves in the target (§4.2) and any bridge
-	// it reaches can pin on it (§8.1). Popped on the way out, including on a panic, so the
-	// stack stays balanced.
-	callerStack = append(callerStack, ce.name)
-	kcallDepth++
-	defer func() {
-		kcallDepth--
-		callerStack = callerStack[:len(callerStack)-1]
-	}()
-
-	resp := invokeByID(id, n, payload)
-	if resp == nil {
-		return ^uint32(0)
-	}
-	// The response must fit the region the caller reserved (§4.1); if it doesn't, write
-	// nothing and return -1 (§4.4) rather than hand back stale bytes under a valid length.
-	if uint32(len(resp)) > ce.wasm.size || !cm.Memory().Write(ce.wasm.scratch, resp) {
-		return ^uint32(0)
-	}
-	return uint32(len(resp))
-}
-
-// suiteSlotName is a signature suite's slot name (README §6.4): the literal-ASCII
-// "seedkernel.suite.v1:" + algo_id_hex (4 lowercase hex digits). Slot names are
-// plain ASCII, not genesis-hash-derived (§5.1), so the signature module builds the
-// byte-identical name and reaches the suite by plain kernel.call. A suite is an
-// ordinary handler at this name — genesis included, seeded natively in boot().
-func suiteSlotName(algoID int) []byte {
-	return []byte(fmt.Sprintf("seedkernel.suite.v1:%04x", algoID))
-}
-
-// genesisSuiteVerify services the genesis suite slot (algo_id 0x0000 = Ed25519 +
-// SHA-3-256) with libsodium, so the genesis verify is the same binary as the
-// browser. A suite verifies, nothing else, so the request has no op selector (§6.6):
-//   [pk_len u16][pk][sig_len u16][sig][data ..] -> [valid u8]
-// `data` is the full signed preimage the signature module assembled
-// (DOMAIN_env ‖ algo_id ‖ signer_len ‖ signer ‖ inner, §6.3); the suite just verifies
-// sig over data under pk, oblivious to its structure.
-func genesisSuiteVerify(req []byte) []byte {
-	invalid := []byte{0}
-	o := 0
-	if o+2 > len(req) {
-		return invalid
-	}
-	pkLen := int(req[o])<<8 | int(req[o+1])
-	o += 2
-	if pkLen != 32 || o+pkLen > len(req) {
-		return invalid
-	}
-	pk := req[o : o+pkLen]
-	o += pkLen
-	if o+2 > len(req) {
-		return invalid
-	}
-	sigLen := int(req[o])<<8 | int(req[o+1])
-	o += 2
-	if sigLen != 64 || o+sigLen > len(req) {
-		return invalid
-	}
-	sig := req[o : o+sigLen]
-	o += sigLen
-	data := req[o:]
-	// Gate on the point check before verifying, as the JS host does: it rejects
-	// non-canonical encodings and small-order/identity keys that crypto_sign_verify_detached
-	// alone would not consistently refuse. Both targets must accept exactly the same key
-	// set, or a signature one node honors another drops (§6.2).
-	if !sd.isValidPoint(pk) {
-		return invalid
-	}
-	if sd.verifyDetached(sig, data, pk) {
-		return []byte{1}
-	}
-	return invalid
-}
-
-// serializeSigner renders the current signer as the `signature.signer` query response
-// (README §6.5): [0x00] when the dispatch is unsigned, or [0x01][algo u16 BE][pk ..]
-// when it is signed — the pubkey runs to the end, so a single signer needs no length
-// prefix and a post-quantum suite's multi-kilobyte key fits without truncation.
-func serializeSigner([]byte) []byte {
-	if curSigner == nil {
-		return []byte{0}
-	}
-	out := []byte{1, byte(curSigner.algo >> 8), byte(curSigner.algo)}
-	return append(out, curSigner.pk...)
-}
-
-// installWasm instantiates handler bytes and binds them to the raw name `n`. The replace is
-// unconditional — the §7.4 policy already ran, and bindHandler releases whatever the name
-// displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §7).
-func installWasm(n, wasm []byte) bool {
+// installWasm instantiates handler bytes and binds them at the name `n`. The replace is
+// unconditional — the §12.5 admission already ran, and bind releases whatever the name
+// displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §12.4).
+func installWasm(n string, wasm []byte) bool {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return false
 	}
-	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", nextID)))
+	modSeq++
+	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	if err != nil {
 		_ = cm.Close(ctx) // instantiation failed — release the compiled code
 		return false
@@ -564,62 +181,25 @@ func installWasm(n, wasm []byte) bool {
 			size = d
 		}
 	}
-	id := nextID
-	nextID++
-	bound = bindHandler(n, id, &entry{name: append([]byte(nil), n...), wasm: &wasmHandler{m, cm, fn, s, size}})
-	return bound
+	bind(n, &wasmHandler{m, cm, fn, s, size})
+	bound = true
+	return true
 }
 
-// boot wires the wasm host imports, instantiates kernel + signature, and stands up the
-// QuickJS realm running the shared installer + bundle loader (host-installer.gen.js).
+// boot wires the wasm host imports and stands up the QuickJS realm running the shared
+// bundle loader + admission policy (host-installer.gen.js).
 func boot() {
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd = bootSodium(rt) // crypto primitive; the genesis suite verify routes to it below
+	sd = bootSodium(rt) // crypto primitive; the genesis verify routes to it below
+	// Every installed handler is a pure transform (README §4): the only host import it
+	// takes is the AssemblyScript `env.abort` shim. There is no kernel.call / kernel.caller
+	// seam and no env.invoke_handler dispatch callback.
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
-	env.NewFunctionBuilder().WithFunc(invoke).Export("invoke_handler")
 	env.Instantiate(ctx)
-	k := rt.NewHostModuleBuilder("kernel")
-	k.NewFunctionBuilder().WithFunc(kcall).Export("call")
-	k.NewFunctionBuilder().WithFunc(func(_ context.Context, m api.Module, out uint32) uint32 {
-		// kernel.caller: write the immediate caller at `out`, return the bytes written, 0 on
-		// failure (§4.2). Only an installed handler has a memory the loader may write to.
-		if byMod[m] == nil {
-			return 0
-		}
-		b := immediateCaller()
-		if !m.Memory().Write(out, b) {
-			return 0
-		}
-		return uint32(len(b))
-	}).Export("caller")
-	k.Instantiate(ctx)
-	kn = load(kernelWasm, "kernelmod")
-	// The runtime above is fresh, so its kernel table is empty: drop entries a previous boot
-	// left behind (the tests boot repeatedly) rather than keep ids from a dead runtime.
-	entries = map[int32]*entry{}
-	byMod = map[api.Module]*entry{}
-	callerStack = nil
-	curSigner = nil
-	kcallDepth = 0
-	// The `signature` wrapper: an ordinary native host handler (no wasm module, no
-	// bespoke ABI). It parses the wrapper, verifies via the suite at its slot, then
-	// records the signer and re-dispatches the inner envelope (README §6.3, §6.5). It
-	// is privileged only in being blocked from kernel.call (§4.4): it establishes the
-	// signer, so an arbitrary handler reaching it via kernel.call could reframe it.
-	sigID := registerNative("signature", signatureHandler)
-	entries[sigID].blocked = true
-
-	// Seed the genesis suite (§6.2) at its slot as an ordinary native handler,
-	// serviced with libsodium — the reference host's "genesis via SetHandler"
-	// (§6.4). The signature wrapper reaches it by plain callHandler to this slot.
-	registerNativeAt(suiteSlotName(0), genesisSuiteVerify)
-
-	// The §6.5 signer query: an ordinary (read-only, freely callable) handler that
-	// serializes the current signer, so an installed module can ask who signed the
-	// dispatch that reached it. Same wiring as the reference host's registerSignerQuery
-	// — without it, `loadTopSignerPubkey` has nothing to call.
-	registerNative("signature.signer", serializeSigner)
+	// The runtime above is fresh, so every handler from a previous boot points into a dead
+	// one (the tests boot repeatedly): start from an empty table rather than keep them.
+	handlers = map[string]*wasmHandler{}
 
 	// QuickJS realm: expose the byte-level bridge, then run the JS orchestration.
 	var err error
@@ -630,23 +210,15 @@ func boot() {
 	b := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 	b.SetPropertyStr("installWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		nm, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		wb, _ := qjs.JsTypedArrayToGo(t.Args()[1])
-		return t.Context().NewBool(installWasm(nm, wb)), nil
+		return t.Context().NewBool(installWasm(t.Args()[0].String(), wb)), nil
 	}))
 	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
 		return t.Context().NewString(string(d)), nil
 	}))
-	// The §7.4 first-install branch refuses to overlay a SetHandler-seeded slot, so the
-	// shared policy needs the kernel's handler-table query.
-	b.SetPropertyStr("isRegistered", fn(func(t *qjs.This) (*qjs.Value, error) {
-		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
-		return t.Context().NewBool(isRegistered(n)), nil
-	}))
 	b.SetPropertyStr("removeHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
-		n, _ := qjs.JsTypedArrayToGo(t.Args()[0])
-		return t.Context().NewBool(removeHandler(n)), nil
+		return t.Context().NewBool(removeHandler(t.Args()[0].String())), nil
 	}))
 	// Bundle-freshness persistence (§12.4): the arithmetic is shared JS, the durable
 	// write is ours — a truncated store reads back as "no marks", silently dropping
@@ -681,45 +253,9 @@ func boot() {
 		panic(err)
 	}
 
-	// DOMAIN_env (README §6.3, §16.1): read the single definition from the evaluated
-	// domains.ts — host-installer.gen.js exports DOMAIN_ENV onto the realm global — so
-	// signatureHandler prepends the byte-identical prefix every other target signs and
-	// verifies with, no hand-copied constant on the native target.
-	dv := mustEval("globalThis.DOMAIN_ENV")
-	envDomain, err = qjs.JsTypedArrayToGo(dv)
-	dv.Free()
-	if err != nil || len(envDomain) == 0 {
-		panic("boot: could not read DOMAIN_ENV from the realm (regenerate host-installer.gen.js)")
-	}
-
 	// No `install` wire handler: code arrives only as a signed bundle (§12.4), and
 	// loadBundleFiles admits each verified module directly via installWasm. There is
-	// no message-driven install path (§7).
-}
-
-// dispatch feeds raw envelope bytes into the pipeline (README §3).
-func dispatch(b []byte) {
-	p := wr(kn, b)
-	if p == 0 { // alloc failed — feeding a null pointer to the kernel would dispatch garbage
-		return
-	}
-	wasmCall(kn, "dispatch", uint64(p), uint64(len(b)))
-	wasmCall(kn, "dealloc", uint64(p))
-}
-
-// registerNativeAt binds a native host service at the raw kernel name `n` and returns the
-// handler id the kernel now has it under — callers that need to block it from kernel.call
-// (§4.4) key off that id. registerNative is the canonical-name convenience over it; the
-// genesis suite slot (whose name derives differently, §6.4) calls it directly in boot().
-func registerNativeAt(n []byte, fn func([]byte) []byte) int32 {
-	id := nextID
-	nextID++
-	bindHandler(n, id, &entry{name: append([]byte(nil), n...), nat: fn})
-	return id
-}
-
-func registerNative(canonical string, fn func([]byte) []byte) int32 {
-	return registerNativeAt(name(canonical), fn)
+	// no message-driven install path (§12.4).
 }
 
 // invokeFree calls the named global function as global.name(args...), then frees the
@@ -738,45 +274,43 @@ func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
 }
 
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
-// its guest: the declared cap domains, the manifest config (author-signed
-// structural constants), and the verified guest source. `author` (hex) + `app` key
-// bundle freshness and derive the guest-signing scope (README §12.2, §12.4).
+// its guest: the guest's declared cap domains, its config (author-signed structural
+// constants), the kernel names its modules landed at, and the verified guest source.
+// `author` (hex) + `app` key bundle freshness and derive the guest-signing scope
+// (README §12.2, §12.4).
 type loadedBundle struct {
 	app, author string
 	version     int
 	caps        []string
-	config      json.RawMessage // manifest `config` object (merged under operator config)
+	config      json.RawMessage   // guest `config` object (merged under operator config)
+	modules     map[string]string // logical name → kernel name, for the guest's BUNDLE
 	guestSource string
+	// Protocol ids the app offers to serve (README §12.10), defaulted by the shared
+	// loader. The native target is a single-bundle runner, so it has no binding table to
+	// consult — it reports them so an operator can see what the app answers for.
+	handles []string
 }
 
 // loaded is the bundle the node is running (set by loadBundle), nil until one loads.
 var loaded *loadedBundle
 
-// loadBundle loads a signed app bundle directory (README §12.4). Reading the directory
-// is all this does: the whole load — manifest signature, policy governance, freshness,
+// loadBundle loads a signed app bundle file (README §12.4). Reading the one file is all
+// this does: the whole load — manifest signature, policy governance, freshness,
 // per-module and guest integrity, and the order they run in — is the shared JS loader
-// (bundle.ts, via host-installer.gen.js), which installs each verified module through
-// the same install policy as a wire install. On success it records the verified guest
-// source + caps + config in `loaded` for the node.
-func loadBundle(dir string) string {
-	entries, err := os.ReadDir(dir)
+// (bundle.ts, via host-installer.gen.js), which admits each verified module through
+// the shared §12.5 policy. On success it records the verified guest source + caps +
+// config + module names in `loaded` for the node.
+//
+// The guest source comes back ACROSS the bridge rather than being re-read here: the
+// shared loader hashed those exact bytes against the manifest, so running them is
+// running what was verified. Go holding its own copy to look up by name would be a
+// second path to the same bytes, which is the drift this seam exists to prevent.
+func loadBundle(path string) string {
+	blob, err := os.ReadFile(path)
 	if err != nil {
 		return "ERROR: " + err.Error()
 	}
-	goFiles := map[string][]byte{}
-	jsFiles := qc.NewObject()
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		fb, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue // unreadable file ⇒ absent; the loader fails it on the hash it can't match
-		}
-		goFiles[e.Name()] = fb
-		jsFiles.SetPropertyStr(e.Name(), qc.NewArrayBuffer(fb))
-	}
-	res, err := invokeFree("loadBundleFiles", jsFiles)
+	res, err := invokeFree("loadBundleBlob", qc.NewArrayBuffer(blob))
 	if err != nil {
 		return "ERROR(invoke): " + err.Error()
 	}
@@ -789,8 +323,10 @@ func loadBundle(dir string) string {
 		App, Author string
 		Version     int
 		Caps        []string
-		Guest       string
 		Config      json.RawMessage
+		Modules     map[string]string
+		GuestSource string
+		Handles     []string
 		Installed   []string
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
@@ -798,9 +334,10 @@ func loadBundle(dir string) string {
 	}
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
-		config: m.Config, guestSource: string(goFiles[m.Guest]),
+		config: m.Config, modules: m.Modules, guestSource: m.GuestSource,
+		handles: m.Handles,
 	}
-	return fmt.Sprintf("%s v%d  installed=%v", m.App, m.Version, m.Installed)
+	return fmt.Sprintf("%s v%d  installed=%v  handles=%v", m.App, m.Version, m.Installed, m.Handles)
 }
 
 // freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
@@ -858,15 +395,11 @@ func applyPolicy(json string) error {
 // modules: codec, reputation). null when the handler is absent or returns nothing.
 func wireModuleCall() {
 	qc.Global().SetPropertyStr("__moduleCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		nm, err := qjs.JsTypedArrayToGo(t.Args()[0])
-		if err != nil {
-			return t.Context().NewNull(), nil
-		}
 		pl, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return t.Context().NewNull(), nil
 		}
-		resp := callHandler(nm, pl)
+		resp := callHandler(t.Args()[0].String(), pl)
 		if resp == nil {
 			return t.Context().NewNull(), nil
 		}
@@ -1024,7 +557,10 @@ func main() {
 	}
 
 	var g *guestRealm
-	if loaded != nil {
+	// A handler-only bundle (app modules, no zero-authority realm) declares no guest —
+	// guestSource is empty, so there is nothing to run and `g` stays nil. The seedstore
+	// bundle always ships a guest, so this guard is defensive, not a second posture.
+	if loaded != nil && loaded.guestSource != "" {
 		// Build the cap funnel for the bundle's declared domains, then the confined
 		// guest from its verified source + the merged APP config (manifest ∪ operator).
 		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s, %q, %q)`, jsStrArray(loaded.caps), loaded.author, loaded.app))); err != nil {
@@ -1036,7 +572,19 @@ func main() {
 			fatal("app-config", err)
 			return
 		}
-		if g, err = newGuestRealm(el, appJSON, loaded.guestSource); err != nil {
+		// `const BUNDLE` — the facts the runtime derived from the admitted manifest
+		// (author, app, signing prefix, module kernel names). Built in the host realm
+		// from the one derivation (cap-bridge bundlePreamble), never restated here.
+		factsJSON, err := json.Marshal(struct {
+			App     string            `json:"app"`
+			Author  string            `json:"author"`
+			Modules map[string]string `json:"modules"`
+		}{loaded.app, loaded.author, loaded.modules})
+		if err != nil {
+			fatal("bundle-facts", err)
+			return
+		}
+		if g, err = newGuestRealm(el, string(factsJSON), appJSON, loaded.guestSource); err != nil {
 			fatal("guest", err)
 			return
 		}

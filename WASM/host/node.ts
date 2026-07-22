@@ -1,33 +1,25 @@
-// Node entry point — bridges the portable KernelHost to Node's filesystem
-// and libsodium-wrappers. Use this when running on Node / Bun / Deno (with
-// Node compat); for the browser see ./browser.ts.
-
-import { readFile } from "node:fs/promises";
+// Node entry point — bridges the portable KernelHost to libsodium-wrappers. Use
+// this when running on Node / Bun / Deno (with Node compat); for the browser see
+// ./browser.ts.
 
 import { KernelHost } from "./kernel-host.js";
 
 // The runtime bundles the sumo build so apps that need symbols beyond the
-// kernel's own Ed25519 + SHA-3 (e.g. seedstore's crypto_stream_xchacha20_xor)
+// kernel's own Ed25519 + BLAKE2b (e.g. seedstore's crypto_stream_xchacha20_xor)
 // reuse one libsodium rather than shipping a second (README §12.1). A *static*
 // import (not createRequire) so `bun build --compile` bundles the package into
 // the standalone shell binary — a dynamic require resolves to nothing there. The
 // default export is the wrapper object; cast it to the module-namespace type the
-// rest of the host (and KernelHost.load) is written against.
+// rest of the host (and the KernelHost constructor) is written against.
 import sodiumDefault from "libsodium-wrappers-sumo";
 const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sumo");
 
-/** Read kernel.wasm from disk, await sodium readiness, and instantiate a
- *  KernelHost. The signature wrapper and genesis suite are host code now
- *  (registered via `host.registerSignature`), so this loads the one WASM blob and
- *  only packages the platform I/O — bootstrap stays the caller's job (§9). */
-export async function loadKernelHost(
-  kernelWasmPath: string,
-): Promise<KernelHost> {
-  const [kernelBytes] = await Promise.all([
-    readFile(kernelWasmPath),
-    sodium.ready,
-  ]);
-  return KernelHost.load(kernelBytes, sodium);
+/** Await sodium readiness and stand up a KernelHost. The handler table is host
+ *  state — there is no kernel blob to load — so booting is "ready libsodium, done"
+ *  (§3); installing bundles stays the caller's job. */
+export async function createKernelHost(): Promise<KernelHost> {
+  await sodium.ready;
+  return new KernelHost();
 }
 
 export async function ensureSodium(): Promise<void> {
@@ -50,24 +42,5 @@ export function generateKeyPair(): {
   return { publicKey: kp.publicKey, privateKey: kp.privateKey };
 }
 
-export {
-  KernelHost,
-  GENESIS_ALGO_ID,
-  GENESIS_PUBKEY_LEN,
-  GENESIS_SIGNATURE_LEN,
-  GENESIS_SECRET_KEY_LEN,
-} from "./kernel-host.js";
-export type { Handler, Signer } from "./kernel-host.js";
-export {
-  Installer,
-  referencePolicy,
-} from "./installer.js";
-export type {
-  ApproveInstall,
-  FirstInstallPolicy,
-  InstallRecord,
-} from "./installer.js";
-export {
-  MAGIC,
-  CURRENT_VERSION,
-} from "./envelope.js";
+export { KernelHost } from "./kernel-host.js";
+export type { AdmitPolicy } from "./bundle.js";

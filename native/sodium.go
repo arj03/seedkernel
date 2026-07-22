@@ -90,7 +90,6 @@ var sodiumExports = map[string]string{
 	"malloc":                               "lm",
 	"free":                                 "mm",
 	"sodium_init":                          "Uj",
-	"crypto_hash_sha3256":                  "Zc",
 	"crypto_generichash":                   "kc",
 	"crypto_stream_xchacha20_xor":          "jm",
 	"crypto_sign_detached":                 "Nh",
@@ -256,22 +255,14 @@ func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 
 // ───────────────────────── the crypto ops ─────────────────────────
 
-func (s *libsodium) hashSha3256(msg []byte) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(msg)) + alignUp(32))
-	in, out := s.takeIn(msg), s.take(32)
-	lo, hi := lenArgs(len(msg))
-	s.call("crypto_hash_sha3256", uint64(out), uint64(in), lo, hi)
-	return s.read(out, 32)
-}
-
-// genericHash is native Go BLAKE2b (not libsodium) — see the file header. This build
-// only ever computes the UNKEYED, 32-byte digest (the content-address block-id), which
-// is KAT-pinned byte-identical to libsodium. Reject any other length loudly: 1–15
-// diverges from libsodium's BYTES_MIN, and 0/>64 would panic inside blake2b.New — a
-// quietly-wrong, consensus-affecting hash is worse than a hard failure. (Keyed hashing
-// is rejected at the JS seam, where the key would otherwise be silently dropped.)
+// genericHash is native Go BLAKE2b (not libsodium) — see the file header. It is the one
+// system hash: the content-address block-id, the guest `HASH` op, and the loader's
+// genesis/content hash (`genesisHash`, §12.4) all route here. This build only ever
+// computes the UNKEYED, 32-byte digest, which is KAT-pinned byte-identical to libsodium.
+// Reject any other length loudly: 1–15 diverges from libsodium's BYTES_MIN, and 0/>64
+// would panic inside blake2b.New — a quietly-wrong, consensus-affecting hash is worse
+// than a hard failure. (Keyed hashing is rejected at the JS seam, where the key would
+// otherwise be silently dropped.)
 func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 	if outLen != 32 {
 		panic(fmt.Sprintf("genericHash: native blake2b is 32-byte-only in this build, got %d", outLen))
@@ -315,10 +306,10 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 }
 
 // isValidPoint gates a public key on crypto_core_ed25519_is_valid_point: canonical
-// encoding, on the curve, prime-order subgroup, not the identity. The genesis suite
-// applies it before verifying (genesisSuiteVerify), matching the JS host's
-// _pubkeyIsValidPoint (kernel-host.ts) — a key one target accepts must be a key the
-// other accepts, or two nodes disagree on whether a message is signed (§6.2).
+// encoding, on the curve, prime-order subgroup, not the identity. The genesis verifier
+// applies it before verifying, matching the JS host's _pubkeyIsValidPoint
+// (kernel-host.ts) — a key one target accepts must be a key the other accepts, or two
+// nodes disagree on whether a message is signed (§12.6).
 func (s *libsodium) isValidPoint(pk []byte) bool {
 	if len(pk) != 32 {
 		return false
@@ -462,9 +453,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	arg := func(t *qjs.This, i int) []byte { b, _ := qjs.JsTypedArrayToGo(t.Args()[i]); return b }
 	ab := func(t *qjs.This, b []byte) *qjs.Value { return t.Context().NewArrayBuffer(b) }
 
-	o.SetPropertyStr("crypto_hash_sha3256", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.hashSha3256(arg(t, 0))), nil
-	}))
 	o.SetPropertyStr("crypto_generichash", fn(func(t *qjs.This) (*qjs.Value, error) {
 		// libsodium-wrappers is crypto_generichash(hashLength, message, key?). The native
 		// blake2b shim computes only the UNKEYED hash, so a key arg would be SILENTLY
@@ -557,7 +545,6 @@ const sodiumShimJS = `
   const N = __sodium;
   const u8 = (b) => new Uint8Array(b);
   globalThis.sodium = {
-    crypto_hash_sha3256: (m) => u8(N.crypto_hash_sha3256(m)),
     crypto_generichash: (len, m) => u8(N.crypto_generichash(len, m)),
     crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
     crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),

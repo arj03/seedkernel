@@ -14,10 +14,9 @@ const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 const {
-  loadKernelHost,
+  createKernelHost,
   generateKeyPair,
   ensureSodium,
-  referencePolicy,
 } = await imp("build/host/node.js");
 
 // Transport + WS module surface (moved up from seedstore in the runtime split,
@@ -32,10 +31,15 @@ const { MemoryFs } = await imp("build/host/fs.js");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
+// The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
+// code path a bundle load does rather than a parallel copy of it.
+const { admitModule, appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor }
+  = await imp("build/host/bundle.js");
+const { buildAdmit: buildAdmitPolicy, policyFromJson } = await imp("build/host/policy.js");
+const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Payload for callDynamicExport against an export that takes no arguments: the
-// JS WASM API drops the surplus argument, so the general helper covers them too.
+// The empty payload — a handler whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
 
 await ensureSodium();
@@ -58,279 +62,112 @@ function assertEqual(actual, expected, msg) {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 }
 
-const kernelWasm = join(root, "build/kernel.wasm");
-
-// Standard bootstrap (README §9): signature handler + the module registry. The
-// default policy accepts every install; tests that need rejection override via
-// host.setApproveInstall.
-async function makeHost(approveInstall = () => true) {
-  const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-
-  host.registerSignature(signatureName);
-  host.registerInstaller();
-  host.setApproveInstall(approveInstall);
-
-  return { host, signatureName };
+// Standard bootstrap (README §3): a fresh handler table. The host holds no policy — it is
+// the §3 map and nothing else — so the admit function lives with the test and is handed to
+// the loader's admission step per install, exactly as `installBundle` does. The default
+// admits every module; tests that need rejection pass their own. Handlers are pure
+// transforms with no signature/dispatch seam, so there is nothing else to wire.
+async function makeHost(admit = () => true) {
+  const host = await createKernelHost();
+  host._testAdmit = admit;   // harness-only: what `installMod` below hands the loader
+  return { host };
 }
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
-const signerProbeBytes = new Uint8Array(readFileSync(join(root, "build/signer-probe.wasm")));
 
-// Admit a module directly under `targetName`, authored by `authorPk`, through the
-// same path the bundle loader uses (installBundleModule → installDirect → the policy
-// callback). Bundles are the only way code arrives now (§12.4) — there is no wire
-// install envelope. Returns whether the policy admitted it.
+// Admit a module directly under `targetName`, authored by `authorPk`, through the very
+// function a bundle load calls (`admitModule` — hash the bytes, ask the policy, bind).
+// Bundles are the only way code arrives (§12.4); there is no wire install envelope.
+// Returns whether the policy admitted it.
 function installMod(host, targetName, wasm, authorPk) {
-  return host.installBundleModule(targetName, wasm, authorPk);
+  return admitModule(host, sodium, host._testAdmit ?? (() => false), targetName, wasm, authorPk);
 }
 
-// ─── Test: Full lifecycle ───────────────────────────────────────────────
+// The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real
+// derivation, not a mirror of it, so a test can name a slot without packing a whole
+// bundle and still land exactly where the loader would put it. Note the author: two
+// authors using the same `app` get different names, which is what makes ownership
+// structural rather than a rule anything has to enforce.
+const modName = (authorPk, app, mod) => bundleKernelNameFor(authorPk, app, mod);
+
+// ─── Test: install a module, reach it by name ───────────────────────────
 
 async function testFullLifecycle() {
-  console.log("Test: Full lifecycle (signed install + signed app message)");
+  console.log("Test: install a bundle module and reach it by name (§4, §12.4)");
 
   const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
-
-  // Install the chat handler under the author's scoped name.
-  installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "chat.text installed");
-
-  // The registry should have a record for it.
-  const rec = host.lookupInstall(chatTextName);
-  assert(rec !== null, "install record exists");
-  assertEqual(rec.author.publicKey, pk, "record author matches signer");
-
-  // Now send a signed app message. The chat handler is the forwarder fixture,
-  // so we forward to a host-side echo handler to verify it ran.
-  const echoName = host.deriveBootstrapName("test.echo");
-  let echoCalls = 0;
-  host.register(echoName, (_n, payload) => { echoCalls++; return new Uint8Array(payload); });
-
-  const text = new TextEncoder().encode("hello from author");
-  const forwardPayload = new Uint8Array(1 + echoName.length + text.length);
-  forwardPayload[0] = echoName.length;
-  forwardPayload.set(echoName, 1);
-  forwardPayload.set(text, 1 + echoName.length);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName, forwardPayload));
-  assertEqual(echoCalls, 1, "echo invoked once via kernel.call");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: the signature.signer query (§6.5) ────────────────────────────
-
-async function testSignerQuery() {
-  console.log("Test: signature.signer query (§6.5) reached by a helper-built handler");
-
-  const { host } = await makeHost();
-  const signerQueryName = host.deriveBootstrapName("signature.signer");
-
-  // This name is ABI, not an implementation detail: assembly/seedkernel/handler.ts
-  // bakes the same literal in (bootstrap names are plain ASCII, §5.1) so a handler
-  // built on the helper reaches the query with nothing planted by the host. Drift on
-  // either side silently costs every such handler its signer lookup — pin the string.
-  assertEqual(new TextDecoder().decode(signerQueryName),
-    "seedkernel.bootstrap.v1:signature.signer",
-    "the signer-query name is the literal ASCII the WASM helper bakes in");
-
-  host.registerSignerQuery(signerQueryName);
-  assertEqual([...host.callHandler(signerQueryName, EMPTY)], [0],
-    "an unsigned dispatch serializes as [0x00]");
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const probeName = host.deriveScopedName("signer.probe", pk);
-  installMod(host, probeName, signerProbeBytes, pk);
-  assert(host.isRegistered(probeName), "signer-probe installed");
-
-  const routeName = host.deriveBootstrapName("test.route");
-  let routed = null;
-  host.register(routeName, (_n, payload) => { routed = new Uint8Array(payload); return null; });
-
-  // configure() is route-only: [route_len u8][route ..]. Nothing here names the
-  // signer query, so the lookup below can only work off the baked-in name.
-  const cfg = new Uint8Array(1 + routeName.length);
-  cfg[0] = routeName.length;
-  cfg.set(routeName, 1);
-  host.callDynamicExport(probeName, "configure", cfg);
-
-  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array([1])));
-  assertEqual(routed, pk,
-    "loadTopSignerPubkey resolves the top signer with no host-planted name");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Invalid signature dropped ────────────────────────────────────
-
-async function testInvalidSignatureDropped() {
-  console.log("Test: Invalid signature silently dropped");
-
-  const { host } = await makeHost();
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const wire = host.wrapAndEncode(sk, pk, chatTextName,
-    new TextEncoder().encode("should not arrive"));
-  wire[40] ^= 0xff;
-  host.dispatch(wire);
-  assertEqual(received, 0, "no messages received");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: 64 KB size limit ─────────────────────────────────────────────
-
-async function testSizeLimitEnforced() {
-  console.log("Test: Oversized envelope rejected (§2.2)");
-
-  // The kernel alone (§1) — this test needs no signature wrapper, so it wires none.
-  const host = await loadKernelHost(kernelWasm);
-
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const smallWire = host.encodeEnvelope(chatTextName,
-    new TextEncoder().encode("ok"));
-  const oversized = new Uint8Array(65537);
-  oversized.set(smallWire);
-  host.dispatch(oversized);
-  assertEqual(received, 0, "65537-byte envelope silently dropped");
-
-  // Exactly 65,536 bytes — must not throw.
-  const boundary = new Uint8Array(65536);
-  boundary.set(smallWire);
-  host.dispatch(boundary);
-
-  console.log("  OK\n");
-}
-
-// ─── Test: one signature per message; nesting is dropped (§6.5) ─────────
-
-async function testSingleSignatureNoNesting() {
-  console.log("Test: one signature per message; nested wrappers dropped (§6.5)");
-
-  const host = await loadKernelHost(kernelWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"));
-
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-
-  // wrap() takes raw inner bytes, so feeding a wrap's output back in nests it.
-  const wrapN = (n, innerBytes) => {
-    let bytes = innerBytes;
-    for (let i = 0; i < n; i++) bytes = host.wrap(sk, pk, bytes);
-    return bytes;
-  };
-  const inner = host.encodeEnvelope(chatTextName,
-    new TextEncoder().encode("hi"));
-
-  // One wrapper: verified, so the inner handler runs.
-  received = 0;
-  host.dispatch(wrapN(1, inner));
-  assertEqual(received, 1, "a single signature reaches the handler");
-
-  // Two wrappers: the outer verifies and re-dispatches its inner, which is itself
-  // a signature wrapper — but a signer is already set, so the inner wrapper drops
-  // before any verify work. The chat handler never runs. This is what makes the
-  // verify-amplification vector (a chain of nested wrappers) unrepresentable.
-  received = 0;
-  host.dispatch(wrapN(2, inner));
-  assertEqual(received, 0, "a nested signature wrapper is dropped");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: SetHandler-seeded slot is not overlaid ────────────────────────
-
-async function testRefuseOverlayBootstrapSlot() {
-  console.log("Test: reference policy refuses to overlay a SetHandler-seeded slot (§7.4)");
-
-  // Use the reference policy with an allow-all first-install branch so this
-  // test exercises only the bootstrap-slot refusal — not an unrelated first-
-  // install rejection.
-  const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName);
-  host.registerInstaller();
-  host.setApproveInstall(referencePolicy(host, () => true));
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  // Try to overlay the signature slot (seeded by SetHandler at bootstrap).
-  installMod(host, signatureName, forwarderBytes, pk);
-
-  // signature must still verify — if it had been overwritten with the
-  // forwarder, the next signed message would fail.
-  const chatTextName = host.deriveBootstrapName("chat.text");
-  let received = 0;
-  host.register(chatTextName, () => { received++; });
-  host.dispatch(host.wrapAndEncode(sk, pk, chatTextName,
-    new TextEncoder().encode("still works")));
-  assertEqual(received, 1, "signature handler still verifying after refused overlay");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: approveInstall is the sole authorization gate ────────────────
-
-async function testApproveInstallRejects() {
-  console.log("Test: approveInstall can reject an install");
-
-  let seen = null;
-  const approve = (name, author, bytesHash, _wasm, existing) => {
-    seen = { name, author, bytesHash, existing };
-    return false;
-  };
-  const { host } = await makeHost(approve);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatName = modName(pk, "chat", "chat");
+
+  // Install the chat handler under its derived kernel name, through the same path the
+  // bundle loader uses. It is a pure transform (the forwarder fixture echoes its input).
+  installMod(host, chatName, forwarderBytes, pk);
+  assert(host.isBound(chatName), "chat handler installed");
+
+  // There is no install record to consult: the author is IN the name (§5.1), so the
+  // table itself says who authored what it holds.
+  assert(chatName.startsWith(toHex(pk) + ":"), "kernel name leads with the author");
+
+  // Reach it by name: the host stages input at the handler's scratch, calls handle, and
+  // reads the response back (README §4). A guest reaches the same handler through the
+  // cap-bridge's MODULE_CALL (§12.2); here the host calls it directly.
+  const text = new TextEncoder().encode("hello from author");
+  const resp = host.callHandler(chatName, text);
+  assert(resp !== null && bytesEqual(resp, text), "handler echoed its input");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the admit policy is the sole authorization gate ──────────────
+
+async function testApproveInstallRejects() {
+  console.log("Test: the admit policy can reject an install");
+
+  let seen = null;
+  const admit = (name, author, bytesHash, _wasm, existing) => {
+    seen = { name, author, bytesHash };
+    return false;
+  };
+  const { host } = await makeHost(admit);
+
+  const { publicKey: pk } = generateKeyPair();
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
-  assert(!host.isRegistered(chatTextName), "install rejected");
-  assert(seen !== null, "approveInstall was called");
+  assert(!host.isBound(chatTextName), "install rejected");
+  assert(seen !== null, "the admit policy was called");
   assertEqual(seen.name, chatTextName, "callback saw the target name");
-  assertEqual(seen.author.publicKey, pk, "callback saw the author pubkey");
-  assert(seen.existing === null, "no existing record for first install");
+  assertEqual(seen.author, pk, "callback saw the author pubkey");
 
   console.log("  OK\n");
 }
 
 async function testApproveInstallReceivesBytesHash() {
-  console.log("Test: approveInstall receives genesisHash(wasm) as bytes_hash (§7.1)");
+  console.log("Test: the admit policy receives genesisHash(wasm) as bytes_hash (§5.1)");
 
   let seenHash = null;
   let seenPayloadLen = 0;
-  const approve = (_n, _a, bytesHash, wasm, _e) => {
+  const admit = (_n, _a, bytesHash, wasm) => {
     seenHash = bytesHash;
     seenPayloadLen = wasm.length; // for sanity
     return true;
   };
-  const { host } = await makeHost(approve);
+  const { host } = await makeHost(admit);
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install accepted");
+  assert(host.isBound(chatTextName), "install accepted");
 
-  assertEqual(seenHash.length, 32, "bytes_hash is SHA-3-256 (32 bytes)");
+  assertEqual(seenHash.length, 32, "bytes_hash is BLAKE2b-256 (32 bytes)");
   // The hash is the content id of the WASM module — the same identifier a
-  // manifest's modules[].hash and a policy allowlist use (§7.1), independent of
+  // manifest's modules[].hash and a policy allowlist use (§5.1), independent of
   // seq or the install framing.
-  const expected = host.genesisHash(forwarderBytes);
+  const expected = gHash(forwarderBytes);
   assertEqual(seenHash, expected, "bytes_hash = genesisHash(wasm)");
   assert(seenPayloadLen === forwarderBytes.length, "wasm bytes passed to callback are unchanged");
 
@@ -338,328 +175,113 @@ async function testApproveInstallReceivesBytesHash() {
 }
 
 async function testNoApproveInstallDropsAll() {
-  console.log("Test: install dropped when no approveInstall is wired");
+  console.log("Test: an omitted policy is deny-all, not 'no policy' (§12.5, §14)");
 
-  const { host } = await makeHost();
-  host.setApproveInstall(null);
+  // `policyFromJson(null)` is the boot default every target shares: an EMPTY author set,
+  // which admits nothing. The absence of a decision is never permission.
+  const { host } = await makeHost(buildAdmitPolicy(policyFromJson(null)));
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
 
-  assert(!host.isRegistered(chatTextName), "install dropped");
+  assert(!host.isBound(chatTextName), "install dropped under the deny-all default");
 
   console.log("  OK\n");
 }
 
-// ─── Test: reference policy upgrade rules (§7.4) ────────────────────────
+// ─── Test: ownership is structural (§5.1, §12.5) ────────────────────────
 
-async function testReferencePolicyUpgradeRules() {
-  console.log("Test: reference policy enforces same-author on upgrade (§7.4)");
+async function testDerivedNamesKeepAuthorsApart() {
+  console.log("Test: derived names keep two authors' same-named apps apart (§5.1)");
 
-  const host = await loadKernelHost(kernelWasm);
-  const signatureName = host.deriveBootstrapName("signature");
-  host.registerSignature(signatureName);
-  host.registerInstaller();
-  host.setApproveInstall(referencePolicy(host, () => true));
+  // An admit that approves EVERYTHING — the point is that even a maximally permissive
+  // policy cannot let one author land on another's name, because there is no shared name
+  // to land on. Squat-resistance is a property of the namespace, not of this function.
+  const { host } = await makeHost(() => true);
 
   const { publicKey: aPk } = generateKeyPair();
   const { publicKey: bPk } = generateKeyPair();
-  // Both authors target the same name so we can exercise the upgrade path.
-  // (Author-scoped names would partition the space and avoid the rule.)
-  const sharedName = host.deriveBootstrapName("test.shared");
 
-  // A claims sharedName (first install — accepted).
-  installMod(host, sharedName, forwarderBytes, aPk);
-  assert(host.isRegistered(sharedName), "A's first install accepted");
-  const recA = host.lookupInstall(sharedName);
-  assert(recA !== null, "record exists after A's install");
-  const aBytesHash = recA.bytesHash;
+  // Both authors ship an app called "shared" with a module called "fwd".
+  const aName = modName(aPk, "shared", "fwd");
+  const bName = modName(bPk, "shared", "fwd");
+  assert(aName !== bName, "same (app, module) under different authors derives distinct names");
+  assert(aName.startsWith(toHex(aPk) + ":"), "A's name leads with A's key");
+  assert(bName.startsWith(toHex(bPk) + ":"), "B's name leads with B's key");
 
-  // B tries to install over the same name — rejected (different author).
-  installMod(host, sharedName, forwarderBytes, bPk);
-  const recAfterB = host.lookupInstall(sharedName);
-  assertEqual(recAfterB.author.publicKey, aPk, "different-author install rejected, A still owns");
-  assertEqual(recAfterB.bytesHash, aBytesHash, "B's bytes did not land");
+  // Both install. Neither displaces the other — they coexist.
+  installMod(host, aName, forwarderBytes, aPk);
+  installMod(host, bName, forwarderBytes, bPk);
+  assert(host.isBound(aName), "A's app is bound");
+  assert(host.isBound(bName), "B's app is bound — it did not have to contend for a name");
 
-  // A re-installs (same author) — accepted; record updates in place. There is
-  // no parent/lineage gate anymore (§7.4): same author is the whole rule.
-  installMod(host, sharedName, forwarderBytes, aPk);
-  const recAfterUpgrade = host.lookupInstall(sharedName);
-  assert(recAfterUpgrade !== null, "upgrade left a record");
-  assertEqual(recAfterUpgrade.author.publicKey, aPk, "A still owns after upgrade");
-  // bytes_hash is genesisHash(wasm) (§7.1), so re-installing the SAME wasm keeps the
-  // same content id — the identifier tracks the binary. (A different wasm would hash
-  // differently; §7.1 makes the content id, a manifest's modules[].hash, and a policy
-  // allowlist all one value.)
-  assertEqual(recAfterUpgrade.bytesHash, aBytesHash,
-    "bytes_hash unchanged across a same-wasm re-install");
-  assertEqual(recAfterUpgrade.bytesHash, host.genesisHash(forwarderBytes),
-    "bytes_hash = genesisHash(wasm)");
+  // A re-install by the SAME author lands on the SAME name: an update, in place, with no
+  // ownership rule consulted anywhere.
+  assert(installMod(host, aName, forwarderBytes, aPk), "A's update re-admitted");
+  assertEqual(modName(aPk, "shared", "fwd"), aName, "the same key derives the same name");
+
+  // The app key is the first two components of the kernel name (§12.4) — one identity
+  // the freshness marks, the bindings and the names all share.
+  assert(aName.startsWith(appKeyFor(aPk, "shared") + ":"), "kernel name extends the app key");
 
   console.log("  OK\n");
 }
 
-// ─── Test: registry.lookup (host-side) returns the install record ────────
+// ─── Test: the `handles` declaration is inert (§12.10) ──────────────────
 
-async function testInstallerLookupHostSide() {
-  console.log("Test: host-side lookupInstall returns the install record (§7.6)");
+async function testHandlesIsADeclarationNotAClaim() {
+  console.log("Test: `handles` is a declaration, not a claim (§12.10)");
 
-  const { host } = await makeHost();
+  const { handlesOf } = await imp("build/host/bundle.js");
 
-  const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  // Absent ⇒ [app]: an app that speaks only its own protocol declares nothing.
+  assertEqual(JSON.stringify(handlesOf({ app: "chat", version: 1, modules: [] })),
+    JSON.stringify(["chat"]), "absent handles defaults to [app]");
 
-  installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install ok");
-
-  // The registry has no wire surface: records are read host-side, not via a wire
-  // query. The policy callback already receives the resolved record; bridges
-  // pin kernel.caller instead of consulting a capability index.
-  const rec = host.lookupInstall(chatTextName);
-  assert(rec !== null, "record present for an installed name");
-  assertEqual(rec.author.publicKey, pk, "record author matches signer");
-  assertEqual(rec.bytesHash, host.genesisHash(forwarderBytes), "bytes_hash = genesisHash(wasm)");
-
-  // Unknown / SetHandler-seeded names have no record.
-  assert(host.lookupInstall(host.deriveBootstrapName("does.not.exist")) === null,
-    "unknown name has no record");
-  assert(host.lookupInstall(host.deriveBootstrapName("signature")) === null,
-    "SetHandler-seeded bootstrap handler has no record");
+  // Any number of apps may declare the same protocol. Nothing in the loader arbitrates
+  // between them, because declaring confers no traffic — a binding does, and that is the
+  // shell's user-owned table (§12.10), not loader state.
+  const mine  = { app: "chat", version: 1, modules: [], handles: ["chat"] };
+  const yours = { app: "natter", version: 1, modules: [], handles: ["chat"] };
+  assertEqual(JSON.stringify(handlesOf(mine)), JSON.stringify(["chat"]), "explicit handles kept");
+  assertEqual(JSON.stringify(handlesOf(yours)), JSON.stringify(["chat"]),
+    "a second app may declare the same protocol");
 
   console.log("  OK\n");
 }
 
-// ─── Test: installer.remove + suite slot removal ────────────────────────
+// ─── Test: removeHandler + suite slot removal ───────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: installer.remove clears the record and the kernel slot (§7.5)");
+  console.log("Test: removeHandler frees the kernel slot (§12.5)");
 
   let approveCalls = 0;
-  const { host } = await makeHost((_n, _a, _h, _w, _e) => {
+  const { host } = await makeHost((_n, _a, _h, _w) => {
     approveCalls++;
     return true;
   });
 
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = host.deriveScopedName("chat.text", pk);
+  const chatTextName = modName(pk, "chat", "text");
 
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "install ok");
-  assert(host.lookupInstall(chatTextName) !== null, "record present");
+  assert(host.isBound(chatTextName), "install ok");
 
-  assert(host.installer.remove(chatTextName), "remove returned true");
-  assert(!host.isRegistered(chatTextName), "kernel slot cleared");
-  assert(host.lookupInstall(chatTextName) === null, "record cleared");
+  assert(host.removeHandler(chatTextName), "remove returned true");
+  assert(!host.isBound(chatTextName), "kernel slot cleared");
+  // Nothing else to clear: a freed name can only be re-occupied by the author whose key
+  // derives it (§5.1), so there is no stale ownership to misattribute onto new bytes.
 
-  // remove() is idempotent — second call returns false.
-  assert(!host.installer.remove(chatTextName), "second remove returns false");
+  // removeHandler is idempotent — a second call on an empty slot returns false.
+  assert(!host.removeHandler(chatTextName), "second remove returns false");
 
   // Re-installing at the same name after a remove succeeds (no tombstone).
   installMod(host, chatTextName, forwarderBytes, pk);
-  assert(host.isRegistered(chatTextName), "reinstall after remove succeeds");
+  assert(host.isBound(chatTextName), "reinstall after remove succeeds");
   assertEqual(approveCalls, 2, "approve called for each accepted install");
 
-  console.log("  OK\n");
-}
-
-// ─── Test: caller stack format ──────────────────────────────────────────
-
-async function testCallerStackFormat() {
-  console.log("Test: kernel.caller / currentCaller — immediate caller only (§4.2)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const forwarderName = host.deriveScopedName("test.forwarder", pk);
-
-  installMod(host, forwarderName, forwarderBytes, pk);
-  assert(host.isRegistered(forwarderName), "forwarder installed");
-
-  // A probe handler reads its immediate caller each time it's called. Only the
-  // immediate caller is exposed — there is no deeper-chain surface (§4.2, §8).
-  const probeName = host.deriveBootstrapName("probe.caller");
-  let seenImmediate = null;
-  host.register(probeName, (_n, _payload, h) => {
-    seenImmediate = h.currentCaller ? new Uint8Array(h.currentCaller) : null;
-    return new Uint8Array([0xff]);
-  });
-
-  // forwarder → probe — the probe's immediate caller is the forwarder.
-  const payload = new Uint8Array(1 + probeName.length);
-  payload[0] = probeName.length;
-  payload.set(probeName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, forwarderName, payload));
-  assert(seenImmediate !== null, "probe saw a caller");
-  assertEqual(seenImmediate, forwarderName, "immediate caller is the forwarder");
-
-  // Top-level dispatch directly into the probe — no caller.
-  seenImmediate = null;
-  host.dispatch(host.wrapAndEncode(sk, pk, probeName, new Uint8Array(0)));
-  assert(seenImmediate === null, "no immediate caller for top-level dispatch");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: Bridge authorizes by pinning kernel.caller ───────────────────
-
-async function testBridgeCallerPinning() {
-  console.log("Test: Bridge authorizes its caller by pinning kernel.caller (README §8)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const chatPinnedName = host.deriveScopedName("chat.pinned", pk);
-  const chatOtherName  = host.deriveScopedName("chat.other",  pk);
-  const netSendName    = host.deriveBootstrapName("cap.net.send");
-
-  installMod(host, chatPinnedName, forwarderBytes, pk);
-  installMod(host, chatOtherName, forwarderBytes, pk);
-  assert(host.isRegistered(chatPinnedName), "chat.pinned installed");
-  assert(host.isRegistered(chatOtherName), "chat.other installed");
-
-  // The bridge pins exactly the caller name it serves (the chat shell's UI-bridge
-  // pattern, generalized): it compares kernel.caller against chatPinnedName and
-  // refuses anyone else. There is no capability index to consult — kernel.caller
-  // is the single bridge-authorization primitive.
-  const bytesEq = (a, b) => !!a && !!b && a.length === b.length && a.every((x, i) => x === b[i]);
-  let bridgeCalls = 0;
-  host.register(netSendName, (_n, _p, h) => {
-    bridgeCalls++;
-    if (!bytesEq(h.currentCaller, chatPinnedName)) return null;
-    return new Uint8Array([1]);
-  });
-
-  const forwardData = new TextEncoder().encode("ping");
-  function makeForward(targetName) {
-    const out = new Uint8Array(1 + targetName.length + forwardData.length);
-    out[0] = targetName.length;
-    out.set(targetName, 1);
-    out.set(forwardData, 1 + targetName.length);
-    return out;
-  }
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatOtherName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 1, "bridge invoked for the unpinned caller");
-  assertEqual(host.callDynamicExport(chatOtherName, "last_resp_len", EMPTY), 0,
-    "unpinned caller: bridge rejected (no response)");
-
-  host.dispatch(host.wrapAndEncode(sk, pk, chatPinnedName, makeForward(netSendName)));
-  assertEqual(bridgeCalls, 2, "bridge invoked for the pinned caller");
-  assertEqual(host.callDynamicExport(chatPinnedName, "last_resp_len", EMPTY), 1,
-    "pinned caller: bridge returned 1 byte");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: blockFromCall on deployer-added mutating handler ──────────────
-
-async function testBlockFromCall() {
-  console.log("Test: blockFromCall makes a deployer handler unreachable via kernel.call (§4.4)");
-
-  const { host } = await makeHost();
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const mutateName = host.deriveBootstrapName("test.mutate");
-  let mutateCalls = 0;
-  const id = host.register(mutateName, () => {
-    mutateCalls++;
-    return new Uint8Array([0x42]);
-  });
-  host.blockFromCall(id);
-
-  // Top-level dispatch must still reach the handler.
-  host.dispatch(host.wrapAndEncode(sk, pk, mutateName, new Uint8Array(0)));
-  assertEqual(mutateCalls, 1, "direct dispatch still reaches blocked handler");
-
-  // Install a forwarder, have it kernel.call the blocked handler. Must drop.
-  const fwdName = host.deriveScopedName("test.forwarder", pk);
-  installMod(host, fwdName, forwarderBytes, pk);
-  assert(host.isRegistered(fwdName), "forwarder installed");
-
-  const fwdPayload = new Uint8Array(1 + mutateName.length);
-  fwdPayload[0] = mutateName.length;
-  fwdPayload.set(mutateName, 1);
-  host.dispatch(host.wrapAndEncode(sk, pk, fwdName, fwdPayload));
-  assertEqual(mutateCalls, 1, "kernel.call to blocked handler did NOT invoke it");
-  assertEqual(host.callDynamicExport(fwdName, "last_resp_len", EMPTY), 0,
-    "kernel.call to blocked handler returned -1 (no response stored)");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: wrap rejects invalid Ed25519 key sizes ───────────────────────
-
-async function testWrapRejectsInvalidKeySizes() {
-  console.log("Test: wrap() rejects invalid Ed25519 key sizes");
-
-  const host = await loadKernelHost(kernelWasm);
-  host.registerSignature(host.deriveBootstrapName("signature"));
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-  const inner = host.encodeEnvelope(
-    host.deriveBootstrapName("chat.text"),
-    new TextEncoder().encode("ok"));
-
-  let threw = false;
-  try { host.wrap(sk.slice(0, 32), pk, inner); } catch { threw = true; }
-  assert(threw, "wrap rejected 32-byte privateKey");
-
-  threw = false;
-  try { host.wrap(sk, pk.slice(0, 16), inner); } catch { threw = true; }
-  assert(threw, "wrap rejected 16-byte publicKey");
-
-  const wire = host.wrap(sk, pk, inner);
-  assert(wire.length > inner.length, "wrap with valid sizes succeeds");
-
-  console.log("  OK\n");
-}
-
-// ─── Perf: 10k dispatch vs. plain Ed25519 verify ────────────────────────
-
-async function testPerf10k() {
-  console.log("Perf: 10k signed-envelope dispatch vs. plain Ed25519 verify");
-
-  const { host } = await makeHost();
-  const chatTextName = host.deriveBootstrapName("chat.text");
-
-  const { publicKey: pk, privateKey: sk } = generateKeyPair();
-
-  let handlerCalls = 0;
-  host.register(chatTextName, () => { handlerCalls++; });
-
-  const N = 10_000;
-  const wireMessages = new Array(N);
-  const signatures   = new Array(N);
-  const payloads     = new Array(N);
-
-  for (let i = 0; i < N; i++) {
-    const payload = new TextEncoder().encode(`message #${i}: hello world benchmark payload data`);
-    wireMessages[i] = host.wrapAndEncode(sk, pk, chatTextName, payload);
-    payloads[i]     = payload;
-    signatures[i]   = sodium.crypto_sign_detached(payload, sk);
-  }
-
-  for (let i = 0; i < 2000; i++) host.dispatch(wireMessages[i % N]);
-  for (let i = 0; i < 2000; i++) sodium.crypto_sign_verify_detached(signatures[i % N], payloads[i % N], pk);
-  handlerCalls = 0;
-
-  const t0 = performance.now();
-  for (let i = 0; i < N; i++) host.dispatch(wireMessages[i]);
-  const kernelMs = performance.now() - t0;
-  const kernelVerified = handlerCalls;
-
-  const t1 = performance.now();
-  for (let i = 0; i < N; i++) sodium.crypto_sign_verify_detached(signatures[i], payloads[i], pk);
-  const plainMs = performance.now() - t1;
-
-  const ratio = kernelMs / plainMs;
-  console.log(`  kernel pipeline  ${N.toLocaleString()} msgs: ${kernelMs.toFixed(0).padStart(6)} ms  (${(kernelMs / N * 1000).toFixed(1)} µs/msg)`);
-  console.log(`  plain Ed25519    ${N.toLocaleString()} msgs: ${plainMs.toFixed(0).padStart(6)} ms  (${(plainMs / N * 1000).toFixed(1)} µs/msg)`);
-  console.log(`  overhead ratio: ${ratio.toFixed(2)}x`);
-
-  assertEqual(kernelVerified, N, `all ${N} messages reached handler`);
   console.log("  OK\n");
 }
 
@@ -836,10 +458,11 @@ async function testCapBridge() {
   const net = new LoopbackNetwork();
   const transport = new Transport(toHex(id.publicKey), net, 40);
 
-  // A host handler reachable by name, to exercise CAP_MODULE_CALL.
+  // A handler reachable by name, to exercise CAP_MODULE_CALL. The forwarder fixture
+  // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
-  const echoName = host.deriveBootstrapName("test.echo");
-  host.register(echoName, (_n, p) => new Uint8Array([p.length, ...p]));
+  const echoName = modName("testapp", "echo");
+  installMod(host, echoName, forwarderBytes, id.publicKey);
 
   // A host-derived signing scope binds the guest's SIGN op to a bundle namespace
   // (README §12.2); a real node derives it from the manifest's (author, app).
@@ -895,10 +518,12 @@ async function testCapBridge() {
     const peers = await bridge(CAP.NET_PEERS, U());
     assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "CAP_NET_PEERS counts the cohort");
 
-    // module-call reaches an installed handler by name
-    const mc = new Uint8Array(1 + echoName.length + 2);
-    mc[0] = echoName.length; mc.set(echoName, 1); mc.set(U(8, 9), 1 + echoName.length);
-    assertEqual([...await bridge(CAP.MODULE_CALL, mc)], [2, 8, 9], "CAP_MODULE_CALL invokes the named handler");
+    // module-call reaches an installed handler by name — the name crosses the seam as
+    // its UTF-8 bytes (§12.2 MODULE_CALL: [nameLen u8][name utf8][req]).
+    const echoNameBytes = new TextEncoder().encode(echoName);
+    const mc = new Uint8Array(1 + echoNameBytes.length + 2);
+    mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
+    assertEqual([...await bridge(CAP.MODULE_CALL, mc)], [8, 9], "CAP_MODULE_CALL invokes the named handler");
   } finally {
     transport.close();
   }
@@ -969,7 +594,7 @@ async function testChannelPinning() {
 
 async function testPolicy() {
   console.log("Test: shell install policy — closed author set + module-hash allowlist");
-  const { parsePolicy, buildApproveInstall } = await imp("build/host/policy.js");
+  const { parsePolicy, buildAdmit } = await imp("build/host/policy.js");
 
   const good = generateKeyPair();
   const bad = generateKeyPair();
@@ -977,12 +602,12 @@ async function testPolicy() {
   // Install the forwarder under a freshly-policied host; returns whether it landed
   // and the bytesHash the installer recorded (for the module-allowlist subtest).
   const tryInstall = async (policyJson, author) => {
-    const { host } = await makeHost();
-    host.setApproveInstall(buildApproveInstall(host, parsePolicy(policyJson)));
-    const name = host.deriveScopedName("mod", author.publicKey);
+    const { host } = await makeHost(buildAdmit(parsePolicy(policyJson)));
+    const name = modName(author.publicKey, "mod", "fwd");
     installMod(host, name, forwarderBytes, author.publicKey);
-    const rec = host.lookupInstall(name);
-    return { landed: host.isRegistered(name), bytesHash: rec ? toHex(rec.bytesHash) : null };
+    // bytesHash is genesisHash(wasm) (§5.1) — computed from the bytes, not read back
+    // from a record, because there is no record to read.
+    return { landed: host.isBound(name), bytesHash: toHex(gHash(forwarderBytes)) };
   };
 
   // ── author allowlist ───────────────────────────────────────────────────
@@ -1025,7 +650,6 @@ async function testShellBoot() {
   let shell;
   try {
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
@@ -1046,7 +670,8 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
+  const { signManifest, verifyManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -1055,26 +680,33 @@ async function testBundle() {
   const author = generateKeyPair();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-bundle-"));
+  const bundlePath = pjoin(dir, "app.skb");
   let shell, shell2;
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
-    // throwaway host to derive the kernel name and hash content. Modules install
-    // directly from the manifest (§12.4) — no per-module .install envelope.
+    // throwaway host to hash content. Modules install directly from the manifest
+    // (§12.4) — no per-module .install envelope — under a kernel name the loader
+    // DERIVES from the signed `(app, name)` pair, so the manifest declares none.
+    // Neither the module nor the guest names a file: they are `<name>.wasm` and
+    // `guest.js`.
     const { host: h } = await makeHost();
-    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const kernelName = kernelNameFor(author.publicKey, "test", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
-      modules: [{
-        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName: toHex(kernelName),
-      }],
-      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      caps: [],
+      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+      // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
+      guest: {
+        hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        caps: [],
+      },
     };
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    wf(pjoin(dir, "guest.js"), guestText);
-    wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest));
+    const writeBundle = (m) => wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, m),
+      [moduleFile("codec")]: forwarderBytes,
+      [GUEST_FILE]: new TextEncoder().encode(guestText),
+    }));
+    writeBundle(manifest);
 
     // sign / verify / tamper
     const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
@@ -1082,43 +714,132 @@ async function testBundle() {
     const tampered = env.slice(); tampered[tampered.length - 1] ^= 1;
     assert(verifyManifest(sodium, tampered) === null, "a tampered manifest fails verification");
 
+    // A manifest whose module names collide is ambiguous (the name keys both the
+    // container and the guest's module map), so it is refused even though it is
+    // validly signed (§12.4).
+    const dupEnv = signManifest(sodium, author.privateKey, author.publicKey, {
+      ...manifest,
+      modules: [manifest.modules[0], { ...manifest.modules[0] }],
+    });
+    let dupRefused = false;
+    try { verifyManifest(sodium, dupEnv); } catch { dupRefused = true; }
+    assert(dupRefused, "a manifest with duplicate module names is refused as malformed");
+
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
-    const loaded = shell.loadBundle(dir);
+    const loaded = shell.loadBundle(bundlePath);
     assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
-    assert(shell.host.isRegistered(kernelName), "module registered under its kernel name");
+    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
     // version and reloading through the same shell exercises the downgrade gate.
-    const remanifest = (version) =>
-      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, { ...manifest, version }));
-    remanifest(1); shell.loadBundle(dir); // equal version reloads (an ordinary reboot)
-    remanifest(2); shell.loadBundle(dir); // newer version advances the mark to 2
-    remanifest(1);                          // now a downgrade
+    const remanifest = (version) => writeBundle({ ...manifest, version });
+    remanifest(1); shell.loadBundle(bundlePath); // equal version reloads (an ordinary reboot)
+    remanifest(2); shell.loadBundle(bundlePath); // newer version advances the mark to 2
+    remanifest(1);                                // now a downgrade
     let downgradeRefused = false;
-    try { shell.loadBundle(dir); } catch { downgradeRefused = true; }
+    try { shell.loadBundle(bundlePath); } catch { downgradeRefused = true; }
     assert(downgradeRefused, "a version below the (author, app) high-water mark is refused as a downgrade");
-    remanifest(2); shell.loadBundle(dir);   // the mark held at 2, so v2 still loads
-    remanifest(1);                          // restore the original manifest for the shell2 check below
+    remanifest(2); shell.loadBundle(bundlePath);  // the mark held at 2, so v2 still loads
+    remanifest(1);                                // restore the original for the shell2 check below
 
     // a shell whose policy does NOT allow the author refuses the bundle
     shell2 = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(generateKeyPair().publicKey)] }),
       dir: pjoin(dir, "_data2"), identity,
     });
     let refused = false;
-    try { shell2.loadBundle(dir); } catch { refused = true; }
+    try { shell2.loadBundle(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a non-allowed author is refused");
   } finally {
     if (shell) shell.close();
     if (shell2) shell2.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("  OK\n");
+}
+
+// ─── Test: handler-only bundle (no guest) + the verify/install split ────
+//
+// A chat-style app is a one-module bundle with NO guest realm — and because caps
+// live inside `guest` (§12.4), omitting it IS declaring zero authority; there is no
+// empty caps list to write. Proves the shared §12.4 loader accepts that shape
+// (guestSource === ""), that a bundle blob round-trips as one value, and that
+// `verifyBundle` authenticates + integrity-checks WITHOUT a host or a policy — the
+// seam the browser shell peeks a received Offer through before asking for consent.
+async function testGuestlessBundleAndArchive() {
+  console.log("Test: handler-only bundle (no guest) loads + verify/install split");
+  const { signManifest, verifyManifest, verifyBundle, checkBundleIntegrity,
+          packBundle, unpackBundle, kernelNameFor, MANIFEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
+  const { boot } = await imp("build/host/main.js");
+  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+
+  const author = generateKeyPair();
+  const identity = generateKeyPair();
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guestless-"));
+  const bundlePath = pjoin(dir, "demo.skb");
+  let shell;
+  try {
+    const { host: h } = await makeHost();
+    const kernelName = kernelNameFor(author.publicKey, "demo", "demo");
+    // A manifest with NO `guest` field — the handler-only shape, and so no caps.
+    const manifest = {
+      app: "demo", version: 1,
+      modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }],
+    };
+    const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+    assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
+
+    // Blob round-trip: a bundle IS one blob, and this is what an Offer carries over a
+    // data channel and what the loader reads from disk — one format, one path.
+    const packed = packBundle({
+      [MANIFEST_FILE]: manifestEnv,
+      [moduleFile("demo")]: forwarderBytes,
+    });
+    const files = unpackBundle(packed);
+    assert(bytesEqual(files[MANIFEST_FILE], manifestEnv), "packed manifest round-trips");
+    assert(bytesEqual(files[moduleFile("demo")], forwarderBytes), "packed module round-trips");
+    let badArchive = false;
+    try { unpackBundle(new Uint8Array([1, 2, 3])); } catch { badArchive = true; }
+    assert(badArchive, "a non-bundle blob is rejected fail-loud");
+
+    // The verify half on its own: no host, no policy, no freshness — the browser
+    // shell's peek path. It authenticates and yields every verified byte.
+    const v = verifyBundle(sodium, packed);
+    assert(bytesEqual(v.author, author.publicKey), "verifyBundle returns the signing author");
+    assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
+    assertEqual(v.guestSource, "", "a guest-less bundle verifies with an empty guest source");
+    checkBundleIntegrity(v, (b) => gHash(b)); // throws on mismatch
+    // Corrupting a module must fail integrity even though the manifest still verifies.
+    const corrupt = packBundle({
+      [MANIFEST_FILE]: manifestEnv,
+      [moduleFile("demo")]: forwarderBytes.slice(0, forwarderBytes.length - 1),
+    });
+    let integrityFailed = false;
+    try { checkBundleIntegrity(verifyBundle(sodium, corrupt), (b) => gHash(b)); }
+    catch { integrityFailed = true; }
+    assert(integrityFailed, "a module that does not match its declared hash fails integrity");
+
+    // Load the guest-less bundle through the shared §12.4 loader.
+    wf(bundlePath, packed);
+    shell = await boot({
+      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      dir: pjoin(dir, "_data"), identity,
+    });
+    const loaded = shell.loadBundle(bundlePath);
+    assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
+    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
+    assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
+  } finally {
+    if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
   }
   console.log("  OK\n");
@@ -1367,25 +1088,29 @@ async function testCapBridgeEnforcement() {
 }
 
 async function testCallHandlerGuards() {
-  console.log("Test: KernelHost.callHandler applies the call-router guards (§4.4)");
+  console.log("Test: KernelHost.callHandler resolves by name, or null when unbound (§4)");
 
   const { host } = await makeHost();
-  // The signature wrapper is blockedFromCall — kernel.call refuses it, so the
-  // host-side by-name path must too (a confined guest reaches this via
-  // CAP_MODULE_CALL). It establishes the top signer, so letting a handler reach
-  // it via kernel.call would reframe the active signer mid-chain (§4.4).
-  const sigName = host.deriveBootstrapName("signature");
-  assert(host.callHandler(sigName, new Uint8Array([1])) === null,
-    "callHandler refuses the signature wrapper");
+  const { publicKey: pk } = generateKeyPair();
 
-  // A normal handler still works, and sees an *empty* immediate caller — not a
-  // stale frame from some outer dispatch (the §8 confused-deputy check).
-  let sawCaller = "unset";
-  const echoName = host.deriveBootstrapName("test.echo2");
-  host.register(echoName, (_n, p, h) => { sawCaller = h.currentCaller; return p; });
+  // An unbound name resolves to nothing — null, distinct from an empty response.
+  const missing = modName("nope", "missing");
+  assert(host.callHandler(missing, new Uint8Array([1])) === null,
+    "callHandler returns null for an unbound name");
+
+  // An installed handler is reached by name. A confined guest reaches the same handler
+  // through the cap-bridge's MODULE_CALL (§12.2).
+  const echoName = modName("guards", "echo");
+  installMod(host, echoName, forwarderBytes, pk);
   const r = host.callHandler(echoName, new Uint8Array([5]));
-  assertEqual([...r], [5], "callHandler still reaches a normal handler");
-  assert(sawCaller === null, "the target sees no installed caller (anonymous frame)");
+  assertEqual([...r], [5], "callHandler reaches an installed handler");
+
+  // A 0-length response is a valid EMPTY answer, NOT the null of an unbound name — the
+  // two are distinct at this seam, so a caller can tell "handler ran, said nothing" from
+  // "nothing there". The forwarder echoes, so an empty input produces an empty response.
+  const empty = host.callHandler(echoName, EMPTY);
+  assert(empty !== null && empty.length === 0,
+    "an empty response is an empty array, distinct from null");
 
   console.log("  OK\n");
 }
@@ -2151,16 +1876,160 @@ async function testRecordLayerIntegrity() {
   console.log("  OK\n");
 }
 
+// ─── Test: manifest suite byte — signed, so it cannot be edited in flight ────────
+//
+// The §12.4 envelope is `[suite 1][pk 32][sig 64][json]` and the suite byte is part of
+// the signed preimage `DOMAIN_manifest ‖ suite ‖ json`. That is what makes it safe to
+// read the byte *before* verifying: a verifier needs it to know the field widths, and
+// the signature it then checks commits to the same byte, so rewriting it only breaks the
+// manifest. Algorithm confusion between two suites is unrepresentable (§14.1).
+async function testManifestSuiteByte() {
+  console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
+  const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
+
+  const author = generateKeyPair();
+  const manifest = { app: "suite-probe", version: 1, modules: [] };
+  const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+
+  // Layout: the suite byte leads, and the author key follows it (not at offset 0).
+  assertEqual(env[0], 0x01, "the envelope opens with the genesis manifest suite id");
+  assertEqual(toHex(env.slice(1, 33)), toHex(author.publicKey), "the author key follows the suite byte");
+
+  // 1. Untouched, it verifies and returns the author + manifest.
+  {
+    const v = verifyManifest(sodium, env);
+    assert(v !== null, "an untouched manifest verifies");
+    assertEqual(toHex(v.author), toHex(author.publicKey), "the author key round-trips");
+    assertEqual(v.manifest.app, "suite-probe", "the manifest round-trips");
+  }
+
+  // 2. An unknown suite is refused as a legibility failure, with its own message —
+  //    not silently reported as a bad signature, which would misdirect an operator
+  //    whose real problem is a bundle built for a newer host.
+  {
+    const bad = env.slice(); bad[0] = 0x7f;
+    let msg = "";
+    try { verifyManifest(sodium, bad); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("unsupported manifest suite"), `unknown suite reports itself (got: ${msg || "no throw"})`);
+    assert(!msg.includes("signature"), "an unknown suite is not reported as a signature failure");
+  }
+
+  // 3. The load-bearing property: the suite byte is inside the signed preimage, so an
+  //    attacker who rewrites it to a suite the verifier DOES accept still fails — the
+  //    preimage no longer matches what was signed. (0x01 signed, re-presented as 0x01
+  //    after tampering the json proves the same binding from the other direction.)
+  {
+    const forged = env.slice();
+    forged[33] ^= 0x01; // flip a signature byte → must not verify
+    assert(verifyManifest(sodium, forged) === null, "a tampered signature does not verify");
+  }
+  {
+    // Re-sign under a preimage WITHOUT the suite byte (the pre-§14.1 construction) and
+    // present it as suite 0x01: the verifier computes the suite-bound preimage, so the
+    // legacy signature fails. A signature is bound to the suite it was made under.
+    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const legacyPre = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), json]);
+    const legacySig = sodium.crypto_sign_detached(legacyPre, author.privateKey);
+    const legacyEnv = concatBytes([Uint8Array.of(0x01), author.publicKey, legacySig, json]);
+    assert(verifyManifest(sodium, legacyEnv) === null,
+      "a signature made without the suite byte does not verify as suite 0x01");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: HELLO suite byte — unknown suite refused, flipped suite cannot downgrade ──
+//
+// The §12.6 suite byte makes HELLO self-describing so a future (post-quantum) handshake
+// is a negotiated rollout rather than a network-wide flag day. Two properties carry it:
+// an unrecognised suite is refused cleanly, and — because the byte lives inside the
+// signed transcript — an in-path flip cannot force a peer onto another suite, it only
+// breaks AUTH. The second is the load-bearing one: a suite is *chosen* by endpoints,
+// never *forced* by the network.
+async function testHelloSuiteByte() {
+  console.log("Test: HELLO suite byte — unknown suite refused, flipped suite breaks AUTH (no downgrade)");
+  const { PeerLink } = await imp("build/host/net-link.js");
+
+  // In-memory pair; `hook.fn` may rewrite any message A sends before B sees it.
+  function pair(hook) {
+    const mk = () => ({
+      msg: null, cls: null, closed: false, twin: null,
+      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
+      close() {
+        if (this.closed) return;
+        this.closed = true;
+        queueMicrotask(() => this.cls && this.cls());
+        const t = this.twin;
+        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
+      },
+    });
+    const a = mk(), b = mk(); a.twin = b; b.twin = a;
+    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
+    a.send = (bytes) => { const m = hook.fn ? hook.fn(bytes.slice()) : bytes.slice(); if (m) deliver(b, m); };
+    b.send = (bytes) => deliver(a, bytes.slice());
+    return { a, b };
+  }
+
+  // Teardown is observed on the channel: a PeerLink that closes *itself* sets `closed`
+  // before closing the channel, so its own onClose opt does not re-fire (onChannelClose
+  // reports only externally-originated closes). The channel flag is the unambiguous signal.
+  async function run(hookFn) {
+    const hook = { fn: hookFn };
+    const { a: chA, b: chB } = pair(hook);
+    const idA = generateKeyPair(), idB = generateKeyPair();
+    const st = { aAuthed: false, bAuthed: false, get bClosed() { return chB.closed; } };
+    const linkB = new PeerLink({
+      channel: chB, identity: idB, sodium, weDialed: false,
+      onAuth: () => { st.bAuthed = true; }, onFrame: () => {}, onClose: () => {},
+    });
+    const linkA = new PeerLink({
+      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
+      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => {},
+    });
+    void linkA; void linkB;
+    for (let i = 0; i < 25 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
+    return st;
+  }
+
+  // 0. Control: untouched, the genesis suite handshake completes.
+  {
+    const st = await run(null);
+    assert(st.aAuthed && st.bAuthed, "an untouched genesis-suite handshake authenticates");
+  }
+
+  // 1. An unknown suite id in HELLO is refused outright — the link never authenticates.
+  //    This is the clean-failure property: a node meeting a handshake it does not speak
+  //    closes, instead of parsing another format's bytes at this format's offsets.
+  {
+    const st = await run((m) => { if (m[0] === 1 /* MSG_HELLO */) m[1] = 0x7f; return m; });
+    assert(!st.bAuthed, "a HELLO carrying an unknown suite id never authenticates");
+    assert(st.bClosed, "an unknown suite closes the link");
+  }
+
+  // 2. Downgrade: flipping the suite byte in flight does not select another suite — B
+  //    now hashes a different half into its transcript than A signed, so AUTH fails.
+  //    (Here the flip is to a byte B rejects outright; the point is that even if a
+  //    future B *did* accept it, the transcript mismatch still denies the attacker a
+  //    completed session.) The byte is authenticated, so it cannot be forced.
+  {
+    const st = await run((m) => { if (m[0] === 1) m[1] = 0x02; return m; });
+    assert(!st.aAuthed && !st.bAuthed, "a suite byte flipped in flight yields no authenticated session");
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Test: a corrupt newer bundle does not advance the freshness mark ────────────
 //
 // Finding guard: the freshness high-water mark must record only versions that fully
-// loaded. A newer bundle whose manifest is intact and signed but whose module file is
+// loaded. A newer bundle whose manifest is intact and signed but whose module bytes are
 // corrupt (a half-landed upgrade) must fail the content check WITHOUT raising the mark —
-// otherwise reloading the known-good older directory would be refused as a downgrade,
+// otherwise reloading the known-good older bundle would be refused as a downgrade,
 // bricking rollback (README §12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { signManifest } = await imp("build/host/bundle.js");
+  const { signManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -2169,49 +2038,49 @@ async function testBundleCorruptNewerRollback() {
   const author = generateKeyPair();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-rollback-"));
+  const bundlePath = pjoin(dir, "rollback.skb");
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = h.deriveScopedName("codec", author.publicKey);
+    const kernelName = kernelNameFor(author.publicKey, "rollback", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
-      modules: [{
-        name: "codec", file: "codec.wasm", hash: toHex(h.genesisHash(forwarderBytes)),
-        kernelName: toHex(kernelName),
-      }],
-      guest: { file: "guest.js", hash: toHex(h.genesisHash(new TextEncoder().encode(guestText))) },
-      caps: [],
+      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+      guest: {
+        hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        caps: [],
+      },
     });
-    wf(pjoin(dir, "guest.js"), guestText);
-    const writeManifest = (version) =>
-      wf(pjoin(dir, "manifest.bundle"), signManifest(sodium, author.privateKey, author.publicKey, manifest(version)));
+    // `wasm` is the module's actual bytes — passed corrupt below to model a
+    // half-written upgrade whose manifest is nonetheless intact and signed.
+    const writeBundle = (version, wasm = forwarderBytes) => wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
+      [moduleFile("codec")]: wasm,
+      [GUEST_FILE]: new TextEncoder().encode(guestText),
+    }));
 
     shell = await boot({
-      kernelBytes: new Uint8Array(readFileSync(kernelWasm)),
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
       dir: pjoin(dir, "_data"), identity,
     });
 
     // 1. Good v4 loads and sets the mark to 4.
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    writeManifest(4);
-    shell.loadBundle(dir);
+    writeBundle(4);
+    shell.loadBundle(bundlePath);
 
-    // 2. A corrupt v5: validly signed at version 5, but the on-disk module no longer
-    //    matches its declared hash. The load must throw on the content check.
-    writeManifest(5);
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes.slice(0, forwarderBytes.length - 1));
+    // 2. A corrupt v5: validly signed at version 5, but the module bytes no longer
+    //    match their declared hash. The load must throw on the content check.
+    writeBundle(5, forwarderBytes.slice(0, forwarderBytes.length - 1));
     let v5Failed = false;
-    try { shell.loadBundle(dir); } catch { v5Failed = true; }
+    try { shell.loadBundle(bundlePath); } catch { v5Failed = true; }
     assert(v5Failed, "a corrupt v5 bundle fails to load");
 
-    // 3. Restore the good v4 directory and reload. If the failed v5 load had advanced the
+    // 3. Restore the good v4 bundle and reload. If the failed v5 load had advanced the
     //    mark to 5, this would now be refused as a downgrade. It must still load.
-    wf(pjoin(dir, "codec.wasm"), forwarderBytes);
-    writeManifest(4);
+    writeBundle(4);
     let v4Reloaded = true;
-    try { shell.loadBundle(dir); } catch { v4Reloaded = false; }
+    try { shell.loadBundle(bundlePath); } catch { v4Reloaded = false; }
     assert(v4Reloaded, "the known-good v4 reloads after the corrupt v5 attempt (mark not advanced)");
   } finally {
     if (shell) shell.close();
@@ -2223,27 +2092,19 @@ async function testBundleCorruptNewerRollback() {
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
-await testSignerQuery();
-await testInvalidSignatureDropped();
-await testSizeLimitEnforced();
-await testSingleSignatureNoNesting();
-await testRefuseOverlayBootstrapSlot();
 await testApproveInstallRejects();
 await testApproveInstallReceivesBytesHash();
 await testNoApproveInstallDropsAll();
-await testReferencePolicyUpgradeRules();
-await testInstallerLookupHostSide();
+await testDerivedNamesKeepAuthorsApart();
+await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();
-await testCallerStackFormat();
-await testBridgeCallerPinning();
-await testBlockFromCall();
-await testWrapRejectsInvalidKeySizes();
 await testFs();
 await testGuestNetFanout();
 await testCapBridge();
 await testPolicy();
 await testShellBoot();
 await testBundle();
+await testGuestlessBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testWsFraming();
 await testChannelPinning();
@@ -2262,8 +2123,9 @@ await testRedialAfterFailedDial();
 await testConnsPerPeerFanout();
 await testWsNetworkFanout();
 await testRecordLayerIntegrity();
+await testHelloSuiteByte();
+await testManifestSuiteByte();
 await testSafeRealmConcurrency();
-await testPerf10k();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

@@ -93,7 +93,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		});
 	`
 	aIdHex := mustEvalString(t, hostQc, `aId`)
-	g, err := newGuestRealm(el, fmt.Sprintf(`{"peer":%q,"type":5}`, aIdHex), askGuestSource)
+	g, err := newGuestRealm(el, "", fmt.Sprintf(`{"peer":%q,"type":5}`, aIdHex), askGuestSource)
 	if err != nil {
 		t.Fatal("guest:", err)
 	}

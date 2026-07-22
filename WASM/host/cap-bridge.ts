@@ -50,7 +50,7 @@ export const CAP = {
                        //   reading every value back. Existence is size ≥ 0, so there is
                        //   no separate FS_HAS.
   // module (15) + clock (16)
-  MODULE_CALL: 15,     // [nameLen u8][name][req] -> installed handler response bytes
+  MODULE_CALL: 15,     // [nameLen u8][name utf8][req] -> installed handler response bytes
   CLOCK: 16,           // -> now ms (u64 BE)
 } as const;
 
@@ -58,6 +58,93 @@ export const CAP = {
 export function capPreamble(): string {
   return Object.entries(CAP).map(([k, v]) => `const CAP_${k} = ${v};`).join("\n") + "\n";
 }
+
+/** The guest-side ABI preamble: `host.call(op, bytes)` over the single seam, plus
+ *  `register`/`__invoke` for entrypoint dispatch. Pure JS — it names no authority, so
+ *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
+ *  shape to call through.
+ *
+ *  ONE definition for every target, for the same reason `bundlePreamble` is one: a bundle
+ *  ships a single `guest.js` that runs byte-identical on the node/browser host (safe-js.ts)
+ *  and inside the native loader's confined realm (guest.go). The preamble is therefore a
+ *  contract between the runtime and signed content, not a host implementation detail — a
+ *  per-target copy is a wire format maintained in two places.
+ *
+ *  HOST CONTRACT — a host embedding this must inject one function:
+ *
+ *    __host_call(op, callId, payload: ArrayBuffer) -> ArrayBuffer | null
+ *
+ *  Returning bytes completes a **sync** op (crypto/fs/clock/module) inline. Returning
+ *  `null` means the host started an **async** (net) op under `callId`; the guest parks a
+ *  Promise here and the host later calls `__netResolve(callId, bytes)` or
+ *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync op that ever returned
+ *  null/undefined would be read as async and leave a Promise pending forever.
+ *
+ *  The async half is deliberately plain ECMAScript rather than a host-created deferred:
+ *  the guest builds its own Promise, so the seam needs no promise primitive from the
+ *  embedding engine. That is what lets one preamble serve both a host holding
+ *  quickjs-emscripten's `newPromise()` and one driving quickjs-ng over wazero, which has
+ *  no such primitive. */
+export function guestPreamble(): string {
+  return GUEST_PREAMBLE;
+}
+
+const GUEST_PREAMBLE = `
+"use strict";
+let __callSeq = 0;
+const __pending = Object.create(null);
+globalThis.__netResolve = (callId, bytes) => {
+  const p = __pending[callId];
+  if (!p) return;
+  delete __pending[callId];
+  p.resolve(new Uint8Array(bytes));
+};
+globalThis.__netReject = (callId, msg) => {
+  const p = __pending[callId];
+  if (!p) return;
+  delete __pending[callId];
+  p.reject(new Error(msg));
+};
+globalThis.host = {
+  // A sync op resolves to its bytes directly; a net op returns a real Promise, so a
+  // guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op) and a
+  // fan-out is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
+  //
+  // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
+  // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
+  // but quickjs-emscripten's getArrayBuffer accepts only a true ArrayBuffer. A subarray is
+  // copied to its own buffer so the host never sees more bytes than the caller passed.
+  call(op, bytes) {
+    const callId = ++__callSeq;
+    const ab = bytes instanceof ArrayBuffer
+      ? bytes
+      : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
+        ? bytes.buffer
+        : bytes.slice().buffer;
+    const r = __host_call(op, callId, ab);
+    if (r !== null) return new Uint8Array(r);          // sync op — bytes directly
+    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net op
+  },
+};
+globalThis.__entries = Object.create(null);
+globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
+function __norm(out) {
+  if (out instanceof ArrayBuffer) return out;
+  if (out instanceof Uint8Array) {
+    return (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength) ? out.buffer : out.slice().buffer;
+  }
+  throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
+}
+globalThis.__invoke = (name, argBuf) => {
+  const fn = globalThis.__entries[name];
+  if (typeof fn !== "function") throw new Error("guest: no entrypoint '" + name + "'");
+  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
+  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
+  // __norm normalizes both to an ArrayBuffer.
+  const out = fn(new Uint8Array(argBuf));
+  return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
+};
+`;
 
 /** Capability *domains* — named groups of ops. A bundle's signed manifest declares
  *  the domains its guest needs (its `caps`), and the shell expands them to the
@@ -97,6 +184,42 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
  *  diverging. `scope` comes from `guestSignScope(author, app)`. */
 export function guestSignPrefix(scope: Uint8Array): Uint8Array {
   return concatBytes([DOMAIN_GUEST, scope]);
+}
+
+/** The facts a guest learns about the bundle it is running as, all of them derived by
+ *  the runtime at admission from the signed manifest. */
+export interface BundleFacts {
+  /** The manifest `app`. */
+  app: string;
+  /** The manifest author's public key — the key the signature verified under. */
+  author: Uint8Array;
+  /** Logical module name → the kernel name it was bound at, from `modules[]`. This is
+   *  what gives a manifest module `name` a job: the key a guest MODULE_CALLs its own
+   *  modules by, without knowing how the name was derived. */
+  modules: Record<string, string>;
+}
+
+/** The generated `const BUNDLE = {…};` block injected alongside `capPreamble()`, holding
+ *  what the runtime knows about the admitted bundle (README §12.4).
+ *
+ *  Every field here is a fact the runtime DERIVES, so no author ever restates one by
+ *  hand: the signing prefix in particular is `DOMAIN_guest ‖ guestSignScope(author, app)`
+ *  — precisely what the SIGN op prepends — and a hand-baked copy that disagrees with the
+ *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
+ *  cause. This is the same one-file rule the DOMAIN_* family follows.
+ *
+ *  Kept deliberately separate from the app's `const APP`: APP is author config that a
+ *  deployment's operator config merges over, so anything living there is operator-
+ *  writable. Nothing in BUNDLE is. */
+export function bundlePreamble(f: BundleFacts): string {
+  const bundle = {
+    app: f.app,
+    author: toHex(f.author),
+    // The prefix a guest prepends before CAP_VERIFY to rebuild what CAP_SIGN signed.
+    signPrefix: toHex(guestSignPrefix(guestSignScope(f.author, f.app))),
+    modules: f.modules,
+  };
+  return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
 }
 
 /** Expand declared capability domains to the concrete op numbers a bridge allows.
@@ -143,7 +266,7 @@ export interface CapBridgeDeps {
    *  is never raw). A host-side caller that never exposes SIGN may omit it. */
   signScope?: Uint8Array;
   /** Reach an installed WASM handler by name (KernelHost.callHandler). */
-  callHandler: (name: Uint8Array, payload: Uint8Array) => Uint8Array | null;
+  callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
   transport: CapTransport;
   /** The peers this node can reach (its cohort / connected set). */
   peers: () => PeerId[];
@@ -152,10 +275,9 @@ export interface CapBridgeDeps {
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
   /** The allowed op set, expanded from the manifest's declared cap domains
-   *  (README §12.2, `opsForCaps` — not from `ops`, which is documentation-only).
-   *  When present, any op outside the set is refused — the guest analogue of the
-   *  §8 bridge check. Omitted = unrestricted (a trusted host-side caller that
-   *  holds the primitives anyway). */
+   *  (README §12.2, `opsForCaps`). When present, any op outside the set is refused,
+   *  so a guest reaches exactly what its bundle declared. Omitted = unrestricted
+   *  (a trusted host-side caller that holds the primitives anyway). */
   allowedOps?: Iterable<number>;
 }
 
@@ -281,8 +403,10 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
 
       // ── installed-handler call + clock ───────────────────────────────────
       case CAP.MODULE_CALL: {
+        // The handler name is a string (README §5.1), so it crosses the seam as its
+        // UTF-8 bytes — a bootstrap name reads plainly, a scoped name is its hex.
         const nameLen = payload[0];
-        const name = payload.slice(1, 1 + nameLen);
+        const name = dec.decode(payload.slice(1, 1 + nameLen));
         const r = callHandler(name, payload.slice(1 + nameLen));
         return r ?? NONE;
       }

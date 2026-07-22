@@ -13,8 +13,8 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }
@@ -26,8 +26,8 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	author, authorPub := testAuthor(t)
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "manifest author is not in the policy's allowed set") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "manifest author is not in the policy's allowed set") {
 		t.Fatalf("expected foreign-author rejection, got: %s", status)
 	}
 }
@@ -44,8 +44,8 @@ func TestPolicyMalformed(t *testing.T) {
 	// is deny-all, so nothing installs (README §14). Before, a realm whose policy failed
 	// to parse kept a permissive default and loaded any signed bundle.
 	author, authorPub := testAuthor(t)
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "not in the policy") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
 		t.Fatalf("after rejected policies the realm must stay deny-all: %s", status)
 	}
 }
@@ -59,31 +59,48 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 
 	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
 	// way code arrives (§12.4), so the manifest-author gate is the whole install surface.
-	dir, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(dir); !strings.Contains(status, "not in the policy") {
+	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
 }
 
-// A bundle module must not overlay a SetHandler-seeded bootstrap slot (README §7.4) —
-// the reference policy's rule, enforced via the kernel's handler table on the shared
-// installDirect path. `signature.signer` is seeded by boot() as a native handler with no
-// install record, so aiming a bundle module at it must leave the native handler in place.
-func TestBundleCannotOverlaySeededSlot(t *testing.T) {
+// Two authors shipping an app under the SAME name coexist (README §5.1): a kernel name
+// is derived from its author's key, so B never aims at A's slot in the first place. There
+// is no ownership register and no same-author clause — the collision the old register
+// existed to refuse is unrepresentable, and both modules land.
+func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	boot()
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+	authorA, authorAPub := testAuthor(t)
+	authorB, authorBPub := testAuthor(t)
+	// Both authors are allowed to install: this test is about the namespace, not the
+	// closed author set. A permissive policy is exactly the interesting case — even with
+	// nothing refusing anyone, neither author can reach the other's names.
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorAPub) + `","` + hex.EncodeToString(authorBPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	seeded := name("signature.signer")
-	dir, _ := writeTestBundle(t, author, authorPub, "overlayapp", 1, seeded)
-	if status := loadBundle(dir); strings.Contains(status, "installed=[fwd]") {
-		t.Fatalf("a bundle module overlaid the seeded `signature.signer` slot: %s", status)
+	nameA := kernelNameFor(authorAPub, "ownedapp", "fwd")
+	nameB := kernelNameFor(authorBPub, "ownedapp", "fwd")
+	if nameA == nameB {
+		t.Fatal("the same app name under two authors must derive distinct kernel names")
 	}
-	if boundToWasm(seeded) {
-		t.Fatal("the seeded `signature.signer` slot was overlaid by a bundle module")
+	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
+	if status := loadBundle(bundleA); !strings.Contains(status, "installed=[fwd]") {
+		t.Fatalf("author A's install should be admitted: %s", status)
 	}
-	if id := findHandlerID(seeded); id < 0 || entries[id].nat == nil {
-		t.Fatal("the seeded `signature.signer` handler is gone from its slot")
+	if !boundToWasm(nameA) {
+		t.Fatalf("author A's module is not bound at `%s`", nameA)
+	}
+	// B's bundle declares the same app name and installs too — beside A, never over it.
+	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
+	if status := loadBundle(bundleB); !strings.Contains(status, "installed=[fwd]") {
+		t.Fatalf("author B's install should be admitted under its own name: %s", status)
+	}
+	if !boundToWasm(nameB) {
+		t.Fatalf("author B's module is not bound at `%s`", nameB)
+	}
+	// The decisive assertion: A's slot is untouched by B's install.
+	if !boundToWasm(nameA) {
+		t.Fatalf("author B's install displaced author A at `%s`", nameA)
 	}
 }

@@ -67,7 +67,7 @@ func TestServe(t *testing.T) {
 		  return new Uint8Array(0);
 		});
 	`
-	g, err := newGuestRealm(el, "{}", holderSource)
+	g, err := newGuestRealm(el, "", "{}", holderSource)
 	if err != nil {
 		t.Fatal("guest:", err)
 	}

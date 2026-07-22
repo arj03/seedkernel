@@ -1,7 +1,7 @@
-// Verifies the patched browser libsodium under Node by serving browser/
-// over HTTP and using a real fetch() against it — same code path a browser
-// would take, just driven from Node. Smoke-tests the 4 sodium functions
-// the browser benchmark uses.
+// Verifies the browser libsodium wrapper under Node by serving browser/ over
+// HTTP and using a real fetch() against it — same code path a browser would
+// take, just driven from Node. Smoke-tests the 4 sodium functions the browser
+// benchmark uses: sign keypair/detached/verify + generichash (BLAKE2b-256).
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
@@ -66,7 +66,7 @@ const { publicKey, privateKey } = sodium.crypto_sign_keypair();
 const msg = new TextEncoder().encode("hello kernel.wasm");
 const sig = sodium.crypto_sign_detached(msg, privateKey);
 const ok = sodium.crypto_sign_verify_detached(sig, msg, publicKey);
-const h = sodium.crypto_hash_sha3256(msg);
+const h = sodium.crypto_generichash(32, msg);
 
 srv.close();
 if (!ok) { console.error("verify failed"); process.exit(1); }

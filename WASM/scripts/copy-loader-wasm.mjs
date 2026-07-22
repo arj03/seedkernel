@@ -15,7 +15,6 @@ const dst = resolve(root, "../native/wasm");
 mkdirSync(dst, { recursive: true });
 
 const copies = [
-  ["build/kernel.wasm", "kernel.wasm"],
   ["build/ws.wasm", "ws.wasm"],
   ["browser/libsodium.wasm", "libsodium.wasm"],
 ];

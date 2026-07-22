@@ -36,8 +36,8 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 		}
 	}
 	load := func(version int) string {
-		dir, _ := writeTestBundle(t, author, authorPub, "testapp", version)
-		return loadBundle(dir)
+		bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", version)
+		return loadBundle(bundlePath)
 	}
 
 	// First boot: v3 clears the (empty) mark and, once loaded, advances + persists it.

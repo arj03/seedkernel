@@ -9,16 +9,20 @@
 // bridges.
 //
 // Async seam: a guest is typically multi-step, and the net steps genuinely round-trip.
-// `host.call` resolves a **sync op** (crypto/fs/clock/module) to its bytes immediately
-// and a **net op** to a real Promise the guest `await`s — implemented with
-// quickjs-emscripten's deferred promise (`ctx.newPromise()`): the host function returns
-// the deferred's handle and settles it when the bridge promise resolves, pumping
-// `executePendingJobs()` so the guest's awaiting continuation runs. There is no Asyncify
-// and no host-driven step loop: a suspended async guest is just heap state, so the same
-// realm can be re-entered synchronously to serve a request (`callSync`, the holder path)
-// while an initiator (`call`) is parked mid-`await`. One `quickjs.wasm` build serves both
-// roles. An app builds its own guest confinement on top of this generic primitive
-// (README §12.3).
+// `host.call` resolves a **sync op** (crypto/fs/clock/module) to its bytes immediately and
+// a **net op** to a real Promise the guest `await`s. The guest builds that Promise itself
+// (the shared preamble parks it under a `callId`); this host returns `null` to say "started
+// async", then settles it with `__netResolve`/`__netReject` and pumps `executePendingJobs()`
+// so the awaiting continuation runs. Deliberately NOT quickjs-emscripten's `newPromise()`
+// deferred: keeping the async half in plain ECMAScript is what lets this host and the
+// native loader (guest.go, quickjs-ng over wazero, which has no promise primitive) share
+// ONE preamble — see `guestPreamble` in cap-bridge.ts.
+//
+// There is no Asyncify and no host-driven step loop: a suspended async guest is just heap
+// state, so the same realm can be re-entered synchronously to serve a request (`callSync`,
+// the holder path) while an initiator (`call`) is parked mid-`await`. One `quickjs.wasm`
+// build serves both roles. An app builds its own guest confinement on top of this generic
+// primitive (README §12.3).
 
 import {
   newQuickJSWASMModule,
@@ -37,6 +41,10 @@ import ngReleaseSyncMod from "@jitl/quickjs-ng-wasmfile-release-sync";
 const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModule>[0]
 >;
+
+// The guest-side ABI, shared with the native loader. See `guestPreamble` for the
+// `__host_call` / `__netResolve` contract this file implements.
+import { guestPreamble } from "./cap-bridge.js";
 
 /** The one capability seam. `op` selects a host capability (net / store / crypto / clock /
  *  rand, mapped by the host); `payload`/return are opaque bytes, exactly like
@@ -76,47 +84,6 @@ export interface SafeRealm {
   callSync(entry: string, payload: Uint8Array): Uint8Array;
   dispose(): void;
 }
-
-// The guest-side preamble. Defines the airtight ABI the guest is written against:
-// `host.call(op, bytes)` over the single seam — bytes for a sync op, a Promise for a net
-// op — and `register`/`__invoke` for entrypoint dispatch. Pure JS — no authority.
-const PREAMBLE = `
-globalThis.host = {
-  // __host_call returns an ArrayBuffer for a sync op (crypto/fs/clock/module) and a
-  // Promise<ArrayBuffer> for a net op (a genuine round trip). So a guest's
-  // 'await host.call(...)' resolves net transparently, while a sync op is returned
-  // directly (awaiting a plain value is a harmless no-op). Real promises mean a fan-out
-  // is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
-  call(op, bytes) {
-    const ab = bytes instanceof ArrayBuffer
-      ? bytes
-      : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
-        ? bytes.buffer
-        : bytes.slice().buffer;
-    const r = __host_call(op, ab);
-    return r instanceof ArrayBuffer ? new Uint8Array(r) : r.then((b) => new Uint8Array(b));
-  },
-};
-globalThis.__entries = Object.create(null);
-globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
-function __norm(out) {
-  if (out instanceof ArrayBuffer) return out;
-  if (out instanceof Uint8Array) {
-    return (out.byteOffset === 0 && out.byteLength === out.buffer.byteLength)
-      ? out.buffer : out.slice().buffer;
-  }
-  throw new Error("safe-js: entrypoint must return Uint8Array | ArrayBuffer");
-}
-globalThis.__invoke = (name, argBuf) => {
-  const fn = globalThis.__entries[name];
-  if (typeof fn !== "function") throw new Error("safe-js: no entrypoint '" + name + "'");
-  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
-  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
-  // __norm normalizes both to an ArrayBuffer.
-  const out = fn(new Uint8Array(argBuf));
-  return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
-};
-`;
 
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
@@ -173,38 +140,43 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const armDeadline = configureRealm(ctx, opts);
   let disposed = false;
 
+  // Settle a parked net op by calling the guest's own __netResolve/__netReject (the
+  // preamble's half of the contract), then pump so the awaiting continuation runs.
+  const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle): void => {
+    const settler = ctx.getProp(ctx.global, fn);
+    const id = ctx.newNumber(callId);
+    ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg)).dispose();
+    id.dispose();
+    arg.dispose();
+    settler.dispose();
+    ctx.runtime.executePendingJobs();
+  };
+
   // The single seam. QuickJS calls it synchronously: a sync op resolves to its bytes and
-  // we hand the ArrayBuffer straight back; a net op returns a Promise, so we create a
-  // QuickJS deferred, settle it when the bridge promise resolves, and pump pending jobs
-  // so the guest's awaiting continuation runs. Returning the deferred's handle from a
-  // newFunction needs no other cleanup as long as resolve/reject fires (quickjs-emscripten
-  // deferred-promise contract).
-  const hostCall = ctx.newFunction("__host_call", (opHandle, payloadHandle) => {
+  // we hand the ArrayBuffer straight back; a net op genuinely round-trips, so we return
+  // null — the preamble parks a Promise under callId — and settle it when the bridge
+  // promise resolves. Returning null (rather than a host-created deferred) is what keeps
+  // this seam identical to the native loader's; see guestPreamble.
+  const hostCall = ctx.newFunction("__host_call", (opHandle, callIdHandle, payloadHandle) => {
     const op = ctx.getNumber(opHandle);
+    const callId = ctx.getNumber(callIdHandle);
     const result = opts.bridge(op, copyPayload(ctx, payloadHandle));
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
       // Sync op — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
     }
-    // Net op — a genuine round trip. Bridge it through a deferred promise.
-    const deferred = ctx.newPromise();
+    // Net op — a genuine round trip. The guest holds the Promise; we settle it by callId.
     (result as Promise<Uint8Array>).then(
       (bytes) => {
         if (disposed || !ctx.alive) return;
-        const ab = ctx.newArrayBuffer(toArrayBuffer(bytes));
-        deferred.resolve(ab);       // borrows ab; does not dispose it, so we do
-        ab.dispose();
-        ctx.runtime.executePendingJobs();
+        settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));
       },
       (err) => {
         if (disposed || !ctx.alive) return;
-        const e = ctx.newError(String((err && (err as Error).message) || err));
-        deferred.reject(e);
-        e.dispose();
-        ctx.runtime.executePendingJobs();
+        settleNet("__netReject", callId, ctx.newString(String((err && (err as Error).message) || err)));
       },
     );
-    return deferred.handle;
+    return ctx.null;
   });
   ctx.setProp(ctx.global, "__host_call", hostCall);
   hostCall.dispose();
@@ -212,7 +184,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // Load the ABI preamble, then the guest. Neither has authority. Each eval's completion
   // value (the trailing assignment) is an owned handle — dispose it so nothing leaks past
   // the context (the QuickJS build asserts on leaks).
-  ctx.unwrapResult(ctx.evalCode(PREAMBLE, "safe-js-preamble.js")).dispose();
+  ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
   return {

@@ -614,6 +614,16 @@
     word-break: break-all;
   }
   .app-row-meta b { color: var(--text); font-weight: 500; }
+  /* One toggle per protocol the app declares it handles (§12.10). Binding is a
+     preference, so it reads as a checkbox rather than anything gate-like. */
+  .app-row-proto {
+    display: flex;
+    align-items: center;
+    gap: 0.35em;
+    cursor: pointer;
+    word-break: normal;
+  }
+  .app-row-proto input { margin: 0; }
   .app-row-buttons {
     display: flex;
     gap: 0.35em;
