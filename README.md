@@ -64,21 +64,21 @@ host frames response & sends over channel
 The reference composition stacks the layers so each depends only on the layers below it (§5 discusses the composition):
 
 ```
-┌──────────────────────────────────┐
-│   App                            │
-│   guest (confined JS) +          │
-│   pure-transform WASM handlers   │
-├──────────────────────────────────┤
-│   Cap-bridge (required if guest   │
-│   JS is present; otherwise omitted)│
-│   the guest's host.call seam —   │
-│   its only reach to real I/O     │
-├──────────────────────────────────┤
-│   Kernel                         │
-│                                  │
-│   handlers[name] → handler       │
-│   one map, held by the host      │
-└──────────────────────────────────┘
+┌─────────────────────────────────────┐
+│   App                               │
+│   guest (confined JS) +             │
+│   pure-transform WASM handlers      │
+├─────────────────────────────────────┤
+│   Cap-bridge (required if guest     │
+│   JS is present; otherwise omitted) │
+│   the guest's host.call seam —      │
+│   its only reach to real I/O        │
+├─────────────────────────────────────┤
+│   Kernel                            │
+│                                     │
+│   handlers[name] → handler          │
+│   one map, held by the host         │
+└─────────────────────────────────────┘
 ```
 
 **Design principles:**
