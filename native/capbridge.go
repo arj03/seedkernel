@@ -41,8 +41,9 @@ const capBridgeGlueJS = `
   // is the node keypair ({publicKey,privateKey} Uint8Arrays — sodium.crypto_sign_keypair
   // shape). transport/peers/moduleCall may be omitted for a local-only node. scope is
   // the host-derived guest-signing scope (guestSignScope(author, app) — README §12.2);
-  // omit it only where SIGN is never exercised.
-  globalThis.__buildCapBridge = function (caps, identity, transport, peers, moduleCall, scope) {
+  // omit it only where SIGN is never exercised. modules is the logical→kernel name map
+  // the bridge uses to resolve MODULE_CALL.
+  globalThis.__buildCapBridge = function (caps, identity, transport, peers, moduleCall, scope, modules) {
     globalThis.__capBridge = createCapBridge({
       sodium,
       identity,
@@ -58,6 +59,7 @@ const capBridgeGlueJS = `
       now: () => Date.now(),
       allowedOps: opsForCaps(new Set(caps)),
       signScope: scope || undefined,
+      modules: modules || undefined,
     });
   };
 

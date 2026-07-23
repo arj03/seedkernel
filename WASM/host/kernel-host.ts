@@ -48,17 +48,15 @@ export class KernelHost {
 
   // ─── installing WASM handlers ─────────────────────────────────────────
 
-  /** Instantiate handler `wasmBytes` and bind them at `targetName` (README §4,
-   *  §12.4). A handler is a pure transform: it imports only the AssemblyScript
-   *  runtime shims (`env.*`) — no `kernel.*` seam — and exports `memory`, a
-   *  `scratch` global, and `handle`. Returns false on any structural failure.
+  /** Instantiate handler `wasmBytes` — compile, validate, check §4 exports — without
+   *  binding to the handler table. Throws on any structural failure so the caller can
+   *  collect all failures before any name is written (two-phase bundle install).
    *
-   *  This is the §3.1 bind, and the loader's admission (`installBundle`, §12.4) is its
-   *  only caller — the policy has already run by the time control reaches here. */
-  installWasmHandler(targetName: string, wasmBytes: Uint8Array): boolean {
-    if (targetName.length === 0) return false;
-    if (wasmBytes.length === 0) return false;
-
+   *  A handler is a pure transform: it imports only the AssemblyScript runtime shims
+   *  (`env.*`) — no `kernel.*` seam — and exports `memory`, a `scratch` global, and
+   *  `handle`. */
+  instantiateWasm(wasmBytes: Uint8Array): WasmHandlerRef {
+    if (wasmBytes.length === 0) throw new Error("kernel: empty wasm bytes");
     let instance: WebAssembly.Instance;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);
@@ -72,8 +70,8 @@ export class KernelHost {
         },
       };
       instance = new WebAssembly.Instance(mod, imports);
-    } catch {
-      return false;
+    } catch (e) {
+      throw new Error(`kernel: failed to instantiate wasm: ${(e as Error).message}`);
     }
     const exps = instance.exports as {
       memory?: WebAssembly.Memory;
@@ -81,33 +79,54 @@ export class KernelHost {
       scratchSize?: WebAssembly.Global;
       handle?: (input_len: number) => number;
     };
-    if (!exps.memory || !(exps.scratch instanceof WebAssembly.Global) || typeof exps.handle !== "function") return false;
+    if (!exps.memory) throw new Error("kernel: handler missing export: memory");
+    if (!(exps.scratch instanceof WebAssembly.Global)) throw new Error("kernel: handler missing export: scratch");
+    if (typeof exps.handle !== "function") throw new Error("kernel: handler missing export: handle");
     const scratchOffset = exps.scratch.value as number;
-    if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) return false;
-    // A handler may OPTIONALLY export `scratchSize` to declare a bigger I/O region
-    // than the 128 KB default (README §4.1). Honor it only when it names real,
-    // in-bounds memory the handler reserved past `scratch`; never shrink below the
-    // default.
+    if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) {
+      throw new Error(`kernel: scratch offset ${scratchOffset} out of bounds`);
+    }
     let scratchSize = DEFAULT_SCRATCH_SIZE;
     if (exps.scratchSize instanceof WebAssembly.Global) {
       const declared = exps.scratchSize.value as number;
-      if (typeof declared === "number" && declared >= DEFAULT_SCRATCH_SIZE &&
-          scratchOffset + declared <= exps.memory.buffer.byteLength) {
-        scratchSize = declared;
+      if (typeof declared !== "number" || declared < DEFAULT_SCRATCH_SIZE) {
+        throw new Error(`kernel: invalid scratchSize ${declared} (must be >= ${DEFAULT_SCRATCH_SIZE})`);
       }
+      if (scratchOffset + declared > exps.memory.buffer.byteLength) {
+        throw new Error(`kernel: scratchSize ${declared} overflows memory`);
+      }
+      scratchSize = declared;
     }
-
-    // SetHandler is unconditional at the table level — replace whatever is there. The
-    // admission policy was applied before this method was called. The displaced entry
-    // is simply dropped: the instance it held is unreachable and collectable.
-    this.handlers.set(targetName, {
+    return {
       memory: exps.memory,
       scratch: scratchOffset,
       scratchSize,
       handle: exps.handle,
-    });
+    };
+  }
 
-    return true;
+  /** Bind an instantiated handler ref at `targetName`. Displaces whatever was at the
+   *  name without ceremony — the admission policy already ran. */
+  bindHandler(targetName: string, ref: WasmHandlerRef): void {
+    if (targetName.length === 0) throw new Error("kernel: empty handler name");
+    this.handlers.set(targetName, ref);
+  }
+
+  /** Release a handler ref that will never be bound (the bundle failed). JS GC
+   *  reclaims abandoned WebAssembly instances on its own, so this is a no-op — but
+   *  it satisfies the BundleHost contract so the JS/native implementations share
+   *  one interface. */
+  discardHandler(_ref: WasmHandlerRef): void {}
+
+  /** Instantiate handler `wasmBytes` and bind them at `targetName` in one call
+   *  (README §4, §12.4). Throws on any structural failure — matching the fail-loud
+   *  posture everywhere else.
+   *
+   *  The §3.1 bind, and the loader's admission (`installBundle`, §12.4) is its
+   *  only caller — the policy has already run by the time control reaches here. */
+  installWasmHandler(targetName: string, wasmBytes: Uint8Array): void {
+    const ref = this.instantiateWasm(wasmBytes);
+    this.bindHandler(targetName, ref);
   }
 
   // ─── public API ──────────────────────────────────────────────────────

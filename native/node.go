@@ -116,10 +116,12 @@ const engineNodeJS = `
   // node's identity + transport + cohort, with module-call routed to Go (installed
   // wasm handlers). caps is the manifest's cap array; authorHex + app derive the
   // guest-signing scope (README §12.2), so the guest's SIGN op is bound to this
-  // bundle's namespace rather than being a raw node-key oracle.
-  globalThis.__buildNodeBridge = function (caps, authorHex, app) {
+  // bundle's namespace rather than being a raw node-key oracle. modules is the
+  // logical→kernel name map — the bridge resolves MODULE_CALL through it so kernel
+  // names never leave the host.
+  globalThis.__buildNodeBridge = function (caps, authorHex, app, modules) {
     const scope = guestSignScope(fromHex(authorHex), app);
-    __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall, scope);
+    __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall, scope, modules);
   };
 })();
 `

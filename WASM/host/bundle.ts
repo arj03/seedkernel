@@ -37,11 +37,11 @@ export const GUEST_FILE = "guest.js";
 export function moduleFile(name: string): string { return name + ".wasm"; }
 
 export interface BundleModule {
-  /** Logical name, e.g. "codec". Four jobs, one value: the module's file in the
-   *  container (`<name>.wasm`), the key the guest addresses it by (`BUNDLE.modules`),
-   *  how the loader reports it, and — with the manifest `app` — the kernel name it
-   *  binds at (`kernelNameFor`). Unique within a manifest, and restricted to
-   *  `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
+  /** Logical name, e.g. "codec". Three jobs, one value: the module's file in the
+   *  container (`<name>.wasm`), the key the guest addresses it by through MODULE_CALL
+   *  (the bridge resolves it to the kernel name), and — with the manifest `app` — the
+   *  kernel name derived from it (`kernelNameFor`). Unique within a manifest, and
+   *  restricted to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
   name: string;
   /** genesisHash(wasm) hex — content integrity for the module bytes, and the
    *  module's `bytes_hash` in the loader's install record (§5.1, §12.4). */
@@ -78,11 +78,12 @@ export function appKeyFor(author: Uint8Array, app: string): string {
  *  contain `:` (NAME_RE), so the last colon always separates the module and everything
  *  between the two is the `app`.
  *
- *  Kernel names are node-local table keys. Nothing on the wire names another node's
+ *  Kernel names never leave the host. Nothing on the wire names another node's
  *  handler: a peer sends a protocol id or an opcode and the receiving host resolves it
- *  through its own bindings (§12.10) to whichever app it holds, and a guest reaches its own
- *  modules by logical name through `BUNDLE.modules`. So this needs to be collision-free
- *  within one node, not agreed across a deployment. */
+ *  through its own bindings (§12.10) to whichever app it holds. A guest reaches its own
+ *  modules by logical name through MODULE_CALL, and the bridge resolves the logical name
+ *  to the kernel name — so the guest never sees a kernel name at all. This needs to be
+ *  collision-free within one node, not agreed across a deployment. */
 export function kernelNameFor(author: Uint8Array, app: string, moduleName: string): string {
   return appKeyFor(author, app) + ":" + moduleName;
 }
@@ -431,14 +432,28 @@ export class FreshnessMarks implements FreshnessStore {
 // signed by the author whose name it is. The kernel table is the host's only install
 // state, so nothing can drift out of step with it.
 
-/** The one host power a bundle load needs: instantiate handler bytes against the §4 ABI
- *  and bind them at `name`. `KernelHost` satisfies it; the native loader forwards the same
- *  single call over its Go bridge (README §12.9).
+/** The one host power a bundle load needs: compile, instantiate, and validate handler bytes
+ *  against the §4 ABI (instantiateWasm — pure, no table effect), then bind them at `name`
+ *  (bindHandler). Separating them is what lets a bundle install atomically: instantiate
+ *  every module first, and bind only when all succeed. `KernelHost` satisfies this; the
+ *  native loader forwards the same calls over its Go bridge (README §12.9).
  *
  *  Hashing is deliberately NOT here — it is `genesisHash(sodium, …)`, so the component
  *  that owns the handler table needs no crypto at all (§3). */
 export interface BundleHost {
-  installWasmHandler(name: string, wasm: Uint8Array): boolean;
+  /** Compile, instantiate, and validate a handler module against the §4 ABI. No table
+   *  effect — the returned opaque ref must be passed to bindHandler to land the module.
+   *  Throws on any structural failure (not valid wasm, missing exports, scratch out of
+   *  bounds, invalid scratchSize). */
+  instantiateWasm(wasm: Uint8Array): unknown;
+  /** Bind a pre-instantiated handler ref at `name` on the kernel table. The caller
+   *  guarantees the ref came from this host's own instantiateWasm. Displaces whatever
+   *  was at the name — the caller already ran the admission policy. */
+  bindHandler(name: string, ref: unknown): void;
+  /** Release a handler ref that will never be bound (the bundle failed). JS GC reclaims
+   *  abandoned instances on its own, so the JS implementation is a no-op; the native
+   *  implementation releases the wazero instance + compiled code. */
+  discardHandler(ref: unknown): void;
 }
 
 // ── Loading (README §12.4) ───────────────────────────────────────────────────
@@ -474,8 +489,6 @@ export interface LoadedBundle {
   /** The verified guest source, or `""` for a handler-only bundle that declared no
    *  guest — the shell runs a realm only when this is non-empty. */
   guestSource: string;
-  /** Logical names of the modules that registered on the kernel. */
-  installed: string[];
 }
 
 /** Authenticate and integrity-check a bundle blob (README §12.4 steps 1, 4a, 5a).
@@ -521,9 +534,10 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
 }
 
 /** Govern a verified bundle and land it (README §12.4 steps 2, 3, 4b): require the
- *  author to be in the policy, enforce version freshness, then install each verified
- *  module under the kernel name derived from the manifest's signed `(author, app, name)`
- *  triple (§5.1).
+ *  author to be in the policy, enforce version freshness, then instantiate every
+ *  verified module (pure, no table effect) and bind them all atomically. If any module
+ *  fails to instantiate the whole load fails — a half-landed bundle is exactly the
+ *  incoherent state the manifest exists to prevent.
  *
  *  There is no per-module admission callback: the manifest's `modules[].hash` commits to
  *  exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
@@ -549,24 +563,31 @@ export function installBundle(
       throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
     }
     // NB: the mark is advanced at the *end* of this function, only after every module
-    // and the guest have integrity-checked and installed — not here. See below.
+    // has instantiated and bound — not here. See below.
   }
-  // Modules were integrity-checked by verifyBundle (§12.4 steps 4a, 5a) — install the
-  // verified bytes. Each module lands under the kernel name DERIVED from the signed
+  // Phase 1: instantiate every module (pure, no table effect). Read as "compile,
+  // validate §4 exports, confirm it IS a handler." Any failure here fails the whole
+  // load — nothing has landed — so the kernel table is never left half-populated.
+  // Accumulated refs are discarded on failure: JS reclaims them on its own, but the
+  // native host must release the wazero instance + compiled code.
+  const refs: { mod: BundleModule; ref: unknown; kernelName: string }[] = [];
+  try {
+    for (const { mod, wasm } of v.modules) {
+      const kernelName = kernelNameFor(v.author, v.manifest.app, mod.name);
+      refs.push({ mod, ref: host.instantiateWasm(wasm), kernelName });
+    }
+  } catch (e) {
+    for (const r of refs) host.discardHandler(r.ref);
+    throw new Error(`bundle: module ${(e as Error).message}`);
+  }
+  // Phase 2: bind every module. instantiateWasm already validated each — these cannot
+  // fail. Each module lands under the kernel name DERIVED from the signed
   // `(author, app, name)` triple (§5.1). No per-module `.install` envelope means no
   // 64 KB envelope cap and no boot-time seq — an equal-version reload just re-installs,
   // and a higher-version bundle from the same author lands on the same names because the
   // same key derives them.
-  //
-  // `installBundle` reports only the modules that actually bound: integrity proves the
-  // bytes are what the author signed, but not that they are a valid §4 handler, so a
-  // hash-correct module that won't instantiate (or is missing the ABI exports) returns
-  // `false` here. That is not fatal — the other modules still land — but it must not be
-  // reported as installed, or `installed` would claim a kernel name that isn't bound.
-  const installed: string[] = [];
-  for (const { mod, wasm } of v.modules) {
-    const kernelName = kernelNameFor(v.author, v.manifest.app, mod.name);
-    if (host.installWasmHandler(kernelName, wasm)) installed.push(mod.name);
+  for (const { ref, kernelName } of refs) {
+    host.bindHandler(kernelName, ref);
   }
   // Advance the freshness mark only now — after a fully successful load. Advancing it
   // during the downgrade check above would brick rollback: a partially written or corrupt
@@ -577,7 +598,7 @@ export function installBundle(
   // (README §12.4). Integrity was verified by verifyBundle before this function was
   // called, so the freshness advance is always behind a successful verify.
   if (freshness) freshness.set(v.author, v.manifest.app, version);
-  return { manifest: v.manifest, author: v.author, guestSource: v.guestSource, installed };
+  return { manifest: v.manifest, author: v.author, guestSource: v.guestSource };
 }
 
 /** Load a signed bundle blob: `verifyBundle` then `installBundle`. This is the whole

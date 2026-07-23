@@ -77,9 +77,9 @@ const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
 // Install a verified module directly under `targetName`. Bundles are the only way code
-// arrives (§12.4); there is no wire install envelope.
+// arrives (§12.4); there is no wire install envelope. Throws on structural failure.
 function installMod(host, targetName, wasm) {
-  return host.installWasmHandler(targetName, wasm);
+  host.installWasmHandler(targetName, wasm);
 }
 
 // The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real
@@ -191,19 +191,18 @@ async function testDenyAllPolicyRejects() {
   console.log("  OK\n");
 }
 
-// ─── Test: `installed` reports only modules that actually bound (§12.4) ───
+// ─── Test: a non-instantiable module fails the whole load (§12.4) ───
 
-async function testInstalledReflectsActualBinds() {
-  console.log("Test: a hash-correct module that isn't a valid handler is not reported installed");
+async function testBundleRefusesNonHandler() {
+  console.log("Test: a hash-correct module that isn't a valid handler fails the whole bundle");
 
   const author = generateKeyPair();
   const { host } = await makeHost();
 
   // A well-formed manifest committing to two modules the author genuinely signed. One is
   // the real forwarder (a valid §4 handler); the other is arbitrary bytes that hash-match
-  // their manifest entry but won't instantiate as a handler — the exact case integrity
-  // (verifyBundle) passes but `installWasmHandler` refuses. `verifyBundle` proves the
-  // bytes are what the author signed; it does NOT prove they are a valid handler.
+  // their manifest entry but won't instantiate as a handler. With a two-phase install, a
+  // module that fails phase 1 (instantiate) should fail the entire load — nothing lands.
   const notAHandler = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
@@ -216,14 +215,13 @@ async function testInstalledReflectsActualBinds() {
     [moduleFile("broken")]: notAHandler,
   });
 
-  // The load succeeds (the author is trusted, every hash matches) — a non-instantiable
-  // module is reported, not fatal.
-  const loaded = loadBundle(host, sodium, { authors: [toHex(author.publicKey)] }, blob);
-
-  // `installed` must name only the module that actually bound. Reporting "broken" here
-  // would claim a kernel name that isn't in the table.
-  assertEqual([...loaded.installed].sort(), ["fwd"], "installed lists only the module that bound");
-  assert(host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is bound");
+  let threw = false;
+  try {
+    loadBundle(host, sodium, { authors: [toHex(author.publicKey)] }, blob);
+  } catch { threw = true; }
+  assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
+  // Neither module is bound — the install was atomic.
+  assert(!host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is NOT bound (the load failed atomically)");
   assert(!host.isBound(modName(author.publicKey, "demo", "broken")), "the non-handler is not bound");
 
   console.log("  OK\n");
@@ -256,7 +254,8 @@ async function testDerivedNamesKeepAuthorsApart() {
 
   // A re-install by the SAME author lands on the SAME name: an update, in place, with no
   // ownership rule consulted anywhere.
-  assert(installMod(host, aName, forwarderBytes), "A's update re-admitted");
+  installMod(host, aName, forwarderBytes);
+  assert(host.isBound(aName), "A's re-install still occupies the slot");
   assertEqual(modName(aPk, "shared", "fwd"), aName, "the same key derives the same name");
 
   // The app key is the first two components of the kernel name (§12.4) — one identity
@@ -761,9 +760,8 @@ async function testBundle() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assertEqual(loaded.installed.join(","), "codec", "the bundle's module installed onto the kernel");
-    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
+    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
@@ -864,7 +862,6 @@ async function testGuestlessBundleAndArchive() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assertEqual(loaded.installed.join(","), "demo", "the guest-less bundle's module installed");
     assert(shell.host.isBound(kernelName), "module registered under its kernel name");
     assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
   } finally {
@@ -2124,7 +2121,7 @@ await testFullLifecycle();
 await testInstallRejectsUntrustedAuthor();
 await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
-await testInstalledReflectsActualBinds();
+await testBundleRefusesNonHandler();
 await testDerivedNamesKeepAuthorsApart();
 await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();

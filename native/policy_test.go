@@ -14,7 +14,7 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  installed=[fwd]") {
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  handles=[testapp]") {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }
@@ -85,7 +85,7 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 		t.Fatal("the same app name under two authors must derive distinct kernel names")
 	}
 	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
-	if status := loadBundle(bundleA); !strings.Contains(status, "installed=[fwd]") {
+	if status := loadBundle(bundleA); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
 	}
 	if !boundToWasm(nameA) {
@@ -93,7 +93,7 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	}
 	// B's bundle declares the same app name and installs too — beside A, never over it.
 	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
-	if status := loadBundle(bundleB); !strings.Contains(status, "installed=[fwd]") {
+	if status := loadBundle(bundleB); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}
 	if !boundToWasm(nameB) {

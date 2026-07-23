@@ -22,8 +22,8 @@ func boundToWasm(n string) bool {
 func TestScratchRegion(t *testing.T) {
 	boot()
 	n := kernelNameFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp", "fwd")
-	if !installWasm(n, forwarderWasm) {
-		t.Fatal("installWasm(forwarder) refused")
+	if err := installWasm(n, forwarderWasm); err != nil {
+		t.Fatalf("installWasm(forwarder) refused: %v", err)
 	}
 	w := handlers[n]
 	if w.size != defaultScratchSize {
@@ -55,7 +55,7 @@ func TestBundleModuleRuns(t *testing.T) {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	bundlePath, kernelName := writeTestBundle(t, author, authorPub, "runapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  installed=[fwd]") {
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  handles=[runapp]") {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")

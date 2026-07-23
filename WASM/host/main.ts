@@ -274,7 +274,7 @@ export async function main(): Promise<void> {
   // step). The shell verifies + governs it before anything lands.
   if (args["bundle"]) {
     const b = await shell.loadBundle(str(args, "bundle")!);
-    console.log(`  bundle ${b.manifest.app} v${b.manifest.version} → installed ${b.installed.join(", ") || "(none)"}`);
+    console.log(`  bundle ${b.manifest.app} v${b.manifest.version}`);
   }
   // One-shot client ops through the loaded guest — "the shell runs the app" as the
   // *initiator* (README §12.8). The request side is served below once we start

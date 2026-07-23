@@ -187,16 +187,14 @@ export function guestSignPrefix(scope: Uint8Array): Uint8Array {
 }
 
 /** The facts a guest learns about the bundle it is running as, all of them derived by
- *  the runtime at admission from the signed manifest. */
+ *  the runtime at admission from the signed manifest. Kernel names never appear here —
+ *  the guest reaches its modules by logical name through MODULE_CALL, and the bridge
+ *  resolves to the kernel name. */
 export interface BundleFacts {
   /** The manifest `app`. */
   app: string;
   /** The manifest author's public key — the key the signature verified under. */
   author: Uint8Array;
-  /** Logical module name → the kernel name it was bound at, from `modules[]`. This is
-   *  what gives a manifest module `name` a job: the key a guest MODULE_CALLs its own
-   *  modules by, without knowing how the name was derived. */
-  modules: Record<string, string>;
 }
 
 /** The generated `const BUNDLE = {…};` block injected alongside `capPreamble()`, holding
@@ -208,6 +206,9 @@ export interface BundleFacts {
  *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
  *  cause. This is the same one-file rule the DOMAIN_* family follows.
  *
+ *  MODULE_CALL takes the logical name — the guest never sees a kernel name — so the
+ *  module map lives in the bridge, not here. BUNDLE carries no modules field.
+ *
  *  Kept deliberately separate from the app's `const APP`: APP is author config that a
  *  deployment's operator config merges over, so anything living there is operator-
  *  writable. Nothing in BUNDLE is. */
@@ -217,7 +218,6 @@ export function bundlePreamble(f: BundleFacts): string {
     author: toHex(f.author),
     // The prefix a guest prepends before CAP_VERIFY to rebuild what CAP_SIGN signed.
     signPrefix: toHex(guestSignPrefix(guestSignScope(f.author, f.app))),
-    modules: f.modules,
   };
   return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
 }
@@ -267,6 +267,11 @@ export interface CapBridgeDeps {
   signScope?: Uint8Array;
   /** Reach an installed WASM handler by name (KernelHost.callHandler). */
   callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
+  /** Logical name → kernel name for MODULE_CALL resolution. The guest calls modules
+   *  by the logical name from its manifest; the bridge maps to the kernel name here
+   *  so kernel names never leave the host. Omitted ⇒ MODULE_CALL names pass through
+   *  unchanged (unrestricted host callers, tests). */
+  modules?: Record<string, string>;
   transport: CapTransport;
   /** The peers this node can reach (its cohort / connected set). */
   peers: () => PeerId[];
@@ -406,11 +411,16 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
 
       // ── installed-handler call + clock ───────────────────────────────────
       case CAP.MODULE_CALL: {
-        // The handler name is a string (README §5.1), so it crosses the seam as its
-        // UTF-8 bytes — a bootstrap name reads plainly, a scoped name is its hex.
+        // The guest calls its own modules by the logical name from its manifest
+        // (README §5.1); the bridge resolves to the kernel name here so kernel
+        // names never leave the host. When a modules map is present, the guest
+        // is held to what its manifest declared — unknown names return no bytes.
+        // Host/test callers omit the map and get passthrough.
         const nameLen = payload[0];
-        const name = dec.decode(payload.slice(1, 1 + nameLen));
-        const r = callHandler(name, payload.slice(1 + nameLen));
+        const logicalName = dec.decode(payload.slice(1, 1 + nameLen));
+        const kernelName = deps.modules ? deps.modules[logicalName] : logicalName;
+        if (kernelName === undefined) return NONE;
+        const r = callHandler(kernelName, payload.slice(1 + nameLen));
         return r ?? NONE;
       }
       case CAP.CLOCK:

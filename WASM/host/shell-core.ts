@@ -172,6 +172,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
 
   const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
     const caps = new Set(b.manifest.guest?.caps ?? []);
+    const modMap = Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)]));
     return createCapBridge({
       sodium: platform.sodium,
       identity: platform.identity,
@@ -181,6 +182,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       now: platform.now ?? (() => Date.now()),
       allowedOps: opsForCaps(caps),
       signScope: guestSignScope(b.author, b.manifest.app),
+      modules: modMap,
     });
   };
 
@@ -189,7 +191,6 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     + bundlePreamble({
       app: b.manifest.app,
       author: b.author,
-      modules: Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)])),
     })
     + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
     + b.guestSource;

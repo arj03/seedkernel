@@ -60,6 +60,10 @@ var (
 	// there is no id indirection and no second table to drift from this one. Every value
 	// is an installed module: bundles are the one way code arrives (§12.4).
 	handlers = map[string]*wasmHandler{}
+	// unbound holds handlers that instantiateWasm created but bindWasm has not yet placed
+	// on the handler table. Keyed by an integer token the JS bridge carries across.
+	unbound    = map[int64]*wasmHandler{}
+	unboundSeq int64
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
@@ -141,49 +145,77 @@ func callHandler(n string, payload []byte) []byte {
 	return out
 }
 
-// installWasm instantiates handler bytes and binds them at the name `n`. The replace is
-// unconditional — the §12.5 admission already ran, and bind releases whatever the name
-// displaced. Exposed to JS as bridge.installWasm (only the host can instantiate wasm, §12.4).
-func installWasm(n string, wasm []byte) bool {
+// instantiateWasm compiles, instantiates, and validates handler bytes against the §4
+// ABI. No table effect — returns an opaque token the caller must later pass to bindWasm.
+// Exposed to JS as bridge.instantiateWasm (only the host can instantiate wasm, §12.4).
+func instantiateWasm(wasm []byte) (*wasmHandler, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
-		return false
+		return nil, fmt.Errorf("compile: %w", err)
 	}
 	modSeq++
 	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	if err != nil {
-		_ = cm.Close(ctx) // instantiation failed — release the compiled code
-		return false
+		_ = cm.Close(ctx)
+		return nil, fmt.Errorf("instantiate: %w", err)
 	}
 	// Every refusal below has to release the instance *and* its compiled code, or a
-	// rejected install leaks both for the process's life.
-	bound := false
+	// rejected instantiate leaks both for the process's life.
+	ok := false
 	defer func() {
-		if !bound {
+		if !ok {
 			_ = m.Close(ctx)
 			_ = cm.Close(ctx)
 		}
 	}()
 	g, fn := m.ExportedGlobal("scratch"), m.ExportedFunction("handle")
 	if g == nil || fn == nil || m.Memory() == nil {
-		return false
+		return nil, fmt.Errorf("missing exports: memory=%v scratch=%v handle=%v", m.Memory() != nil, g != nil, fn != nil)
 	}
 	// §4.1: the handler reserves [scratch, scratch+size). It MAY export `scratchSize` to
 	// declare more than the default — honored only if it names real, in-bounds memory, and
 	// never below the default. A negative i32 arrives as a huge uint32 the bounds refuse.
 	mem, s := uint64(m.Memory().Size()), uint32(g.Get())
 	if s == 0 || uint64(s)+defaultScratchSize > mem {
-		return false
+		return nil, fmt.Errorf("scratch offset %d out of bounds (mem %d)", s, mem)
 	}
 	size := uint32(defaultScratchSize)
 	if sg := m.ExportedGlobal("scratchSize"); sg != nil {
-		if d := uint32(sg.Get()); d >= defaultScratchSize && uint64(s)+uint64(d) <= mem {
-			size = d
+		d := uint32(sg.Get())
+		if d < defaultScratchSize {
+			return nil, fmt.Errorf("scratchSize %d is below the %d default", d, defaultScratchSize)
 		}
+		if uint64(s)+uint64(d) > mem {
+			return nil, fmt.Errorf("scratchSize %d overflows memory (scratch %d, mem %d)", d, s, mem)
+		}
+		size = d
 	}
-	bind(n, &wasmHandler{m, cm, fn, s, size})
-	bound = true
-	return true
+	ok = true
+	return &wasmHandler{m, cm, fn, s, size}, nil
+}
+
+// bindWasm binds a pre-instantiated handler at the name `n`. The replace is
+// unconditional — the §12.5 admission already ran, and bind releases whatever the name
+// displaced. Exposed to JS as bridge.bindWasm.
+func bindWasm(n string, w *wasmHandler) {
+	bind(n, w)
+}
+
+// discardWasm releases a handler ref that will never be bound (the bundle failed during
+// a two-phase load). Frees the wazero instance + compiled code the token held.
+func discardWasm(w *wasmHandler) {
+	closeHandler(w)
+}
+
+// installWasm compiles, instantiates, validates, and binds in one call. Kept as a
+// convenience for the direct tests; the two-phase path is instantiateWasm + bindWasm.
+func installWasm(n string, wasm []byte) error {
+	w, err := instantiateWasm(wasm)
+	if err != nil {
+		return err
+	}
+	bindWasm(n, w)
+	return nil
 }
 
 // boot wires the wasm host imports and stands up the QuickJS realm running the shared
@@ -209,9 +241,35 @@ func boot() {
 	qc = qrt.Context()
 	b := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
-	b.SetPropertyStr("installWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		wb, _ := qjs.JsTypedArrayToGo(t.Args()[1])
-		return t.Context().NewBool(installWasm(t.Args()[0].String(), wb)), nil
+	b.SetPropertyStr("instantiateWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
+		wb, _ := qjs.JsTypedArrayToGo(t.Args()[0])
+		w, err := instantiateWasm(wb)
+		if err != nil {
+			return nil, fmt.Errorf("instantiateWasm: %w", err)
+		}
+		unboundSeq++
+		unbound[unboundSeq] = w
+		return t.Context().NewInt64(unboundSeq), nil
+	}))
+	b.SetPropertyStr("bindWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
+		tok := t.Args()[1].Int64()
+		w := unbound[tok]
+		if w == nil {
+			return nil, fmt.Errorf("bindWasm: token %d not found", tok)
+		}
+		delete(unbound, tok)
+		bindWasm(t.Args()[0].String(), w)
+		return t.Context().NewNull(), nil
+	}))
+	b.SetPropertyStr("discardWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
+		tok := t.Args()[0].Int64()
+		w := unbound[tok]
+		if w == nil {
+			return t.Context().NewNull(), nil // token already consumed (bind or double discard) — harmless
+		}
+		delete(unbound, tok)
+		discardWasm(w)
+		return t.Context().NewNull(), nil
 	}))
 	b.SetPropertyStr("utf8", fn(func(t *qjs.This) (*qjs.Value, error) {
 		d, _ := qjs.JsTypedArrayToGo(t.Args()[0])
@@ -275,7 +333,8 @@ func invokeFree(fnName string, args ...*qjs.Value) (*qjs.Value, error) {
 
 // loadedBundle is the slim descriptor of a verified bundle the node needs to run
 // its guest: the guest's declared cap domains, its config (author-signed structural
-// constants), the kernel names its modules landed at, and the verified guest source.
+// constants), the logical→kernel module name map (for the bridge's MODULE_CALL
+// resolution), and the verified guest source.
 // `author` (hex) + `app` key bundle freshness and derive the guest-signing scope
 // (README §12.2, §12.4).
 type loadedBundle struct {
@@ -285,6 +344,10 @@ type loadedBundle struct {
 	config      json.RawMessage   // guest `config` object (merged under operator config)
 	bundlePreamble string          // pre-built "const BUNDLE = {…};\n" from the shared loader
 	guestSource string
+	// Logical name → kernel name for every declared module. The cap-bridge's
+	// MODULE_CALL resolves the guest's logical names through this so kernel names
+	// never leave the host.
+	modules map[string]string
 	// Protocol ids the app offers to serve (README §12.10), defaulted by the shared
 	// loader. The native target is a single-bundle runner, so it has no binding table to
 	// consult — it reports them so an operator can see what the app answers for.
@@ -327,7 +390,7 @@ func loadBundle(path string) string {
 		BundlePreamble string `json:"bundlePreamble"`
 		GuestSource    string
 		Handles     []string
-		Installed   []string
+		Modules     map[string]string
 	}
 	if err := json.Unmarshal([]byte(out), &m); err != nil {
 		return "ERROR(json): " + err.Error()
@@ -335,9 +398,9 @@ func loadBundle(path string) string {
 	loaded = &loadedBundle{
 		app: m.App, author: m.Author, version: m.Version, caps: m.Caps,
 		config: m.Config, bundlePreamble: m.BundlePreamble, guestSource: m.GuestSource,
-		handles: m.Handles,
+		handles: m.Handles, modules: m.Modules,
 	}
-	return fmt.Sprintf("%s v%d  installed=%v  handles=%v", m.App, m.Version, m.Installed, m.Handles)
+	return fmt.Sprintf("%s v%d  handles=%v", m.App, m.Version, m.Handles)
 }
 
 // freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
@@ -563,7 +626,7 @@ func main() {
 	if loaded != nil && loaded.guestSource != "" {
 		// Build the cap funnel for the bundle's declared domains, then the confined
 		// guest from its verified source + the merged APP config (manifest ∪ operator).
-		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s, %q, %q)`, jsStrArray(loaded.caps), loaded.author, loaded.app))); err != nil {
+		if _, err := qc.Eval("<bridge>", qjs.Code(fmt.Sprintf(`__buildNodeBridge(%s, %q, %q, %s)`, jsStrArray(loaded.caps), loaded.author, loaded.app, jsStrMap(loaded.modules)))); err != nil {
 			fatal("cap-bridge", err)
 			return
 		}
@@ -703,6 +766,15 @@ func jsStrArray(ss []string) string {
 		return "[]"
 	}
 	b, _ := json.Marshal(ss)
+	return string(b)
+}
+
+// jsStrMap renders a string→string map as a JS object literal (`{}` when empty).
+func jsStrMap(m map[string]string) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	b, _ := json.Marshal(m)
 	return string(b)
 }
 

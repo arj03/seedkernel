@@ -7,8 +7,8 @@
 // manifest signature + its domain prefix (§12.4), the freshness arithmetic, the deny-all
 // default — comes from bundle.ts and policy.ts, compiled once and shared. What lives here
 // is only the glue that cannot: the Go bridge is byte-level, so the powers the loader
-// needs (instantiate wasm, write a file atomically) arrive as `bridge.*` and are adapted
-// to the `BundleHost` / `FreshnessStore` interfaces here.
+// needs (instantiate wasm, bind a name, write a file atomically) arrive as `bridge.*` and
+// are adapted to the `BundleHost` / `FreshnessStore` interfaces here.
 //
 // Because it is TypeScript checked against those same interfaces, the drift that a
 // hand-written mirror accumulates is now a compile error.
@@ -24,8 +24,14 @@ import { toHex } from "./util.js";
 /** The byte-level primitives the Go loader exposes into the realm (native/main.go).
  *  Only the host powers QuickJS genuinely cannot reach: everything else is JS. */
 declare const bridge: {
-  /** Instantiate handler bytes against the §4 ABI and SetHandler them at `name`. */
-  installWasm(name: string, wasm: Uint8Array): boolean;
+  /** Compile + instantiate handler bytes against the §4 ABI. Returns an opaque token
+   *  for a later bindWasm; throws on structural failure. No table effect. */
+  instantiateWasm(wasm: Uint8Array): unknown;
+  /** Bind a pre-instantiated handler token at `name` on the handler table. */
+  bindWasm(name: string, token: unknown): void;
+  /** Release a handler token that will never be bound (bundle failed). Frees the
+   *  wazero instance + compiled code. */
+  discardWasm(token: unknown): void;
   /** Unbind `name` (SetHandler(name, null)). Exposed for operator revocation. */
   removeHandler(name: string): boolean;
   /** The persisted freshness store's contents, or null on first boot. */
@@ -42,10 +48,11 @@ declare const sodium: {
   crypto_sign_verify_detached(sig: Uint8Array, msg: Uint8Array, pk: Uint8Array): boolean;
 };
 
-/** The Go loader as a `BundleHost` — one call, forwarded. Everything else the load needs
- *  is shared TS running over `sodium` above. */
+/** The Go loader as a `BundleHost` — the two-phase install (instantiate all, then bind). */
 const host: BundleHost = {
-  installWasmHandler(name: string, wasm: Uint8Array): boolean { return bridge.installWasm(name, wasm); },
+  instantiateWasm(wasm: Uint8Array): unknown { return bridge.instantiateWasm(wasm); },
+  bindHandler(name: string, ref: unknown): void { bridge.bindWasm(name, ref); },
+  discardHandler(ref: unknown): void { bridge.discardWasm(ref); },
 };
 
 /** The freshness store over the Go atomic-write seam (README §12.4). */
@@ -100,10 +107,10 @@ function loadBundleBlob(blob: ArrayBuffer): string {
       config: b.manifest.guest?.config ?? {},
       guestSource: b.guestSource,
       // The "const BUNDLE = {…};\n" preamble this bundle's guest runs under. Built here
-      // from the admitted manifest so Go never re-derives the signing prefix or the kernel
-      // names — the one derivation (cap-bridge bundlePreamble) runs once.
-      bundlePreamble: bundlePreamble({ app: b.manifest.app, author: b.author, modules: modMap }),
-      installed: b.installed,
+      // from the admitted manifest so Go never re-derives the signing prefix.
+      bundlePreamble: bundlePreamble({ app: b.manifest.app, author: b.author }),
+      // Logical → kernel name map for MODULE_CALL resolution (the bridge needs it).
+      modules: modMap,
     });
   } catch (e) {
     return "ERROR: " + (e as Error).message;
