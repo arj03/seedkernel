@@ -448,9 +448,8 @@ function embedAppMeta(wasmBytes, meta) {
 }
 
 // ── persistence ────────────────────────────────────────────────────────
-// The packed bundle is the only piece of app state we need to rebuild — the
-// loader's install record, the handler in the kernel, and the uiHtml all
-// derive from it. We keep them in sessionStorage so a reload
+// The packed bundle is the only piece of app state we need — the
+// handler in the kernel and the uiHtml both derive from it. We keep them in sessionStorage so a reload
 // within the same tab keeps the user's app set and lets transitive offers
 // continue to work.
 function persistInstalledApps() {

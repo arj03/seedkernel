@@ -44,8 +44,7 @@ export interface BundleModule {
    *  kernel name derived from it (`kernelNameFor`). Unique within a manifest, and
    *  restricted to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
   name: string;
-  /** genesisHash(wasm) hex — content integrity for the module bytes, and the
-   *  module's `bytes_hash` in the loader's install record (§5.1, §12.4). */
+  /** genesisHash(wasm) hex — content integrity for the module bytes (§5.1, §12.4). */
   hash: string;
 }
 
@@ -421,10 +420,10 @@ export class FreshnessMarks implements FreshnessStore {
   }
 }
 
-// ── Admission: the loader's install records (README §12.4) ───────────────────
+// ── Admission (§12.4) ────────────────────────────────────────────────────────
 //
 // Binding a module IS the loader's job — there is no separate "module registry", and no
-// ownership register either. `admit` below is a pure function of the bundle in front of
+// install records either. `admit` below is a pure function of the bundle in front of
 // it: hash the verified bytes, ask the policy, and on approval instantiate + SetHandler.
 //
 // What a register would once have answered — "who owns this name?" — has no content now

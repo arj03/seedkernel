@@ -33,7 +33,7 @@ loadBundle (host admin path)                         §12.4
 policy check — author trusted? version valid?        §12.5
         │
         ▼
-admit each module — policy ok? record (author, hash) §12.4
+admit each module — policy ok? §12.4
         │
         ▼
 SetHandler(name, wasm_bytes) — handler table updated §3.1
