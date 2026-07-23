@@ -65,7 +65,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	el, qc, done := netRouteNode(t)
 	defer done()
 
-	// A listens; B dials A and asks; A's request handler echoes [type, ...payload].
+	// A listens; B dials A and asks; A's request handler echoes the payload back.
 	harness := fmt.Sprintf(`
 		globalThis.startTest = async function () {
 		  const idA = sodium.crypto_sign_keypair();
@@ -76,14 +76,9 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  await netA.start();
 		  const tA = new Transport(aId, netA, 1000);
 		  const tB = new Transport(bId, netB, 1000);
-		  tA.onRequest((from, proto, type, payload) => {
-		    const out = new Uint8Array(payload.length + 1);
-		    out[0] = type;
-		    out.set(payload, 1);
-		    return out;
-		  });
+		  tA.onRequest((from, proto, payload) => payload);
 		  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.%s, transport: "%s" });
-		  return await tB.request(aId, new TextEncoder().encode("_test"), 5, new Uint8Array([10, 20, 30]));
+		  return await tB.request(aId, new TextEncoder().encode("_test"), new Uint8Array([10, 20, 30]));
 		};
 	`, listenArgs, portField, transport)
 	if _, err := qc.Eval("transport-harness.js", qjs.Code(harness)); err != nil {
@@ -97,7 +92,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	if kind != 0 {
 		t.Fatalf("request did not resolve: kind=%d msg=%q", kind, msg)
 	}
-	if want := []byte{5, 10, 20, 30}; !bytes.Equal(value, want) {
+	if want := []byte{10, 20, 30}; !bytes.Equal(value, want) {
 		t.Fatalf("response = %v, want %v", value, want)
 	}
 }

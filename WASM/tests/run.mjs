@@ -402,9 +402,9 @@ async function testGuestNetFanout() {
   const ta = new Transport(toHex(a.publicKey), net, 40);
   const tb = new Transport(toHex(b.publicKey), net, 40);
   const tc = new Transport(toHex(c.publicKey), net, 40);
-  // Each peer echoes type + payload, so a distinct payload comes back distinctly.
-  tb.onRequest((_from, _proto, type, payload) => new Uint8Array([type, ...payload]));
-  tc.onRequest((_from, _proto, type, payload) => new Uint8Array([type, ...payload]));
+  // Each peer echoes the payload directly.
+  tb.onRequest((_from, _proto, payload) => payload);
+  tc.onRequest((_from, _proto, payload) => payload);
 
   const bId = toHex(b.publicKey), cId = toHex(c.publicKey);
   const dead = toHex(generateKeyPair().publicKey);
@@ -412,12 +412,12 @@ async function testGuestNetFanout() {
     sodium, identity: a, callHandler: () => null,
     transport: ta, peers: () => [], fs: new MemoryFs(),
   });
-  // The guest fans out over NET_SEND itself: build [peer 32][pidLen u8][proto utf8][type u8][payload]
+  // The guest fans out over NET_SEND itself: build [peer 32][pidLen u8][proto utf8][payload]
   // per peer and Promise.all them. NET_SEND returns [ok u8][resp]; an unreachable peer
   // resolves [0] (ok:false), never rejecting the batch.
   const src = `
     register("fanout", async (arg) => {
-      // arg = count u8, then count * (peer 32 | type u8 | plen u8 | payload)
+      // arg = count u8, then count * (peer 32 | type u8 | plen u8 | data)
       const count = arg[0];
       let o = 1;
       const reqs = [];
@@ -426,10 +426,12 @@ async function testGuestNetFanout() {
         const peer = arg.slice(o, o + 32); o += 32;
         const type = arg[o]; o += 1;
         const plen = arg[o]; o += 1;
-        const payload = arg.slice(o, o + plen); o += plen;
-        const frame = new Uint8Array(33 + 1 + protoEnc.length + plen);
+        const data = arg.slice(o, o + plen); o += plen;
+        const payload = new Uint8Array(1 + data.length);
+        payload[0] = type; payload.set(data, 1);                 // type folded into payload
+        const frame = new Uint8Array(32 + 1 + protoEnc.length + payload.length);
         frame.set(peer, 0); frame[32] = protoEnc.length; frame.set(protoEnc, 33);
-        frame[33 + protoEnc.length] = type; frame.set(payload, 33 + protoEnc.length + 1);
+        frame.set(payload, 33 + protoEnc.length);
         reqs.push(host.call(CAP_NET_SEND, frame));
       }
       const results = await Promise.all(reqs);            // real concurrent round trips
@@ -1076,7 +1078,7 @@ async function testCapBridgeEnforcement() {
   console.log("Test: cap-bridge enforces the manifest's declared op set + allocation caps");
 
   const id = generateKeyPair();
-  const stubTransport = { request: async (_peer, _proto, _type, _payload) => new Uint8Array() };
+  const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
@@ -1152,10 +1154,10 @@ async function testTransportResponseBinding() {
   const ta = new Transport(A, net, 200);
   const tb = new Transport(B, net, 200);
   const tc = new Transport(C, net, 200);
-  tb.onRequest((_from, _proto, _type, _payload) => new Uint8Array([42]));
+  tb.onRequest((_from, _proto, _payload) => new Uint8Array([42]));
 
   try {
-    const reqP = ta.request(B, _testProto, 7, new Uint8Array());
+    const reqP = ta.request(B, _testProto, new Uint8Array());
     // C (an authenticated cohort member in real life) races a spoofed response
     // with the predictable first correlation id. It must be ignored.
     net.endpoint(C).send(A, Uint8Array.from([1, 0, 0, 0, 1, 7, 99]));
@@ -1183,16 +1185,16 @@ async function testTransportStallTimeout() {
   // (every inter-frame gap is 150 ms < 250 ms), so all three must resolve. This is
   // the PUT STORE round in miniature: many requests against one issue instant,
   // with the tail alive only because the transfer is visibly progressing.
-  tb.onRequest(async (_from, _proto, type) => { await sleep(150 * type); return new Uint8Array([type]); });
+  tb.onRequest(async (_from, _proto, payload) => { const t = payload[0] || 1; await sleep(150 * t); return new Uint8Array([t]); });
 
   try {
-    const rs = await Promise.all([1, 2, 3].map((t) => ta.request(B, _testProto, t, new Uint8Array())));
+    const rs = await Promise.all([1, 2, 3].map((t) => ta.request(B, _testProto, new Uint8Array([t]))));
     assertEqual(rs.map((r) => r[0]), [1, 2, 3], "a slow-but-streaming peer never times out");
 
     // A silent peer still fails after ~timeoutMs — the stall clock is a real bound.
     const t0 = Date.now();
     let failed = false;
-    try { await ta.request(toHex(generateKeyPair().publicKey), _testProto, 9, new Uint8Array()); }
+    try { await ta.request(toHex(generateKeyPair().publicKey), _testProto, new Uint8Array()); }
     catch { failed = true; }
     assert(failed, "a silent peer still times out");
     assert(Date.now() - t0 < 2000, "silence is detected promptly, not hung");
@@ -1226,7 +1228,7 @@ async function testTransportBackstop() {
   try {
     const t0 = Date.now();
     let failed = false, msg = "";
-    try { await ta.request(B, _testProto, 7, new Uint8Array()); }
+    try { await ta.request(B, _testProto, new Uint8Array()); }
     catch (e) { failed = true; msg = String(e?.message ?? e); }
     const dt = Date.now() - t0;
     assert(failed, "a request whose response never comes still rejects, despite a live peer");
@@ -1778,7 +1780,7 @@ async function testWeriftRtcNetwork() {
   // Generous timeout: werift's pure-JS DTLS/SCTP bring-up is slower than native.
   const ta = new Transport(aId, netA, 4000);
   const tb = new Transport(bId, netB, 4000);
-  tb.onRequest((_from, _proto, type, payload) => new Uint8Array([type, ...payload]));
+  tb.onRequest((_from, _proto, payload) => payload);
 
   try {
     netA.join(); netB.join(); // announce into the room → the WebRTC dance begins
@@ -1790,9 +1792,9 @@ async function testWeriftRtcNetwork() {
     assert(netA.linkedPeers().includes(bId), "A holds an authenticated link to B over real WebRTC");
     assert(netB.linkedPeers().includes(aId), "B holds an authenticated link to A over real WebRTC");
 
-    // A real request crosses the data channel and the typed response comes back.
-    const res = await ta.request(bId, _testProto, 7, new Uint8Array([3, 4]));
-    assert(bytesEqual(res, new Uint8Array([7, 3, 4])), "request/response round-trips over the werift data channel");
+    // A real request crosses the data channel and the response comes back.
+    const res = await ta.request(bId, _testProto, new Uint8Array([3, 4]));
+    assert(bytesEqual(res, new Uint8Array([3, 4])), "request/response round-trips over the werift data channel");
   } finally {
     ta.close(); tb.close();
     netA.close(); netB.close();

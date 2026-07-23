@@ -614,7 +614,7 @@ function dismissOffer(bytesHashHex) {
 function broadcastToPeers(proto, payload) {
   const protoBytes = new TextEncoder().encode(proto);
   for (const peerId of net.linkedPeers()) {
-    shell.transport.send(peerId, protoBytes, 0, payload);
+    shell.transport.send(peerId, protoBytes, payload);
   }
 }
 
@@ -975,7 +975,7 @@ const net = new RtcNetwork({
       const chatBytes = new Uint8Array(1 + body.length);
       chatBytes[0] = 0x02;
       chatBytes.set(body, 1);
-      shell.transport.send(peerId, new TextEncoder().encode(lastSentNickBody.proto), 0, chatBytes);
+      shell.transport.send(peerId, new TextEncoder().encode(lastSentNickBody.proto), chatBytes);
     }
   },
   onPeerDown: (peerId) => {
@@ -1019,7 +1019,7 @@ shell = createShell({
 // An inbound frame names a protocol id (§12.10); the handler resolves it through
 // bindings to the installed app. The custom FRAME_CHAT / FRAME_OFFER framing that
 // used to live here is gone.
-shell.transport.onRequest((from, proto, _type, payload) => {
+shell.transport.onRequest((from, proto, payload) => {
   // Bundle offers ride the same Transport, with a well-known protocol id.
   if (proto === OFFER_PROTO) {
     handleOffer(payload, from).catch(() => {});

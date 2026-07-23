@@ -133,25 +133,18 @@ const engineNodeJS = `
 // from local fs + crypto, so onRequest gets bytes back immediately.
 func wireServe(hostQc *qjs.Context, g *guestRealm) {
 	hostQc.Global().SetPropertyStr("__serveHandle", hostQc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		typ := byte(t.Args()[0].Int32())
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		payload, err := qjs.JsTypedArrayToGo(t.Args()[0])
 		if err != nil {
 			return t.Context().NewArrayBuffer(nil), nil
 		}
-		resp, err := g.serveHandle(typ, payload)
+		resp, err := g.serveHandle(payload)
 		if err != nil {
 			return t.Context().NewArrayBuffer(nil), nil
 		}
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
-	// net.ts dispatchRequest does frame.set(resp, …), so the handler must return a
-	// Uint8Array — wrap the ArrayBuffer __serveHandle hands back. The second argument
-	// (proto) is the protocol id from the req frame (§12.10); the Go native target
-	// hosts a single app, so it ignores the proto and routes every request to the one
-	// guest — a serving node that later hosts several apps would look it up in the
-	// binding table first.
 	if _, err := hostQc.Eval("wire-serve.js", qjs.Code(
-		`__transport.onRequest((from, proto, type, payload) => new Uint8Array(__serveHandle(type, payload)));`,
+		`__transport.onRequest((from, proto, payload) => new Uint8Array(__serveHandle(payload)));`,
 	)); err != nil {
 		panic(fmt.Sprintf("wireServe: %v", err))
 	}

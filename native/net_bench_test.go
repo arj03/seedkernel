@@ -30,7 +30,7 @@ import (
 )
 
 // netBenchHarness wires two nodes in one realm: A listens and answers (type 7 → a fixed
-// 64 KB block for the FETCH bench; anything else → an echo of [type, ...payload]), B is
+// 64 KB block for the FETCH bench; anything else → an echo of payload), B is
 // the requester. benchPingN/benchFetchN issue n sequential requests over the one link.
 const netBenchHarness = `
 	globalThis.idA = sodium.crypto_sign_keypair();
@@ -43,20 +43,19 @@ const netBenchHarness = `
 	globalThis.tB = new Transport(bId, netB, 2000);
 
 	const block64k = new Uint8Array(65536); block64k.fill(0x5a);
-	tA.onRequest((from, proto, type, payload) => {
-	  if (type === 7) return block64k;                       // FETCH-shaped: bulk response
-	  if (type === 9) return new Uint8Array([(payload.length ^ payload[payload.length - 1]) & 255]); // UPLOAD-shaped: 1-byte ack folding in length + last byte, so a short/torn receive changes it
-	  const out = new Uint8Array(payload.length + 1);        // control-plane: echo [type, ...payload]
-	  out[0] = type; out.set(payload, 1);
-	  return out;
+	tA.onRequest((from, proto, payload) => {
+	  if (payload.length > 0 && payload[0] === 7) return block64k;     // FETCH-shaped: bulk response (type=7 in payload[0])
+	  if (payload.length > 0 && payload[0] === 9) return new Uint8Array([(payload.slice(1).length ^ payload[payload.length - 1]) & 255]); // UPLOAD-shaped: 1-byte ack folding in length + last byte
+	  return payload;                                                   // control-plane: echo
 	});
 
 	globalThis.__ping = new Uint8Array([10, 20, 30]);
-	globalThis.__fid = new Uint8Array(32);
-	globalThis.__big = new Uint8Array(1 << 20); __big.fill(0x5a); // 1 MiB upload payload (a STORE group)
-	globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await tB.request(aId, new TextEncoder().encode("_test"), 5, __ping); return new Uint8Array(0); };
-	globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), 7, __fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
-	globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), 9, __big); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
+	globalThis.__fid = new Uint8Array([7, ...new Array(31).fill(0)]);      // type=7 fetch id (type byte inside payload)
+	globalThis.__big = new Uint8Array(1 << 20); __big.fill(0x5a);          // 1 MiB upload payload (a STORE group)
+	globalThis.__big9 = new Uint8Array(1 + __big.length); __big9[0] = 9; __big9.set(__big, 1); // type=9 upload (type byte inside payload)
+	globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await tB.request(aId, new TextEncoder().encode("_test"), __ping); return new Uint8Array(0); };
+	globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), __fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
+	globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), __big9); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
 `
 
 // setupNetBench stands up the harness, binds A's listener, and points B at it. The

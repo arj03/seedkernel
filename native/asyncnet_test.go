@@ -42,7 +42,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 
 	// A (responder, listens) and B (the guest's node). The guest's cap-bridge is built
 	// over B's identity + transport, granting crypto + net only. A's onRequest echoes
-	// [type, ...payload] so the round-trip result is checkable.
+	// the payload so the round-trip result is checkable.
 	if _, err := hostQc.Eval("setup.js", qjs.Code(`
 		globalThis.idA = sodium.crypto_sign_keypair();
 		globalThis.idB = sodium.crypto_sign_keypair();
@@ -52,11 +52,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.netB = makeNetwork(idB, undefined, undefined);
 		globalThis.tA = new Transport(aId, netA, 2000);
 		globalThis.tB = new Transport(bId, netB, 2000);
-		tA.onRequest((from, proto, type, payload) => {
-		  const out = new Uint8Array(payload.length + 1);
-		  out[0] = type; out.set(payload, 1);
-		  return out;
-		});
+		tA.onRequest((from, proto, payload) => payload);
 		__buildCapBridge(["crypto", "net"], idB, tB, [aId]);
 	`)); err != nil {
 		t.Fatal("setup:", err)
@@ -84,19 +80,18 @@ func TestAsyncNetInitiator(t *testing.T) {
 		register("ask", async (msg) => {
 		  const peer = fromHex(APP.peer);            // A's 32-byte public key
 		  const proto = [0x74, 0x65, 0x73, 0x74];    // "test"
-		  const req = new Uint8Array(32 + 1 + proto.length + 1 + msg.length); // [peer 32][pidLen u8][proto][type u8][payload]
+		  const req = new Uint8Array(32 + 1 + proto.length + msg.length); // [peer 32][pidLen u8][proto][payload]
 		  req.set(peer, 0);
 		  req[32] = proto.length;
 		  req.set(proto, 33);
-		  req[33 + proto.length] = APP.type;
-		  req.set(msg, 33 + proto.length + 1);
+		  req.set(msg, 33 + proto.length);
 		  const r = await host.call(CAP_NET_SEND, req); // [ok u8][resp]
 		  if (r[0] !== 1) throw new Error("net send failed");
 		  return r.slice(1);
 		});
 	`
 	aIdHex := mustEvalString(t, hostQc, `aId`)
-	g, err := newGuestRealm(el, "", fmt.Sprintf(`{"peer":%q,"type":5}`, aIdHex), askGuestSource)
+	g, err := newGuestRealm(el, "", fmt.Sprintf(`{"peer":%q}`, aIdHex), askGuestSource)
 	if err != nil {
 		t.Fatal("guest:", err)
 	}
@@ -107,7 +102,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	if err != nil {
 		t.Fatal("ask:", err)
 	}
-	want := append([]byte{5}, msg...) // A echoes [type=5, ...payload]
+	want := msg // A echoes the payload directly
 	if !bytes.Equal(got, want) {
 		t.Fatalf("ask = %v, want %v", got, want)
 	}

@@ -247,14 +247,11 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       served = true;
       const hr = await ensureRealm(b);
       const appKey = appKeyFor(b.author, b.manifest.app);
-      transport.onRequest((_from, proto, type, payload) => {
+      transport.onRequest((_from, proto, payload) => {
         // Only answer for protocols bound to our loaded app (§12.10).
         const boundKey = bindings.boundApp(proto);
         if (!boundKey || boundKey !== appKey) return null;
-        const arg = new Uint8Array(1 + payload.length);
-        arg[0] = type & 255;
-        arg.set(payload, 1);
-        return hr.callSync("handle", arg);
+        return hr.callSync("handle", payload);
       });
     },
     close() {

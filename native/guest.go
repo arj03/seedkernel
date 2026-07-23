@@ -205,20 +205,19 @@ func (g *guestRealm) runGuest(entry string, payload []byte) ([]byte, error) {
 }
 
 // serveHandle invokes the guest's `handle` entrypoint synchronously — the request
-// side (README §12.8). The arg is [type u8][payload]; the guest answers from local
-// fs + crypto (no net), so it returns bytes without yielding. Called re-entrantly
-// from the host realm's transport.onRequest (wireServe).
-func (g *guestRealm) serveHandle(typ byte, payload []byte) ([]byte, error) {
-	// Stage [type][payload] straight into one wasm buffer instead of building a
-	// concatenated Go slice first and copying it in again (two passes over payload).
-	argv := g.qc.NewArrayBufferParts([]byte{typ}, payload)
-	defer argv.Free() // Invoke borrows its args; free the per-request ArrayBuffer
+// side (README §12.8). The arg is the raw payload from the req frame; the guest
+// reads its own dispatch byte from payload[0] if it needs one. The guest answers
+// from local fs + crypto (no net), so it returns bytes without yielding. Called
+// re-entrantly from the host realm's transport.onRequest (wireServe).
+func (g *guestRealm) serveHandle(payload []byte) ([]byte, error) {
+	argv := g.qc.NewArrayBuffer(payload)
+	defer argv.Free()
 	res, err := g.qc.Invoke(g.invoke, g.qc.NewUndefined(), g.handleName, argv)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Free()                 // own-ref result; the copy below happens before this runs
-	return qjs.JsTypedArrayToGo(res) // sync handle → ArrayBuffer (not a Promise)
+	defer res.Free()
+	return qjs.JsTypedArrayToGo(res)
 }
 
 func (g *guestRealm) close() {

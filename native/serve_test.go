@@ -58,6 +58,7 @@ func TestServe(t *testing.T) {
 
 	// The holder guest: type 1 = STORE (payload already framed for FS_PUT),
 	// type 2 = FETCH (payload = key). Local fs + crypto only — fully synchronous.
+	// The guest reads its own dispatch byte from payload[0] directly.
 	const holderSource = `
 		register("handle", (arg) => {
 		  const type = arg[0];
@@ -79,12 +80,16 @@ func TestServe(t *testing.T) {
 		netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 		const key = new TextEncoder().encode("greeting");
 		const val = new TextEncoder().encode("held by the cohort");
-		const store = new Uint8Array(4 + key.length + val.length);
-		new DataView(store.buffer).setUint32(0, key.length);
-		store.set(key, 4); store.set(val, 4 + key.length);
-		const ok = await tB.request(aId, new TextEncoder().encode("_test"), 1, store);
+		const fsFrame = new Uint8Array(4 + key.length + val.length);
+		new DataView(fsFrame.buffer).setUint32(0, key.length);
+		fsFrame.set(key, 4); fsFrame.set(val, 4 + key.length);
+		const store = new Uint8Array(1 + fsFrame.length);
+		store[0] = 1; store.set(fsFrame, 1);                // type=1 STORE prepended into payload
+		const ok = await tB.request(aId, new TextEncoder().encode("_test"), store);
 		if (ok[0] !== 1) throw new Error("store not acked");
-		const got = await tB.request(aId, new TextEncoder().encode("_test"), 2, key);
+		const fetch = new Uint8Array(1 + key.length);
+		fetch[0] = 2; fetch.set(key, 1);                    // type=2 FETCH prepended into payload
+		const got = await tB.request(aId, new TextEncoder().encode("_test"), fetch);
 		if (got[0] !== 1) throw new Error("fetch miss");
 		return got.slice(1);
 	})()`, 8*time.Second)

@@ -37,7 +37,7 @@ export const CAP = {
   IDENTITY: 5,         // -> this node's 32B public key
   RANDOM: 6,           // [n u32] -> n random bytes
   // net (7–8) — NET_SEND is the only async op (a real round trip → a Promise)
-  NET_SEND: 7,         // [peer 32][pidLen u8][protocolId utf8][type u8][payload] -> [ok u8][resp]
+  NET_SEND: 7,         // [peer 32][pidLen u8][protocolId utf8][payload ..] -> [ok u8][resp]
   NET_PEERS: 8,        // -> [count u32][pk 32 …]
   // fs (9–14)
   FS_GET: 9,           // key(utf8) -> [0] | [1][bytes]
@@ -249,7 +249,7 @@ export interface CapSodium {
  *  confined guest fans out itself with `Promise.all` over `NET_SEND`, so the bridge
  *  needs only single-peer request/response — no host-side scatter-gather. */
 export interface CapTransport {
-  request(to: PeerId, proto: Uint8Array, type: number, payload: Uint8Array): Promise<Uint8Array>;
+  request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
 }
 
 /** Everything a cap-bridge needs — all kernel primitives, zero app knowledge. */
@@ -360,8 +360,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         const pidLen = payload[32];
         const proto = payload.slice(33, 33 + pidLen);
         const off = 33 + pidLen;
-        const type = payload[off];
-        return transport.request(peer, proto, type, payload.slice(off + 1)).then(
+        return transport.request(peer, proto, payload.slice(off)).then(
           (resp) => concatBytes([ONE, resp]),
           () => ZERO,
         );
