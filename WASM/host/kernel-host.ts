@@ -161,6 +161,17 @@ export class KernelHost {
     return this.handlers.delete(name);
   }
 
+  /** Remove every handler whose name starts with `prefix`. Returns the count of
+   *  handlers removed. Used by the shell's `uninstall` to clean up all kernel names
+   *  derived from one app key in a single pass. */
+  removePrefix(prefix: string): number {
+    let removed = 0;
+    for (const name of this.handlers.keys()) {
+      if (name.startsWith(prefix)) { this.handlers.delete(name); removed++; }
+    }
+    return removed;
+  }
+
   /** True if a handler occupies `name` — the §3.1 resolve, as a predicate. A shell uses
    *  it to check that the modules it expects a bundle to have landed are bound. */
   isBound(name: string): boolean {

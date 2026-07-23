@@ -82,6 +82,9 @@ export interface Shell {
    *  policy, integrity-check + install the modules, and return the guest source.
    *  The §12.4 load order — the ONE install path. */
   loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
+  /** Uninstall an app by its app key — the one uninstall path, symmetric with
+   *  loadBundleBlob (§12.5). */
+  uninstall(appKey: string): boolean;
   runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   serve(): Promise<void>;
   close(): void;
@@ -155,6 +158,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     peers: core.peers,
     addPeer: core.addPeer,
     loadBundleBlob: core.loadBundleBlob,
+    uninstall: core.uninstall,
     async loadBundle(file) {
       return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
     },

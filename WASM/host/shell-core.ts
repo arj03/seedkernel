@@ -77,12 +77,13 @@ export interface CreateShellOptions {
 }
 
 /** The handler table as exposed by the Shell — everything a caller needs to
- *  reach installed handlers, WITHOUT installWasmHandler. The bind itself is the
- *  bundle loader's job (§12.4) and no longer public API. */
+ *  reach installed handlers, WITHOUT installWasmHandler AND WITHOUT
+ *  removeHandler. The bind is the bundle loader's job (§12.4); the unbind
+ *  is the shell's uninstall method (§12.5). Neither install nor remove is a
+ *  public host method. */
 export interface KernelTable {
   callHandler(name: string, payload: Uint8Array): Uint8Array | null;
   isBound(name: string): boolean;
-  removeHandler(name: string): boolean;
 }
 
 export type { LoadedBundle, FreshnessStore, VerifiedBundle };
@@ -112,6 +113,11 @@ export interface Shell {
    *  integrity-check + install the modules, and return the guest source. This is
    *  the §12.4 load order — the ONE install path. */
   loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
+  /** Uninstall an app: remove every kernel handler derived from `appKey`,
+   *  drop every protocol binding for it, and — if this is the loaded guest —
+   *  dispose the confined realm. Returns true if any handlers were removed.
+   *  The one uninstall path, symmetric with loadBundleBlob (§12.5). */
+  uninstall(appKey: string): boolean;
   /** Run one of a loaded bundle's guest entrypoints through a generic
    *  cap-bridge over the kernel's primitives. Load a guest bundle first.
    *  Throws for handler-only bundles (no guest source). */
@@ -212,6 +218,17 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       const key = appKeyFor(loaded.author, loaded.manifest.app);
       bindings.autoBind(key, handlesOf(loaded.manifest));
       return loaded;
+    },
+    uninstall(appKey) {
+      const removed = host.removePrefix(appKey + ":");
+      bindings.removeApp(appKey);
+      if (loaded && appKeyFor(loaded.author, loaded.manifest.app) === appKey) {
+        realm?.dispose();
+        realm = null;
+        served = false;
+        loaded = null;
+      }
+      return removed > 0;
     },
     async runGuest(entry, payload) {
       const b = requireLoaded();

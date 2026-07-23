@@ -775,12 +775,10 @@ function removeApp(key) {
   const rec = installedApps.get(key);
   if (!rec) return;
   if (!confirm(`Remove ${rec.name} ${rec.version}? The kernel handler will be uninstalled.`)) return;
-  // Revocation (§12.5): removeHandler empties the kernel slot AND clears its install
-  // record, so the same name is free to re-admit later with no stale attribution.
-  shell.host.removeHandler(rec.handlerName);
+  // Revocation (§12.5): uninstall removes every kernel handler derived from the app key,
+  // drops all protocol bindings, and disposes the guest realm if this was the loaded app.
+  shell.uninstall(key);
   installedApps.delete(key);
-  // Drop every protocol this app held (§12.10).
-  shell.bindings.removeApp(key);
   if (activeAppKey === key) unmountActiveApp();
   persistInstalledApps();
   renderAppList();
