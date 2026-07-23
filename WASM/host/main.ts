@@ -60,34 +60,14 @@ export interface ShellOptions {
 
 export type { LoadedBundle, FreshnessStore };
 
-/** The Node-side Shell — the platform-neutral core plus a file-backed
- *  `loadBundle`. Kept as its own interface so a caller using the CLI shape
- *  (which wants the file loader) sees both; cross-platform callers use CoreShell
- *  directly from shell-core. */
-export interface Shell {
-  /** The handler table: callHandler + isBound, without installWasmHandler.
-   *  The bind is solely the bundle loader's job (§12.4). */
-  host: KernelTable;
-  net: Network;
-  transport: Transport;
+/** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
+ *  `loadBundle` and a guaranteed `fs` (Node always has a filesystem). */
+export interface Shell extends CoreShell {
   fs: Fs;
-  sodium: ShellSodium;
-  readonly peers: Set<PeerId>;
-  addPeer(peerId: PeerId): void;
-  /** Load a signed bundle *file*: read it from disk then delegate to the shared
-   *  §12.4 loader. This is the Node convenience wrapper; cross-platform callers
-   *  use `loadBundleBlob`. */
+  /** Load a signed bundle *file*: read it from disk then delegate to
+   *  loadBundleBlob (§12.4). This is the Node convenience wrapper;
+   *  cross-platform callers use loadBundleBlob directly. */
   loadBundle(file: string): Promise<LoadedBundle>;
-  /** Load a signed bundle blob: verify the manifest, govern it against the
-   *  policy, integrity-check + install the modules, and return the guest source.
-   *  The §12.4 load order — the ONE install path. */
-  loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
-  /** Uninstall an app by its app key — the one uninstall path, symmetric with
-   *  loadBundleBlob (§12.5). */
-  uninstall(appKey: string): boolean;
-  runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  serve(): Promise<void>;
-  close(): void;
 }
 
 /** A `FreshnessStore` backed by one JSON file (`{ "authorHex:app": version }`). Kept
@@ -151,12 +131,14 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // ── Node wrapper: add file-backed loadBundle ───────────────────────────────
   return {
     host: core.host,
+    bindings: core.bindings,
     net: core.net,
     transport: core.transport,
     fs: core.fs!,
     sodium: core.sodium,
     peers: core.peers,
     addPeer: core.addPeer,
+    removePeer: core.removePeer,
     loadBundleBlob: core.loadBundleBlob,
     uninstall: core.uninstall,
     async loadBundle(file) {
