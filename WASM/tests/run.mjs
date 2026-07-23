@@ -38,7 +38,7 @@ const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.j
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
          signManifest, verifyBundle, loadBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
-const { policyFromJson } = await imp("build/host/policy.js");
+const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -132,11 +132,12 @@ async function testInstallRejectsUntrustedAuthor() {
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
 
-  // The policy only trusts a DIFFERENT key.
+  // The predicate only trusts a DIFFERENT key.
   const stranger = generateKeyPair();
+  const admit = authorAllowlist([toHex(stranger.publicKey)]);
   let threw = false;
   try {
-    loadBundle(host, sodium, { authors: [toHex(stranger.publicKey)] }, blob);
+    loadBundle(host, sodium, blob, undefined, admit);
   } catch { threw = true; }
   assert(threw, "installBundle throws when the author is not in the policy");
 
@@ -172,10 +173,11 @@ async function testManifestHashIsEnforced() {
 async function testDenyAllPolicyRejects() {
   console.log("Test: an omitted policy is deny-all, not 'no policy' (§12.5, §14)");
 
-  // `policyFromJson(null)` is the boot default every target shares: an EMPTY author set,
-  // which admits nothing. The absence of a decision is never permission.
-  const policy = policyFromJson(null);
-  assert(policy.authors.length === 0, "deny-all policy has an empty author set");
+  // `policyFromJson(null)` is the boot default every target shares: a predicate
+  // that returns false for every bundle. The absence of a decision is never permission.
+  const admit = policyFromJson(null);
+  assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
+    "deny-all predicate returns false for any VerifiedBundle");
 
   const { host } = await makeHost();
   const author = generateKeyPair();
@@ -185,8 +187,8 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
 
   let threw = false;
-  try { loadBundle(host, sodium, policy, blob); } catch { threw = true; }
-  assert(threw, "loadBundle with deny-all policy throws");
+  try { loadBundle(host, sodium, blob, undefined, admit); } catch { threw = true; }
+  assert(threw, "loadBundle with deny-all admit predicate throws");
 
   console.log("  OK\n");
 }
@@ -215,9 +217,10 @@ async function testBundleRefusesNonHandler() {
     [moduleFile("broken")]: notAHandler,
   });
 
+  const admit = authorAllowlist([toHex(author.publicKey)]);
   let threw = false;
   try {
-    loadBundle(host, sodium, { authors: [toHex(author.publicKey)] }, blob);
+    loadBundle(host, sodium, blob, undefined, admit);
   } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
@@ -634,7 +637,7 @@ async function testPolicy() {
   const good = generateKeyPair();
   const bad = generateKeyPair();
 
-  // Build a signed bundle from each author; loadBundle accepts/rejects by policy.
+  // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { KernelHost } = await imp("build/host/kernel-host.js");
   const tryLoad = (policyJson, author) => {
     const host = new KernelHost();
@@ -642,9 +645,9 @@ async function testPolicy() {
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
-    const policy = parsePolicy(policyJson);
+    const admit = parsePolicy(policyJson);
     let landed = false;
-    try { loadBundle(host, sodium, policy, blob); landed = true; } catch { /* author not in policy */ }
+    try { loadBundle(host, sodium, blob, undefined, admit); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -687,7 +690,6 @@ async function testShellBoot() {
     // author's code is the bundle path, covered end-to-end by testBundle (§12.4) — the
     // only way code arrives now that the wire install path is gone.
     assert(shell.fs.list().length === 0, "fs.* backend is wired over the data dir");
-    assert(shell.policy.authors.includes(toHex(author.publicKey)), "the policy loaded the allowed author");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });

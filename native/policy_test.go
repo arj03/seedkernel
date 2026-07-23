@@ -27,7 +27,7 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 	author, authorPub := testAuthor(t)
 	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.Contains(status, "manifest author is not in the policy's allowed set") {
+	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("expected foreign-author rejection, got: %s", status)
 	}
 }
@@ -45,7 +45,7 @@ func TestPolicyMalformed(t *testing.T) {
 	// to parse kept a permissive default and loaded any signed bundle.
 	author, authorPub := testAuthor(t)
 	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
+	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("after rejected policies the realm must stay deny-all: %s", status)
 	}
 }
@@ -60,7 +60,7 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
 	// way code arrives (§12.4), so the manifest-author gate is the whole install surface.
 	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.Contains(status, "not in the policy") {
+	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
 }

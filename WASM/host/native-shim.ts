@@ -13,7 +13,7 @@
 // Because it is TypeScript checked against those same interfaces, the drift that a
 // hand-written mirror accumulates is now a compile error.
 
-import { policyFromJson, type ShellPolicy } from "./policy.js";
+import { policyFromJson, type AdmitPredicate } from "./policy.js";
 import {
   FreshnessMarks, handlesOf, kernelNameFor, loadBundle,
   type BundleHost,
@@ -65,16 +65,15 @@ class NativeFreshnessStore extends FreshnessMarks {
 }
 
 let freshness: NativeFreshnessStore | null = null;
-// The realm boots deny-all (README §14): setPolicy has not run, so the author set is
-// empty and every install is refused. A permissive default here would be a silent
-// second posture — the whole reason this file is generated rather than written.
-let policy: ShellPolicy = policyFromJson(null);
-const applyPolicy = (p: ShellPolicy): void => { policy = p; };
+// The realm boots deny-all (README §14): setPolicy has not run, so the predicate
+// admits nothing and every install is refused. A permissive default here would be
+// a silent second posture — the whole reason this file is generated rather than written.
+let admit: AdmitPredicate = policyFromJson(null);
 
 /** Narrow the realm's trust to a policy config (§12.5). `null` restores the deny-all
  *  default; malformed JSON throws, so a typo fails the loader's boot loudly. */
 function setPolicy(json: string | null): void {
-  applyPolicy(policyFromJson(json));
+  admit = policyFromJson(json);
 }
 
 /** Load a signed bundle (README §12.4). Go has read the one bundle file — that is the
@@ -90,7 +89,7 @@ function loadBundleBlob(blob: ArrayBuffer): string {
   // store's path) from the CLI *after* it evaluates this bundle.
   if (!freshness) freshness = new NativeFreshnessStore();
   try {
-    const b = loadBundle(host, sodium, policy, new Uint8Array(blob), freshness);
+    const b = loadBundle(host, sodium, new Uint8Array(blob), freshness, admit);
     const modMap = Object.fromEntries(b.manifest.modules.map((m) =>
       [m.name, kernelNameFor(b.author, b.manifest.app, m.name)]));
     return JSON.stringify({

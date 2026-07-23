@@ -1,40 +1,43 @@
-// The shell's admission policy (README §12.5): a closed set of author keys permitted
-// to sign a bundle manifest (§12.4). It needs no name rule and no per-module gate:
-// kernel names derive from the author's key (§5.1), so squat-resistance is structural,
-// and the signed manifest's `modules[].hash` is the definitive declaration of which
-// bytes are authorized. Trusting an author means trusting everything they sign.
+// The shell's admission policy (README §12.5): a single predicate — `admit(v)` —
+// that answers exactly one question: "may this verified bundle land on this host?"
+// Admission is one seam between verifyBundle and installBundle (§12.4), and one
+// policy answers it. Governance is the one predicate; mechanics is installBundle.
 //
-// This is the only governance the generic runtime carries: everything else — codec,
-// reputation, the storage guest — arrives in a signed bundle whose manifest author
-// must clear this gate (§12.4).
+// Three constructors cover the three deployment postures:
+//   authorAllowlist  — a file-backed closed set of author keys
+//   admitAll         — "the bundle my operator handed me" (StorageNode posture)
+//   interactive      — the caller writes their own, e.g. a per-bundle consent dialog
+//
+// Deny-all stays the default: the absent predicate admits nothing.
 
-export interface ShellPolicy {
-  /** Closed set of author Ed25519 public keys (hex) permitted to sign a bundle
-   *  manifest and bind names (§12.4–§12.5). Not consulted when `open` is set. */
-  authors: string[];
-  /** When set, ANY author is admitted — the `authors` allow-list is bypassed.
-   *  For deployments where admission is decided somewhere other than a static key
-   *  set: an interactive shell that gates each install on user consent (createShell's
-   *  `admit`, the browser path), and a node that loads exactly the one signed bundle
-   *  its operator handed it (a StorageNode's seedstore.skb) — there the choice of
-   *  bundle IS the trust decision. Deny-all stays the default for an omitted policy;
-   *  `open` is opt-in and never the result of parsing a config file. */
-  open?: boolean;
+import type { VerifiedBundle } from "./bundle.js";
+import { toHex } from "./util.js";
+
+/** The single admission seam.
+ *  `(v: VerifiedBundle) → bool | Promise<bool>`.
+ *  Return `true` to admit, `false` or throw to reject. */
+export type AdmitPredicate = (v: VerifiedBundle) => boolean | Promise<boolean>;
+
+/** The default: nothing is admitted.
+ *  A node with no configured predicate boots, serves, and refuses every install. */
+export const denyAll: AdmitPredicate = () => false;
+
+/** Any verified bundle is admitted — "the bundle my operator handed me IS the
+ *  trust decision." A StorageNode loads exactly the one bundle it was configured
+ *  with; the choice of bundle already settled admission. */
+export const admitAll: AdmitPredicate = () => true;
+
+/** A predicate that checks the manifest author's public key against a closed set.
+ *  `authors` strings are hex Ed25519 pubkeys, case-insensitive. */
+export function authorAllowlist(authors: string[]): AdmitPredicate {
+  const set = new Set(authors.map((a) => a.toLowerCase()));
+  return (v) => set.has(toHex(v.author));
 }
 
-/** An open admission policy: any author is admitted. Use where a static author
- *  allow-list is the wrong shape — an interactive shell whose real gate is per-bundle
- *  user consent, or a node that only ever loads the single bundle it was configured
- *  with. The author's manifest signature and the module hashes are still verified
- *  (that is `verifyBundle`, not policy); `open` only waives the *who-signed-it*
- *  allow-list, not authenticity or integrity. */
-export function openPolicy(): ShellPolicy {
-  return { authors: [], open: true };
-}
-
-/** Parse + validate a policy config. Throws on malformed input so a typo in the
- *  allowed-keys file fails the boot loudly rather than silently widening trust. */
-export function parsePolicy(json: string): ShellPolicy {
+/** Parse a policy config file and return an AdmitPredicate.
+ *  Throws on malformed input — a typo fails the boot loudly rather than
+ *  silently widening trust. */
+export function parsePolicy(json: string): AdmitPredicate {
   let raw: unknown;
   try { raw = JSON.parse(json); }
   catch (e) { throw new Error(`policy: invalid JSON (${(e as Error).message})`); }
@@ -47,18 +50,17 @@ export function parsePolicy(json: string): ShellPolicy {
   }
   const authors = (o.authors as string[]).map((s) => s.toLowerCase());
   if (authors.length === 0) throw new Error('policy: "authors" must list at least one allowed author key');
-  return { authors };
+  return authorAllowlist(authors);
 }
 
-/** The policy a shell runs under given its (optional) config file. A *provided*
- *  config is parsed strictly by `parsePolicy` — a typo fails the boot loudly rather
- *  than silently widening trust — and an **omitted** one is deny-all: an empty author
- *  set, so the node boots and serves but every install is refused (README §14).
+/** The predicate a shell runs under given its (optional) config file.
+ *  A provided config is parsed strictly by `parsePolicy` — a typo fails the
+ *  boot loudly. An omitted one is deny-all: the node boots, serves, and every
+ *  install is refused (README §14).
  *
- *  The default lives here, in the shared core, precisely because it is a security
- *  posture: every target (the Node shell, the native loader) resolves "no policy
- *  configured" through this one function, so a target cannot drift into a permissive
- *  default of its own. */
-export function policyFromJson(json: string | null | undefined): ShellPolicy {
-  return json ? parsePolicy(json) : { authors: [] };
+ *  The default lives here, in the shared core, so every target — the Node shell,
+ *  the native loader — resolves "no policy configured" through this one function
+ *  and cannot drift into a permissive default of its own. */
+export function policyFromJson(json: string | null | undefined): AdmitPredicate {
+  return json ? parsePolicy(json) : denyAll;
 }

@@ -27,7 +27,8 @@
 
 import { concatBytes, toHex } from "./util.js";
 import { DOMAIN_MANIFEST, SUITE_MANIFEST_GENESIS } from "./domains.js";
-import type { ShellPolicy } from "./policy.js";
+import type { AdmitPredicate } from "./policy.js";
+import { denyAll } from "./policy.js";
 
 /** The manifest envelope's name inside the container. */
 export const MANIFEST_FILE = "manifest.bundle";
@@ -533,24 +534,23 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
   return result;
 }
 
-/** Govern a verified bundle and land it (README §12.4 steps 2, 3, 4b): require the
- *  author to be in the policy, enforce version freshness, then instantiate every
- *  verified module (pure, no table effect) and bind them all atomically. If any module
- *  fails to instantiate the whole load fails — a half-landed bundle is exactly the
- *  incoherent state the manifest exists to prevent.
+/** Land a verified bundle (README §12.4 steps 3, 4b): enforce version freshness,
+ *  then instantiate every verified module (pure, no table effect) and bind them all
+ *  atomically. If any module fails to instantiate the whole load fails — a half-landed
+ *  bundle is exactly the incoherent state the manifest exists to prevent.
+ *
+ *  Admission (§12.5) runs BEFORE this function, between verifyBundle and installBundle.
+ *  By the time a bundle reaches here the decision is already settled — this function
+ *  only handles mechanics (freshness + instantiate + bind), not governance.
  *
  *  There is no per-module admission callback: the manifest's `modules[].hash` commits to
  *  exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
  *  Trusting the author means trusting everything the author signed. */
 export function installBundle(
   host: BundleHost,
-  policy: ShellPolicy,
   v: VerifiedBundle,
   freshness?: FreshnessStore,
 ): LoadedBundle {
-  if (!policy.open && !policy.authors.map((a) => a.toLowerCase()).includes(toHex(v.author))) {
-    throw new Error("bundle: manifest author is not in the policy's allowed set");
-  }
   // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
   // (verifyManifest already shape-checked it). Refuse a load below the persisted
   // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
@@ -601,15 +601,28 @@ export function installBundle(
   return { manifest: v.manifest, author: v.author, guestSource: v.guestSource };
 }
 
-/** Load a signed bundle blob: `verifyBundle` then `installBundle`. This is the whole
- *  §12.4 load order in one call — the checks and their sequence are the protocol, so no
- *  target restates them (README §12.9). */
+/** Load a signed bundle blob: `verifyBundle`, then `admit`, then `installBundle`.
+ *  This is the whole §12.4 load order in one call — the checks and their sequence
+ *  are the protocol, so no target restates them (README §12.9).
+ *
+ *  The `admit` predicate gates admission between verify and install (§12.5).
+ *  It must be synchronous (return `boolean`, not `Promise<boolean>`) — the
+ *  combined verify→admit→install path is a sync call used by the native loader's
+ *  Go bridge. Targets that need async admission (e.g. a consent dialog) use the
+ *  shell's `loadBundleBlob` which awaits the predicate itself. Omitted ⇒ deny-all
+ *  (nothing admitted). */
 export function loadBundle(
   host: BundleHost,
   sodium: BundleCrypto,
-  policy: ShellPolicy,
   blob: Uint8Array,
-  freshness?: FreshnessStore,
+  freshness: FreshnessStore | undefined,
+  admit: AdmitPredicate = denyAll,
 ): LoadedBundle {
-  return installBundle(host, policy, verifyBundle(sodium, blob), freshness);
+  const v = verifyBundle(sodium, blob);
+  const ok = admit(v);
+  if (ok instanceof Promise) {
+    throw new Error("bundle: async admit predicate not supported in sync loadBundle — use the shell's loadBundleBlob");
+  }
+  if (!ok) throw new Error("bundle: rejected by admission predicate");
+  return installBundle(host, v, freshness);
 }

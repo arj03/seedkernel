@@ -168,22 +168,25 @@ A bundle is a **value, not a path**: one blob is read from disk, carried in an `
 
 **Load algorithm** (`loadBundle`). The shell is host code, so failures here **throw to the operator** — the §3 "drop" semantics apply to wire messages, not to loading a local file.
 
-The load is two halves, and they are separate functions because they hold genuinely different powers. **`verifyBundle`** is authenticity + integrity: no host, no policy, no persistence, so "nothing has landed" is a property of its type rather than of reading it carefully. **`installBundle`** is governance + effect: it takes what `verifyBundle` proved and applies the deployment's policy, freshness, and binds. `loadBundle` is the two composed.
+The load is three halves: `verifyBundle` (authenticity + integrity), `admit` (governance — §12.5), and `installBundle` (freshness + bind). A single predicate answers the single question: "may this verified bundle land on this host?"
 
 *verify* — pure, nothing lands:
 
 1. Unpack the blob, read `manifest.bundle`, and verify the envelope signature. Invalid ⇒ reject.
 2. Read each module's `<name>.wasm` and, if a `guest` is declared, `guest.js`. A missing file ⇒ reject.
 
-*install* — governance, then effect:
+*admit* — governance, the one predicate:
 
-3. Require `author_pk` to be in the policy's `authors` (§12.5).
+3. Call the admission predicate with the `VerifiedBundle`. Return `true` to admit, `false` or throw to reject. The predicate IS the policy (§12.5) — a file-backed author allowlist, an interactive consent dialog, or "the bundle my operator handed me" are three constructors of it. Deny-all stays the default: the absent predicate admits nothing.
+
+*install* — mechanics, then effect:
+
 4. **Freshness.** Read the persisted high-water mark for `(author_pk, app)` (absent ⇒ −∞). Refuse if `version < high_water` — a downgrade, nothing lands. Otherwise the mark advances at the *end* of a fully successful load (see freshness below). Equal versions reload (an ordinary reboot); the mark is monotonic and never rewound, so once version N loads, nothing older ever loads again on this node.
 5. Integrity-check **everything** before binding anything: each module against its `hash`, and the guest against `guest.hash` (§5.1). A mismatch anywhere ⇒ reject with nothing bound, so a bad file can never leave a partial bundle on the kernel.
 6. **Install** atomically: instantiate every module first (pure, no table effect — compile, validate §4 exports, confirm each IS a handler). If any module fails to instantiate the accumulated refs are discarded and the whole load throws — nothing lands. Only when all instantiate successfully are they bound at `"<author hex>:<app>:<name>"` (§5.1).
 7. Only now, and only if a guest was declared, may it run (§12.8): a realm (§12.3) over a cap-bridge restricted to `guest.caps`' op set, loaded with `op preamble ‖ const BUNDLE ‖ const APP = merge(guest.config, operator config) ‖ guest source`.
 
-**Splitting verify from install is what makes consent possible.** An interactive shell must show a bundle's author and metadata and wait for the user *before* anything binds — the browser shell's `OFFER` flow (§11) is exactly that. With one monolithic `loadBundle` such a shell has to hand-roll its own copy of the signature-and-integrity order, which is the drift the shared loader exists to prevent; with the seam it calls `verifyBundle` and stops. (User consent is that deployment's admission policy: it carries no policy file and no freshness marks, so it never reaches `installBundle`.)
+**Splitting verify from install is what makes consent possible.** An interactive shell must show a bundle's author and metadata and wait for the user *before* anything binds — the browser shell's `OFFER` flow (§11) is exactly that. With a single `admit` predicate between `verifyBundle` and `installBundle`, the shell calls `verifyBundle`, stops, and the predicate asks the user before `installBundle` ever sees the bundle. That is one predicate, one answer.
 
 **The runtime's facts reach the guest as `BUNDLE`, never as hand-written config.** Alongside `APP`, the shell injects `const BUNDLE = { app, author, signPrefix }` — everything it derived from the admitted manifest: the app name, the author's key, and the guest signing prefix `DOMAIN_guest ‖ guestSignScope(author, app)` (§12.2). An author who instead baked these into `config` would be restating a load-time fact at build time, and a copy that silently disagrees fails as signatures that verify nowhere with nothing naming the cause — the same one-file rule the `DOMAIN_*` family follows (§16.1).
 
@@ -195,7 +198,7 @@ The load is two halves, and they are separate functions because they hold genuin
 
 **The policy needs no state because the name already carries it.** An admission decision would once have had to ask "who owns this name?", which meant a register mapping names to owners and a rule for updating it. With the author derived into the name (§5.1) that question has no content: a name is reachable only to the key that derives it, so the only bundle that can ever re-bind a name is one signed by the author whose name it is. The policy is a pure function of the bundle in front of it, the kernel table is the only install state on the host, and neither can drift from the other.
 
-**One authentication, one authorization.** The manifest signature authenticates and freshness-checks the *set* (steps 1–3); the content-hash check in `verifyBundle` binds each module's bytes to the manifest's commitment (step 4); the install policy (§12.5) authorizes the *bundle* (author in the allowed set). Every module the manifest declares is authorized by construction — the author signed its hash, and the hash matched the bytes. The manifest is the single authenticated statement, the policy the single authorization decision.
+**One authentication, one authorization.** The manifest signature authenticates and integrity-checks the *set* (verifyBundle); the content-hash check binds each module's bytes to the manifest's commitment; the admission predicate (§12.5) authorizes the *bundle* — one predicate, one answer, between verify and install. Every module the manifest declares is authorized by construction — the author signed its hash, and the hash matched the bytes. The manifest is the single authenticated statement, the predicate the single authorization decision.
 
 **Operator config wins.** The shell merges the operator's `--app-config` *over* the manifest's `config` before injection. The split is intentional: author-signed `config` carries content-structural constants (a storage app's k/m/blockSize), the operator's carries per-node policy (a quota). The merge is opaque — the shell never inspects a key — so the operator can even override a structural constant. That fits the trust model (the operator's host *is* the TCB, §14), but bundle authors should not assume their `config` reaches the guest unmodified.
 
@@ -203,7 +206,15 @@ The load is two halves, and they are separate functions because they hold genuin
 
 ### 12.5 The admission policy
 
-Admission (§12.4) asks exactly one question — *may this author's signed bundle land on this host?* — and one policy answers it. "Who may install" is settled here and nowhere else. The form is a file, `--policy <allowed-keys.json>` (`host/policy.ts`), parsed strictly — a malformed file fails the boot loudly rather than silently widening trust:
+Admission (§12.4) asks exactly one question — *may this author's signed bundle land on this host?* — and one policy answers it. The form is a single predicate `admit(v: VerifiedBundle) → bool | Promise<bool>`, called between `verifyBundle` and `installBundle`. Three constructors of it cover three deployment postures:
+
+- **authorAllowlist(authors)** — a closed set of hex Ed25519 pubkeys parsed from `--policy <allowed-keys.json>`. Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
+- An **interactive consent dialog** — the browser shell's posture: `verifyBundle` reveals the author and manifest to the user, and the predicate returns `true` only once the user says yes.
+- **admitAll** — "the bundle my operator handed me IS the trust decision." A StorageNode loads exactly the one bundle it was configured with; the choice of bundle already settled admission.
+
+All three are the SAME type — one seam, not three mechanisms layered on top of each other.
+
+The policy file (when present) is `--policy <allowed-keys.json>` (`host/policy.ts`), parsed strictly — a malformed file fails the boot loudly rather than silently widening trust:
 
 ```json
 {
@@ -213,11 +224,11 @@ Admission (§12.4) asks exactly one question — *may this author's signed bundl
 
 | Field | Required | Semantics |
 | --- | --- | --- |
-| `authors` | yes, non-empty | The closed set of keys that may sign a bundle manifest (§12.4 step 2). Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match before `installBundle` is called. |
+| `authors` | yes, non-empty | The closed set of keys that may sign a bundle manifest (§12.4 step 2). Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match before the predicate runs. |
 
 There is no per-module allowlist: the manifest IS the definitive list of authorized modules. An author who signs a manifest with five modules is authorizing all five. If an operator wants only some of an author's modules, the author publishes a separate bundle.
 
-**Omitting `--policy` is deny-all, not "no policy".** A node with no policy file runs an *empty author set*: it boots, serves, and refuses every manifest (§12.4 step 2). Trust is something an operator adds deliberately; the absence of a decision is never permission. One shared function (`policyFromJson`) resolves this, so every target — the Node shell and the native loader (§12.9) — boots the same posture, with no permissive default of its own.
+**Omitting `--policy` is deny-all, not "no policy".** A node with no configured predicate runs `denyAll`: it boots, serves, and refuses every manifest. Trust is something an operator adds deliberately; the absence of a decision is never permission. One shared constant (`denyAll`) resolves this, so every target — the Node shell and the native loader (§12.9) — boots the same posture, with no permissive default of its own.
 
 **Revocation is host-side.** A handler is a pure transform with no imports (§4.2), so nothing in the sandbox can reach the loader — there is no revoke-message. Undoing a bind is an operator action: `remove(name)` `SetHandler`s the slot empty, and the policy's closed author set prevents the same key from re-binding behind it. A deployment wanting *remote-triggered* revocation builds a trusted host-side path to `remove` (an operator console over an authenticated channel, a signed control bundle): the decision and the mutation both stay in host code, where the TCB is (§14).
 

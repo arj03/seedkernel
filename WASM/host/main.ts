@@ -17,7 +17,7 @@ import { resolve } from "node:path";
 
 import type { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
-import { policyFromJson, type ShellPolicy } from "./policy.js";
+import { policyFromJson, type AdmitPredicate } from "./policy.js";
 import {
   FreshnessMarks, loadBundle as loadBundleBlob,
   type BundleManifest, type FreshnessStore, type LoadedBundle,
@@ -72,7 +72,6 @@ export interface Shell {
   transport: Transport;
   fs: Fs;
   sodium: ShellSodium;
-  policy: ShellPolicy;
   readonly peers: Set<PeerId>;
   addPeer(peerId: PeerId): void;
   /** Load a signed bundle *file*: read it from disk then delegate to the shared
@@ -140,7 +139,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   // ── Assemble the shared shell ───────────────────────────────────────────────
   const core = createShell({
     platform: { sodium: sodium as unknown as ShellSodium, identity: opts.identity, fs, freshnessStore: freshness, network: net },
-    policy: policyFromJson(opts.policyJson),
+    admit: policyFromJson(opts.policyJson),
     peers: opts.peers,
     timeoutMs: opts.timeoutMs,
     config: opts.config,
@@ -153,7 +152,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     transport: core.transport,
     fs: core.fs!,
     sodium: core.sodium,
-    policy: core.policy,
     peers: core.peers,
     addPeer: core.addPeer,
     loadBundleBlob: core.loadBundleBlob,
@@ -171,10 +169,11 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
  *  install order. Reading the file is the whole platform seam: a bundle is one blob, so
  *  there is no directory walk and no filename to resolve. */
 export function loadBundle(
-  host: KernelHost, sodium: Sodium, policy: ShellPolicy, file: string,
+  host: KernelHost, sodium: Sodium, file: string,
   freshness?: FreshnessStore,
+  admit?: AdmitPredicate,
 ): LoadedBundle {
-  return loadBundleBlob(host, sodium, policy, new Uint8Array(readFileSync(file)), freshness);
+  return loadBundleBlob(host, sodium, new Uint8Array(readFileSync(file)), freshness, admit);
 }
 
 // Re-export the shared types so callers get everything from one import.

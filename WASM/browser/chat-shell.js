@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { createShell, openPolicy } from "../build/host/shell-core.js";
+import { createShell } from "../build/host/shell-core.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 import { signManifest, packBundle,
          genesisHash, kernelNameFor, appKeyFor, handlesOf,
@@ -1000,8 +1000,8 @@ const net = new RtcNetwork({
 
 // Assemble the shared shell now that the identity and the RtcNetwork exist. The
 // platform is a browser seam: sodium, our identity, an in-memory freshness store, and
-// the RtcNetwork as the Network backend — no fs (a chat app is handler-only). An open
-// policy defers admission to `admit` (user consent).
+// the RtcNetwork as the Network backend — no fs (a chat app is handler-only).
+// Admission is deferred to `admit` (user consent).
 shell = createShell({
   platform: {
     sodium,
@@ -1009,7 +1009,6 @@ shell = createShell({
     freshnessStore: new FreshnessMarks(),
     network: net,
   },
-  policy: openPolicy(),
   admit(v) {
     const bytesHashHex = v.modules.length > 0 ? v.modules[0].mod.hash : "";
     if (!pendingApprovals.has(bytesHashHex)) return false;

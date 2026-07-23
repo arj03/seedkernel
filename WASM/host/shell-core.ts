@@ -17,7 +17,7 @@
 // claim structurally true instead of true-by-convention.
 
 import { KernelHost } from "./kernel-host.js";
-import { policyFromJson, type ShellPolicy } from "./policy.js";
+import { denyAll, type AdmitPredicate } from "./policy.js";
 import {
   kernelNameFor, appKeyFor, handlesOf, verifyBundle, installBundle,
   type BundleCrypto, type FreshnessStore, type LoadedBundle, type VerifiedBundle,
@@ -53,18 +53,17 @@ export interface ShellPlatform {
 
 /** Interactive admission callback. Runs after verifyBundle proves authenticity
  *  and integrity, before installBundle lands the modules. Return `true` to admit,
- *  `false` or throw to reject. When omitted, policy-author membership alone gates
- *  the install. This is the browser's consent seam (§12.4): the shell verifies the
- *  bundle, shows the author + manifest to the user, and only installs once the user
+ *  `false` or throw to reject. When omitted, deny-all — nothing is admitted.
+ *  This is the browser's consent seam (§12.4): the shell verifies the bundle,
+ *  shows the author + manifest to the user, and only installs once the user
  *  says yes. */
 export type AdmitCallback = (v: VerifiedBundle) => boolean | Promise<boolean>;
 
 export interface CreateShellOptions {
-  /** Admission policy. Omitted ⇒ deny-all (empty author set), so the node boots
-   *  but accepts no installs. */
-  policy?: ShellPolicy;
   /** Interactive consent callback (§12.4 browser path). Runs between verify and
-   *  install. When absent, only the static policy gates the load. */
+   *  install. When absent, deny-all — nothing is admitted. A file-backed author
+   *  allowlist, a consent dialog, and "the bundle my operator handed me" are
+   *  three constructors of the same predicate type (§12.5). */
   admit?: AdmitCallback;
   peers?: PeerId[];
   timeoutMs?: number;
@@ -87,11 +86,11 @@ export interface KernelTable {
 }
 
 export type { LoadedBundle, FreshnessStore, VerifiedBundle };
-// Re-export the open-admission policy so a target that gates admission on consent
-// (the browser) or on which bundle it was handed (a StorageNode) can reach it from
-// the same module it gets createShell from.
-export { openPolicy } from "./policy.js";
-export type { ShellPolicy } from "./policy.js";
+// Re-export the admission predicate constructors so a target that gates admission
+// on consent (the browser) or on which bundle it was handed (a StorageNode) can
+// reach them from the same module it gets createShell from.
+export { denyAll, admitAll, authorAllowlist, policyFromJson } from "./policy.js";
+export type { AdmitPredicate } from "./policy.js";
 export { Bindings } from "./bindings.js";
 
 export interface Shell {
@@ -106,13 +105,12 @@ export interface Shell {
   /** Filesystem backend. Absent for handler-only shells. */
   fs?: Fs;
   sodium: ShellSodium;
-  policy: ShellPolicy;
   readonly peers: Set<PeerId>;
   addPeer(peerId: PeerId): void;
   removePeer(peerId: PeerId): void;
-  /** Load a signed bundle blob: verify the manifest, run admit (if set), govern
-   *  it against the policy, integrity-check + install the modules, and return the
-   *  guest source. This is the §12.4 load order — the ONE install path. */
+  /** Load a signed bundle blob: verify the manifest, run the admission predicate,
+   *  integrity-check + install the modules, and return the guest source. This is
+   *  the §12.4 load order — the ONE install path. */
   loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
   /** Run one of a loaded bundle's guest entrypoints through a generic
    *  cap-bridge over the kernel's primitives. Load a guest bundle first.
@@ -134,8 +132,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
   const host = new KernelHost();
   const bindings = new Bindings();
 
-  const policy = opts.policy ?? policyFromJson(undefined);
-  const admit = opts.admit;
+  const admit = opts.admit ?? denyAll;
 
   const peerId = toHex(platform.identity.publicKey);
   const transport = new Transport(peerId, platform.network, opts.timeoutMs ?? 2000);
@@ -204,17 +201,14 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     transport,
     fs: platform.fs,
     sodium,
-    policy,
     peers,
     addPeer(p) { if (p !== peerId) peers.add(p); },
     removePeer(p) { peers.delete(p); },
     async loadBundleBlob(blob) {
       const v = verifyBundle(sodium, blob);
-      if (admit) {
-        const ok = await admit(v);
-        if (!ok) throw new Error("bundle: rejected by admission callback");
-      }
-      loaded = installBundle(host, policy, v, platform.freshnessStore);
+      const ok = await admit(v);
+      if (!ok) throw new Error("bundle: rejected by admission predicate");
+      loaded = installBundle(host, v, platform.freshnessStore);
       const key = appKeyFor(loaded.author, loaded.manifest.app);
       bindings.autoBind(key, handlesOf(loaded.manifest));
       return loaded;
