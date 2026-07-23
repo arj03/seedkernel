@@ -52,7 +52,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.netB = makeNetwork(idB, undefined, undefined);
 		globalThis.tA = new Transport(aId, netA, 2000);
 		globalThis.tB = new Transport(bId, netB, 2000);
-		tA.onRequest((from, type, payload) => {
+		tA.onRequest((from, proto, type, payload) => {
 		  const out = new Uint8Array(payload.length + 1);
 		  out[0] = type; out.set(payload, 1);
 		  return out;
@@ -83,10 +83,13 @@ func TestAsyncNetInitiator(t *testing.T) {
 		}
 		register("ask", async (msg) => {
 		  const peer = fromHex(APP.peer);            // A's 32-byte public key
-		  const req = new Uint8Array(32 + 1 + msg.length); // [peer 32][type u8][payload]
+		  const proto = [0x74, 0x65, 0x73, 0x74];    // "test"
+		  const req = new Uint8Array(32 + 1 + proto.length + 1 + msg.length); // [peer 32][pidLen u8][proto][type u8][payload]
 		  req.set(peer, 0);
-		  req[32] = APP.type;
-		  req.set(msg, 33);
+		  req[32] = proto.length;
+		  req.set(proto, 33);
+		  req[33 + proto.length] = APP.type;
+		  req.set(msg, 33 + proto.length + 1);
 		  const r = await host.call(CAP_NET_SEND, req); // [ok u8][resp]
 		  if (r[0] !== 1) throw new Error("net send failed");
 		  return r.slice(1);

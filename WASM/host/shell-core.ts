@@ -19,11 +19,12 @@
 import { KernelHost } from "./kernel-host.js";
 import { policyFromJson, type ShellPolicy } from "./policy.js";
 import {
-  kernelNameFor, verifyBundle, installBundle,
+  kernelNameFor, appKeyFor, handlesOf, verifyBundle, installBundle,
   type BundleCrypto, type FreshnessStore, type LoadedBundle, type VerifiedBundle,
 } from "./bundle.js";
 import { Transport, type Network, type PeerId } from "./net.js";
 import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
+import { Bindings } from "./bindings.js";
 // safe-js is imported for its *types* only. The QuickJS engine it wraps is a heavy
 // wasm module with bare-specifier imports, so it is loaded lazily — a dynamic
 // `import()` the first time a guest actually runs (runGuest/serve). A handler-only
@@ -91,12 +92,15 @@ export type { LoadedBundle, FreshnessStore, VerifiedBundle };
 // the same module it gets createShell from.
 export { openPolicy } from "./policy.js";
 export type { ShellPolicy } from "./policy.js";
+export { Bindings } from "./bindings.js";
 
 export interface Shell {
   /** The handler table: callHandler to reach installed handlers, isBound to
    *  check occupancy, removeHandler to uninstall. installWasmHandler is NOT on
    *  this interface — code lands only via loadBundleBlob (§12.4). */
   host: KernelTable;
+  /** Protocol bindings (§12.10): which app handles which protocol. */
+  bindings: Bindings;
   net: Network;
   transport: Transport;
   /** Filesystem backend. Absent for handler-only shells. */
@@ -128,6 +132,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
   const { platform } = opts;
   const sodium = platform.sodium;
   const host = new KernelHost();
+  const bindings = new Bindings();
 
   const policy = opts.policy ?? policyFromJson(undefined);
   const admit = opts.admit;
@@ -193,6 +198,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
 
   return {
     host,
+    bindings,
     net: platform.network,
     transport,
     fs: platform.fs,
@@ -207,7 +213,10 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
         const ok = await admit(v);
         if (!ok) throw new Error("bundle: rejected by admission callback");
       }
-      return (loaded = installBundle(host, policy, v, platform.freshnessStore));
+      loaded = installBundle(host, policy, v, platform.freshnessStore);
+      const key = appKeyFor(loaded.author, loaded.manifest.app);
+      bindings.autoBind(key, handlesOf(loaded.manifest));
+      return loaded;
     },
     async runGuest(entry, payload) {
       const b = requireLoaded();
@@ -225,7 +234,11 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       if (served || !b || !hasGuest(b)) return;
       served = true;
       const hr = await ensureRealm(b);
-      transport.onRequest((_from, type, payload) => {
+      const appKey = appKeyFor(b.author, b.manifest.app);
+      transport.onRequest((_from, proto, type, payload) => {
+        // Only answer for protocols bound to our loaded app (§12.10).
+        const boundKey = bindings.boundApp(proto);
+        if (!boundKey || boundKey !== appKey) return null;
         const arg = new Uint8Array(1 + payload.length);
         arg[0] = type & 255;
         arg.set(payload, 1);

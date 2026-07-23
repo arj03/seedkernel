@@ -217,110 +217,21 @@ function updatePeerPill() {
 const installedApps = new Map();   // appKey → AppRecord
 let activeAppKey = null;
 
-// ── protocol bindings (§12.10) ─────────────────────────────────────────
-//
-// Which installed app receives a given protocol's messages. This is a user PREFERENCE,
-// not a permission: it cannot make unadmitted code run, cannot widen anyone's authority,
-// and is freely rewritable — the worst a wrong binding does is deliver to the wrong app
-// the user already chose to install. That is exactly why it lives here in the shell and
-// not in the loader's policy.
-//
-// A manifest's `handles` (defaulting to `[app]`) says what an app is WILLING to serve;
-// this table says what it actually does. Declaring is free and confers nothing, so any
-// number of apps may offer "chat" without contending for it.
-//
-// One app per protocol. A second handler would be a fan-out, and today it would be a
-// no-op: WASM handlers are pure transforms with zero authority (§4.2), so a would-be
-// logger bound alongside could only return bytes the shell discards. The component that
-// could genuinely act is a capability-holding guest, and binding one is an authority
-// grant needing its own approval — a different question from "which chat app do I want",
-// so it is deliberately not what this single-valued table expresses.
-const bindings = new Map();        // protocol id → appKey
+// Protocol bindings (§12.10) — these are now handled by the shared Bindings module
+// (shell-core.js re-exports Bindings from bindings.ts). The hand-rolled code that used
+// to live here is gone; every target shares one implementation of the three binding rules.
+// After the shell is assembled below, `shell.bindings` is the binding table.
 
-// Session-storage namespace for the app state below. VERSIONED because `apps.active` and
-// the `installedApps` keys hold app keys (§12.4) where they once held bare app ids: a tab
-// carrying the older shape would restore its bundles, fail to match its saved active app,
-// and sit on the empty-state placeholder as though nothing had installed. Bump this
-// whenever the shape of anything under it changes — sessionStorage is per-tab, so the
-// stale entries die with the tab and there is nothing to migrate.
 const STORE = "apps.v2";
 
-/** The app bound to `proto`, or null. */
-function boundApp(proto) {
-  const key = bindings.get(proto);
-  return key ? (installedApps.get(key) ?? null) : null;
-}
-
-/** Bind `proto` to `key`, replacing whatever held it. */
-function bindProtocol(proto, key) {
-  bindings.set(proto, key);
-  persistInstalledApps();
-  renderAppList();
-}
-
-/** Auto-bind on install, into VACANCIES only (§12.10): the first app to offer a protocol
- *  takes it — there is no decision to surface because there is no alternative — while an
- *  app offering an already-bound protocol lands installed-but-unbound, leaving the choice
- *  to the user. An update (same app key) keeps what it already held and any NEWLY declared
- *  protocol lands unbound, so a v2 cannot inherit traffic on the strength of v1's consent. */
-function autoBind(rec) {
-  for (const proto of rec.handles) {
-    if (!bindings.has(proto)) bindings.set(proto, rec.key);
-  }
-}
-
-/** Protocols currently pointing at this app. */
-function boundProtocols(key) {
-  const out = [];
-  for (const [proto, k] of bindings) if (k === key) out.push(proto);
-  return out;
-}
+const OFFER_PROTO = "_offer";
 
 // ── shell frame wire format ─────────────────────────────────────────────
 //
-// Without envelopes, the shell frames what it puts on a data channel itself. The
-// sender pubkey is NOT in the frame — the AKE channel already authenticates it and
-// hands it up as `_from`. Two kinds:
-//   CHAT   [0x01][protoLen u8][protocol id utf8][chatType u8][body]
-//   OFFER  [0x02][bundle bytes]
-//
-// The CHAT frame names a PROTOCOL, never an app, an author or a kernel name — those are
-// node-local (§5.1), and a wire that named them would make one peer's install choices
-// everyone else's business.
-const FRAME_CHAT = 0x01;
-const FRAME_OFFER = 0x02;
-
-function encodeChatFrame(proto, chatBytes) {
-  const idBytes = new TextEncoder().encode(proto);
-  const out = new Uint8Array(2 + idBytes.length + chatBytes.length);
-  out[0] = FRAME_CHAT;
-  out[1] = idBytes.length;
-  out.set(idBytes, 2);
-  out.set(chatBytes, 2 + idBytes.length);
-  return out;
-}
-
-function encodeOfferFrame(bundleBytes) {
-  const out = new Uint8Array(1 + bundleBytes.length);
-  out[0] = FRAME_OFFER;
-  out.set(bundleBytes, 1);
-  return out;
-}
-
-// Run an app's transform for one message and, if it's the active app, render it.
-// `senderPk` is the authenticated peer (or our own key for a local echo);
-// `chatBytes` is [chatType u8][body]. The transform's input is senderPk ‖ chatBytes.
-function deliverChat(proto, senderPk, chatBytes) {
-  // Resolve the wire's protocol id through OUR bindings (§12.10). An unbound protocol
-  // drops — the sender got no say in which app runs, or whose code that is.
-  const rec = boundApp(proto);
-  if (!rec) return;
-  const input = new Uint8Array(senderPk.length + chatBytes.length);
-  input.set(senderPk, 0);
-  input.set(chatBytes, senderPk.length);
-  const render = shell.host.callHandler(rec.handlerName, input);
-  if (render && rec.key === activeAppKey) deliverRender(new Uint8Array(render));
-}
+// Messages now ride the Transport request plane: a chat message is a req with a
+// protocol id in the frame, and the receiving shell resolves the protocol through
+// bindings to the bound app's handler. The custom FRAME_CHAT / FRAME_OFFER framing
+// that used to live here is gone — one plane, one dispatch scheme (§12.10).
 
 // ── iframe bridge ──────────────────────────────────────────────────────
 //
@@ -473,7 +384,7 @@ async function applyAppBundle(bundleBytes) {
     uiHtml,
   };
   installedApps.set(key, record);
-  autoBind(record);
+  shell.bindings.autoBind(key, handles);
   persistInstalledApps();
   renderAppList();
   return record;
@@ -552,7 +463,7 @@ function persistInstalledApps() {
     // Bindings are ordinary user preference (§12.10) — they persist beside the apps and
     // carry no security property, so a hand-edited store can misroute a message and
     // nothing more.
-    sessionStorage.setItem(STORE + ".bindings", JSON.stringify(Array.from(bindings)));
+    sessionStorage.setItem(STORE + ".bindings", JSON.stringify(shell.bindings.entries()));
     if (activeAppKey) sessionStorage.setItem(STORE + ".active", activeAppKey);
     else sessionStorage.removeItem(STORE + ".active");
   } catch {}
@@ -569,7 +480,7 @@ async function restoreInstalledApps() {
     if (Array.isArray(saved)) {
       for (const pair of saved) {
         if (Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") {
-          bindings.set(pair[0], pair[1]);
+          shell.bindings.bind(pair[0], pair[1]);
         }
       }
     }
@@ -586,8 +497,8 @@ async function restoreInstalledApps() {
       shellPrint(`Could not restore an app: ${err.message}`, "err");
     }
   }
-  for (const [proto, key] of bindings) if (!installedApps.has(key)) bindings.delete(proto);
-  for (const rec of installedApps.values()) autoBind(rec);
+  for (const [proto, key] of shell.bindings.entries()) if (!installedApps.has(key)) shell.bindings.unbind(proto);
+  for (const rec of installedApps.values()) shell.bindings.autoBind(rec.key, rec.handles);
   const saved = sessionStorage.getItem(STORE + ".active");
   if (saved && installedApps.has(saved)) setActiveApp(saved);
 }
@@ -700,12 +611,32 @@ function dismissOffer(bytesHashHex) {
   renderOfferList();
 }
 
+function broadcastToPeers(proto, payload) {
+  const protoBytes = new TextEncoder().encode(proto);
+  for (const peerId of net.linkedPeers()) {
+    shell.transport.send(peerId, protoBytes, 0, payload);
+  }
+}
+
+function deliverChat(rec, senderPk, payload) {
+  const input = new Uint8Array(senderPk.length + payload.length);
+  input.set(senderPk, 0);
+  input.set(payload, senderPk.length);
+  const render = shell.host.callHandler(rec.handlerName, input);
+  if (render && rec.key === activeAppKey) deliverRender(new Uint8Array(render));
+  return render;
+}
+
 // Broadcast the stored bundle for `id` to every open peer. Anyone who receives
 // this can forward it to others — that's transitivity for free.
 function offerApp(key) {
   const rec = installedApps.get(key);
   if (!rec) return;
-  const n = broadcastFrame(encodeOfferFrame(rec.bundleBytes));
+  const linked = net.linkedPeers();
+  for (const peerId of linked) {
+    shell.transport.send(peerId, new TextEncoder().encode(OFFER_PROTO), 0, rec.bundleBytes);
+  }
+  const n = linked.length;
   shellPrint(
     n > 0
       ? `Offered ${rec.name} ${rec.version} to ${n} peer${n === 1 ? "" : "s"}.`
@@ -770,22 +701,22 @@ function buildAppRow(rec) {
   const protos = document.createElement("div");
   protos.className = "app-row-meta";
   for (const proto of rec.handles) {
-    const holder = bindings.get(proto);
-    const mine = holder === rec.key;
+    const boundKey = shell.bindings.boundApp(proto);
+    const mine = boundKey === rec.key;
     const label = document.createElement("label");
     label.className = "app-row-proto";
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = mine;
     cb.addEventListener("change", () => {
-      if (cb.checked) bindProtocol(proto, rec.key);
-      else { bindings.delete(proto); persistInstalledApps(); renderAppList(); }
+      if (cb.checked) { shell.bindings.bind(proto, rec.key); persistInstalledApps(); renderAppList(); }
+      else { shell.bindings.unbind(proto); persistInstalledApps(); renderAppList(); }
     });
     label.appendChild(cb);
     const txt = document.createElement("span");
     // Name the app currently holding a contested protocol, so "why am I not getting
     // messages" has a visible answer rather than being silent.
-    const other = holder && !mine ? installedApps.get(holder) : null;
+    const other = boundKey && !mine ? installedApps.get(boundKey) : null;
     txt.textContent = ` handles “${proto}”` +
       (mine ? "" : other ? ` — bound to ${other.name}` : " — unbound");
     label.appendChild(txt);
@@ -848,9 +779,8 @@ function removeApp(key) {
   // record, so the same name is free to re-admit later with no stale attribution.
   shell.host.removeHandler(rec.handlerName);
   installedApps.delete(key);
-  // Drop every protocol this app held (§12.10). Removing an app unbinds it; it does not
-  // hand its protocols to anyone else, so the user chooses again from what remains.
-  for (const proto of boundProtocols(key)) bindings.delete(proto);
+  // Drop every protocol this app held (§12.10).
+  shell.bindings.removeApp(key);
   if (activeAppKey === key) unmountActiveApp();
   persistInstalledApps();
   renderAppList();
@@ -979,14 +909,16 @@ window.addEventListener("message", (ev) => {
     // Send under a protocol the active app is actually BOUND to, so our own echo
     // (and a peer that binds the same protocol to a different implementation) routes
     // to the right place. An app the user has unbound sends nothing.
-    const proto = boundProtocols(active.key)[0];
+    const proto = shell.bindings.boundProtocols(active.key)[0];
     if (!proto) return;
     const body = msg.body instanceof Uint8Array ? msg.body : new Uint8Array(msg.body);
     const chatBytes = new Uint8Array(1 + body.length);   // [chatType][body]
     chatBytes[0] = msg.chatType & 0xff;
     chatBytes.set(body, 1);
-    broadcastFrame(encodeChatFrame(proto, chatBytes));
-    deliverChat(proto, myKeys.publicKey, chatBytes);   // local echo
+    // Fire-and-forget to every linked peer over Transport — one plane.
+    broadcastToPeers(proto, chatBytes);
+    // Local echo: run the handler directly, render if active.
+    deliverChat(active, myKeys.publicKey, chatBytes);
     if (msg.chatType === 0x02) {
       // Sticky "presence" replay: nick announcements are cached and
       // re-broadcast on every newly-opened dc so peers joining mid-session
@@ -1003,12 +935,11 @@ window.addEventListener("message", (ev) => {
 //
 // The WebRTC mesh — perfect negotiation, the relay rendezvous, per-peer
 // identity, the unauthed-peer cap, ICE-restart recovery — all lives in
-// RtcNetwork now. This shell only wires it up: it routes inbound shell frames
-// (CHAT / OFFER), broadcasts outbound frames to the linked peers, and mirrors
-// link up/down into the UI. Channel identity is PeerLink's in-channel HELLO/AUTH
-// (host/net-link.ts), so any frame handed to our sink is already attributed to an
-// authenticated peer — `_from` is that peer's pubkey, which we treat as the
-// message author. No per-message signature.
+// RtcNetwork now. This shell wires it up and sets Transport.onRequest for
+// protocol-based dispatch (§12.10) — one plane, one dispatch scheme. Channel
+// identity is PeerLink's in-channel HELLO/AUTH (host/net-link.ts), so any frame
+// handed to our sink is already attributed to an authenticated peer — `_from` is
+// that peer's pubkey, which we treat as the message author. No per-message signature.
 // ---------------------------------------------------------------------------
 
 let lastSentNickBody = null;   // {proto, body} — replayed to peers that join mid-session
@@ -1041,12 +972,12 @@ const net = new RtcNetwork({
     updatePeerPill();
     // Replay our last nick so a peer joining mid-session learns our identity
     // without us re-sending it (chat v2 uses chatType 0x02 for nick).
-    if (lastSentNickBody && bindings.has(lastSentNickBody.proto)) {
+    if (lastSentNickBody && shell.bindings.boundApp(lastSentNickBody.proto)) {
       const body = lastSentNickBody.body;
       const chatBytes = new Uint8Array(1 + body.length);
       chatBytes[0] = 0x02;
       chatBytes.set(body, 1);
-      endpoint.send(peerId, encodeChatFrame(lastSentNickBody.proto, chatBytes));
+      shell.transport.send(peerId, new TextEncoder().encode(lastSentNickBody.proto), 0, chatBytes);
     }
   },
   onPeerDown: (peerId) => {
@@ -1071,10 +1002,6 @@ const net = new RtcNetwork({
 // platform is a browser seam: sodium, our identity, an in-memory freshness store, and
 // the RtcNetwork as the Network backend — no fs (a chat app is handler-only). An open
 // policy defers admission to `admit` (user consent).
-//
-// This MUST run before endpoint.onFrame below. createShell builds a Transport that
-// registers a frame sink on this same RtcNetwork; the RtcNetwork keeps a single sink
-// (last write wins), and we want the chat sink set just below to be the survivor.
 shell = createShell({
   platform: {
     sodium,
@@ -1091,36 +1018,26 @@ shell = createShell({
   },
 });
 
-// Our attachment to the fabric — RtcNetwork is bound to our one key, so it vends
-// exactly this endpoint. Each inbound frame is a shell frame (CHAT / OFFER); the
-// sender `from` is the authenticated peer's pubkey hex.
-const endpoint = net.endpoint(myPkHex);
-endpoint.onFrame((from, frame) => {
-  const bytes = frame instanceof Uint8Array ? frame : new Uint8Array(frame);
-  if (bytes.length < 1) return;
-  const kind = bytes[0];
-  if (kind === FRAME_CHAT) {
-    if (bytes.length < 2) return;
-    const idLen = bytes[1];
-    if (bytes.length < 2 + idLen) return;
-    const proto = new TextDecoder().decode(bytes.subarray(2, 2 + idLen));
-    const chatBytes = bytes.subarray(2 + idLen);   // [chatType][body]
-    deliverChat(proto, hexToBytes(from), chatBytes);
-  } else if (kind === FRAME_OFFER) {
-    handleOffer(bytes.slice(1), from).catch(() => {});
+// One plane, one dispatch scheme: Transport.onRequest answers all inbound messages.
+// An inbound frame names a protocol id (§12.10); the handler resolves it through
+// bindings to the installed app. The custom FRAME_CHAT / FRAME_OFFER framing that
+// used to live here is gone.
+shell.transport.onRequest((from, proto, _type, payload) => {
+  // Bundle offers ride the same Transport, with a well-known protocol id.
+  if (proto === OFFER_PROTO) {
+    handleOffer(payload, from).catch(() => {});
+    return null;
   }
+  const appKey = shell.bindings.boundApp(proto);
+  if (!appKey) return null;
+  const rec = installedApps.get(appKey);
+  if (!rec) return null;
+  const senderBytes = hexToBytes(from);
+  const render = deliverChat(rec, senderBytes, payload);
+  return render;
 });
 
-// Broadcast a shell frame to every authenticated peer. Returns the peer count so
-// callers can report "offered to N peers". endpoint.send() drops to any peer we
-// hold no authenticated link to, so iterating linkedPeers() is exact.
-function broadcastFrame(frameBytes) {
-  const linked = net.linkedPeers();
-  for (const peerId of linked) endpoint.send(peerId, frameBytes);
-  return linked.length;
-}
-
-// Boot the app registry now that the shell and the endpoint are wired: render the
+// Boot the app registry now that the shell and the transport are wired: render the
 // (empty) lists, then pull back anything installed earlier this session so a
 // transitive Offer works the moment peers connect, from the saved signed bytes.
 renderAppList();

@@ -82,9 +82,9 @@ func TestServe(t *testing.T) {
 		const store = new Uint8Array(4 + key.length + val.length);
 		new DataView(store.buffer).setUint32(0, key.length);
 		store.set(key, 4); store.set(val, 4 + key.length);
-		const ok = await tB.request(aId, 1, store);
+		const ok = await tB.request(aId, new TextEncoder().encode("_test"), 1, store);
 		if (ok[0] !== 1) throw new Error("store not acked");
-		const got = await tB.request(aId, 2, key);
+		const got = await tB.request(aId, new TextEncoder().encode("_test"), 2, key);
 		if (got[0] !== 1) throw new Error("fetch miss");
 		return got.slice(1);
 	})()`, 8*time.Second)

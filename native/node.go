@@ -143,9 +143,13 @@ func wireServe(hostQc *qjs.Context, g *guestRealm) {
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
 	// net.ts dispatchRequest does frame.set(resp, …), so the handler must return a
-	// Uint8Array — wrap the ArrayBuffer __serveHandle hands back.
+	// Uint8Array — wrap the ArrayBuffer __serveHandle hands back. The second argument
+	// (proto) is the protocol id from the req frame (§12.10); the Go native target
+	// hosts a single app, so it ignores the proto and routes every request to the one
+	// guest — a serving node that later hosts several apps would look it up in the
+	// binding table first.
 	if _, err := hostQc.Eval("wire-serve.js", qjs.Code(
-		`__transport.onRequest((from, type, payload) => new Uint8Array(__serveHandle(type, payload)));`,
+		`__transport.onRequest((from, proto, type, payload) => new Uint8Array(__serveHandle(type, payload)));`,
 	)); err != nil {
 		panic(fmt.Sprintf("wireServe: %v", err))
 	}

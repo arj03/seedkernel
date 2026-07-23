@@ -9,7 +9,7 @@
 //                net-node.ts) is a single-identity fabric satisfying the same shape.
 //   - Endpoint:  one node's attachment to the fabric — send(to, frame) with the
 //                sender implicit, plus an onFrame sink.
-//   - Transport: per-node request/response keyed by correlation id — a single
+//   - Transport: per-node request/response keyed by correlation id — the single
 //                frame plane (§12.6). Block bytes ride it too: a STORE pushes
 //                bytes in a `req` body and a FETCH returns them in a `res` body,
 //                so the §12.6 record layer authenticates and encrypts them along
@@ -17,9 +17,13 @@
 //                unauthenticated bulk path.
 //
 // Frames on the wire (carried inside the §12.6 AEAD record layer):
-//   req = [0 kind][corr u32 BE][type u8][payload ...]
+//   req = [0 kind][corr u32 BE][pidLen u8][protocolId utf8][type u8][payload ...]
 //   res = [1 kind][corr u32 BE][payload ...]   (no type — the requester matches
 //         the response to its request by corr; the type it sent is what it wanted)
+//
+// The protocol id names an app-level protocol (e.g. "chat-v1") — it answers
+// "which app gets this frame" on a node that hosts several (§12.10). A few
+// ASCII bytes per request is nothing against 16 MiB frames.
 
 import { writeU32BE, readU32BE } from "./util.js";
 
@@ -27,6 +31,10 @@ export type PeerId = string; // hex of the peer's kernel public key
 
 const KIND_REQ = 0;
 const KIND_RES = 1;
+const FLAG_NO_REPLY = 0x80;
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
 
 // Absolute backstop, as a multiple of timeoutMs (see Transport.request). The silence
 // clock re-arms on any frame from the peer, so on its own it never bounds a request
@@ -96,7 +104,7 @@ export class LoopbackNetwork implements Network {
   }
 }
 
-export type RequestHandler = (from: PeerId, type: number, payload: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
+export type RequestHandler = (from: PeerId, proto: string, type: number, payload: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
 
 interface Pending {
   /** The peer the request went to — a response only resolves if it arrives from
@@ -158,13 +166,24 @@ export class Transport {
    *  second, absolute backstop rejects after maxStallWindows silence windows since
    *  issue no matter how live the peer looks — finite, but generous enough never to
    *  fire on a legit request whose tail is still draining. */
-  request(to: PeerId, type: number, payload: Uint8Array): Promise<Uint8Array> {
-    const corr = this.corr++;
-    const frame = new Uint8Array(1 + 4 + 1 + payload.length);
-    frame[0] = KIND_REQ;
+  /** Build a req frame: [kind=KIND_REQ][corr u32 BE][pidLen u8][proto utf8][type u8][payload].
+   *  `flags` (e.g. FLAG_NO_REPLY) is OR'd into the kind byte so the receiver can
+   *  skip the response frame for fire-and-forget sends. */
+  private buildReq(corr: number, proto: Uint8Array, type: number, payload: Uint8Array, flags = 0): Uint8Array {
+    if (proto.length > 255) throw new Error(`net: protocol id too long (>255 bytes): ${dec.decode(proto).slice(0, 32)}...`);
+    const frame = new Uint8Array(1 + 4 + 1 + proto.length + 1 + payload.length);
+    frame[0] = KIND_REQ | flags;
     writeU32BE(frame, 1, corr);
-    frame[5] = type & 255;
-    frame.set(payload, 6);
+    frame[5] = proto.length;
+    frame.set(proto, 6);
+    frame[6 + proto.length] = type & 255;
+    frame.set(payload, 6 + proto.length + 1);
+    return frame;
+  }
+
+  request(to: PeerId, proto: Uint8Array, type: number, payload: Uint8Array): Promise<Uint8Array> {
+    const corr = this.corr++;
+    const frame = this.buildReq(corr, proto, type, payload);
     return new Promise<Uint8Array>((resolve, reject) => {
       const issuedAt = Date.now();
       // Absolute deadline the per-frame re-arm cannot push out (see maxStallWindows).
@@ -188,12 +207,22 @@ export class Transport {
         }
         this.pending.delete(corr);
         const why = remaining > 0 ? "backstop" : "timeout"; // live-but-withholding vs. silent
-        reject(new Error(`net.send: ${why} to ${to.slice(0, 8)} (type ${type})`));
+        reject(new Error(`net.send: ${why} to ${to.slice(0, 8)} (proto ${dec.decode(proto)} type ${type})`));
       };
       const timer = setTimeout(check, this.timeoutMs);
       this.pending.set(corr, { to, resolve, reject, timer, issuedAt });
       this.endpoint.send(to, frame);
     });
+  }
+
+  /** Fire-and-forget: send a request with the NO_REPLY flag so the receiver
+   *  still runs its handler (deliverRender, local state) but skips the response
+   *  frame that would otherwise ship the render bytes back across the wire. No
+   *  Promise to await, no timeout — the message just goes out. */
+  send(to: PeerId, proto: Uint8Array, type: number, payload: Uint8Array): void {
+    const corr = this.corr++;
+    const frame = this.buildReq(corr, proto, type, payload, FLAG_NO_REPLY);
+    this.endpoint.send(to, frame);
   }
 
   close(): void {
@@ -211,8 +240,9 @@ export class Transport {
     // lazily off this stamp when it fires.
     this.lastFrameAt.set(from, Date.now());
     const kind = frame[0];
+    const noReply = !!(kind & FLAG_NO_REPLY);
     const corr = readU32BE(frame, 1);
-    if (kind === KIND_RES) {
+    if ((kind & 1) === KIND_RES) {
       const p = this.pending.get(corr);
       if (!p) return;
       // Bind the response to the request's target: a frame from anyone else is
@@ -223,24 +253,27 @@ export class Transport {
       p.resolve(frame.slice(5)); // res = [1][corr u32][payload] — no type byte
       return;
     }
-    // KIND_REQ — dispatch to the node's handler and reply with the same corr.
-    if (kind === KIND_REQ) {
-      const type = frame[5];
-      const payload = frame.slice(6);
-      void this.dispatchRequest(from, corr, type, payload);
+    if ((kind & 1) === KIND_REQ && frame.length >= 6) {
+      const idLen = frame[5];
+      if (frame.length < 6 + idLen + 1) return;
+      const proto = dec.decode(frame.subarray(6, 6 + idLen));
+      const type = frame[6 + idLen];
+      const payload = frame.slice(6 + idLen + 1);
+      void this.dispatchRequest(from, corr, proto, type, payload, noReply);
     }
   }
 
-  private async dispatchRequest(from: PeerId, corr: number, type: number, payload: Uint8Array): Promise<void> {
+  private async dispatchRequest(from: PeerId, corr: number, proto: string, type: number, payload: Uint8Array, noReply: boolean): Promise<void> {
     let resp: Uint8Array | null = null;
     if (this.reqHandler) {
       try {
-        const r = this.reqHandler(from, type, payload);
+        const r = this.reqHandler(from, proto, type, payload);
         resp = r instanceof Promise ? await r : r;
       } catch {
         resp = null;
       }
     }
+    if (noReply) return;
     const body = resp ?? new Uint8Array(0);
     // res carries no type byte: the requester matches by corr and already knows the
     // type it asked for. (req still carries it — that's how the responder dispatches.)
