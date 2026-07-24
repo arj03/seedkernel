@@ -27,8 +27,6 @@
 
 import { concatBytes, toHex } from "./util.js";
 import { DOMAIN_MANIFEST, SUITE_MANIFEST_GENESIS } from "./domains.js";
-import type { AdmitPredicate } from "./policy.js";
-import { denyAll } from "./policy.js";
 
 /** The manifest envelope's name inside the container. */
 export const MANIFEST_FILE = "manifest.bundle";
@@ -471,9 +469,9 @@ export interface BundleHost {
 // Splitting them is what lets a shell INSPECT a bundle before consenting to it — the
 // browser shows an app's author and metadata and waits for the user (§12.4) — without
 // hand-rolling a second copy of the verification order, which is exactly the drift the
-// shared loader exists to prevent. `loadBundle` is the two composed, and is what a
-// non-interactive target calls.
-
+// shared loader exists to prevent. The only composition of the two is the shell's
+// `loadBundleBlob` (shell-core.ts), so "one install path" is true of the public API
+// as well as the implementation.
 export interface VerifiedBundle {
   /** The manifest author's public key (the signature verified under it). */
   author: Uint8Array;
@@ -484,13 +482,10 @@ export interface VerifiedBundle {
   guestSource: string;
 }
 
-export interface LoadedBundle {
-  manifest: BundleManifest;
-  author: Uint8Array;
-  /** The verified guest source, or `""` for a handler-only bundle that declared no
-   *  guest — the shell runs a realm only when this is non-empty. */
-  guestSource: string;
-}
+/** What the shell returns from `loadBundleBlob`: everything the manifest proved,
+ *  minus the raw module bytes already bound into the handler table. The guest source
+ *  is `""` for a handler-only bundle that declared none. */
+export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
 /** Authenticate and integrity-check a bundle blob (README §12.4 steps 1, 4a, 5a).
  *  Verifies the manifest signature, then hashes every module and the guest against
@@ -599,30 +594,4 @@ export function installBundle(
   // called, so the freshness advance is always behind a successful verify.
   if (freshness) freshness.set(v.author, v.manifest.app, version);
   return { manifest: v.manifest, author: v.author, guestSource: v.guestSource };
-}
-
-/** Load a signed bundle blob: `verifyBundle`, then `admit`, then `installBundle`.
- *  This is the whole §12.4 load order in one call — the checks and their sequence
- *  are the protocol, so no target restates them (README §12.9).
- *
- *  The `admit` predicate gates admission between verify and install (§12.5).
- *  It must be synchronous (return `boolean`, not `Promise<boolean>`) — the
- *  combined verify→admit→install path is a sync call used by the native loader's
- *  Go bridge. Targets that need async admission (e.g. a consent dialog) use the
- *  shell's `loadBundleBlob` which awaits the predicate itself. Omitted ⇒ deny-all
- *  (nothing admitted). */
-export function loadBundle(
-  host: BundleHost,
-  sodium: BundleCrypto,
-  blob: Uint8Array,
-  freshness: FreshnessStore | undefined,
-  admit: AdmitPredicate = denyAll,
-): LoadedBundle {
-  const v = verifyBundle(sodium, blob);
-  const ok = admit(v);
-  if (ok instanceof Promise) {
-    throw new Error("bundle: async admit predicate not supported in sync loadBundle — use the shell's loadBundleBlob");
-  }
-  if (!ok) throw new Error("bundle: rejected by admission predicate");
-  return installBundle(host, v, freshness);
 }

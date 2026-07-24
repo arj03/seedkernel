@@ -36,11 +36,19 @@ const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.j
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
-         signManifest, verifyBundle, loadBundle, packBundle, moduleFile, MANIFEST_FILE }
+         signManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
+ *  policy + integrity tests that own their own KernelHost without a shell. */
+function loadBundle(host, blob, admit) {
+  const v = verifyBundle(sodium, blob);
+  if (!admit(v)) throw new Error("admit rejected");
+  return installBundle(host, v);
+}
 
 // The empty payload — a handler whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
@@ -137,9 +145,7 @@ async function testInstallRejectsUntrustedAuthor() {
   const stranger = generateKeyPair();
   const admit = authorAllowlist([toHex(stranger.publicKey)]);
   let threw = false;
-  try {
-    loadBundle(host, sodium, blob, undefined, admit);
-  } catch { threw = true; }
+  try { loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "installBundle throws when the author is not in the policy");
 
   console.log("  OK\n");
@@ -188,8 +194,8 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
 
   let threw = false;
-  try { loadBundle(host, sodium, blob, undefined, admit); } catch { threw = true; }
-  assert(threw, "loadBundle with deny-all admit predicate throws");
+  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  assert(threw, "a deny-all admit predicate prevents install");
 
   console.log("  OK\n");
 }
@@ -220,9 +226,7 @@ async function testBundleRefusesNonHandler() {
 
   const admit = authorAllowlist([toHex(author.publicKey)]);
   let threw = false;
-  try {
-    loadBundle(host, sodium, blob, undefined, admit);
-  } catch { threw = true; }
+  try { loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
   assert(!host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is NOT bound (the load failed atomically)");
@@ -650,7 +654,7 @@ async function testPolicy() {
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { loadBundle(host, sodium, blob, undefined, admit); landed = true; } catch { /* author not in policy */ }
+    try { loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
