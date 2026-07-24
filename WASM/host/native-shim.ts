@@ -58,8 +58,7 @@ const host: BundleHost = {
 /** The freshness store over the Go atomic-write seam (README §12.4). */
 class NativeFreshnessStore extends FreshnessMarks {
   constructor() {
-    super();
-    this.load(bridge.readFreshness());
+    super(bridge.readFreshness());
   }
   protected override persist(json: string): void { bridge.writeFreshness(json); }
 }

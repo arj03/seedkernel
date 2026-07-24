@@ -79,7 +79,8 @@ const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.w
 // Install a verified module directly under `targetName`. Bundles are the only way code
 // arrives (§12.4); there is no wire install envelope. Throws on structural failure.
 function installMod(host, targetName, wasm) {
-  host.installWasmHandler(targetName, wasm);
+  const ref = host.instantiateWasm(wasm);
+  host.bindHandler(targetName, ref);
 }
 
 // The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real

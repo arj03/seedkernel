@@ -15,15 +15,11 @@
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-import type { KernelHost } from "./kernel-host.js";
 import { loadSodium } from "./node.js";
-import { policyFromJson, type AdmitPredicate } from "./policy.js";
-import {
-  FreshnessMarks, loadBundle as loadBundleBlob,
-  type BundleManifest, type FreshnessStore, type LoadedBundle,
-} from "./bundle.js";
+import { policyFromJson } from "./policy.js";
+import { FreshnessMarks, type FreshnessStore, type LoadedBundle } from "./bundle.js";
 import { NodeNetwork, parsePeerSpec } from "./net-node.js";
-import { type Network, type PeerId, type Transport } from "./net.js";
+import { type Network, type PeerId } from "./net.js";
 import { NodeFs } from "./fs-node.js";
 import type { Fs } from "./fs.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
@@ -80,11 +76,10 @@ export interface Shell extends CoreShell {
  *  this adds only the Node persistence seam. */
 export class FileFreshnessStore extends FreshnessMarks {
   constructor(private readonly path: string) {
-    super();
     let json: string | null = null;
     try { json = readFileSync(path, "utf8"); }
     catch { /* absent/unreadable ⇒ start empty (−∞ for every key) */ }
-    this.load(json);
+    super(json);
   }
   protected override persist(json: string): void {
     // Persist atomically: write a sibling temp then rename onto the path (atomic within
@@ -146,18 +141,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     serve: core.serve,
     close() { core.close(); if (ownsNet) (net as NodeNetwork).close(); },
   };
-}
-
-/** Load a signed bundle *file* onto a host — the Node binding of the shared loader
- *  (bundle.ts `loadBundle`), which owns the verify → govern → freshness → integrity →
- *  install order. Reading the file is the whole platform seam: a bundle is one blob, so
- *  there is no directory walk and no filename to resolve. */
-export function loadBundle(
-  host: KernelHost, sodium: Sodium, file: string,
-  freshness?: FreshnessStore,
-  admit?: AdmitPredicate,
-): LoadedBundle {
-  return loadBundleBlob(host, sodium, new Uint8Array(readFileSync(file)), freshness, admit);
 }
 
 // Re-export the shared types so callers get everything from one import.

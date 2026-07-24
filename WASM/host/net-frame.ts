@@ -13,7 +13,8 @@
 // handshake finishes — so frames queue until the channel opens.
 
 import { encodeFrame, wsAcceptKey, wsClientKey, WsParser, WS_OPCODES } from "./ws/ws-codec.js";
-import { type RawChannel, type TransportCrypto } from "./net-link.js";
+import type { TransportCrypto } from "./net-link.js";
+import { BufferedChannel } from "./net-channel.js";
 
 const MAX_WS_HANDSHAKE = 16 * 1024; // an HTTP upgrade request is tiny
 
@@ -30,16 +31,12 @@ export interface RawByteStream {
 
 const utf8 = new TextEncoder();
 
-abstract class WsChannelBase implements RawChannel {
-  private onMsg: ((bytes: Uint8Array) => void) | null = null;
-  private onCls: (() => void) | null = null;
+abstract class WsChannelBase extends BufferedChannel {
   private readonly parser: WsParser;
-  private opened = false;
-  private dead = false;
   private handshake = new Uint8Array(0);
-  private readonly pending: Uint8Array[] = [];
 
   constructor(protected readonly stream: RawByteStream, expectMasked: boolean) {
+    super();
     this.parser = new WsParser(expectMasked);
     stream.onData((chunk) => this.onData(chunk));
     stream.onClose(() => this.fail());
@@ -54,20 +51,11 @@ abstract class WsChannelBase implements RawChannel {
    *  or -1 to wait for more bytes; throws to fail the channel. */
   protected abstract tryHandshake(buf: Uint8Array): number;
 
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
-    if (!this.opened) { this.pending.push(bytes); return; }
+  protected write(bytes: Uint8Array): void {
     this.stream.write(encodeFrame(WS_OPCODES.OP_BINARY, bytes, this.mask()));
   }
-  onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
-  onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; this.stream.close(); } }
 
-  // Failure teardown: close the stream AND notify onClose. close() (the
-  // deliberate path) sets `dead` first, so a fail() that follows it stays silent
-  // — but an error on a live channel must always reach onClose, or the owning
-  // PeerLink is never forgotten from the routing maps and the peer is blackholed.
-  private fail(): void { if (this.dead) return; this.dead = true; this.stream.close(); this.onCls?.(); }
+  protected stop(): void { this.stream.close(); }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -78,11 +66,9 @@ abstract class WsChannelBase implements RawChannel {
       let consumed: number;
       try { consumed = this.tryHandshake(this.handshake); }
       catch { this.fail(); return; }
-      // wait for the rest of the head, but never hoard unbounded bytes
       if (consumed < 0) { if (this.handshake.length > MAX_WS_HANDSHAKE) this.fail(); return; }
-      this.opened = true;
-      for (const b of this.pending) this.stream.write(encodeFrame(WS_OPCODES.OP_BINARY, b, this.mask()));
-      this.pending.length = 0;
+      // Handshake complete: open the channel (drains buffered frames through write()).
+      this.open();
       const rest = this.handshake.subarray(consumed);
       this.handshake = new Uint8Array(0);
       if (rest.length) this.feedFrames(rest);
@@ -96,7 +82,7 @@ abstract class WsChannelBase implements RawChannel {
     try { frames = this.parser.push(chunk); }
     catch { this.fail(); return; }
     for (const f of frames) {
-      if (f.opcode === WS_OPCODES.OP_BINARY) this.onMsg?.(f.payload);
+      if (f.opcode === WS_OPCODES.OP_BINARY) this.deliver(f.payload);
       else if (f.opcode === WS_OPCODES.OP_PING) this.stream.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, this.mask()));
       else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
     }

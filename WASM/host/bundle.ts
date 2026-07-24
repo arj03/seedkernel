@@ -383,12 +383,13 @@ export class FreshnessMarks implements FreshnessStore {
   /** Seed from a persisted `{ "authorHex:app": version }` blob. Absent, unreadable
    *  or malformed input ⇒ start empty (−∞ for every key); a target's loader hands in
    *  null rather than throwing, since a missing store is the first-boot case. */
-  protected load(json: string | null): void {
-    if (!json) return;
-    try {
-      const raw = JSON.parse(json) as Record<string, unknown>;
-      for (const [k, v] of Object.entries(raw)) if (typeof v === "number") this.marks.set(k, v);
-    } catch { /* malformed ⇒ start empty */ }
+  constructor(json?: string | null) {
+    if (json) {
+      try {
+        const raw = JSON.parse(json) as Record<string, unknown>;
+        for (const [k, v] of Object.entries(raw)) if (typeof v === "number") this.marks.set(k, v);
+      } catch { /* malformed ⇒ start empty */ }
+    }
   }
 
   /** Serialize the marks for `persist`. */

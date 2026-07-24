@@ -118,17 +118,6 @@ export class KernelHost {
    *  one interface. */
   discardHandler(_ref: WasmHandlerRef): void {}
 
-  /** Instantiate handler `wasmBytes` and bind them at `targetName` in one call
-   *  (README §4, §12.4). Throws on any structural failure — matching the fail-loud
-   *  posture everywhere else.
-   *
-   *  The §3.1 bind, and the loader's admission (`installBundle`, §12.4) is its
-   *  only caller — the policy has already run by the time control reaches here. */
-  installWasmHandler(targetName: string, wasmBytes: Uint8Array): void {
-    const ref = this.instantiateWasm(wasmBytes);
-    this.bindHandler(targetName, ref);
-  }
-
   // ─── public API ──────────────────────────────────────────────────────
 
   /** Invoke a handler by name with `payload`, returning its response bytes, or null if

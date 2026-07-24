@@ -5,7 +5,7 @@
 // emits HELLO before the transport is writable), and the close/fail teardown are
 // written once here; a subclass only wires its transport's events to
 // open()/deliver()/fail() and says how to write bytes and tear the transport down.
-// (net-frame.ts's WsChannelBase is the sibling base for the RFC 6455 codec channels.)
+// net-frame.ts's WsChannelBase extends this, adding the RFC 6455 codec.
 
 import type { RawChannel } from "./net-link.js";
 
@@ -13,7 +13,7 @@ export abstract class BufferedChannel implements RawChannel {
   protected onMsg: ((bytes: Uint8Array) => void) | null = null;
   protected onCls: (() => void) | null = null;
   private readonly pending: Uint8Array[] = [];
-  private opened = false;
+  protected opened = false;
   protected dead = false;
 
   protected abstract write(bytes: Uint8Array): void; // put bytes on the open transport
