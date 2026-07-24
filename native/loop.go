@@ -36,12 +36,6 @@ type eventLoop struct {
 	// loop, so a net result that settles on the host realm can resume the guest).
 	extra []*qjs.Context
 
-	// resolveGuestNet settles a guest's net host.call when the host realm's Transport
-	// promise resolves: __netDone/__netFail (node.go) call it with the call's id, and it
-	// resolves the pending guest Promise (the guest realm's deliverNet). nil when no guest
-	// realm is attached. Set in newGuestRealm, cleared in guestRealm.close.
-	resolveGuestNet func(callID int64, kind int, bytes []byte, msg string)
-
 	// awaitIn installs one persistent __settle per context (tracked here) that routes
 	// into the in-flight await's onSettle, instead of creating — and leaking, since the
 	// callback registry has no unregister — a fresh JS function (and retaining its result
@@ -344,9 +338,10 @@ func (el *eventLoop) ensureSettle(c *qjs.Context) {
 // awaitIn is NOT re-entrant: el.onSettle is a single shared slot, and the defer below
 // resets it to nil (not a saved previous value), so a nested awaitIn would orphan the
 // outer await's result sink. The loader never nests it — only one await is in flight at a
-// time. A guest's net host.call settles via el.resolveGuestNet (deliverNet), not a second
-// awaitIn, so it never touches onSettle; the awaited entrypoint's own promise is the one
-// __settle reports here once the guest resumes and returns.
+// time. A guest's net host.call settles through its own realm's callbacks (guest.go
+// settleNet), and an initiator call through that realm's __callDone/__callFail — neither
+// is a second awaitIn, so neither touches onSettle. The awaited expression's own promise
+// is the one __settle reports here.
 func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Duration) (kind int, value []byte, msg string, err error) {
 	kind = -1
 	el.ensureSettle(c)

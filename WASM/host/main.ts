@@ -23,7 +23,7 @@ import { type Network, type PeerId } from "./net.js";
 import { NodeFs } from "./fs-node.js";
 import type { Fs } from "./fs.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
-import { createShell, type Shell as CoreShell, type KernelTable, type ShellSodium } from "./shell-core.js";
+import { createShell, KernelHost, type RealmFactory, type Shell as CoreShell, type KernelTable, type ShellSodium } from "./shell-core.js";
 
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
 
@@ -100,6 +100,13 @@ function freshnessPathFor(dir: string): string {
   return resolve(dir).replace(/[/\\]+$/, "") + ".freshness.json";
 }
 
+/** The JS platform's realm factory (§12.3): safe-js, a QuickJS interpreter compiled
+ *  to wasm. Imported lazily — the engine is a heavy module with bare-specifier
+ *  imports, and a node that never runs a guest should never pay for it — which is
+ *  exactly why realm creation is a platform member rather than something the shared
+ *  shell reaches for itself. */
+const createRealm: RealmFactory = async (o) => (await import("./safe-js.js")).createSafeRealm(o);
+
 /** Assemble the runtime on Node: create the Node platform (NodeFs, FileFreshnessStore,
  *  NodeNetwork) and hand it to the shared createShell(). The Node shell is the platform-
  *  neutral core plus a file-backed `loadBundle` — that is the whole platform seam. */
@@ -117,7 +124,11 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
 
   // ── Assemble the shared shell ───────────────────────────────────────────────
   const core = createShell({
-    platform: { sodium: sodium as unknown as ShellSodium, identity: opts.identity, fs, freshnessStore: freshness, network: net, livePeers: opts.livePeers },
+    platform: {
+      sodium: sodium as unknown as ShellSodium, identity: opts.identity,
+      kernel: new KernelHost(), fs, freshnessStore: freshness, network: net,
+      createRealm, livePeers: opts.livePeers,
+    },
     admit: policyFromJson(opts.policyJson),
     timeoutMs: opts.timeoutMs,
     config: opts.config,

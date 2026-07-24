@@ -114,35 +114,7 @@ func exposeWs(qc *qjs.Context) {
 	qc.Global().SetPropertyStr("__ws", o)
 }
 
-// installWsCodec wires the WebSocket layer into a realm that already holds __net +
-// sodium: the shared WS codec bundle (host-ws.gen.js: ws-codec + net-frame), the
-// __ws primitive, and the glue (engineWsJS) that points the codec at __ws and
-// exposes netConnectWS/netListenWS — WS RawChannels over a raw Go byte stream.
-func installWsCodec(qc *qjs.Context) error {
-	if _, err := qc.Eval("host-ws.gen.js", qjs.Code(hostWsJS)); err != nil {
-		return fmt.Errorf("ws bundle: %w", err)
-	}
-	exposeWs(qc)
-	if _, err := qc.Eval("engine-ws.js", qjs.Code(engineWsJS)); err != nil {
-		return fmt.Errorf("ws glue: %w", err)
-	}
-	return nil
-}
-
-const engineWsJS = `
-"use strict";
-(function () {
-  // Drive the canonical ws.wasm framing (host-ws bundle) through the Go __ws
-  // primitive — the same 4-op ABI the node/bun WebAssembly backend uses, so the
-  // RFC 6455 codec is byte-identical across targets.
-  setWsHandle((req) => new Uint8Array(__ws.handle(req)));
-
-  // WS RawChannels for the routing core (engineNetworkJS, sock.go): a WebSocket
-  // over a raw Go byte stream (netConnectRaw/netListenRaw), framed in JS by the
-  // shared net-frame classes. The browser uses its platform WebSocket; this is the
-  // node-dialing-a-WS-endpoint / node-accepting-a-browser side.
-  globalThis.netConnectWS = (host, port) => new WsClientChannel(netConnectRaw(host, port), host, port, sodium);
-  globalThis.netListenWS = (host, port, onAccept) =>
-    netListenRaw(host, port, (stream) => onAccept(new WsServerChannel(stream)));
-})();
-`
+// The codec's state machine (the handshake, masking, the residual receive buffer)
+// and the WS RawChannels built over it are the shared host JS — host/native-shim.ts
+// points the codec at `__ws` and wraps a raw Go byte stream in the shared net-frame
+// classes. Go's WebSocket involvement stops at this byte transform.

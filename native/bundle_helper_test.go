@@ -62,20 +62,30 @@ func kernelNameFor(author []byte, app, moduleName string) string {
 }
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
-// dir: one forwarder module + a stub guest, under an author-signed manifest at the given
-// (app, version). Returns the bundle's path and the kernel name the module will bind at —
-// derived from `(app, "fwd")`, since the manifest declares no bind name. Requires boot()
-// first (it hashes content with the booted sodium). Mirrors the TS run.mjs testBundle.
+// dir: one forwarder module + a stub guest with no caps, under an author-signed manifest
+// at the given (app, version). See writeBundle for the general form.
 func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
 	t.Helper()
+	return writeBundle(t, priv, pub, app, version, "register('ping', () => new Uint8Array([1]));", nil)
+}
+
+// writeBundle assembles a signed bundle FILE: one forwarder module plus the given guest,
+// under an author-signed manifest. An empty guestSrc makes it HANDLER-ONLY — the manifest
+// declares no `guest` at all, which is the shape a chat-style app ships (§12.4) and the
+// only way to exercise the shell's handler dispatch arm. Returns the bundle's path and
+// the kernel name the module will bind at, derived from `(app, "fwd")` since the manifest
+// declares no bind name. Requires a booted realm (it hashes content with the booted
+// sodium). Mirrors the TS run.mjs testBundle.
+func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
+	t.Helper()
 	kernelName := kernelNameFor(pub, app, "fwd")
-	guestSrc := "register('ping', () => new Uint8Array([1]));"
 
 	type mod struct {
 		Name string `json:"name"`
 		Hash string `json:"hash"`
 	}
-	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's.
+	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's,
+	// so a bundle with no guest has no authority to declare and omits the object.
 	type guest struct {
 		Hash string   `json:"hash"`
 		Caps []string `json:"caps"`
@@ -84,14 +94,19 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 		App     string `json:"app"`
 		Version int    `json:"version"`
 		Modules []mod  `json:"modules"`
-		Guest   guest  `json:"guest"`
+		Guest   *guest `json:"guest,omitempty"`
 	}{
 		App:     app,
 		Version: version,
 		Modules: []mod{{
 			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
 		}},
-		Guest: guest{Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))), Caps: []string{}},
+	}
+	if caps == nil {
+		caps = []string{}
+	}
+	if guestSrc != "" {
+		manifest.Guest = &guest{Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))), Caps: caps}
 	}
 	mjson, err := json.Marshal(manifest)
 	if err != nil {
@@ -108,11 +123,14 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
 
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
-	blob := packBundle([][2]any{
+	files := [][2]any{
 		{"manifest.bundle", menv},
 		{"fwd.wasm", forwarderWasm},
-		{"guest.js", []byte(guestSrc)},
-	})
+	}
+	if guestSrc != "" {
+		files = append(files, [2]any{"guest.js", []byte(guestSrc)})
+	}
+	blob := packBundle(files)
 	path := filepath.Join(t.TempDir(), app+".skb")
 	if err := os.WriteFile(path, blob, 0o644); err != nil {
 		t.Fatal(err)

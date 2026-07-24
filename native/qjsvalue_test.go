@@ -12,7 +12,7 @@ import (
 )
 
 func TestJsTypedArrayToGoViews(t *testing.T) {
-	boot()
+	bootRealm(t)
 	v, err := qc.Eval("typedarray-view-test.js", qjs.Code(`
 		(() => {
 			const buf = new ArrayBuffer(64);

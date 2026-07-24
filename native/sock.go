@@ -317,35 +317,6 @@ const netShimJS = `
 })();
 `
 
-// installNetwork wires the shared NodeNetworkCore (host-netroute.gen.js) to the Go
-// socket primitive via a ChannelFactory over __net, exposing makeNetwork(identity,
-// listen, wsListen). Eval AFTER the route bundle, sodium, and the net shim.
-func installNetwork(qc *qjs.Context) {
-	if _, err := qc.Eval("engine-net.js", qjs.Code(engineNetworkJS)); err != nil {
-		panic(fmt.Sprintf("install network: %v", err))
-	}
-}
-
-const engineNetworkJS = `
-"use strict";
-(function () {
-  // The engine ChannelFactory: the routing core's one platform seam, backed by the
-  // Go __net primitive. connect/listen return/produce RawChannels identically to
-  // the node:net factory, so NodeNetworkCore runs unchanged.
-  globalThis.makeNetwork = function (identity, listen, wsListen) {
-    const channels = {
-      connect: (addr) => addr.transport === "ws"
-        ? netConnectWS(addr.host, addr.port)
-        : netConnect(addr.host, addr.port),
-      listen: (tcp, ws, onAccept) => {
-        let port = 0, wsPort = 0;
-        if (tcp) port = netListen(tcp.host, tcp.port, onAccept);
-        if (ws) wsPort = netListenWS(ws.host, ws.port, onAccept);
-        return Promise.resolve({ port, wsPort });
-      },
-      close: () => { netCloseListeners(); }, // close bound listeners + their accept goroutines on teardown
-    };
-    return new NodeNetworkCore({ identity, sodium, channels, listen, wsListen });
-  };
-})();
-`
+// The ChannelFactory over these primitives — and the NodeNetworkCore built on it —
+// live in host/native-shim.ts, where they are typed against the shared interfaces.
+// Go's networking stops at the socket.

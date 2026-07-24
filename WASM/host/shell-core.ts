@@ -1,35 +1,37 @@
 // The platform-neutral shell core — the §12.9 "move one level up". Everything that
-// boot() in main.ts does EXCEPT the Node-specific parts (NodeFs, FileFreshnessStore,
-// NodeNetwork) lives here. A target supplies the platform seam — { fs?, network,
-// freshnessStore, identity, sodium } — exactly like NodeNetworkCore takes a
-// ChannelFactory, and gets back a fully wired Shell.
+// standing a node up involves EXCEPT the parts that genuinely vary by target lives
+// here: the handler table's owner, the cap-bridge wiring, the preamble assembly, the
+// realm's lifecycle, the bundle load order, and the inbound dispatch. A target supplies
+// the platform seam — { kernel, sodium, identity, freshnessStore, network, fs?,
+// createRealm? } — exactly like NodeNetworkCore takes a ChannelFactory, and gets back a
+// fully wired Shell.
 //
-// This is the ONE assemble path. Every current hand-rolled shell becomes "call
-// createShell with a platform and loadBundle with a blob":
+// This is the ONE assemble path, and the assembly ORDER is the point: it is the last
+// thing two hosts could disagree about, so no target restates it.
 //
-//   main-node.ts → boot() → NodeFs + FileFreshnessStore + NodeNetwork → createShell()
-//   browser       → chat-shell.js → RtcNetwork + sessionStorage freshness → createShell()
-//   native        → guest.go → Go-backed Fs + Go channel factory → createShell()
-//   seedstore     → StorageNode → { MemoryFs, Network, FreshnessMarks } → createShell() + loadBundle(seedstore.skb)
+//   main.ts       → boot()         → KernelHost + NodeFs + FileFreshnessStore + NodeNetwork + safe-js → createShell()
+//   browser       → chat-shell.js  → KernelHost + RtcNetwork + sessionStorage freshness (no realm)    → createShell()
+//   native        → native-shim.ts → Go handler table + Go Fs + Go channels + Go realm                → createShell()
+//   seedstore     → StorageNode    → { MemoryFs, Network, FreshnessMarks }                            → createShell() + loadBundle(seedstore.skb)
 //
-// After this, installWasmHandler is no longer public API on the Shell and the raw-bind
-// path dies — the only way code lands is via a signed bundle (§12.4), making the §3.1
-// claim structurally true instead of true-by-convention.
+// installWasmHandler is not public API on the Shell and there is no raw-bind path — the
+// only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
+// true instead of true-by-convention.
 
-import { KernelHost } from "./kernel-host.js";
 import { denyAll, type AdmitPredicate } from "./policy.js";
 import {
   kernelNameFor, appKeyFor, handlesOf, verifyBundle, installBundle,
-  type BundleCrypto, type FreshnessStore, type LoadedBundle, type VerifiedBundle,
+  type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle,
 } from "./bundle.js";
 import { Transport, type Network, type PeerId } from "./net.js";
 import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, guestSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
-// safe-js is imported for its *types* only. The QuickJS engine it wraps is a heavy
-// wasm module with bare-specifier imports, so it is loaded lazily — a dynamic
-// `import()` the first time a guest actually runs (runGuest/serve). A handler-only
-// shell (the browser chat demo runs no guest) therefore never pulls the engine into
-// its module graph, which is what lets shell-core load as plain ESM in the browser.
+// safe-js is imported for its *types* only — it is the JS platform's realm factory, not
+// this module's. The QuickJS engine it wraps is a heavy wasm module with bare-specifier
+// imports; a target that runs guests passes `createRealm` (main.ts loads safe-js lazily
+// behind it), and a handler-only shell passes none and never pulls the engine into its
+// module graph at all. That is what lets shell-core load as plain ESM in the browser —
+// and what lets the native target hand in a Go-backed realm instead.
 import type { SafeRealm, SafeRealmBridge } from "./safe-js.js";
 import type { Fs } from "./fs.js";
 import { toHex, fromHex } from "./util.js";
@@ -39,16 +41,57 @@ import { toHex, fromHex } from "./util.js";
  *  build satisfies both. */
 export type ShellSodium = BundleCrypto & CapSodium;
 
+/** How a target creates the confined realm a guest runs in (§12.3). The JS platform's
+ *  factory is `createSafeRealm` (safe-js.ts: QuickJS-over-wasm, driven by
+ *  quickjs-emscripten's job pump); the native target's is a second quickjs-ng realm
+ *  driven by Go's event loop (native/guest.go). Both honor the same contract —
+ *  `call` may await net, `callSync` must not yield — so the shell drives either
+ *  without knowing which it holds. */
+export type RealmFactory = (opts: {
+  source: string;
+  bridge: SafeRealmBridge;
+  memoryLimitBytes?: number;
+}) => Promise<SafeRealm>;
+
+/** The handler table as exposed by the Shell — everything a caller needs to
+ *  reach installed handlers, WITHOUT installWasmHandler AND WITHOUT
+ *  removeHandler. The bind is the bundle loader's job (§12.4); the unbind
+ *  is the shell's uninstall method (§12.5). Neither install nor remove is a
+ *  public host method. */
+export interface KernelTable {
+  callHandler(name: string, payload: Uint8Array): Uint8Array | null;
+  isBound(name: string): boolean;
+}
+
+/** The §3 handler table as the shell uses it: the two install powers a bundle load
+ *  needs (`BundleHost`), plus reaching and releasing what landed. A platform
+ *  primitive, not shell logic — `KernelHost` is the JS implementation over
+ *  `WebAssembly`, and the native target's is Go's wazero map behind its byte bridge
+ *  (§12.9). The table is the same contract either way; only who owns the instances
+ *  differs. */
+export interface KernelBackend extends BundleHost, KernelTable {
+  /** Remove every handler whose name starts with `prefix`, returning how many went.
+   *  One pass is all `uninstall` needs: every kernel name of an app shares its app
+   *  key as a prefix (§5.1). */
+  removePrefix(prefix: string): number;
+}
+
 /** The platform seam — everything the shell needs that varies by target.
  *  `fs` is optional: handler-only shells (the browser chat-shell) need no
- *  filesystem backend. `livePeers` feeds the NET_PEERS cap — the network owns
- *  connectivity, the shell just passes the closure through to the cap-bridge. */
+ *  filesystem backend. `createRealm` is optional for the same reason — absent, the
+ *  shell still verifies, admits and installs a bundle's modules, but running or
+ *  serving a guest throws rather than silently doing nothing. `livePeers` feeds the
+ *  NET_PEERS cap — the network owns connectivity, the shell just passes the closure
+ *  through to the cap-bridge. */
 export interface ShellPlatform {
   sodium: ShellSodium;
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
+  /** The handler table this shell binds bundle modules into (§3). */
+  kernel: KernelBackend;
   fs?: Fs;
   freshnessStore: FreshnessStore;
   network: Network;
+  createRealm?: RealmFactory;
   now?: () => number;
   livePeers?: () => PeerId[];
 }
@@ -77,23 +120,16 @@ export interface CreateShellOptions {
   realmMemoryBytes?: number;
 }
 
-/** The handler table as exposed by the Shell — everything a caller needs to
- *  reach installed handlers, WITHOUT installWasmHandler AND WITHOUT
- *  removeHandler. The bind is the bundle loader's job (§12.4); the unbind
- *  is the shell's uninstall method (§12.5). Neither install nor remove is a
- *  public host method. */
-export interface KernelTable {
-  callHandler(name: string, payload: Uint8Array): Uint8Array | null;
-  isBound(name: string): boolean;
-}
-
 export type { LoadedBundle, FreshnessStore, VerifiedBundle };
 // Re-export the admission predicate constructors so a target that gates admission
 // on consent (the browser) or on which bundle it was handed (a StorageNode) can
-// reach them from the same module it gets createShell from.
+// reach them from the same module it gets createShell from. KernelHost rides along
+// for the same reason: the JS platforms all hand it in as their `kernel`, and a
+// re-export keeps that a one-line seam rather than a second import.
 export { denyAll, admitAll, authorAllowlist, policyFromJson } from "./policy.js";
 export type { AdmitPredicate } from "./policy.js";
 export { Bindings } from "./bindings.js";
+export { KernelHost } from "./kernel-host.js";
 
 export interface Shell {
   /** The handler table: callHandler to reach installed handlers, isBound to
@@ -147,7 +183,7 @@ interface AppSlot {
 export function createShell(opts: CreateShellOptions & { platform: ShellPlatform }): Shell {
   const { platform } = opts;
   const sodium = platform.sodium;
-  const host = new KernelHost();
+  const host = platform.kernel;
   const bindings = new Bindings();
 
   const admit = opts.admit ?? denyAll;
@@ -171,15 +207,18 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     return [...apps.values()][0];
   };
 
-  /** The confined realm for `slot`, created lazily on first use. Both roles share
-   *  it: the async initiator (`runGuest` → realm.call) and the synchronous holder
-   *  (`dispatch` → realm.callSync), so the holder can answer re-entrantly while an
-   *  initiator is parked mid-await in the same realm (§2.1). safe-js is imported
-   *  here, lazily, so a handler-only shell never loads it. */
+  /** The confined realm for `slot`, created lazily on first use through the
+   *  platform's factory. Both roles share it: the async initiator (`runGuest` →
+   *  realm.call) and the synchronous holder (`dispatch` → realm.callSync), so the
+   *  holder can answer re-entrantly while an initiator is parked mid-await in the
+   *  same realm (§2.1). Lazy because the JS factory pulls in a heavy engine, and
+   *  because a node may serve for a long time before its first guest call. */
   const ensureRealm = async (slot: AppSlot): Promise<SafeRealm> => {
     if (slot.realm) return slot.realm;
-    const { createSafeRealm } = await import("./safe-js.js");
-    slot.realm = await createSafeRealm({
+    if (!platform.createRealm) {
+      throw new Error("shell: this platform supplies no createRealm — it can install handler modules but not run a guest");
+    }
+    slot.realm = await platform.createRealm({
       source: guestFullSource(slot.loaded),
       bridge: buildBridge(slot.loaded),
       memoryLimitBytes: opts.realmMemoryBytes,

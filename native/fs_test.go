@@ -78,7 +78,7 @@ func TestNodeFsNoEscape(t *testing.T) {
 // The `fs` object exposed into the realm presents the host/fs.ts shape (Uint8Array
 // on a hit, null on a miss) end to end through the QuickJS shim.
 func TestFsExposedToRealm(t *testing.T) {
-	boot()
+	bootRealm(t)
 	if err := exposeFs(qc, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}

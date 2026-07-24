@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tetratelabs/wazero"
-
 	"seedloader/qjs"
 )
 
@@ -24,46 +22,17 @@ import (
 // covered by asyncnet_test (makeNetwork + Transport + a confined guest over a real
 // TCP socket) and end-to-end against real node/bun nodes by scripts/loader-interop.sh.
 
-// netRouteNode stands up one isolated host realm with the full net stack (sodium,
-// the __net socket primitive, the shared route bundle, the WS codec, makeNetwork) on
-// its own loop — everything a Transport needs over a real socket. Takes testing.TB so
-// both the request/response tests and net_bench_test's round-trip benches share it.
-func netRouteNode(tb testing.TB) (*eventLoop, *qjs.Context, func()) {
-	tb.Helper()
-	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd := bootSodium(wrt)
-
-	rt, err := qjs.New()
-	if err != nil {
-		wrt.Close(ctx)
-		tb.Fatal(err)
-	}
-	qc := rt.Context()
-	el := newEventLoop(qc)
-	installPolyfills(qc)
-	exposeSodium(qc, sd)
-	exposeNet(qc, el)
-	if _, err := qc.Eval("host-netroute.gen.js", qjs.Code(hostNetRouteJS)); err != nil {
-		rt.Close()
-		wrt.Close(ctx)
-		tb.Fatal("eval route bundle:", err)
-	}
-	if err := installWsCodec(qc); err != nil { // WS codec (ws.wasm via __ws) for the ws transport
-		rt.Close()
-		wrt.Close(ctx)
-		tb.Fatal("ws codec:", err)
-	}
-	installNetwork(qc)
-	return el, qc, func() { rt.Close(); wrt.Close(ctx) }
-}
+// The realm a networking test runs in is the production one: boot() installs the __net
+// socket primitive and ws.wasm, then evaluates the shared bundle carrying the routing
+// core — so `makeNetwork` here is the very factory the binary boots with, not a harness
+// that assembles the stack a second way.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `undefined, { host: "127.0.0.1", port: 0 }`)
 }
 
 func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
-	el, qc, done := netRouteNode(t)
-	defer done()
+	bootRealm(t)
 
 	// A listens; B dials A and asks; A's request handler echoes the payload back.
 	harness := fmt.Sprintf(`

@@ -37,33 +37,27 @@ register("get", (id) => {
   return r.slice(1);
 });
 register("probe", () => {
-  const names = ["sodium", "fs", "__net", "__capBridge", "__callBridge", "bridge", "process", "Bun"];
+  const names = ["sodium", "fs", "__net", "__capBridge", "__callBridge", "bridge", "createShell", "process", "Bun"];
   const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
   return new TextEncoder().encode(leaked.join(","));
 });
 `
 
 func TestGuestPutGetAndConfinement(t *testing.T) {
-	hostQc, el, done := capBridgeRealm(t)
-	defer done()
+	capBridgeRealm(t)
 
 	// Host realm: build the cap-bridge granting crypto + fs (no net/module).
-	if _, err := hostQc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildCapBridge(["crypto", "fs"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
-
-	g, err := newGuestRealm(el, "", "{}", storeGuestSource)
-	if err != nil {
-		t.Fatal("guest realm:", err)
-	}
-	defer g.close()
+	newTestRealm(t, "{}", storeGuestSource)
 
 	// put → returns the content id (32-byte hash).
 	data := []byte("hello, confined world — stored by content id")
-	id, err := g.runGuest("put", data)
+	id, err := realmCall("put", data)
 	if err != nil {
 		t.Fatal("put:", err)
 	}
@@ -72,7 +66,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 
 	// get(id) → the original bytes (proves it stored under the content id).
-	got, err := g.runGuest("get", id)
+	got, err := realmCall("get", id)
 	if err != nil {
 		t.Fatal("get:", err)
 	}
@@ -81,12 +75,12 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 
 	// get of an unknown id rejects (the guest throws "not found").
-	if _, err := g.runGuest("get", make([]byte, 32)); err == nil {
+	if _, err := realmCall("get", make([]byte, 32)); err == nil {
 		t.Fatal("get of an absent id should have failed")
 	}
 
 	// Confinement: none of the host capabilities are reachable by name in the realm.
-	leaked, err := g.runGuest("probe", nil)
+	leaked, err := realmCall("probe", nil)
 	if err != nil {
 		t.Fatal("probe:", err)
 	}
@@ -95,34 +89,28 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 }
 
-// The realm's heap cap (guestMemoryLimit) is a confinement property, not a tuning knob:
-// the admission policy decides WHICH guest runs, but an admitted guest that runs away must
-// exhaust its own realm rather than the host — including on the serveHandle path, which a
-// remote peer drives. Asserted on the real newGuestRealm path, since the cap can only be
-// set at runtime creation and is easy to drop there silently. The modest allocation is the
+// The realm's heap cap is a confinement property, not a tuning knob: the admission
+// policy decides WHICH guest runs, but an admitted guest that runs away must exhaust
+// its own realm rather than the host — including on the request path, which a remote
+// peer drives. Asserted on the real createRealm path, since the cap can only be set at
+// runtime creation and is easy to drop there silently. The modest allocation is the
 // control: without it a realm that was simply broken would pass the same test.
 func TestGuestRealmHeapCapped(t *testing.T) {
-	hostQc, el, done := capBridgeRealm(t)
-	defer done()
+	capBridgeRealm(t)
 
-	if _, err := hostQc.Eval("build.js", qjs.Code(`
+	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildCapBridge(["crypto"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
-
 	src := fmt.Sprintf(`
 		register("ok",  () => new Uint8Array(1 << 20));  // well under the cap
 		register("hog", () => new Uint8Array(%d));       // twice the cap
-	`, 2*guestMemoryLimit)
-	g, err := newGuestRealm(el, "", "{}", src)
-	if err != nil {
-		t.Fatal("guest realm:", err)
-	}
-	defer g.close()
+	`, 2*defaultRealmMemory)
+	newTestRealm(t, "{}", src)
 
-	out, err := g.runGuest("ok", nil)
+	out, err := realmCall("ok", nil)
 	if err != nil {
 		t.Fatal("guest refused a 1 MiB allocation under its cap:", err)
 	}
@@ -130,7 +118,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 		t.Fatalf("guest returned %d bytes, want %d", len(out), 1<<20)
 	}
 
-	if _, err := g.runGuest("hog", nil); err == nil {
+	if _, err := realmCall("hog", nil); err == nil {
 		t.Fatal("guest allocated past its heap cap — the realm is not confined")
 	}
 }

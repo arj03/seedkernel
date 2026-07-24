@@ -14,27 +14,21 @@ import (
 // load path — boot, load, "reboot", load again — so a regression that dropped the write
 // (or left it non-atomic and unreadable) shows up as a downgrade that is wrongly allowed.
 func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
-	// Isolate the global store path and restore it afterwards, so this test neither sees
-	// nor leaks marks to the other tests in the package (which run with it empty).
-	saved := freshnessStorePath
-	defer func() { freshnessStorePath = saved }()
+	// The mark is a SIBLING of the data dir (a fs-capable guest writes files inside the
+	// dir and must not be able to reach its own mark), so give the dir a parent we can
+	// list: one data directory plus exactly one mark file, and no stray temp.
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "data")
 
-	storeDir := t.TempDir()
-	freshnessStorePath = filepath.Join(storeDir, "data.freshness.json")
-
-	// One author across every "boot": the mark is keyed by (author, app).
-	boot()
+	// One author across every "boot": the mark is keyed by (author, app). The author is
+	// minted against the first realm's sodium, so boot once before writing bundles.
+	bootRealmIn(t, dataDir)
 	author, authorPub := testAuthor(t)
 	policyJSON := `{"authors":["` + hex.EncodeToString(authorPub) + `"]}`
 
-	// reboot stands up a fresh realm — the marks are in-realm state, so this is what
-	// forces the next load to re-read them from the file.
-	reboot := func() {
-		boot()
-		if err := applyPolicy(policyJSON); err != nil {
-			t.Fatalf("applyPolicy: %v", err)
-		}
-	}
+	// reboot stands up a fresh realm and node on the same data dir — the marks are
+	// in-realm state, so this is what forces the next load to re-read them from the file.
+	reboot := func() { bootShell(t, dataDir, policyJSON, nil) }
 	load := func(version int) string {
 		bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", version)
 		return loadBundle(bundlePath)
@@ -50,9 +44,15 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	if _, err := os.Stat(freshnessStorePath); err != nil {
 		t.Fatalf("freshness mark was not persisted: %v", err)
 	}
-	entries, _ := os.ReadDir(storeDir)
-	if len(entries) != 1 {
-		t.Fatalf("store dir has %d files, want exactly 1 (a stray temp means the write was not atomic)", len(entries))
+	entries, _ := os.ReadDir(parent)
+	files := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			files++
+		}
+	}
+	if files != 1 {
+		t.Fatalf("%d files beside the data dir, want exactly 1 (a stray temp means the write was not atomic)", files)
 	}
 
 	// Reboot: a v2 downgrade is now refused purely from the persisted mark.

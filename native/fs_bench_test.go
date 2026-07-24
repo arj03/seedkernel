@@ -106,7 +106,7 @@ func BenchmarkFsGetJS64K(b *testing.B) {
 // seeds one block, and returns the retained __benchPut function (callers fetch
 // __benchGet themselves). The boot is shared via ensureBooted, like the dispatch bench.
 func setupFsJS(b *testing.B) *qjs.Value {
-	ensureBooted()
+	ensureBooted(b)
 	if err := exposeFs(qc, b.TempDir()); err != nil {
 		b.Fatal(err)
 	}

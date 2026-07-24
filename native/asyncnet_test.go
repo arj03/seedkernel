@@ -6,8 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tetratelabs/wazero"
-
 	"seedloader/qjs"
 )
 
@@ -23,27 +21,12 @@ import (
 // [type, ...payload]; B (the guest's node) holds the cap-bridge over its transport.
 // The guest, running as initiator, asks A and returns the echoed bytes.
 func TestAsyncNetInitiator(t *testing.T) {
-	dir := t.TempDir()
-	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd := bootSodium(wrt)
-	rt, err := qjs.New()
-	if err != nil {
-		wrt.Close(ctx)
-		t.Fatal(err)
-	}
-	hostQc := rt.Context()
-	el := newEventLoop(hostQc)
-	if err := installEngineHost(hostQc, el, sd, dir); err != nil {
-		rt.Close()
-		wrt.Close(ctx)
-		t.Fatal("host:", err)
-	}
-	defer func() { rt.Close(); wrt.Close(ctx) }()
+	capBridgeRealm(t)
 
 	// A (responder, listens) and B (the guest's node). The guest's cap-bridge is built
 	// over B's identity + transport, granting crypto + net only. A's onRequest echoes
 	// the payload so the round-trip result is checkable.
-	if _, err := hostQc.Eval("setup.js", qjs.Code(`
+	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.idA = sodium.crypto_sign_keypair();
 		globalThis.idB = sodium.crypto_sign_keypair();
 		globalThis.aId = toHex(idA.publicKey);
@@ -62,7 +45,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	if _, _, _, err := el.await(`(async () => { await netA.start(); return new Uint8Array(0); })()`, 5*time.Second); err != nil {
 		t.Fatal("start:", err)
 	}
-	if _, err := hostQc.Eval("peer.js", qjs.Code(
+	if _, err := qc.Eval("peer.js", qjs.Code(
 		`netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });`,
 	)); err != nil {
 		t.Fatal("addPeerAddr:", err)
@@ -90,15 +73,11 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  return r.slice(1);
 		});
 	`
-	aIdHex := mustEvalString(t, hostQc, `aId`)
-	g, err := newGuestRealm(el, "", fmt.Sprintf(`{"peer":%q}`, aIdHex), askGuestSource)
-	if err != nil {
-		t.Fatal("guest:", err)
-	}
-	defer g.close()
+	aIdHex := mustEvalString(t, qc, `aId`)
+	newTestRealm(t, fmt.Sprintf(`{"peer":%q}`, aIdHex), askGuestSource)
 
 	msg := []byte("ping over the wire")
-	got, err := g.runGuest("ask", msg)
+	got, err := realmCall("ask", msg)
 	if err != nil {
 		t.Fatal("ask:", err)
 	}

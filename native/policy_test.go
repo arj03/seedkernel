@@ -8,7 +8,7 @@ import (
 
 // With the bundle author allow-listed, the closed policy still loads the bundle.
 func TestPolicyAllowsBundleAuthor(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	author, authorPub := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
@@ -21,7 +21,7 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 
 // A policy that omits the bundle author rejects it at the manifest-governance gate.
 func TestPolicyRejectsForeignAuthor(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	if err := applyPolicy(`{"authors":["` + strings.Repeat("ab", 32) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 
 // parsePolicy fails loudly on malformed config rather than silently widening trust.
 func TestPolicyMalformed(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	for _, bad := range []string{`{}`, `{"authors":[]}`, `[]`, `not json`, `{"authors":[123]}`, `{"authors":"x"}`} {
 		if err := applyPolicy(bad); err == nil {
 			t.Fatalf("applyPolicy(%q) = nil, want an error", bad)
@@ -54,7 +54,7 @@ func TestPolicyMalformed(t *testing.T) {
 // refuses every install rather than trusting any signed author (README §14). The JS
 // shell has always done this (main.ts) — the native loader used to do the opposite.
 func TestNoPolicyDeniesInstalls(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	author, authorPub := testAuthor(t)
 
 	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
@@ -70,7 +70,7 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 // is no ownership register and no same-author clause — the collision the old register
 // existed to refuse is unrepresentable, and both modules land.
 func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	authorA, authorAPub := testAuthor(t)
 	authorB, authorBPub := testAuthor(t)
 	// Both authors are allowed to install: this test is about the namespace, not the

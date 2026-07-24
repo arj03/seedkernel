@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tetratelabs/wazero"
+
 
 	"seedloader/qjs"
 )
@@ -17,37 +17,9 @@ import (
 // mutual HELLO/AUTH over a real loopback socket, attribute frames to the
 // authenticated peerId, and honour expectPeerId — none of it logic in Go.
 
-// netNode builds the minimal JS host stack a networking test needs: libsodium in
-// its own wazero runtime, a QuickJS realm with the event loop, polyfills, sodium,
-// the Go socket primitive, and the shared net-route bundle (which exports PeerLink) —
-// the same net bundle production loads, so this test exercises no test-only wiring.
-func netNode(t *testing.T) (*eventLoop, *qjs.Context, func()) {
-	t.Helper()
-	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd := bootSodium(wrt)
-
-	rt, err := qjs.New()
-	if err != nil {
-		wrt.Close(ctx)
-		t.Fatal(err)
-	}
-	qc := rt.Context()
-	el := newEventLoop(qc)
-	installPolyfills(qc)
-	exposeSodium(qc, sd)
-	exposeNet(qc, el)
-	if _, err := qc.Eval("host-netroute.gen.js", qjs.Code(hostNetRouteJS)); err != nil {
-		rt.Close()
-		wrt.Close(ctx)
-		t.Fatal("eval net-route bundle:", err)
-	}
-	if err := installWsCodec(qc); err != nil { // netConnectWS/netListenWS + the ws.wasm codec
-		rt.Close()
-		wrt.Close(ctx)
-		t.Fatal("ws codec:", err)
-	}
-	return el, qc, func() { rt.Close(); wrt.Close(ctx) }
-}
+// These run in the production realm (bootRealm → boot): the Go socket primitive, the
+// ws.wasm codec, and the shared bundle that carries PeerLink and the WS channels — so
+// the test exercises no wiring of its own.
 
 // The handshake runs identically over TCP and over WebSocket — the WS path wraps
 // the same raw Go byte stream in the shared net-frame WsChannel, presenting the
@@ -60,8 +32,7 @@ func TestPeerLinkHandshakeOverWebSocket(t *testing.T) {
 }
 
 func runHandshake(t *testing.T, connectFn, listenFn string) {
-	el, qc, done := netNode(t)
-	defer done()
+	bootRealm(t)
 
 	// A dials B; both authenticate; A sends a frame which B must receive attributed
 	// to A's authenticated peerId. expectPeerId pins B's key on the dial.
@@ -128,8 +99,7 @@ func runHandshake(t *testing.T, connectFn, listenFn string) {
 }
 
 func TestPeerLinkExpectPeerIdMismatch(t *testing.T) {
-	el, qc, done := netNode(t)
-	defer done()
+	bootRealm(t)
 
 	// A dials B but pins the WRONG expected key. On B's HELLO, A finds peerId !=
 	// expectPeerId and drops the socket without sending AUTH — so A never auths and B

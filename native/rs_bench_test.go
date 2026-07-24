@@ -83,8 +83,9 @@ func bundleAuthor(blob []byte) ([]byte, error) {
 // encode request plus a "one data block lost" decode request — the §21 single-loss
 // read path, identical to bench.mjs's decode case (surviving data rows 1..k-1 plus
 // the first parity row). Both requests are validated once before timing.
-func setupRS() {
-	ensureBooted()
+func setupRS(tb testing.TB) {
+	ensureBooted(tb)
+
 	path := os.Getenv("SEEDSTORE_BUNDLE")
 	if path == "" {
 		return // opt-in only: no seedstore bundle configured → rsReady stays false → Skip
@@ -158,7 +159,7 @@ func setupRS() {
 }
 
 func BenchmarkRSEncode(b *testing.B) {
-	rsOnce.Do(setupRS)
+	rsOnce.Do(func() { setupRS(b) })
 	if rsSetupErr != nil {
 		b.Fatalf("SEEDSTORE_BUNDLE is set but the bench could not run: %v", rsSetupErr)
 	}
@@ -173,7 +174,7 @@ func BenchmarkRSEncode(b *testing.B) {
 }
 
 func BenchmarkRSDecode(b *testing.B) {
-	rsOnce.Do(setupRS)
+	rsOnce.Do(func() { setupRS(b) })
 	if rsSetupErr != nil {
 		b.Fatalf("SEEDSTORE_BUNDLE is set but the bench could not run: %v", rsSetupErr)
 	}

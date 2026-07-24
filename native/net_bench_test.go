@@ -17,7 +17,7 @@ package main
 //
 // b.N requests run as one JS-side await loop (benchPingN/benchFetchN) so the per-op
 // el.await harness cost isn't folded into every iteration — only the socket round-trips
-// are timed. Built on transport_test.go's netRouteNode harness.
+// are timed. Built on the shared benchmark realm (bench_test.go).
 //
 //	go test -run x -bench BenchmarkNet -benchmem ./...
 
@@ -58,23 +58,20 @@ const netBenchHarness = `
 	globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), __big9); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
 `
 
-// setupNetBench stands up the harness, binds A's listener, and points B at it. The
-// returned loop drives benchPingN/benchFetchN; done() tears both runtimes down.
-func setupNetBench(b *testing.B) (*eventLoop, func()) {
-	el, qc, done := netRouteNode(b)
+// setupNetBench stands up the harness in the shared benchmark realm, binds A's
+// listener, and points B at it. The returned loop drives benchPingN/benchFetchN.
+func setupNetBench(b *testing.B) *eventLoop {
+	ensureBooted(b)
 	if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
-		done()
 		b.Fatal("harness:", err)
 	}
 	if kind, _, msg, err := el.await(`(async () => { await netA.start(); return new Uint8Array(0); })()`, 8*time.Second); err != nil || kind != 0 {
-		done()
 		b.Fatalf("netA.start: kind=%d msg=%q err=%v", kind, msg, err)
 	}
 	if _, err := qc.Eval("net-bench-peer.js", qjs.Code(`netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });`)); err != nil {
-		done()
 		b.Fatal("addPeerAddr:", err)
 	}
-	return el, done
+	return el
 }
 
 // benchAwait drives one JS request loop to completion and fails the bench if it rejects
@@ -92,8 +89,7 @@ func benchAwait(b *testing.B, el *eventLoop, expr string) {
 }
 
 func BenchmarkNetRoundTrip(b *testing.B) {
-	el, done := setupNetBench(b)
-	defer done()
+	el := setupNetBench(b)
 	benchAwait(b, el, "benchPingN(1)") // warmup: dial + PeerLink handshake (amortized out)
 	b.ResetTimer()
 	benchAwait(b, el, fmt.Sprintf("benchPingN(%d)", b.N))
@@ -101,8 +97,7 @@ func BenchmarkNetRoundTrip(b *testing.B) {
 }
 
 func BenchmarkNetFetch64K(b *testing.B) {
-	el, done := setupNetBench(b)
-	defer done()
+	el := setupNetBench(b)
 	b.SetBytes(blockBytes)
 	benchAwait(b, el, "benchFetchN(1)") // warmup
 	b.ResetTimer()
@@ -116,8 +111,7 @@ func BenchmarkNetFetch64K(b *testing.B) {
 // dispatch) — the path a PUT hits at the holder, which no other bench exercises (Fetch
 // has A *send* the bulk and *receive* a tiny request).
 func BenchmarkNetUpload1M(b *testing.B) {
-	el, done := setupNetBench(b)
-	defer done()
+	el := setupNetBench(b)
 	b.SetBytes(1 << 20)
 	benchAwait(b, el, "benchUploadN(1)") // warmup
 	b.ResetTimer()

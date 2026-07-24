@@ -1,5 +1,5 @@
 import sodium from "./libsodium-wrappers.mjs";
-import { createShell } from "../build/host/shell-core.js";
+import { createShell, KernelHost } from "../build/host/shell-core.js";
 import { RtcNetwork } from "../build/host/net-rtc.js";
 import { signManifest, packBundle,
          genesisHash, kernelNameFor, appKeyFor, handlesOf,
@@ -1026,13 +1026,16 @@ const net = new RtcNetwork({
 });
 
 // Assemble the shared shell now that the identity and the RtcNetwork exist. The
-// platform is a browser seam: sodium, our identity, an in-memory freshness store, and
-// the RtcNetwork as the Network backend — no fs (a chat app is handler-only).
-// Admission is deferred to `admit` (user consent).
+// platform is a browser seam: sodium, our identity, a WebAssembly-backed handler
+// table, an in-memory freshness store, and the RtcNetwork as the Network backend —
+// no fs and no createRealm, because a chat app is handler-only. Omitting the realm
+// factory is what keeps the QuickJS engine out of this page's module graph
+// entirely. Admission is deferred to `admit` (user consent).
 shell = createShell({
   platform: {
     sodium,
     identity: myKeys,
+    kernel: new KernelHost(),
     freshnessStore: new FreshnessMarks(),
     network: net,
   },

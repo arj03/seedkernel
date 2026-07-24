@@ -20,7 +20,7 @@ func boundToWasm(n string) bool {
 // only the clamp refuses it. (The declared-scratchSize branch belongs to handlers like
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 func TestScratchRegion(t *testing.T) {
-	boot()
+	bootRealm(t)
 	n := kernelNameFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp", "fwd")
 	if err := installWasm(n, forwarderWasm); err != nil {
 		t.Fatalf("installWasm(forwarder) refused: %v", err)
@@ -49,7 +49,7 @@ func TestScratchRegion(t *testing.T) {
 // name now (README §4, §12.4) — there is no kernel.call/dispatch seam to drive one through —
 // so echoing a payload back is the whole "the bundle-installed wasm runs" proof.
 func TestBundleModuleRuns(t *testing.T) {
-	boot()
+	bootShell(t, t.TempDir(), "", nil)
 	author, authorPub := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)

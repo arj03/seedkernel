@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/tetratelabs/wazero"
-
 	"seedloader/qjs"
 )
 
@@ -15,31 +13,8 @@ import (
 // single `__capBridge(op, bytes)` funnel and checked against the underlying
 // primitive, plus the cap-domain gate (an undeclared op is refused).
 
-func capBridgeRealm(t *testing.T) (*qjs.Context, *eventLoop, func()) {
-	t.Helper()
-	wrt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd := bootSodium(wrt)
-	rt, err := qjs.New()
-	if err != nil {
-		wrt.Close(ctx)
-		t.Fatal(err)
-	}
-	qc := rt.Context()
-	installPolyfills(qc)
-	exposeSodium(qc, sd)
-	if err := exposeFs(qc, t.TempDir()); err != nil {
-		rt.Close()
-		wrt.Close(ctx)
-		t.Fatal("fs:", err)
-	}
-	el := newEventLoop(qc)
-	exposeCapBridge(qc)
-	return qc, el, func() { rt.Close(); wrt.Close(ctx) }
-}
-
 func TestCapBridgeOps(t *testing.T) {
-	qc, _, done := capBridgeRealm(t)
-	defer done()
+	capBridgeRealm(t)
 
 	// Grant crypto + fs + clock (not net/module) and an identity from sodium. The
 	// guest-signing scope binds SIGN to a bundle namespace (README §12.2); a real node
@@ -47,7 +22,7 @@ func TestCapBridgeOps(t *testing.T) {
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__scope = guestSignScope(__id.publicKey, "testapp");
-		__buildCapBridge(["crypto", "fs", "clock"], __id, null, [], null, __scope);
+		__buildCapBridge(["crypto", "fs", "clock"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}

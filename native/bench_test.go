@@ -1,11 +1,40 @@
 package main
 
-import "sync"
+import (
+	"os"
+	"sync"
+	"testing"
+)
 
-// bootOnce shares a single shell boot across every benchmark in the package (boot()
-// is a global singleton; re-running it would leak a runtime and reset the kernel's
-// handler table out from under already-registered handlers). The fs and RS benches
-// call ensureBooted so their measured path runs against one warmed-up shell.
-var bootOnce sync.Once
+// One boot for the whole benchmark run. boot() is a process-wide singleton — a second
+// one tears down the realm, and with it the handler table a benchmark already staged
+// its module into — so every benchmark that needs a realm shares this one. Go runs all
+// tests before all benchmarks, so the fresh-realm boots the tests do are long finished
+// by the time this fires.
+var (
+	benchBootOnce sync.Once
+	benchBootErr  error
+	benchDataDir  string
+)
 
-func ensureBooted() { bootOnce.Do(boot) }
+// ensureBooted stands the shared benchmark realm up (and a node in it, so a bench can
+// load a bundle) on first use.
+func ensureBooted(tb testing.TB) {
+	tb.Helper()
+	benchBootOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "seedloader-bench-")
+		if err != nil {
+			benchBootErr = err
+			return
+		}
+		benchDataDir = dir
+		if benchBootErr = boot(dir); benchBootErr != nil {
+			return
+		}
+		cfg := nodeConfig{KeyHex: testKeyHex(tb), TimeoutMs: 2000}
+		_, benchBootErr = startNode(cfg)
+	})
+	if benchBootErr != nil {
+		tb.Fatal("bench boot:", benchBootErr)
+	}
+}
