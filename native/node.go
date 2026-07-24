@@ -106,12 +106,11 @@ const engineNodeJS = `
     const p = __network.port | 0, w = __network.wsPort | 0;
     return new Uint8Array([(p >>> 8) & 255, p & 255, (w >>> 8) & 255, w & 255]);
   };
-  // Teach the network a cohort peer's address (--peers entry: pk@host:port) and add
-  // it to the reachable set (CAP_NET_PEERS). Mirrors the --peers wiring in main.ts.
+  // Teach the network a cohort peer's address (--peers entry: pk@host:port).
+  // The network owns connectivity; the NET_PEERS cap returns live links.
   globalThis.__addPeer = function (spec) {
     const { peerId, addr } = parsePeerSpec(spec, "tcp");
     __network.addPeerAddr(peerId, addr);
-    (globalThis.__peers = globalThis.__peers || []).push(peerId);
   };
   // Pre-dial the cohort so net.peers is connected before serving (best-effort).
   globalThis.__nodeReady = function () { return __network.ready().catch(() => {}); };
@@ -124,7 +123,7 @@ const engineNodeJS = `
   // names never leave the host.
   globalThis.__buildNodeBridge = function (caps, authorHex, app, modules) {
     const scope = guestSignScope(fromHex(authorHex), app);
-    __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall, scope, modules);
+    __buildCapBridge(caps, __identity, __transport, [], globalThis.__moduleCall, scope, modules);
   };
   // Set up protocol bindings for a loaded app (§12.10). Called after
   // loadBundleBlob returns — auto-binds the app's handles into vacancies.

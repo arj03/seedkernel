@@ -45,8 +45,9 @@ export interface ShellOptions {
   /** Inject a Network (tests). Defaults to a NodeNetwork on listen/wsListen — the
    *  shell `start()`s and `close()`s the one it makes, but never an injected one. */
   network?: Network;
-  /** Cohort peers the guest may reach via net.peers (the CLI also dials them). */
-  peers?: PeerId[];
+  /** Live connected peers for the NET_PEERS cap. The network owns
+   *  connectivity; this closure feeds it into the cap-bridge. */
+  livePeers?: () => PeerId[];
   /** net.send timeout in ms (how long before a peer is treated unreachable). */
   timeoutMs?: number;
   /** Operator-supplied app config, merged *over* the bundle manifest's `config`
@@ -121,9 +122,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
 
   // ── Assemble the shared shell ───────────────────────────────────────────────
   const core = createShell({
-    platform: { sodium: sodium as unknown as ShellSodium, identity: opts.identity, fs, freshnessStore: freshness, network: net },
+    platform: { sodium: sodium as unknown as ShellSodium, identity: opts.identity, fs, freshnessStore: freshness, network: net, livePeers: opts.livePeers },
     admit: policyFromJson(opts.policyJson),
-    peers: opts.peers,
     timeoutMs: opts.timeoutMs,
     config: opts.config,
   });
@@ -136,9 +136,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     transport: core.transport,
     fs: core.fs!,
     sodium: core.sodium,
-    peers: core.peers,
-    addPeer: core.addPeer,
-    removePeer: core.removePeer,
     loadBundleBlob: core.loadBundleBlob,
     uninstall: core.uninstall,
     async loadBundle(file) {
@@ -238,13 +235,12 @@ export async function main(): Promise<void> {
   });
   const nodeNet = shell.net as NodeNetwork;
 
-  // Cohort peers the guest may reach (net.peers): teach the network their
-  // addresses and add them to the cohort — the same wiring a storage node does.
+  // Cohort peers the guest may reach: teach the network their addresses so the
+  // transport can dial them. The network owns connectivity (§12.10).
   if (args["peers"]) {
     for (const spec of str(args, "peers")!.split(",").map((s) => s.trim()).filter(Boolean)) {
       const { peerId, addr } = parsePeerSpec(spec, "tcp");
       nodeNet.addPeerAddr(peerId, addr);
-      shell.addPeer(peerId);
     }
     await nodeNet.ready();
   }
@@ -252,7 +248,7 @@ export async function main(): Promise<void> {
   console.log(`seedkernel-shell ${toHex(identity.publicKey)}`);
   console.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
   console.log(`  store  ${dir} (fs.* backend)`);
-  console.log(`  cohort ${shell.peers.size} peer(s)`);
+  console.log(`  cohort ${args["peers"] ? (str(args, "peers")!.split(",").filter(Boolean).length) : 0} peer(s)`);
   if (nodeNet.port) console.log(`  tcp    listening on :${nodeNet.port}`);
   if (nodeNet.wsPort) console.log(`  ws     listening on :${nodeNet.wsPort}`);
 

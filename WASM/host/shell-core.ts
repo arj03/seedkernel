@@ -41,7 +41,8 @@ export type ShellSodium = BundleCrypto & CapSodium;
 
 /** The platform seam — everything the shell needs that varies by target.
  *  `fs` is optional: handler-only shells (the browser chat-shell) need no
- *  filesystem backend. */
+ *  filesystem backend. `livePeers` feeds the NET_PEERS cap — the network owns
+ *  connectivity, the shell just passes the closure through to the cap-bridge. */
 export interface ShellPlatform {
   sodium: ShellSodium;
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
@@ -49,6 +50,7 @@ export interface ShellPlatform {
   freshnessStore: FreshnessStore;
   network: Network;
   now?: () => number;
+  livePeers?: () => PeerId[];
 }
 
 /** Interactive admission callback. Runs after verifyBundle proves authenticity
@@ -65,7 +67,6 @@ export interface CreateShellOptions {
    *  allowlist, a consent dialog, and "the bundle my operator handed me" are
    *  three constructors of the same predicate type (§12.5). */
   admit?: AdmitCallback;
-  peers?: PeerId[];
   timeoutMs?: number;
   /** Operator-supplied app config, merged *over* the bundle manifest's `config`
    *  into the guest's `const APP = …`. Opaque to the shell. */
@@ -106,9 +107,6 @@ export interface Shell {
   /** Filesystem backend. Absent for handler-only shells. */
   fs?: Fs;
   sodium: ShellSodium;
-  readonly peers: Set<PeerId>;
-  addPeer(peerId: PeerId): void;
-  removePeer(peerId: PeerId): void;
   /** Load a signed bundle blob: verify the manifest, run the admission predicate,
    *  integrity-check + install the modules, and return the guest source. This is
    *  the §12.4 load order — the ONE install path. */
@@ -156,10 +154,9 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
 
   const peerId = toHex(platform.identity.publicKey);
   const transport = new Transport(peerId, platform.network, opts.timeoutMs ?? 2000);
-  const peers = new Set<PeerId>(opts.peers ?? []);
+  const livePeers = platform.livePeers ?? (() => []);
 
   const apps = new Map<string, AppSlot>();
-  let wired = false;
   // The tail of every initiator `runGuest` call. close() defers realm disposal onto
   // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
   // is never resumed into a freed realm — a QuickJS use-after-free (§2.1).
@@ -197,7 +194,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       sodium: platform.sodium,
       identity: platform.identity,
       callHandler: (name, p) => host.callHandler(name, p),
-      transport, peers: () => [...peers],
+      transport, peers: livePeers,
       fs: caps.has("fs") && platform.fs ? platform.fs : undefined,
       now: platform.now ?? (() => Date.now()),
       allowedOps: opsForCaps(caps),
@@ -241,9 +238,6 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     transport,
     fs: platform.fs,
     sodium,
-    peers,
-    addPeer(p) { if (p !== peerId) peers.add(p); },
-    removePeer(p) { peers.delete(p); },
     async loadBundleBlob(blob) {
       const v = verifyBundle(sodium, blob);
       const ok = await admit(v);
@@ -281,7 +275,6 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       for (const slot of apps.values()) {
         if (hasGuest(slot.loaded)) await ensureRealm(slot);
       }
-      wired = true;
       transport.onRequest((from, proto, payload) => {
         const result = doDispatch(from, proto, payload);
         if (onResult) {
