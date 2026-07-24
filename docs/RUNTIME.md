@@ -338,7 +338,7 @@ bindings: protocol id → app key
 
 pointing at the `"<author hex>:<app>"` of §12.4. To deliver, the host reads the frame's protocol id, looks up the app key, and reaches that app — a guest app through its confined realm's `handle`, a handler-only app by the derived kernel name of its first module (§5.1) with the authenticated sender prepended. An unbound protocol reaches no app at all, so the request is answered empty (the Transport always answers; a null handler result is an empty body, never a dropped frame).
 
-**Declaring is free, so it is not worth attacking.** Any number of bundles may declare `handles: ["chat"]`; none receives a byte until the user points a binding at it. This is why no register is needed to keep names apart *and* no race replaces it: the two acts an ownership register used to conflate — landing code, and receiving traffic — are now separate, one authorized by policy and one chosen by the user.
+**The `_offer` protocol.** The protocol id `_offer` is reserved for bundle transit (§12.4) — a peer sends a signed bundle blob, the recipient verifies and optionally admits it. It is never bound through the bindings table; the shell intercepts it before dispatch and handles it directly. Any number of bundles may declare `handles: ["chat"]`; none receives a byte until the user points a binding at it. This is why no register is needed to keep names apart *and* no race replaces it: the two acts an ownership register used to conflate — landing code, and receiving traffic — are now separate, one authorized by policy and one chosen by the user.
 
 **Binding rules.** Three, and they are the whole of it:
 

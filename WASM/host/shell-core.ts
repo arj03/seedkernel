@@ -162,10 +162,9 @@ export interface Shell {
    *  For a handler-only app: calls the kernel handler with senderPk ‖ payload.
    *  Returns the response bytes, or null if no bound app handles the protocol. */
   dispatch(from: PeerId, proto: string, payload: Uint8Array): Uint8Array | null;
-  /** Wire transport.onRequest to the shell's dispatch. An optional `onResult`
-   *  receives (appKey, result) after dispatch, before bytes go on the wire —
-   *  a UI shell uses this to render the result into an iframe. */
-  serve(onResult?: (appKey: string | null, result: Uint8Array | null) => void): Promise<void>;
+  /** Wire transport.onRequest to the shell's dispatch. After this, every
+   *  inbound frame resolves through the bindings table to its app (§12.10). */
+  serve(): Promise<void>;
   close(): void;
 }
 
@@ -310,17 +309,12 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       return call;
     },
     dispatch: doDispatch,
-    async serve(onResult) {
+    async serve() {
       for (const slot of apps.values()) {
         if (hasGuest(slot.loaded)) await ensureRealm(slot);
       }
       transport.onRequest((from, proto, payload) => {
-        const result = doDispatch(from, proto, payload);
-        if (onResult) {
-          const appKey = bindings.boundApp(proto);
-          onResult(appKey, result);
-        }
-        return result;
+        return doDispatch(from, proto, payload);
       });
     },
     close() {
