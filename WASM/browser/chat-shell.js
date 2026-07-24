@@ -631,7 +631,7 @@ function offerApp(key) {
   if (!rec) return;
   const linked = net.linkedPeers();
   for (const peerId of linked) {
-    shell.transport.send(peerId, new TextEncoder().encode(OFFER_PROTO), 0, rec.bundleBytes);
+    shell.transport.send(peerId, new TextEncoder().encode(OFFER_PROTO), rec.bundleBytes);
   }
   const n = linked.length;
   shellPrint(
