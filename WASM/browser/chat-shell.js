@@ -686,10 +686,24 @@ function buildAppRow(rec) {
   meta.className = "app-row-meta";
   const authorHex = bytesToHex(rec.authorPk);
   const isMine = bytesEqual(rec.authorPk, myKeys.publicKey);
-  meta.innerHTML =
-    `<b>id</b> ${rec.id} · <b>author</b> ${authorHex.slice(0, 8)}` +
-    (isMine ? " (you)" : "") +
-    ` · <b>wasm</b> ${bytesToHex(rec.bytesHash).slice(0, 12)}`;
+  {
+    const bId = document.createElement("b");
+    bId.textContent = "id";
+    meta.appendChild(bId);
+    const vId = document.createTextNode(` ${rec.id} · `);
+    meta.appendChild(vId);
+    const bAu = document.createElement("b");
+    bAu.textContent = "author";
+    meta.appendChild(bAu);
+    const vAu = document.createTextNode(
+      ` ${authorHex.slice(0, 8)}` + (isMine ? " (you)" : "") + ` · `);
+    meta.appendChild(vAu);
+    const bWa = document.createElement("b");
+    bWa.textContent = "wasm";
+    meta.appendChild(bWa);
+    const vWa = document.createTextNode(` ${bytesToHex(rec.bytesHash).slice(0, 12)}`);
+    meta.appendChild(vWa);
+  }
   li.appendChild(meta);
 
   // Protocol bindings (§12.10). One row per protocol this app offers to serve, each a
@@ -818,10 +832,28 @@ function buildOfferRow(hex, offer) {
   }
   const m = document.createElement("div");
   m.className = "app-row-meta";
-  m.innerHTML =
-    `<b>id</b> ${meta.id} · <b>author</b> ${bytesToHex(offer.peeked.authorPk).slice(0, 8)}` +
-    ` · <b>from</b> ${offer.fromPkHex.slice(0, 8)}` +
-    ` · <b>wasm</b> ${bytesToHex(offer.peeked.bytesHash).slice(0, 12)}`;
+  {
+    const bId = document.createElement("b");
+    bId.textContent = "id";
+    m.appendChild(bId);
+    const vId = document.createTextNode(` ${meta.id} · `);
+    m.appendChild(vId);
+    const bAu = document.createElement("b");
+    bAu.textContent = "author";
+    m.appendChild(bAu);
+    const vAu = document.createTextNode(` ${bytesToHex(offer.peeked.authorPk).slice(0, 8)} · `);
+    m.appendChild(vAu);
+    const bFr = document.createElement("b");
+    bFr.textContent = "from";
+    m.appendChild(bFr);
+    const vFr = document.createTextNode(` ${offer.fromPkHex.slice(0, 8)} · `);
+    m.appendChild(vFr);
+    const bWa = document.createElement("b");
+    bWa.textContent = "wasm";
+    m.appendChild(bWa);
+    const vWa = document.createTextNode(` ${bytesToHex(offer.peeked.bytesHash).slice(0, 12)}`);
+    m.appendChild(vWa);
+  }
   li.appendChild(m);
   const btns = document.createElement("div");
   btns.className = "app-row-buttons";
