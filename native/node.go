@@ -45,6 +45,9 @@ func installEngineNet(qc *qjs.Context, el *eventLoop) error {
 	}
 	installNetwork(qc)
 	exposeCapBridge(qc)
+	if _, err := qc.Eval("host-bindings.gen.js", qjs.Code(hostBindingsJS)); err != nil {
+		return fmt.Errorf("bindings bundle: %w", err)
+	}
 	if _, err := qc.Eval("engine-node.js", qjs.Code(engineNodeJS)); err != nil {
 		return fmt.Errorf("node setup glue: %w", err)
 	}
@@ -123,14 +126,21 @@ const engineNodeJS = `
     const scope = guestSignScope(fromHex(authorHex), app);
     __buildCapBridge(caps, __identity, __transport, globalThis.__peers || [], globalThis.__moduleCall, scope, modules);
   };
+  // Set up protocol bindings for a loaded app (§12.10). Called after
+  // loadBundleBlob returns — auto-binds the app's handles into vacancies.
+  globalThis.__setupBindings = function (appKey, handles) {
+    globalThis.__bindings = new Bindings();
+    globalThis.__bindings.autoBind(appKey, handles);
+  };
 })();
 `
 
 // wireServe routes incoming transport requests to a confined guest's `handle`
-// entrypoint — "the shell runs the app" on the request side (README §12.8), the
-// engine twin of the reference shell's serve(). The host realm must hold the
-// bundle's Transport at globalThis.__transport. The guest answers synchronously
-// from local fs + crypto, so onRequest gets bytes back immediately.
+// entrypoint — "the shell runs the app" on the request side (README §12.8). The
+// host realm must hold the bundle's Transport at globalThis.__transport, and a
+// Bindings instance at globalThis.__bindings whose proto→appKey table the shared
+// dispatch consults (§12.10). A request whose protocol is not bound to an installed
+// app is silently dropped — the node has nothing to answer with.
 func wireServe(hostQc *qjs.Context, g *guestRealm) {
 	hostQc.Global().SetPropertyStr("__serveHandle", hostQc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[0])
@@ -144,7 +154,10 @@ func wireServe(hostQc *qjs.Context, g *guestRealm) {
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
 	if _, err := hostQc.Eval("wire-serve.js", qjs.Code(
-		`__transport.onRequest((from, proto, payload) => new Uint8Array(__serveHandle(payload)));`,
+		`__transport.onRequest((from, proto, payload) => {
+			if (!__bindings.boundApp(proto)) return null;
+			return new Uint8Array(__serveHandle(payload));
+		});`,
 	)); err != nil {
 		panic(fmt.Sprintf("wireServe: %v", err))
 	}

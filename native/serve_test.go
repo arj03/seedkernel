@@ -73,6 +73,15 @@ func TestServe(t *testing.T) {
 		t.Fatal("guest:", err)
 	}
 	defer g.close()
+	// Set up bindings for the test protocol so wireServe's shared dispatch can
+	// resolve it. The native target now consults __bindings.boundApp(proto)
+	// instead of unconditionally routing to the one guest (§12.10).
+	if _, err := hostQc.Eval("bind.js", qjs.Code(`
+		globalThis.__bindings = new Bindings();
+		__bindings.bind("_test", "test:v1");
+	`)); err != nil {
+		t.Fatal("bind:", err)
+	}
 	wireServe(hostQc, g)
 
 	// B dials A, stores a value through A's holder, then fetches it back.

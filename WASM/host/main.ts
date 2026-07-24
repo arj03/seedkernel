@@ -145,6 +145,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
       return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
     },
     runGuest: core.runGuest,
+    dispatch: core.dispatch,
     serve: core.serve,
     close() { core.close(); if (ownsNet) (net as NodeNetwork).close(); },
   };

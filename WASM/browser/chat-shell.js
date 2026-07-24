@@ -384,7 +384,6 @@ async function applyAppBundle(bundleBytes) {
     uiHtml,
   };
   installedApps.set(key, record);
-  shell.bindings.autoBind(key, handles);
   persistInstalledApps();
   renderAppList();
   return record;
@@ -617,13 +616,12 @@ function broadcastToPeers(proto, payload) {
   }
 }
 
-function deliverChat(rec, senderPk, payload) {
-  const input = new Uint8Array(senderPk.length + payload.length);
-  input.set(senderPk, 0);
-  input.set(payload, senderPk.length);
+function renderLocal(rec, payload) {
+  const input = new Uint8Array(myKeys.publicKey.length + payload.length);
+  input.set(myKeys.publicKey, 0);
+  input.set(payload, myKeys.publicKey.length);
   const render = shell.host.callHandler(rec.handlerName, input);
-  if (render && rec.key === activeAppKey) deliverRender(new Uint8Array(render));
-  return render;
+  if (render) deliverRender(new Uint8Array(render));
 }
 
 // Broadcast the stored bundle for `id` to every open peer. Anyone who receives
@@ -915,7 +913,7 @@ window.addEventListener("message", (ev) => {
     // Fire-and-forget to every linked peer over Transport — one plane.
     broadcastToPeers(proto, chatBytes);
     // Local echo: run the handler directly, render if active.
-    deliverChat(active, myKeys.publicKey, chatBytes);
+    renderLocal(active, chatBytes);
     if (msg.chatType === 0x02) {
       // Sticky "presence" replay: nick announcements are cached and
       // re-broadcast on every newly-opened dc so peers joining mid-session
@@ -1014,23 +1012,21 @@ shell = createShell({
   },
 });
 
-// One plane, one dispatch scheme: Transport.onRequest answers all inbound messages.
-// An inbound frame names a protocol id (§12.10); the handler resolves it through
-// bindings to the installed app. The custom FRAME_CHAT / FRAME_OFFER framing that
-// used to live here is gone.
+// One plane, one dispatch scheme: the shell owns the shared dispatch (§12.10).
+// An inbound frame names a protocol id; the shell resolves it through bindings
+// to the installed app, calls the right handler, and returns the response.
+// The only special protocol is _offer (bundle transit), which we handle directly.
 shell.transport.onRequest((from, proto, payload) => {
-  // Bundle offers ride the same Transport, with a well-known protocol id.
   if (proto === OFFER_PROTO) {
     handleOffer(payload, from).catch(() => {});
     return null;
   }
-  const appKey = shell.bindings.boundApp(proto);
-  if (!appKey) return null;
-  const rec = installedApps.get(appKey);
-  if (!rec) return null;
-  const senderBytes = hexToBytes(from);
-  const render = deliverChat(rec, senderBytes, payload);
-  return render;
+  const result = shell.dispatch(from, proto, payload);
+  if (result) {
+    const appKey = shell.bindings.boundApp(proto);
+    if (appKey === activeAppKey) deliverRender(new Uint8Array(result));
+  }
+  return result;
 });
 
 // Boot the app registry now that the shell and the transport are wired: render the

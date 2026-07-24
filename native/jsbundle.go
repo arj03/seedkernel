@@ -20,3 +20,10 @@ var hostNetRouteJS string
 //
 //go:embed host-ws.gen.js
 var hostWsJS string
+
+// hostBindingsJS is the shared protocol bindings table (bindings.ts Bindings class),
+// bundled from build/host/bindings.js. It runs in QuickJS so proto → appKey dispatch
+// shares one implementation across all three targets (§12.10).
+//
+//go:embed host-bindings.gen.js
+var hostBindingsJS string

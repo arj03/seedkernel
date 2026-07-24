@@ -32,7 +32,7 @@ import { Bindings } from "./bindings.js";
 // its module graph, which is what lets shell-core load as plain ESM in the browser.
 import type { SafeRealm, SafeRealmBridge } from "./safe-js.js";
 import type { Fs } from "./fs.js";
-import { toHex } from "./util.js";
+import { toHex, fromHex } from "./util.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
  *  (BundleCrypto) plus the cap-bridge crypto ops (CapSodium). Any sumo libsodium
@@ -96,8 +96,8 @@ export { Bindings } from "./bindings.js";
 
 export interface Shell {
   /** The handler table: callHandler to reach installed handlers, isBound to
-   *  check occupancy, removeHandler to uninstall. installWasmHandler is NOT on
-   *  this interface — code lands only via loadBundleBlob (§12.4). */
+   *  check occupancy. installWasmHandler is NOT on this interface — code lands
+   *  only via loadBundleBlob (§12.4). */
   host: KernelTable;
   /** Protocol bindings (§12.10): which app handles which protocol. */
   bindings: Bindings;
@@ -114,19 +114,33 @@ export interface Shell {
    *  the §12.4 load order — the ONE install path. */
   loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
   /** Uninstall an app: remove every kernel handler derived from `appKey`,
-   *  drop every protocol binding for it, and — if this is the loaded guest —
-   *  dispose the confined realm. Returns true if any handlers were removed.
+   *  drop every protocol binding for it, and dispose the confined realm if
+   *  this was its last app. Returns true if any handlers were removed.
    *  The one uninstall path, symmetric with loadBundleBlob (§12.5). */
   uninstall(appKey: string): boolean;
   /** Run one of a loaded bundle's guest entrypoints through a generic
-   *  cap-bridge over the kernel's primitives. Load a guest bundle first.
-   *  Throws for handler-only bundles (no guest source). */
-  runGuest(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  /** Serve the app's request side: route incoming transport requests to the
-   *  loaded guest's `handle` entrypoint on the same confined realm. No-op for
-   *  handler-only bundles. */
-  serve(): Promise<void>;
+   *  cap-bridge over the kernel's primitives. `appKey` defaults to the
+   *  only loaded app; throws when more than one is loaded and no key is
+   *  given. Throws for handler-only bundles (no guest source). */
+  runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
+  /** Dispatch inbound request to the right app via protocol bindings (§12.10).
+   *  For a guest app: calls the confined realm's `handle` synchronously.
+   *  For a handler-only app: calls the kernel handler with senderPk ‖ payload.
+   *  Returns the response bytes, or null if no bound app handles the protocol. */
+  dispatch(from: PeerId, proto: string, payload: Uint8Array): Uint8Array | null;
+  /** Wire transport.onRequest to the shell's dispatch. An optional `onResult`
+   *  receives (appKey, result) after dispatch, before bytes go on the wire —
+   *  a UI shell uses this to render the result into an iframe. */
+  serve(onResult?: (appKey: string | null, result: Uint8Array | null) => void): Promise<void>;
   close(): void;
+}
+
+/** One installed app. A handler-only app has no realm. */
+interface AppSlot {
+  loaded: LoadedBundle;
+  realm: SafeRealm | null;
+  /** Kernel handler name for handler-only dispatch — the first module's name. */
+  handleName: string;
 }
 
 /** Assemble the platform-neutral shell. Every target calls this instead of
@@ -144,33 +158,36 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
   const transport = new Transport(peerId, platform.network, opts.timeoutMs ?? 2000);
   const peers = new Set<PeerId>(opts.peers ?? []);
 
-  let loaded: LoadedBundle | null = null;
-  let realm: SafeRealm | null = null;
-  let served = false;
+  const apps = new Map<string, AppSlot>();
+  let wired = false;
   // The tail of every initiator `runGuest` call. close() defers realm disposal onto
   // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
   // is never resumed into a freed realm — a QuickJS use-after-free (§2.1).
   let inFlight: Promise<unknown> = Promise.resolve();
 
-  const requireLoaded = (): LoadedBundle => {
-    if (!loaded) throw new Error("shell: load a bundle first (loadBundleBlob)");
-    return loaded;
+  /** The one app that was loaded, when exactly one is installed. Throws when zero
+   *  or multiple apps are present, so callers that omit an explicit appKey get a
+   *  clear error rather than silent ambiguity. */
+  const onlyApp = (): AppSlot => {
+    if (apps.size === 0) throw new Error("shell: load a bundle first (loadBundleBlob)");
+    if (apps.size > 1) throw new Error("shell: multiple apps loaded — supply appKey");
+    return [...apps.values()][0];
   };
 
-  /** The one confined realm, created lazily on first use. Both roles share it: the
-   *  async initiator (`runGuest` → realm.call) and the synchronous holder (`serve` →
-   *  realm.callSync), so the holder can answer re-entrantly while an initiator is
-   *  parked mid-await in the same realm (§2.1). safe-js (the QuickJS engine) is
-   *  imported here, lazily, so a handler-only shell never loads it. */
-  const ensureRealm = async (b: LoadedBundle): Promise<SafeRealm> => {
-    if (realm) return realm;
+  /** The confined realm for `slot`, created lazily on first use. Both roles share
+   *  it: the async initiator (`runGuest` → realm.call) and the synchronous holder
+   *  (`dispatch` → realm.callSync), so the holder can answer re-entrantly while an
+   *  initiator is parked mid-await in the same realm (§2.1). safe-js is imported
+   *  here, lazily, so a handler-only shell never loads it. */
+  const ensureRealm = async (slot: AppSlot): Promise<SafeRealm> => {
+    if (slot.realm) return slot.realm;
     const { createSafeRealm } = await import("./safe-js.js");
-    realm = await createSafeRealm({
-      source: guestFullSource(b),
-      bridge: buildBridge(b),
+    slot.realm = await createSafeRealm({
+      source: guestFullSource(slot.loaded),
+      bridge: buildBridge(slot.loaded),
       memoryLimitBytes: opts.realmMemoryBytes,
     });
-    return realm;
+    return slot.realm;
   };
 
   const buildBridge = (b: LoadedBundle): SafeRealmBridge => {
@@ -200,6 +217,23 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
 
   const hasGuest = (b: LoadedBundle): boolean => b.guestSource.length > 0;
 
+  const doDispatch = (from: PeerId, proto: string, payload: Uint8Array): Uint8Array | null => {
+    const key = bindings.boundApp(proto);
+    if (!key) return null;
+    const slot = apps.get(key);
+    if (!slot) return null;
+    if (hasGuest(slot.loaded)) {
+      if (!slot.realm) return null; // realm not yet created — serve() must be called first
+      return slot.realm.callSync("handle", payload);
+    }
+    if (!slot.handleName) return null;
+    const senderBytes = fromHex(from);
+    const input = new Uint8Array(senderBytes.length + payload.length);
+    input.set(senderBytes, 0);
+    input.set(payload, senderBytes.length);
+    return host.callHandler(slot.handleName, input);
+  };
+
   return {
     host,
     bindings,
@@ -214,52 +248,55 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       const v = verifyBundle(sodium, blob);
       const ok = await admit(v);
       if (!ok) throw new Error("bundle: rejected by admission predicate");
-      loaded = installBundle(host, v, platform.freshnessStore);
+      const loaded = installBundle(host, v, platform.freshnessStore);
       const key = appKeyFor(loaded.author, loaded.manifest.app);
       bindings.autoBind(key, handlesOf(loaded.manifest));
+      const handleName = loaded.manifest.modules.length > 0
+        ? kernelNameFor(loaded.author, loaded.manifest.app, loaded.manifest.modules[0].name)
+        : "";
+      apps.set(key, { loaded, realm: null, handleName });
       return loaded;
     },
     uninstall(appKey) {
       const removed = host.removePrefix(appKey + ":");
       bindings.removeApp(appKey);
-      if (loaded && appKeyFor(loaded.author, loaded.manifest.app) === appKey) {
-        realm?.dispose();
-        realm = null;
-        served = false;
-        loaded = null;
+      const slot = apps.get(appKey);
+      if (slot) {
+        slot.realm?.dispose();
+        apps.delete(appKey);
       }
       return removed > 0;
     },
-    async runGuest(entry, payload) {
-      const b = requireLoaded();
-      if (!hasGuest(b)) throw new Error("shell: no guest source — this is a handler-only bundle");
-      const r = await ensureRealm(b);
+    async runGuest(entry, payload, appKey) {
+      const slot = appKey ? apps.get(appKey) : onlyApp();
+      if (!slot) throw new Error(`shell: no app '${appKey}' loaded`);
+      if (!hasGuest(slot.loaded)) throw new Error("shell: no guest source — this is a handler-only bundle");
+      const r = await ensureRealm(slot);
       const call = r.call(entry, payload);
-      // Record the call so close() can wait it out before disposing the realm.
       inFlight = inFlight.then(() => call, () => call).catch(() => {});
       return call;
     },
-    async serve() {
-      // No bundle yet ⇒ nothing to serve. Do NOT latch `served`: a caller may serve()
-      // before loading and again after, and the second call must still wire the holder.
-      const b = loaded;
-      if (served || !b || !hasGuest(b)) return;
-      served = true;
-      const hr = await ensureRealm(b);
-      const appKey = appKeyFor(b.author, b.manifest.app);
-      transport.onRequest((_from, proto, payload) => {
-        // Only answer for protocols bound to our loaded app (§12.10).
-        const boundKey = bindings.boundApp(proto);
-        if (!boundKey || boundKey !== appKey) return null;
-        return hr.callSync("handle", payload);
+    dispatch: doDispatch,
+    async serve(onResult) {
+      for (const slot of apps.values()) {
+        if (hasGuest(slot.loaded)) await ensureRealm(slot);
+      }
+      wired = true;
+      transport.onRequest((from, proto, payload) => {
+        const result = doDispatch(from, proto, payload);
+        if (onResult) {
+          const appKey = bindings.boundApp(proto);
+          onResult(appKey, result);
+        }
+        return result;
       });
     },
     close() {
-      // Close the transport first so any parked initiator round trip settles (rejects
-      // as unreachable) rather than hanging, then dispose the realm only after the
-      // in-flight chain drains — disposing under a parked call is a use-after-free.
       transport.close();
-      const dispose = () => { realm?.dispose(); realm = null; };
+      const dispose = () => {
+        for (const slot of apps.values()) { slot.realm?.dispose(); }
+        apps.clear();
+      };
       inFlight.then(dispose, dispose);
     },
   };

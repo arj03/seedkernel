@@ -349,8 +349,8 @@ type loadedBundle struct {
 	// never leave the host.
 	modules map[string]string
 	// Protocol ids the app offers to serve (README §12.10), defaulted by the shared
-	// loader. The native target is a single-bundle runner, so it has no binding table to
-	// consult — it reports them so an operator can see what the app answers for.
+	// loader. Auto-bound into the bindings table after load so the shared dispatch
+	// can resolve proto → app instead of ignoring the proto.
 	handles []string
 }
 
@@ -617,6 +617,17 @@ func main() {
 	fmt.Println("  bundle " + bundleResult)
 	if strings.HasPrefix(bundleResult, "ERROR") {
 		os.Exit(1)
+	}
+
+	// Wire protocol bindings for the loaded app (§12.10): auto-bind each declared
+	// protocol to this app. The shared dispatch consults this table — a request
+	// whose protocol is not bound to an installed app is silently dropped.
+	if loaded != nil {
+		appKey := loaded.author + ":" + loaded.app
+		if _, err := qc.Eval("<bind>", qjs.Code(fmt.Sprintf(`__setupBindings(%q, %s)`, appKey, jsStrArray(loaded.handles)))); err != nil {
+			fatal("bindings", err)
+			return
+		}
 	}
 
 	var g *guestRealm
