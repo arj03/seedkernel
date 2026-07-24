@@ -22,8 +22,9 @@ import (
 // yielding, which is what lets it serve while an initiator is parked mid-await.
 const holderGuestSource = `
 	register("handle", (arg) => {
-	  const type = arg[0];
-	  const payload = arg.slice(1);
+	  const sender = arg.slice(0, 32);
+	  const type = arg[32];
+	  const payload = arg.slice(33);
 	  if (type === 1) { host.call(CAP_FS_PUT, payload); return new Uint8Array([1]); }
 	  if (type === 2) { return host.call(CAP_FS_GET, payload); }
 	  return new Uint8Array(0);

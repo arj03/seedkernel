@@ -259,7 +259,11 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     if (!slot) return null;
     if (hasGuest(slot.loaded)) {
       if (!slot.realm) return null; // realm not yet created — serve() must be called first
-      return slot.realm.callSync("handle", payload);
+      const senderBytes = fromHex(from);
+      const input = new Uint8Array(senderBytes.length + payload.length);
+      input.set(senderBytes, 0);
+      input.set(payload, senderBytes.length);
+      return slot.realm.callSync("handle", input);
     }
     if (!slot.handleName) return null;
     const senderBytes = fromHex(from);
