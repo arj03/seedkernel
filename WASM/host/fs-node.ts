@@ -18,11 +18,28 @@ import type { Fs, FsStat } from "./fs.js";
 // dot names, which are directory references, not files.
 const SAFE_KEY = /^(?!\.{1,2}$)[A-Za-z0-9._-]+$/;
 
+// Windows resolves these device names before touching the filesystem: opening
+// "CON"/"NUL"/"COM1"… (with or without an extension) hits the console, null, or
+// serial device, not a file. Rejected on every OS so the key space is identical
+// across Go and Bun nodes.
+const fsReserved = new Set<string>(["CON", "PRN", "AUX", "NUL"]);
+for (let i = 0; i <= 9; i++) {
+  fsReserved.add("COM" + i);
+  fsReserved.add("LPT" + i);
+}
+
+function fsReservedName(k: string): boolean {
+  const dot = k.indexOf(".");
+  const stem = dot >= 0 ? k.slice(0, dot) : k;
+  return fsReserved.has(stem.toUpperCase());
+}
+
 export class NodeFs implements Fs {
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }
 
   private path(key: string): string {
     if (!SAFE_KEY.test(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
+    if (fsReservedName(key)) throw new Error(`fs: reserved device name ${JSON.stringify(key)}`);
     return join(this.dir, key);
   }
 
