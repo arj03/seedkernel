@@ -9,14 +9,18 @@
 // it authenticates. The routing, striping, and double-connect rule live there.
 
 import type { Network, Endpoint, PeerId } from "./net.js";
-import { PeerLink, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { PeerLink, HalfOpenLimiter, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { LinkRouter } from "./link-router.js";
-import { toHex } from "./util.js";
+import { toHex, fromHex } from "./util.js";
 
 export interface PeerAddr {
   host: string;
   port: number;
   transport: "tcp" | "ws";
+  /** OPTIONAL contact secret for the peer at this address — THEIRS, not ours. It is what
+   *  makes an address a credential rather than merely a location: without it a dial to a
+   *  gated peer draws no response at all. Omitted for an open peer. */
+  contactSecret?: Uint8Array;
 }
 
 /** How the routing core opens sockets — the one platform seam. A target supplies
@@ -38,6 +42,19 @@ export interface ChannelFactory {
 
 export interface NodeNetworkCoreOptions {
   identity: Identity;
+  /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published with
+   *  our address to the peers we want to be able to reach us. A caller that cannot
+   *  produce it draws no response at all. Absent, this node is open: it answers anyone.
+   *
+   *  Per node, so a leak is contained to this node's inbound side — rotate it, re-issue
+   *  the address to our own peers, and nothing else in the network moves. See
+   *  PeerLinkOptions.contactSecret. */
+  contactSecret?: Uint8Array;
+  /** OPTIONAL network key: which network this node belongs to (staging vs production,
+   *  say). An isolation boundary, not a gate — nodes on different network keys cannot
+   *  complete a handshake under any circumstances. Public by design; see
+   *  PeerLinkOptions.networkKey. */
+  networkKey?: Uint8Array;
   sodium: TransportCrypto;
   channels: ChannelFactory;
   listen?: { host: string; port: number };
@@ -56,6 +73,24 @@ export interface NodeNetworkCoreOptions {
    *  mixed pools and dropped frames along the way. Don't stripe from both ends of the
    *  same peer pair. */
   connsPerPeer?: number;
+  /** Bounds concurrent half-open (accepted, not yet authenticated) links. Pass the
+   *  host's shared limiter to make the cap global across every transport it stands
+   *  up; omit it and this core makes its own, which is still a bound but only over
+   *  its own listeners. Only ACCEPTED links draw on it — a dial we chose to make is
+   *  our own resource decision, and counting it would let inbound pressure starve
+   *  outbound connectivity, which is the wrong way round. */
+  halfOpen?: HalfOpenLimiter;
+  /** Optional peer whitelist. Absent (the default) admits everyone.
+   *
+   *  One hook, wired to BOTH gates on every transport: PeerLink refuses during the
+   *  handshake, silently, before it will finish authenticating; LinkRouter refuses again
+   *  before the link is installed or delivers a frame. Same predicate, so a deployment
+   *  sets one thing and gets both.
+   *
+   *  Called with a peer id whose signature has already verified — never with a claimed
+   *  key, which is what let the old pre-signature filter be used as a membership oracle
+   *  (§12.6.2 §2.3). Keep it pure and fast; it runs per handshake. */
+  admitPeer?: (peerId: PeerId) => boolean;
 }
 
 export class NodeNetworkCore implements Network {
@@ -76,6 +111,10 @@ export class NodeNetworkCore implements Network {
   private readonly addrs = new Map<PeerId, PeerAddr>();
   private readonly authWaiters = new Set<() => void>();
   private readonly conns: number;
+  private readonly halfOpen: HalfOpenLimiter;
+  private readonly admitPeer?: (peerId: PeerId) => boolean;
+  private readonly contactSecret?: Uint8Array;
+  private readonly networkKey?: Uint8Array;
 
   private readonly listenOpt?: { host: string; port: number };
   private readonly wsListenOpt?: { host: string; port: number };
@@ -88,10 +127,16 @@ export class NodeNetworkCore implements Network {
     this.listenOpt = opts.listen;
     this.wsListenOpt = opts.wsListen;
     this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
+    // Injected when the host shares one limiter across transports; otherwise ours.
+    this.halfOpen = opts.halfOpen ?? new HalfOpenLimiter();
+    this.admitPeer = opts.admitPeer;
+    this.contactSecret = opts.contactSecret;
+    this.networkKey = opts.networkKey;
     // A server core has no roster gate and no cohort mirror; ready() waits on the
     // first link to each dialed peer, so onPeerUp wakes those waiters.
     this.router = new LinkRouter({
       ownPubkey: this.identity.publicKey, ownId: this.ownId,
+      admit: opts.admitPeer,
       onPeerUp: () => { for (const w of [...this.authWaiters]) w(); },
     });
   }
@@ -154,11 +199,17 @@ export class NodeNetworkCore implements Network {
   }
 
   close(): void {
-    this.router.closeAll();
-    for (const arr of this.connecting.values()) for (const l of arr) l.close();
-    for (const l of this.inbound) l.close();
+    // Snapshot and clear before closing: PeerLink.close() now reaches opts.onClose on
+    // every path, so forget() runs synchronously inside each close() and splices the
+    // very arrays this would otherwise be iterating (skipping elements, leaving links
+    // open). Clearing first also makes those forget() calls no-ops.
+    const pending: PeerLink[] = [];
+    for (const arr of this.connecting.values()) for (const l of arr) pending.push(l);
+    for (const l of this.inbound) pending.push(l);
     this.connecting.clear();
     this.inbound.clear();
+    this.router.closeAll();
+    for (const l of pending) l.close();
     this.channels.close();
   }
 
@@ -176,6 +227,10 @@ export class NodeNetworkCore implements Network {
       const link = new PeerLink({
         channel, identity: this.identity, sodium: this.sodium,
         weDialed: true, expectPeerId: peerId,
+        // Dialing: the secret gating the far end is THEIRS, carried by the address.
+        contactSecret: addr.contactSecret,
+        networkKey: this.networkKey,
+        admitPeer: this.admitPeer,
         onAuth: (pid, l) => this.onAuth(pid, l),
         onFrame: (pid, frame) => this.router.deliver(pid, frame),
         onClose: (l) => this.forget(l),
@@ -185,9 +240,18 @@ export class NodeNetworkCore implements Network {
   }
 
   private accept(channel: RawChannel): void {
+    // The one fully unauthenticated entry point in this transport: anyone who can reach
+    // the listener lands here. The limiter caps how many such links may be outstanding
+    // (globally and per source) and PeerLink puts a deadline on each, so a peer that
+    // connects and never speaks — or ten thousand that do — costs a bounded amount.
     const link = new PeerLink({
       channel, identity: this.identity, sodium: this.sodium,
       weDialed: false,
+      limiter: this.halfOpen,
+      // Accepting: the secret a caller must produce is OURS.
+      contactSecret: this.contactSecret,
+      networkKey: this.networkKey,
+      admitPeer: this.admitPeer,
       onAuth: (pid, l) => this.onAuth(pid, l),
       onFrame: (pid, frame) => this.router.deliver(pid, frame),
       onClose: (l) => this.forget(l),
@@ -227,14 +291,29 @@ export class NodeNetworkCore implements Network {
 
 export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
   const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`bad peer spec (want pk@host:port): ${spec}`);
-  const peerId = spec.slice(0, at).toLowerCase();
+  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@host:port): ${spec}`);
+  // `pk` names WHO lives there — it keys the address book, so dial-by-identity has
+  // something to look up. The optional `.secret` is the peer's contact secret, which is
+  // what makes the address a credential: without it a gated peer answers nothing. The two
+  // do different jobs, so the pk is not a security field and losing it would only cost
+  // routing.
+  const idPart = spec.slice(0, at).toLowerCase();
+  const dot = idPart.indexOf(".");
+  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
   if (peerId.length !== 64 || /[^0-9a-f]/.test(peerId)) throw new Error(`bad peer pubkey hex: ${spec}`);
+  let contactSecret: Uint8Array | undefined;
+  if (dot >= 0) {
+    const hex = idPart.slice(dot + 1);
+    if (hex.length !== 64 || /[^0-9a-f]/.test(hex)) {
+      throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
+    }
+    contactSecret = fromHex(hex);
+  }
   const hostPort = spec.slice(at + 1);
   const colon = hostPort.lastIndexOf(":");
   if (colon < 0) throw new Error(`bad peer host:port: ${spec}`);
   const host = hostPort.slice(0, colon);
   const port = Number(hostPort.slice(colon + 1));
   if (!Number.isInteger(port) || port <= 0) throw new Error(`bad peer port: ${spec}`);
-  return { peerId, addr: { host, port, transport } };
+  return { peerId, addr: { host, port, transport, contactSecret } };
 }

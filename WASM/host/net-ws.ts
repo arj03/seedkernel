@@ -24,7 +24,7 @@ import type { Network, Endpoint, PeerId } from "./net.js";
 import { PeerLink, type Identity, type TransportCrypto } from "./net-link.js";
 import { BufferedChannel } from "./net-channel.js";
 import { LinkRouter } from "./link-router.js";
-import { toHex } from "./util.js";
+import { toHex, fromHex } from "./util.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
  *  this module type-checks without committing to a DOM lib and accepts any
@@ -56,11 +56,26 @@ export class WsChannel extends BufferedChannel {
     ws.addEventListener("error", () => this.fail());
   }
   protected write(bytes: Uint8Array): void { this.ws.send(bytes); }
-  protected stop(): void { this.ws.close(); }
+  // WebSocket.close() sends the queued frames before the close frame, so a graceful
+  // stop needs nothing extra here.
+  protected stop(_graceful: boolean): void { this.ws.close(); }
 }
 
 export interface WsNetworkOptions {
   identity: Identity;
+  /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published with
+   *  our address to the peers we want to be able to reach us. A caller that cannot
+   *  produce it draws no response at all. Absent, this node is open: it answers anyone.
+   *
+   *  Per node, so a leak is contained to this node's inbound side — rotate it, re-issue
+   *  the address to our own peers, and nothing else in the network moves. See
+   *  PeerLinkOptions.contactSecret. */
+  contactSecret?: Uint8Array;
+  /** OPTIONAL network key: which network this node belongs to (staging vs production,
+   *  say). An isolation boundary, not a gate — nodes on different network keys cannot
+   *  complete a handshake under any circumstances. Public by design; see
+   *  PeerLinkOptions.networkKey. */
+  networkKey?: Uint8Array;
   sodium: TransportCrypto;
   /** Open a WebSocket to `url`. Defaults to the platform global, which is what a
    *  browser tab (and Node ≥22 / Bun) provide. Referenced only here, so importing
@@ -70,9 +85,17 @@ export interface WsNetworkOptions {
    *  these into a StorageNode's cohort (addPeer / removePeer), same as RtcNetwork. */
   onPeerUp?: (peerId: PeerId) => void;
   onPeerDown?: (peerId: PeerId) => void;
-  /** Optional roster gate applied *after* the identity handshake proves who the
-   *  peer is: an off-roster peer is dropped before any frame is delivered. */
-  admit?: (peerId: PeerId) => boolean;
+  /** Optional peer whitelist. Absent (the default) admits everyone.
+   *
+   *  One hook, wired to BOTH gates on every transport: PeerLink refuses during the
+   *  handshake, silently, before it will finish authenticating; LinkRouter refuses again
+   *  before the link is installed or delivers a frame. Same predicate, so a deployment
+   *  sets one thing and gets both.
+   *
+   *  Called with a peer id whose signature has already verified — never with a claimed
+   *  key, which is what let the old pre-signature filter be used as a membership oracle
+   *  (§12.6.2 §2.3). Keep it pure and fast; it runs per handshake. */
+  admitPeer?: (peerId: PeerId) => boolean;
   /** How many parallel connections to open per peer (default 1). Bulk PUT/GET
    *  stripes its frames round-robin across them — each still its own PeerLink and
    *  record session — so a high-RTT/lossy link that a single TCP flow can't fill is
@@ -100,7 +123,7 @@ export class WsNetwork implements Network {
     // outbound (weDialed = true), so its double-connect tie-break never fires.
     this.router = new LinkRouter({
       ownPubkey: opts.identity.publicKey, ownId: this.ownId,
-      admit: opts.admit, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
+      admit: opts.admitPeer, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
     });
   }
 
@@ -128,7 +151,7 @@ export class WsNetwork implements Network {
    *  early-return on "already dialing" would leave the pool permanently degraded to
    *  whatever survived). Returns the parsed peer id either way. */
   connect(spec: string): PeerId {
-    const { peerId, url } = parseWsPeer(spec);
+    const { peerId, contactSecret, url } = parseWsPeer(spec);
     if (peerId === this.ownId) return peerId;
     // `dialing` holds every live link we dialed to this peer — pre-auth AND post-auth
     // (promote() leaves them here; forget() removes one the instant it closes) — so its
@@ -144,6 +167,12 @@ export class WsNetwork implements Network {
         sodium: this.opts.sodium,
         weDialed: true,
         expectPeerId: peerId, // pin the far key to the address we dialed
+        // DIALING: the secret gating the far end is THEIRS, from the peer spec — not
+        // ours. Passing our own here seals msg1 under a secret the peer has never seen,
+        // so every dial to a gated peer draws silence.
+        contactSecret,
+        networkKey: this.opts.networkKey,
+        admitPeer: this.opts.admitPeer,
         // On auth the router installs the link and fires onPeerUp; if it declines
         // (off-roster), drop the link from `dialing` too so it isn't counted as a
         // live flow — a rejected link never fires its channel-close forget().
@@ -161,9 +190,14 @@ export class WsNetwork implements Network {
 
   /** Tear down every link. */
   close(): void {
-    for (const arr of this.dialing.values()) for (const l of arr) l.close();
+    // Snapshot and clear first: PeerLink.close() now reaches opts.onClose on every path,
+    // so forget() runs synchronously inside each close() and splices the arrays this
+    // loop is walking. Clearing up front also makes those forget() calls no-ops.
+    const pending: PeerLink[] = [];
+    for (const arr of this.dialing.values()) for (const l of arr) pending.push(l);
     this.dialing.clear();
     this.router.closeAll(); // authenticated links also live in `dialing`; double-close is a no-op
+    for (const l of pending) l.close();
   }
 
   // A link died (channel close) or was declined by the roster: remove it from the
@@ -180,14 +214,25 @@ export class WsNetwork implements Network {
 /** Parse a `pubkey@host:port` (or `pubkey@ws://host:port[/path]`) cohort peer spec
  *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
  *  ws:// scheme; pass wss:// explicitly for TLS. */
-export function parseWsPeer(spec: string): { peerId: PeerId; url: string } {
+export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
   const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`ws peer must be pubkey@host:port, got ${spec}`);
-  const peerId = spec.slice(0, at).trim().toLowerCase();
+  if (at < 0) throw new Error(`ws peer must be pubkey[.secret]@host:port, got ${spec}`);
+  // `pk` names WHO lives there and keys the peer table; the optional `.secret` is THAT
+  // PEER's contact secret, which is what our opening message must be sealed under. They
+  // do different jobs — the pk is routing, the secret is the credential.
+  const idPart = spec.slice(0, at).trim().toLowerCase();
+  const dot = idPart.indexOf(".");
+  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
   if (!isHex64(peerId)) throw new Error(`ws peer id must be 32-byte hex, got ${peerId}`);
+  let contactSecret: Uint8Array | undefined;
+  if (dot >= 0) {
+    const hex = idPart.slice(dot + 1);
+    if (!isHex64(hex)) throw new Error(`ws peer contact secret must be 32-byte hex, got ${hex}`);
+    contactSecret = fromHex(hex);
+  }
   let url = spec.slice(at + 1).trim();
   if (!url.startsWith("ws://") && !url.startsWith("wss://")) url = "ws://" + url;
-  return { peerId, url };
+  return { peerId, contactSecret, url };
 }
 
 // The host JS carries no regex literals (the minifier treats every `/` as

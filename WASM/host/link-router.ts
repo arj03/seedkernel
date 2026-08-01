@@ -78,8 +78,17 @@ export class LinkRouter {
     const rival = pool.find((l) => l.weDialed !== link.weDialed);
     if (rival) {
       if (!this.canonicalKeep(link)) { link.close(); return false; }
-      rival.close();
+      // Order matters: PeerLink.close() now reaches opts.onClose on every path, so the
+      // transport's forget() — and through it remove() — runs synchronously inside
+      // rival.close(). Splice the rival out FIRST so remove() finds nothing to do.
+      // Closing first would have remove() splice it, leaving indexOf(rival) === -1 here
+      // and splice(-1, 1) silently dropping a healthy parallel flow instead; and where
+      // the rival was the peer's only link, remove() would fire a spurious onPeerDown
+      // for a peer that never actually went down, with no matching up edge (wasEmpty is
+      // already false, so promote() does not re-fire onPeerUp).
       pool.splice(pool.indexOf(rival), 1);
+      this.links.set(peerId, pool);
+      rival.close();
     }
     pool.push(link);
     this.links.set(peerId, pool);
@@ -122,8 +131,16 @@ export class LinkRouter {
   /** Close every authenticated link and clear the tables. The transport clears its
    *  own pre-auth bookkeeping; double-closing a link it also tracks is a no-op. */
   closeAll(): void {
-    for (const pool of this.links.values()) for (const l of pool) l.close();
+    // Snapshot, then clear, then close. close() reaches the transport's forget() and so
+    // remove(), which splices these very pools and deletes map entries — mutating what
+    // we would otherwise be iterating. Clearing the tables before closing also keeps a
+    // deliberate shutdown quiet: remove() finds nothing, so no onPeerDown storm is
+    // emitted for a fleet that is being torn down on purpose (the previous behaviour,
+    // when a self-close notified nobody at all).
+    const all: PeerLink[] = [];
+    for (const pool of this.links.values()) for (const l of pool) all.push(l);
     this.links.clear();
     this.rr.clear();
+    for (const l of all) l.close();
   }
 }

@@ -13,7 +13,7 @@
 // handshake finishes — so frames queue until the channel opens.
 
 import { encodeFrame, wsAcceptKey, wsClientKey, WsParser, WS_OPCODES } from "./ws/ws-codec.js";
-import type { TransportCrypto } from "./net-link.js";
+import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES, type TransportCrypto } from "./net-link.js";
 import { BufferedChannel } from "./net-channel.js";
 
 const MAX_WS_HANDSHAKE = 16 * 1024; // an HTTP upgrade request is tiny
@@ -30,6 +30,8 @@ export interface RawByteStream {
 }
 
 const utf8 = new TextEncoder();
+/** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
+const CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 
 abstract class WsChannelBase extends BufferedChannel {
   private readonly parser: WsParser;
@@ -37,7 +39,8 @@ abstract class WsChannelBase extends BufferedChannel {
 
   constructor(protected readonly stream: RawByteStream, expectMasked: boolean) {
     super();
-    this.parser = new WsParser(expectMasked);
+    // Pre-auth the parser stages only handshake-sized frames; PeerLink raises it.
+    this.parser = new WsParser(expectMasked, MAX_HANDSHAKE_FRAME_BYTES);
     stream.onData((chunk) => this.onData(chunk));
     stream.onClose(() => this.fail());
   }
@@ -55,7 +58,20 @@ abstract class WsChannelBase extends BufferedChannel {
     this.stream.write(encodeFrame(WS_OPCODES.OP_BINARY, bytes, this.mask()));
   }
 
-  protected stop(): void { this.stream.close(); }
+  // A graceful stop sends the RFC 6455 close frame first. It rides the same byte
+  // stream as the binary frame PeerLink just wrote, so it cannot overtake it — which
+  // is the ordering the end-of-stream record depends on. RawByteStream.close() has no
+  // flush of its own (each target backs it with a different socket), so this frame is
+  // what makes the shutdown observably clean rather than a cut.
+  protected stop(graceful: boolean): void {
+    if (graceful) {
+      try { this.stream.write(encodeFrame(WS_OPCODES.OP_CLOSE, CLOSE_NORMAL, this.mask())); }
+      catch { /* stream already gone */ }
+    }
+    this.stream.close();
+  }
+
+  allowLargeFrames(): void { this.parser.setCap(MAX_FRAME_BYTES); }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -78,14 +94,19 @@ abstract class WsChannelBase extends BufferedChannel {
   }
 
   private feedFrames(chunk: Uint8Array): void {
-    let frames;
-    try { frames = this.parser.push(chunk); }
-    catch { this.fail(); return; }
-    for (const f of frames) {
-      if (f.opcode === WS_OPCODES.OP_BINARY) this.deliver(f.payload);
-      else if (f.opcode === WS_OPCODES.OP_PING) this.stream.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, this.mask()));
-      else if (f.opcode === WS_OPCODES.OP_CLOSE) { this.fail(); return; }
-    }
+    // Deliver as each frame is parsed rather than after the whole chunk: delivering msg4
+    // raises the frame cap, and an application frame riding the same TCP segment must be
+    // measured against the raised cap, not the pre-auth one.
+    let closed = false;
+    try {
+      this.parser.push(chunk, (f) => {
+        if (closed || this.dead) return;
+        if (f.opcode === WS_OPCODES.OP_BINARY) this.deliver(f.payload);
+        else if (f.opcode === WS_OPCODES.OP_PING) this.stream.write(encodeFrame(WS_OPCODES.OP_PONG, f.payload, this.mask()));
+        else if (f.opcode === WS_OPCODES.OP_CLOSE) closed = true;
+      });
+    } catch { this.fail(); return; }
+    if (closed) this.fail();
   }
 }
 

@@ -29,6 +29,11 @@ const sodium = await loadSodium();
 // (NodeNetwork) and the no-cap `./ws` framing module — so they are exercised here,
 // where they live, rather than only from a downstream consumer.
 const { NodeNetwork } = await imp("build/host/net-node.js");
+
+// One contact secret for the whole harness. In production each node has its own and
+// hands it out with its address; a single value here just means every test node is
+// reachable by every other.
+const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
 const { CAP, createCapBridge, opsForCaps, guestSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES }
   = await imp("build/host/cap-bridge.js");
@@ -611,12 +616,12 @@ async function testChannelPinning() {
   console.log("Test: a connection is pinned to the peer's key — wrong key → no delivery");
 
   const idS = generateKeyPair(), idB = generateKeyPair();
-  const netS = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port: 0 } });
+  const netS = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port: 0 } });
   await netS.start();
   let received = 0;
   netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
 
-  const netB = new NodeNetwork({ identity: idB, sodium }); // dials out only
+  const netB = new NodeNetwork({ identity: idB, contactSecret: TEST_CONTACT, sodium }); // dials out only
   const epB = netB.endpoint(toHex(idB.publicKey));
   epB.onFrame(() => {});
 
@@ -630,7 +635,8 @@ async function testChannelPinning() {
     assertEqual(received, 0, "frame to a mismatched identity is never delivered");
 
     // Now address S by its true id: the handshake succeeds and the frame arrives.
-    netB.addPeerAddr(toHex(idS.publicKey), { host: "127.0.0.1", port: netS.port, transport: "tcp" });
+    netB.addPeerAddr(toHex(idS.publicKey),
+      { host: "127.0.0.1", port: netS.port, transport: "tcp", contactSecret: TEST_CONTACT });
     epB.send(toHex(idS.publicKey), new Uint8Array([4, 5, 6]));
     await sleep(200);
     assertEqual(received, 1, "frame to the correct identity is delivered");
@@ -1301,22 +1307,25 @@ async function testRedialAfterFailedDial() {
 
   const idS = generateKeyPair(), idB = generateKeyPair();
   // Reserve a port, then free it so the first dial hits ECONNREFUSED.
-  const probe = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port: 0 } });
+  const probe = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port: 0 } });
   await probe.start();
   const port = probe.port;
   probe.close();
   await sleep(50);
 
-  const netB = new NodeNetwork({ identity: idB, sodium });
+  const netB = new NodeNetwork({ identity: idB, contactSecret: TEST_CONTACT, sodium });
   const epB = netB.endpoint(toHex(idB.publicKey));
   epB.onFrame(() => {});
   let netS = null;
   try {
-    netB.addPeerAddr(toHex(idS.publicKey), { host: "127.0.0.1", port, transport: "tcp" });
+    // Dialing gates on the secret of the far end, so it rides on the ADDRESS, not on
+    // our own constructor (which only says what we demand of callers we accept).
+    netB.addPeerAddr(toHex(idS.publicKey),
+      { host: "127.0.0.1", port, transport: "tcp", contactSecret: TEST_CONTACT });
     epB.send(toHex(idS.publicKey), new Uint8Array([1]));
     await sleep(200); // the dial fails; the stale connecting entry must be cleaned up
 
-    netS = new NodeNetwork({ identity: idS, sodium, listen: { host: "127.0.0.1", port } });
+    netS = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port } });
     await netS.start();
     let received = 0;
     netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
@@ -1381,15 +1390,16 @@ async function testConnsPerPeerFanout() {
   };
 
   const idS = generateKeyPair(), idC = generateKeyPair();
-  const server = new NodeNetworkCore({ identity: idS, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
+  const server = new NodeNetworkCore({ identity: idS, contactSecret: TEST_CONTACT, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
   await server.start();
   const got = [];
   server.endpoint(toHex(idS.publicKey)).onFrame((_from, frame) => got.push(frame));
 
-  const client = new NodeNetworkCore({ identity: idC, sodium, channels: clientFactory, connsPerPeer: 3 });
+  const client = new NodeNetworkCore({ identity: idC, contactSecret: TEST_CONTACT, sodium, channels: clientFactory, connsPerPeer: 3 });
   const epC = client.endpoint(toHex(idC.publicKey));
   epC.onFrame(() => {});
-  client.addPeerAddr(toHex(idS.publicKey), { host: "x", port: 1, transport: "tcp" });
+  client.addPeerAddr(toHex(idS.publicKey),
+    { host: "x", port: 1, transport: "tcp", contactSecret: TEST_CONTACT });
   const sendC = (bytes) => epC.send(toHex(idS.publicKey), bytes);
 
   try {
@@ -2045,20 +2055,24 @@ async function testHelloSuiteByte() {
 
   // 1. An unknown suite id in HELLO is refused outright — the link never authenticates.
   //    This is the clean-failure property: a node meeting a handshake it does not speak
-  //    closes, instead of parsing another format's bytes at this format's offsets.
+  //    refuses, instead of parsing another format's bytes at this format's offsets.
+  //    Under suite 0x02 the refusal is SILENT (PeerLink.stall, §12.6.2): closing would
+  //    tell the prober it had reached a seedkernel node, which is the oracle this suite
+  //    exists to remove. So the assertion is "never authenticates, never answers" —
+  //    the link is left to the handshake deadline, indistinguishable from a dead port.
   {
     const st = await run((m) => { if (m[0] === 1 /* MSG_HELLO */) m[1] = 0x7f; return m; });
     assert(!st.bAuthed, "a HELLO carrying an unknown suite id never authenticates");
-    assert(st.bClosed, "an unknown suite closes the link");
+    assert(!st.bClosed, "an unknown suite is refused silently — no close to probe with");
   }
 
-  // 2. Downgrade: flipping the suite byte in flight does not select another suite — B
-  //    now hashes a different half into its transcript than A signed, so AUTH fails.
-  //    (Here the flip is to a byte B rejects outright; the point is that even if a
-  //    future B *did* accept it, the transcript mismatch still denies the attacker a
-  //    completed session.) The byte is authenticated, so it cannot be forced.
+  // 2. Downgrade: flipping the suite byte in flight does not select another suite. The
+  //    byte is hashed into the transcript both AUTHs cover, so a flip B *did* accept
+  //    would still leave B hashing a different half than A signed and deny the attacker
+  //    a completed session; today B refuses at parse, one suite earlier. Either way
+  //    NEITHER side ends up authenticated — the byte cannot be forced.
   {
-    const st = await run((m) => { if (m[0] === 1) m[1] = 0x02; return m; });
+    const st = await run((m) => { if (m[0] === 1) m[1] = 0x01; return m; });
     assert(!st.aAuthed && !st.bAuthed, "a suite byte flipped in flight yields no authenticated session");
   }
 

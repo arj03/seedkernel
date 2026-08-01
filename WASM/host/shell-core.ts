@@ -91,7 +91,12 @@ export interface KernelBackend extends BundleHost, KernelTable {
  *  through to the cap-bridge. */
 export interface ShellPlatform {
   sodium: ShellSodium;
+  /** The CHANNEL keypair — its public half is this node's peer id. */
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
+  /** The GUEST signing keypair (§12.9), a sibling subkey. The cap-bridge SIGN op uses
+   *  this and nothing else, so a guest can never elicit a channel signature. Defaults to
+   *  `identity` for hosts that supply a single keypair. */
+  guestIdentity?: { publicKey: Uint8Array; privateKey: Uint8Array };
   /** The handler table this shell binds bundle modules into (§3). */
   kernel: KernelBackend;
   fs?: Fs;
@@ -261,7 +266,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     const modMap = Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)]));
     return createCapBridge({
       sodium: platform.sodium,
-      identity: platform.identity,
+      identity: platform.guestIdentity ?? platform.identity,
       callHandler: (name, p) => host.callHandler(name, p),
       transport, peers: livePeers,
       // Scoped to this app key, so `fs` grants reach over this app's own keyspace and

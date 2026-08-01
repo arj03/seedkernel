@@ -37,7 +37,7 @@ func bootRealmIn(tb testing.TB, dir string) {
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
-	cfg := nodeConfig{KeyHex: testKeyHex(tb), Listen: listen, TimeoutMs: 2000}
+	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, TimeoutMs: 2000}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON
 	}
@@ -47,6 +47,11 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 	}
 	return st
 }
+
+// testContactSecretHex is the deployment secret every test node shares: it gates who may
+// draw any response at all from a node, so two nodes on different values are mutually
+// invisible. One value here means one deployment.
+const testContactSecretHex = "0303030303030303030303030303030303030303030303030303030303030303"
 
 // testKeyHex mints a node identity. Go's ed25519 private key is seed‖public, which is
 // byte-for-byte what libsodium calls a secret key — the same 128 hex chars --key holds.

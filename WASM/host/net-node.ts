@@ -14,7 +14,7 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { NodeNetworkCore, type ChannelFactory, type PeerAddr } from "./net-route.js";
-import { MAX_FRAME_BYTES, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
 import { BufferedChannel } from "./net-channel.js";
 import { WsServerChannel, WsClientChannel, type RawByteStream } from "./net-frame.js";
 import { installWasmWsBackend } from "./ws/ws-wasm-backend.js";
@@ -32,6 +32,19 @@ installWasmWsBackend();
 
 export interface NodeNetworkOptions {
   identity: Identity;
+  /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published with
+   *  our address to the peers we want to be able to reach us. A caller that cannot
+   *  produce it draws no response at all. Absent, this node is open: it answers anyone.
+   *
+   *  Per node, so a leak is contained to this node's inbound side — rotate it, re-issue
+   *  the address to our own peers, and nothing else in the network moves. See
+   *  PeerLinkOptions.contactSecret. */
+  contactSecret?: Uint8Array;
+  /** OPTIONAL network key: which network this node belongs to (staging vs production,
+   *  say). An isolation boundary, not a gate — nodes on different network keys cannot
+   *  complete a handshake under any circumstances. Public by design; see
+   *  PeerLinkOptions.networkKey. */
+  networkKey?: Uint8Array;
   sodium: TransportCrypto;
   /** TCP listener for node↔node peers. Port 0 binds an ephemeral port. */
   listen?: { host: string; port: number };
@@ -52,11 +65,21 @@ export interface NodeNetworkOptions {
 // the length-prefix framing on write and its reassembly on receive. node:net buffers
 // writes issued before connect, so the channel is writable from birth — open() is
 // called straight away and the base's pre-open queue stays unused.
+/** How long a gracefully-closed socket may linger waiting for its FIN to flush
+ *  before it is destroyed outright. */
+const TCP_LINGER_MS = 5_000;
+
 class TcpChannel extends BufferedChannel {
   private readonly q = new ByteQueue();
+  /** The peer's IP, for the per-source half-open cap only (§12.6.1). Captured at
+   *  construction because `socket.remoteAddress` reads undefined once the socket is
+   *  destroyed, and the limiter must be able to release the same bucket it took.
+   *  Unauthenticated and spoofable at the IP level — never an identity. */
+  readonly remoteAddr?: string;
 
   constructor(private readonly socket: Socket) {
     super();
+    this.remoteAddr = socket.remoteAddress ?? undefined;
     this.open();
     socket.on("data", (chunk: Buffer) => this.onData(new Uint8Array(chunk)));
     socket.on("close", () => this.fail());
@@ -69,7 +92,23 @@ class TcpChannel extends BufferedChannel {
     out.set(bytes, 4);
     this.socket.write(out);
   }
-  protected stop(): void { this.socket.destroy(); }
+  // A graceful stop must FLUSH. `destroy()` drops whatever is still in the socket's
+  // write buffer, which for PeerLink means the end-of-stream record it just wrote is
+  // silently discarded and the peer reads a clean shutdown as a truncation. `end()`
+  // writes the queued bytes and then sends FIN. The linger timer is the backstop: a
+  // peer that never FINs back must not hold the socket open forever.
+  protected stop(graceful: boolean): void {
+    if (!graceful) { this.socket.destroy(); return; }
+    try {
+      this.socket.end();
+      const t = setTimeout(() => this.socket.destroy(), TCP_LINGER_MS);
+      (t as unknown as { unref?: () => void }).unref?.();
+    } catch { this.socket.destroy(); }
+  }
+
+  private frameCap = MAX_HANDSHAKE_FRAME_BYTES;
+
+  allowLargeFrames(): void { this.frameCap = MAX_FRAME_BYTES; }
 
   private onData(chunk: Uint8Array): void {
     if (this.dead) return;
@@ -78,7 +117,10 @@ class TcpChannel extends BufferedChannel {
       const head = this.q.peek(4);
       if (!head) break;
       const len = readU32BE(head, 0);
-      if (len > MAX_FRAME_BYTES) { this.fail(); return; }
+      // Pre-auth this is the small handshake cap, not MAX_FRAME_BYTES: a stranger who
+      // knows only host:port must not be able to reserve megabytes by declaring a frame
+      // and then dribbling it. PeerLink raises the cap on authentication.
+      if (len > this.frameCap) { this.fail(); return; }
       if (this.q.length < 4 + len) break;
       this.q.drop(4);
       this.deliver(this.q.take(len)!);

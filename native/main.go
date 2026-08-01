@@ -406,13 +406,14 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 // (host/native-shim.ts BootConfig). Parsing the flags is Go's job; acting on them is
 // the shell's, so they cross as data rather than as spliced-together JS.
 type nodeConfig struct {
-	PolicyJSON *string           `json:"policyJson"`
-	KeyHex     string            `json:"keyHex"`
-	Listen     *hostPort         `json:"listen,omitempty"`
-	WsListen   *hostPort         `json:"wsListen,omitempty"`
-	Peers      []string          `json:"peers,omitempty"`
-	TimeoutMs  int               `json:"timeoutMs,omitempty"`
-	Config     map[string]any    `json:"config,omitempty"`
+	PolicyJSON       *string        `json:"policyJson"`
+	KeyHex           string         `json:"keyHex"`
+	ContactSecretHex string         `json:"contactSecretHex"`
+	Listen           *hostPort      `json:"listen,omitempty"`
+	WsListen         *hostPort      `json:"wsListen,omitempty"`
+	Peers            []string       `json:"peers,omitempty"`
+	TimeoutMs        int            `json:"timeoutMs,omitempty"`
+	Config           map[string]any `json:"config,omitempty"`
 }
 
 type hostPort struct {
@@ -549,6 +550,7 @@ func writeFileAtomic(path string, b []byte) error {
 type cliArgs struct {
 	bundleDir, dataDir, policyPath, keyPath string
 	listen, wsListen, peers                 string
+	contactSecret                           string
 	put, get, out, appConfig                string
 	revokeKeys, uninstallApps               string
 	timeoutMs                               int
@@ -562,7 +564,8 @@ func parseCLI() cliArgs {
 	flag.StringVar(&a.policyPath, "policy", "", "policy JSON file: authors allowed to install (default: deny-all — no install lands)")
 	flag.StringVar(&a.listen, "listen", "", "TCP listen address (host:port)")
 	flag.StringVar(&a.wsListen, "ws-listen", "", "WebSocket listen address (host:port)")
-	flag.StringVar(&a.peers, "peers", "", "cohort peers to dial (pk@host:port,…)")
+	flag.StringVar(&a.peers, "peers", "", "cohort peers to dial (pk[.secret]@host:port,…)")
+	flag.StringVar(&a.contactSecret, "contact-secret", "", "32-byte hex contact secret callers must produce to reach us (default: open — answer anyone)")
 	flag.StringVar(&a.put, "put", "", "put a file, print its hash, and exit")
 	flag.StringVar(&a.get, "get", "", "get a hash and exit")
 	flag.StringVar(&a.out, "out", "", "output path for --get")
@@ -698,6 +701,24 @@ func main() {
 
 // ── CLI helpers ──────────────────────────────────────────────────────────────
 
+// parseContactSecret validates the -contact-secret flag: the secret we DEMAND of inbound
+// callers, 32 bytes of hex, or empty for an open node that answers anyone.
+//
+// Checked at STARTUP rather than left to the shell because a wrong contact secret has no
+// runtime symptom. A gated node refuses callers in silence (§12.6.2) — no close, no error
+// — so a typo here produces a node that looks perfectly healthy and is reachable by
+// nobody. Parse time is the only place an operator can still be told.
+func parseContactSecret(hexStr string) (string, error) {
+	if hexStr == "" {
+		return "", nil // absent means open, not "gate on the empty string"
+	}
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(b) != 32 {
+		return "", fmt.Errorf("contact-secret: want 32-byte hex, got %q", hexStr)
+	}
+	return hexStr, nil
+}
+
 // configFromCLI turns the parsed flags into the node config the realm boots from,
 // reading the two operator files (the policy and the app config) along the way.
 // Omitting --policy is not "no policy" but deny-all: the shell resolves a null policy
@@ -714,6 +735,9 @@ func configFromCLI(a cliArgs) (nodeConfig, error) {
 		cfg.PolicyJSON = &s
 	}
 	var err error
+	if cfg.ContactSecretHex, err = parseContactSecret(a.contactSecret); err != nil {
+		return cfg, err
+	}
 	if cfg.Listen, err = parseHostPort(a.listen); err != nil {
 		return cfg, fmt.Errorf("listen: %w", err)
 	}

@@ -52,7 +52,7 @@ Peers connect over a WebRTC mesh from `RtcNetwork` (`host/net-rtc.ts`, §12.7) �
 
 The relay is partitioned into **rooms** so one instance hosts many independent groups without cross-talk. A client picks its room as the URL path — `ws://host:8080/<room>` — and the relay forwards only between sockets sharing a room; a bare `/` lands in the default room `global`. Room names are URL-safe (`[A-Za-z0-9._-]`, ≤128 chars). The room is **not** an authenticated channel — knowing the name is the only credential, and the relay sees all signaling in its room — but the end-to-end identity binding below means a relay or room member cannot impersonate a peer, only observe SDP metadata and refuse to forward.
 
-`RtcNetwork` binds channel identity with `PeerLink`'s in-channel HELLO/AUTH challenge (`host/net-link.ts`, §12.6): each end proves it holds the private key for the pubkey it claims *before* any frame is delivered, then every later frame rides the §12.6 ChaCha20-Poly1305 record layer, attributed to that identity rather than to anything inside the frame. This is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` assertion at the signaling layer (RFC 8827 §5.6.4) — a MITM relay can splice SDP and bring DTLS up to itself, but can never complete AUTH without the peer's private key, so the link never authenticates and never delivers a byte. The record layer already makes every frame confidential and integrity-protected; the data channel's own DTLS is a redundant second layer underneath (§12.7).
+`RtcNetwork` binds channel identity with `PeerLink`'s in-channel handshake (`host/net-link.ts`, §12.6): each end proves it holds the private key for the identity it claims *before* any frame is delivered — and neither identity crosses the wire in the clear, then every later frame rides the §12.6 ChaCha20-Poly1305 record layer, attributed to that identity rather than to anything inside the frame. This is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` assertion at the signaling layer (RFC 8827 §5.6.4) — a MITM relay can splice SDP and bring DTLS up to itself, but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. The record layer already makes every frame confidential and integrity-protected; the data channel's own DTLS is a redundant second layer underneath (§12.7).
 
 The chat handler never reaches the UI itself: it is a pure transform that *returns* render bytes, which the shell forwards to the iframe by `postMessage`. The iframe is `sandbox="allow-scripts allow-forms"` with no same-origin access to the shell, so app-rendered content stays walled off from the shell's keys and peer state.
 
@@ -274,45 +274,170 @@ The *guest's* §12.2 cap domains are **not** gated by this file — they come fr
 
 ### 12.6 Node↔node transport: channel identity binding
 
-A real socket carries no trustworthy "from" field, so before a connection delivers frames it runs a mutual challenge/response (`host/net-link.ts`) proving each end holds the kernel private key for the pubkey it claims — the same binding `RtcNetwork` applies to each WebRTC data channel (§11, §12.7). `PeerLink` is transport-agnostic over any channel that delivers whole messages: raw TCP (length-prefix framing) node↔node, RFC 6455 WebSocket (`ws.wasm` framing) browser↔node (`host/net-node.ts`), or a WebRTC `RTCDataChannel` peer↔peer (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Every transport enforces one wire-visible frame cap, `MAX_FRAME_BYTES` (16 MiB, §16.1), checked against the length prefix (TCP) or frame length (WS) **before** the body is buffered, so an unauthenticated peer cannot make a node allocate more than a single frame. TCP and WebSocket cap identically.
+A real socket carries no trustworthy "from" field, so before a connection delivers frames it runs a mutual challenge/response (`host/net-link.ts`) proving each end holds the kernel private key for the pubkey it claims — the same binding `RtcNetwork` applies to each WebRTC data channel (§11, §12.7). `PeerLink` is transport-agnostic over any channel that delivers whole messages: raw TCP (length-prefix framing) node↔node, RFC 6455 WebSocket (`ws.wasm` framing) browser↔node (`host/net-node.ts`), or a WebRTC `RTCDataChannel` peer↔peer (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Every transport checks a frame cap against the length prefix (TCP) or frame length (WS) **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). TCP and WebSocket cap identically.
 
-Three link-layer messages, each tagged with a leading type byte:
-
-```
-HELLO = [0x01][suite: 1][pubkey: 32][nonce: 32][eph: 32]   sent by both ends immediately
-AUTH  = [0x02][sig: 64]                                    sig = Ed25519(transcript) — see below
-FRAME = [0x03][AEAD record ..]                             accepted only after AUTH verifies
-```
-
-`eph` is a fresh **ephemeral X25519 public key**, generated per connection. AUTH signs the whole **transcript**, not just a nonce:
+Four handshake messages, each tagged with a leading type byte, then records:
 
 ```
-transcript = DOMAIN_channel ‖ lo ‖ hi
-             {lo, hi} = the two `suite ‖ pubkey ‖ nonce ‖ eph` halves (mine, the peer's) sorted by bytes
+                tag        body (the tag byte is not part of the length)
+msg1  i→r   HELLO 0x01   [suite: 1][eph_i: 32][seal(k1; nonce_i): 48]      81 B  contact proof, no identity
+msg2  r→i   AUTH  0x02   [eph_r: 32][seal(k2; nonce_r): 48]                80 B  contact proof, no identity
+msg3  i→r   AUTH  0x02   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]            112 B  the caller names itself
+msg4  r→i   AUTH  0x02   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]            112 B  the receiver answers, or not
+FRAME       FRAME 0x03   [AEAD record ..]                                        only after authentication
+
+Three of the four share the AUTH tag: which message a body is follows from the reader's
+role and how far the exchange has got, not from a tag, so there is nothing for an attacker
+to reorder by relabelling. Note `suite` is a *body* field of msg1 and distinct from the
+tag byte, which happens also to be 0x01.
 ```
 
-Both ends derive the *same* transcript — the two `suite ‖ pubkey ‖ nonce ‖ eph` halves ordered canonically, so dialer and accepter agree regardless of who opened the socket — each signs it and verifies the peer's AUTH against it.
+`eph` is a fresh **ephemeral X25519 public key**, generated per connection. `seal` is
+ChaCha20-Poly1305-IETF at nonce zero under the named key; each key encrypts exactly one
+message, so the nonce need never vary.
 
-**`suite` names the handshake, and is not negotiated.** `0x01` is the genesis suite (§16.1): Ed25519 identity, ephemeral X25519, ChaCha20-Poly1305 records. A link speaks exactly one suite — an unrecognised id closes the connection, and HELLO is a fixed width per suite, so trailing bytes are malformed rather than forward-compatible. There is no list, no fallback, and no "highest common" rule. What the byte buys is that **HELLO is self-describing**: a later suite may change every field width below it — an ML-KEM-768 encapsulation key is 1184 bytes against the 32 here — and the two formats are still unambiguous on the wire, so a migration is a rollout rather than a network-wide flag day (§14.1). Because the byte is the first thing in each transcript half, it is covered by both signatures: an in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies. A suite is *chosen* by the endpoints, never *forced* by the network. The HELLO body a node sends and the half it signs are one construction in `net-link.ts`, so the wire format and the signed format cannot drift apart. Because the signature commits to **both identities, both nonces, and both ephemeral keys**, a signature collected on one connection — even from a node used as a signing oracle — names the wrong peer elsewhere and fails to verify, closing the impersonation hole a nonce-only AUTH would leave (sign the victim's nonce, replay it as the victim); see §14. `DOMAIN_channel` is `"seedkernel-channel-id-v1\0"` — domain separation so a handshake signature cannot double as another protocol's over the same bytes. An outbound dial pins `expectPeerId`: if the far end's HELLO presents a different key, the link closes. Frames sent before authentication are queued, bounded by `MAX_QUEUE_BYTES` (1 MiB) with oldest-dropped — a byte bound, not a frame count — so a peer that never authenticates cannot make a node hoard memory.
+**Neither identity appears in cleartext, and only a dialer speaks unprompted.** An
+accepting node stays silent until a msg1 opens under its **contact secret** (§12.6.3), so a
+stranger who opens a socket sees what it would see from a port that is not listening. The
+caller then names itself at msg3, *before* the receiver has said anything about itself, so a
+caller the receiver declines learns nothing — not even whether the identity it dialed is
+there. Both identities travel under keys derived from `ee`, which dies with the connection.
+See [CHANNEL](CHANNEL.md) §3–§4 for why the identities are deferred and why the ordering is
+worth a second round trip.
 
-**The signed ephemeral key makes this an AKE.** Because the identity signature covers `eph`, the handshake is a SIGMA-style authenticated key exchange: the signature binds the key exchange, and — since it already covers *both* identities — there is no separate identity-MAC seam to get wrong. Once both AUTHs verify, each end computes the ephemeral–ephemeral DH `X25519(my_eph_sk, peer_eph_pk)` and derives two directional session keys from it and the transcript hash, `KDF(dh, transcript_hash, label)`, the canonical lo/hi ordering assigning directions (the `lo` end encrypts with `k_lo→hi`, decrypts with `k_hi→lo`; `hi` mirrors). Every post-AUTH FRAME is then a **ChaCha20-Poly1305-IETF record** under the sending key, with an implicit monotonic per-direction counter as the nonce and strict enforcement on receive. There is exactly one post-handshake frame type — the AEAD record — so no plane split, no downgrade seam. The identity Ed25519 key stays signing-only and never takes a DH role, disjoint from the sealed-box / Curve25519 uses of the node key (§12.9, §14).
-
-Above the link, `Transport` (`host/net.ts`) runs typed request/response inside the encrypted record channel — a single frame plane, no separate unauthenticated bulk path. There is no type byte: the runtime reads exactly one field — the protocol id — and routes on it; everything else is app bytes.
+The transcript root is `H(DOMAIN_channel ‖ network_key)`, so two networks derive disjoint
+keys and signatures (§12.6.3).
 
 ```
-req = [kind|flags][corr: u32][pidLen: u8][protocolId: utf8][payload ..]
-res = [kind][corr: u32][payload ..]
+root = H(DOMAIN_channel ‖ network_key)
+k1   = KDF(contact,      H(root ‖ suite ‖ eph_i))
+h1   = H(root ‖ msg1)
+ee   = X25519(eph_i_sk, eph_r) = X25519(eph_r_sk, eph_i)
+k2   = KDF(ee ‖ contact, h1)
+h2   = H(h1 ‖ msg2)     k3 = KDF(ee ‖ contact, h2)   sig_i = Ed25519(root ‖ h2 ‖ id_i)
+h3   = H(h2 ‖ msg3)     k4 = KDF(ee ‖ contact, h3)   sig_r = Ed25519(root ‖ h3 ‖ id_r)
+h4   = H(h3 ‖ msg4)     k_i2r, k_r2i = KDF(ee ‖ contact, h4, "…i->r-v1\0" / "…r->i-v1\0")
 ```
 
-`FLAG_NO_REPLY` (`0x80`, OR'd into the kind byte) makes a fire-and-forget request: the receiver still runs its handler, but skips the response frame. Block bytes ride this plane too (in seed store a STORE pushes bytes in a `req` body, a FETCH returns them in a `res` body), so the record layer authenticates and encrypts them like any frame; content-addressing (`genesisHash(bytes) == block_id`) stays the app-level admission check on those payloads, not the transport's integrity story. A response resolves only if it arrives from the peer the request went to, so a malicious cohort member cannot answer on another's behalf by guessing the counter. Scatter-gather is the guest's own: because `NET_SEND` hands it a real Promise (§12.2, §12.3), a fan-out is `Promise.all` over a distinct request per peer (broadcasting one payload is just N identical entries) — partial results by construction, since an unreachable peer resolves `[ok 0]` rather than rejecting the batch. The transport's one concurrency primitive is the single request/response.
+Both early messages carry a seal keyed by the contact secret, so neither side reveals an
+identity to a party without it.
 
-**What the handshake gives.** Because AUTH signs the full transcript, it authenticates that the far end held the claimed private key *for this exchange*: bound to the exact identities, nonces, and ephemeral keys that produced it, the signature cannot be harvested on one connection and replayed on another, and a signing oracle yields nothing reusable. The same signature binds the ephemeral keys, so the session is authenticated end to end. Every post-AUTH frame is then individually authenticated, confidential, and replay-protected (strict counter enforcement over the ordered channel), and the session is **forward-secret** because the DH keys are ephemeral — an in-path attacker who hijacks the live stream after authentication can neither read nor forge frames. `PeerLink` therefore needs no external tunnel (TLS, Noise); the record layer lives in the shared `net-link.ts`, uniform across TCP, WebSocket, and WebRTC. See §14.
+**`suite` names the handshake, and is not negotiated.** `0x02` is the concealed suite
+(§16.1): Ed25519 identity, ephemeral X25519, contact secret, ChaCha20-Poly1305 records. A
+link speaks exactly one suite — an unrecognised id draws silence, and every message is a
+fixed width per suite, so trailing bytes are malformed rather than forward-compatible.
+There is no list, no fallback, and no "highest common" rule. Suite `0x01`, which carried
+both identities in cleartext, is removed rather than disabled. Because the byte is folded
+into the transcript root at `h1`, both signatures cover it: an in-path attacker who flips
+it only makes the two ends sign different bytes. A suite is *chosen* by the endpoints,
+never *forced* by the network (§14.1). The bytes a node sends and the bytes it folds into
+the transcript are one construction in `net-link.ts`.
+
+**Each signature commits to its own identity and the whole transcript.** `sig_i` covers
+`DOMAIN_channel ‖ h2 ‖ id_i`, and `h2` chains `DOMAIN_channel`, msg1 and msg2 — hence the
+suite, both ephemeral keys and both nonces. So a signature collected on one connection,
+even from a node used as a signing oracle, names the wrong exchange elsewhere and fails to
+verify; see §14. The identity is committed explicitly because it travels *inside* a
+ciphertext rather than in the hashed wire bytes. `DOMAIN_channel` is
+`"seedkernel-channel-id-v1\0"` — domain separation so a handshake signature cannot double
+as another protocol's over the same bytes. An outbound dial pins `expectPeerId`: if msg4
+presents a different key, the link closes, and it closes *before* the dial is treated as
+live. Frames sent before authentication are queued, bounded by `MAX_QUEUE_BYTES` (1 MiB)
+with oldest-dropped — a byte bound, not a frame count — so a peer that never authenticates
+cannot make a node hoard memory.
+
+**This is an AKE.** The identity signatures cover the transcript that carries both
+ephemeral keys, so they authenticate the key exchange (SIGMA-style; since each signature
+already covers its own identity there is no separate identity-MAC seam). The responder
+authenticates at msg3 and may carry application data alongside msg4 (1.5 RTT); the
+initiator authenticates at msg4 (2 RTT). Session keys derive from `ee` and the contact
+secret over the full transcript hash, with roles assigning the directions — the initiator
+encrypts with `k_i2r` and decrypts with `k_r2i`, the responder mirrors. Every
+post-handshake FRAME is a **ChaCha20-Poly1305-IETF record** under the sending key, with an
+implicit monotonic per-direction `(epoch, counter)` nonce and strict enforcement on
+receive. There is exactly one post-handshake frame type — the AEAD record — so no plane
+split, no downgrade seam.
+
+**The handshake uses no long-term Diffie–Hellman key at all**: `ee` is ephemeral on both
+sides, and the contact secret and network key are KDF inputs. So the channel Ed25519 key
+stays signing-only and never takes a DH role (§14), and a node address needs no DH key —
+which is also why the post-quantum suite will not change the address format
+([CHANNEL](CHANNEL.md) §11).
+
+**Refusals are silent, and that is load-bearing.** Every way a handshake can fail before
+authentication — wrong contact secret, wrong network, malformed message, bad signature, an
+identity `admitPeer` declines — does nothing at all and lets the deadline expire. Closing
+on any of them would answer a question, which is the enumeration this suite exists to
+close. The one exception is an `expectPeerId` mismatch at msg4, which aborts: we named
+ourselves at msg3, so there is nothing left to hide. See §12.6.2 for what the silence costs
+and [CHANNEL](CHANNEL.md) §5 for why it is worth paying.
+
+#### 12.6.2 Half-open budgets
+
+A refused connection stays open until its deadline rather than being dropped, so the
+budgets are what stands between a stranger and the node. `HalfOpenLimiter` (`net-link.ts`)
+is injectable and shared by every transport a host stands up. Measured behaviour lives in
+`tests/net-link.load.test.mjs`; the reasoning is in [CHANNEL](CHANNEL.md) §5.
+
+- **No cryptography before proof.** An accepting link generates its ephemeral keypair only
+  once a msg1 opens; verifying msg1 is a hash and a Poly1305 check. A stranger costs a
+  socket, a timer and no asymmetric operations.
+- **Two budgets.** `MAX_HALF_OPEN_UNVERIFIED` (1024) for callers that have not yet produced
+  the contact secret, `MAX_HALF_OPEN_VERIFIED` (256) for those that have. A link is promoted
+  between them the moment its msg1 opens.
+- **Both budgets evict the oldest; neither refuses the newest.** Refusing lets a saturating
+  flood turn arriving peers away *at the door*, before they can prove anything — promotion
+  cannot rescue a connection that was never accepted. This applies to the verified tier
+  too: otherwise anyone holding the contact secret could saturate it and lock members out.
+- **`MAX_HALF_OPEN_PER_SOURCE` (8) is not evictable.** One address at its own limit is
+  refused outright, never allowed to push a different address out, so saturating the
+  unverified budget needs 128 distinct sources.
+- **Two deadlines.** `UNVERIFIED_TIMEOUT_MS` (2 s) until msg1 opens, `HANDSHAKE_TIMEOUT_MS`
+  (10 s) for the rest. Observing the longer one requires the contact secret, so the split
+  leaks nothing.
+- **`MAX_HANDSHAKE_FRAME_BYTES` (512) caps inbound reassembly pre-auth**, raised to
+  `MAX_FRAME_BYTES` via `RawChannel.allowLargeFrames()` on authentication. No handshake
+  message exceeds 113 bytes; applying the 16 MiB application cap to an unauthenticated peer
+  let a stranger reserve megabytes per connection.
+
+#### 12.6.2b One master seed, purpose-bound keys
+
+A node stores **one** secret: a 32-byte master seed. Every signing keypair is derived from
+it under a distinct, versioned label (`host/subkeys.ts`), so no key signs for two purposes.
+Two exist today: `channel`, whose public half **is** the peer id and which signs the
+handshake; and `guest`, used only by the cap-bridge `SIGN` op (§12.2). The master signs
+nothing itself, and derivation is deterministic, so a node rebuilds every subkey at boot
+with nothing extra to persist. Labels are closed and literal, never built from runtime
+data. Why this is worth having on top of domain separation: [CHANNEL](CHANNEL.md) §7.
+
+#### 12.6.3 The contact secret, the network key, and `admitPeer`
+
+Three values gate a link, answering different questions. Rationale for the scope of each —
+and why the contact secret is per node rather than per deployment or per pair — is in
+[CHANNEL](CHANNEL.md) §6.
+
+| | Scope | Secret? | Effect |
+| --- | --- | --- | --- |
+| **Contact secret** | per node | yes | A caller that cannot produce the *receiver's* secret draws no response. Distributed with the node's address, which makes an address a credential. Absent, the node is open and answers anyone — a DoS and caller-privacy posture, not an identity leak. |
+| **Network key** | per deployment | **no, public by design** | Which network this node belongs to. Nodes on different network keys cannot link under any circumstances. An isolation boundary — staging cannot reach production — not access control. |
+| **`admitPeer`** | per node | n/a | Optional whitelist, empty by default. Consulted only on an identity whose signature has verified. |
+
+The contact secret is mixed at msg1 together with the initiator's ephemeral, and into every
+later key. The network key is applied as a prologue: it seeds the transcript root, so every
+derived key *and* every signature preimage differs between networks and a cross-network
+handshake fails at the first message. `admitPeer` runs at both gates — in `PeerLink` at
+msg3, before msg4 is built, refusing by silence; and again in `LinkRouter.promote`, before
+the link is installed or delivers a frame.
+
+Revocation is key rotation in each case: a node dropping a peer rotates its contact secret,
+a network splitting rotates its network key. There is no separate mechanism, and the
+whitelist is not one.
 
 ### 12.7 Browser↔console WebRTC
 
 §12.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `peers` surface as the TCP and WebSocket transports.
 
-**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the relay (`scripts/relay.mjs`) is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and `Transport` (§12.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing `PeerLink` between two connected peers — and carries *no* SDP-fingerprint signature, because identity is proven in-channel: `PeerLink`'s HELLO/AUTH runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never complete AUTH without the peer's private key, so the link never authenticates and never delivers a byte. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. werift (pure-TS) is used over native `node-datachannel`, which segfaults under Bun.
+**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the relay (`scripts/relay.mjs`) is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and `Transport` (§12.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing `PeerLink` between two connected peers — and carries *no* SDP-fingerprint signature, because identity is proven in-channel: `PeerLink`'s handshake runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. Signaling must also supply the deployment's contact secret, without which a peer draws no response at all. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. werift (pure-TS) is used over native `node-datachannel`, which segfaults under Bun.
 
 **Confidentiality.** Like every transport, the WebRTC fabric's frames are confidential and integrity-protected by the §12.6 AKE record layer. A data channel is also DTLS-encrypted, a redundant-but-harmless second layer underneath. As on the raw transports, the in-channel AUTH supplies the identity binding DTLS alone does not (§11).
 

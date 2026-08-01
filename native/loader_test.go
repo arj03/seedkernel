@@ -63,3 +63,44 @@ func TestBundleModuleRuns(t *testing.T) {
 		t.Fatalf("bundle module echo = %q, want %q (module ran + host read its response)", r, msg)
 	}
 }
+
+// TestContactSecretFlag covers -contact-secret validation (parseContactSecret).
+//
+// Validation belongs at STARTUP because a wrong contact secret has no runtime symptom:
+// a gated node refuses callers in silence (§12.6.2), so a typo'd secret produces a node
+// that looks healthy and answers nobody. Failing at parse is the only place an operator
+// gets told. Empty stays empty — absent means "open", not "gate on the empty string".
+func TestContactSecretFlag(t *testing.T) {
+	const good = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+	for _, tc := range []struct {
+		name, in, want string
+		ok             bool
+	}{
+		{name: "absent leaves the node open", in: "", want: "", ok: true},
+		{name: "32-byte hex is accepted", in: good, want: good, ok: true},
+		{name: "non-hex is refused", in: "nothexatall", ok: false},
+		{name: "31 bytes is refused", in: good[:62], ok: false},
+		{name: "33 bytes is refused", in: good + "ab", ok: false},
+		{name: "odd-length hex is refused", in: good[:63], ok: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseContactSecret(tc.in)
+			if tc.ok {
+				if err != nil {
+					t.Fatalf("want accepted, got error: %v", err)
+				}
+				if got != tc.want {
+					t.Fatalf("ContactSecretHex = %q, want %q", got, tc.want)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want error for %q, got none (got=%q)", tc.in, got)
+			}
+			if !strings.Contains(err.Error(), "contact-secret") {
+				t.Fatalf("error should name the flag, got: %v", err)
+			}
+		})
+	}
+}

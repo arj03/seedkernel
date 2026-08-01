@@ -33,6 +33,11 @@ export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
  *  one connection and no other. */
 export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
 
+/** Subkey derivation (§12.9): `DOMAIN_subkey ‖ label ‖ master` hashed to a seed. Its own
+ *  domain so a derived seed can never coincide with any other hash this system computes,
+ *  and so the label space stays private to subkeys.ts. */
+export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
+
 // ── Algorithm suites ────────────────────────────────────────────────────────────
 //
 // A suite id is the first byte of the structure it governs *and* part of what that
@@ -51,8 +56,24 @@ export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
 // is at its own genesis algorithms. Never read one as the other, and never assume they
 // move together. See §14.1.
 
-/** Channel handshake (§12.6): Ed25519 identity · ephemeral X25519 · ChaCha20-Poly1305. */
+/** Channel handshake (§12.6): Ed25519 identity · ephemeral X25519 · ChaCha20-Poly1305.
+ *  Both identities ride in cleartext; see SUITE_CHANNEL_CONCEALED. */
 export const SUITE_CHANNEL_GENESIS = 0x01;
+
+/** Channel handshake with concealed identities (§12.6.2): a long-term X25519 key per
+ *  node in addition to the Ed25519 identity, and neither identity on the wire in clear.
+ *
+ *  The initiator proves prior knowledge of the responder's static key in its first
+ *  message, so a node never speaks to a peer that does not already know it — which is
+ *  what stops a scanner from reading identities off any listener it can reach. Both
+ *  identities then travel under keys derived from the ephemeral-ephemeral DH, so
+ *  seizing a node's long-term key later does not retroactively deanonymise the peers
+ *  that dialled it. Same record layer as 0x01 below the handshake.
+ *
+ *  A node that accepts BOTH suites has the concealment of neither: a scanner offers
+ *  0x01 and reads the cleartext HELLO. 0x01 acceptance is therefore a deployment
+ *  setting to be turned off, not a permanent compatibility mode (§12.6.2 phase 5). */
+export const SUITE_CHANNEL_CONCEALED = 0x02;
 
 /** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
 export const SUITE_MANIFEST_GENESIS = 0x01;

@@ -99,9 +99,25 @@ export class WsParser {
   private fragOpcode = -1;
   private frags: Uint8Array[] = [];
   private fragBytes = 0;
-  constructor(private readonly expectMasked: boolean) {}
+  /** Largest frame this parser will stage. Starts at the handshake cap so an
+   *  unauthenticated peer cannot reserve memory by declaring a large frame; raised once
+   *  the link authenticates. */
+  private cap: number;
+  constructor(private readonly expectMasked: boolean, cap: number = SCRATCH_MAX) { this.cap = cap; }
 
-  push(chunk: Uint8Array): WsFrame[] {
+  /** Raise the frame cap (called on authentication). */
+  setCap(cap: number): void { this.cap = cap; }
+
+  /** Parse whatever is complete in the queue.
+   *
+   *  `onFrame` is invoked AS EACH FRAME IS PARSED, not after the whole chunk. That
+   *  ordering is load-bearing: the caller may change `cap` in response to a frame — the
+   *  channel raises it once the link authenticates — and a batch-then-deliver parser
+   *  checks frame N+1 against the cap in force before frame N was seen. A msg4 and a
+   *  first application frame arriving in one TCP segment would then be rejected under
+   *  the pre-auth cap even though the link authenticated in between. Callers that do not
+   *  care can omit the callback and take the returned array. */
+  push(chunk: Uint8Array, onFrame?: (f: WsFrame) => void): WsFrame[] {
     this.q.push(chunk);
     const out: WsFrame[] = [];
     for (;;) {
@@ -109,7 +125,7 @@ export class WsParser {
       // frame arriving in many chunks is copied once, not once per chunk.
       const total = this.frameLength();
       if (total < 0) break;
-      if (total > SCRATCH_MAX) throw new Error("ws: oversize frame");
+      if (total > this.cap || total > SCRATCH_MAX) throw new Error("ws: oversize frame");
       if (this.q.length < total) break;
       const frame = this.q.take(total)!;
       const req = new Uint8Array(2 + frame.length);
@@ -133,7 +149,7 @@ export class WsParser {
           const whole = concatBytes(this.frags);
           const first = this.fragOpcode;
           this.fragOpcode = -1; this.frags = []; this.fragBytes = 0;
-          out.push({ opcode: first, payload: whole });
+          if (onFrame) onFrame({ opcode: first, payload: whole }); else out.push({ opcode: first, payload: whole });
         }
       } else if (!fin) {
         // first fragment of a data message (the module rejects fragmented
@@ -146,7 +162,7 @@ export class WsParser {
         // unfragmented frame; a *data* frame may not preempt an in-flight
         // fragmented message, but control frames interleave freely (§5.4)
         if (opcode < 0x8 && this.fragOpcode >= 0) throw new Error("ws: protocol error");
-        out.push({ opcode, payload });
+        if (onFrame) onFrame({ opcode, payload }); else out.push({ opcode, payload });
       }
     }
     return out;

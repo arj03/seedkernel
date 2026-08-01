@@ -27,6 +27,8 @@ import { type Network, type PeerId } from "./net.js";
 import { NodeFs } from "./fs-node.js";
 import type { Fs } from "./fs.js";
 import { toHex, fromHex, concatBytes } from "./util.js";
+import { type Identity } from "./net-link.js";
+import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto } from "./subkeys.js";
 import { createShell, KernelHost, type RealmFactory, type Shell as CoreShell, type KernelTable, type ShellSodium } from "./shell-core.js";
 
 type Sodium = Awaited<ReturnType<typeof loadSodium>>;
@@ -38,8 +40,16 @@ export interface ShellOptions {
   policyJson?: string;
   /** Directory backing the fs.* capability. */
   dir: string;
-  /** This node's kernel keypair (README §12.6). */
-  identity: { publicKey: Uint8Array; privateKey: Uint8Array };
+  /** This node's kernel keypair (README §12.6) — the CHANNEL subkey, whose public half
+   *  is the peer id. */
+  identity: Identity;
+  /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`, used only by
+   *  the cap-bridge SIGN op. Separate so guest signing structurally cannot produce a
+   *  channel handshake signature, whatever happens to the domain prefixes. Defaults to
+   *  `identity`, so an embedding host that supplies one keypair still works. */
+  guestIdentity?: Identity;
+  /** Optional deployment secret (§12.6.3). */
+  contactSecret?: Uint8Array;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
   /** Inject a Network (tests). Defaults to a NodeNetwork on listen/wsListen — the
@@ -135,7 +145,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
   const ownsNet = !opts.network;
   const net: Network = opts.network ?? new NodeNetwork({
-    identity: opts.identity, sodium, listen: opts.listen, wsListen: opts.wsListen,
+    identity: opts.identity, contactSecret: opts.contactSecret,
+    sodium, listen: opts.listen, wsListen: opts.wsListen,
   });
   if (ownsNet) await (net as NodeNetwork).start();
 
@@ -143,6 +154,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
   const core = createShell({
     platform: {
       sodium: sodium as unknown as ShellSodium, identity: opts.identity,
+      guestIdentity: opts.guestIdentity,
       kernel: new KernelHost(), fs, freshnessStore: freshness, network: net,
       createRealm, livePeers: opts.livePeers,
     },
@@ -209,17 +221,41 @@ function parseHostPort(s: string): { host: string; port: number } {
   return { host, port };
 }
 
-/** Load the identity from --key, or mint one and persist it. The libsodium
- *  ed25519 secret key is seed‖pubkey, so the 32-byte public key is its tail. */
-function loadIdentity(sodium: Sodium, keyPath: string): { publicKey: Uint8Array; privateKey: Uint8Array } {
+/** Load the node's MASTER SEED from --key, or mint one and persist it, and derive every
+ *  purpose-bound keypair from it (§12.9).
+ *
+ *  One secret on disk, 32 bytes. The master signs nothing itself — it only derives — so
+ *  the channel handshake and guest SIGN hold different keys and neither can produce a
+ *  signature for the other's purpose. Preimages are still domain-separated; separate keys
+ *  make cross-purpose forgery structurally impossible rather than merely incorrect.
+ *
+ *  The node's peer id is the CHANNEL subkey's public half. */
+function loadNodeKeys(sodium: Sodium, keyPath: string): NodeKeys {
   if (existsSync(keyPath)) {
-    const sk = fromHex(readFileSync(keyPath, "utf8").trim());
-    if (sk.length !== 64) throw new Error(`--key must hold a 64-byte secret key (got ${sk.length})`);
-    return { privateKey: sk, publicKey: sk.slice(32) };
+    const master = fromHex(readFileSync(keyPath, "utf8").trim());
+    if (master.length !== 32) throw new Error(`--key must hold a 32-byte master seed (got ${master.length})`);
+    return deriveNodeKeys(sodium as unknown as SubkeyCrypto, master);
   }
-  const kp = sodium.crypto_sign_keypair();
-  writeFileSync(keyPath, toHex(kp.privateKey), { mode: 0o600 });
-  return { privateKey: kp.privateKey, publicKey: kp.publicKey };
+  const master = sodium.randombytes_buf(32);
+  writeFileSync(keyPath, toHex(master), { mode: 0o600 });
+  return deriveNodeKeys(sodium as unknown as SubkeyCrypto, master);
+}
+
+/** Load the optional deployment secret from --contact-secret (a file holding 32 bytes of hex).
+ *
+ *  Omitting it is the DEFAULT and does not weaken identity concealment: with four
+ *  messages the caller names itself before the receiver does, so a caller the receiver
+ *  declines learns nothing either way, and both identities ride the ephemeral-ephemeral
+ *  secret regardless. What a roster key adds is a cheap gate in front of the responder's
+ *  keypair — so a stranger costs one AEAD open rather than a keygen and a scalarmult —
+ *  plus protection of the CALLER's identity against an active attacker who is not a
+ *  member. It costs one secret shared by the whole deployment, which a single compromised
+ *  node discloses for everyone, so it is opt-in. See §12.6.3. */
+function loadContactSecret(path: string | undefined): Uint8Array | undefined {
+  if (!path) return undefined;
+  const k = fromHex(readFileSync(path, "utf8").trim());
+  if (k.length !== 32) throw new Error(`--contact-secret must hold 32 bytes of hex (got ${k.length})`);
+  return k;
 }
 
 export async function main(): Promise<void> {
@@ -232,7 +268,9 @@ export async function main(): Promise<void> {
   const keyPath = str(args, "key", "./seedkernel.key")!;
 
   const sodium = await loadSodium();
-  const identity = loadIdentity(sodium, keyPath);
+  const keys = loadNodeKeys(sodium, keyPath);
+  const identity = keys.channel;
+  const contactSecret = loadContactSecret(str(args, "contact-secret"));
 
   // Operator-supplied app config (e.g. a storage node's quota), merged over the
   // bundle's author-signed config. Opaque JSON the shell forwards into `const APP`.
@@ -241,7 +279,7 @@ export async function main(): Promise<void> {
     : undefined;
 
   const shell = await boot({
-    policyJson, dir, identity,
+    policyJson, dir, identity, contactSecret,
     listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
     wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
     timeoutMs: args["timeout"] ? Number(str(args, "timeout")) : undefined,

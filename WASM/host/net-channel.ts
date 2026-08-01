@@ -17,7 +17,15 @@ export abstract class BufferedChannel implements RawChannel {
   protected dead = false;
 
   protected abstract write(bytes: Uint8Array): void; // put bytes on the open transport
-  protected abstract stop(): void;                    // tear it down (may throw; guarded)
+  /** Tear the transport down (may throw; guarded).
+   *
+   *  `graceful` asks for any already-written bytes to reach the wire before the
+   *  transport goes away. It exists for exactly one caller: PeerLink writes its
+   *  authenticated end-of-stream record and then closes, and on a transport that
+   *  discards buffered writes (a TCP socket destroyed rather than ended) that record
+   *  never leaves — so the far end sees precisely the truncation the record exists to
+   *  rule out. A subclass that flushes on close regardless may ignore the flag. */
+  protected abstract stop(graceful: boolean): void;
 
   send(bytes: Uint8Array): void {
     if (this.dead) return;
@@ -25,7 +33,11 @@ export abstract class BufferedChannel implements RawChannel {
   }
   onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
   onClose(cb: () => void): void { this.onCls = cb; }
-  close(): void { if (!this.dead) { this.dead = true; try { this.stop(); } catch { /* already gone */ } } }
+  close(graceful = false): void {
+    if (this.dead) return;
+    this.dead = true;
+    try { this.stop(graceful); } catch { /* already gone */ }
+  }
 
   /** The transport became writable — drain the pre-open buffer. Idempotent, so a
    *  transport writable from birth (a socket that buffers its own writes) calls it
@@ -45,7 +57,7 @@ export abstract class BufferedChannel implements RawChannel {
   protected fail(): void {
     if (this.dead) return;
     this.dead = true;
-    try { this.stop(); } catch { /* already gone */ }
+    try { this.stop(false); } catch { /* already gone */ }
     this.onCls?.();
   }
 }

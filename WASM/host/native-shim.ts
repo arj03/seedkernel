@@ -162,10 +162,11 @@ const channels: ChannelFactory = {
  *  Exported because the native tests stand up two of them in one realm. */
 function makeNetwork(
   identity: Identity,
+  contactSecret: Uint8Array | undefined,
   listen?: { host: string; port: number },
   wsListen?: { host: string; port: number },
 ): NodeNetworkCore {
-  return new NodeNetworkCore({ identity, sodium, channels, listen, wsListen });
+  return new NodeNetworkCore({ identity, contactSecret, sodium, channels, listen, wsListen });
 }
 
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm
@@ -221,6 +222,9 @@ interface BootConfig {
   policyJson: string | null;
   /** This node's 64-byte Ed25519 secret key, hex (libsodium sk = seed‖pk). */
   keyHex: string;
+  /** OPTIONAL deployment secret, hex (§12.6.3). Omit for an open network; identity
+   *  concealment does not depend on it. */
+  contactSecretHex?: string;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
   /** Cohort peers to dial, as `pk@host:port`. The network owns connectivity. */
@@ -268,7 +272,8 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
   const sk = fromHex(cfg.keyHex);
   const identity: Identity = { privateKey: sk, publicKey: sk.slice(32) };
 
-  const network = makeNetwork(identity, cfg.listen, cfg.wsListen);
+  const contactSecret = cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined;
+  const network = makeNetwork(identity, contactSecret, cfg.listen, cfg.wsListen);
   await network.start();
   for (const spec of cfg.peers ?? []) {
     const { peerId, addr } = parsePeerSpec(spec, "tcp");

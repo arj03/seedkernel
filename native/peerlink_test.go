@@ -40,6 +40,7 @@ func runHandshake(t *testing.T, connectFn, listenFn string) {
 		globalThis.__result = { aAuthed: false, bAuthed: false, aPeerId: "", bPeerId: "", frameFrom: "", frame: null };
 		globalThis.startTest = function () {
 		  const r = __result;
+		  const CONTACT = new Uint8Array(32).fill(3);
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();
 		  globalThis.__aPub = toHex(idA.publicKey);
@@ -48,7 +49,7 @@ func runHandshake(t *testing.T, connectFn, listenFn string) {
 
 		  const port = %s("127.0.0.1", 0, (channel) => {
 		    new PeerLink({
-		      channel, identity: idB, sodium, weDialed: false,
+		      channel, identity: idB, sodium, weDialed: false, contactSecret: CONTACT,
 		      onAuth: (peerId) => { r.bAuthed = true; r.bPeerId = peerId; maybeDone(); },
 		      onFrame: (peerId, frame) => { r.frameFrom = peerId; r.frame = frame; maybeDone(); },
 		      onClose: () => {},
@@ -57,7 +58,7 @@ func runHandshake(t *testing.T, connectFn, listenFn string) {
 
 		  const chA = %s("127.0.0.1", port);
 		  new PeerLink({
-		    channel: chA, identity: idA, sodium, weDialed: true,
+		    channel: chA, identity: idA, sodium, weDialed: true, contactSecret: CONTACT,
 		    expectPeerId: toHex(idB.publicKey),
 		    onAuth: (peerId, link) => { r.aAuthed = true; r.aPeerId = peerId; link.send(new Uint8Array([42, 7, 9])); maybeDone(); },
 		    onFrame: () => {},
@@ -109,17 +110,18 @@ func TestPeerLinkExpectPeerIdMismatch(t *testing.T) {
 		globalThis.__res = { aAuthed: false, bAuthed: false, bClosed: false };
 		globalThis.startTest = function () {
 		  const r = __res;
+		  const CONTACT = new Uint8Array(32).fill(3);
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();
 		  const idWrong = sodium.crypto_sign_keypair();
 		  const port = netListen("127.0.0.1", 0, (channel) => {
-		    new PeerLink({ channel, identity: idB, sodium, weDialed: false,
+		    new PeerLink({ channel, identity: idB, sodium, weDialed: false, contactSecret: CONTACT,
 		      onAuth: () => { r.bAuthed = true; }, onFrame: () => {},
 		      onClose: () => { r.bClosed = true; __signal(); } });
 		  });
 		  const chA = netConnect("127.0.0.1", port);
 		  new PeerLink({
-		    channel: chA, identity: idA, sodium, weDialed: true,
+		    channel: chA, identity: idA, sodium, weDialed: true, contactSecret: CONTACT,
 		    expectPeerId: toHex(idWrong.publicKey),
 		    onAuth: () => { r.aAuthed = true; __signal(); },
 		    onFrame: () => {},

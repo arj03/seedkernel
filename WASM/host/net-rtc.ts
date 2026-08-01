@@ -58,7 +58,9 @@ export class RtcChannel extends BufferedChannel {
   // SharedArrayBuffer); PeerLink frames are always plain Uint8Arrays over a real
   // ArrayBuffer, so the narrowing cast is sound.
   protected write(bytes: Uint8Array): void { this.dc.send(bytes as Uint8Array<ArrayBuffer>); }
-  protected stop(): void { this.dc.close(); }
+  // RTCDataChannel.close() drains bufferedAmount before the channel goes away, so a
+  // graceful stop needs nothing extra here.
+  protected stop(_graceful: boolean): void { this.dc.close(); }
 }
 
 // ── Signaling: a pluggable rendezvous for the SDP/ICE exchange ─────────────────
@@ -83,6 +85,22 @@ interface SignalMsg {
 
 export interface RtcNetworkOptions {
   identity: Identity;
+  /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published with
+   *  our address to the peers we want to be able to reach us. A caller that cannot
+   *  produce it draws no response at all. Absent, this node is open: it answers anyone.
+   *
+   *  Per node, so a leak is contained to this node's inbound side — rotate it, re-issue
+   *  the address to our own peers, and nothing else in the network moves. See
+   *  PeerLinkOptions.contactSecret. */
+  contactSecret?: Uint8Array;
+  /** OPTIONAL network key: which network this node belongs to (staging vs production,
+   *  say). An isolation boundary, not a gate — nodes on different network keys cannot
+   *  complete a handshake under any circumstances. Public by design; see
+   *  PeerLinkOptions.networkKey. */
+  networkKey?: Uint8Array;
+  /** Resolve a peer's contact secret when dialing it. Signaling already names the peer,
+   *  so it can carry the credential too. */
+  peerContactFor?: (peerId: PeerId) => Uint8Array | undefined;
   sodium: TransportCrypto;
   signaling: Signaling;
   /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
@@ -95,10 +113,17 @@ export interface RtcNetworkOptions {
    *  is referenced only inside ensurePeer(), never at module scope, so importing
    *  this module under Node without a factory stays safe. */
   peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
-  /** Optional roster gate: which peers we are willing to link with (e.g. a storage
-   *  cohort). Applied to signaling and at authentication, so an off-roster peer
-   *  never gets a connection or a frame. Default: admit everyone in the room. */
-  admit?: (peerId: PeerId) => boolean;
+  /** Optional peer whitelist. Absent (the default) admits everyone.
+   *
+   *  One hook, wired to BOTH gates on every transport: PeerLink refuses during the
+   *  handshake, silently, before it will finish authenticating; LinkRouter refuses again
+   *  before the link is installed or delivers a frame. Same predicate, so a deployment
+   *  sets one thing and gets both.
+   *
+   *  Called with a peer id whose signature has already verified — never with a claimed
+   *  key, which is what let the old pre-signature filter be used as a membership oracle
+   *  (§12.6.2 §2.3). Keep it pure and fast; it runs per handshake. */
+  admitPeer?: (peerId: PeerId) => boolean;
   /** Called when a peer's link authenticates / drops. The storage demo uses these
    *  to mirror the live mesh into a StorageNode's cohort (addPeer/removePeer). */
   onPeerUp?: (peerId: PeerId) => void;
@@ -143,7 +168,7 @@ export class RtcNetwork implements Network {
     // one channel per pair, so each pool is size ≤1 and the tie-break never fires.
     this.router = new LinkRouter({
       ownPubkey: opts.identity.publicKey, ownId: this.ownId,
-      admit: opts.admit, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
+      admit: opts.admitPeer, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
     });
     opts.signaling.onMessage((m) => this.onSignal(m));
   }
@@ -285,6 +310,9 @@ export class RtcNetwork implements Network {
       identity: this.opts.identity,
       sodium: this.opts.sodium,
       weDialed,
+      // Dialing gates on THEIR secret; accepting gates on ours.
+      contactSecret: weDialed ? this.opts.peerContactFor?.(peerId) : this.opts.contactSecret,
+      admitPeer: this.opts.admitPeer,
       expectPeerId: peerId, // PeerLink pins the far key to who signaling said it is
       onAuth: (pid, l) => this.onAuth(pid, l, e),
       onFrame: (pid, frame) => this.router.deliver(pid, frame),
@@ -313,7 +341,7 @@ export class RtcNetwork implements Network {
   private async onSignal(msg: SignalMsg): Promise<void> {
     if (!msg || typeof msg !== "object") return;
     if (msg.from === this.ownId || (msg.to && msg.to !== this.ownId)) return;
-    if (this.opts.admit && !this.opts.admit(msg.from)) return; // ignore off-roster peers
+    if (this.opts.admitPeer && !this.opts.admitPeer(msg.from)) return; // ignore non-whitelisted peers
     try {
       if (msg.type === "hello") await this.onHello(msg);
       else if (msg.type === "sdp") await this.onSdp(msg);
