@@ -14,7 +14,10 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { NodeNetworkCore, type ChannelFactory, type PeerAddr } from "./net-route.js";
-import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES, type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+import { type RawChannel, type Identity, type TransportCrypto } from "./net-link.js";
+// From the core, never from net-link.js: this file is the one holding the descriptor, so
+// it must not take its flood bound from the module it is bounding (net-limits.ts).
+import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "./net-limits.js";
 import { BufferedChannel } from "./net-channel.js";
 import { WsServerChannel, WsClientChannel, type RawByteStream } from "./net-frame.js";
 import { installWasmWsBackend } from "./ws/ws-wasm-backend.js";

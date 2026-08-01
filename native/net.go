@@ -20,7 +20,11 @@ import (
 	"time"
 )
 
-const maxFrameBytes = 16 << 20 // MAX_FRAME_BYTES (§12.6, §16.1): one wire-visible frame cap
+// MAX_FRAME_BYTES (§12.6, §16.1): one wire-visible frame cap. This target holds its own
+// descriptors, so it declares and enforces its own copy — the same rule that puts the
+// declaration in host/net-limits.ts rather than in the transport it bounds. Keep the two
+// in step; a socket seam must never read this number out of the module it is bounding.
+const maxFrameBytes = 16 << 20
 
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
 // protocol is a single request/response plane — even a block upload awaits an ack per

@@ -13,7 +13,8 @@
 // handshake finishes — so frames queue until the channel opens.
 
 import { encodeFrame, wsAcceptKey, wsClientKey, WsParser, WS_OPCODES } from "./ws/ws-codec.js";
-import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES, type TransportCrypto } from "./net-link.js";
+import { type TransportCrypto } from "./net-link.js";
+import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "./net-limits.js";
 import { BufferedChannel } from "./net-channel.js";
 
 const MAX_WS_HANDSHAKE = 16 * 1024; // an HTTP upgrade request is tiny

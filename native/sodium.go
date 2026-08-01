@@ -7,26 +7,29 @@
 // libsodium-wrappers method names — so the shared host JS (and, later, cap-bridge.ts)
 // calls `sodium.*` unchanged.
 //
-// Two primitives run on native Go instead — both are fully standardized, so native
-// output is byte-identical to libsodium's, and both sit on the storage data path
-// where wazero runs the wasm materially slower:
+// Two primitives run on native Go instead, under the native fast-path rule (§12.9):
+// *where a primitive is standardized, a target may substitute a native implementation,
+// because the bytes are identical and only the speed differs* — subject to the three
+// conditions stated there (standardized, byte-identical and KAT-pinned, no protocol
+// judgement inside). The rule is written down once in the docs rather than re-derived
+// here per primitive; what belongs in this file is which primitives took it and what
+// pins them:
 //
-//   - genericHash (BLAKE2b-256, the content-address block-id hash;
-//     golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is standardized, so native
-//     output matches libsodium (pinned by a KAT in TestSodiumGenericHash); every
-//     block is hashed on PUT and verified on bulk receive (§12.6), and it's the one
-//     hash wazero runs slower than V8 (~600 vs ~390 MB/s native).
+//   - genericHash — BLAKE2b-256, the content-address block-id hash
+//     (golang.org/x/crypto/blake2b). Pinned by TestSodiumGenericHash. Every block is
+//     hashed on PUT and verified on bulk receive (§12.6), and it is the one hash
+//     wazero runs slower than V8 (~600 vs ~390 MB/s native).
 //
-//   - the ChaCha20-Poly1305-IETF record layer (RFC 8439;
-//     golang.org/x/crypto/chacha20poly1305). Every post-AUTH frame is a seal on send
-//     and an open on receive (§12.6), so it's a per-frame cost on the bulk frame path.
-//     RFC 8439 is byte-exact, so native ciphertext is identical to libsodium's (pinned
-//     by TestSodiumAead, captured from this build's binary); native runs it ~8× faster
-//     than the wasm, and — needing no scratch arena — takes no lock.
+//   - the ChaCha20-Poly1305-IETF record layer — RFC 8439
+//     (golang.org/x/crypto/chacha20poly1305). Pinned by TestSodiumAead, captured from
+//     this build's own binary. Every post-AUTH frame is a seal on send and an open on
+//     receive (§12.6); native runs it ~8× faster and, needing no scratch arena, takes
+//     no lock.
 //
-// Ed25519 stays on libsodium (consensus-critical: a signature a Go node accepts every
-// node must accept), and X25519/scalarmult stays wasm (handshake-only, amortized over
-// the link, so speed doesn't matter). Both keep the exact-binary guarantee for free.
+// Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm on condition 3, not on
+// speed: a verifier decides whether to *accept*, and its accept/reject boundary is
+// consensus. X25519/scalarmult stays wasm because there is nothing to win —
+// handshake-only, amortized over the link.
 package main
 
 import (

@@ -123,6 +123,10 @@
 
 import { concatBytes, toHex, writeU32BE } from "./util.js";
 import { DOMAIN_CHANNEL, SUITE_CHANNEL_CONCEALED } from "./domains.js";
+// The inbound flood bound is the core's to declare (net-limits.ts): the socket seams
+// enforce it, and a module must not be the source of the number that bounds it. This
+// module reads it only to size its own send budget below.
+import { MAX_FRAME_BYTES } from "./net-limits.js";
 
 /** A peer identity — the node's kernel ed25519 keypair (README §12.6). */
 export interface Identity {
@@ -239,23 +243,6 @@ const LABEL_M3 = new TextEncoder().encode("seedkernel-c-msg3-v1\0");
 const LABEL_M4 = new TextEncoder().encode("seedkernel-c-msg4-v1\0");
 const LABEL_I2R = new TextEncoder().encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = new TextEncoder().encode("seedkernel-session-r->i-v1\0");
-// Hard cap on one link frame, matching §16.1; the transports enforce it on the
-// length prefix (TCP) / frame length (WS) before buffering. Exported so every
-// transport caps identically — a frame that crosses one crosses the other.
-export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
-
-/** The frame cap that applies BEFORE a link authenticates.
- *
- *  MAX_FRAME_BYTES bounds what an *application* frame may be, and applying it to an
- *  unauthenticated peer was a memory-exhaustion hole: a stranger who knows only
- *  host:port could declare a 16 MiB frame, dribble the body, and hold that much of our
- *  memory — times the half-open budget, which is gigabytes for the price of opening
- *  sockets. No handshake message is anywhere near it (the largest is 113 bytes including
- *  the tag), so nothing legitimate needs the headroom until the link is authenticated.
- *
- *  The cap is raised by PeerLink via RawChannel.allowLargeFrames() at exactly the moment
- *  the peer becomes a known, admitted identity. */
-export const MAX_HANDSHAKE_FRAME_BYTES = 512;
 // The largest *plaintext* frame send() accepts. Sealing wraps a frame in the 1-byte
 // MSG_FRAME tag plus the 16-byte Poly1305 tag, and MAX_FRAME_BYTES is enforced on that
 // framed record at the receiver — so a plaintext frame within 17 bytes of the wire cap

@@ -1,4 +1,19 @@
-// net.send transport (README §12.6) + a request/response layer over it.
+// net.send transport (README §12.6) + a request/response layer over it. Exported as
+// `seedkernel-wasm/net`.
+//
+// **This file is structure, and says so.** Correlation ids, a `pidLen`-prefixed
+// protocol id, flag bits, a request/response state machine — all of it has an endpoint
+// substitute and is therefore content, not core. The raw-byte `net` capability it is
+// written against is `Endpoint.send(to, bytes)` / `onFrame`: bytes to and from an opaque
+// peer id, which is the part with no substitute and the only part in the core. The
+// socket seams that actually hold a file descriptor (net-node.ts, net-ws.ts, net-rtc.ts)
+// are core; everything below is a state machine over whole messages that a signed bundle
+// could replace without rebuilding a host.
+//
+// There used to be a `transport.ts` barrel re-exporting this file and the AKE
+// (net-link.ts) as one "raw-byte net capability … and nothing structural". Both halves
+// of that sentence were wrong about their own export list, so the barrel is gone rather
+// than reworded: `./net` is this file, and the channel handshake is `./net-link`.
 //
 // net.send is "addressed unicast to a peer over its data channel" and is async
 // by nature — it returns a correlation id and the host later delivers the
