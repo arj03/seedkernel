@@ -4,10 +4,7 @@
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
 import { performance } from "node:perf_hooks";
-const require = createRequire(import.meta.url);
-const sodium = require("libsodium-wrappers-sumo");
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -16,8 +13,16 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const {
   createKernelHost,
   generateKeyPair,
-  ensureSodium,
+  loadSodium,
 } = await imp("build/host/node.js");
+
+// Take the host's already-readied instance instead of importing our own copy.
+// libsodium-wrappers-sumo declares separate "import" and "require" conditions
+// pointing at different builds, so a require() here returns a SECOND instance
+// with its own wasm heap — one nothing ever awaits .ready on, which leaves every
+// crypto_* symbol undefined at call time. One shared instance is the documented
+// rule (README §12.1), and these tests have to follow it like any other consumer.
+const sodium = await loadSodium();
 
 // Transport + WS module surface (moved up from seedstore in the runtime split,
 // the runtime split). These are seedkernel's own public exports — `./net-node`
@@ -52,8 +57,6 @@ function loadBundle(host, blob, admit) {
 
 // The empty payload — a handler whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
-
-await ensureSodium();
 
 let passed = 0;
 let failed = 0;
