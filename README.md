@@ -141,7 +141,7 @@ npm run build        # ws.wasm + the shared host
 node tests/run.mjs   # end-to-end tests
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor; `npm run relay` runs the WebRTC signaling rendezvous both use. The worked-example trace in §13 walks the chat pipeline byte-by-byte.
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat (`scripts/relay.mjs`), which seed store also points at. The worked-example trace in §13 walks the chat pipeline byte-by-byte.
 
 ## The rest of the spec
 

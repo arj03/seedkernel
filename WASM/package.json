@@ -83,7 +83,6 @@
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
     "build": "npm run build:ws && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium",
-    "relay": "node scripts/relay.mjs",
     "shell": "node build/host/main-node.js",
     "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release",
     "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/net-link.test.mjs && node tests/net-link.load.test.mjs && node tests/transport.test.mjs && node tests/run.mjs",

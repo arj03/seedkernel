@@ -64,7 +64,7 @@ export class RtcChannel extends BufferedChannel {
 }
 
 // ── Signaling: a pluggable rendezvous for the SDP/ICE exchange ─────────────────
-// The relay (scripts/relay.mjs) satisfies this unchanged: it broadcasts JSON
+// The relay (seedchat's scripts/relay.mjs) satisfies this unchanged: it broadcasts JSON
 // `{type, from, to}` messages within a room. Any rendezvous that delivers those
 // works — a DHT, gossip, even a shared channel between two already-connected peers
 // for renegotiation. We deliberately do NOT carry an SDP-fingerprint signature
@@ -396,7 +396,7 @@ export class RtcNetwork implements Network {
   }
 }
 
-// ── a Signaling over the relay WebSocket (scripts/relay.mjs) ───────────────────
+// ── a Signaling over the relay WebSocket (seedchat's scripts/relay.mjs) ────────
 // Connect to ws://host:port/<room>; the relay broadcasts every JSON frame to the
 // other clients in the same room. Browser-native (uses the platform WebSocket).
 export function relaySignaling(url: string): Signaling {
