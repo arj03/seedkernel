@@ -25,6 +25,13 @@ const domain = (s: string): Uint8Array => new TextEncoder().encode(s);
  *  can't double as an envelope wrapper over the same bytes. */
 export const DOMAIN_MANIFEST = domain("seedkernel-manifest-sig-v1\0");
 
+/** Bundle manifest author id (§12.4): prefixes the key material an author id is
+ *  derived from under a multi-key suite. Not a signing context — the one member of
+ *  this family that prefixes a *hash* — but it lives here for the same reason the
+ *  others do: it must be disjoint from every signing prefix, so a derived author id
+ *  can never also be a preimage someone signed. See `hybridAuthorId` (bundle.ts). */
+export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
+
 /** Cap-bridge SIGN (§12.2): prefixes `scope ‖ msg`, scope host-derived from the
  *  manifest — a guest's signature stays in its bundle's namespace, not a key oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
@@ -77,3 +84,16 @@ export const SUITE_CHANNEL_CONCEALED = 0x02;
 
 /** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
 export const SUITE_MANIFEST_GENESIS = 0x01;
+
+/** Bundle manifest (§12.4): **hybrid** Ed25519 + ML-DSA-65 (FIPS 204). Both signatures
+ *  are made over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json` and **both must
+ *  verify** — the classical half stays load-bearing while the PQ half is young, so a
+ *  flaw in ML-DSA fails *closed* (valid bundles rejected) rather than open (forged
+ *  bundles admitted), and the bundle is no weaker than `0x01` against a classical
+ *  attacker (§14.1).
+ *
+ *  This is the migration that can never get cheaper than a coordinated rebuild: a PQ
+ *  verifier cannot be delivered as a bundle, because the classical verifier would be
+ *  the thing admitting it. So it goes into the artifact *ahead* of need, unlike the
+ *  channel suite, which is content and can wait for a credible break (§14.1). */
+export const SUITE_MANIFEST_HYBRID_PQ = 0x02;

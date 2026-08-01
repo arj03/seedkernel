@@ -50,6 +50,7 @@ const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNa
          signManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
+const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -92,6 +93,11 @@ async function makeHost() {
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
+
+// ML-DSA-65 onto the test instance, exactly as a target does at its crypto seam
+// (node.ts) — the hybrid manifest suite is "a sodium that knows this method" (§12.4).
+// Same browser/mldsa65.wasm the browser fetches and the Go loader embeds.
+withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 
 // Install a verified module directly under `targetName`. Bundles are the only way code
 // arrives (§12.4); there is no wire install envelope. Throws on structural failure.
@@ -1994,6 +2000,248 @@ async function testManifestSuiteByte() {
   console.log("  OK\n");
 }
 
+// ─── Test: ML-DSA-65 against NIST's own vectors (ACVP known-answer test) ─────────
+//
+// Round-trip tests — sign, verify, flip a bit, verify again — are satisfied by an
+// implementation that is wrong but self-consistent, and they say nothing about
+// whether two targets will agree. These are NIST's published ACVP vectors for
+// ML-DSA-65 (external interface, pure, FIPS 204): fixed public keys, messages and
+// signatures with a verdict attached, plus sigGen cases where the signature itself
+// must match byte for byte.
+//
+// This is what makes "one implementation across three targets" checkable rather
+// than asserted: the browser fetches these bytes, Node reads them, and the Go
+// loader embeds them (native/mldsa.go), so a build that drifts — wrong parameter
+// set, a bad compiler flag, a resurrected second implementation — fails here
+// instead of silently splitting the network into nodes that admit a bundle and
+// nodes that refuse it.
+async function testMlDsaAcvpVectors() {
+  console.log("Test: ML-DSA-65 ACVP known-answer vectors (FIPS 204, external/pure)");
+  const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mldsa65-acvp.json"), "utf8"));
+  const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
+  const mldsa = await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm")));
+
+  // The vectors carry FIPS 204 context strings; the runtime always signs with an
+  // empty one (§12.4), so the raw module is exercised through the same low-level
+  // entry the adapter wraps.
+  const inst = (await WebAssembly.instantiate(readFileSync(join(root, "browser/mldsa65.wasm")), {})).instance;
+  const e = inst.exports;
+  const base = e.__heap_base.value;
+  let top = base;
+  const alloc = (n) => {
+    const p = (top + 15) & ~15;
+    top = p + n;
+    const short = top - e.memory.buffer.byteLength;
+    if (short > 0) e.memory.grow(Math.ceil(short / 65536) + 1);
+    return p;
+  };
+  const put = (b) => { const p = alloc(b.length); new Uint8Array(e.memory.buffer).set(b, p); return p; };
+
+  let checked = 0;
+  for (const t of kat.sigVer) {
+    top = base;
+    const sig = put(hex(t.sig)), msg = hex(t.msg), m = put(msg);
+    const ctx = hex(t.ctx), c = put(ctx), pk = put(hex(t.pk));
+    const got = e.mldsa65_verify(sig, m, msg.length, c, ctx.length, pk) === 1;
+    assertEqual(got, t.pass, `ACVP sigVer tc${t.tcId} (${t.reason})`);
+    checked++;
+  }
+  for (const t of kat.sigGen) {
+    top = base;
+    const sk = put(hex(t.sk)), msg = hex(t.msg), m = put(msg);
+    const ctx = hex(t.ctx), c = put(ctx), rnd = put(hex(t.rnd)), sig = alloc(ML_DSA65_SIG_LEN);
+    assertEqual(e.mldsa65_sign(sig, m, msg.length, c, ctx.length, rnd, sk), 1, `ACVP sigGen tc${t.tcId} signs`);
+    const out = new Uint8Array(e.memory.buffer).slice(sig, sig + ML_DSA65_SIG_LEN);
+    assertEqual(toHex(out), t.sig, `ACVP sigGen tc${t.tcId} signature is byte-exact`);
+    checked++;
+  }
+
+  // The adapter's own path (empty context, the runtime's only mode) must agree with
+  // the raw module — a wrapper that quietly passed a stray context byte would still
+  // pass every vector above.
+  {
+    const seed = new Uint8Array(32).fill(9);
+    const kp = mldsa.ml_dsa65_keypair_from_seed(seed);
+    assertEqual(kp.publicKey.length, ML_DSA65_PK_LEN, "keygen returns a full-width public key");
+    const msg = new TextEncoder().encode("adapter path");
+    const sig = mldsa.ml_dsa65_sign_detached(msg, kp.privateKey);
+    assert(mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
+    top = base;
+    const sp = put(sig), mp = put(msg), pp = put(kp.publicKey);
+    assertEqual(e.mldsa65_verify(sp, mp, msg.length, 0, 0, pp), 1,
+      "the raw module verifies what the adapter signed, with an empty context");
+    sig[0] ^= 1;
+    assert(!mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
+    assert(!mldsa.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
+      "a wrong-width signature is false, not a throw");
+  }
+
+  console.log(`  OK (${checked} NIST vectors)\n`);
+}
+
+// ─── Test: hybrid manifest suite 0x02 — Ed25519 + ML-DSA-65, both required ───────
+//
+// The §14.1 migration that cannot be delivered through its own mechanism: a PQ verifier
+// shipped as a bundle would be admitted by the classical verifier, so the manifest suite
+// goes into the artifact ahead of need. What the tests below pin is the *shape* of that
+// suite rather than the algorithm — both signatures required, the author id bound to
+// both keys, and a host without the PQ half refusing rather than falling back.
+async function testHybridManifestSuite() {
+  console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
+  const { signManifest, signManifestHybrid, verifyManifest, hybridAuthorId,
+          verifyBundle, packBundle, kernelNameFor, MANIFEST_FILE }
+    = await imp("build/host/bundle.js");
+  const { generatePqKeyPair } = await imp("build/host/node.js");
+
+  const ed = generateKeyPair();
+  const pq = generatePqKeyPair();
+  const keys = { ed, mlDsa: pq };
+  const manifest = { app: "pq-probe", version: 1, modules: [] };
+  const env = signManifestHybrid(sodium, keys, manifest);
+
+  // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
+  //    lead, so a verifier reads the whole key set before either signature.
+  const OFF_ML_PK = 33, OFF_ED_SIG = OFF_ML_PK + ML_DSA65_PK_LEN;
+  const OFF_ML_SIG = OFF_ED_SIG + 64, OFF_JSON = OFF_ML_SIG + ML_DSA65_SIG_LEN;
+  assertEqual(env[0], 0x02, "the envelope opens with the hybrid manifest suite id");
+  assertEqual(toHex(env.slice(1, 33)), toHex(ed.publicKey), "the Ed25519 key follows the suite byte");
+  assertEqual(toHex(env.slice(OFF_ML_PK, OFF_ED_SIG)), toHex(pq.publicKey), "the ML-DSA key follows it");
+  assertEqual(new TextDecoder().decode(env.slice(OFF_JSON)), JSON.stringify(manifest),
+    "the manifest JSON is carried verbatim after both signatures");
+
+  // 2. Untouched, it verifies — and the author id is NOT either public key, it is the
+  //    hash over both (§12.4). That is the property hybrid signing actually rests on:
+  //    an attacker who breaks one algorithm cannot reach this identity while holding a
+  //    key of their own choosing for the other half.
+  {
+    const v = verifyManifest(sodium, env);
+    assert(v !== null, "an untouched hybrid manifest verifies");
+    assertEqual(v.suite, 0x02, "the verified result reports the suite it was signed under");
+    assertEqual(toHex(v.author), toHex(hybridAuthorId(sodium, ed.publicKey, pq.publicKey)),
+      "the author id is the derived key-set hash");
+    assert(toHex(v.author) !== toHex(ed.publicKey), "the author id is not the Ed25519 key");
+    assertEqual(toHex(v.authorKeys.ed), toHex(ed.publicKey), "both signing keys are reported");
+    assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey), "including the PQ one");
+    assertEqual(v.manifest.app, "pq-probe", "the manifest round-trips");
+  }
+
+  // 3. Both halves are load-bearing: tampering with either signature fails the whole
+  //    manifest. "Either verifies" would be exactly as strong as the weaker algorithm.
+  {
+    const badEd = env.slice(); badEd[OFF_ED_SIG] ^= 0x01;
+    assert(verifyManifest(sodium, badEd) === null, "a broken Ed25519 half fails the manifest");
+    const badMl = env.slice(); badMl[OFF_ML_SIG] ^= 0x01;
+    assert(verifyManifest(sodium, badMl) === null, "a broken ML-DSA half fails the manifest");
+  }
+
+  // 4. The splice a hybrid format has to survive: swap in a different Ed25519 key with a
+  //    validly-made signature of its own, keeping the original PQ key and signature.
+  //    Both preimages commit to BOTH keys, so the surviving half no longer verifies —
+  //    the pair cannot be taken apart and half-replaced.
+  {
+    const attacker = generateKeyPair();
+    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const pre = concatBytes([
+      new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x02),
+      attacker.publicKey, pq.publicKey, json,
+    ]);
+    const spliced = concatBytes([
+      Uint8Array.of(0x02), attacker.publicKey, pq.publicKey,
+      sodium.crypto_sign_detached(pre, attacker.privateKey),
+      env.slice(OFF_ML_SIG, OFF_JSON), json,
+    ]);
+    assert(verifyManifest(sodium, spliced) === null,
+      "an Ed25519 key swap invalidates the untouched ML-DSA half");
+  }
+
+  // 5. A host with no ML-DSA verifier REFUSES rather than falling back to the Ed25519
+  //    signature alone — the downgrade the suite exists to prevent. It throws with its
+  //    own message, the same way an unknown suite does: this is a legibility failure,
+  //    not a verdict on the bundle.
+  {
+    const classicalOnly = {
+      crypto_sign_verify_detached: (...a) => sodium.crypto_sign_verify_detached(...a),
+      crypto_generichash: (...a) => sodium.crypto_generichash(...a),
+    };
+    let msg = "";
+    try { verifyManifest(classicalOnly, env); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("unsupported manifest suite 0x02"),
+      `a host without ML-DSA refuses 0x02 (got: ${msg || "no throw"})`);
+    assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");
+  }
+
+  // 6. End to end: a hybrid-signed bundle loads, and its modules bind under names
+  //    derived from the DERIVED id — so nothing downstream of the verifier knows or
+  //    cares which suite signed. Same-content bundles under the two suites are two
+  //    different authors, which is the honest reading of a stronger statement.
+  {
+    const wasm = forwarderBytes;
+    const m = { app: "pq-app", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
+    const blob = packBundle({
+      [MANIFEST_FILE]: signManifestHybrid(sodium, keys, m),
+      [moduleFile("codec")]: wasm,
+    });
+    const v = verifyBundle(sodium, blob);
+    assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
+    const host = await createKernelHost();
+    installBundle(host, v);
+    const derived = kernelNameFor(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app", "codec");
+    assert(host.isBound(derived), "the module binds under the derived hybrid author id");
+
+    const edOnly = packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, ed.privateKey, ed.publicKey, m),
+      [moduleFile("codec")]: wasm,
+    });
+    assert(toHex(verifyBundle(sodium, edOnly).author) !== toHex(v.author),
+      "the same author's 0x01 and 0x02 identities are distinct");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: policy may require a manifest suite (§12.5) ───────────────────────────
+//
+// The verifier accepts every suite it can check; which ones a deployment TRUSTS is a
+// separate, operator-owned question. Without it there is no way to finish a migration —
+// the classical suite would stay acceptable forever on every host that can still verify
+// it.
+async function testPolicyManifestSuite() {
+  console.log("Test: policy manifestSuites — a deployment can insist on PQ-signed manifests");
+  const { signManifest, signManifestHybrid, verifyBundle, packBundle, MANIFEST_FILE }
+    = await imp("build/host/bundle.js");
+  const { generatePqKeyPair } = await imp("build/host/node.js");
+
+  const ed = generateKeyPair();
+  const pq = generatePqKeyPair();
+  const wasm = forwarderBytes;
+  const m = { app: "suite-policy", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
+  const pack = (envelope) => packBundle({ [MANIFEST_FILE]: envelope, [moduleFile("codec")]: wasm });
+
+  const classical = verifyBundle(sodium, pack(signManifest(sodium, ed.privateKey, ed.publicKey, m)));
+  const hybrid = verifyBundle(sodium, pack(signManifestHybrid(sodium, { ed, mlDsa: pq }, m)));
+
+  const pqOnly = policyFromJson(JSON.stringify({
+    authors: [toHex(classical.author), toHex(hybrid.author)],
+    manifestSuites: [2],
+  }));
+  assert(await pqOnly(hybrid) === true, "a hybrid-signed bundle is admitted");
+  assert(await pqOnly(classical) === false, "an Ed25519-only bundle from a trusted author is refused");
+
+  // Absent, the field constrains nothing — an existing policy file keeps its meaning.
+  const anySuite = policyFromJson(JSON.stringify({ authors: [toHex(classical.author)] }));
+  assert(await anySuite(classical) === true, "a policy without manifestSuites admits any suite");
+
+  // Strict parsing, like every other field: a typo fails the boot loudly.
+  for (const bad of [{ manifestSuites: 2 }, { manifestSuites: [] }, { manifestSuites: ["2"] }]) {
+    let threw = false;
+    try { policyFromJson(JSON.stringify({ authors: [toHex(classical.author)], ...bad })); }
+    catch { threw = true; }
+    assert(threw, `malformed manifestSuites is rejected: ${JSON.stringify(bad)}`);
+  }
+
+  console.log("  OK\n");
+}
+
 // ─── Test: HELLO suite byte — unknown suite refused, flipped suite cannot downgrade ──
 //
 // The §12.6 suite byte makes HELLO self-describing so a future (post-quantum) handshake
@@ -2334,6 +2582,9 @@ await testWsNetworkFanout();
 await testRecordLayerIntegrity();
 await testHelloSuiteByte();
 await testManifestSuiteByte();
+await testMlDsaAcvpVectors();
+await testHybridManifestSuite();
+await testPolicyManifestSuite();
 await testSafeRealmConcurrency();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();

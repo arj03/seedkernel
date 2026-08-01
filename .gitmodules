@@ -1,0 +1,3 @@
+[submodule "WASM/pq/mldsa-native"]
+	path = WASM/pq/mldsa-native
+	url = https://github.com/pq-code-package/mldsa-native.git

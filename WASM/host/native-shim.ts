@@ -84,7 +84,11 @@ type CapCall = (op: number, payload: ArrayBuffer, callId: number) => Uint8Array 
 /** libsodium, in libsodium-wrappers method names (native/sodium.go). Typed as the
  *  full surface the shared code consumes — the loader's verifier and hasher, the
  *  cap-bridge's crypto ops, and the §12.6 channel AKE — so a Go shim that stops
- *  satisfying one of them fails the build rather than a handshake. */
+ *  satisfying one of them fails the build rather than a handshake.
+ *
+ *  `ml_dsa65_verify_detached` is on it too (native/mldsa.go), driving the same
+ *  mldsa65.wasm the browser fetches and Node reads — so manifest suite `0x02` (§12.4)
+ *  is verified identically on every target rather than being a JS-only capability. */
 declare const sodium: ShellSodium & TransportCrypto;
 
 /** The `fs.*` backend over Go's data directory (native/fs.go). */

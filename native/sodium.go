@@ -523,6 +523,10 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		crand.Read(b)
 		return ab(t, b), nil
 	}))
+	// The PQ half of the manifest suite lives in its own module (mldsa.go) but on the
+	// same object: the shared loader's crypto surface is one `sodium`, and it
+	// feature-detects suite 0x02 by the presence of this method.
+	exposeMlDsa(qc, o, md)
 	qc.Global().SetPropertyStr("__sodium", o)
 	if _, err := qc.Eval("sodium-shim.js", qjs.Code(sodiumShimJS)); err != nil {
 		panic(fmt.Sprintf("sodium shim: %v", err))
@@ -549,6 +553,7 @@ const sodiumShimJS = `
     crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
     crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
     crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
+    ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
     crypto_sign_ed25519_pk_to_curve25519: (pk) => u8(N.crypto_sign_ed25519_pk_to_curve25519(pk)),
     crypto_sign_ed25519_sk_to_curve25519: (sk) => u8(N.crypto_sign_ed25519_sk_to_curve25519(sk)),
     crypto_box_seal: (m, pk) => u8(N.crypto_box_seal(m, pk)),

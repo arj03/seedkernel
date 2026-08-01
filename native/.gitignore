@@ -7,6 +7,7 @@
 # dist). qjs/qjs.wasm is NOT ignored — it's vendored upstream.
 /wasm/ws.wasm
 /wasm/libsodium.wasm
+/wasm/mldsa65.wasm
 
 # Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
 /seedloader

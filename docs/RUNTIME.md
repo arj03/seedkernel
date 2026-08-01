@@ -18,7 +18,7 @@ So the costs worth measuring are the three places real cryptography lives, all o
 
 - **Per connection:** the AKE handshake (§12.6) — one Ed25519 sign + verify and one X25519 exchange, amortised across the whole session.
 - **Per frame:** one ChaCha20-Poly1305 record seal/open (§12.6) — symmetric, fast, the steady-state transport cost.
-- **Per bundle load:** one Ed25519 manifest verify plus a BLAKE2b-256 content hash per module (§12.4) — once, at install.
+- **Per bundle load:** one manifest verify — Ed25519 under suite `0x01`, Ed25519 *and* ML-DSA-65 under `0x02` (§12.4) — plus a BLAKE2b-256 content hash per module. Once, at install, which is why the hybrid suite's extra verify and its ~5.3 KB envelope cost nothing that shows: a manifest is never on the message path (§13).
 
 The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (net round-trip, fs, the crypto primitives, the record layer); `WASM/tests/run.mjs` exercises the same paths end-to-end on the JS target, and seed store's `WASM/tests/bench.mjs` measures storage throughput. There is no signed-message microbenchmark anymore because there is no signed message — a chat frame crosses the WASM boundary only for its handler's single pure-transform call.
 
@@ -29,10 +29,11 @@ The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (
 | host/*.js — minified (`build/host-min`; ~29 KB gzipped) | ~117 KB |
 | libsodium.wasm (sumo build: Ed25519 + BLAKE2b + XChaCha20, the §12.1 backends) | 278 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 152 KB |
-| **Total browser deployment** | **~547 KB** |
+| mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`, §12.4) | 18 KB |
+| **Total browser deployment** | **~565 KB** |
 | QuickJS realm engine (the single release-sync build, from `quickjs-emscripten`) — only loaded when a bundle's guest runs (§12.3) | ~750 KB |
 
-The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — net, fs, the cap-bridge, safe-js, bundle verification, policy, and the entire node↔node transport stack (§12.6), which now lives in shared JS rather than a per-target reimplementation. That transport is the bulk of why the host is larger than a table-only driver would be. libsodium is the host's crypto library (BLAKE2b for content hashing and the §12.1 hash backend, Ed25519 for manifests and the handshake, ChaCha20 / XChaCha20 for the record layer and the §12.1 backends); the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
+The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — net, fs, the cap-bridge, safe-js, bundle verification, policy, and the entire node↔node transport stack (§12.6), which now lives in shared JS rather than a per-target reimplementation. That transport is the bulk of why the host is larger than a table-only driver would be. libsodium is the host's crypto library (BLAKE2b for content hashing and the §12.1 hash backend, Ed25519 for manifests and the handshake, ChaCha20 / XChaCha20 for the record layer and the §12.1 backends); the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). `mldsa65.wasm` is small for the opposite reason: one parameter set, no libc and no imports at all (§12.4), so it is 18 KB rather than a library. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
 
 `npm run build` emits the host twice: the readable `build/host` (~203 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (~117 KB, ~29 KB gzipped) for shipping. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does the cut — no bundler, no new dependencies. The table's host figure is the shipped, minified build.
 
@@ -166,9 +167,29 @@ A bundle is a **value, not a path**: one blob is read from disk, carried in an `
 
 **One authenticated statement, one authorization.** The bundle is the *only* way code arrives. The signed manifest commits to every module's `genesisHash` (§5.1), and the loader verifies each `.wasm`'s bytes against it, then admits each verified module under the kernel name it *derives* from the manifest's signed `(author, app, name)` triple (§5.1) — a policy decision (§12.5) followed by `SetHandler`. Admission touches no replay state, so an equal-version reload just re-binds cleanly — a reboot re-reading the same bundle installs the same modules again with no collision. A **live update** is not a separate mechanism: it is delivering a bundle whose manifest `version` is higher, which the freshness guard (below) requires; it lands on the same names because the same key signed it, and a bundle from any other key lands on names of its own.
 
-**Manifest envelope.** `[suite: 1][author_pk: 32][sig: 64][manifest: UTF-8 JSON to end]` — an Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`, where `DOMAIN_manifest` is `"seedkernel-manifest-sig-v1\0"` (§16.1), prepended before signing but not stored. The disjoint prefix means a manifest signature can never double as a guest `SIGN` or channel-handshake signature over the same bytes (§14). There is deliberately no canonical-JSON step: the envelope carries the exact signed bytes and the verifier parses exactly what it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
+**Manifest envelope.** Fixed-width per suite, JSON to the end:
 
-`suite` names the signature algorithm — `0x01` is Ed25519 (§16.1), and an unrecognised id is refused with its own error rather than reported as a bad signature, since "this bundle wants a newer host" and "someone tampered with this bundle" are different problems for an operator. Unlike the domain prefix the byte is **stored as well as signed**, and that pairing is the whole design: a verifier must read it *before* verifying, because another suite's key and signature are other widths, so it has to be legible up front — and because the signature it then checks commits to the same byte, an attacker who rewrites it only invalidates the manifest. A signature is therefore bound to the suite it was made under, and algorithm confusion between two suites is unrepresentable rather than merely unlikely (§14.1). This is the same discipline the channel suite byte follows (§12.6), on the axis that migrates independently.
+```
+0x01  [suite: 1][ed_pk: 32][ed_sig: 64][manifest: UTF-8 JSON to end]
+0x02  [suite: 1][ed_pk: 32][ml_dsa_pk: 1952][ed_sig: 64][ml_dsa_sig: 3309][manifest: UTF-8 JSON to end]
+```
+
+`0x01` is an Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`, where `DOMAIN_manifest` is `"seedkernel-manifest-sig-v1\0"` (§16.1), prepended before signing but not stored. The disjoint prefix means a manifest signature can never double as a guest `SIGN` or channel-handshake signature over the same bytes (§14). There is deliberately no canonical-JSON step: the envelope carries the exact signed bytes and the verifier parses exactly what it checked, so the bytes *are* the manifest and canonicalisation has nothing to bite on.
+
+`suite` names the signature algorithm — `0x01` is Ed25519, `0x02` the hybrid Ed25519 + ML-DSA-65 suite below (§16.1) — and an unrecognised id is refused with its own error rather than reported as a bad signature, since "this bundle wants a newer host" and "someone tampered with this bundle" are different problems for an operator. Unlike the domain prefix the byte is **stored as well as signed**, and that pairing is the whole design: a verifier must read it *before* verifying, because another suite's key and signature are other widths, so it has to be legible up front — and because the signature it then checks commits to the same byte, an attacker who rewrites it only invalidates the manifest. A signature is therefore bound to the suite it was made under, and algorithm confusion between two suites is unrepresentable rather than merely unlikely (§14.1). This is the same discipline the channel suite byte follows (§12.6), on the axis that migrates independently.
+
+**Suite `0x02`: hybrid Ed25519 + ML-DSA-65.** Both signatures are made over the same preimage — `DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ json` — and **both must verify**. Not either: "either" is exactly as strong as the weaker algorithm. Requiring both means a flaw in the young half fails *closed* (valid bundles rejected, an operator's problem, recoverable) rather than open (forged bundles admitted, which is not), and the bundle stays no weaker than `0x01` against a classical attacker while ML-DSA is new. The cost is envelope size — ~5.3 KB of header against 97 bytes — paid once per install, off the message path entirely (§13), which is why the manifest is the cheapest place in the system to absorb it.
+
+Both public keys are inside both preimages, so the pair cannot be taken apart: an attacker who holds a forgery for one algorithm cannot keep the sound half's key and signature and splice its own key in beside them — the surviving signature no longer verifies over the new key set.
+
+**Where the primitive comes from.** One freestanding wasm module (`browser/mldsa65.wasm`, built from the pinned `pq/mldsa-native` submodule by `scripts/build-mldsa.mjs`), fetched by the browser, read by Node and instantiated under wazero by the Go loader — the same arrangement Ed25519 has through libsodium.wasm, and for the same reason: a bundle one node admits, every node must admit, so the verifier is compiled once and shared rather than reimplemented per target. The module has no imports at all (randomness and the FIPS 204 context are arguments), so there is no per-target host glue that could differ. `bundle.ts` names only the method `ml_dsa65_verify_detached` on the crypto object; a host that supplies none refuses `0x02` rather than falling back.
+
+**The author id under `0x02` is derived, not carried.** It is `genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk)` — 32 bytes, like an Ed25519 key, so `appKeyFor`, every kernel name (§5.1), every policy entry and every freshness mark are unchanged by the existence of a second key. Two reasons it is the hash and not simply the Ed25519 key:
+
+- **Otherwise hybrid signing buys nothing at the moment it should pay.** An attacker who eventually breaks Ed25519 forges that half and generates a *fresh* ML-DSA key for the other. Both signatures verify; if the id were the Ed25519 key, the id would be unchanged, and the forged bundle would land on the real author's names. Hashing the whole key set makes the identity unreachable without both private keys — which is the property "hybrid" is supposed to name.
+- **The id's width is load-bearing far outside the envelope.** A suite that widened it would change name derivation, the policy file format, and the freshness key at once.
+
+The consequence is that an author moving from `0x01` to `0x02` gets a **new identity**: new kernel names, a fresh freshness lineage, a new policy entry. That is the honest reading rather than a wart — a hybrid-signed manifest is a *different, stronger* statement about who signed, and treating it as the old identity would be the bug. Operators list both entries during an overlap and drop the `0x01` one when the author has finished migrating (`manifestSuites`, §12.5).
 
 **Manifest fields.**
 
@@ -228,23 +249,25 @@ The load is three halves: `verifyBundle` (authenticity + integrity), `admit` (go
 
 Admission (§12.4) asks exactly one question — *may this author's signed bundle land on this host?* — and one policy answers it. The form is a single predicate `admit(v: VerifiedBundle) → bool | Promise<bool>`, called between `verifyBundle` and `installBundle`. Three constructors of it cover three deployment postures:
 
-- **authorAllowlist(authors)** — a closed set of hex Ed25519 pubkeys parsed from `--policy <allowed-keys.json>`. Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
+- **authorAllowlist(authors)** — a closed set of hex author ids parsed from `--policy <allowed-keys.json>`. Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
 - An **interactive consent dialog** — the browser shell's posture: `verifyBundle` reveals the author and manifest to the user, and the predicate returns `true` only once the user says yes.
 - **admitAll** — "the bundle my operator handed me IS the trust decision." A StorageNode loads exactly the one bundle it was configured with; the choice of bundle already settled admission.
 
-All three are the SAME type — one seam, not three mechanisms layered on top of each other.
+All three are the SAME type — one seam, not three mechanisms layered on top of each other. A fourth constructor, **manifestSuiteAllowlist(suites)**, is an axis rather than a posture — *which signature suites* (§12.4) an operator accepts — and composes with any of the three through `allOf`.
 
 The policy file (when present) is `--policy <allowed-keys.json>` (`host/policy.ts`), parsed strictly — a malformed file fails the boot loudly rather than silently widening trust:
 
 ```json
 {
-  "authors": ["<author ed25519 pubkey, hex>", "…"]
+  "authors": ["<author id, hex>", "…"],
+  "manifestSuites": [1, 2]
 }
 ```
 
 | Field | Required | Semantics |
 | --- | --- | --- |
-| `authors` | yes, non-empty | The closed set of keys that may sign a bundle manifest (§12.4 step 2). Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match before the predicate runs. |
+| `authors` | yes, non-empty | The closed set of author ids that may sign a bundle manifest (§12.4 step 2) — an Ed25519 pubkey under suite `0x01`, the derived key-set id under `0x02`, 32 bytes either way, so an operator pins an identity without naming a suite. Trusting an author means trusting every module and guest their manifest declares — the manifest's `modules[].hash` commits to exactly which bytes are authorized, and `verifyBundle` already proved the bytes match before the predicate runs. |
+| `manifestSuites` | no | The signature suites (§12.4) this deployment will accept. Absent ⇒ any suite the host can verify. This is deliberately *policy* and not verifier logic: "can this host check suite N" and "will this deployment trust suite N" are different questions, and a node finishing a post-quantum migration answers yes to the first for `0x01` and no to the second. Without the field there would be no way to ever finish a migration — the classical suite would stay acceptable forever on every host still able to verify it. |
 
 There is no per-module allowlist: the manifest IS the definitive list of authorized modules. An author who signs a manifest with five modules is authorizing all five. If an operator wants only some of an author's modules, the author publishes a separate bundle.
 

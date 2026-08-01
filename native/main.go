@@ -231,6 +231,10 @@ func boot(dataDir string) error {
 	shutdown()
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the realm's bundle verification routes to it
+	// ML-DSA-65 for manifest suite 0x02 (§12.4) — the same wasm the browser and Node
+	// use, so this target's answer to "is this bundle authentic" cannot differ from
+	// theirs (mldsa.go).
+	md = bootMlDsa(rt)
 	// Every installed handler is a pure transform (README §4): the only host import it
 	// takes is the AssemblyScript `env.abort` shim. There is no kernel.call / kernel.caller
 	// seam and no env.invoke_handler dispatch callback.

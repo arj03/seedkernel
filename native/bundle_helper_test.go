@@ -21,6 +21,17 @@ import (
 //go:embed testdata/forwarder.wasm
 var forwarderWasm []byte
 
+// Manifest signing constants, mirroring domains.ts. The domain prefixes are disjoint from
+// every other prefix in the family (§16.1), which is what stops one signature from being
+// replayed as another over the same bytes — and, for the author prefix, what stops a
+// derived id from ever also being something someone signed.
+const (
+	domainManifest       = "seedkernel-manifest-sig-v1\x00"
+	domainManifestAuthor = "seedkernel-manifest-author-v1\x00"
+	suiteManifestGenesis = 0x01
+	suiteManifestHybrid  = 0x02
+)
+
 // testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).
 // Fresh per test so bundle-freshness marks (keyed by author+app) never collide.
 func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
@@ -78,7 +89,26 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 // sodium). Mirrors the TS run.mjs testBundle.
 func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
 	t.Helper()
-	kernelName := kernelNameFor(pub, app, "fwd")
+	mjson := manifestJSON(t, app, version, guestSrc, caps)
+
+	// Manifest envelope: [suite 1][author_pk 32][sig 64][json]. The Ed25519 detached sig is
+	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
+	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
+	// that tells it the field widths and then checks a signature committing to that same
+	// byte (§14.1). suiteManifestGenesis mirrors SUITE_MANIFEST_GENESIS in domains.ts.
+	preimage := append(append([]byte(domainManifest), suiteManifestGenesis), mjson...)
+	sig := ed25519.Sign(priv, preimage)
+	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
+
+	return writeBundleFile(t, app, menv, guestSrc), kernelNameFor(pub, app, "fwd")
+}
+
+// manifestJSON builds the manifest body both suites sign: one forwarder module plus the
+// given guest. An empty guestSrc makes it HANDLER-ONLY — the manifest declares no `guest`
+// at all. The bytes are the signed bytes; there is no canonicalisation step, so the
+// verifier parses exactly what it checked (§12.4).
+func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps []string) []byte {
+	t.Helper()
 
 	type mod struct {
 		Name string `json:"name"`
@@ -112,16 +142,15 @@ func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Manifest envelope: [suite 1][author_pk 32][sig 64][json]. The Ed25519 detached sig is
-	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
-	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
-	// that tells it the field widths and then checks a signature committing to that same
-	// byte (§14.1). suiteManifestGenesis mirrors SUITE_MANIFEST_GENESIS in domains.ts.
-	const suiteManifestGenesis = 0x01
-	preimage := append([]byte("seedkernel-manifest-sig-v1\x00"), suiteManifestGenesis)
-	sig := ed25519.Sign(priv, append(preimage, mjson...))
-	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
+	return mjson
+}
 
+// writeBundleFile packs a finished manifest envelope, the forwarder module and the guest
+// (if any) into the container and writes it to a fresh temp dir. Suite-agnostic on
+// purpose: the envelope is opaque bytes to the container, which is the property that lets
+// a new signature suite land without the packing format moving (§12.4).
+func writeBundleFile(t *testing.T, app string, menv []byte, guestSrc string) string {
+	t.Helper()
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
 	files := [][2]any{
 		{"manifest.bundle", menv},
@@ -130,10 +159,9 @@ func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, 
 	if guestSrc != "" {
 		files = append(files, [2]any{"guest.js", []byte(guestSrc)})
 	}
-	blob := packBundle(files)
 	path := filepath.Join(t.TempDir(), app+".skb")
-	if err := os.WriteFile(path, blob, 0o644); err != nil {
+	if err := os.WriteFile(path, packBundle(files), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return path, kernelName
+	return path
 }

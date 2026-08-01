@@ -17,6 +17,10 @@ mkdirSync(dst, { recursive: true });
 const copies = [
   ["build/ws.wasm", "ws.wasm"],
   ["browser/libsodium.wasm", "libsodium.wasm"],
+  // ML-DSA-65 for manifest suite 0x02 (§12.4). The Go loader instantiates the very
+  // same artifact the browser fetches, which is the point: one verifier, one
+  // accept/reject boundary, across all three targets (native/mldsa.go).
+  ["browser/mldsa65.wasm", "mldsa65.wasm"],
 ];
 
 for (const [from, to] of copies) {
