@@ -45,6 +45,38 @@ export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
  *  and so the label space stays private to subkeys.ts. */
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 
+// ── The guest seam's version ────────────────────────────────────────────────────
+
+/** The guest ABI version — which shape of `host.call` a guest was written against
+ *  (§12.2). A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
+ *  refuses a guest written for an ABI this host does not implement.
+ *
+ *  Bumped when an existing op changes what it RETURNS — an op moving across the
+ *  sync/async line, a payload framing change. Adding an op does not: a guest written
+ *  against ABI n that never calls the new op behaves identically, and one that does call
+ *  it declares the domain and gets it.
+ *
+ *  The field exists because the failure it guards is silent. When `fs` moves async, a
+ *  guest that writes `host.call(FS_GET, k)` without awaiting gets a Promise where bytes
+ *  were expected and reads `undefined` — a wrong answer, not an error. A declared ABI
+ *  turns that into a refused load.
+ *
+ *  **It lives HERE, with the suite ids, rather than in cap-bridge.ts where the seam it
+ *  versions is defined.** It is the same kind of thing they are — a number naming which
+ *  version of a contract a signed document was written for, read by the loader before
+ *  anything is trusted — and putting it here is what keeps the loader from importing the
+ *  guest bridge to check a manifest field. That edge would drag the whole op catalog and
+ *  preamble into every page that verifies a bundle, including handler-only shells
+ *  (seedchat) that never build a bridge at all. cap-bridge.ts re-exports it, so a reader
+ *  of the seam still finds the number next to the ops. */
+export const GUEST_ABI_VERSION = 1;
+
+/** The guest ABIs this host can run. One entry today; a host supporting two seams at
+ *  once (a migration window) lists both, and the loader admits a guest declaring either.
+ *  Absent from this list ⇒ the load is refused with its own error, the same legibility
+ *  failure as an unsupported manifest suite (§12.4). */
+export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
+
 // ── Algorithm suites ────────────────────────────────────────────────────────────
 //
 // A suite id is the first byte of the structure it governs *and* part of what that

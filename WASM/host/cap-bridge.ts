@@ -20,28 +20,13 @@ import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "./util.js";
 import { DOMAIN_GUEST } from "./domains.js";
 import type { SafeRealmBridge } from "./safe-js.js";
 
-/** The guest seam's ABI version — which shape of `host.call` a guest was written
- *  against. A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
- *  refuses a guest written for an ABI this host does not implement.
- *
- *  It lives HERE, next to the op catalog and the preamble, because the number and the
- *  seam are one edit: anything that changes what `host.call(op, bytes)` returns for an
- *  existing op — an op moving across the sync/async line, an op's payload framing
- *  changing — bumps this. Adding an op does not: a guest written against ABI n that
- *  never calls the new op behaves identically, and one that does call it declares the
- *  domain and gets it.
- *
- *  The field exists because the failure it guards is silent. When `fs` moves async
- *  (phase 4) a guest that writes `host.call(FS_GET, k)` without awaiting gets a Promise
- *  where bytes were expected and reads `undefined` — a wrong answer, not an error. A
- *  declared ABI turns that into a refused load. */
-export const GUEST_ABI_VERSION = 1;
-
-/** The guest ABIs this host can run. One entry today; a host that supports two seams
- *  at once (a migration window) lists both, and the loader admits a guest declaring
- *  either. Absent from this list ⇒ the load is refused with its own error, the same
- *  legibility failure as an unsupported manifest suite (§12.4). */
-export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
+/** The version of the seam defined below — re-exported so a reader of the ops finds it
+ *  beside them, and so `seedkernel-wasm/cap-bridge` is the import a bundle builder
+ *  reaches for (it is stamping "which host contract is this guest written against",
+ *  which is this file's subject). It is DECLARED in domains.ts, with the suite ids, so
+ *  the loader can check a manifest's `guest.abi` without importing the guest bridge —
+ *  see the note there. Anything that changes what an existing op returns bumps it. */
+export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS } from "./domains.js";
 
 /** The generic op catalog — the seam ABI (README §12.2). `capPreamble()` injects
  *  these as `const CAP_X = n;` into the guest, and the bridge switch reads them

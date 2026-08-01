@@ -31,10 +31,9 @@
 import { concatBytes, toHex } from "./util.js";
 import {
   DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR,
-  SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ,
+  SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS,
 } from "./domains.js";
 import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "./wasm-limits.js";
-import { SUPPORTED_GUEST_ABIS } from "./cap-bridge.js";
 
 /** The manifest envelope's name inside the container. */
 export const MANIFEST_FILE = "manifest.bundle";
