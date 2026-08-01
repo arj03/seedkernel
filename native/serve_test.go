@@ -89,7 +89,7 @@ func serveNode(t *testing.T, authorPub []byte) nodeStatus {
 func TestServeGuestApp(t *testing.T) {
 	author, authorPub := testAuthor(t)
 	st := serveNode(t, authorPub)
-	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"crypto", "fs"})
+	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"transform", "fs"})
 	if status := loadBundle(bundlePath); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("bundle load: %s", status)
 	}
@@ -132,7 +132,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// app names — so they derive disjoint kernel names (§5.1) and bind their own
 	// protocols. The forwarder module echoes its input, so the echo app's response IS
 	// whatever the shell handed it.
-	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"crypto", "fs"})
+	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"transform", "fs"})
 	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("guest bundle load: %s", status)
 	}

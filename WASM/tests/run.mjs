@@ -35,7 +35,7 @@ const { NodeNetwork } = await imp("build/host/net-node.js");
 // reachable by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
-const { CAP, createCapBridge, opsForCaps, guestSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES }
+const { CAP, createCapBridge, opsForCaps, guestSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION }
   = await imp("build/host/cap-bridge.js");
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
@@ -47,7 +47,7 @@ const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.j
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
-         signManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
+         signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
@@ -56,9 +56,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own KernelHost without a shell. */
-function loadBundle(host, blob, admit) {
+// The two halves of a load with the admission seam between them (§12.4). `admit` may
+// answer with a Promise — a composed policy does — so this awaits it: reading an
+// unawaited Promise as a verdict is fail-OPEN, which is the one way this seam must never
+// be wrong.
+async function loadBundle(host, blob, admit) {
   const v = verifyBundle(sodium, blob);
-  if (!admit(v)) throw new Error("admit rejected");
+  if (!(await admit(v))) throw new Error("admit rejected");
   return installBundle(host, v);
 }
 
@@ -160,7 +164,7 @@ async function testInstallRejectsUntrustedAuthor() {
   const stranger = generateKeyPair();
   const admit = authorAllowlist([toHex(stranger.publicKey)]);
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "installBundle throws when the author is not in the policy");
 
   console.log("  OK\n");
@@ -209,7 +213,7 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
 
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a deny-all admit predicate prevents install");
 
   console.log("  OK\n");
@@ -241,7 +245,7 @@ async function testBundleRefusesNonHandler() {
 
   const admit = authorAllowlist([toHex(author.publicKey)]);
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
   assert(!host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is NOT bound (the load failed atomically)");
@@ -664,24 +668,46 @@ async function testPolicy() {
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { KernelHost } = await imp("build/host/kernel-host.js");
-  const tryLoad = (policyJson, author) => {
+  const tryLoad = async (policyJson, author, extra = {}) => {
     const host = new KernelHost();
-    const manifest = { app: "mod", version: 1,
+    const manifest = { app: "mod", version: 1, ...extra,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
   // ── author allowlist ───────────────────────────────────────────────────
-  const okAuthor = tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), good);
+  const okAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), good);
   assert(okAuthor, "install by an allowed author is accepted");
 
-  const badAuthor = tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
+  const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
+
+  // ── the slot admission class (§12.5) ───────────────────────────────────
+  // A bundle claiming a slot is an authority grant — the transport sees all plaintext
+  // and holds the session keys — so the ordinary author allowlist must NOT admit one,
+  // even for an author it already trusts with apps. Only a `roles` entry does.
+  const goodHex = toHex(good.publicKey);
+  const appOnly = JSON.stringify({ authors: [goodHex] });
+  const withSlot = JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } });
+
+  const slotLanded = await tryLoad(appOnly, good, { role: "transport" });
+  assert(!slotLanded, "an author trusted for apps does NOT thereby occupy the transport slot");
+  const slotAllowed = await tryLoad(withSlot, good, { role: "transport" });
+  assert(slotAllowed, "a roles entry admits that author into the slot it names");
+  const strangerSlot = await tryLoad(withSlot, bad, { role: "transport" });
+  assert(!strangerSlot, "an author outside the slot's list is refused the slot");
+  const appStillOk = await tryLoad(withSlot, good, {});
+  assert(appStillOk, "adding a slot entry does not disturb ordinary app admission");
+
+  // The two classes partition the bundles: a slot list alone admits no apps.
+  const slotsOnly = JSON.stringify({ authors: [toHex(bad.publicKey)], roles: { transport: [goodHex] } });
+  const appUnderSlotList = await tryLoad(slotsOnly, good, {});
+  assert(!appUnderSlotList, "a slot entry is not an app grant — the app allowlist still decides apps");
 
   // ── parse validation ───────────────────────────────────────────────────
   let threw = false;
@@ -690,6 +716,121 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
   assert(threw, "an empty author set is rejected");
+  threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transprot: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "a typo'd slot name fails the boot rather than silently admitting nothing");
+  threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [] } })); } catch { threw = true; }
+  assert(threw, "an empty slot list is rejected (omit the slot to allow none)");
+
+  // A manifest may only claim a slot this host knows (§12.4) — an unknown role is a
+  // malformed manifest, not an ignored field that lands as an ordinary app.
+  threw = false;
+  try {
+    verifyManifest(sodium, signManifest(sodium, good.privateKey, good.publicKey,
+      { app: "mod", version: 1, role: "quantum-relay", modules: [] }));
+  } catch { threw = true; }
+  assert(threw, "a manifest claiming an unknown slot is refused as malformed");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the guest ABI field (§12.2, §12.4) ───────────────────────────
+
+async function testGuestAbi() {
+  console.log("Test: a guest declares the host ABI it was written against");
+
+  const author = generateKeyPair();
+  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestBytes = new TextEncoder().encode(guestText);
+  const mk = (guest) => signManifest(sodium, author.privateKey, author.publicKey,
+    { app: "abi", version: 1, modules: [], guest });
+  const hash = toHex(gHash(guestBytes));
+
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, caps: [] })) !== null,
+    "a guest declaring this host's ABI verifies");
+
+  // Missing: the field is required, not defaulted. A guest author who never thought
+  // about the seam version is indistinguishable from one who meant the old one, and
+  // defaulting would silently pick the population a bump exists to catch.
+  let threw = false;
+  try { verifyManifest(sodium, mk({ hash, caps: [] })); } catch { threw = true; }
+  assert(threw, "a guest with no declared ABI is refused as malformed");
+
+  // Present but unimplemented: a legibility failure ("this bundle wants a host I am
+  // not"), so it throws with its own message rather than reading as a bad signature.
+  let msg = "";
+  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION + 1, caps: [] })); }
+  catch (e) { msg = e.message; }
+  assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
+
+  // A handler-only bundle declares no guest and therefore no ABI — the seam it never
+  // touches is not a field it has to fill in.
+  assert(verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+    { app: "abi", version: 1, modules: [] })) !== null,
+    "a handler-only bundle needs no ABI declaration");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the slot freshness floor (§12.4) ─────────────────────────────
+
+async function testSlotFreshnessFloor() {
+  console.log("Test: a slot's freshness floor is keyed by the slot, not by the signer");
+
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { KernelHost } = await imp("build/host/kernel-host.js");
+
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const blobFrom = (author, version, role) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey,
+      { app: "link", version, ...(role ? { role } : {}), modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] }),
+    [moduleFile("fwd")]: forwarderBytes,
+  });
+  const land = (host, freshness, author, version, role) => {
+    installBundle(host, verifyBundle(sodium, blobFrom(author, version, role)), freshness);
+  };
+
+  // The case the (author, app) key cannot see: A's v5 lands, then B — a DIFFERENT
+  // trusted author, whose own mark is still −∞ — offers v1 of the same slot. Under the
+  // per-author key alone that is a fresh install; under the slot floor it is a
+  // downgrade, which is the whole point (§12.4).
+  {
+    const freshness = new FreshnessMarks();
+    const host = new KernelHost();
+    land(host, freshness, a, 5, "transport");
+    assertEqual(freshness.getRole("transport"), 5, "landing a slot occupant raises the slot floor");
+    let refused = false;
+    try { land(host, freshness, b, 1, "transport"); } catch { refused = true; }
+    assert(refused, "a second author's stale slot bundle is refused by the slot floor");
+    land(host, freshness, b, 6, "transport");
+    assertEqual(freshness.getRole("transport"), 6, "a newer bundle from another author advances the floor");
+  }
+
+  // The floor is the slot's alone: an ordinary app at v1 is untouched by it, and
+  // claiming no slot writes no floor.
+  {
+    const freshness = new FreshnessMarks();
+    const host = new KernelHost();
+    land(host, freshness, a, 5, "transport");
+    land(host, freshness, b, 1, undefined);
+    assertEqual(freshness.get(b.publicKey, "link"), 1, "an app is governed by its own (author, app) mark");
+    assertEqual(freshness.getRole("transport"), 5, "an app load leaves the slot floor alone");
+  }
+
+  // It survives a reboot through the same serialization as the marks, and a store
+  // written before slot floors existed reads as no floor rather than throwing.
+  {
+    const freshness = new FreshnessMarks();
+    freshness.setRole("transport", 4);
+    const json = JSON.stringify({ marks: {}, roles: { transport: 4 }, revoked: [] });
+    const reloaded = new FreshnessMarks(json);
+    assertEqual(reloaded.getRole("transport"), 4, "the floor round-trips through the persisted store");
+    const old = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, revoked: [] }));
+    assertEqual(old.getRole("transport"), -Infinity, "a store predating slot floors reads as no floor");
+    assertEqual(old.get(new Uint8Array(0), "app"), -Infinity, "…and its existing marks are untouched");
+  }
 
   console.log("  OK\n");
 }
@@ -754,6 +895,7 @@ async function testBundle() {
       // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        abi: GUEST_ABI_VERSION,
         caps: [],
       },
     };
@@ -1132,12 +1274,27 @@ async function testCapBridgeEnforcement() {
 
   // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
   // op set the bridge enforces (the "wire the caps" path). A guest that declared
-  // only "crypto" hashes fine but cannot touch fs, and a typo'd domain fails loudly.
-  const cryptoOnly = mk(opsForCaps(["crypto"]));
-  assertEqual((await cryptoOnly(CAP.HASH, U(1, 2))).length, 32, "a declared domain (crypto) grants its ops");
+  // only "transform" hashes fine but cannot touch fs, and a typo'd domain fails loudly.
+  const transformOnly = mk(opsForCaps(["transform"]));
+  assertEqual((await transformOnly(CAP.HASH, U(1, 2))).length, 32, "a declared domain (transform) grants its ops");
   threw = false;
-  try { await cryptoOnly(CAP.FS_GET, U(120)); } catch { threw = true; }
+  try { await transformOnly(CAP.FS_GET, U(120)); } catch { threw = true; }
   assert(threw, "an op outside the declared domains (fs) is refused");
+  // The §12.5 split: a pure transform no longer rides along with the node key. Hashing
+  // is `transform`; `crypto` is the authority domain and grants SIGN with it.
+  threw = false;
+  try { await transformOnly(CAP.SIGN, U(1, 2)); } catch { threw = true; }
+  assert(threw, "SIGN is NOT in the transform domain — authority and pure transform are separate grants");
+  const authorityOnly = createCapBridge({
+    sodium, identity: id, callHandler: () => null,
+    transport: stubTransport, peers: () => [], fs: new MemoryFs(),
+    allowedOps: opsForCaps(["crypto"]), modules: UNSCOPED_MODULES,
+    signScope: guestSignScope(new Uint8Array(32), "probe"),
+  });
+  assertEqual((await authorityOnly(CAP.SIGN, U(1, 2))).length, 64, "crypto grants the node-key ops");
+  threw = false;
+  try { await authorityOnly(CAP.HASH, U(1, 2)); } catch { threw = true; }
+  assert(threw, "HASH is NOT in the crypto domain — an app that hashes need not ask for the signing key");
   threw = false;
   try { opsForCaps(["crypto", "nope"]); } catch { threw = true; }
   assert(threw, "an unknown capability domain throws (a manifest typo fails loudly)");
@@ -2357,6 +2514,7 @@ async function testBundleCorruptNewerRollback() {
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        abi: GUEST_ABI_VERSION,
         caps: [],
       },
     });
@@ -2559,6 +2717,8 @@ await testFs();
 await testGuestNetFanout();
 await testCapBridge();
 await testPolicy();
+await testGuestAbi();
+await testSlotFreshnessFloor();
 await testShellBoot();
 await testBundle();
 await testGuestlessBundleAndArchive();

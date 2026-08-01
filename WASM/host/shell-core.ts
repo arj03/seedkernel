@@ -146,7 +146,7 @@ export type { LoadedBundle, FreshnessStore, VerifiedBundle };
 // reach them from the same module it gets createShell from. KernelHost rides along
 // for the same reason: the JS platforms all hand it in as their `kernel`, and a
 // re-export keeps that a one-line seam rather than a second import.
-export { denyAll, admitAll, authorAllowlist, policyFromJson } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, roleAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
 export type { AdmitPredicate } from "./policy.js";
 export { Bindings } from "./bindings.js";
 export { KernelHost } from "./kernel-host.js";

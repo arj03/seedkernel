@@ -24,7 +24,7 @@ const { createShell } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/host/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { LoopbackNetwork } = await imp("build/host/net.js");
-const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES } = await imp("build/host/cap-bridge.js");
+const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ok   ${m}`); } else { fail++; console.log(`  FAIL ${m}`); } };
@@ -180,7 +180,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const guestBytes = new TextEncoder().encode(guestSrc);
   const manifest = {
     app: "probe", version: 1, modules: [],
-    guest: { hash: toHex(genesisHash(sodium, guestBytes)), caps: [] },
+    guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, caps: [] },
   };
   const blob = packBundle({
     [MANIFEST_FILE]: signManifest(sodium, kp.privateKey, kp.publicKey, manifest),

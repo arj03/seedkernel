@@ -34,6 +34,7 @@ import {
   SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ,
 } from "./domains.js";
 import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "./wasm-limits.js";
+import { SUPPORTED_GUEST_ABIS } from "./cap-bridge.js";
 
 /** The manifest envelope's name inside the container. */
 export const MANIFEST_FILE = "manifest.bundle";
@@ -130,11 +131,21 @@ export function handlesOf(manifest: BundleManifest): string[] {
 export interface BundleGuest {
   /** genesisHash(utf8(source)) hex of `guest.js`. */
   hash: string;
-  /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
-   *  "module" | "clock") granted to the guest. The shell expands these to the concrete
-   *  allowed op set and wires only the matching backends — so this is the enforced
-   *  capability declaration, not just documentation. Required whenever a guest exists;
-   *  an empty array is a guest with no authority at all. */
+  /** Which host seam this guest was written against (`GUEST_ABI_VERSION`, §12.2).
+   *  Required, and checked at load: a guest declaring an ABI this host does not
+   *  implement is refused with its own error rather than run against a seam that no
+   *  longer means what it meant.
+   *
+   *  Required and not optional-with-a-default because the default would have to be the
+   *  oldest ABI, which is exactly the population a bump exists to catch — and because a
+   *  guest author who never thought about the seam version is indistinguishable from one
+   *  who meant the old one. There is nothing to infer here, so the format asks. */
+  abi: number;
+  /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "transform" |
+   *  "net" | "fs" | "module" | "clock") granted to the guest. The shell expands these to
+   *  the concrete allowed op set and wires only the matching backends — so this is the
+   *  enforced capability declaration, not just documentation. Required whenever a guest
+   *  exists; an empty array is a guest with no authority at all. */
   caps: string[];
   /** App-structural constants the guest needs as injected globals (e.g. storage
    *  k/m/blockSize). Opaque to the runtime — the shell forwards it verbatim into the
@@ -148,6 +159,22 @@ export interface BundleGuest {
    *  nothing pointing at the cause. */
   config?: Record<string, string | number>;
 }
+
+/** The slots a bundle may claim (README §12.4). A slot is a *role* every other node
+ *  must interoperate with, and there is exactly one occupant of it per host — where an
+ *  ordinary app is a node-local choice that contends with nothing (§12.10).
+ *
+ *  A closed vocabulary, checked at load, so an unknown slot is a refused bundle rather
+ *  than an unenforced string. That is deliberate even though it means a new slot needs a
+ *  host rev: a slot is an authority class with its own admission (`roleAllowlist`,
+ *  §12.5) and its own freshness floor, and neither can be honoured for a name this host
+ *  has never heard of. A bundle claiming an unknown slot would otherwise be admitted as
+ *  an ordinary app — the exact confusion the field exists to prevent.
+ *
+ *  `transport` is the only member today: the AKE, record layer and link routing (§12.6),
+ *  which sees all plaintext and holds the session keys. */
+export const BUNDLE_ROLES = ["transport"] as const;
+export type BundleRole = typeof BUNDLE_ROLES[number];
 
 export interface BundleManifest {
   app: string;
@@ -164,6 +191,17 @@ export interface BundleManifest {
    *  anything. That separation — landing code is authorized by policy, receiving messages
    *  is chosen by the user — is what lets the loader hold no ownership state at all. */
   handles?: string[];
+  /** The slot this bundle claims, or absent for an ordinary app (README §12.4, §12.5).
+   *  Signed, so what a bundle claims to be is the author's statement and not the
+   *  deliverer's, and one of `BUNDLE_ROLES` or the load is refused.
+   *
+   *  Two things key off it, and both are the ways a slot differs from an app. Admission:
+   *  a slot occupant is an authority grant, not a preference, so the ordinary author
+   *  allowlist does NOT admit one — it needs a per-slot decision (`roleAllowlist`).
+   *  Freshness: the high-water mark is keyed by the slot as well as by `(author, app)`,
+   *  because a floor keyed only to the signer says nothing about a *different* trusted
+   *  author's stale v1 (see `FreshnessStore.getRole`). */
+  role?: BundleRole;
   modules: BundleModule[];
   /** Which module receives inbound dispatch for a handler-only bundle — the `name` of
    *  one of `modules` (README §12.10).
@@ -398,9 +436,11 @@ export function signManifestHybrid(sodium: ManifestCrypto, keys: HybridAuthorKey
  *  signed but got wrong (a missing/mistyped field) into a clean, loud rejection
  *  instead of a raw TypeError surfacing deep in the loader, and lets the rest of
  *  the runtime treat every field as present and correctly typed (matching the
- *  fail-loud posture of parsePolicy). Note `caps` is required *inside* `guest`: the
- *  enforced capability declaration is never optional where a guest exists, and never
- *  present where one doesn't. */
+ *  fail-loud posture of parsePolicy). Note `caps` and `abi` are required *inside*
+ *  `guest`: the capability declaration and the seam the guest was written against are
+ *  never optional where a guest exists, and never present where one doesn't. Whether
+ *  this host *implements* the declared `abi` is a separate question, answered by
+ *  verifyManifest — this is shape only. */
 function isValidManifest(m: unknown): m is BundleManifest {
   if (typeof m !== "object" || m === null || Array.isArray(m)) return false;
   const o = m as Record<string, unknown>;
@@ -415,6 +455,11 @@ function isValidManifest(m: unknown): m is BundleManifest {
   if (o.handles !== undefined) {
     if (!Array.isArray(o.handles)) return false;
     for (const h of o.handles) if (typeof h !== "string" || h.length === 0) return false;
+  }
+  // `role` is optional (absent ⇒ an ordinary app) and closed: an unrecognized slot name
+  // is a rejection, never an ignored field. See BUNDLE_ROLES.
+  if (o.role !== undefined) {
+    if (typeof o.role !== "string" || !(BUNDLE_ROLES as readonly string[]).includes(o.role)) return false;
   }
   if (!Array.isArray(o.modules)) return false;
   const seen = new Set<string>();
@@ -438,6 +483,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
     const g = o.guest as Record<string, unknown> | null;
     if (typeof g !== "object" || g === null || Array.isArray(g)) return false;
     if (typeof g.hash !== "string") return false;
+    if (typeof g.abi !== "number" || !Number.isInteger(g.abi)) return false;
     if (!Array.isArray(g.caps) || g.caps.some((c) => typeof c !== "string")) return false;
     if (g.config !== undefined) {
       if (typeof g.config !== "object" || g.config === null || Array.isArray(g.config)) return false;
@@ -519,6 +565,17 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
   try { parsed = JSON.parse(new TextDecoder().decode(json)); }
   catch { throw new Error("bundle: malformed manifest (not JSON)"); }
   if (!isValidManifest(parsed)) throw new Error("bundle: malformed manifest");
+  // Guest ABI support (§12.2), the same KIND of check as the suite above and refused the
+  // same way: "this bundle wants a host I am not" is a legibility failure, not an
+  // authenticity verdict, so it throws with its own message rather than returning null.
+  // It sits here, at the one place a manifest becomes a value the rest of the runtime
+  // trusts, so no target can forget it and no inspecting shell shows an operator a guest
+  // it could never run.
+  if (parsed.guest && !SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
+    throw new Error(
+      `bundle: guest ABI ${parsed.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`,
+    );
+  }
   return { author, authorKeys, suite, manifest: parsed };
 }
 
@@ -602,6 +659,19 @@ export interface FreshnessStore {
   get(author: Uint8Array, app: string): number;
   /** Advance the mark to `version` (monotonic; a lower value never rewinds it). */
   set(author: Uint8Array, app: string, version: number): void;
+  /** The highest `version` ever loaded into this SLOT, by any author, or −Infinity.
+   *
+   *  A second floor, not a replacement: `(author, app)` is the right key for an app,
+   *  because versions are an author's own lineage and two authors' apps are unrelated
+   *  things that happen to share a name. A slot is the opposite — its occupant is a role
+   *  every peer must interoperate with (§12.4) — so a floor keyed to whoever signed says
+   *  nothing about the case that matters. If policy trusts authors A and B for the
+   *  transport slot, A's v5 landing leaves B's mark at −∞, and an adversary controlling
+   *  the path serves B's validly signed v1 with a weaker suite and it is admitted as
+   *  fresh. Keying the floor to the slot is what makes that a refused downgrade. */
+  getRole(role: string): number;
+  /** Advance a slot's floor (monotonic, like `set`). */
+  setRole(role: string, version: number): void;
   /** Has this author key been written off (§12.5)? Checked on every load. */
   isRevoked(author: Uint8Array): boolean;
   /** Write off an author key permanently. Monotonic like the marks: nothing in the
@@ -619,10 +689,13 @@ export interface FreshnessStore {
  *  store: `persist` does nothing, which is exactly right for a test. */
 export class FreshnessMarks implements FreshnessStore {
   protected readonly marks = new Map<string, number>();
+  /** Slot floors, keyed by role name — author-independent by construction (§12.4). */
+  protected readonly roleMarks = new Map<string, number>();
   /** Author keys written off (§12.5), as lowercase hex. */
   protected readonly revoked = new Set<string>();
 
-  /** Seed from a persisted `{ marks: { "authorHex:app": version }, revoked: [hex] }`
+  /** Seed from a persisted
+   *  `{ marks: { "authorHex:app": version }, roles: { role: version }, revoked: [hex] }`
    *  blob. Absent or unreadable input ⇒ start empty (−∞ for every key, nothing
    *  revoked); a target's loader hands in null rather than throwing, since a missing
    *  store is the first-boot case.
@@ -636,7 +709,12 @@ export class FreshnessMarks implements FreshnessStore {
    *  upgrade, with the next stale bundle accepted and nothing anywhere saying why. An
    *  operator must be told to migrate or delete the file; the shape is unambiguous
    *  (a bare map has neither key), so this can never fire on a store this version
-   *  wrote. */
+   *  wrote.
+   *
+   *  A store written before slot floors existed has no `roles` and needs no migration:
+   *  it reads as no floors, which is exactly true — nothing could have claimed a slot on
+   *  a host that had none. That is the difference from the case above, where the missing
+   *  key would have silently dropped guards that HAD been earned. */
   constructor(json?: string | null) {
     if (json) {
       let raw: Record<string, unknown> | undefined;
@@ -660,6 +738,12 @@ export class FreshnessMarks implements FreshnessStore {
             if (typeof v === "number") this.marks.set(k, v);
           }
         }
+        const roles = raw.roles;
+        if (typeof roles === "object" && roles !== null && !Array.isArray(roles)) {
+          for (const [k, v] of Object.entries(roles as Record<string, unknown>)) {
+            if (typeof v === "number") this.roleMarks.set(k, v);
+          }
+        }
         if (Array.isArray(raw.revoked)) {
           for (const a of raw.revoked) if (typeof a === "string") this.revoked.add(a.toLowerCase());
         }
@@ -667,11 +751,13 @@ export class FreshnessMarks implements FreshnessStore {
     }
   }
 
-  /** Serialize the marks and the dead-key set for `persist`. */
+  /** Serialize the marks, the slot floors and the dead-key set for `persist`. */
   protected serialize(): string {
     const marks: Record<string, number> = {};
     for (const [k, v] of this.marks) marks[k] = v;
-    return JSON.stringify({ marks, revoked: [...this.revoked] });
+    const roles: Record<string, number> = {};
+    for (const [k, v] of this.roleMarks) roles[k] = v;
+    return JSON.stringify({ marks, roles, revoked: [...this.revoked] });
   }
 
   /** Write the serialized state durably. The base store is in-memory only; a target
@@ -692,6 +778,18 @@ export class FreshnessMarks implements FreshnessStore {
     const cur = this.marks.get(k);
     if (cur !== undefined && cur >= version) return; // monotonic: never rewound
     this.marks.set(k, version);
+    this.persist(this.serialize());
+  }
+
+  getRole(role: string): number {
+    const v = this.roleMarks.get(role);
+    return v === undefined ? -Infinity : v;
+  }
+
+  setRole(role: string, version: number): void {
+    const cur = this.roleMarks.get(role);
+    if (cur !== undefined && cur >= version) return; // monotonic: never rewound
+    this.roleMarks.set(role, version);
     this.persist(this.serialize());
   }
 
@@ -864,6 +962,16 @@ export function installBundle(
     if (version < highWater) {
       throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
     }
+    // The slot floor, for a bundle that claims one. Checked in ADDITION to the mark
+    // above and keyed only by the role, so a second trusted author cannot reset the
+    // floor to −∞ by signing an old transport with a key that has never occupied the
+    // slot (FreshnessStore.getRole).
+    if (v.manifest.role !== undefined) {
+      const roleFloor = freshness.getRole(v.manifest.role);
+      if (version < roleFloor) {
+        throw new Error(`bundle: version ${version} is below the "${v.manifest.role}" slot freshness floor ${roleFloor} — downgrade refused`);
+      }
+    }
     // NB: the mark is advanced at the *end* of this function, only after every module
     // has instantiated and bound — not here. See below.
   }
@@ -905,7 +1013,10 @@ export function installBundle(
   // the freshness file. The mark must record the highest version that actually loaded
   // (README §12.4). Integrity was verified by verifyBundle before this function was
   // called, so the freshness advance is always behind a successful verify.
-  if (freshness) freshness.set(v.author, v.manifest.app, version);
+  if (freshness) {
+    freshness.set(v.author, v.manifest.app, version);
+    if (v.manifest.role !== undefined) freshness.setRole(v.manifest.role, version);
+  }
   return {
     manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, suite: v.suite,
     guestSource: v.guestSource,

@@ -20,15 +20,39 @@ import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "./util.js";
 import { DOMAIN_GUEST } from "./domains.js";
 import type { SafeRealmBridge } from "./safe-js.js";
 
+/** The guest seam's ABI version — which shape of `host.call` a guest was written
+ *  against. A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
+ *  refuses a guest written for an ABI this host does not implement.
+ *
+ *  It lives HERE, next to the op catalog and the preamble, because the number and the
+ *  seam are one edit: anything that changes what `host.call(op, bytes)` returns for an
+ *  existing op — an op moving across the sync/async line, an op's payload framing
+ *  changing — bumps this. Adding an op does not: a guest written against ABI n that
+ *  never calls the new op behaves identically, and one that does call it declares the
+ *  domain and gets it.
+ *
+ *  The field exists because the failure it guards is silent. When `fs` moves async
+ *  (phase 4) a guest that writes `host.call(FS_GET, k)` without awaiting gets a Promise
+ *  where bytes were expected and reads `undefined` — a wrong answer, not an error. A
+ *  declared ABI turns that into a refused load. */
+export const GUEST_ABI_VERSION = 1;
+
+/** The guest ABIs this host can run. One entry today; a host that supports two seams
+ *  at once (a migration window) lists both, and the loader admits a guest declaring
+ *  either. Absent from this list ⇒ the load is refused with its own error, the same
+ *  legibility failure as an unsupported manifest suite (§12.4). */
+export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
+
 /** The generic op catalog — the seam ABI (README §12.2). `capPreamble()` injects
  *  these as `const CAP_X = n;` into the guest, and the bridge switch reads them
  *  here, so guest and host can never drift. The numbers are a shared guest↔host
  *  identifier regenerated with the preamble — never a wire value between nodes — so
- *  they form one contiguous block grouped by domain (crypto 1–6, net 7–8, fs 9–14,
- *  module 15, clock 16); new ops are appended. Net fan-out is not an op: with real
- *  promises the guest fans out itself with `Promise.all` over `NET_SEND`. */
+ *  they form one contiguous block, numbered in the order they were added; new ops are
+ *  appended. The numbering is NOT the capability grouping — `CAP_DOMAINS` below is, and
+ *  ops 1–6 straddle two domains. Net fan-out is not an op: with real promises the guest
+ *  fans out itself with `Promise.all` over `NET_SEND`. */
 export const CAP = {
-  // crypto (1–6)
+  // pure crypto transforms + node-key/entropy ops (1–6) — two domains, see CAP_DOMAINS
   HASH: 1,             // bytes -> 32B generic hash (blake2b / crypto_generichash)
   STREAM_XOR: 2,       // [nonce 24][key 32][msg] -> xchacha20 keystream XOR
   SIGN: 3,             // msg -> 64B detached ed25519 signature by this identity, over
@@ -150,13 +174,25 @@ globalThis.__invoke = (name, argBuf) => {
  *  the domains its guest needs (its `caps`), and the shell expands them to the
  *  concrete op set it enforces (`allowedOps`) and to which backends it wires. This
  *  is the coarse, human-auditable capability vocabulary: "this app reaches net + fs",
- *  not a list of 17 op numbers. `caps` is the grant; the preamble is the ABI. */
+ *  not a list of 17 op numbers. `caps` is the grant; the preamble is the ABI.
+ *
+ *  **`crypto` and `transform` are split because authority and pure transform are not
+ *  one word.** `SIGN` is a signing oracle under the node identity, `IDENTITY` hands out
+ *  the node's public key and `RANDOM` reaches the OS entropy source — every one of them
+ *  a grant over something the host owns. `HASH`, `VERIFY` and `STREAM_XOR` reach
+ *  nothing: they are functions of their arguments, and a guest holding them can compute
+ *  what it could already have computed with code of its own. Under one domain an app
+ *  that wanted to hash a byte string had to ask for the node's signing key, which makes
+ *  the coarse vocabulary lie about the most consequential grant in it. Both are still
+ *  serviced by the same host libsodium — this is a question of what a manifest has to
+ *  ask for, not of where the code runs. */
 export const CAP_DOMAINS = {
-  crypto: [CAP.HASH, CAP.STREAM_XOR, CAP.SIGN, CAP.VERIFY, CAP.IDENTITY, CAP.RANDOM],
-  net:    [CAP.NET_SEND, CAP.NET_PEERS],
-  fs:     [CAP.FS_GET, CAP.FS_PUT, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
-  module: [CAP.MODULE_CALL],
-  clock:  [CAP.CLOCK],
+  crypto:    [CAP.SIGN, CAP.IDENTITY, CAP.RANDOM],
+  transform: [CAP.HASH, CAP.VERIFY, CAP.STREAM_XOR],
+  net:       [CAP.NET_SEND, CAP.NET_PEERS],
+  fs:        [CAP.FS_GET, CAP.FS_PUT, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
+  module:    [CAP.MODULE_CALL],
+  clock:     [CAP.CLOCK],
 } as const;
 
 export type CapDomain = keyof typeof CAP_DOMAINS;

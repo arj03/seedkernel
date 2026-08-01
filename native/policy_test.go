@@ -32,6 +32,44 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
+// A slot occupant is a SECOND admission class (§12.5): the transport sees all plaintext
+// and holds the session keys, so "I trust this author's apps" must not answer "may this
+// author be my transport". The author allowlist refuses a `role` claim; only a `roles`
+// entry admits one. Driven through the native loader because the policy file is an
+// operator-facing surface on this target — `--policy` is parsed by the shared JS, and
+// this is what proves the loader reaches that decision and not a permissive default.
+func TestPolicySlotNeedsItsOwnGrant(t *testing.T) {
+	bootShell(t, t.TempDir(), "", nil)
+	author, authorPub := testAuthor(t)
+	authorHex := hex.EncodeToString(authorPub)
+
+	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
+		t.Fatalf("applyPolicy: %v", err)
+	}
+	slotBundle := writeSlotBundle(t, author, authorPub, "linkapp", 1, "transport")
+	if status := loadBundle(slotBundle); !strings.Contains(status, "rejected by admission") {
+		t.Fatalf("an app-allowlisted author must not thereby occupy a slot: %s", status)
+	}
+
+	// The deliberate second entry admits it — and the app grant still works alongside.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"roles":{"transport":["` + authorHex + `"]}}`); err != nil {
+		t.Fatalf("applyPolicy: %v", err)
+	}
+	if status := loadBundle(slotBundle); strings.Contains(status, "rejected") {
+		t.Fatalf("a roles entry must admit the slot it names: %s", status)
+	}
+	appBundle, _ := writeTestBundle(t, author, authorPub, "ordinary", 1)
+	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {
+		t.Fatalf("adding a slot entry must not disturb app admission: %s", status)
+	}
+
+	// A typo'd slot name fails the boot rather than parsing into a list that admits
+	// nothing and looks like it should.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"roles":{"transprot":["` + authorHex + `"]}}`); err == nil {
+		t.Fatal("an unknown slot name in the policy must fail loudly")
+	}
+}
+
 // parsePolicy fails loudly on malformed config rather than silently widening trust.
 func TestPolicyMalformed(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)

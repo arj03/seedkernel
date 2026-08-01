@@ -30,6 +30,12 @@ const (
 	domainManifestAuthor = "seedkernel-manifest-author-v1\x00"
 	suiteManifestGenesis = 0x01
 	suiteManifestHybrid  = 0x02
+	// The guest seam version these test bundles are written against, mirroring
+	// GUEST_ABI_VERSION in cap-bridge.ts. A manifest declaring anything else is refused
+	// by the shared loader, which is the point of the field (§12.2) — so a bump lands
+	// here too, and a stale native test fails loudly rather than running a guest against
+	// a seam that moved.
+	guestABIVersion = 1
 )
 
 // testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).
@@ -89,8 +95,36 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 // sodium). Mirrors the TS run.mjs testBundle.
 func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
 	t.Helper()
-	mjson := manifestJSON(t, app, version, guestSrc, caps)
+	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, caps), guestSrc)
+}
 
+// writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a handler-only
+// manifest carrying `role`. A slot occupant is an authority grant with its own admission
+// class (§12.5), so the native tests need a bundle the ordinary author allowlist must
+// refuse — and `role` is inside the signed JSON, which is why this signs its own body
+// rather than post-editing one.
+func writeSlotBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, role string) string {
+	t.Helper()
+	type mod struct {
+		Name string `json:"name"`
+		Hash string `json:"hash"`
+	}
+	mjson, err := json.Marshal(struct {
+		App     string `json:"app"`
+		Version int    `json:"version"`
+		Role    string `json:"role"`
+		Modules []mod  `json:"modules"`
+	}{App: app, Version: version, Role: role, Modules: []mod{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, _ := signBundleJSON(t, priv, pub, app, mjson, "")
+	return path
+}
+
+// signBundleJSON wraps a finished manifest body in the suite-0x01 envelope and packs it.
+func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, mjson []byte, guestSrc string) (string, string) {
+	t.Helper()
 	// Manifest envelope: [suite 1][author_pk 32][sig 64][json]. The Ed25519 detached sig is
 	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
 	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
@@ -116,8 +150,11 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 	}
 	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's,
 	// so a bundle with no guest has no authority to declare and omits the object.
+	// `abi` names the host seam the guest was written against (§12.2) and is required
+	// wherever a guest is — the loader refuses one it does not implement.
 	type guest struct {
 		Hash string   `json:"hash"`
+		Abi  int      `json:"abi"`
 		Caps []string `json:"caps"`
 	}
 	manifest := struct {
@@ -136,7 +173,11 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 		caps = []string{}
 	}
 	if guestSrc != "" {
-		manifest.Guest = &guest{Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))), Caps: caps}
+		manifest.Guest = &guest{
+			Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
+			Abi:  guestABIVersion,
+			Caps: caps,
+		}
 	}
 	mjson, err := json.Marshal(manifest)
 	if err != nil {

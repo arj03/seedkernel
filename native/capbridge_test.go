@@ -22,7 +22,7 @@ func TestCapBridgeOps(t *testing.T) {
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__scope = guestSignScope(__id.publicKey, "testapp");
-		__buildCapBridge(["crypto", "fs", "clock"], __id, null, [], __scope);
+		__buildCapBridge(["crypto", "transform", "fs", "clock"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
