@@ -128,7 +128,7 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 | --- | --- | --- |
 | **Kernel** | the host's `handlers` map | The name → handler table and its one lookup (§3). No crypto, no I/O, no dispatch. |
 | **Cap-bridge** (optional) | Cap-bridge (host-side) | The `host.call(op, bytes)` seam a confined guest reaches its I/O through — the only outward reach the guest has (§12.2). |
-| **App** | Chat (§11), [seed store](https://github.com/arj03/seedstore) | Pure-transform WASM handlers plus, optionally, a zero-authority JS guest — delivered as a signed bundle (§12.4). |
+| **App** | [seedchat](https://github.com/arj03/seedchat) (§11), [seed store](https://github.com/arj03/seedstore) — both live outside this repo | Pure-transform WASM handlers plus, optionally, a zero-authority JS guest — delivered as a signed bundle (§12.4). |
 
 Each layer is testable standalone: the kernel is exercised on its own, the loader against a bundle with no live transport, chat as a handful of pure transforms with no crypto in sight. Composition across layers is the host's or the guest's, through `callHandler` / `MODULE_CALL` (§4.2) — never a handler reaching sideways.
 

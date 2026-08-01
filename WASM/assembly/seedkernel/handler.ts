@@ -1,5 +1,12 @@
 // Shared scaffolding for pure-transform WASM handlers (README §3.2, §4).
 //
+// NOTE: nothing inside this repo imports this file. Its only consumer today is
+// seedchat, which reaches it as `seedkernel-wasm/assembly/seedkernel/handler`.
+// (seed store's modules predate it and declare their own layout.) It is not dead
+// code: it is the guest half of the handler ABI, published for the same reason
+// the bundle format is — an ABI that apps fork is an ABI that drifts. Moving or
+// renaming it is a breaking change to the public surface.
+//
 // A handler is a PURE TRANSFORM. It exports `memory`, a `scratch` global, and
 // `handle(input_len)`. The host stages the input bytes at `scratch`, calls
 // `handle`, and reads the response back from `scratch[0..ret]`. Handlers import

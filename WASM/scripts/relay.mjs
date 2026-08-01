@@ -1,10 +1,12 @@
-// Minimal WebSocket broadcast hub for the browser/chat.html demo.
+// Minimal WebSocket broadcast hub — the signaling rendezvous for RtcNetwork
+// (host/net-rtc.ts, §12.7). Not tied to any one app: seedstore and seedchat
+// both use it, as does anything else standing up a WebRTC mesh.
 //
 // Used only as a WebRTC signaling rendezvous: clients exchange JSON SDP
 // offers / answers and ICE candidates here, then open RTCDataChannels to
 // each other and route kernel envelopes peer-to-peer. Once every pair of
-// active tabs has an open DataChannel, this process can be killed without
-// disrupting the chat — it only matters for adding new peers.
+// active peers has an open DataChannel, this process can be killed without
+// disrupting traffic — it only matters for adding new peers.
 //
 // Clients pick a "room" by connecting to ws://host:port/<room>. Broadcasts
 // are scoped to the room: a frame from a client in room "alpha" reaches
@@ -73,8 +75,8 @@ for (let i = 0; i < args.length; i++) {
   else if (/^\d+$/.test(a)) { PORT = Number(a); }
 }
 // Defaults: localhost over http/https on common dev ports. file:// pages
-// send Origin: null, which is also permitted by default so that opening
-// the bundled chat-shell.html directly off disk still works.
+// send Origin: null, which is also permitted by default so that an app page
+// opened directly off disk still works.
 if (ALLOWED_ORIGINS.size === 0) {
   ALLOWED_ORIGINS.add("null");
   for (const scheme of ["http", "https"]) {
@@ -467,7 +469,7 @@ if (HEARTBEAT_MS > 0) {
 }
 
 server.listen(PORT, HOST, () => {
-  console.log(`SeedKernel chat relay listening on ws://${HOST}:${PORT}/<room>`);
+  console.log(`SeedKernel signaling relay listening on ws://${HOST}:${PORT}/<room>`);
   console.log(`  origin allowlist: ${[...ALLOWED_ORIGINS].slice(0, 4).join(", ")}…`);
   console.log(`  frame cap: ${MAX_FRAME_PAYLOAD} B  socket backlog cap: ${MAX_SOCKET_BACKLOG} B`);
   console.log(`  rooms: any path component (chars [A-Za-z0-9._-], up to ${MAX_ROOM_NAME}); bare "/" = "${DEFAULT_ROOM}"`);
@@ -476,5 +478,5 @@ server.listen(PORT, HOST, () => {
   if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1") {
     console.log(`  ⚠  bound to ${HOST} — exposed to the network`);
   }
-  console.log(`Open browser/chat-shell.html in two tabs to chat.`);
+  console.log(`Signaling only — point an app's Network tab at this relay.`);
 });
