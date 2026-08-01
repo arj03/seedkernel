@@ -31,6 +31,9 @@ func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `undefined, { host: "127.0.0.1", port: 0 }`)
 }
 
+// listenArgs is the `listen, wsListen` pair — makeNetwork's third and fourth arguments,
+// the second being the contact secret (§12.6). Both nodes here are open (no secret), so
+// the pair is what selects which transport A binds.
 func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	bootRealm(t)
 
@@ -40,8 +43,8 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();
 		  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
-		  const netA = makeNetwork(idA, %s);
-		  const netB = makeNetwork(idB, undefined, undefined);
+		  const netA = makeNetwork(idA, undefined, %s);
+		  const netB = makeNetwork(idB, undefined, undefined, undefined);
 		  await netA.start();
 		  const tA = new Transport(aId, netA, 1000);
 		  const tB = new Transport(bId, netB, 1000);

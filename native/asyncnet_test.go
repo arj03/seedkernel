@@ -31,8 +31,8 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.idB = sodium.crypto_sign_keypair();
 		globalThis.aId = toHex(idA.publicKey);
 		globalThis.bId = toHex(idB.publicKey);
-		globalThis.netA = makeNetwork(idA, { host: "127.0.0.1", port: 0 }, undefined);
-		globalThis.netB = makeNetwork(idB, undefined, undefined);
+		globalThis.netA = makeNetwork(idA, undefined, { host: "127.0.0.1", port: 0 }, undefined);
+		globalThis.netB = makeNetwork(idB, undefined, undefined, undefined);
 		globalThis.tA = new Transport(aId, netA, 2000);
 		globalThis.tB = new Transport(bId, netB, 2000);
 		tA.onRequest((from, proto, payload) => payload);

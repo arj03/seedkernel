@@ -37,8 +37,8 @@ const netBenchHarness = `
 	globalThis.idB = sodium.crypto_sign_keypair();
 	globalThis.aId = toHex(idA.publicKey);
 	globalThis.bId = toHex(idB.publicKey);
-	globalThis.netA = makeNetwork(idA, { host: "127.0.0.1", port: 0 }, undefined);
-	globalThis.netB = makeNetwork(idB, undefined, undefined);
+	globalThis.netA = makeNetwork(idA, undefined, { host: "127.0.0.1", port: 0 }, undefined);
+	globalThis.netB = makeNetwork(idB, undefined, undefined, undefined);
 	globalThis.tA = new Transport(aId, netA, 2000);
 	globalThis.tB = new Transport(bId, netB, 2000);
 
@@ -62,8 +62,21 @@ const netBenchHarness = `
 // listener, and points B at it. The returned loop drives benchPingN/benchFetchN.
 func setupNetBench(b *testing.B) *eventLoop {
 	ensureBooted(b)
-	if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
-		b.Fatal("harness:", err)
+	// Once per REALM, not once per call. The realm is shared across benchmarks
+	// (ensureBooted) and the framework re-enters each benchmark to grow b.N, so a second
+	// eval of the harness would redeclare its top-level consts and fail as a SyntaxError.
+	// Asking the realm what it already holds keeps this correct however the benchmarks are
+	// ordered or filtered — a Go-side "did I do this" flag would drift from the realm.
+	v, err := qc.Eval("net-bench-installed.js", qjs.Code(`typeof benchPingN`))
+	if err != nil {
+		b.Fatal("harness probe:", err)
+	}
+	if v.String() != "function" {
+		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
+			b.Fatal("harness:", err)
+		}
+	} else {
+		return el // already wired: listener bound, peer addressed
 	}
 	if kind, _, msg, err := el.await(`(async () => { await netA.start(); return new Uint8Array(0); })()`, 8*time.Second); err != nil || kind != 0 {
 		b.Fatalf("netA.start: kind=%d msg=%q err=%v", kind, msg, err)

@@ -102,10 +102,16 @@ func runHandshake(t *testing.T, connectFn, listenFn string) {
 func TestPeerLinkExpectPeerIdMismatch(t *testing.T) {
 	bootRealm(t)
 
-	// A dials B but pins the WRONG expected key. On B's HELLO, A finds peerId !=
-	// expectPeerId and drops the socket without sending AUTH — so A never auths and B
-	// never auths. PeerLink.close() is intentionally silent on the closing side, so
-	// the observable signal is B seeing the socket drop (its onClose).
+	// A dials B but pins the WRONG expected key. Under the concealed suite (0x02) the
+	// identities come LAST: A names itself at msg3 and B answers at msg4, so A can only
+	// check `expectPeerId` after it has already revealed itself — net-link.ts says so in
+	// as many words, and it is the standard Noise-XX limitation the four-message ordering
+	// buys its identity hiding with. So the mismatch aborts A at msg4, and B — which saw
+	// a perfectly good msg3 — HAS authenticated by then. That asymmetry is the assertion:
+	// the pin protects A from talking to the wrong node, not from having said hello to it.
+	//
+	// PeerLink.close() is intentionally silent on the closing side, so the observable
+	// signal is B seeing the socket drop (its onClose).
 	const harness = `
 		globalThis.__res = { aAuthed: false, bAuthed: false, bClosed: false };
 		globalThis.startTest = function () {
@@ -139,8 +145,8 @@ func TestPeerLinkExpectPeerIdMismatch(t *testing.T) {
 	if res.GetPropertyStr("aAuthed").String() == "true" {
 		t.Fatal("A authenticated despite an expectPeerId mismatch")
 	}
-	if res.GetPropertyStr("bAuthed").String() == "true" {
-		t.Fatal("B authenticated though A never sent AUTH")
+	if res.GetPropertyStr("bAuthed").String() != "true" {
+		t.Fatal("B should have authenticated at msg3 — A's identity is sent before it can check the pin")
 	}
 	if res.GetPropertyStr("bClosed").String() != "true" {
 		t.Fatal("B did not observe the socket drop after A rejected the mismatch")

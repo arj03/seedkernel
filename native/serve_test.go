@@ -36,12 +36,18 @@ const holderGuestSource = `
 // test is the one bootNode built; this is only the peer knocking on its door.
 const requesterJS = `
 "use strict";
-globalThis.startRequester = async function (holderId, port) {
+globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
-  globalThis.__net2 = makeNetwork(id, undefined, undefined);
+  globalThis.__net2 = makeNetwork(id, undefined, undefined, undefined);
   globalThis.__t2 = new Transport(__peerId, __net2, 2000);
-  __net2.addPeerAddr(holderId, { host: "127.0.0.1", port, transport: "tcp" });
+  // The secret rides in the ADDRESS, not in this node's own config: on a dial it is the
+  // PEER's contact secret (§12.6), and without it the holder answers a stranger's msg1
+  // with silence — which is the whole point of the gate, and would show up here only as
+  // a request timeout.
+  __net2.addPeerAddr(holderId, {
+    host: "127.0.0.1", port, transport: "tcp", contactSecret: fromHex(contactSecretHex),
+  });
   return new Uint8Array(0);
 };
 // Go stages bytes as ArrayBuffers; Transport.request takes the Uint8Array view every
@@ -56,7 +62,8 @@ func startRequester(t *testing.T, holderID string, port int) string {
 	if _, err := qc.Eval("requester.js", qjs.Code(requesterJS)); err != nil {
 		t.Fatal("requester:", err)
 	}
-	if _, err := callRealm("startRequester", 5*time.Second, qc.NewString(holderID), qc.NewInt32(int32(port))); err != nil {
+	if _, err := callRealm("startRequester", 5*time.Second,
+		qc.NewString(holderID), qc.NewInt32(int32(port)), qc.NewString(testContactSecretHex)); err != nil {
 		t.Fatal("startRequester:", err)
 	}
 	return mustEvalString(t, qc, `__peerId`)
