@@ -167,6 +167,19 @@ export interface Shell {
    *  this was its last app. Returns true if any handlers were removed.
    *  The one uninstall path, symmetric with loadBundleBlob (§12.5). */
   uninstall(appKey: string): boolean;
+  /** Write off an author key: refuse everything it signs from now on, and uninstall
+   *  every app of its already running. Returns the app keys torn down.
+   *
+   *  This is the remedy for a stolen author key, and it exists because the two halves
+   *  are useless apart. Uninstalling alone leaves nothing to stop the thief's next
+   *  bundle landing on the same derived names; refusing alone leaves the compromised
+   *  code running. Neither half implies the other, so an operator doing this by hand
+   *  can do half of it — which is the actual gap, not the absence of a protocol.
+   *
+   *  Permanent and host-local: the key stays refused across reboots and across later
+   *  edits to the policy allowlist. Recovery is a new author key, which derives new
+   *  names and a fresh mark (§5.1) — not an un-revoke. */
+  revoke(authorHex: string): string[];
   /** Run one of a loaded bundle's guest entrypoints through a generic
    *  cap-bridge over the kernel's primitives. `appKey` defaults to the
    *  only loaded app; throws when more than one is loaded and no key is
@@ -276,6 +289,17 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
 
   const hasGuest = (b: LoadedBundle): boolean => b.guestSource.length > 0;
 
+  const doUninstall = (appKey: string): boolean => {
+    const removed = host.removePrefix(appKey + ":");
+    bindings.removeApp(appKey);
+    const slot = apps.get(appKey);
+    if (slot) {
+      slot.realm?.dispose();
+      apps.delete(appKey);
+    }
+    return removed > 0;
+  };
+
   const doDispatch = (from: PeerId, proto: string, payload: Uint8Array): Uint8Array | null => {
     const key = bindings.boundApp(proto);
     if (!key) return null;
@@ -306,6 +330,15 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
     sodium,
     async loadBundleBlob(blob) {
       const v = verifyBundle(sodium, blob);
+      // Revocation before `admit`, not just inside installBundle. The predicate is
+      // where an interactive shell puts its consent dialog (§12.4), so asking it
+      // first would show a user the author and metadata of a bundle this host has
+      // already decided to refuse, take their approval, and only then fail. A written-
+      // off key should never reach the prompt. The check in installBundle stays as the
+      // backstop for callers that reach it another way.
+      if (platform.freshnessStore.isRevoked(v.author)) {
+        throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
+      }
       const ok = await admit(v);
       if (!ok) throw new Error("bundle: rejected by admission predicate");
       const loaded = installBundle(host, v, platform.freshnessStore);
@@ -319,15 +352,24 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       apps.set(key, { loaded, realm: null, handleName });
       return loaded;
     },
-    uninstall(appKey) {
-      const removed = host.removePrefix(appKey + ":");
-      bindings.removeApp(appKey);
-      const slot = apps.get(appKey);
-      if (slot) {
-        slot.realm?.dispose();
-        apps.delete(appKey);
+    uninstall: doUninstall,
+    revoke(authorHex) {
+      const hex = authorHex.toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(hex)) {
+        throw new Error(`shell: revoke expects a 64-character hex author key, got ${JSON.stringify(authorHex)}`);
       }
-      return removed > 0;
+      // Persist FIRST, then tear down. The other order leaves a window in which the
+      // apps are gone but nothing refuses the key, and the case this exists for is a
+      // key that is actively publishing.
+      platform.freshnessStore.revoke(fromHex(hex));
+      const gone: string[] = [];
+      for (const appKey of [...apps.keys()]) {
+        // Every kernel name of an app begins with its author (§5.1), so one prefix
+        // test finds every app this key ever landed — including ones this shell
+        // loaded before the key went bad.
+        if (appKey.startsWith(hex + ":")) { doUninstall(appKey); gone.push(appKey); }
+      }
+      return gone;
     },
     async runGuest(entry, payload, appKey) {
       const slot = appKey ? apps.get(appKey) : onlyApp();

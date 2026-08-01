@@ -476,6 +476,42 @@ func runGuest(entry string, payload []byte) ([]byte, error) {
 	return callRealm("runGuest", 60*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
 }
 
+// uninstall removes one app by app key (README §12.5). The unbind, the protocol
+// bindings and the realm disposal are all the shared shell's; Go owns only the CLI.
+func uninstall(appKey string) string {
+	out, err := callRealm("uninstall", 30*time.Second, qc.NewString(appKey))
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	var removed bool
+	if err := json.Unmarshal(out, &removed); err != nil {
+		return "ERROR(json): " + err.Error()
+	}
+	if !removed {
+		return appKey + " (nothing bound)"
+	}
+	return appKey
+}
+
+// revoke writes off a compromised author key (README §12.5): every bundle it signs is
+// refused from here on, and every app it already landed is torn down. Both halves in
+// one call, because either alone leaves a hole — an uninstall the key can undo by
+// publishing again, or a refusal with the compromised code still serving.
+func revoke(authorHex string) string {
+	out, err := callRealm("revoke", 30*time.Second, qc.NewString(authorHex))
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	var gone []string
+	if err := json.Unmarshal(out, &gone); err != nil {
+		return "ERROR(json): " + err.Error()
+	}
+	if len(gone) == 0 {
+		return authorHex + " (no apps of its were loaded)"
+	}
+	return fmt.Sprintf("%s (uninstalled %d app(s): %v)", authorHex, len(gone), gone)
+}
+
 // freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
 // (README §12.4). The marks and the monotonic rule live in JS (bundle.ts FreshnessMarks);
 // Go owns only the path and the atomic write. Empty ⇒ purely in-memory, so a fresh
@@ -514,6 +550,7 @@ type cliArgs struct {
 	bundleDir, dataDir, policyPath, keyPath string
 	listen, wsListen, peers                 string
 	put, get, out, appConfig                string
+	revokeKeys, uninstallApps               string
 	timeoutMs                               int
 }
 
@@ -530,6 +567,8 @@ func parseCLI() cliArgs {
 	flag.StringVar(&a.get, "get", "", "get a hash and exit")
 	flag.StringVar(&a.out, "out", "", "output path for --get")
 	flag.StringVar(&a.appConfig, "app-config", "", "app config JSON")
+	flag.StringVar(&a.revokeKeys, "revoke", "", "write off compromised author keys (hex,…): refuse their bundles and uninstall what they landed")
+	flag.StringVar(&a.uninstallApps, "uninstall", "", "uninstall app keys (authorHex:app,…) without revoking the author")
 	flag.IntVar(&a.timeoutMs, "timeout", 2000, "network start timeout (ms)")
 	flag.Parse()
 	if flag.NArg() > 0 {
@@ -575,6 +614,18 @@ func main() {
 	}
 	if st.WsPort != 0 {
 		fmt.Printf("  ws     listening on :%d\n", st.WsPort)
+	}
+
+	// Operator remedies (§12.5), applied BEFORE the bundle load: a node told to write
+	// off a key must never briefly install what it was told to refuse. Both persist
+	// through the same atomic seam as the freshness marks, so the decision survives
+	// even if the bundle load below then fails — which it will, and should, when the
+	// revoked key is the one that signed this node's own bundle.
+	for _, authorHex := range splitList(a.revokeKeys) {
+		fmt.Println("  revoke " + revoke(authorHex))
+	}
+	for _, appKey := range splitList(a.uninstallApps) {
+		fmt.Println("  uninstall " + uninstall(appKey))
 	}
 
 	// The signed bundle: verify + install its modules, stand up its guest, bind its

@@ -412,15 +412,30 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
 
 // ── Freshness (README §12.4 step 3) ──────────────────────────────────────────
 
-/** The persisted bundle-freshness high-water mark per `(author, app)` (README §12.4).
+/** The persisted bundle-freshness high-water mark per `(author, app)` (README §12.4),
+ *  plus the set of author keys this host has written off (§12.5).
+ *
  *  Host-local state that survives reboots, so an older signed bundle cannot silently
  *  replace a newer one — the guest is loaded wholesale from the bundle at every boot
- *  and carries no `seq` of its own. */
+ *  and carries no `seq` of its own.
+ *
+ *  The two live in one store because they are the same KIND of thing — persisted
+ *  operator decisions about an author, read on the same load path, written through
+ *  the same atomic seam — and because the dead-key set is worth nothing if a
+ *  truncated write can drop it. The name still says "freshness" for the older half;
+ *  renaming it would touch every target for no behavioural gain. */
 export interface FreshnessStore {
   /** The highest `version` ever loaded for this `(author, app)`, or −Infinity if none. */
   get(author: Uint8Array, app: string): number;
   /** Advance the mark to `version` (monotonic; a lower value never rewinds it). */
   set(author: Uint8Array, app: string, version: number): void;
+  /** Has this author key been written off (§12.5)? Checked on every load. */
+  isRevoked(author: Uint8Array): boolean;
+  /** Write off an author key permanently. Monotonic like the marks: nothing in the
+   *  runtime removes a key from this set, so an author re-added to the policy's
+   *  allowlist by a later edit stays refused. Undoing it is an out-of-band operator
+   *  action on the store file, symmetric with rolling a freshness mark back. */
+  revoke(author: Uint8Array): void;
 }
 
 /** The freshness *arithmetic*: the `(author, app)` key derivation, the monotonic
@@ -431,30 +446,65 @@ export interface FreshnessStore {
  *  store: `persist` does nothing, which is exactly right for a test. */
 export class FreshnessMarks implements FreshnessStore {
   protected readonly marks = new Map<string, number>();
+  /** Author keys written off (§12.5), as lowercase hex. */
+  protected readonly revoked = new Set<string>();
 
-  /** Seed from a persisted `{ "authorHex:app": version }` blob. Absent, unreadable
-   *  or malformed input ⇒ start empty (−∞ for every key); a target's loader hands in
-   *  null rather than throwing, since a missing store is the first-boot case. */
+  /** Seed from a persisted `{ marks: { "authorHex:app": version }, revoked: [hex] }`
+   *  blob. Absent or unreadable input ⇒ start empty (−∞ for every key, nothing
+   *  revoked); a target's loader hands in null rather than throwing, since a missing
+   *  store is the first-boot case.
+   *
+   *  Note that "unreadable ⇒ start empty" also means "start UNREVOKED", which is why
+   *  `persist` must be atomic on every target.
+   *
+   *  A store written before revocation existed — a bare `{ "authorHex:app": version }`
+   *  map — THROWS rather than reading as empty. It would otherwise parse as no marks
+   *  at all, silently discarding every downgrade guard on the one boot after a host
+   *  upgrade, with the next stale bundle accepted and nothing anywhere saying why. An
+   *  operator must be told to migrate or delete the file; the shape is unambiguous
+   *  (a bare map has neither key), so this can never fire on a store this version
+   *  wrote. */
   constructor(json?: string | null) {
     if (json) {
+      let raw: Record<string, unknown> | undefined;
       try {
-        const raw = JSON.parse(json) as Record<string, unknown>;
-        for (const [k, v] of Object.entries(raw)) if (typeof v === "number") this.marks.set(k, v);
+        const parsed = JSON.parse(json) as unknown;
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          raw = parsed as Record<string, unknown>;
+        }
       } catch { /* malformed ⇒ start empty */ }
+      if (raw) {
+        if (raw.marks === undefined && raw.revoked === undefined && Object.keys(raw).length > 0) {
+          throw new Error(
+            "freshness store: this file predates author revocation (§12.5) and holds only high-water marks. " +
+            'Reading it as-is would silently drop every downgrade guard. Migrate it to {"marks":{…},"revoked":[]} ' +
+            "or delete it to start from no marks.",
+          );
+        }
+        const marks = raw.marks;
+        if (typeof marks === "object" && marks !== null && !Array.isArray(marks)) {
+          for (const [k, v] of Object.entries(marks as Record<string, unknown>)) {
+            if (typeof v === "number") this.marks.set(k, v);
+          }
+        }
+        if (Array.isArray(raw.revoked)) {
+          for (const a of raw.revoked) if (typeof a === "string") this.revoked.add(a.toLowerCase());
+        }
+      }
     }
   }
 
-  /** Serialize the marks for `persist`. */
+  /** Serialize the marks and the dead-key set for `persist`. */
   protected serialize(): string {
-    const obj: Record<string, number> = {};
-    for (const [k, v] of this.marks) obj[k] = v;
-    return JSON.stringify(obj);
+    const marks: Record<string, number> = {};
+    for (const [k, v] of this.marks) marks[k] = v;
+    return JSON.stringify({ marks, revoked: [...this.revoked] });
   }
 
-  /** Write the serialized marks durably. The base store is in-memory only; a target
+  /** Write the serialized state durably. The base store is in-memory only; a target
    *  overrides this with its atomic-write seam (README §12.4 requires the write be
-   *  atomic — a truncated store reads back as "no marks", silently discarding every
-   *  downgrade guard). */
+   *  atomic — a truncated store reads back as "nothing known", silently discarding
+   *  every downgrade guard AND every revocation). */
   protected persist(_json: string): void {}
 
   private key(author: Uint8Array, app: string): string { return appKeyFor(author, app); }
@@ -469,6 +519,17 @@ export class FreshnessMarks implements FreshnessStore {
     const cur = this.marks.get(k);
     if (cur !== undefined && cur >= version) return; // monotonic: never rewound
     this.marks.set(k, version);
+    this.persist(this.serialize());
+  }
+
+  isRevoked(author: Uint8Array): boolean {
+    return this.revoked.has(toHex(author));
+  }
+
+  revoke(author: Uint8Array): void {
+    const hex = toHex(author);
+    if (this.revoked.has(hex)) return;
+    this.revoked.add(hex);
     this.persist(this.serialize());
   }
 }
@@ -607,6 +668,16 @@ export function installBundle(
   // the mark is never rewound.
   const version = v.manifest.version;
   if (freshness) {
+    // Revocation (§12.5) before freshness. A stolen key satisfies freshness trivially
+    // — it signs `version + 1` — so this is the check that has anything to say about
+    // it, and it must speak first or the load succeeds. It sits HERE rather than in
+    // the admission predicate (§12.5) because a predicate is a pure function of the
+    // bundle and every target writes its own: `admitAll` would silently have no
+    // revocation, and an OFFER-delivered bundle (§11) is exactly the path that needs
+    // one. One check on the one install path covers every target.
+    if (freshness.isRevoked(v.author)) {
+      throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${version}`);
+    }
     const highWater = freshness.get(v.author, v.manifest.app);
     if (version < highWater) {
       throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);

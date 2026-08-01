@@ -83,10 +83,11 @@ export interface Shell extends CoreShell {
   loadBundle(file: string): Promise<LoadedBundle>;
 }
 
-/** A `FreshnessStore` backed by one JSON file (`{ "authorHex:app": version }`). Kept
+/** A `FreshnessStore` backed by one JSON file (`{ marks, revoked }`). Kept
  *  *outside* the guest-writable fs directory (a sibling file), so a `fs`-capable guest
- *  cannot tamper with its own freshness mark. An operator rolls back by deleting or
- *  lowering it out of band (the operator is the TCB, README §14).
+ *  cannot tamper with its own freshness mark — or with the dead-key set beside it
+ *  (§12.5). An operator rolls back a mark, or un-revokes a key, by editing this file
+ *  out of band (the operator is the TCB, README §14).
  *
  *  The monotonic rule and the serialization live in `FreshnessMarks` (bundle.ts) —
  *  this adds only the Node persistence seam. */
@@ -162,6 +163,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     sodium: core.sodium,
     loadBundleBlob: core.loadBundleBlob,
     uninstall: core.uninstall,
+    revoke: core.revoke,
     async loadBundle(file) {
       return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
     },
@@ -273,6 +275,20 @@ export async function main(): Promise<void> {
   console.log(`  cohort ${args["peers"] ? (str(args, "peers")!.split(",").filter(Boolean).length) : 0} peer(s)`);
   if (nodeNet.port) console.log(`  tcp    listening on :${nodeNet.port}`);
   if (nodeNet.wsPort) console.log(`  ws     listening on :${nodeNet.wsPort}`);
+
+  // Operator remedies (§12.5), applied BEFORE --bundle deliberately: a node booting
+  // with both should never briefly install what it was told to refuse. --revoke is
+  // the whole remedy for a compromised key (refuse + tear down); --uninstall is the
+  // narrower one — drop an app without writing its author off.
+  const list = (name: string): string[] =>
+    args[name] ? str(args, name)!.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  for (const hex of list("revoke")) {
+    const gone = shell.revoke(hex);
+    console.log(`  revoke ${hex}${gone.length ? ` (uninstalled ${gone.length} app(s))` : ""}`);
+  }
+  for (const appKey of list("uninstall")) {
+    console.log(`  uninstall ${appKey}${shell.uninstall(appKey) ? "" : " (nothing bound)"}`);
+  }
 
   // A signed bundle from disk (the file-first path; relay delivery is the next
   // step). The shell verifies + governs it before anything lands.

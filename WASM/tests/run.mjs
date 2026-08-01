@@ -2135,6 +2135,154 @@ async function testBundleCorruptNewerRollback() {
   console.log("  OK\n");
 }
 
+// ─── Test: writing off a compromised author key (§12.5) ─────────────────────────
+//
+// Finding guard: freshness cannot answer "is this key still the author's?". A stolen
+// key signs `version + 1`, clears the high-water mark, and lands on the SAME derived
+// names (§5.1) — forever. `shell.revoke` is the remedy, and the test is that both of
+// its halves happen and that the refusal survives a reboot: an operator doing this by
+// hand can uninstall without closing the door, or close it with the code still running.
+async function testAuthorRevocation() {
+  console.log("Test: revoking an author key refuses its bundles and tears down what it landed");
+  const { signManifest, packBundle, MANIFEST_FILE, moduleFile } = await imp("build/host/bundle.js");
+  const { boot } = await imp("build/host/main.js");
+  const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+
+  const author = generateKeyPair();
+  const identity = generateKeyPair();
+  const authorHex = toHex(author.publicKey);
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-revoke-"));
+  const bundlePath = pjoin(dir, "app.skb");
+  const dataDir = pjoin(dir, "_data");
+  const policyJson = JSON.stringify({ authors: [authorHex] });
+  let shell;
+  try {
+    const manifest = (version) => ({
+      app: "victim", version,
+      modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+    });
+    const writeBundle = (version) => wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
+      [moduleFile("codec")]: forwarderBytes,
+    }));
+
+    shell = await boot({ policyJson, dir: dataDir, identity });
+    const appKey = appKeyFor(author.publicKey, "victim");
+    const kernelName = bundleKernelNameFor(author.publicKey, "victim", "codec");
+
+    // 1. The author is trusted: v1 loads and binds.
+    writeBundle(1);
+    await shell.loadBundle(bundlePath);
+    assert(shell.host.isBound(kernelName), "the app binds while the author is trusted");
+
+    // 2. The key is stolen. Freshness does NOT stop it — v2 is strictly newer, so it
+    //    loads over the same name. This is the gap, asserted rather than assumed.
+    writeBundle(2);
+    await shell.loadBundle(bundlePath);
+    assert(shell.host.isBound(kernelName), "freshness does not stop a newer bundle from a stolen key");
+
+    // 3. Write the key off. Both halves must happen in the one call.
+    const gone = shell.revoke(authorHex);
+    assert(gone.includes(appKey), "revoke reports the app it tore down");
+    assert(!shell.host.isBound(kernelName), "revoke uninstalls what the key already landed");
+
+    // 4. The thief's next bundle is refused even though the version keeps climbing
+    //    and the author is still in the policy allowlist.
+    writeBundle(3);
+    let refused = false;
+    try { await shell.loadBundle(bundlePath); } catch { refused = true; }
+    assert(refused, "a bundle from a revoked key is refused despite a higher version");
+    assert(!shell.host.isBound(kernelName), "nothing landed on the refused load");
+
+    // 4b. The refusal must come BEFORE the admission predicate, not after it. An
+    //     interactive shell puts its consent dialog there (§12.4), and prompting a
+    //     user to approve a bundle this host has already decided to refuse — then
+    //     failing once they say yes — is the wrong order to ask in.
+    {
+      const { createShell: mkShell, KernelHost: KH } = await imp("build/host/shell-core.js");
+      const { LoopbackNetwork } = await imp("build/host/net.js");
+      const { FreshnessMarks } = await imp("build/host/bundle.js");
+      const store = new FreshnessMarks();
+      let admitCalls = 0;
+      const probe = mkShell({
+        platform: {
+          sodium, identity, kernel: new KH(), freshnessStore: store,
+          network: new LoopbackNetwork(toHex(identity.publicKey)),
+        },
+        admit: () => { admitCalls++; return true; },
+      });
+      probe.revoke(authorHex);
+      try { await probe.loadBundleBlob(new Uint8Array(readFileSync(bundlePath))); } catch { /* expected */ }
+      assert(admitCalls === 0, "a revoked author never reaches the admission predicate");
+      probe.close();
+    }
+
+    // 5. The refusal is persisted, not process-local: a fresh boot over the same data
+    //    directory — same unedited policy file — still refuses. This is the half an
+    //    operator calling uninstall by hand does not get.
+    shell.close();
+    shell = await boot({ policyJson, dir: dataDir, identity });
+    let refusedAfterReboot = false;
+    try { await shell.loadBundle(bundlePath); } catch { refusedAfterReboot = true; }
+    assert(refusedAfterReboot, "the revocation survives a reboot with the policy untouched");
+
+    // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5.1) and
+    //    its own mark, so it is unaffected by the dead key's state.
+    const heir = generateKeyPair();
+    wf(bundlePath, packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, heir.privateKey, heir.publicKey, manifest(1)),
+      [moduleFile("codec")]: forwarderBytes,
+    }));
+    shell.close();
+    shell = await boot({
+      policyJson: JSON.stringify({ authors: [authorHex, toHex(heir.publicKey)] }),
+      dir: dataDir, identity,
+    });
+    await shell.loadBundle(bundlePath);
+    assert(shell.host.isBound(bundleKernelNameFor(heir.publicKey, "victim", "codec")),
+      "a replacement author key installs normally after the old one is written off");
+  } finally {
+    if (shell) shell.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  console.log("  OK\n");
+}
+
+// ─── Test: a pre-revocation store file is refused, not silently emptied ─────────
+//
+// Finding guard: the store gained a `revoked` set, so its shape changed from a bare
+// `{ "authorHex:app": version }` map to `{ marks, revoked }`. An old file parsed
+// leniently would read as NO marks — every downgrade guard silently dropped on the
+// first boot after a host upgrade, with the next stale bundle accepted and nothing
+// saying why. It must fail loudly instead (§12.4).
+async function testPreRevocationStoreIsRefused() {
+  console.log("Test: a store file predating revocation is refused rather than read as empty");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const key = "aa".repeat(32) + ":app";
+
+  let msg = "";
+  try { new FreshnessMarks(JSON.stringify({ [key]: 7 })); } catch (e) { msg = e.message; }
+  assert(msg.includes("predates author revocation"), "the old bare-map format throws with a migration message");
+
+  // The current format round-trips, marks and revocations both.
+  const cur = new FreshnessMarks(JSON.stringify({ marks: { [key]: 7 }, revoked: ["bb".repeat(32)] }));
+  assert(cur.get(new Uint8Array(32).fill(0xaa), "app") === 7, "the current format reads marks back");
+  assert(cur.isRevoked(new Uint8Array(32).fill(0xbb)), "the current format reads revocations back");
+
+  // The first-boot cases must NOT throw: absent, unparseable, or an empty object are
+  // all "nothing known yet", and only a populated bare map is the old format.
+  let firstBootThrew = false;
+  try {
+    new FreshnessMarks(null);
+    new FreshnessMarks("not json at all");
+    new FreshnessMarks("{}");
+  } catch { firstBootThrew = true; }
+  assert(!firstBootThrew, "absent, unparseable and empty stores still start empty");
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -2173,6 +2321,8 @@ await testRecordLayerIntegrity();
 await testHelloSuiteByte();
 await testManifestSuiteByte();
 await testSafeRealmConcurrency();
+await testAuthorRevocation();
+await testPreRevocationStoreIsRefused();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

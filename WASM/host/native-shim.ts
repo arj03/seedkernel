@@ -324,11 +324,31 @@ function serve(): Promise<void> {
   return theShell().serve();
 }
 
+/** Uninstall one app by its app key (§12.5). Returns the boolean JSON-encoded, not
+ *  raw: the realm bridge marshals only `Uint8Array`/`ArrayBuffer` results and turns
+ *  anything else into zero bytes (native/loop.go `awaitIn`), so a bare `false` would
+ *  reach Go as an empty buffer and read as success. Encode it. */
+function uninstall(appKey: string): Uint8Array {
+  return utf8.encode(JSON.stringify(theShell().uninstall(appKey)));
+}
+
+/** Write off a compromised author key (§12.5): refuse everything it signs from here
+ *  on, and tear down every app of its already running. Returns the app keys removed,
+ *  JSON-encoded, for the operator's console line.
+ *
+ *  Exposed for the same reason `loadBundleBlob` is: the decision and the state are
+ *  the shared shell's, and Go owns only the CLI surface and the durable write. A
+ *  native loader that could install but never revoke would leave §12.5's remedy
+ *  reachable on some targets and not others. */
+function revoke(authorHex: string): Uint8Array {
+  return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
+}
+
 // What Go reaches by name in the realm. `createRealm` and `makeNetwork` are here as
 // much for the native tests as for the boot above: a test that stands up a guest or
 // a second node drives the very factories production does, so there is no test-only
 // wiring to keep in step with the real one.
 export {
-  bootNode, setPolicy, loadBundleBlob, runGuest, serve,
+  bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke,
   createRealm, makeNetwork, netConnectWS, netListenWS,
 };
