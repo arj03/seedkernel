@@ -86,6 +86,11 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
     peers: () => peers || [],
     now: () => Date.now(),
     allowedOps: opsForCaps(new Set(caps)),
+    // No signed manifest behind this harness, so there is no logical->kernel map to
+    // scope MODULE_CALL against. The sentinel says so explicitly; omitting the field
+    // is refused (§12.2), which is the point — production reaches this call through
+    // createShell, which always has a manifest.
+    modules: UNSCOPED_MODULES,
     signScope: scope || undefined,
   });
   return __capBridge;
@@ -109,10 +114,20 @@ func capBridgeRealm(tb testing.TB) {
 // bundle's guest.
 func newTestRealm(tb testing.TB, appJSON, source string) {
 	tb.Helper()
+	newTestRealmBudget(tb, appJSON, source, 0)
+}
+
+// newTestRealmBudget is newTestRealm with an explicit execution budget in ms (0 = the
+// target default, §16.1). Separate so the budget test can use a short one without every
+// other test paying for a non-default path.
+func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
+	tb.Helper()
 	qc.Global().SetPropertyStr("__src", qc.NewString("const APP = "+appJSON+";\n"+source))
+	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {
-			globalThis.__realm = await createRealm({ source: capPreamble() + __src, bridge: __capBridge });
+			globalThis.__realm = await createRealm({ source: capPreamble() + __src, bridge: __capBridge,
+				deadlineMs: __deadlineMs || undefined });
 			globalThis.__realmCall = (entry, arg) => __realm.call(entry, new Uint8Array(arg));
 			return new Uint8Array(0);
 		})`,

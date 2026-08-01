@@ -77,7 +77,7 @@
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release && node scripts/inline-ws.mjs",
     "build:host": "tsc -p host && tsc -p host/tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
-    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"bootNode,setPolicy,loadBundleBlob,runGuest,serve,createRealm,makeNetwork,netConnectWS,netListenWS,guestPreamble,capPreamble,createCapBridge,opsForCaps,guestSignScope,Transport,PeerLink,Bindings,toHex,fromHex\" build/host/util.js build/host/domains.js build/host/policy.js build/host/bundle.js build/host/cap-bridge.js build/host/bindings.js build/host/net.js build/host/net-link.js build/host/link-router.js build/host/net-route.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/host/net-channel.js build/host/net-frame.js build/host/shell-core.js build/host/native-shim.js",
+    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"bootNode,setPolicy,loadBundleBlob,runGuest,serve,createRealm,makeNetwork,netConnectWS,netListenWS,guestPreamble,capPreamble,createCapBridge,opsForCaps,guestSignScope,UNRESTRICTED_OPS,UNSCOPED_MODULES,Transport,PeerLink,Bindings,toHex,fromHex\" build/host/util.js build/host/domains.js build/host/wasm-limits.js build/host/fs.js build/host/policy.js build/host/bundle.js build/host/cap-bridge.js build/host/bindings.js build/host/net.js build/host/net-link.js build/host/link-router.js build/host/net-route.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/host/net-channel.js build/host/net-frame.js build/host/shell-core.js build/host/native-shim.js",
     "build:loader-wasm": "npm run build:ws && npm run build:browser-sodium && node scripts/copy-loader-wasm.mjs",
     "build:loader": "npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
@@ -85,8 +85,8 @@
     "build:browser": "npm run build && npm run build:browser-sodium",
     "relay": "node scripts/relay.mjs",
     "shell": "node build/host/main-node.js",
-    "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release",
-    "test": "npm run build && npm run build:fixtures && node tests/run.mjs"
+    "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release",
+    "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/run.mjs"
   },
   "dependencies": {
     "@jitl/quickjs-ng-wasmfile-release-asyncify": "^0.32.0",

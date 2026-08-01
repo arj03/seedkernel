@@ -58,7 +58,7 @@ declare const bridge: {
   // ── the confined realm (§12.3), Go's twin of safe-js.ts ──
   /** Stand up a zero-authority QuickJS realm running `source`, with the guest's
    *  single `host.call` seam funnelled into `capCall`. Returns an opaque handle. */
-  createRealm(source: string, capCall: CapCall, memoryLimitBytes: number): unknown;
+  createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): unknown;
   /** Invoke an entrypoint as the *initiator*: it may await net, so the result comes
    *  back through `onDone`/`onFail` rather than as a return value. */
   realmCall(
@@ -176,7 +176,16 @@ function makeNetwork(
  *  realm, so a settled net op routes to the realm that parked it structurally, and
  *  an initiator's result is delivered into a Promise built in plain ECMAScript. Go
  *  needs no promise primitive of its own. */
-const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes }): Promise<SafeRealm> => {
+// `deadlineMs` crosses as milliseconds with two sentinel encodings, because the bridge
+// carries numbers and not `undefined`/`Infinity`: 0 means "the target's default" (matching
+// how memoryLimitBytes is read on the Go side) and a negative value means Infinity — no
+// budget, said explicitly rather than reached by omission.
+//
+// Note the native realm does NOT enforce this through QuickJS: New_QJS's maxExecutionTime
+// argument is inert in the vendored qjs.wasm (a 1 ms limit does not interrupt a spinning
+// loop), so guest.go arms a wazero deadline instead. That makes a budget kill fatal to the
+// realm rather than a catchable JS error — see qjs.Runtime.Budget.
+const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes, deadlineMs }): Promise<SafeRealm> => {
   // Assigned before any guest code can call back: bridge.createRealm evaluates the
   // guest, whose top-level can only reach sync ops (a Promise it could not await).
   let realm: unknown;
@@ -189,7 +198,8 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
     );
     return null;
   };
-  realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0);
+  realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0,
+    deadlineMs === undefined ? 0 : (deadlineMs === Infinity ? -1 : deadlineMs));
   return {
     call: (entry, payload) => new Promise<Uint8Array>((resolve, reject) => {
       bridge.realmCall(realm, entry, payload,

@@ -30,7 +30,8 @@ const sodium = await loadSodium();
 // where they live, rather than only from a downstream consumer.
 const { NodeNetwork } = await imp("build/host/net-node.js");
 const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
-const { CAP, createCapBridge, opsForCaps, guestSignScope } = await imp("build/host/cap-bridge.js");
+const { CAP, createCapBridge, opsForCaps, guestSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES }
+  = await imp("build/host/cap-bridge.js");
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
 const { MemoryFs } = await imp("build/host/fs.js");
 const enc = new TextEncoder();
@@ -419,6 +420,7 @@ async function testGuestNetFanout() {
   const bridge = createCapBridge({
     sodium, identity: a, callHandler: () => null,
     transport: ta, peers: () => [], fs: new MemoryFs(),
+    allowedOps: UNRESTRICTED_OPS, modules: UNSCOPED_MODULES,
   });
   // The guest fans out over NET_SEND itself: build [peer 32][pidLen u8][proto utf8][payload]
   // per peer and Promise.all them. NET_SEND returns [ok u8][resp]; an unreachable peer
@@ -517,6 +519,7 @@ async function testCapBridge() {
     sodium, identity: id,
     callHandler: (name, p) => host.callHandler(name, p),
     transport, peers: () => [toHex(id.publicKey)], fs, signScope,
+    allowedOps: UNRESTRICTED_OPS, modules: UNSCOPED_MODULES,
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -1089,7 +1092,8 @@ async function testCapBridgeEnforcement() {
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (allowedOps) => createCapBridge({
     sodium, identity: id, callHandler: () => null,
-    transport: stubTransport, peers: () => [], fs: new MemoryFs(), allowedOps,
+    transport: stubTransport, peers: () => [], fs: new MemoryFs(),
+    allowedOps, modules: UNSCOPED_MODULES,
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -1103,8 +1107,12 @@ async function testCapBridgeEnforcement() {
   try { await restricted(CAP.FS_DELETE, U(120)); } catch { threw = true; }
   assert(threw, "an undeclared op (FS_DELETE) is refused by the bridge");
 
-  // guest-controlled allocation caps (no allowedOps → unrestricted host caller)
-  const open = mk(undefined);
+  // guest-controlled allocation caps. UNRESTRICTED_OPS is the host-side caller that
+  // opts out of gating *by name* — omitting allowedOps entirely now throws (§12.2).
+  const open = mk(UNRESTRICTED_OPS);
+  let omitted = false;
+  try { mk(undefined); } catch { omitted = true; }
+  assert(omitted, 'omitting allowedOps throws rather than granting every op');
   assertEqual((await open(CAP.RANDOM, U(0, 0, 4, 0))).length, 1024, "RANDOM under the cap works");
   threw = false;
   try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }

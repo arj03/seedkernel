@@ -4,17 +4,12 @@
   ],
   "targets": {
     "release": {
-      "outFile": "build/forwarder.wasm",
-      "textFile": "build/forwarder.wat",
+      "outFile": "build/forwarder-nomax.wasm",
       "optimizeLevel": 3,
       "shrinkLevel": 2,
       "converge": false,
       "noAssert": true,
       "exportRuntime": true
     }
-  },
-  "options": {
-    "bindings": "raw",
-    "maximumMemory": 256
   }
 }

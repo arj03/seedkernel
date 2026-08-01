@@ -27,6 +27,7 @@
 
 import { concatBytes, toHex } from "./util.js";
 import { DOMAIN_MANIFEST, SUITE_MANIFEST_GENESIS } from "./domains.js";
+import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "./wasm-limits.js";
 
 /** The manifest envelope's name inside the container. */
 export const MANIFEST_FILE = "manifest.bundle";
@@ -154,11 +155,58 @@ export interface BundleManifest {
    *  is chosen by the user — is what lets the loader hold no ownership state at all. */
   handles?: string[];
   modules: BundleModule[];
+  /** Which module receives inbound dispatch for a handler-only bundle — the `name` of
+   *  one of `modules` (README §12.10).
+   *
+   *  Declared, not positional. The shell used to take `modules[0]`, which made the
+   *  order of a JSON array load-bearing: reordering a manifest silently redirected every
+   *  inbound message to a different module, with nothing in the format saying that the
+   *  order meant anything. Since the field is inside the signed JSON, what receives
+   *  traffic is now something the author states and signs.
+   *
+   *  Optional only where it is unambiguous — a bundle with exactly one module, or one
+   *  whose guest does its own dispatch. Two or more modules and no guest requires it;
+   *  see `entryModuleOf`. */
+  entry?: string;
   /** The guest program, or absent for a handler-only bundle (app modules bound as
    *  handlers, no zero-authority realm — e.g. the chat demo). Present ⇒ the loader
    *  integrity-checks `guest.js` and hands the source back for the shell to run in a
    *  confined realm (§12.2). */
   guest?: BundleGuest;
+}
+
+/** The fs keyspace prefix for one app (README §12.2).
+ *
+ *  A hash of the app key rather than the app key itself, because the key must double as
+ *  a *filename* component: both fs backends restrict keys to `[A-Za-z0-9._-]`, which
+ *  `"<author hex>:<app>"` fails on its colons, and an author-chosen `app` cannot be
+ *  trusted to stay inside any charset. Hashing solves both at once — the output is hex,
+ *  and it is fixed-length, so two distinct app keys cannot produce prefixes where one
+ *  is an extension of the other.
+ *
+ *  128 bits of the digest: this separates namespaces, it does not authenticate them —
+ *  reaching another app's data still requires forging its author key, which is what
+ *  actually holds the boundary. */
+export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: string): string {
+  const key = new TextEncoder().encode(appKeyFor(author, app));
+  return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
+}
+
+/** The module name inbound dispatch goes to for a handler-only bundle, or null when the
+ *  bundle has a guest (which dispatches itself, §12.2) or no modules at all.
+ *
+ *  Ambiguity is an error rather than a default: a manifest with several modules and no
+ *  `entry` throws here instead of quietly picking one. That is the whole point of the
+ *  field — the previous positional rule could not distinguish "the author meant the first
+ *  one" from "the author never thought about it", and only one of those should load. */
+export function entryModuleOf(manifest: BundleManifest): string | null {
+  if (manifest.guest) return null;
+  if (manifest.modules.length === 0) return null;
+  if (manifest.entry !== undefined) return manifest.entry;
+  if (manifest.modules.length === 1) return manifest.modules[0].name;
+  throw new Error(
+    `bundle: ${manifest.modules.length} modules and no "entry" — declare which one receives inbound messages`,
+  );
 }
 
 /** The surface *verifying* a manifest needs (a subset of libsodium). Deliberately
@@ -251,6 +299,12 @@ function isValidManifest(m: unknown): m is BundleManifest {
     // ambiguous rather than merely redundant.
     if (seen.has(mm.name)) return false;
     seen.add(mm.name);
+  }
+  // `entry` must name a module this same manifest declares. Checked here, with the rest
+  // of the shape, so a mistyped entry is caught at load rather than at the first inbound
+  // message — an app whose traffic silently goes nowhere is the worst way to learn this.
+  if (o.entry !== undefined) {
+    if (typeof o.entry !== "string" || !seen.has(o.entry)) return false;
   }
   if (o.guest !== undefined) {
     const g = o.guest as Record<string, unknown> | null;
@@ -569,6 +623,12 @@ export function installBundle(
   try {
     for (const { mod, wasm } of v.modules) {
       const kernelName = kernelNameFor(v.author, v.manifest.app, mod.name);
+      // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
+      // instantiation is what allocates the declared initial memory, so a host-side
+      // check could only run after the damage. It sits here, on the shared admission
+      // path, rather than in each host's instantiateWasm: this is an admission rule, and
+      // §3 puts admission rules in the one compiled implementation both targets evaluate.
+      checkHandlerMemory(wasm, DEFAULT_MAX_HANDLER_MEMORY_BYTES);
       refs.push({ mod, ref: host.instantiateWasm(wasm), kernelName });
     }
   } catch (e) {

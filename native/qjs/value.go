@@ -54,6 +54,14 @@ func (v *Value) Context() *Context { return v.c }
 // Free releases the JSValue reference.
 func (v *Value) Free() {
 	if v != nil && v.raw != 0 {
+		// A runtime terminated by a Budget deadline has had its whole linear memory
+		// reclaimed by wazero, so there is nothing left to free and the call would
+		// panic. Drop the handle instead: a killed call path is full of deferred
+		// Free()s, and they must not turn a clean error into a panic.
+		if !v.c.rt.Alive() {
+			v.raw = 0
+			return
+		}
 		v.c.rt.call("QJS_FreeValue", v.c.handle, v.raw)
 		v.raw = 0
 	}

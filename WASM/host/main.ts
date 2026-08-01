@@ -9,6 +9,10 @@
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
 //        --listen 0.0.0.0:7000 --bundle ./app.skb
 //
+// A loaded guest runs under two operator-set resource bounds (§12.3), both defaulted:
+// --guest-timeout <ms> (execution budget per entrypoint call, default 5000; 0 = none)
+// and --guest-memory <MiB> (realm heap cap, default 64).
+//
 // For a self-contained non-browser binary, the Go/native target (native/,
 // README §12.9) embeds and runs this same shared host JS — no Node install needed.
 
@@ -46,6 +50,18 @@ export interface ShellOptions {
   livePeers?: () => PeerId[];
   /** net.send timeout in ms (how long before a peer is treated unreachable). */
   timeoutMs?: number;
+  /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3, §16.1).
+   *  Omitted ⇒ the 5s default. Counts time the guest is running, not time it spends
+   *  parked on a host bridge, so it bounds a wedged guest without penalising one
+   *  legitimately awaiting the network. `Infinity` disables it.
+   *
+   *  Reaching `createShell` from here is the point: a bound the shell accepts but no
+   *  target can set is a bound nobody has — which is exactly what happened to
+   *  safe-js's `deadlineMs` before this. */
+  guestDeadlineMs?: number;
+  /** QuickJS heap cap for the guest realm, in bytes (§12.3). Omitted ⇒ the 64 MiB
+   *  default. Raise it for an app that streams large windows through the guest. */
+  realmMemoryBytes?: number;
   /** Operator-supplied app config, merged *over* the bundle manifest's `config`
    *  into the guest's `const APP = …`. This is where per-node operator policy
    *  lives — e.g. a storage node's `quota` byte budget — as opposed to the
@@ -131,6 +147,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     },
     admit: policyFromJson(opts.policyJson),
     timeoutMs: opts.timeoutMs,
+    guestDeadlineMs: opts.guestDeadlineMs,
+    realmMemoryBytes: opts.realmMemoryBytes,
     config: opts.config,
   });
 
@@ -225,6 +243,16 @@ export async function main(): Promise<void> {
     listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
     wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
     timeoutMs: args["timeout"] ? Number(str(args, "timeout")) : undefined,
+    // Guest resource bounds (§12.3). Both default to a real number, so omitting the
+    // flags leaves the guest bounded rather than unbounded; these only widen or
+    // tighten. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
+    // rather than reached by leaving a flag off.
+    guestDeadlineMs: args["guest-timeout"]
+      ? (Number(str(args, "guest-timeout")) || Infinity)
+      : undefined,
+    realmMemoryBytes: args["guest-memory"]
+      ? Number(str(args, "guest-memory")) * 1024 * 1024
+      : undefined,
     config: appConfig,
   });
   const nodeNet = shell.net as NodeNetwork;

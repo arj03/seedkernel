@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -121,4 +122,186 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	if _, err := realmCall("hog", nil); err == nil {
 		t.Fatal("guest allocated past its heap cap — the realm is not confined")
 	}
+}
+
+// A guest that never yields is terminated by its execution budget (README §12.3, §16.1).
+//
+// This is the native half of safe-js.ts's interrupt handler, and it does NOT go through
+// QuickJS: New_QJS's maxExecutionTime argument is inert in the vendored qjs.wasm (a 1 ms
+// limit does not stop `for(;;){f()}`), so guest.go arms a wazero deadline instead. The
+// consequence asserted below is that the kill is fatal to the realm rather than a
+// catchable JS error — wazero closes the module, so the realm must refuse later calls
+// cleanly instead of panicking on a freed handle.
+//
+// The trivial call first is the control: without it a realm that was simply broken would
+// pass the same test.
+func TestGuestRealmExecutionBudget(t *testing.T) {
+	capBridgeRealm(t)
+
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__id = sodium.crypto_sign_keypair();
+		__buildCapBridge(["crypto"], __id, null, []);
+	`)); err != nil {
+		t.Fatal("build bridge:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		register("ok",   () => new Uint8Array([7]));
+		register("spin", () => { for (;;) {} });
+	`, 300)
+
+	out, err := realmCall("ok", nil)
+	if err != nil || len(out) != 1 || out[0] != 7 {
+		t.Fatalf("a bounded realm refused a trivial call: %v %v", out, err)
+	}
+
+	start := time.Now()
+	if _, err := realmCall("spin", nil); err == nil {
+		t.Fatal("a spinning guest was not interrupted")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("interrupted after %s, want near the 300ms budget", d)
+	}
+
+	if _, err := realmCall("ok", nil); err == nil {
+		t.Fatal("a realm terminated by its budget should refuse further calls")
+	}
+}
+
+// A realm killed mid-flight must SETTLE the calls it still owes, not strand them.
+//
+// The dangerous shape is an entrypoint that parks on net and then burns its budget in
+// the continuation: the kill lands inside settleNet, i.e. after the initiator's promise
+// was handed to the shell but before anything settled it. safe-js has no equivalent
+// problem — its interrupt throws, the guest's promise rejects, the caller sees an error —
+// so a native realm that merely stopped answering would be a divergence that hangs the
+// node rather than failing it. A hang is strictly worse than an error: the caller cannot
+// retry, time out on its own, or even tell that anything went wrong.
+func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
+	capBridgeRealm(t)
+
+	// A stub transport is enough: NET_SEND only needs a promise that settles on the
+	// loop, and using one keeps the kill (not a socket) as the only variable.
+	if _, err := qc.Eval("setup.js", qjs.Code(`
+		globalThis.__id = sodium.crypto_sign_keypair();
+		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
+		__buildCapBridge(["crypto", "net"], __id,
+			{ request: async () => new Uint8Array([9]) }, [__peer]);
+	`)); err != nil {
+		t.Fatal("setup:", err)
+	}
+
+	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
+		function fromHex(h) {
+		  const out = new Uint8Array(h.length / 2);
+		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
+		  return out;
+		}
+		register("park", async () => {
+		  const peer = fromHex(APP.peer);
+		  const proto = [0x74, 0x65, 0x73, 0x74];
+		  const req = new Uint8Array(32 + 1 + proto.length);
+		  req.set(peer, 0);
+		  req[32] = proto.length;
+		  req.set(proto, 33);
+		  await host.call(CAP_NET_SEND, req);
+		  for (;;) {}                 // burn the budget in the CONTINUATION
+		});
+	`, 300)
+
+	start := time.Now()
+	if _, err := realmCall("park", nil); err == nil {
+		t.Fatal("a guest that spun in its continuation was not stopped")
+	}
+	// The harness gives up at 30s. Anything near that means the call was stranded
+	// rather than settled — the bug this test exists for.
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("in-flight call was stranded for %s, not settled with an error", d)
+	}
+}
+
+// The budget also covers continuations the loop pumps directly.
+//
+// A plain `await` (no host.call) resumes through eventLoop.pumpAll rather than settleNet,
+// which for a while was outside every guard the realm had: one `await Promise.resolve()`
+// bought an unbounded loop, since only the segment before the await was budgeted. The
+// loop now drains a guest realm through guestRealm.pump, so a queued job is guest code
+// like any other.
+//
+// Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
+// the loop must be driven by whoever is waiting on it.
+func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
+	capBridgeRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		globalThis.__id = sodium.crypto_sign_keypair();
+		__buildCapBridge(["crypto"], __id, null, []);
+	`)); err != nil {
+		t.Fatal("build bridge:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		register("park", async () => {
+			await Promise.resolve();   // resumes via pumpAll, not settleNet
+			for (;;) {}
+		});
+	`, 300)
+
+	start := time.Now()
+	if _, err := realmCall("park", nil); err == nil {
+		t.Fatal("a guest spinning in a pumped continuation was not stopped")
+	}
+	if d := time.Since(start); d > 20*time.Second {
+		t.Fatalf("caller stranded for %s rather than settled with an error", d)
+	}
+}
+
+// Closing a realm settles the calls it still owes, rather than stranding them.
+//
+// Same failure mode as a budget kill and the same fix: an initiator's promise lives
+// inside the realm, so a close with calls outstanding leaves the caller waiting on
+// something that can no longer be resolved. safe-js's dispose() fails its pending
+// callers for this reason; close() has to as well.
+func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
+	capBridgeRealm(t)
+	if _, err := qc.Eval("setup.js", qjs.Code(`
+		globalThis.__id = sodium.crypto_sign_keypair();
+		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
+		__buildCapBridge(["crypto", "net"], __id,
+			{ request: () => new Promise(() => {}) }, [__peer]);
+	`)); err != nil {
+		t.Fatal("setup:", err)
+	}
+	// The transport never settles, so the guest parks forever and the realm is closed
+	// out from under a live call — the shape that used to hang.
+	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
+		function fromHex(h) {
+		  const out = new Uint8Array(h.length / 2);
+		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
+		  return out;
+		}
+		register("park", async () => {
+		  const peer = fromHex(APP.peer);
+		  const proto = [0x74, 0x65, 0x73, 0x74];
+		  const req = new Uint8Array(32 + 1 + proto.length);
+		  req.set(peer, 0);
+		  req[32] = proto.length;
+		  req.set(proto, 33);
+		  await host.call(CAP_NET_SEND, req);
+		  return new Uint8Array([1]);
+		});
+	`, 0)
+
+	if _, err := qc.Eval("close.js", qjs.Code(`
+		__realm.call("park", new Uint8Array(0)).then(
+			() => { globalThis.__outcome = "resolved"; },
+			(e) => { globalThis.__outcome = "rejected: " + (e && e.message || e); });
+		__realm.dispose();
+	`)); err != nil {
+		t.Fatal("close:", err)
+	}
+	// One bounded await is enough to drive the loop; the rejection must arrive in it.
+	_, _ = callRealm("(() => new Promise(r => setTimeout(() => r(new Uint8Array(0)), 50)))", 5*time.Second)
+	got := mustEvalString(t, qc, `String(globalThis.__outcome)`)
+	if got == "undefined" {
+		t.Fatal("call was stranded: closing the realm left its caller unsettled")
+	}
+	t.Logf("caller settled with: %s", got)
 }

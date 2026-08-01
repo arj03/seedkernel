@@ -2,7 +2,7 @@
 // stays a pure library module with no argv-sniffing auto-run guard.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
-//        --listen 0.0.0.0:7000
+//        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64]
 
 import { main } from "./main.js";
 

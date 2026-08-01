@@ -20,7 +20,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -33,6 +35,11 @@ import (
 // path, which a remote peer drives. QuickJS takes it at runtime creation only, hence
 // qjs.WithMemoryLimit rather than a setter.
 const defaultRealmMemory = 64 << 20 // 64 MiB
+
+// defaultRealmBudget mirrors safe-js.ts's DEFAULT_DEADLINE_MS (README §16.1) so the two
+// targets hold a guest to the same number. Like the memory cap it is a real default, not
+// an absent one: a shell that configures nothing still gets a bounded guest.
+const defaultRealmBudget = 5 * time.Second
 
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. A
@@ -60,6 +67,20 @@ type guestRealm struct {
 	// holds the host-realm resolve/reject of the Promise the shim handed the shell.
 	calls   map[int64]*initiatorCall
 	callSeq int64
+
+	// Execution budget (README §12.3), mirroring safe-js.ts's ExecClock. `budget` is the
+	// per-entrypoint allowance; `consumed` accumulates only the segments during which
+	// guest code actually holds the thread, so time the host spends awaiting a bridge on
+	// the guest's behalf is nobody's budget. Without that split one number cannot serve
+	// both roles: an initiator parked on a 2s request would be killed by any budget tight
+	// enough to catch a holder's infinite loop.
+	budget   time.Duration
+	consumed time.Duration
+	// dead is set when a budget kill terminated the wasm module. wazero closes the module
+	// rather than unwinding one call, so the realm cannot be reused: every later call is
+	// refused with an error rather than panicking on a freed handle. Recovering means
+	// building a fresh realm — reloading the bundle — not retrying against this one.
+	dead bool
 }
 
 type initiatorCall struct{ onDone, onFail *qjs.Value }
@@ -96,7 +117,16 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if mem == 0 {
 			mem = defaultRealmMemory
 		}
-		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem)
+		// 0 from the shim means "the target's default", matching how mem is read above —
+		// so a shell that configures nothing still gets a bounded realm on both targets.
+		// A negative value is the shim's encoding of Infinity: no budget, said explicitly.
+		budget := defaultRealmBudget
+		if ms := t.Args()[3].Int64(); ms < 0 {
+			budget = 0
+		} else if ms > 0 {
+			budget = time.Duration(ms) * time.Millisecond
+		}
+		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -166,15 +196,23 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 // fronted with the cap preamble, the bundle facts and the app config, so what arrives
 // here is exactly what a safe-js realm would be handed — with host.call funnelled into
 // `capCall`, a host-realm function the shell built for this app.
-func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLimit uint64) (*guestRealm, error) {
+func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
 	hostQc := loop.c
-	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit))
+	// Interruptibility is paired with the budget: armed only when there is one to
+	// enforce, so a realm explicitly run unbounded (deadlineMs: Infinity) does not pay
+	// wazero's per-call context check for a lever nothing will pull.
+	ropts := []qjs.Option{qjs.WithMemoryLimit(memoryLimit)}
+	if budget > 0 {
+		ropts = append(ropts, qjs.WithInterruptible())
+	}
+	rt, err := qjs.New(ropts...)
 	if err != nil {
 		return nil, err
 	}
 	g := &guestRealm{
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
 		capCall: capCall.Dup(), calls: map[int64]*initiatorCall{},
+		budget: budget,
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -186,7 +224,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	}
 	// The guest shares the host loop rather than owning one, so it just needs its job
 	// queue pumped — no Go timers of its own.
-	loop.addContext(g.qc)
+	loop.addContext(g.qc, g.pump)
 
 	// The single seam. Read (op, callId, payload) from the guest and shuttle the call to
 	// the cap-bridge in the host realm. A sync op returns its bytes here; a net op returns
@@ -288,11 +326,19 @@ func hostGuestPreamble(hostQc *qjs.Context) string {
 // result to return — onDone/onFail (host-realm functions settling the shim's Promise)
 // are called when the entrypoint's own promise settles, which the shared loop drives.
 func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Value) {
+	if err := g.checkAlive(); err != nil {
+		// Settle in the HOST realm, which is a different runtime and still alive.
+		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
+		return
+	}
 	g.callSeq++
 	id := g.callSeq
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
 	entryV, argV := g.qc.NewString(entry), g.qc.NewArrayBuffer(payload)
-	res, err := g.qc.Invoke(g.start, g.qc.NewUndefined(), g.qc.NewInt64(id), entryV, argV)
+	g.consumed = 0 // one top-level entrypoint invocation, one budget
+	res, err := g.within(func() (*qjs.Value, error) {
+		return g.qc.Invoke(g.start, g.qc.NewUndefined(), g.qc.NewInt64(id), entryV, argV)
+	})
 	entryV.Free()
 	argV.Free()
 	if res != nil {
@@ -308,12 +354,133 @@ func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Valu
 	}
 }
 
+// within runs one entry into the realm under the execution budget.
+//
+// It opens a clock segment, arms wazero's deadline for whatever budget is left, and
+// converts a budget kill into an error. The kill arrives as a panic from qjs's call
+// path (wazero returns an error, which qjs.Runtime.call panics on) and is fatal to the
+// module, so the realm is marked dead here rather than pretending it can be reused.
+func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err error) {
+	remaining := time.Duration(0)
+	if g.budget > 0 {
+		if remaining = g.budget - g.consumed; remaining <= 0 {
+			// Cumulative exhaustion across segments: the module is still alive, but the
+			// guest has spent its allowance and its in-flight work cannot be unwound
+			// from here, so the realm ends. Distinct from the wazero kill below only in
+			// how it was reached.
+			return nil, g.markDead(errors.New("guest realm terminated: execution budget exceeded"))
+		}
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			// Distinguish a budget kill from any other engine panic by asking the module
+			// rather than by matching on the message: a closed module IS the kill.
+			if !g.rt.Alive() {
+				err = g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
+				return
+			}
+			panic(rec)
+		}
+	}()
+	restore := g.rt.Budget(remaining)
+	start := time.Now()
+	defer func() {
+		g.consumed += time.Since(start)
+		restore()
+	}()
+	v, err = fn()
+	// A kill reaches us two ways and both must end the realm the same way: qjs's call
+	// helpers panic on a wazero error, which the recover above catches, but any path
+	// that *returns* the error instead (Context.Pump does) would otherwise slip past
+	// with the realm silently dead and its callers never settled. Ask the module.
+	if err != nil && !g.rt.Alive() {
+		return nil, g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
+	}
+	return v, err
+}
+
+// markDead ends the realm's life and settles every call it still owes.
+//
+// The settling is the point. A realm dies with continuations outstanding — the kill
+// typically lands inside settleNet, after the initiator's promise reached the shell but
+// before anything resolved it — and a dead realm cannot reject them itself. Without this
+// the shell's promise never settles and the caller hangs forever, which is strictly worse
+// than an error: it cannot retry, time out, or even observe that anything went wrong.
+// safe-js has no equivalent path because its interrupt throws inside the guest and the
+// guest's own promise rejects; on this target the host has to do it.
+//
+// Callbacks are HOST-realm values, so reporting works even though the guest runtime is
+// gone. Returns err so callers can `return nil, g.markDead(...)`.
+func (g *guestRealm) markDead(err error) error {
+	g.dead = true
+	settled := false
+	for id, c := range g.calls {
+		delete(g.calls, id)
+		g.reportCall(c.onFail, g.hostQc.NewString(err.Error()))
+		c.free()
+		settled = true
+	}
+	// Rejecting those promises only queues a microtask on the host realm. If this ran
+	// inside a pump that has already drained, nothing would deliver it and the caller
+	// would wait out its whole timeout — a hang instead of the error we just produced.
+	if settled {
+		g.loop.wake()
+	}
+	return err
+}
+
+// pump drains this realm's job queue under its execution budget.
+//
+// The loop calls it instead of Context.Pump because a queued job IS guest code: the
+// continuation after `await Promise.resolve()` never passes through settleNet, so
+// pumping the context directly would run it outside every guard the realm has. A guest
+// could then spend one await to buy an unbounded loop — the budget would cover the
+// segment before the await and nothing after it.
+//
+// A dead realm is skipped rather than pumped; markDead has already settled its callers.
+func (g *guestRealm) pump() {
+	if g.rt == nil || g.dead || !g.rt.Alive() {
+		return
+	}
+	_, _ = g.within(func() (*qjs.Value, error) {
+		return nil, g.qc.Pump()
+	})
+}
+
+// checkAlive refuses a realm a budget kill already terminated. Callers must ask BEFORE
+// allocating anything in the guest runtime — NewString/NewArrayBuffer on a closed module
+// would panic, so a late check inside within() would come one allocation too late.
+func (g *guestRealm) checkAlive() error {
+	if g.rt == nil {
+		// Closed, not killed. close() has already settled whatever it owed, so this
+		// only has to refuse — and must not touch g.rt, which is nil from here on.
+		return errors.New("guest realm closed")
+	}
+	if g.dead || !g.rt.Alive() {
+		return g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
+	}
+	return nil
+}
+
+// enterNested suspends the current budget and starts a fresh one, returning the
+// suspended total. A re-entrant holder callSync runs while an initiator sits parked in
+// the same realm; it gets its own budget rather than spending — or clearing — the
+// initiator's. Mirrors safe-js.ts.
+func (g *guestRealm) enterNested() time.Duration {
+	saved := g.consumed
+	g.consumed = 0
+	return saved
+}
+
 // callSync invokes an entrypoint synchronously — the request side (README §12.8). The
 // arg is the raw payload from the req frame; the guest reads its own dispatch byte from
 // it if it needs one. A holder answers from local fs + crypto (no net), so it returns
 // bytes without yielding. Called re-entrantly from the host realm's transport.onRequest,
 // which is what lets it answer while an initiator is parked mid-await in this realm.
 func (g *guestRealm) callSync(entry string, payload []byte) ([]byte, error) {
+	if err := g.checkAlive(); err != nil {
+		return nil, err
+	}
 	name := g.handle
 	if entry != "handle" {
 		name = g.qc.NewString(entry)
@@ -321,7 +488,11 @@ func (g *guestRealm) callSync(entry string, payload []byte) ([]byte, error) {
 	}
 	argv := g.qc.NewArrayBuffer(payload)
 	defer argv.Free()
-	res, err := g.qc.Invoke(g.invoke, g.qc.NewUndefined(), name, argv)
+	saved := g.enterNested()
+	res, err := g.within(func() (*qjs.Value, error) {
+		return g.qc.Invoke(g.invoke, g.qc.NewUndefined(), name, argv)
+	})
+	g.consumed = saved
 	if err != nil {
 		return nil, err
 	}
@@ -334,24 +505,36 @@ func (g *guestRealm) callSync(entry string, payload []byte) ([]byte, error) {
 // non-re-entrant call into the suspended guest runtime; the loop's next pump then runs
 // the awaiting entrypoint's continuation.
 func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
+	if g.checkAlive() != nil {
+		return // the realm the continuation belonged to no longer exists
+	}
 	var res *qjs.Value
 	var err error
 	if bytes != nil {
 		// new Uint8Array(ab) inside __netResolve retains the ArrayBuffer, so freeing our
 		// handle after the call leaves the guest's copy alive (refcount stays ≥ 1).
 		ab := g.qc.NewArrayBuffer(bytes)
-		res, err = g.qc.Invoke(g.netResolve, g.qc.NewUndefined(), g.qc.NewInt64(callID), ab)
+		res, err = g.within(func() (*qjs.Value, error) {
+			return g.qc.Invoke(g.netResolve, g.qc.NewUndefined(), g.qc.NewInt64(callID), ab)
+		})
 		ab.Free()
 	} else {
 		msgV := g.qc.NewString(msg)
-		res, err = g.qc.Invoke(g.netReject, g.qc.NewUndefined(), g.qc.NewInt64(callID), msgV)
+		res, err = g.within(func() (*qjs.Value, error) {
+			return g.qc.Invoke(g.netReject, g.qc.NewUndefined(), g.qc.NewInt64(callID), msgV)
+		})
 		msgV.Free()
 	}
 	if res != nil {
 		res.Free()
 	}
 	if err != nil {
-		fmt.Println("guest: net delivery error:", err)
+		// The continuation itself failed — typically the budget kill. markDead has
+		// already settled the pending calls when that is why; this covers any other
+		// engine failure so a caller is never left waiting on a realm that cannot reply.
+		if !g.dead {
+			g.markDead(fmt.Errorf("guest realm failed delivering a net result: %w", err))
+		}
 	}
 }
 
@@ -391,9 +574,19 @@ func (g *guestRealm) close() {
 		return
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
+	// Settle before freeing, not instead of it. An initiator's promise can only be
+	// resolved from inside this realm, so tearing it down with calls outstanding leaves
+	// every parked caller waiting on something that can no longer happen — the same hang
+	// markDead exists to prevent, and the one safe-js's dispose() fixes on that target.
+	settled := false
 	for id, c := range g.calls {
-		c.free()
 		delete(g.calls, id)
+		g.reportCall(c.onFail, g.hostQc.NewString("guest realm closed"))
+		c.free()
+		settled = true
+	}
+	if settled {
+		g.loop.wake() // rejecting only queues a microtask; see eventLoop.wake
 	}
 	g.capCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()

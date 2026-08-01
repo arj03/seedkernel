@@ -34,7 +34,12 @@ type eventLoop struct {
 
 	// extra contexts pumped alongside el.c (e.g. a confined guest realm sharing this
 	// loop, so a net result that settles on the host realm can resume the guest).
-	extra []*qjs.Context
+	// Each entry pumps one registered context. A guest realm supplies a pump that runs
+	// under its execution budget (guestRealm.pump) rather than the bare Context.Pump:
+	// a continuation queued by a plain `await` is guest code like any other, and
+	// pumping it directly would run it outside every budget the realm has — an escape
+	// hatch worth exactly one `await Promise.resolve()`.
+	extra []pumpEntry
 
 	// awaitIn installs one persistent __settle per context (tracked here) that routes
 	// into the in-flight await's onSettle, instead of creating — and leaking, since the
@@ -89,7 +94,21 @@ func newEventLoop(c *qjs.Context) *eventLoop {
 // promise reaction in that realm (e.g. a guest entrypoint's settling __settle) runs as
 // part of this loop. The guest realm uses native Promises only (no Go timers), so it
 // needs no separate loop — just its job queue drained.
-func (el *eventLoop) addContext(c *qjs.Context) { el.extra = append(el.extra, c) }
+// pumpEntry pairs a registered context with the func that drains it, so removeContext
+// can still identify the entry by context while pumpAll goes through the realm's guard.
+type pumpEntry struct {
+	c    *qjs.Context
+	pump func()
+}
+
+// addContext registers a context pumped alongside el.c. pump is how it gets drained —
+// a guest realm passes its budget-guarded pump; anything else passes a bare Pump.
+func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
+	if pump == nil {
+		pump = func() { _ = c.Pump() }
+	}
+	el.extra = append(el.extra, pumpEntry{c: c, pump: pump})
+}
 
 // removeContext drops a context registered with addContext, so pumpAll stops
 // touching it once its realm is closed (guestRealm.close). Safe to call with a
@@ -97,7 +116,7 @@ func (el *eventLoop) addContext(c *qjs.Context) { el.extra = append(el.extra, c)
 func (el *eventLoop) removeContext(c *qjs.Context) {
 	delete(el.settleInstalled, c) // its __settle dies with the realm's runtime
 	for i, x := range el.extra {
-		if x == c {
+		if x.c == c {
 			el.extra = append(el.extra[:i], el.extra[i+1:]...)
 			return
 		}
@@ -109,8 +128,8 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 // pumped first (el.c) so that guest job runs in the same round.
 func (el *eventLoop) pumpAll() {
 	el.c.Pump()
-	for _, c := range el.extra {
-		c.Pump()
+	for _, x := range el.extra {
+		x.pump()
 	}
 }
 
@@ -162,6 +181,25 @@ func (el *eventLoop) install() {
 
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
 func (el *eventLoop) post(fn func()) { el.tasks <- fn }
+
+// wake nudges the loop into another pump round.
+//
+// step() blocks in its select with no wait channel when there is no timer and no
+// deadline, and it only pumps after a timer fires, after a task arrives, or once before
+// blocking. A microtask queued *during* a pump — a host callback settling a JS promise
+// after the drain loop has already passed it — therefore sits unqueued-for until
+// something else happens to wake the loop, which for a caller awaiting that promise
+// looks exactly like a hang. Anything that settles a promise from Go outside a
+// task/timer path has to nudge the loop; markDead is the case in point.
+//
+// Non-blocking on purpose: it is safe to call from the loop goroutine itself, and a full
+// buffer means the loop already has work and will pump regardless.
+func (el *eventLoop) wake() {
+	select {
+	case el.tasks <- func() {}:
+	default:
+	}
+}
 
 // armTimer (re)arms the loop's single reusable wait timer for duration d and returns
 // its channel. step() runs only on the loop goroutine and never re-entrantly, so one

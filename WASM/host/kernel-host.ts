@@ -25,11 +25,22 @@
 // Authenticity is the transport's job (the AKE channel attributes every frame), not a
 // per-message signature — so there is no signature wrapper and no signer scoping here.
 
+import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "./wasm-limits.js";
+
 // ─── handler routing ─────────────────────────────────────────────────────
 
 // Default scratch size mirrored by the host — handlers must reserve at least
 // this much I/O space at their `scratch` offset (README §4.1).
 const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
+
+export interface KernelHostOptions {
+  /** Ceiling on a handler's declared initial *and* maximum linear memory, in bytes.
+   *  A module above it — or one declaring no maximum at all — is refused at install
+   *  (§4.3). Defaults to the shared `DEFAULT_MAX_HANDLER_MEMORY_BYTES` that
+   *  `installBundle` also applies; lower it to hold this host's direct installs to
+   *  something tighter than the bundle path requires. */
+  maxHandlerMemoryBytes?: number;
+}
 
 /** What the table holds at one name: an instantiated WASM handler, reached by name
  *  through `callHandler`. */
@@ -46,6 +57,13 @@ export class KernelHost {
    *  nothing else can disagree about what a name resolves to. */
   private readonly handlers = new Map<string, WasmHandlerRef>();
 
+  /** The §4.3 memory ceiling this host holds installs to. */
+  private readonly maxHandlerMemoryBytes: number;
+
+  constructor(opts: KernelHostOptions = {}) {
+    this.maxHandlerMemoryBytes = opts.maxHandlerMemoryBytes ?? DEFAULT_MAX_HANDLER_MEMORY_BYTES;
+  }
+
   // ─── installing WASM handlers ─────────────────────────────────────────
 
   /** Instantiate handler `wasmBytes` — compile, validate, check §4 exports — without
@@ -57,6 +75,12 @@ export class KernelHost {
    *  `handle`. */
   instantiateWasm(wasmBytes: Uint8Array): WasmHandlerRef {
     if (wasmBytes.length === 0) throw new Error("kernel: empty wasm bytes");
+    // BEFORE instantiation, not after: `new WebAssembly.Instance` allocates the module's
+    // declared initial memory, so a module asking for 4 GiB has already OOMed this host
+    // by the time the export checks below could see it. Reading the limits off the bytes
+    // is the only point at which the §4.3 memory residual can be refused (wasm-limits.ts,
+    // which also refuses an imported or shared memory).
+    checkHandlerMemory(wasmBytes, this.maxHandlerMemoryBytes);
     let instance: WebAssembly.Instance;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);

@@ -235,6 +235,32 @@ export function opsForCaps(domains: Iterable<string>): number[] {
   return out;
 }
 
+// ── Opting out of gating, explicitly ────────────────────────────────────────
+//
+// Two of the deps below govern how far a guest reaches: `allowedOps` (which ops resolve
+// at all) and `modules` (which kernel names MODULE_CALL can address). Both once had a
+// permissive meaning for the *absent* value — omit them and the guest got every op and
+// every name. That is the wrong default in the one file where a mistake is a capability
+// escalation: it makes full authority the thing a new call site gets by forgetting a
+// field, in a runtime whose admission policy is otherwise deny-all (policy.ts).
+//
+// They are now required, and the permissive case is a value a caller has to name. There
+// IS a legitimate permissive caller — a host-side orchestrator that already holds every
+// primitive the bridge wraps, so gating it protects nothing — and these sentinels are for
+// it. Symbols rather than strings or `null`: a symbol cannot arrive from parsed config or
+// be produced by `opsForCaps`, so the only way to reach the permissive branch is to
+// import the constant and mean it.
+
+/** Run without op gating: every op in `CAP` resolves. For a host-side caller that
+ *  already holds the primitives; never for a bundle's guest, whose reach is its
+ *  manifest `caps` and nothing else (§12.2). */
+export const UNRESTRICTED_OPS: unique symbol = Symbol("seedkernel.cap.unrestricted-ops");
+
+/** Run without module-name scoping: MODULE_CALL passes logical names straight through
+ *  as kernel names. For tests and host-side callers that address the table directly;
+ *  never for a guest, which must not be able to name another author's modules. */
+export const UNSCOPED_MODULES: unique symbol = Symbol("seedkernel.cap.unscoped-modules");
+
 /** The libsodium surface the crypto ops use — structural so any sumo build
  *  (the kernel's bundled `libsodium-wrappers-sumo`) satisfies it. */
 export interface CapSodium {
@@ -269,9 +295,10 @@ export interface CapBridgeDeps {
   callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
   /** Logical name → kernel name for MODULE_CALL resolution. The guest calls modules
    *  by the logical name from its manifest; the bridge maps to the kernel name here
-   *  so kernel names never leave the host. Omitted ⇒ MODULE_CALL names pass through
-   *  unchanged (unrestricted host callers, tests). */
-  modules?: Record<string, string>;
+   *  so kernel names never leave the host. Required: pass `UNSCOPED_MODULES` to opt
+   *  out deliberately, since a missing map means a guest could name any handler on
+   *  the table, including another author's. */
+  modules: Record<string, string> | typeof UNSCOPED_MODULES;
   transport: CapTransport;
   /** The peers this node can reach (its cohort / connected set). */
   peers: () => PeerId[];
@@ -280,10 +307,10 @@ export interface CapBridgeDeps {
   /** Wall clock (ms). Defaults to Date.now. */
   now?: () => number;
   /** The allowed op set, expanded from the manifest's declared cap domains
-   *  (README §12.2, `opsForCaps`). When present, any op outside the set is refused,
-   *  so a guest reaches exactly what its bundle declared. Omitted = unrestricted
-   *  (a trusted host-side caller that holds the primitives anyway). */
-  allowedOps?: Iterable<number>;
+   *  (README §12.2, `opsForCaps`). Any op outside the set is refused, so a guest
+   *  reaches exactly what its bundle declared. Required: pass `UNRESTRICTED_OPS` to
+   *  opt out deliberately (a host-side caller that holds the primitives anyway). */
+  allowedOps: Iterable<number> | typeof UNRESTRICTED_OPS;
 }
 
 // Host-side allocation bounds for guest-controlled sizes. The realm's own
@@ -314,7 +341,19 @@ function u64be(value: number): Uint8Array {
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
   const { sodium, identity, callHandler, transport } = deps;
   const now = deps.now ?? (() => Date.now());
-  const allowed = deps.allowedOps ? new Set(deps.allowedOps) : null;
+  // Checked at runtime, not only in the types: the native target evaluates the COMPILED
+  // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
+  // to enforce anything. A gate that only holds on one of two targets is not a gate, so
+  // an absent value throws here rather than resolving to the permissive branch.
+  if (deps.allowedOps === undefined) {
+    throw new Error("cap-bridge: allowedOps is required — pass opsForCaps(manifest caps), or UNRESTRICTED_OPS to opt out");
+  }
+  if (deps.modules === undefined) {
+    throw new Error("cap-bridge: modules is required — pass the manifest's logical→kernel name map, or UNSCOPED_MODULES to opt out");
+  }
+  // null in both cases means "the caller named the sentinel" — never "the caller forgot".
+  const allowed = deps.allowedOps === UNRESTRICTED_OPS ? null : new Set(deps.allowedOps);
+  const modules = deps.modules === UNSCOPED_MODULES ? null : deps.modules;
   const fs = (): Fs => {
     if (!deps.fs) throw new Error("cap-bridge: fs.* used but no fs backend wired");
     return deps.fs;
@@ -412,12 +451,14 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
       case CAP.MODULE_CALL: {
         // The guest calls its own modules by the logical name from its manifest
         // (README §5.1); the bridge resolves to the kernel name here so kernel
-        // names never leave the host. When a modules map is present, the guest
-        // is held to what its manifest declared — unknown names return no bytes.
-        // Host/test callers omit the map and get passthrough.
+        // names never leave the host. The guest is held to what its manifest
+        // declared — an undeclared name resolves to nothing, rather than being
+        // passed through as a kernel name it could have chosen freely.
+        if (payload.length < 1) return NONE;
         const nameLen = payload[0];
+        if (payload.length < 1 + nameLen) return NONE;
         const logicalName = dec.decode(payload.slice(1, 1 + nameLen));
-        const kernelName = deps.modules ? deps.modules[logicalName] : logicalName;
+        const kernelName = modules ? modules[logicalName] : logicalName;
         if (kernelName === undefined) return NONE;
         const r = callHandler(kernelName, payload.slice(1 + nameLen));
         return r ?? NONE;

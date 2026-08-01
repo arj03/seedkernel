@@ -20,7 +20,7 @@
 
 import { denyAll, type AdmitPredicate } from "./policy.js";
 import {
-  kernelNameFor, appKeyFor, handlesOf, verifyBundle, installBundle,
+  kernelNameFor, appKeyFor, appScopeFor, handlesOf, entryModuleOf, verifyBundle, installBundle,
   type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle,
 } from "./bundle.js";
 import { Transport, type Network, type PeerId } from "./net.js";
@@ -33,7 +33,7 @@ import { Bindings } from "./bindings.js";
 // module graph at all. That is what lets shell-core load as plain ESM in the browser —
 // and what lets the native target hand in a Go-backed realm instead.
 import type { SafeRealm, SafeRealmBridge } from "./safe-js.js";
-import type { Fs } from "./fs.js";
+import { scopedFs, type Fs } from "./fs.js";
 import { toHex, fromHex } from "./util.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
@@ -51,6 +51,12 @@ export type RealmFactory = (opts: {
   source: string;
   bridge: SafeRealmBridge;
   memoryLimitBytes?: number;
+  /** Budget of guest *execution* time per entrypoint invocation, in ms. Omitted ⇒ the
+   *  factory's own default (safe-js: 5s). Both resource bounds cross this seam, so a
+   *  guard a factory implements is one the shell can actually reach — `deadlineMs`
+   *  existed in safe-js before this field did and was therefore dead code, since the
+   *  shell is the only caller and had no way to pass it. */
+  deadlineMs?: number;
 }) => Promise<SafeRealm>;
 
 /** The handler table as exposed by the Shell — everything a caller needs to
@@ -118,6 +124,15 @@ export interface CreateShellOptions {
    *  default (64 MiB). A target that streams large windows through the guest raises
    *  it to run without the realm OOMing (seedstore's `realmMemoryBytes`). */
   realmMemoryBytes?: number;
+  /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
+   *  realm factory's default (5s, §16.1). Counts time the guest is *running*, not time
+   *  it spends parked on a host bridge, so it bounds a wedged guest without penalising
+   *  one legitimately awaiting the network. `Infinity` disables it.
+   *
+   *  This is the operator's number, not the author's: unlike the handler memory ceiling
+   *  (§4.3), which a bundle declares in its signed manifest, how long this node is
+   *  willing to spend on one message is a property of the deployment. */
+  guestDeadlineMs?: number;
 }
 
 export type { LoadedBundle, FreshnessStore, VerifiedBundle };
@@ -172,7 +187,9 @@ export interface Shell {
 interface AppSlot {
   loaded: LoadedBundle;
   realm: SafeRealm | null;
-  /** Kernel handler name for handler-only dispatch — the first module's name. */
+  /** Kernel handler name for handler-only dispatch — the manifest's declared `entry`
+   *  module (§12.10), resolved once at load by `entryModuleOf`. Empty for a guest app,
+   *  which dispatches itself. */
   handleName: string;
 }
 
@@ -221,6 +238,7 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       source: guestFullSource(slot.loaded),
       bridge: buildBridge(slot.loaded),
       memoryLimitBytes: opts.realmMemoryBytes,
+      deadlineMs: opts.guestDeadlineMs,
     });
     return slot.realm;
   };
@@ -233,7 +251,13 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       identity: platform.identity,
       callHandler: (name, p) => host.callHandler(name, p),
       transport, peers: livePeers,
-      fs: caps.has("fs") && platform.fs ? platform.fs : undefined,
+      // Scoped to this app key, so `fs` grants reach over this app's own keyspace and
+      // not the node's (fs.ts). Two admitted apps can no longer read, enumerate or
+      // delete each other's data, which brings `fs` into line with the structural
+      // ownership kernel names already have (§5.1).
+      fs: caps.has("fs") && platform.fs
+        ? scopedFs(platform.fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
+        : undefined,
       now: platform.now ?? (() => Date.now()),
       allowedOps: opsForCaps(caps),
       signScope: guestSignScope(b.author, b.manifest.app),
@@ -287,9 +311,11 @@ export function createShell(opts: CreateShellOptions & { platform: ShellPlatform
       const loaded = installBundle(host, v, platform.freshnessStore);
       const key = appKeyFor(loaded.author, loaded.manifest.app);
       bindings.autoBind(key, handlesOf(loaded.manifest));
-      const handleName = loaded.manifest.modules.length > 0
-        ? kernelNameFor(loaded.author, loaded.manifest.app, loaded.manifest.modules[0].name)
-        : "";
+      // Which module receives inbound traffic is the manifest's `entry`, not the first
+      // array element (§12.10). entryModuleOf throws on an ambiguous manifest, so the
+      // load fails loudly rather than binding traffic to an arbitrary module.
+      const entry = entryModuleOf(loaded.manifest);
+      const handleName = entry ? kernelNameFor(loaded.author, loaded.manifest.app, entry) : "";
       apps.set(key, { loaded, realm: null, handleName });
       return loaded;
     },
