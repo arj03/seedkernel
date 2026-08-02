@@ -33,7 +33,7 @@ The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (
 | **Total browser deployment** | **~565 KB** |
 | QuickJS realm engine (the single release-sync build, from `quickjs-emscripten`) — only loaded when a bundle's guest runs (§12.3) | ~750 KB |
 
-The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — net, fs, the cap-bridge, safe-js, bundle verification, policy, and the entire node↔node transport stack (§12.6), which now lives in shared JS rather than a per-target reimplementation. That transport is the bulk of why the host is larger than a table-only driver would be. libsodium is the host's crypto library (BLAKE2b for content hashing and the §12.1 hash backend, Ed25519 for manifests and the handshake, ChaCha20 / XChaCha20 for the record layer and the §12.1 backends); the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). `mldsa65.wasm` is small for the opposite reason: one parameter set, no libc and no imports at all (§12.4), so it is 18 KB rather than a library. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
+The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — the raw net and fs seams, the cap-bridge, safe-js, bundle verification, policy, and the transport *driver* (§12.6), which is shared JS rather than a per-target reimplementation. The transport protocol itself is not in this figure at all: it is the guest program of a signed bundle (`transport/guest.js`), which ships inside the artifact but is content. libsodium is the host's crypto library — it backs the whole primitive catalog (§12.1) plus content hashing and the manifest signature: BLAKE2b-256, Ed25519, ChaCha20 / XChaCha20; the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). `mldsa65.wasm` is small for the opposite reason: one parameter set, no libc and no imports at all (§12.4), so it is 18 KB rather than a library. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
 
 `npm run build` emits the host twice: the readable `build/host` (~203 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (~117 KB, ~29 KB gzipped) for shipping. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does the cut — no bundler, no new dependencies. The table's host figure is the shipped, minified build.
 
@@ -45,7 +45,7 @@ Chat is the simplest possible app: a single **pure-transform** handler (§4) bou
 
 The app itself lives in [seedchat](https://github.com/arj03/seedchat), not in this repo. Like [seed store](https://github.com/arj03/seedstore), it is a *consumer* of the runtime: it installs `seedkernel-wasm` and reaches the kernel only through published entry points (`shell-core`, `bundle`, `net-rtc`, `libsodium`). Nothing here knows chat exists — this section describes it because it is the shortest complete trace of the whole stack, and §13 walks the same pipeline byte-by-byte.
 
-What the demo stands up is a browser shell owning only the kernel, the bundle loader and its admission policy, a WebRTC transport (`RtcNetwork`, `host/net-rtc.ts`, §12.7), and a sandboxed iframe — every byte of chat UI and logic arrives as a signed bundle admitted at runtime.
+What the demo stands up is a browser shell owning only the kernel, the bundle loader and its admission policy, a WebRTC socket seam (`RtcNetwork`, `host/net-rtc.ts`, §12.7) under the transport bundle, and a sandboxed iframe — every byte of chat UI and logic arrives as a signed bundle admitted at runtime.
 
 On load it generates an Ed25519 identity, constructs a host (§3), and loads an admission policy (§12.5) approving modules whose author is the local identity — or, for apps received from a peer, one the user consents to. That consent decision is the browser's own policy state, and it is the only one the shell has to make: names cannot contend (§5.1), so a multi-app shell arbitrates *whether code runs*, never *who holds a name*. The table starts empty. The user picks a chat app (`v1 — text only`, `v2 — text + image + nick`); the shell builds a **signed bundle** — a `manifest.bundle` (the local key's Ed25519 signature over the manifest, which commits to the module's `genesisHash`) plus the app's `.wasm`, packed into one blob (§12.4) — verifies it, and the loader admits the module under that policy (§12.4). This is the *same* bundle format seed store loads; a chat app is just a one-module, guest-less bundle. Upgrading v1→v2 is a re-admit at the same name under the same key — the same key derives the same name — and it keeps the `chat` binding it already held (§12.10). Peers hand these bundles to each other in an `OFFER` frame; the recipient re-verifies the original author's manifest signature and admits it the same way — and because the manifest signs the module hash, the bundle survives any number of transitive relays and still authenticates against its original author (the store-and-forward property an offer needs, §12.4).
 
@@ -53,7 +53,7 @@ Peers connect over a WebRTC mesh from `RtcNetwork` (`host/net-rtc.ts`, §12.7) �
 
 The relay is partitioned into **rooms** so one instance hosts many independent groups without cross-talk. A client picks its room as the URL path — `ws://host:8080/<room>` — and the relay forwards only between sockets sharing a room; a bare `/` lands in the default room `global`. Room names are URL-safe (`[A-Za-z0-9._-]`, ≤128 chars). The room is **not** an authenticated channel — knowing the name is the only credential, and the relay sees all signaling in its room — but the end-to-end identity binding below means a relay or room member cannot impersonate a peer, only observe SDP metadata and refuse to forward.
 
-`RtcNetwork` binds channel identity with `PeerLink`'s in-channel handshake (`host/net-link.ts`, §12.6): each end proves it holds the private key for the identity it claims *before* any frame is delivered — and neither identity crosses the wire in the clear, then every later frame rides the §12.6 ChaCha20-Poly1305 record layer, attributed to that identity rather than to anything inside the frame. This is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` assertion at the signaling layer (RFC 8827 §5.6.4) — a MITM relay can splice SDP and bring DTLS up to itself, but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. The record layer already makes every frame confidential and integrity-protected; the data channel's own DTLS is a redundant second layer underneath (§12.7).
+`RtcNetwork` (`host/net-rtc.ts`) is only the WebRTC socket seam: it hands each data channel to the transport driver, and the transport bundle runs its handshake *inside* that channel (§12.6), so each end proves it holds the private key for the identity it claims *before* any frame is delivered — and neither identity crosses the wire in the clear, then every later frame rides the §12.6 ChaCha20-Poly1305 record layer, attributed to that identity rather than to anything inside the frame. This is continuous channel binding, stronger than a one-shot SDP `a=fingerprint` assertion at the signaling layer (RFC 8827 §5.6.4) — a MITM relay can splice SDP and bring DTLS up to itself, but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. The record layer already makes every frame confidential and integrity-protected; the data channel's own DTLS is a redundant second layer underneath (§12.7).
 
 The chat handler never reaches the UI itself: it is a pure transform that *returns* render bytes, which the shell forwards to the iframe by `postMessage`. The iframe is `sandbox="allow-scripts allow-forms"` with no same-origin access to the shell, so app-rendered content stays walled off from the shell's keys and peer state.
 
@@ -67,7 +67,9 @@ To run it: build this repo (`npm run build:browser`), then follow the build step
 
 Chat (§11) is a browser shell wired by hand, in its own repo. The same onion ships as a **general runtime artifact** — the *shell* — that any app rides on as **signed content**. The shell knows nothing about chat or storage; it offers a fixed, generic surface, verifies a bundle against a policy, and *becomes* whatever the bundle is. [seed store](https://github.com/arj03/seedstore) is the worked example: a full peer-to-peer storage node is the shell plus a signed bundle, with no storage-specific code in the runtime.
 
-"Capabilities" from here on mean one thing: the **bundle cap domains** (§12.2, §12.4) — six coarse names (`crypto`, `transform`, `net`, `fs`, `module`, `clock`) that a bundle's signed manifest grants to the app's confined JS *guest*. They answer "may this *app's guest* reach this backend at all?" (WASM handlers, by contrast, carry no capabilities at all — a pure transform reaches nothing but the input it is handed and the output it returns, §4.2.)
+"Capabilities" from here on mean one thing: the **bundle cap domains** (§12.2, §12.4) — coarse names (`crypto`, `net`, `fs`, `module`, `clock`, `timer`, plus the two only a slot occupant may declare, `rawnet` and `transport`) that a bundle's signed manifest grants to the app's confined JS *guest*. They answer "may this *app's guest* reach this backend at all?" (WASM handlers, by contrast, carry no capabilities at all — a pure transform reaches nothing but the input it is handed and the output it returns, §4.2.)
+
+**Only authorities appear there.** A crypto primitive is a function of bytes the guest already holds, so it reaches nothing and there is nothing to grant: the guest calls it by name through one ungated op and the host resolves it in a catalog (§12.2). What a manifest declares beside `caps` is `primitives` — the names it calls — which is a *compatibility* declaration, so a host missing one refuses the load by name instead of failing at the guest's first call.
 
 The manifest's `guest.caps` field is the guest's *entire* authority — which is why it lives inside the signed manifest, nested under `guest`, and nowhere else. It has to: the guest is not a kernel handler — it has no name in the kernel's table at all, so nothing below the signed manifest could carry its authority.
 
@@ -75,12 +77,14 @@ The manifest's `guest.caps` field is the guest's *entire* authority — which is
 
 The runtime provides the capability *backends* an app's confined logic drives through the cap-bridge (§12.2). They are deliberately structureless — bytes in, bytes out — so the kernel never learns what an app means by them:
 
-- `crypto.*` / `transform.*` — the bundled sumo libsodium, under **two** grants: hash (BLAKE2b), `verify` (Ed25519) and the raw `stream_xor` (xchacha20) are `transform`; `sign`, `identity` and `random` are `crypto` (`host/cap-bridge.ts`, backed by `loadSodium`). One backend, two domains, because they are two different kinds of ask: the `transform` ops are functions of their arguments and reach nothing a guest could not have computed with code of its own, while `crypto` reaches things the *host* owns — the node key and the OS entropy source. Under one domain an app that wanted to hash a byte string had to ask for the node's signing key, which made the coarse vocabulary lie about the most consequential grant in it. `sign` is under the node identity but **scoped**: the host prepends `DOMAIN_guest` plus the app's identity to the message before signing (§12.2), so a guest never obtains a raw node-key signature. Raw signing stays host-internal (it backs the PeerLink handshake, §12.6).
+- **The primitive catalog** — a flat map from an opaque **name** to a pure transform, reached through the single `CRYPTO(name, args) -> bytes` op and served by the bundled sumo libsodium plus `mlkem768.wasm` (`host/cap-bridge.ts`, backed by `loadSodium`). The names are declared in `core/domains.ts` as `PRIMITIVE_NAMES`: `blake2b-256`, `ed25519/verify`, `xchacha20/xor`, `chacha20poly1305-ietf/{seal,open}`, `x25519/dh`, `ml-kem-768/{keypair,encaps,decaps}`. **This is not a capability.** Every entry is a function of its arguments and reaches nothing a guest could not have computed with code of its own — no key of the host's, no entropy, no state — so there is nothing to grant and no domain gates it. Adding an algorithm is a catalog entry: no op number, no ABI rev, no capability domain. Entropy is deliberately absent from it, which is what keeps it functional: an ephemeral keypair is `RANDOM(32)` — an authority — followed by `x25519/dh` against the base point.
 
-  **Why the sumo build, and what it would take to leave it.** Of every libsodium symbol the runtime uses, exactly one is absent from the standard build: `crypto_stream_xchacha20_xor`, the `stream_xor` backend. Dropping to the core build would save 79 KB across the wasm and its loader (430 → 351 KB, ~14% of the browser deployment; ~0.8% of the native binary) at the price of a hand-written stream cipher in the trusted base on all three targets. Unlike ML-DSA-65 that buys no capability libsodium lacks — only bytes — so the sumo build stays. If browser payload ever becomes the binding constraint, the migration is the one `withMlDsa65` already demonstrates (§12.4): mix `crypto_stream_xchacha20_xor` onto the `sodium` object from a small module with the core build underneath. Keeping the method *on the object* is what makes it free for consumers, because the symbol is also reached directly by host-side app code, not only through this seam.
-- `net.*` — an authenticated request/response transport over a `Network` (`host/net.ts`): node↔node over raw TCP, browser↔node over RFC 6455 WebSocket (`host/net-node.ts`), or peer↔peer over WebRTC (`host/net-rtc.ts`, §12.7), each connection pinned to a peer's kernel pubkey by a challenge/response (`host/net-link.ts`). It offers `send` (a single peer request/response) and `peers`; a guest fans out itself with `Promise.all` over `send` (§12.2, §12.3).
-- `fs.*` — raw bytes under an opaque, flat key (`host/fs.ts`): `get`/`put`/`size`/`list`/`delete`/`stat` (existence is `size ≥ 0`, so there is no separate `has`). An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
-- `clock` and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
+  **Why the sumo build, and what it would take to leave it.** Of every libsodium symbol the runtime uses, exactly one is absent from the standard build: `crypto_stream_xchacha20_xor`, which backs the `xchacha20/xor` primitive. Dropping to the core build would save 79 KB across the wasm and its loader (430 → 351 KB, ~14% of the browser deployment; ~0.8% of the native binary) at the price of a hand-written stream cipher in the trusted base on all three targets. Unlike ML-DSA-65 that buys no capability libsodium lacks — only bytes — so the sumo build stays. If browser payload ever becomes the binding constraint, the migration is the one `withMlDsa65` already demonstrates (§12.4): mix `crypto_stream_xchacha20_xor` onto the `sodium` object from a small module with the core build underneath. Keeping the method *on the object* is what makes it free for consumers, because the symbol is also reached directly by host-side app code, not only through this seam.
+- **The authorities** — everything that reaches something no confined module can hold. `SIGN` under the node identity but **scoped**: the host prepends a domain and a host-derived scope to the message before signing (§12.2), so a guest never obtains a raw node-key signature and raw signing stays host-internal. `IDENTITY` (the node's public key), `RANDOM` (the OS entropy source), `CLOCK`, `TIMER_*` (the platform's event loop), and an installed-handler call (`KernelHost.callHandler`) to reach a WASM handler by name.
+- **`fs`** — raw bytes under an opaque, flat key (`core/fs.ts`): `get`/`put`/`size`/`list`/`delete`/`stat` (existence is `size ≥ 0`, so there is no separate `has`). An in-RAM `MemoryFs` and a directory-backed `NodeFs` (`host/fs-node.ts`); OPFS/IndexedDB in the browser later. No content-addressing, no paths — that's app policy.
+- **Two nets, and they are different capabilities.** `rawnet` is the platform's whole contribution to the network: bytes over an **opaque link id** the host mints and the guest never interprets — open, send, close, and one request to raise this link's inbound frame cap (`NET_LINK_*`, §12.2). There is no peer here, no protocol id and no correlation, because a peer id is an *attributed* identity, which is an output rather than a contribution. The `net` domain is the **structured** face — `send` to an attributed peer under a protocol id, and `peers` — and it is the transport bundle's output, reached by an ordinary app through the same seam as anything else (§12.2, §12.3). A guest fans out itself with `Promise.all` over `send`. The slot occupant consumes the first and provides the second (`transport` domain); nothing else holds both, and neither `rawnet` nor `transport` is an app capability (§12.4).
+
+  Under the platform the socket seams are `host/net-node.ts` (raw TCP), `host/net-ws.ts` (RFC 6455 over `ws.wasm`) and `host/net-rtc.ts` (WebRTC, §12.7), each handing a whole-message channel to the driver in `host/transport-host.ts`; the flood bounds that must sit with whoever holds the descriptor are `core/net-limits.ts` (§12.6.2).
 
 Anything with *structure* is a **no-capability module** that transforms bytes: WebSocket framing is `ws.wasm` (`./ws`), Reed–Solomon erasure coding is an app's `codec.wasm` — both pure transforms the host drives, never something the kernel knows.
 
@@ -90,38 +94,59 @@ An app's confined logic reaches all of the above through a single seam, `host.ca
 
 The op numbers are a **shared guest↔host identifier**, not a wire value: the generated preamble injects them into the guest as `const CAP_<NAME> = n;` and the bridge switch reads the same table, so the two cannot drift (regenerated together, never independently versioned, never sent between nodes). The set is one contiguous block grouped by domain; new ops are appended. Multi-byte integers are big-endian (§16).
 
+**There are two kinds of entry here and only one of them is a capability.** `CRYPTO` is the *primitive* seam — a flat map over opaque names, resolved in the host's catalog (§12.1), ungated by construction because a function of bytes the guest already holds is computation, not permission. Every other op is an *authority*: it touches the node key, the entropy source, the clock, a socket or the disk, and is gated through the domains below. That split is why a new algorithm never appears in this table.
+
 | # | Op | Request | Response |
 | --- | --- | --- | --- |
-| 1 | `HASH` | message bytes | 32-byte generic hash (BLAKE2b) |
-| 2 | `STREAM_XOR` | `[nonce 24][key 32][msg ..]` | `msg` ⊕ XChaCha20 keystream |
-| 3 | `SIGN` | message bytes | 64-byte detached Ed25519 signature under the node identity, over `DOMAIN_guest ‖ scope ‖ msg` — the scope is host-derived (below, §16.1), never guest-supplied |
-| 4 | `VERIFY` | `[pk 32][sig 64][msg ..]` | `[valid u8]` |
-| 5 | `IDENTITY` | (empty) | the node's 32-byte public key |
-| 6 | `RANDOM` | `[n u32]` | `n` random bytes |
-| 7 | `NET_SEND` | `[peer 32][pidLen u8][protocolId utf8][payload ..]` | `[ok u8][response ..]` |
-| 8 | `NET_PEERS` | (empty) | `[count u32][pk 32 ×count]` |
-| 9 | `FS_GET` | key (utf8) | `[0]` absent \| `[1][bytes ..]` |
-| 10 | `FS_PUT` | `[klen u32][key][bytes ..]` | (empty) |
-| 11 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
-| 12 | `FS_DELETE` | key (utf8) | (empty) |
-| 13 | `FS_STAT` | (empty) | `[used u64][available u64]` |
-| 14 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
-| 15 | `MODULE_CALL` | `[name_len u8][name utf8][request ..]` | the installed handler's response bytes — `name` is the logical name from the manifest; the bridge resolves it to the kernel name (§12.4) |
-| 16 | `CLOCK` | (empty) | now in unix ms (`u64`) |
+| 1 | `CRYPTO` | `[nameLen u8][name utf8][args ..]` | the named primitive's output — dispatched through the catalog (§12.1); an unknown name throws |
+| 2 | `SIGN` | message bytes | 64-byte detached Ed25519 signature under the node identity, over `domain ‖ scope ‖ msg` — both host-supplied from the asking bundle's slot (below, §16.1), never guest-supplied |
+| 3 | `IDENTITY` | (empty) | the node's 32-byte public key |
+| 4 | `RANDOM` | `[n u32]` | `n` random bytes |
+| 5 | `NET_SEND` | `[peer 32][pidLen u8][protocolId utf8][payload ..]` | `[ok u8][response ..]` |
+| 6 | `NET_PEERS` | (empty) | `[count u32][pk 32 ×count]` |
+| 7 | `FS_GET` | key (utf8) | `[0]` absent \| `[1][bytes ..]` |
+| 8 | `FS_PUT` | `[klen u32][key][bytes ..]` | (empty) |
+| 9 | `FS_LIST` | prefix (utf8, may be empty) | `[count u32] {[klen u32][key]}` |
+| 10 | `FS_DELETE` | key (utf8) | (empty) |
+| 11 | `FS_STAT` | (empty) | `[used u64][available u64]` |
+| 12 | `FS_SIZE` | key (utf8) | `[size i32]` (−1 if absent) |
+| 13 | `MODULE_CALL` | `[name_len u8][name utf8][request ..]` | the installed handler's response bytes — `name` is the logical name from the manifest; the bridge resolves it to the kernel name (§12.4) |
+| 14 | `CLOCK` | (empty) | now in unix ms (`u64`) |
+| 15 | `NET_LINK_OPEN` | `[dest ..]` — an opaque destination name the host resolves in the address book it was configured with, exactly as `fs` resolves a key | `[linkId u32]` (0 ⇒ no route) |
+| 16 | `NET_LINK_SEND` | `[linkId u32][bytes ..]` | (empty) |
+| 17 | `NET_LINK_CLOSE` | `[linkId u32][graceful u8]` | (empty) |
+| 18 | `NET_LINK_CAP` | `[linkId u32]` | (empty) — raise this link's inbound frame cap from `MAX_HANDSHAKE_FRAME_BYTES` to `MAX_FRAME_BYTES`. Both numbers stay the host's; this asks for the transition (§12.6.2) |
+| 19 | `TIMER_ARM` | `[id u32][ms u32]` | (empty) — fires the `timer` entrypoint |
+| 20 | `TIMER_CLEAR` | `[id u32]` | (empty) |
+| 21 | `NET_DELIVER` | `[corr u32][noReply u8][from 32][pidLen u8][proto][payload ..]` | (empty) — an inbound request, attributed. Answered later through the `respond` entrypoint, never inline |
+| 22 | `NET_SETTLE` | `[corr u32][ok u8][payload \| utf8 message]` | (empty) — settle an app's outbound request under the corr the host assigned |
+| 23 | `NET_LINK_AUTH` | `[linkId u32][pk 32]` | `[admitted u8]` — this link authenticated as `pk`; the host's roster gate answers |
+| 24 | `NET_PEER_EDGE` | `[up u8][pk 32]` | (empty) — a peer's first link came up / last went down |
+| 25 | `NET_READY` | `[ok u8]` | (empty) — answer to the `ready` entrypoint |
+| 26 | `NET_LINK_DOWN` | `[linkId u32][reason u8]` | (empty) — a link the host handed over tore down, with why |
 
-`NET_SEND` is the only op that genuinely round-trips: the guest `await`s it, and a fan-out is the guest's own `Promise.all` over it — the seam hands out real promises, so scatter-gather is the guest's own, not a host op. Every other op resolves to bytes without yielding.
+Ops 15–18 are the **raw** net capability and 21–26 are what the transport slot **provides** back; both directions ride this one seam rather than a second host↔module ABI, and inbound bytes arrive the other way, as ordinary entrypoint invocations on the slot occupant's guest (§12.6).
 
-**The signing op is scoped, never raw.** `SIGN` does not sign the guest's bytes as given: the host signs `DOMAIN_guest ‖ scope ‖ msg`, where `scope = author_pk ‖ app_len u8 ‖ app` is derived from the admitted manifest (§12.4) — the same `(author, app)` pair that keys freshness — never guest-supplied. The domain-prefix family is disjoint (§14, §16.1), so a guest-obtained signature never verifies as a manifest or a channel AUTH; and distinct bundles derive disjoint scopes, so one app cannot sign in another's namespace. `VERIFY` stays raw — verification is not an oracle — so an app checks a scoped signature by reconstructing the preimage itself; every node running the same bundle derives the same scope, which makes the signatures portable across a cohort. One consequence: rotating a bundle's author key changes the scope and orphans previously signed objects, so an app anticipating handover records its scope inside its own signed formats. §14 has the trust rationale.
+`NET_SEND` is the only op that genuinely round-trips: the guest `await`s it, and a fan-out is the guest's own `Promise.all` over it — the seam hands out real promises, so scatter-gather is the guest's own, not a host op. Every other op resolves to bytes without yielding. **No op re-enters the realm**, which is what lets the slot occupant call out from inside a synchronous entrypoint: a socket write does not deliver during the write, an armed timer fires on a later turn, and `NET_DELIVER` is answered through the `respond` entrypoint rather than inline.
 
-The **capability domains** a manifest declares (§12.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of op numbers:
+**The signing op is scoped, never raw, and the scope comes from the slot.** `SIGN` does not sign the guest's bytes as given: the host prepends a domain and a scope, both of its own choosing, and never reads the suffix. An ordinary app gets `DOMAIN_guest ‖ author_pk ‖ app_len u8 ‖ app` (`appSignScope`), derived from the admitted manifest (§12.4) — the same `(author, app)` pair that keys freshness. The **transport slot** gets `DOMAIN_channel ‖ network_key` (`transportSignScope`), which is what lets the AKE transcript signature be an ordinary `SIGN` call: no handshake shape is pinned into the core, and the node key never enters the guest. The domain-prefix family is disjoint (§14, §16.1), so a guest-obtained signature never verifies as a manifest; and distinct bundles derive disjoint scopes, so one app cannot sign in another's namespace. Verification is a *primitive* (`ed25519/verify`, §12.1), not an authority — verification is not an oracle — so an app checks a scoped signature by reconstructing the preimage itself; every node running the same bundle derives the same scope, which makes the signatures portable across a cohort. One consequence: rotating a bundle's author key changes the scope and orphans previously signed objects, so an app anticipating handover records its scope inside its own signed formats. §14 has the trust rationale.
 
-| Domain | Ops |
-| --- | --- |
-| `crypto` | 1–6 (`HASH`, `STREAM_XOR`, `SIGN`, `VERIFY`, `IDENTITY`, `RANDOM`) |
-| `net` | 7–8 (`NET_SEND`, `NET_PEERS`) |
-| `fs` | 9–14 (`FS_GET`, `FS_PUT`, `FS_LIST`, `FS_DELETE`, `FS_STAT`, `FS_SIZE`) |
-| `module` | 15 (`MODULE_CALL`) |
-| `clock` | 16 (`CLOCK`) |
+The **capability domains** a manifest declares (§12.4) expand to fixed op sets — the coarse, human-auditable vocabulary ("this app reaches net + fs"), not a list of op numbers. The primitive op is in none of them:
+
+| Domain | Ops | |
+| --- | --- | --- |
+| `crypto` | 2–4 (`SIGN`, `IDENTITY`, `RANDOM`) | the node key and the entropy source — what the *host* owns |
+| `net` | 5–6 (`NET_SEND`, `NET_PEERS`) | the structured face: an attributed peer, a protocol id, a correlation |
+| `fs` | 7–12 (`FS_GET`, `FS_PUT`, `FS_LIST`, `FS_DELETE`, `FS_STAT`, `FS_SIZE`) | |
+| `module` | 13 (`MODULE_CALL`) | |
+| `clock` | 14 (`CLOCK`) | |
+| `timer` | 19–20 (`TIMER_ARM`, `TIMER_CLEAR`) | ordinary and small: any guest that needs a deadline |
+| `rawnet` | 15–18 (`NET_LINK_*`) | **slot only** — bytes over an opaque link id |
+| `transport` | 21–26 (`NET_DELIVER`, `NET_SETTLE`, `NET_LINK_AUTH`, `NET_PEER_EDGE`, `NET_READY`, `NET_LINK_DOWN`) | **slot only** — what the occupant provides back |
+
+`CRYPTO` (op 1) appears in no row: there is nothing to grant, so a manifest never asks for it. What it *does* declare is `guest.primitives` (§12.4) — the names it calls, checked against the host's catalog at load.
+
+**The last two rows are not app capabilities.** `SLOT_ONLY_DOMAINS` (`core/domains.ts`) is enforced at load, not at first use: a manifest that claims no `role` and names `rawnet` or `transport` is rejected outright. The argument is the one that keeps `authorAllowlist` from admitting a slot claim (§12.5) — an authority class this large needs a deliberate per-slot policy decision, never a cap string an ordinary app can add to its own manifest and have quietly honoured. Splitting the two nets is what makes that statable at all: while `net` meant the structured thing, an app declaring it was implicitly handed the transport's output *and* the platform's socket seam under one word. `timer` is deliberately not on that list — the transport happening to want one is not a reason to make it a privilege.
 
 An op outside the granted domains does not resolve — the bridge refuses it, and the shell never wired the backing resource in the first place (an `fs`-less bundle gets no fs backend at all, not an fs backend behind a check). An unknown domain name in a manifest throws when the realm is built — a typo fails loudly rather than silently granting nothing, or, worse, everything.
 
@@ -133,7 +158,7 @@ An op outside the granted domains does not resolve — the bridge refuses it, an
 
 ### 12.3 Zero-authority JS realms
 
-Logic that is inherently async or awkward as a *synchronous* WASM handler runs as confined JS in a QuickJS-compiled-to-WASM realm (`host/safe-js.ts`, `./safe-js`). A fresh realm has only the ECMAScript intrinsics — it cannot even *name* `fs`/`net`/`process`/`fetch` — and reaches out only through the injected `host.call` seam. The seam is narrow-async: a sync op (crypto/fs/clock/module) resolves to bytes immediately, and the one round-tripping op (`NET_SEND`) returns a real Promise the guest `await`s. So the guest is ordinary async/await JS, a fan-out is `Promise.all`, and there is **one** realm — a single non-Asyncify build — serving both roles: `call()` runs an initiator that may `await` net, and `callSync()` answers an incoming request straight through *while* an initiator is parked mid-`await` in that same realm. A suspended async function is just heap state, so re-entering to run a synchronous handler is ordinary JS — no second engine, no Asyncify, no module-global suspend state. This is the chat shell's sandboxed-iframe confinement (§11) generalised: "run zero-authority guest JS over a cap seam," the sibling of "run a WASM handler under caps."
+Logic that is inherently async or awkward as a *synchronous* WASM handler runs as confined JS in a QuickJS-compiled-to-WASM realm (`host/safe-js.ts`, `./safe-js`). A fresh realm has only the ECMAScript intrinsics — it cannot even *name* `fs`/`net`/`process`/`fetch` — and reaches out only through the injected `host.call` seam. The seam is narrow-async: a sync op (the primitive catalog, fs, clock, module, the raw-link ops) resolves to bytes immediately, and the one round-tripping op (`NET_SEND`) returns a real Promise the guest `await`s. So the guest is ordinary async/await JS, a fan-out is `Promise.all`, and there is **one** realm — a single non-Asyncify build — serving both roles: `call()` runs an initiator that may `await` net, and `callSync()` answers an incoming request straight through *while* an initiator is parked mid-`await` in that same realm. A suspended async function is just heap state, so re-entering to run a synchronous handler is ordinary JS — no second engine, no Asyncify, no module-global suspend state. This is the chat shell's sandboxed-iframe confinement (§11) generalised: "run zero-authority guest JS over a cap seam," the sibling of "run a WASM handler under caps."
 
 **Bounded, not merely confined.** Zero authority answers "what can this guest reach"; it says nothing about "how much of this node can it consume". Two bounds answer that, and both default to a real number so a shell that configures neither still gets a bounded guest:
 
@@ -203,10 +228,11 @@ The consequence is that an author moving from `0x01` to `0x02` gets a **new iden
 | `handles[]` | string[] | no | Protocol ids this app can serve. Absent ⇒ `[app]`, so an app that speaks only its own protocol declares nothing. **A declaration, not a claim:** it makes the app *eligible* for a binding and confers no traffic on its own (§12.10), so any number of bundles may declare the same id without contending for anything. |
 | `modules[]` | `{name, hash}` | yes | One entry per WASM module. `name` does three jobs: the module's file in the container (`<name>.wasm`), the logical name the guest passes through MODULE_CALL (the bridge resolves it to the kernel name), and — after the app key — the kernel name it binds at, `"<author hex>:<app>:<name>"` (§5.1) — so it is unique within a manifest and restricted to `[A-Za-z0-9_-]`. `hash` is `genesisHash(wasm)` hex (§5.1) — the definitive declaration of which bytes the author authorized. `verifyBundle` checks every module against this hash, so by the time a module reaches `installBundle` its integrity is already proven. **There is no bind-name field:** the loader derives the name from values the author already signed, so a manifest holds nothing that could point a module at an unexpected handler. |
 | `entry` | string | if ambiguous | Which module receives inbound dispatch (§12.10) — the `name` of one of `modules`. **Declared, not positional:** the shell once took `modules[0]`, which made the order of a JSON array load-bearing without the format saying so, and could not distinguish "the author meant the first one" from "the author never thought about it". Required when a handler-only bundle has two or more modules; optional where unambiguous (exactly one module, or a guest that dispatches itself). A value naming no declared module is rejected at load, so a typo fails there rather than at the first inbound message. |
-| `guest` | `{hash, abi, caps, config?}` | if present | Optional — the zero-authority guest program and **everything about it**. A handler-only bundle (the chat demo — WASM handlers, no realm) omits the whole object, which is the same statement as "this bundle holds no authority": there is no empty `caps` list to write. |
+| `guest` | `{hash, abi, caps, primitives?, config?}` | if present | Optional — the zero-authority guest program and **everything about it**. A handler-only bundle (the chat demo — WASM handlers, no realm) omits the whole object, which is the same statement as "this bundle holds no authority": there is no empty `caps` list to write. |
 | `guest.hash` | string | yes | `genesisHash(utf8(source))` hex of `guest.js`. |
 | `guest.abi` | integer | **yes** | Which host seam this guest was written against (`GUEST_ABI_VERSION`, §12.2). A guest declaring an ABI this host does not implement is refused by name — a legibility failure, like an unsupported signature suite, not an authenticity verdict. Required rather than defaulted: the default would have to be the oldest ABI, which is exactly the population a bump exists to catch, and a guest author who never considered the seam version is indistinguishable from one who meant the old one. The number tracks changes to what an existing op *returns* — an op moving across the sync/async line, a payload framing change — not the appending of new ops, which a guest that never calls them cannot notice. Its reason for existing is that the failure it guards is silent: when `fs` becomes async, a guest calling `host.call(FS_GET, k)` without `await` gets a Promise where bytes were expected and reads `undefined`. |
-| `guest.caps` | string[] | **yes** | The capability domains (§12.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants raw node-identity signing — the `crypto` domain's `SIGN` is scoped to this app's namespace, §12.2, §14). An app that only hashes asks for `transform` and never names `crypto` at all. |
+| `guest.caps` | string[] | **yes** | The **authority** domains (§12.2) granted to the guest. The shell expands them to the allowed op set and wires only the matching backends; nothing outside them resolves. They are ordinary app powers the operator authorizes by choosing to run this bundle (none grants raw node-identity signing — the `crypto` domain's `SIGN` is scoped to this bundle's slot, §12.2, §14). An app that only hashes and verifies declares no domain at all: those are primitives, and it lists them under `primitives` instead. `rawnet` and `transport` are refused here unless the manifest also claims a `role` (§12.2). |
+| `guest.primitives` | string[] | if present | The crypto primitives (§12.1) this guest calls by name. **A compatibility declaration, not a capability one:** it grants nothing — after the domains dropped the pure transforms there is nothing to grant — and exists so a host that cannot serve a name refuses the load *by name* rather than failing at the guest's first call. That is the same legibility `abi` buys for the seam version, which is why it sits beside `abi` and not inside `caps`. Optional: a guest calling none declares none. |
 | `guest.config` | map (string → string \| number) | no | App-structural constants injected into the guest as `const APP = {…}`. Opaque to the runtime. Facts the runtime already derives do **not** belong here — see `BUNDLE` below. |
 
 **Why `caps` and `config` live inside `guest`.** Both are the guest's alone: `caps` is the guest's entire authority (§12.2) and `config` only ever becomes its injected `APP`. WASM handlers carry no authority and read no config, so at the top level `caps` would be a mandatory field that a handler-only bundle must fill in with a meaningless `[]`. Nested, "no guest ⇒ zero authority" is the schema's shape rather than a rule prose has to state and every target has to honour.
@@ -306,7 +332,9 @@ The *guest's* §12.2 cap domains are **not** gated by this file — they come fr
 
 ### 12.6 Node↔node transport: channel identity binding
 
-A real socket carries no trustworthy "from" field, so before a connection delivers frames it runs a mutual challenge/response (`host/net-link.ts`) proving each end holds the kernel private key for the pubkey it claims — the same binding `RtcNetwork` applies to each WebRTC data channel (§11, §12.7). `PeerLink` is transport-agnostic over any channel that delivers whole messages: raw TCP (length-prefix framing) node↔node, RFC 6455 WebSocket (`ws.wasm` framing) browser↔node (`host/net-node.ts`), or a WebRTC `RTCDataChannel` peer↔peer (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Every transport checks a frame cap against the length prefix (TCP) or frame length (WS) **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). TCP and WebSocket cap identically.
+**Everything in this section is the transport bundle's guest program** (`transport/guest.js`, §1) — the handshake, the record layer, the link router and the request/response frame codec — not host code. It reaches sockets through the `rawnet` ops and is driven through named entrypoints (§12.2), and the host side of that is one driver, `host/transport-host.ts`, which owns the channels by the link id it mints, the timers, the outbound promises, the address book and the roster gate, and knows no protocol. What follows is therefore *content*: replaceable by a second signed bundle claiming the slot (§12.4, §12.5), which is the property the rest of §12.6 exists to make safe.
+
+A real socket carries no trustworthy "from" field, so before a connection delivers frames the bundle runs a mutual challenge/response proving each end holds the kernel private key for the pubkey it claims — the same binding applied to each WebRTC data channel (§11, §12.7). The channel is transport-agnostic over anything that delivers whole messages: raw TCP (length-prefix framing) node↔node, RFC 6455 WebSocket (`ws.wasm` framing) browser↔node (`host/net-node.ts`, `host/net-ws.ts`), or a WebRTC `RTCDataChannel` peer↔peer (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Every socket seam checks a frame cap against the length prefix (TCP) or frame length (WS) **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). TCP and WebSocket cap identically.
 
 Four handshake messages, each tagged with a leading type byte, then records:
 
@@ -363,7 +391,7 @@ both identities in cleartext, is removed rather than disabled. Because the byte 
 into the transcript root at `h1`, both signatures cover it: an in-path attacker who flips
 it only makes the two ends sign different bytes. A suite is *chosen* by the endpoints,
 never *forced* by the network (§14.1). The bytes a node sends and the bytes it folds into
-the transcript are one construction in `net-link.ts`.
+the transcript are one construction in the transport bundle.
 
 **Each signature commits to its own identity and the whole transcript.** `sig_i` covers
 `DOMAIN_channel ‖ h2 ‖ id_i`, and `h2` chains `DOMAIN_channel`, msg1 and msg2 — hence the
@@ -407,8 +435,12 @@ and [CHANNEL](CHANNEL.md) §5 for why it is worth paying.
 #### 12.6.2 Half-open budgets
 
 A refused connection stays open until its deadline rather than being dropped, so the
-budgets are what stands between a stranger and the node. `HalfOpenLimiter` (`net-link.ts`)
-is injectable and shared by every transport a host stands up. Measured behaviour lives in
+budgets are what stands between a stranger and the node. The half-open limiter lives in the
+transport bundle and is shared by every socket seam a host stands up; the two frame caps it
+works against are the *host's* (`core/net-limits.ts`), because a limit protecting a resource
+must be declared by whoever owns the resource — a host importing its own flood bound from
+the module it is bounding would be taking the bounded party's word for the bound. Measured
+behaviour lives in
 `tests/net-link.load.test.mjs`; the reasoning is in [CHANNEL](CHANNEL.md) §5.
 
 - **No cryptography before proof.** An accepting link generates its ephemeral keypair only
@@ -427,17 +459,28 @@ is injectable and shared by every transport a host stands up. Measured behaviour
 - **Two deadlines.** `UNVERIFIED_TIMEOUT_MS` (2 s) until msg1 opens, `HANDSHAKE_TIMEOUT_MS`
   (10 s) for the rest. Observing the longer one requires the contact secret, so the split
   leaks nothing.
-- **`MAX_HANDSHAKE_FRAME_BYTES` (512) caps inbound reassembly pre-auth**, raised to
-  `MAX_FRAME_BYTES` via `RawChannel.allowLargeFrames()` on authentication. No handshake
-  message exceeds 113 bytes; applying the 16 MiB application cap to an unauthenticated peer
-  let a stranger reserve megabytes per connection.
+- **`MAX_HANDSHAKE_FRAME_BYTES` (8 KiB) caps inbound reassembly pre-auth**, raised to
+  `MAX_FRAME_BYTES` when the bundle asks through `NET_LINK_CAP` (§12.2) on authentication —
+  both numbers stay the host's (`core/net-limits.ts`), and the occupant may only ask for
+  the transition. Applying the 16 MiB application cap to an unauthenticated peer let a
+  stranger reserve megabytes per connection. No handshake message today exceeds 113 bytes,
+  but the cap is 8 KiB rather than the 512 it started at because an ML-KEM-768
+  encapsulation key is 1,184 bytes: with `ml-kem-768` in the primitive catalog (§12.1), a
+  512-byte cap would have been the one remaining reason a post-quantum handshake still
+  needed a core rev — the socket seam refusing the message the catalog had just made
+  expressible (§14.1). At 8 KiB against the 1,024 unverified budget the bound is 8 MiB,
+  still small, and it no longer decides which suites are expressible.
 
 #### 12.6.2b One master seed, purpose-bound keys
 
 A node stores **one** secret: a 32-byte master seed. Every signing keypair is derived from
-it under a distinct, versioned label (`host/subkeys.ts`), so no key signs for two purposes.
+it under a distinct, versioned label (`core/subkeys.ts`), so no key signs for two purposes.
 Two exist today: `channel`, whose public half **is** the peer id and which signs the
-handshake; and `guest`, used only by the cap-bridge `SIGN` op (§12.2). The master signs
+handshake; and `guest`, which backs every ordinary app's scoped signature. Both are reached
+through the one cap-bridge `SIGN` op (§12.2), and *which* of them a call reaches is the
+host's decision from the asking bundle's slot — the transport occupant gets the channel key
+under `DOMAIN_channel ‖ network_key`, an app gets the guest key under `DOMAIN_guest ‖ scope`
+— never the guest's, and neither key enters a realm. The master signs
 nothing itself, and derivation is deterministic, so a node rebuilds every subkey at boot
 with nothing extra to persist. Labels are closed and literal, never built from runtime
 data. Why this is worth having on top of domain separation: [CHANNEL](CHANNEL.md) §7.
@@ -457,9 +500,11 @@ and why the contact secret is per node rather than per deployment or per pair �
 The contact secret is mixed at msg1 together with the initiator's ephemeral, and into every
 later key. The network key is applied as a prologue: it seeds the transcript root, so every
 derived key *and* every signature preimage differs between networks and a cross-network
-handshake fails at the first message. `admitPeer` runs at both gates — in `PeerLink` at
-msg3, before msg4 is built, refusing by silence; and again in `LinkRouter.promote`, before
-the link is installed or delivers a frame.
+handshake fails at the first message. `admitPeer` runs at both gates — inside the handshake at
+msg3, before msg4 is built, refusing by silence; and again as the host's **roster gate**,
+which the bundle asks through `NET_LINK_AUTH` (§12.2) before the link is installed or
+delivers a frame. The second is applied by the host to the attribution the occupant
+*reports*, rather than handed to the occupant to apply to itself.
 
 Revocation is key rotation in each case: a node dropping a peer rotates its contact secret,
 a network splitting rotates its network key. There is no separate mechanism, and the
@@ -467,9 +512,9 @@ whitelist is not one.
 
 ### 12.7 Browser↔console WebRTC
 
-§12.6's `PeerLink` rides any whole-message channel, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `peers` surface as the TCP and WebSocket transports.
+§12.6's channel rides any whole-message pipe, and a WebRTC `RTCDataChannel` is one — which turns WebRTC into a first-class `Network` exposing the same `send` / `peers` surface as the TCP and WebSocket transports.
 
-**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the relay (seedchat's `scripts/relay.mjs`) is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and `Transport` (§12.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing `PeerLink` between two connected peers — and carries *no* SDP-fingerprint signature, because identity is proven in-channel: `PeerLink`'s handshake runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. Signaling must also supply the deployment's contact secret, without which a peer draws no response at all. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. werift (pure-TS) is used over native `node-datachannel`, which segfaults under Bun.
+**`RtcNetwork` (`host/net-rtc.ts`) — relay-signaled mesh.** Peers reach each other directly over `RTCDataChannel`s; the relay (seedchat's `scripts/relay.mjs`) is only the *signaling* rendezvous for SDP/ICE and can be killed once channels are open — no server in the data path. One ordered binary channel per peer carries everything, and `Transport` (§12.6) rides on top untouched, so a storage cohort gets P2P for free while a fire-and-forget app (chat) consumes `send` directly. The `Signaling` seam is pluggable — relay, DHT, gossip, or even an existing authenticated link between two connected peers — and carries *no* SDP-fingerprint signature, because identity is proven in-channel: the transport bundle's handshake runs *inside* the data channel (§12.6), stronger than a one-shot SDP-fingerprint assertion at the signaling layer (§11). A MITM relay can splice SDP and bring DTLS up to itself but can never produce the transcript signature without the peer's private key, so the link never authenticates and never delivers a byte. Signaling must also supply the deployment's contact secret, without which a peer draws no response at all. The module is browser-native (it uses the platform `RTCPeerConnection`); a Node/Bun *console* node joins by passing a `peerConnectionFactory` (`weriftPeerConnectionFactory`, `host/net-rtc-node.ts`) — "swap the connection, keep the stack," the §12.6 move applied to WebRTC. werift (pure-TS) is used over native `node-datachannel`, which segfaults under Bun.
 
 **Confidentiality.** Like every transport, the WebRTC fabric's frames are confidential and integrity-protected by the §12.6 AKE record layer. A data channel is also DTLS-encrypted, a redundant-but-harmless second layer underneath. As on the raw transports, the in-channel AUTH supplies the identity binding DTLS alone does not (§11).
 
@@ -490,7 +535,7 @@ A serving node that has loaded a bundle runs the app's *initiator* side on deman
 
 The §12.8 shell runs as JS on Node or Bun, but the **recommended** way to run a node outside the browser is the **Go/native target** (`native/`, a top-level Go module): a single self-contained, cgo-free binary — `seedloader` — with no Node, no Bun, and no separate JS engine to install on the box.
 
-It is a **platform target, not a reimplementation.** All protocol and app logic stays shared TypeScript — the cap-bridge (§12.2), the node↔node transport (§12.6: the PeerLink AKE, the encrypted request/response Transport, the routing), the loader and its admission policy (§12.4–§12.5), bundle verification (§12.4), the confined safe-js guest (§12.3) — the same code the other targets run, just hosted differently. Go supplies only the platform **primitives** the §1 table calls for; protocol is never re-derived in a second language (*Go grows with primitives, never with logic*).
+It is a **platform target, not a reimplementation.** All protocol and app logic stays shared TypeScript — the cap-bridge (§12.2), the transport driver and its socket seams (§12.6 — the protocol itself is not host code at all, but the guest program of a signed bundle), the loader and its admission policy (§12.4–§12.5), bundle verification (§12.4), the confined safe-js guest (§12.3) — the same code the other targets run, just hosted differently. Go supplies only the platform **primitives** the §1 table calls for; protocol is never re-derived in a second language (*Go grows with primitives, never with logic*).
 
 This is enforced mechanically: the shared modules are compiled by `tsc` and assembled into **one** `native/host-shell.gen.js` by `scripts/bundle-loader.mjs` (`npm run build:loader-bundles`), which the loader `//go:embed`s and evaluates in QuickJS. Nothing under `native/` is a hand-written second copy. The bundle runs over a *seam* — a single TypeScript adapter (`host/native-shim.ts`) satisfying the same interfaces the JS host does (`BundleHost`, `FreshnessStore`, `ChannelFactory`, `RealmFactory`) by forwarding to Go's byte-level `bridge`, and then handing the result to the shared `createShell`. Because the adapter is typechecked against those interfaces, a shared-rule change the native target fails to honor is a **compile error**, not a silent divergence. The seam carries no rules of its own: who may install (§12.5), the name derivation (§5.1), the admit-then-`SetHandler` step (§12.4), the manifest signature and its domain prefix (§12.4), the freshness arithmetic, and the deny-all default (§14) all live in the shared modules — one implementation of each to audit.
 
