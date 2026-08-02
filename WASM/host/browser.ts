@@ -3,7 +3,7 @@
 // build/browser folder ships a patched libsodium-wrappers.mjs that streams the
 // .wasm separately) and passing it in. For Node, see ./node.ts.
 
-import { KernelHost } from "./kernel-host.js";
+import { KernelHost } from "../core/kernel-host.js";
 
 type Sodium = typeof import("libsodium-wrappers-sumo");
 
@@ -19,4 +19,4 @@ export async function createKernelHost(sodium: Sodium): Promise<KernelHost> {
   return new KernelHost();
 }
 
-export { KernelHost } from "./kernel-host.js";
+export { KernelHost } from "../core/kernel-host.js";

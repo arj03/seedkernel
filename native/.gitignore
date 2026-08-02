@@ -1,5 +1,5 @@
-# Generated host JS bundles — the shared TS (net-route / net-link / cap-bridge),
-# bundled for //go:embed. Regenerate from WASM/: `npm run build:loader`.
+# Generated host JS bundles — the shared core/ + host/ TS, bundled for //go:embed.
+# Regenerate from WASM/: `npm run build:loader`.
 *.gen.js
 
 # WASM artifacts built from this repo's source and copied in by
@@ -8,6 +8,7 @@
 /wasm/ws.wasm
 /wasm/libsodium.wasm
 /wasm/mldsa65.wasm
+/wasm/mlkem768.wasm
 
 # Built loader binary (`gorun.sh build -o seedloader[.exe] .`).
 /seedloader

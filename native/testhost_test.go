@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -34,9 +35,46 @@ func bootRealmIn(tb testing.TB, dir string) {
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
+// withTransportRole adds the artifact's own transport author to a policy's
+// roles.transport. A node whose policy does not admit a transport bundle has no
+// network at all — which is also what a deliberate deny-all looks like, so the two
+// must not be confused by accident in a test.
+func withTransportRole(tb testing.TB, policyJSON string) string {
+	tb.Helper()
+	author := evalString(tb, "embeddedTransportAuthor")
+	if author == "" {
+		return policyJSON
+	}
+	var p map[string]any
+	if policyJSON == "" {
+		p = map[string]any{}
+	} else if err := json.Unmarshal([]byte(policyJSON), &p); err != nil {
+		tb.Fatal("policy json:", err)
+	}
+	authors, _ := p["authors"].([]any)
+	p["authors"] = append(authors, author)
+	p["roles"] = map[string]any{"transport": []string{author}}
+	out, err := json.Marshal(p)
+	if err != nil {
+		tb.Fatal("policy json:", err)
+	}
+	return string(out)
+}
+
+// evalString evaluates a JS expression in the host realm and returns it as a string.
+func evalString(tb testing.TB, expr string) string {
+	tb.Helper()
+	v, err := qc.Eval("<evalString>", qjs.Code(expr))
+	if err != nil {
+		tb.Fatal("eval:", err)
+	}
+	return v.String()
+}
+
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
+	policyJSON = withTransportRole(tb, policyJSON)
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, TimeoutMs: 2000}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON

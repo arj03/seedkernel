@@ -35,7 +35,7 @@ const (
 	// by the shared loader, which is the point of the field (§12.2) — so a bump lands
 	// here too, and a stale native test fails loudly rather than running a guest against
 	// a seam that moved.
-	guestABIVersion = 1
+	guestABIVersion = 2
 )
 
 // testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).

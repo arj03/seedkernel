@@ -21,6 +21,9 @@ const copies = [
   // same artifact the browser fetches, which is the point: one verifier, one
   // accept/reject boundary, across all three targets (native/mldsa.go).
   ["browser/mldsa65.wasm", "mldsa65.wasm"],
+  // ML-KEM-768 for the primitive catalog (§14.1). Same artifact, same reason to share
+  // it: a name in the catalog must mean the same bytes on every target (native/mlkem.go).
+  ["browser/mlkem768.wasm", "mlkem768.wasm"],
 ];
 
 for (const [from, to] of copies) {

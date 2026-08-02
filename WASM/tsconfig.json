@@ -7,9 +7,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,
-    "outDir": "../build/host",
+    "outDir": "build",
     "rootDir": "."
   },
-  "include": ["**/*.ts"],
+  "include": ["core/**/*.ts", "host/**/*.ts"],
   "exclude": []
 }

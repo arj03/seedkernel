@@ -15,7 +15,7 @@ import (
 // the realm is zero-authority — the host capabilities are not reachable by name.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
-// put hashes the data (CAP_HASH) and stores it under that id (CAP_FS_PUT); get
+// put hashes the data (CAP_CRYPTO, by name) and stores it under that id (CAP_FS_PUT); get
 // fetches by id (CAP_FS_GET). `probe` reports any leaked host globals.
 const storeGuestSource = `
 function hex(u8) { let s = ""; for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0"); return s; }
@@ -28,7 +28,12 @@ function fsPutArg(key, bytes) {
   return out;
 }
 register("put", (data) => {
-  const id = host.call(CAP_HASH, data);
+  // A primitive is reached BY NAME through the one CAP_CRYPTO op:
+  // [nameLen u8][name utf8][args].
+  const nm = new TextEncoder().encode("blake2b-256");
+  const call = new Uint8Array(1 + nm.length + data.length);
+  call[0] = nm.length; call.set(nm, 1); call.set(data, 1 + nm.length);
+  const id = host.call(CAP_CRYPTO, call);
   host.call(CAP_FS_PUT, fsPutArg(hex(id), data));
   return id;
 });
@@ -50,7 +55,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	// Host realm: build the cap-bridge granting crypto + fs (no net/module).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["transform", "fs"], __id, null, []);
+		__buildCapBridge(["fs"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import type { Fs, FsStat } from "./fs.js";
+import type { Fs, FsStat } from "../core/fs.js";
 
 // An opaque key becomes a filename verbatim, so it must be a safe, flat name:
 // no separators, no `.`/`..`, nothing that could escape the directory.

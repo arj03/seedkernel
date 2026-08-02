@@ -267,7 +267,7 @@ await test("FRAME CAP: the caller raises before it flushes its queue", async () 
 });
 
 await test("SUBKEYS: one master seed, purpose-bound keys, deterministic", async () => {
-  const { deriveNodeKeys } = await import("../build/host/subkeys.js");
+  const { deriveNodeKeys } = await import("../build/core/subkeys.js");
   const master = new Uint8Array(32).fill(5);
   const a = deriveNodeKeys(sodium, master), b = deriveNodeKeys(sodium, master);
   const hex = (u) => Buffer.from(u).toString("hex");

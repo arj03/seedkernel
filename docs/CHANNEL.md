@@ -342,6 +342,12 @@ All but 13 are covered by `tests/net-link.test.mjs` and `tests/net-link.load.tes
 
 ## 11. The post-quantum landing (suite `0x03`)
 
+**The primitive is already there.** `ml-kem-768/{keypair,encaps,decaps}` are in the host's
+primitive catalog (`PRIMITIVE_NAMES`, §12.2), provisioned ahead of any caller because a
+bundle is replaceable and the vocabulary it draws on is not. So `0x03` is a signed transport
+bundle and one policy entry — no host rebuild on three targets, which is what the ordering
+argument in §14.1 was protecting against.
+
 **Already prepared for.** `SUITE_PARAMS` holds the per-suite message widths in one table, so
 `0x03` is an entry. The key schedule takes a *list* of shared secrets, so a KEM secret joins
 it rather than displacing anything. And because the handshake publishes no long-term DH key,

@@ -19,11 +19,9 @@
 //
 // Nothing here is negotiated and nothing is per-suite. Both caps apply identically on
 // TCP, WebSocket and WebRTC, so a frame that crosses one crosses the other.
-
 /** Hard cap on one link frame, matching §16.1. Enforced by the socket seams on the
  *  length prefix (TCP) or frame length (WS) before buffering. */
 export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
-
 /** The frame cap that applies BEFORE a link authenticates.
  *
  *  MAX_FRAME_BYTES bounds what an *application* frame may be, and applying it to an
@@ -33,9 +31,16 @@ export const MAX_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB
  *  sockets. No handshake message is anywhere near it (the largest is 113 bytes including
  *  the tag), so nothing legitimate needs the headroom until the link is authenticated.
  *
- *  Raised to MAX_FRAME_BYTES by PeerLink through `RawChannel.allowLargeFrames()` at
- *  exactly the moment the peer becomes a known, admitted identity — the one transition
- *  the module is allowed to ask for, and the host still owns both numbers. A post-quantum
- *  handshake suite would raise this one (§14.2), which is another reason it is declared
- *  where the socket can see it. */
-export const MAX_HANDSHAKE_FRAME_BYTES = 512;
+ *  Raised to MAX_FRAME_BYTES by the transport bundle through `NET_LINK_CAP` at exactly
+ *  the moment the peer becomes a known, admitted identity — the one transition the
+ *  module is allowed to ask for, and the host still owns both numbers.
+ *
+ *  **8 KiB rather than the 512 this started at, and the difference is the post-quantum
+ *  migration §14.1 puts on a clock.** An ML-KEM-768 encapsulation key is 1,184 bytes, so
+ *  512 was a second lock on the same door: with `ml-kem-768` now in the primitive
+ *  catalog, a 512-byte cap would have been the one remaining reason a PQ handshake still
+ *  needed a core rev — the socket seam would have refused the message the catalog had
+ *  just made expressible. The bound still does its job — it exists to cap *pre-authentication*
+ *  buffering, and 8 KiB against the 1,024 unverified half-open budget is 8 MiB, bounded
+ *  and small — while no longer deciding which suites are expressible. */
+export const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;

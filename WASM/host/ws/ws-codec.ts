@@ -14,7 +14,7 @@
 // returned bytes. The host keeps the residual receive buffer (the WsParser),
 // since the module holds no per-connection state.
 
-import { concatBytes, readU32BE, ByteQueue } from "../util.js";
+import { concatBytes, readU32BE, ByteQueue } from "../../core/util.js";
 import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, MAX_FRAME_PAYLOAD } from "./ws-abi.js";
 
 // The ws.wasm ABI ops and scratch caps live in ws-abi.ts, shared verbatim with

@@ -3,7 +3,7 @@
 // The source is heavily documented and over half the gzipped host bytes are doc
 // comments, so simply stripping comments ~halves the wire size — no bundler, no
 // terser, no new dependencies. It reads the commented build/host (kept as-is for
-// debugging) and emits a comment-stripped build/host-min (for shipping). One
+// debugging) and emits a comment-stripped build-min (for shipping). One
 // `npm run build` produces both.
 //
 // The host has no regex literals (verified), so a bare `/` is never a regex
@@ -19,8 +19,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
-const srcDir = join(root, "build", "host");
-const outDir = join(root, "build", "host-min");
+const srcDir = join(root, "build");
+const outDir = join(root, "build-min");
 
 /** Strip `//` and block comments, preserving string and template-literal
  *  contents (including `${ }` interpolations, tracked with a brace stack). */
@@ -94,4 +94,4 @@ for (const f of files) {
   gzOut += gzipSync(min, { level: 9 }).length;
 }
 const kb = (n) => (n / 1024).toFixed(1) + " KB";
-console.log(`minified ${files.length} host files → build/host-min  (${kb(gzIn)} → ${kb(gzOut)} gz, −${(100 * (1 - gzOut / gzIn)).toFixed(0)}%)`);
+console.log(`minified ${files.length} host files → build-min  (${kb(gzIn)} → ${kb(gzOut)} gz, −${(100 * (1 - gzOut / gzIn)).toFixed(0)}%)`);

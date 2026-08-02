@@ -31,18 +31,25 @@ func TestAsyncNetInitiator(t *testing.T) {
 		globalThis.idB = sodium.crypto_sign_keypair();
 		globalThis.aId = toHex(idA.publicKey);
 		globalThis.bId = toHex(idB.publicKey);
-		globalThis.netA = makeNetwork(idA, undefined, { host: "127.0.0.1", port: 0 }, undefined);
-		globalThis.netB = makeNetwork(idB, undefined, undefined, undefined);
-		globalThis.tA = new Transport(aId, netA, 2000);
-		globalThis.tB = new Transport(bId, netB, 2000);
-		tA.onRequest((from, proto, payload) => payload);
-		__buildCapBridge(["crypto", "net"], idB, tB, [aId]);
+		// A node without an admitted transport bundle has no network at all, so the
+		// policy has to name the artifact's own transport author before either node
+		// stands up. The id is read from the realm, never restated.
+		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
+		                           roles: { transport: [embeddedTransportAuthor] } }));
+		globalThis.__setup = (async () => {
+		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
+		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
+		  globalThis.netA = a.net;
+		  globalThis.netB = b.net;
+		  netA.onRequest((from, proto, payload) => payload);
+		  __buildCapBridge(["crypto", "net"], idB, netB, [aId]);
+		})();
 	`)); err != nil {
 		t.Fatal("setup:", err)
 	}
 
 	// Bind A's listener (sets netA.port), then point B at A.
-	if _, _, _, err := el.await(`(async () => { await netA.start(); return new Uint8Array(0); })()`, 5*time.Second); err != nil {
+	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); return new Uint8Array(0); })()", 5*time.Second); err != nil {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(

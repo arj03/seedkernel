@@ -39,8 +39,10 @@ const requesterJS = `
 globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
-  globalThis.__net2 = makeNetwork(id, undefined, undefined, undefined);
-  globalThis.__t2 = new Transport(__peerId, __net2, 2000);
+  const { net } = await makeTransportNode({
+    identity: id, contactSecret: fromHex(contactSecretHex), timeoutMs: 2000,
+  });
+  globalThis.__net2 = net;
   // The secret rides in the ADDRESS, not in this node's own config: on a dial it is the
   // PEER's contact secret (§12.6), and without it the holder answers a stranger's msg1
   // with silence — which is the whole point of the gate, and would show up here only as
@@ -48,12 +50,13 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   __net2.addPeerAddr(holderId, {
     host: "127.0.0.1", port, transport: "tcp", contactSecret: fromHex(contactSecretHex),
   });
+  await __net2.start();
   return new Uint8Array(0);
 };
-// Go stages bytes as ArrayBuffers; Transport.request takes the Uint8Array view every
-// other caller hands it, so make one here rather than loosening the shared signature.
+// Go stages bytes as ArrayBuffers; request takes the Uint8Array view every other
+// caller hands it, so make one here rather than loosening the shared signature.
 globalThis.ask = (holderId, proto, payload) =>
-  __t2.request(holderId, new TextEncoder().encode(proto), new Uint8Array(payload));
+  __net2.request(holderId, new TextEncoder().encode(proto), new Uint8Array(payload));
 `
 
 // startRequester boots the second node and returns its peer id.
@@ -96,7 +99,7 @@ func serveNode(t *testing.T, authorPub []byte) nodeStatus {
 func TestServeGuestApp(t *testing.T) {
 	author, authorPub := testAuthor(t)
 	st := serveNode(t, authorPub)
-	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"transform", "fs"})
+	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(bundlePath); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("bundle load: %s", status)
 	}
@@ -139,7 +142,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// app names — so they derive disjoint kernel names (§5.1) and bind their own
 	// protocols. The forwarder module echoes its input, so the echo app's response IS
 	// whatever the shell handed it.
-	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"transform", "fs"})
+	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("guest bundle load: %s", status)
 	}

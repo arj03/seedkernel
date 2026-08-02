@@ -13,8 +13,8 @@
       "default": "./build/host/browser.js"
     },
     "./net": {
-      "types": "./build/host/net.d.ts",
-      "default": "./build/host/net.js"
+      "types": "./build/core/net.d.ts",
+      "default": "./build/core/net.js"
     },
     "./net-node": {
       "types": "./build/host/net-node.d.ts",
@@ -41,8 +41,8 @@
       "default": "./build/host/ws.js"
     },
     "./fs": {
-      "types": "./build/host/fs.d.ts",
-      "default": "./build/host/fs.js"
+      "types": "./build/core/fs.d.ts",
+      "default": "./build/core/fs.js"
     },
     "./fs-node": {
       "types": "./build/host/fs-node.d.ts",
@@ -65,8 +65,8 @@
       "default": "./build/host/shell-core.js"
     },
     "./pq": {
-      "types": "./build/host/pq.d.ts",
-      "default": "./build/host/pq.js"
+      "types": "./build/core/pq.d.ts",
+      "default": "./build/core/pq.js"
     },
     "./bundle": {
       "types": "./build/host/bundle.d.ts",
@@ -75,23 +75,28 @@
     "./libsodium": "./browser/libsodium-wrappers.mjs",
     "./libsodium-core": "./browser/libsodium-core.mjs",
     "./libsodium.wasm": "./browser/libsodium.wasm",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./kem": {
+      "types": "./build/core/kem.d.ts",
+      "default": "./build/core/kem.js"
+    }
   },
   "scripts": {
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release && node scripts/inline-ws.mjs",
-    "build:host": "tsc -p host && tsc -p host/tsconfig.check.json",
+    "build:host": "tsc -p . && tsc -p tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
-    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"bootNode,setPolicy,loadBundleBlob,runGuest,serve,uninstall,revoke,createRealm,makeNetwork,netConnectWS,netListenWS,guestPreamble,capPreamble,createCapBridge,opsForCaps,guestSignScope,UNRESTRICTED_OPS,UNSCOPED_MODULES,Transport,PeerLink,Bindings,toHex,fromHex\" build/host/util.js build/host/domains.js build/host/wasm-limits.js build/host/net-limits.js build/host/fs.js build/host/bundle.js build/host/policy.js build/host/cap-bridge.js build/host/bindings.js build/host/net.js build/host/net-link.js build/host/link-router.js build/host/net-route.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/host/net-channel.js build/host/net-frame.js build/host/shell-core.js build/host/native-shim.js",
+    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"bootNode,setPolicy,loadBundleBlob,runGuest,serve,uninstall,revoke,createRealm,netConnectWS,netListenWS,guestPreamble,capPreamble,createCapBridge,opsForCaps,guestSignScope,appSignScope,transportSignScope,UNRESTRICTED_OPS,UNSCOPED_MODULES,Bindings,toHex,fromHex,TRANSPORT_BUNDLE_B64,makeTransportNode,embeddedTransportAuthor\" build/core/util.js build/core/domains.js build/core/wasm-limits.js build/core/net-limits.js build/core/fs.js build/host/bundle.js build/host/policy.js build/host/cap-bridge.js build/host/bindings.js build/core/net.js build/core/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/ws/ws-abi.js build/host/ws/ws-codec.js build/core/net-channel.js build/host/net-frame.js build/host/shell-core.js build/host/native-shim.js",
     "build:loader-wasm": "npm run build:ws && npm run build:browser-sodium && npm run build:pq && node scripts/copy-loader-wasm.mjs",
     "build:loader": "npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
-    "build:pq": "node scripts/build-mldsa.mjs",
-    "build": "npm run build:ws && npm run build:host && npm run build:host:min",
+    "build:pq": "node scripts/build-mldsa.mjs && node scripts/build-mlkem.mjs",
+    "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium && npm run build:pq",
     "shell": "node build/host/main-node.js",
     "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release",
-    "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/net-link.test.mjs && node tests/net-link.load.test.mjs && node tests/transport.test.mjs && node tests/run.mjs",
-    "test:load": "npm run build && node tests/net-link.load.test.mjs"
+    "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/net-link.test.mjs && node tests/net-link.load.test.mjs && node tests/transport.test.mjs && node tests/transport-bundle.test.mjs && node tests/run.mjs",
+    "test:load": "npm run build && node tests/net-link.load.test.mjs",
+    "build:transport-bundle": "node scripts/build-transport-bundle.mjs"
   },
   "dependencies": {
     "@jitl/quickjs-ng-wasmfile-release-asyncify": "^0.32.0",

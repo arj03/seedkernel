@@ -17,78 +17,49 @@
 // about, so it is not restated here: `createShell` owns it, and this file only names
 // the platform. Because it is TypeScript checked against those same interfaces, the
 // drift a hand-written second assembly accumulates is now a compile error.
-
-import { policyFromJson, type AdmitPredicate } from "./policy.js";
-import { appKeyFor, FreshnessMarks } from "./bundle.js";
+import { policyFromJson } from "./policy.js";
+import { appKeyFor, verifyBundle, FreshnessMarks } from "./bundle.js";
 import {
   createShell, type KernelBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { NodeNetworkCore, parsePeerSpec, type ChannelFactory } from "./net-route.js";
-import { WsClientChannel, WsServerChannel, type RawByteStream } from "./net-frame.js";
+import { TransportHost } from "./transport-host.js";
+import type { ChannelFactory, Identity, RawChannel, RawByteStream, TransportCrypto } from "../core/socket-seam.js";
+import type { Fs } from "../core/fs.js";
+import { parsePeerSpec } from "../core/socket-seam.js";
+import { WsClientChannel, WsServerChannel } from "./net-frame.js";
 import { setWsHandle } from "./ws/ws-codec.js";
-import type { Identity, RawChannel, TransportCrypto } from "./net-link.js";
-import type { SafeRealm } from "./safe-js.js";
-import type { Fs } from "./fs.js";
-import { toHex, fromHex } from "./util.js";
+import { toHex, fromHex } from "../core/util.js";
+// The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
+// the signed program that IS the node's network (phase 3).
+import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 
-// ── The Go seam ──────────────────────────────────────────────────────────────
-
-/** The byte-level powers the Go loader exposes into the realm (native/main.go).
- *  Only the host powers QuickJS genuinely cannot reach: compile and hold wasm,
- *  write a file atomically, and stand up a second (zero-authority) realm.
- *  Everything else on this page is JS. */
-declare const bridge: {
-  /** Compile + instantiate handler bytes against the §4 ABI. Returns an opaque token
-   *  for a later bindWasm; throws on structural failure. No table effect. */
-  instantiateWasm(wasm: Uint8Array): unknown;
-  /** Bind a pre-instantiated handler token at `name` on the handler table. */
-  bindWasm(name: string, token: unknown): void;
-  /** Release a handler token that will never be bound (the bundle failed). */
-  discardWasm(token: unknown): void;
-  /** Invoke a bound handler (§4). null when the name is unbound or it produced nothing. */
-  callHandler(name: string, payload: Uint8Array): ArrayBuffer | null;
-  isBound(name: string): boolean;
-  /** Unbind every handler whose name starts with `prefix`; returns how many went. */
-  removePrefix(prefix: string): number;
-  /** The persisted freshness store's contents, or null on first boot. */
-  readFreshness(): string | null;
-  /** Write the freshness store atomically (temp file + rename). */
-  writeFreshness(json: string): void;
-
-  // ── the confined realm (§12.3), Go's twin of safe-js.ts ──
-  /** Stand up a zero-authority QuickJS realm running `source`, with the guest's
-   *  single `host.call` seam funnelled into `capCall`. Returns an opaque handle. */
-  createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): unknown;
-  /** Invoke an entrypoint as the *initiator*: it may await net, so the result comes
-   *  back through `onDone`/`onFail` rather than as a return value. */
-  realmCall(
-    realm: unknown, entry: string, payload: Uint8Array,
-    onDone: (bytes: ArrayBuffer) => void, onFail: (msg: string) => void,
-  ): void;
-  /** Invoke an entrypoint synchronously — the holder request side (§12.8). */
-  realmCallSync(realm: unknown, entry: string, payload: Uint8Array): ArrayBuffer;
-  /** Settle a parked net op in `realm`: `bytes` fulfils it, `msg` rejects it. */
-  realmSettle(realm: unknown, callId: number, bytes: Uint8Array | null, msg: string | null): void;
-  realmDispose(realm: unknown): void;
-};
-
-/** What Go calls for every `host.call` a guest makes. A sync op (crypto/fs/clock/
- *  module) returns its bytes here; a net op genuinely round-trips, so it returns
- *  null — Go leaves the guest's Promise parked under `callId` — and is settled later
- *  through `bridge.realmSettle`. The same null-means-async contract safe-js.ts's
- *  host function implements, so one guest preamble serves both targets.
- *  The payload arrives as a bare ArrayBuffer: that is the Go seam's currency, and
- *  the view the cap-bridge wants is made here rather than in Go. */
+/** The guest→host seam Go calls into. A null return means the op parked: Go holds
+ *  the guest's Promise under `callId` and settles it later through
+ *  `bridge.realmSettle`, the same null-means-async contract safe-js.ts implements. */
 type CapCall = (op: number, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
-/** libsodium, in libsodium-wrappers method names (native/sodium.go). Typed as the
- *  full surface the shared code consumes — the loader's verifier and hasher, the
- *  cap-bridge's crypto ops, and the §12.6 channel AKE — so a Go shim that stops
- *  satisfying one of them fails the build rather than a handshake.
- *
- *  `ml_dsa65_verify_detached` is on it too (native/mldsa.go), driving the same
- *  mldsa65.wasm the browser fetches and Node reads — so manifest suite `0x02` (§12.4)
- *  is verified identically on every target rather than being a JS-only capability. */
+/** The handler table and realm plumbing Go exposes (main.go). */
+declare const bridge: {
+  instantiateWasm(wasm: Uint8Array): number;
+  bindWasm(name: string, ref: number): void;
+  discardWasm(ref: number): void;
+  callHandler(name: string, payload: Uint8Array): ArrayBuffer | null;
+  isBound(name: string): boolean;
+  removePrefix(prefix: string): number;
+  readFreshness(): string | null;
+  writeFreshness(json: string): void;
+  createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;
+  realmCall(realm: number, entry: string, payload: Uint8Array,
+            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): void;
+  realmCallSync(realm: number, entry: string, payload: Uint8Array): ArrayBuffer;
+  realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
+  realmDispose(realm: number): void;
+};
+
+/** libsodium, in libsodium-wrappers method names (native/sodium.go), plus the PQ
+ *  half (native/mldsa.go) and the catalog's KEM (native/mlkem.go). Typed as the full
+ *  surface the shared code consumes, so a Go shim that stops satisfying one of them
+ *  fails the build rather than a handshake. */
 declare const sodium: ShellSodium & TransportCrypto;
 
 /** The `fs.*` backend over Go's data directory (native/fs.go). */
@@ -99,8 +70,8 @@ declare const fs: Fs;
 declare const __ws: { handle(req: Uint8Array): ArrayBuffer };
 
 /** Go's TCP socket primitive as RawChannels / raw byte duplexes (native/sock.go).
- *  `listen` returns the bound port. This is the whole networking seam: the PeerLink
- *  handshake, the routing table and the request/response Transport above it are the
+ *  `listen` returns the bound port. This is the whole networking seam: the channel
+ *  handshake, the routing table and the request/response layer above it are the
  *  shared TS, unchanged. */
 declare function netConnect(host: string, port: number): RawChannel;
 declare function netConnectRaw(host: string, port: number): RawByteStream;
@@ -112,67 +83,78 @@ declare function netCloseListeners(): void;
 // WebAssembly backend; here it is the identical ws.wasm driven over wazero, so
 // framing is byte-identical across targets.
 setWsHandle((req) => new Uint8Array(__ws.handle(req)));
-
 // ── The platform ─────────────────────────────────────────────────────────────
-
 /** The §3 handler table, which on this target lives in Go (wazero instances cannot
  *  be JS values). Shape only — every rule about what may land is the shared loader's. */
 const kernel: KernelBackend = {
-  instantiateWasm(wasm: Uint8Array): unknown { return bridge.instantiateWasm(wasm); },
-  bindHandler(name: string, ref: unknown): void { bridge.bindWasm(name, ref); },
-  discardHandler(ref: unknown): void { bridge.discardWasm(ref); },
-  callHandler(name: string, payload: Uint8Array): Uint8Array | null {
-    const r = bridge.callHandler(name, payload);
-    return r === null ? null : new Uint8Array(r);
-  },
-  isBound(name: string): boolean { return bridge.isBound(name); },
-  removePrefix(prefix: string): number { return bridge.removePrefix(prefix); },
+    instantiateWasm(wasm) { return bridge.instantiateWasm(wasm); },
+    bindHandler(name, ref) { bridge.bindWasm(name, ref as number); },
+    discardHandler(ref) { bridge.discardWasm(ref as number); },
+    callHandler(name, payload) {
+        const r = bridge.callHandler(name, payload);
+        return r === null ? null : new Uint8Array(r);
+    },
+    isBound(name) { return bridge.isBound(name); },
+    removePrefix(prefix) { return bridge.removePrefix(prefix); },
 };
-
 /** The freshness store over the Go atomic-write seam (README §12.4). */
 class NativeFreshnessStore extends FreshnessMarks {
-  constructor() {
-    super(bridge.readFreshness());
-  }
-  protected override persist(json: string): void { bridge.writeFreshness(json); }
+    constructor() {
+        super(bridge.readFreshness());
+    }
+    persist(json: string) { bridge.writeFreshness(json); }
 }
-
 /** WebSocket RawChannels over Go's raw byte streams: the node-dialing-a-WS-endpoint
  *  and node-accepting-a-browser sides, framed by the shared net-frame classes. The
  *  browser uses its platform WebSocket instead; this is the same codec either way. */
 function netConnectWS(host: string, port: number): RawChannel {
-  return new WsClientChannel(netConnectRaw(host, port), host, port, sodium);
+    return new WsClientChannel(netConnectRaw(host, port), host, port, sodium);
 }
 function netListenWS(host: string, port: number, onAccept: (ch: RawChannel) => void): number {
-  return netListenRaw(host, port, (stream) => onAccept(new WsServerChannel(stream)));
+    return netListenRaw(host, port, (stream) => onAccept(new WsServerChannel(stream)));
 }
-
-/** The routing core's one platform seam, backed by Go's sockets. connect/listen
- *  produce RawChannels identically to the node:net factory, so NodeNetworkCore —
- *  the address book, the dialing, the link pool — runs unchanged. */
+/** This target's socket seam, backed by Go's sockets: the transport driver's
+ *  ChannelFactory. connect/listen produce RawChannels identically to the node:net
+ *  factory, so the transport bundle's link state machine — driven by TransportHost
+ *  — runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
-  connect: (addr) => addr.transport === "ws"
-    ? netConnectWS(addr.host, addr.port)
-    : netConnect(addr.host, addr.port),
-  listen: (tcp, ws, onAccept) => Promise.resolve({
-    port: tcp ? netListen(tcp.host, tcp.port, onAccept) : 0,
-    wsPort: ws ? netListenWS(ws.host, ws.port, onAccept) : 0,
-  }),
-  // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
-  close: () => { netCloseListeners(); },
+    connect: (addr) => addr.transport === "ws"
+        ? netConnectWS(addr.host, addr.port)
+        : netConnect(addr.host, addr.port),
+    listen: (tcp, ws, onAccept) => Promise.resolve({
+        port: tcp ? netListen(tcp.host, tcp.port, onAccept) : 0,
+        wsPort: ws ? netListenWS(ws.host, ws.port, onAccept) : 0,
+    }),
+    // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
+    close: () => { netCloseListeners(); },
 };
-
-/** This target's Network: the shared routing core over the Go channel factory.
- *  Exported because the native tests stand up two of them in one realm. */
-function makeNetwork(
-  identity: Identity,
-  contactSecret: Uint8Array | undefined,
-  listen?: { host: string; port: number },
-  wsListen?: { host: string; port: number },
-): NodeNetworkCore {
-  return new NodeNetworkCore({ identity, contactSecret, sodium, channels, listen, wsListen });
-}
-
+/** The artifact-shipped transport bundle, as raw bytes (transport-bundle.js). */
+const embeddedTransport = (() => {
+    try {
+        const bin = atob(TRANSPORT_BUNDLE_B64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++)
+            out[i] = bin.charCodeAt(i);
+        return out;
+    }
+    catch {
+        return null;
+    }
+})();
+/** Who signed the transport this artifact ships — hex, DERIVED from the blob rather
+ *  than restated anywhere. This is the id an operator pins as `roles.transport` in a
+ *  policy file (§12.5), so a build with a different key needs a different entry and
+ *  nothing has to be kept in step by hand. Empty if the artifact carries no transport. */
+const embeddedTransportAuthor = (() => {
+    if (!embeddedTransport)
+        return "";
+    try {
+        return toHex(verifyBundle(sodium, embeddedTransport).author);
+    }
+    catch {
+        return "";
+    }
+})();
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm
  *  driven by Go's event loop. safe-js.ts is the JS platform's answer to the same
  *  seam; both present the same `SafeRealm`, so the shell drives either.
@@ -190,157 +172,172 @@ function makeNetwork(
 // argument is inert in the vendored qjs.wasm (a 1 ms limit does not interrupt a spinning
 // loop), so guest.go arms a wazero deadline instead. That makes a budget kill fatal to the
 // realm rather than a catchable JS error — see qjs.Runtime.Budget.
-const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes, deadlineMs }): Promise<SafeRealm> => {
-  // Assigned before any guest code can call back: bridge.createRealm evaluates the
-  // guest, whose top-level can only reach sync ops (a Promise it could not await).
-  let realm: unknown;
-  const capCall: CapCall = (op, payload, callId) => {
-    const r = capBridge(op, new Uint8Array(payload));
-    if (!r || typeof (r as Promise<Uint8Array>).then !== "function") return r as Uint8Array;
-    (r as Promise<Uint8Array>).then(
-      (bytes) => bridge.realmSettle(realm, callId, bytes, null),
-      (e) => bridge.realmSettle(realm, callId, null, String((e && (e as Error).message) || e)),
-    );
-    return null;
-  };
-  realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0,
-    deadlineMs === undefined ? 0 : (deadlineMs === Infinity ? -1 : deadlineMs));
-  return {
-    call: (entry, payload) => new Promise<Uint8Array>((resolve, reject) => {
-      bridge.realmCall(realm, entry, payload,
-        (bytes) => resolve(new Uint8Array(bytes)),
-        (msg) => reject(new Error(msg)));
-    }),
-    callSync: (entry, payload) => new Uint8Array(bridge.realmCallSync(realm, entry, payload)),
-    dispose: () => { bridge.realmDispose(realm); },
-  };
+const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes, deadlineMs }) => {
+    // Assigned before any guest code can call back: bridge.createRealm evaluates the
+    // guest, whose top-level can only reach sync ops (a Promise it could not await).
+    let realm: number;
+    const capCall: CapCall = (op, payload, callId) => {
+        const r = capBridge(op, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
+        if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
+            return r as Uint8Array;
+        (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, String((e as Error)?.message ?? e)));
+        return null;
+    };
+    realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0, deadlineMs === undefined ? 0 : (deadlineMs === Infinity ? -1 : deadlineMs));
+    return {
+        call: (entry: string, payload: Uint8Array) => new Promise((resolve, reject) => {
+            bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg)));
+        }),
+        callSync: (entry: string, payload: Uint8Array) => new Uint8Array(bridge.realmCallSync(realm, entry, payload)),
+        dispose: () => { bridge.realmDispose(realm); },
+    };
 };
-
-// ── The entry points Go drives ───────────────────────────────────────────────
-
-/** Everything the operator chose, forwarded from Go's CLI flags as one JSON object
- *  — so the flag surface is parsed once, in Go, and the assembly reads it as data
- *  rather than as spliced-together JS. */
-interface BootConfig {
-  /** allowed-keys.json contents, or null for the deny-all default (README §14). */
-  policyJson: string | null;
-  /** This node's 64-byte Ed25519 secret key, hex (libsodium sk = seed‖pk). */
-  keyHex: string;
-  /** OPTIONAL deployment secret, hex (§12.6.3). Omit for an open network; identity
-   *  concealment does not depend on it. */
-  contactSecretHex?: string;
-  listen?: { host: string; port: number };
-  wsListen?: { host: string; port: number };
-  /** Cohort peers to dial, as `pk@host:port`. The network owns connectivity. */
-  peers?: string[];
-  /** net.send timeout in ms (how long before a peer is treated unreachable). */
-  timeoutMs?: number;
-  /** Operator app config, merged *over* the bundle manifest's `config`. */
-  config?: Record<string, string | number>;
-}
-
-/** What a boot reports back: who we are and what we actually bound. */
-interface NodeStatus { peerId: string; port: number; wsPort: number; }
-
 /** Everything that crosses back to Go crosses as BYTES — that is the currency of this
  *  seam (host.call, callHandler, a realm result), and the one shape Go's await harness
  *  carries out of a settled promise. A JSON report is no exception. */
 const utf8 = new TextEncoder();
-
 let shell: Shell | null = null;
-
 /** The admission predicate in force (§12.5). It starts deny-all — the realm boots
  *  refusing everything, so the absence of a decision is never permission (README §14)
  *  — and `--policy` replaces it at boot. The shell closes over this indirection rather
  *  than over a fixed predicate, so an operator can narrow or widen trust without
  *  restarting the node; the rules themselves are entirely policy.ts's. */
-let admitPredicate: AdmitPredicate = policyFromJson(null);
-
+let admitPredicate = policyFromJson(null);
 /** Point the realm at a policy config (§12.5). `null` restores the deny-all default;
  *  malformed JSON throws, so a typo fails loudly rather than silently widening trust. */
 function setPolicy(json: string | null): void {
-  admitPredicate = policyFromJson(json);
+    admitPredicate = policyFromJson(json);
 }
-
 /** The one shell, or a clear error if Go asked for something before booting one. */
-function theShell(): Shell {
-  if (!shell) throw new Error("native: bootNode has not run");
-  return shell;
+function theShell() {
+    if (!shell)
+        throw new Error("native: bootNode has not run");
+    return shell;
 }
-
-/** Stand the node up: identity, network, then the shared shell over this platform.
+/** Stand a node up on this platform: a shell, the transport bundle admitted under
+ *  the policy in force, and its listeners bound. Returns the shell and the driver
+ *  that IS its network.
+ *
+ *  There is one of these and everything uses it — `bootNode` below, and a native test
+ *  that needs a second endpoint in the process. That is deliberate: a test standing a
+ *  node up some other way is the second assembly this target exists not to have
+ *  (§12.9), and the last time the two diverged the drift did not fail to compile, it
+ *  surfaced as a network timeout. The config is an OBJECT for the same reason — a
+ *  positional signature drifting against a Go harness string is a silent break. */
+async function makeTransportNode(cfg: {
+    identity: Identity;
+    contactSecret?: Uint8Array;
+    listen?: {
+        host: string;
+        port: number;
+    };
+    wsListen?: {
+        host: string;
+        port: number;
+    };
+    timeoutMs?: number;
+    config?: Record<string, string | number>;
+}): Promise<{
+    shell: Shell;
+    net: TransportHost;
+}> {
+    const s = createShell({
+        platform: {
+            sodium, identity: cfg.identity, kernel, fs,
+            freshnessStore: new NativeFreshnessStore(),
+            channels, listen: cfg.listen, wsListen: cfg.wsListen,
+            contactSecret: cfg.contactSecret, createRealm,
+        },
+        admit: (v) => admitPredicate(v),
+        timeoutMs: cfg.timeoutMs,
+        config: cfg.config,
+    });
+    // The transport bundle IS the node's network: verify + govern under policy
+    // (roles.transport), install, and the shell stands the driver up. A policy that
+    // does not admit the transport author leaves the node without a network.
+    if (embeddedTransport) {
+        try {
+            await s.loadBundleBlob(embeddedTransport);
+        }
+        catch (err) {
+            if (String((err as Error).message).includes("rejected by admission predicate")) {
+                // A deliberate configuration: this node does not speak to anyone.
+            }
+            else {
+                throw err;
+            }
+        }
+    }
+    const net = s.net as unknown as TransportHost;
+    if (net instanceof TransportHost)
+        await net.start();
+    return { shell: s, net };
+}
+/** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so
  *  Go can print the real ports. */
 async function bootNode(cfgJson: string): Promise<Uint8Array> {
-  const cfg = JSON.parse(cfgJson) as BootConfig;
-  const sk = fromHex(cfg.keyHex);
-  const identity: Identity = { privateKey: sk, publicKey: sk.slice(32) };
-
-  const contactSecret = cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined;
-  const network = makeNetwork(identity, contactSecret, cfg.listen, cfg.wsListen);
-  await network.start();
-  for (const spec of cfg.peers ?? []) {
-    const { peerId, addr } = parsePeerSpec(spec, "tcp");
-    network.addPeerAddr(peerId, addr);
-  }
-  // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
-  // cohort member that is not up yet delays the boot but never fails it.
-  if (cfg.peers && cfg.peers.length > 0) await network.ready();
-
-  setPolicy(cfg.policyJson);
-  shell = createShell({
-    platform: {
-      sodium, identity, kernel, fs,
-      freshnessStore: new NativeFreshnessStore(),
-      network, createRealm,
-    },
-    admit: (v) => admitPredicate(v),
-    timeoutMs: cfg.timeoutMs,
-    config: cfg.config,
-  });
-  const status: NodeStatus = {
-    peerId: toHex(identity.publicKey), port: network.port, wsPort: network.wsPort,
-  };
-  return utf8.encode(JSON.stringify(status));
+    const cfg = JSON.parse(cfgJson);
+    const sk = fromHex(cfg.keyHex);
+    const identity = { privateKey: sk, publicKey: sk.slice(32) };
+    setPolicy(cfg.policyJson);
+    const { shell: s, net: network } = await makeTransportNode({
+        identity,
+        contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
+        listen: cfg.listen,
+        wsListen: cfg.wsListen,
+        timeoutMs: cfg.timeoutMs,
+        config: cfg.config,
+    });
+    shell = s;
+    if (network instanceof TransportHost) {
+        for (const spec of cfg.peers ?? []) {
+            const { peerId, addr } = parsePeerSpec(spec, "tcp");
+            network.addPeerAddr(peerId, addr);
+        }
+        // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
+        // cohort member that is not up yet delays the boot but never fails it.
+        if (cfg.peers && cfg.peers.length > 0)
+            await network.ready();
+    }
+    const status = {
+        peerId: toHex(identity.publicKey), port: network.port, wsPort: network.wsPort,
+    };
+    return utf8.encode(JSON.stringify(status));
 }
-
 /** Load a signed bundle (README §12.4). Go has read the one file — that is the whole
  *  fs seam — and passes its bytes; every check, its order, and the module binding are
  *  the shared shell's. Returns the little Go needs to report; the guest source, the
  *  caps, the signing scope and the kernel names never leave this realm. */
 async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
-  const b = await theShell().loadBundleBlob(new Uint8Array(blob));
-  return utf8.encode(JSON.stringify({
-    app: b.manifest.app,
-    version: b.manifest.version,
-    author: toHex(b.author),
-    // The protocols this app actually ended up serving (§12.10) — auto-bound inside
-    // loadBundleBlob, so this reports what happened rather than what was declared.
-    // For the operator's console line and nothing else.
-    handles: theShell().bindings.boundProtocols(appKeyFor(b.author, b.manifest.app)),
-  }));
+    const b = await theShell().loadBundleBlob(new Uint8Array(blob));
+    return utf8.encode(JSON.stringify({
+        app: b.manifest.app,
+        version: b.manifest.version,
+        author: toHex(b.author),
+        // The protocols this app actually ended up serving (§12.10) — auto-bound inside
+        // loadBundleBlob, so this reports what happened rather than what was declared.
+        // For the operator's console line and nothing else.
+        handles: theShell().bindings.boundProtocols(appKeyFor(b.author, b.manifest.app)),
+    }));
 }
-
 /** Run a loaded bundle's guest entrypoint as the *initiator* (§12.8) — the
  *  `--put` / `--get` one-shots. Arguments and results cross as raw bytes. */
 function runGuest(entry: string, arg: ArrayBuffer): Promise<Uint8Array> {
-  return theShell().runGuest(entry, new Uint8Array(arg));
+    return theShell().runGuest(entry, new Uint8Array(arg));
 }
-
 /** Serve the cohort: route inbound requests to whichever installed app the
  *  protocol is bound to (§12.10), through the shared dispatch. */
 function serve(): Promise<void> {
-  return theShell().serve();
+    return theShell().serve();
 }
-
 /** Uninstall one app by its app key (§12.5). Returns the boolean JSON-encoded, not
  *  raw: the realm bridge marshals only `Uint8Array`/`ArrayBuffer` results and turns
  *  anything else into zero bytes (native/loop.go `awaitIn`), so a bare `false` would
  *  reach Go as an empty buffer and read as success. Encode it. */
 function uninstall(appKey: string): Uint8Array {
-  return utf8.encode(JSON.stringify(theShell().uninstall(appKey)));
+    return utf8.encode(JSON.stringify(theShell().uninstall(appKey)));
 }
-
 /** Write off a compromised author key (§12.5): refuse everything it signs from here
  *  on, and tear down every app of its already running. Returns the app keys removed,
  *  JSON-encoded, for the operator's console line.
@@ -350,14 +347,10 @@ function uninstall(appKey: string): Uint8Array {
  *  native loader that could install but never revoke would leave §12.5's remedy
  *  reachable on some targets and not others. */
 function revoke(authorHex: string): Uint8Array {
-  return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
+    return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
 }
-
-// What Go reaches by name in the realm. `createRealm` and `makeNetwork` are here as
-// much for the native tests as for the boot above: a test that stands up a guest or
-// a second node drives the very factories production does, so there is no test-only
-// wiring to keep in step with the real one.
-export {
-  bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke,
-  createRealm, makeNetwork, netConnectWS, netListenWS,
-};
+// What Go reaches by name in the realm. `createRealm` and the transport bundle
+// helpers are here as much for the native tests as for the boot above: a test that
+// stands up a guest or a second node drives the very factories production does, so
+// there is no test-only wiring to keep in step with the real one.
+export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, netConnectWS, netListenWS, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

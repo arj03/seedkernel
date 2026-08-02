@@ -23,7 +23,7 @@
 // Deny-all stays the default: the absent predicate admits nothing.
 
 import { BUNDLE_ROLES, type VerifiedBundle } from "./bundle.js";
-import { toHex } from "./util.js";
+import { toHex } from "../core/util.js";
 
 /** The single admission seam.
  *  `(v: VerifiedBundle) → bool | Promise<bool>`.

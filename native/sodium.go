@@ -530,6 +530,9 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	// same object: the shared loader's crypto surface is one `sodium`, and it
 	// feature-detects suite 0x02 by the presence of this method.
 	exposeMlDsa(qc, o, md)
+	// And the catalog's KEM, on the same object for the same reason — the cap-bridge
+	// reaches every primitive through one `sodium` (mlkem.go).
+	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)
 	if _, err := qc.Eval("sodium-shim.js", qjs.Code(sodiumShimJS)); err != nil {
 		panic(fmt.Sprintf("sodium shim: %v", err))
@@ -591,6 +594,22 @@ const sodiumShimJS = `
     crypto_sign_seed_keypair: (seed) => {
       const k = N.crypto_sign_seed_keypair(seed);
       return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ed25519" };
+    },
+    // ML-KEM-768, the primitive catalog's KEM (§14.1, mlkem.go). null is a rejection
+    // the caller must be able to read — a public key that fails FIPS 203 §7.2's modulus
+    // check, or a secret key that fails §7.3's hash check — so unlike the libsodium
+    // wrappers above it is passed through rather than thrown.
+    ml_kem768_keypair_from_seed: (seed) => {
+      const k = N.ml_kem768_keypair_from_seed(seed);
+      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ml-kem-768" };
+    },
+    ml_kem768_encaps: (pk, coins) => {
+      const r = N.ml_kem768_encaps(pk, coins);
+      return r === null ? null : { ciphertext: u8(r.ciphertext), sharedSecret: u8(r.sharedSecret) };
+    },
+    ml_kem768_decaps: (sk, ct) => {
+      const r = N.ml_kem768_decaps(sk, ct);
+      return r === null ? null : u8(r);
     },
     randombytes_buf: (n) => u8(N.randombytes_buf(n)),
   };

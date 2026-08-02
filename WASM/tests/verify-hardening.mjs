@@ -15,13 +15,13 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 await _sodium.ready;
 const sodium = _sodium;
 
-const { KernelHost } = await imp("build/host/kernel-host.js");
-const { readMemoryLimits, checkHandlerMemory } = await imp("build/host/wasm-limits.js");
-const { MemoryFs, scopedFs } = await imp("build/host/fs.js");
+const { KernelHost } = await imp("build/core/kernel-host.js");
+const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
+const { MemoryFs, scopedFs } = await imp("build/core/fs.js");
 const { entryModuleOf, appScopeFor, genesisHash, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { createShell } = await imp("build/host/shell-core.js");
-const { toHex } = await imp("build/host/util.js");
+const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { LoopbackNetwork } = await imp("build/host/net.js");
 const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
@@ -191,7 +191,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const shell = createShell({
     platform: {
       sodium, identity: kp, kernel: new KernelHost(), fs: new MemoryFs(),
-      freshnessStore: new FreshnessMarks(), network: new LoopbackNetwork(toHex(kp.publicKey)),
+      freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen = o;
         return { call: async () => new Uint8Array(), callSync: () => new Uint8Array(), dispose() {} };
@@ -214,7 +214,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const bare = createShell({
     platform: {
       sodium, identity: kp, kernel: new KernelHost(), fs: new MemoryFs(),
-      freshnessStore: new FreshnessMarks(), network: new LoopbackNetwork(toHex(kp.publicKey)),
+      freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen2 = o;
         return { call: async () => new Uint8Array(), callSync: () => new Uint8Array(), dispose() {} };

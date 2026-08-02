@@ -18,35 +18,27 @@
 //
 // The Go/native loader evaluates this very file via the generated bundles (§12.9),
 // so its prefixes match by construction, not by a hand-copied constant.
-
-const domain = (s: string): Uint8Array => new TextEncoder().encode(s);
-
+const domain = (s: string) => new TextEncoder().encode(s);
 /** Bundle manifest (§12.4): prefixes the manifest JSON, so a manifest signature
  *  can't double as an envelope wrapper over the same bytes. */
 export const DOMAIN_MANIFEST = domain("seedkernel-manifest-sig-v1\0");
-
 /** Bundle manifest author id (§12.4): prefixes the key material an author id is
  *  derived from under a multi-key suite. Not a signing context — the one member of
  *  this family that prefixes a *hash* — but it lives here for the same reason the
  *  others do: it must be disjoint from every signing prefix, so a derived author id
  *  can never also be a preimage someone signed. See `hybridAuthorId` (bundle.ts). */
 export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
-
 /** Cap-bridge SIGN (§12.2): prefixes `scope ‖ msg`, scope host-derived from the
  *  manifest — a guest's signature stays in its bundle's namespace, not a key oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
-
 /** Channel AUTH (§12.6): prefixes the AKE transcript, so an AUTH signature names
  *  one connection and no other. */
 export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
-
 /** Subkey derivation (§12.9): `DOMAIN_subkey ‖ label ‖ master` hashed to a seed. Its own
  *  domain so a derived seed can never coincide with any other hash this system computes,
  *  and so the label space stays private to subkeys.ts. */
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
-
 // ── The guest seam's version ────────────────────────────────────────────────────
-
 /** The guest ABI version — which shape of `host.call` a guest was written against
  *  (§12.2). A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
  *  refuses a guest written for an ABI this host does not implement.
@@ -69,14 +61,69 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  preamble into every page that verifies a bundle, including handler-only shells
  *  (seedchat) that never build a bridge at all. cap-bridge.ts re-exports it, so a reader
  *  of the seam still finds the number next to the ops. */
-export const GUEST_ABI_VERSION = 1;
+export const GUEST_ABI_VERSION = 2;
+/** The crypto primitives this host serves through the one `CAP.CRYPTO` op — the catalog
+ *  a manifest's `guest.primitives` is checked against at load (phase 3a, task 8).
+ *
+ *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: the
+ *  loader checks a manifest field before anything is trusted, and it should not have to
+ *  import the op catalog and preamble to do it. cap-bridge.ts builds the dispatch map
+ *  from this list and re-exports it, so the names and the transforms cannot drift.
+ *
+ *  **Adding a name here is the whole cost of a new algorithm** — no op number, no ABI
+ *  rev, no capability domain. That is the point of a named catalog, and it is why a core
+ *  vocabulary is provisioned ahead of need (§14.1): a bundle is replaceable, the
+ *  vocabulary it draws on is not. */
+export const PRIMITIVE_NAMES = [
+    "blake2b-256",
+    "ed25519/verify",
+    "xchacha20/xor",
+    "chacha20poly1305-ietf/seal",
+    "chacha20poly1305-ietf/open",
+    "x25519/dh",
+    // ML-KEM-768 (FIPS 203), provisioned AHEAD of any caller — the whole point of the
+    // rule above. The channel's post-quantum suite is content (a signed transport
+    // bundle plus one policy entry), but only once its primitive exists on all three
+    // targets, and a primitive is the one thing that cannot be delivered as a bundle.
+    // Nothing in this tree calls these yet; §14.1 puts them on a clock rather than on
+    // a credible break, so they land now.
+    //
+    // Derandomized, like every other entry: the coins are an argument, drawn by the
+    // guest from `RANDOM` — an authority — so the catalog stays purely functional.
+    "ml-kem-768/keypair",
+    "ml-kem-768/encaps",
+    "ml-kem-768/decaps",
+] as const;
 
+export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
+/** The capability domains only a SLOT occupant may declare (phase 3a, task 11).
+ *
+ *  `rawnet` is what the transport slot consumes — sockets behind opaque link ids, the
+ *  whole of what the platform contributes to the network — and `transport` is what it
+ *  provides back: the attributed peer, protocol id and correlation every other app's
+ *  `net` domain reaches. Neither is an app capability. Splitting the two nets is what
+ *  makes that statable at all: before it, `net` meant the structured thing and an app
+ *  declaring it was implicitly being handed the transport's output and the platform's
+ *  socket seam under one word.
+ *
+ *  Enforced at load, not at first use, and on the same argument that keeps
+ *  `authorAllowlist` from admitting a slot claim: an authority class this large needs a
+ *  deliberate per-slot policy decision, never a cap string an ordinary app can add to
+ *  its own manifest and have quietly honoured.
+ *
+ *  `timer` is deliberately NOT here. It is an ordinary authority — small, host-bounded,
+ *  and useful to any guest that needs a deadline — and the transport happening to want
+ *  one is not a reason to make it a privilege.
+ *
+ *  Here rather than in cap-bridge.ts for the reason `GUEST_ABI_VERSION` is: the loader
+ *  checks this against a manifest before anything is trusted, and should not have to
+ *  import the op catalog to do it. */
+export const SLOT_ONLY_DOMAINS: readonly string[] = ["rawnet", "transport"];
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility
  *  failure as an unsupported manifest suite (§12.4). */
 export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
-
 // ── Algorithm suites ────────────────────────────────────────────────────────────
 //
 // A suite id is the first byte of the structure it governs *and* part of what that
@@ -94,11 +141,9 @@ export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
 // retroactive attack and can migrate late. They both read `0x01` today only because each
 // is at its own genesis algorithms. Never read one as the other, and never assume they
 // move together. See §14.1.
-
 /** Channel handshake (§12.6): Ed25519 identity · ephemeral X25519 · ChaCha20-Poly1305.
  *  Both identities ride in cleartext; see SUITE_CHANNEL_CONCEALED. */
 export const SUITE_CHANNEL_GENESIS = 0x01;
-
 /** Channel handshake with concealed identities (§12.6.2): a long-term X25519 key per
  *  node in addition to the Ed25519 identity, and neither identity on the wire in clear.
  *
@@ -113,10 +158,8 @@ export const SUITE_CHANNEL_GENESIS = 0x01;
  *  0x01 and reads the cleartext HELLO. 0x01 acceptance is therefore a deployment
  *  setting to be turned off, not a permanent compatibility mode (§12.6.2 phase 5). */
 export const SUITE_CHANNEL_CONCEALED = 0x02;
-
 /** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
 export const SUITE_MANIFEST_GENESIS = 0x01;
-
 /** Bundle manifest (§12.4): **hybrid** Ed25519 + ML-DSA-65 (FIPS 204). Both signatures
  *  are made over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json` and **both must
  *  verify** — the classical half stays load-bearing while the PQ half is young, so a
