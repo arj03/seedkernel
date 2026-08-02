@@ -164,33 +164,33 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which: `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content.
 
-The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are non-test code only.
+The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded.
 
-**Shared — compiled once, run by all three targets (4,845 lines)**
+**Shared — compiled once, run by all three targets (2,560 LOC)**
 
-| Concern | Where | Lines |
+| Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 1,236 |
-| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts` | 890 |
-| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 828 |
-| Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, suite ids, the primitive catalog | `core/*.ts` (8 files) | 815 |
-| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 675 |
-| WS codec and framing | `host/ws/*`, `host/net-frame.ts` | 401 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 574 |
+| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 495 |
+| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 474 |
+| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 386 |
+| Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, suite ids, the primitive catalog | `core/*.ts` (8 files) | 369 |
+| WS codec and framing | `host/ws/*`, `host/net-frame.ts` | 261 |
 
 **Per-target platform — the seam, written once per target**
 
-| Target | What | Lines |
+| Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 2,641 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (357), the Go binding, which is TypeScript and rides in the shared bundle | 4,148 Go + 357 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,545 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (235), the Go binding, which is TypeScript and rides in the shared bundle | 3,341 Go + 235 TS |
 
 **Signed content — not host code at all**
 
-| | Where | Lines |
+| | Where | LOC |
 | --- | --- | --- |
-| Transport bundle — the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` | 1,422 |
+| Transport bundle — the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` | 1,006 |
 
-Each target therefore runs 4,845 shared lines over roughly 2,600–4,500 of its own plumbing, and the protocol on the wire is none of it — that lives in the signed bundle.
+Each target therefore runs 2,560 shared lines over roughly 1,500–3,500 of its own plumbing, and the protocol on the wire is none of it — that lives in the signed bundle.
 
 Shared binaries, byte-identical on every target:
 
