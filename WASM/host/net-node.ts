@@ -1,5 +1,5 @@
 // The Node platform binding for the TCP/WS socket seam — node↔node over TCP and
-// browser↔node over WebSocket. It implements ChannelFactory (transport-seam.ts):
+// browser↔node over WebSocket. It implements ChannelFactory (core/socket-seam.ts):
 // it knows how to open node:net sockets and wrap them as RawChannels, and nothing
 // else. The transport itself — the PeerLink handshake, link routing, the
 // request/response layer — now runs in the transport bundle's guest program,

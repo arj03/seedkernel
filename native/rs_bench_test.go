@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/crypto/blake2b"
 )
 
 const (
@@ -45,12 +47,18 @@ var (
 	rsSetupErr  error // non-nil ⇒ SEEDSTORE_BUNDLE was set but unusable: fail, don't skip
 )
 
-// bundleAuthor pulls the manifest author key out of a packed bundle blob (§12.4). The
+const manifestAuthorDomain = "seedkernel-manifest-author-v1\x00"
+const hybridEnvelopePK = 1952 // ML-DSA-65 public key width (WASM/core/pq.ts ML_DSA65_PK_LEN)
+
+// bundleAuthor pulls the manifest author id out of a packed bundle blob (§12.4). The
 // container is [magic 4][count u16] then per file [nameLen u16][name][dataLen u32][data],
-// and the manifest envelope inside it leads with a suite byte: [suite 1][author_pk 32]
-// [sig 64][json]. Mirrors packBundle/verifyManifest in bundle.ts. The bench only needs the
-// key to allow-list — loadBundle still verifies the signature against it, so a wrong key
-// here fails the load rather than weakening it.
+// and the manifest envelope inside it leads with a suite byte. Under suite 0x01 the
+// author id IS the Ed25519 key: [suite 1][ed_pk 32][sig 64][json]. Under the hybrid
+// suite 0x02 it is the DERIVED genesis hash — DOMAIN_MANIFEST_AUTHOR ‖ 0x02 ‖ ed_pk ‖
+// ml_dsa_pk (bundle.ts hybridAuthorId), never either key alone, so a policy written for
+// the raw key would refuse the load (fail-closed). Mirrors packBundle/verifyManifest in
+// bundle.ts. The bench only needs the id to allow-list — loadBundle still verifies the
+// signature against it, so a wrong id here fails the load rather than weakening it.
 func bundleAuthor(blob []byte) ([]byte, error) {
 	if len(blob) < 6 {
 		return nil, fmt.Errorf("bundle blob too short (%d B)", len(blob))
@@ -72,7 +80,23 @@ func bundleAuthor(blob []byte) ([]byte, error) {
 			if dataLen < 33 {
 				return nil, fmt.Errorf("manifest envelope too short (%d B)", dataLen)
 			}
-			return blob[o+1 : o+33], nil // +1 skips the suite byte
+			switch suite := blob[o]; suite {
+			case 1:
+				return blob[o+1 : o+33], nil // +1 skips the suite byte
+			case 2:
+				if dataLen < 1+32+hybridEnvelopePK {
+					return nil, fmt.Errorf("hybrid manifest envelope too short (%d B)", dataLen)
+				}
+				pre := make([]byte, 0, len(manifestAuthorDomain)+1+32+hybridEnvelopePK)
+				pre = append(pre, manifestAuthorDomain...)
+				pre = append(pre, suite)
+				pre = append(pre, blob[o+1:o+33]...)            // ed_pk
+				pre = append(pre, blob[o+33:o+33+hybridEnvelopePK]...) // ml_dsa_pk
+				h := blake2b.Sum256(pre)
+				return h[:], nil
+			default:
+				return nil, fmt.Errorf("unknown manifest suite 0x%02x", suite)
+			}
 		}
 		o += dataLen
 	}

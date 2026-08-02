@@ -1161,6 +1161,41 @@ async function testRealmSerialization() {
     realm.dispose();
   }
 
+  // 4. Disposing a realm while an invocation is parked mid-await — the ordinary state of
+  //    a node whose initiator is waiting on the network — fails the parked caller and
+  //    frees the context WITHOUT taking the wasm module with it. The engine asserts an
+  //    empty gc object list when a runtime is freed, and a parked call releases its own
+  //    handle from a `finally` that runs as a MICROTASK after dispose() returns: freeing
+  //    the context in the same turn aborts the whole module, which is every realm in the
+  //    process, not just this one. Hence the teardown is deferred a macrotask, and this
+  //    pins it — a regression here is a host crash, not a failed assertion.
+  {
+    const realm = await createSafeRealm({
+      source: `register("park", async () => await host.call(7, new Uint8Array()));`,
+      bridge: (op) => (op === 7 ? new Promise(() => {}) : new Uint8Array()),  // op 7 never settles
+    });
+    const parked = realm.call("park", new Uint8Array());
+    for (let i = 0; i < 10; i++) await Promise.resolve();   // let it reach its await
+    realm.dispose();
+
+    let msg = "";
+    try { await parked; } catch (e) { msg = e.message; }
+    assertEqual(msg, "guest realm disposed", "the parked invocation is failed by dispose, not stranded");
+    let after = "";
+    try { await realm.call("park", new Uint8Array()); } catch (e) { after = e.message; }
+    assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
+
+    // A realm built after the deferred teardown has run proves the module survived it.
+    await sleep(1);
+    const next = await createSafeRealm({
+      source: `register("ping", (arg) => arg);`,
+      bridge: () => new Uint8Array(),
+    });
+    assertEqual([...(await next.call("ping", new Uint8Array([7])))], [7],
+      "the engine is still alive after the parked realm's context was freed");
+    next.dispose();
+  }
+
   console.log("  OK\n");
 }
 

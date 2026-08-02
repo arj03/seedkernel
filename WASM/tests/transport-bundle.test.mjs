@@ -40,8 +40,11 @@ const upgradeKeys = (() => {
 })();
 const upgradeAuthor = Buffer.from(upgradeKeys.publicKey).toString("hex");
 
-function transportBundleAt(version, keys) {
-  const guest = new Uint8Array(readFileSync(join(root, "transport/guest.js")));
+// `guestSource` overrides the artifact's guest — the only caller that passes one hands in
+// a program that cannot compile, to fail the load at the point where the DRIVER stands
+// rather than at verify.
+function transportBundleAt(version, keys, guestSource) {
+  const guest = guestSource ?? new Uint8Array(readFileSync(join(root, "transport/guest.js")));
   const manifest = {
     app: "transport", version, role: "transport", modules: [],
     guest: {
@@ -143,6 +146,27 @@ try { await a.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version is refused after the upgrade — the slot floor advanced");
 assert(a.net === aNet2, "…and the refused load left the standing transport in place");
+
+// ── A version that never ran must not consume the slot ───────────────────────────
+// A slot occupant's load is not done when its modules bind — it is done when its DRIVER
+// STANDS, one step later. A v3 whose guest cannot compile dies at that step. If the mark
+// and the floor had been advanced on the way in, the node would keep serving the
+// transport it has and yet never be able to reinstall it: every version it can reach now
+// sits below a floor that a bundle which never executed a line raised. That is rollback
+// bricked by a failed upgrade — the exact outcome the downgrade refusals exist to
+// prevent — so the marks are deferred until the driver is up (bundle.ts `deferMark`).
+const brokenGuest = new TextEncoder().encode("const nope = ( ;");
+let v3Failed = false;
+try { await a.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
+catch { v3Failed = true; }
+assert(v3Failed, "a v3 whose guest cannot compile fails the load");
+assert(a.net === aNet2, "…and the node keeps the transport that was standing");
+
+let v2Reloaded = true;
+try { await a.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
+catch { v2Reloaded = false; }
+assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what loaded");
+assert(a.net !== aNet2, "…as a genuinely re-stood driver, not the old one left in place");
 
 a.close();
 b.close();

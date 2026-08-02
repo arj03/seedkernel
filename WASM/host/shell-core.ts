@@ -1,18 +1,18 @@
 // The platform-neutral shell core — the §12.9 "move one level up". Everything that
 // standing a node up involves EXCEPT the parts that genuinely vary by target lives
 // here: the handler table's owner, the cap-bridge wiring, the preamble assembly, the
-// realm's lifecycle, the bundle load order, and the inbound dispatch. A target supplies
-// the platform seam — { kernel, sodium, identity, freshnessStore, network, fs?,
-// createRealm? } — exactly like NodeNetworkCore takes a ChannelFactory, and gets back a
-// fully wired Shell.
+// realm's lifecycle, the bundle load order, the transport slot, and the inbound
+// dispatch. A target supplies the platform seam — { sodium, identity, kernel, fs?,
+// freshnessStore, channels?, listen?, wsListen?, createRealm? } — exactly like the
+// transport driver takes a ChannelFactory, and gets back a fully wired Shell.
 //
 // This is the ONE assemble path, and the assembly ORDER is the point: it is the last
 // thing two hosts could disagree about, so no target restates it.
 //
-//   main.ts       → boot()         → KernelHost + NodeFs + FileFreshnessStore + NodeNetwork + safe-js → createShell()
-//   browser       → chat-shell.js  → KernelHost + RtcNetwork + sessionStorage freshness (no realm)    → createShell()
+//   main.ts       → boot()         → KernelHost + NodeFs + FileFreshnessStore + NodeChannelFactory + safe-js → createShell()
+//   browser       → chat-shell.js  → KernelHost + RtcNetwork-style openLink edges + sessionStorage freshness  → createShell()
 //   native        → native-shim.ts → Go handler table + Go Fs + Go channels + Go realm                → createShell()
-//   seedstore     → StorageNode    → { MemoryFs, Network, FreshnessMarks }                            → createShell() + loadBundle(seedstore.skb)
+//   seedstore     → StorageNode    → { MemoryFs, LoopbackChannels, FreshnessMarks }                  → createShell() + loadBundle(seedstore.skb)
 //
 // installWasmHandler is not public API on the Shell and there is no raw-bind path — the
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
@@ -510,8 +510,20 @@ export function createShell(opts: CreateShellOptions & {
             const ok = await admit(v);
             if (!ok)
                 throw new Error("bundle: rejected by admission predicate");
-            const loaded = installBundle(host, v, platform.freshnessStore);
+            // A slot occupant's load is not "done" when its modules bind — the driver
+            // must STAND — so its marks are deferred (installBundle `deferMark`) and
+            // advanced only after installTransport below: a transport guest that fails
+            // to compile raises nothing, and the node — still running the transport it
+            // had — can still roll back to the previous version. The mark must record
+            // the highest version that actually loaded (README §12.4).
+            const loaded = installBundle(host, v, platform.freshnessStore, v.manifest.role !== undefined);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
+            const advanceMarks = (): void => {
+                const fs = platform.freshnessStore;
+                fs.set(loaded.author, loaded.manifest.app, v.manifest.version);
+                if (v.manifest.role !== undefined)
+                    fs.setRole(v.manifest.role, v.manifest.version);
+            };
             // A slot occupant is not an app: it binds no protocol ids (its handles
             // would claim a dispatch the runtime itself performs), receives no inbound
             // dispatch, and `transport` — the one slot today — is stood up as the
@@ -526,6 +538,7 @@ export function createShell(opts: CreateShellOptions & {
                     await installTransport(slot);
                 roles.set(role, slot);
                 roleKeys.set(role, key);
+                advanceMarks();
                 return loaded;
             }
             bindings.autoBind(key, handlesOf(loaded.manifest));
@@ -535,6 +548,8 @@ export function createShell(opts: CreateShellOptions & {
             const entry = entryModuleOf(loaded.manifest);
             const handleName = entry ? kernelNameFor(loaded.author, loaded.manifest.app, entry) : "";
             apps.set(key, { loaded, realm: null, handleName });
+            // An app's marks were already advanced inside installBundle — nothing can fail
+            // between that return and here — so the app path advances exactly as before.
             return loaded;
         },
         uninstall: doUninstall,

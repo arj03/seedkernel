@@ -189,8 +189,8 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 
 // closeListeners closes every bound listener, which makes each accept goroutine's
 // ln.Accept() return an error and exit — releasing the listener fd and the goroutine.
-// Wired to makeNetwork's channels.close so a realm/network teardown (tests, any future
-// re-serve) doesn't leak a listener + accept goroutine until os.Exit.
+// Wired to the driver's channels.close (native-shim.ts) so a realm/network teardown
+// (tests, any future re-serve) doesn't leak a listener + accept goroutine until os.Exit.
 func (n *netHost) closeListeners() {
 	n.mu.Lock()
 	lns := n.listeners
@@ -317,6 +317,6 @@ const netShimJS = `
 })();
 `
 
-// The ChannelFactory over these primitives — and the NodeNetworkCore built on it —
+// The ChannelFactory over these primitives — and the transport driver built on it —
 // live in host/native-shim.ts, where they are typed against the shared interfaces.
 // Go's networking stops at the socket.

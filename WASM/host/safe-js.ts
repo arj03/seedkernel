@@ -347,7 +347,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       pending.delete(rejectThis);
       // In `finally` for the same reason as settleNet's handles: an interrupted or
       // failed call must not leave this alive, or dispose() aborts the module.
-      if (ctx.alive) evalResult.dispose();
+      // Unconditional because dispose() defers the context teardown (see below):
+      // whether the call completed or was interrupted by failPending, this finally
+      // runs while the context is still alive, so the handle is always releasable.
+      evalResult.dispose();
     }
   };
 
@@ -360,7 +363,17 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller.
       failPending(new Error("guest realm disposed"));
-      ctx.dispose();
+      // ...but the context itself must NOT die in the same turn. A parked invocation's
+      // rejection continuation — the `finally` above, which releases its evalResult
+      // handle — runs as a microtask after failPending, and the quickjs-ng build
+      // asserts an empty gc object list at JS_FreeRuntime, so a handle released after
+      // the context died would abort the whole wasm module. Deferring the teardown to
+      // the NEXT MACROTASK (setTimeout 0) runs it after every microtask of the parked
+      // continuations, by which point nothing can re-enter (the queue fails on
+      // `disposed`): the context is quiescent when it dies.
+      setTimeout(() => {
+        if (disposed && ctx.alive) ctx.dispose();
+      }, 0);
     },
   };
 }

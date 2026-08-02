@@ -19,8 +19,8 @@ import (
 // Only the WebSocket transport is exercised here — it drives the full WS path: the
 // raw Go byte stream (sock.go connectRaw/listenRaw), the shared net-frame WsChannel,
 // and the RFC 6455 framing in ws.wasm (via __ws). The TCP twin of this exact flow is
-// covered by asyncnet_test (makeNetwork + Transport + a confined guest over a real
-// TCP socket) and end-to-end against real node/bun nodes by scripts/loader-interop.sh.
+// covered by asyncnet_test (a confined guest over a real TCP socket) and end-to-end
+// against real node/bun nodes by scripts/loader-interop.sh.
 
 // The realm a networking test runs in is the production one: boot() installs the __net
 // socket primitive and ws.wasm, then evaluates the shared bundle carrying the routing
@@ -31,7 +31,7 @@ func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `wsListen: { host: "127.0.0.1", port: 0 },`)
 }
 
-// listenArgs is the `listen, wsListen` pair — makeNetwork's third and fourth arguments,
+// listenArgs is the `listen, wsListen` pair — makeTransportNode's transport config,
 // the second being the contact secret (§12.6). Both nodes here are open (no secret), so
 // the pair is what selects which transport A binds.
 func runTwoNode(t *testing.T, transport, portField, listenArgs string) {

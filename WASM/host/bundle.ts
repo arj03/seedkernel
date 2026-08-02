@@ -779,11 +779,12 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     return files;
 }
 /** The freshness *arithmetic*: the `(author, app)` key derivation, the monotonic
- *  never-rewind rule, and the `{ "authorHex:app": version }` serialization. All of
- *  it is target-independent, so it lives here and every target subclasses this with
- *  its own persistence seam (`persist`) rather than restating the rules — the author
- *  hex is fixed-length, so the key is unambiguous. On its own this is an in-memory
- *  store: `persist` does nothing, which is exactly right for a test. */
+ *  never-rewind rule, the per-slot role floors, the revocation set, and the
+ *  `{ marks, roles, revoked }` serialization. All of it is target-independent, so
+ *  it lives here and every target subclasses this with its own persistence seam
+ *  (`persist`) rather than restating the rules — the author hex is fixed-length, so
+ *  the key is unambiguous. On its own this is an in-memory store: `persist` does
+ *  nothing, which is exactly right for a test. */
 export class FreshnessMarks {
     marks = new Map();
     /** Slot floors, keyed by role name — author-independent by construction (§12.4). */
@@ -955,8 +956,18 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *
  *  There is no per-module admission callback: the manifest's `modules[].hash` commits to
  *  exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
- *  Trusting the author means trusting everything the author signed. */
-export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore): LoadedBundle {
+ *  Trusting the author means trusting everything the author signed.
+ *
+ *  `deferMark` is for the one load whose "actually loaded" boundary is NOT this
+ *  function's: a slot occupant is only loaded once its driver STANDS, which happens
+ *  after this returns (shell-core `loadBundleBlob` → `installTransport`). A realm
+ *  built from the guest source can fail there, and the node then keeps the transport
+ *  it had — so advancing the mark inside would raise the (author, app) mark and the
+ *  role floor before that was known, bricking a rollback to the last good version
+ *  (the exact outcome the downgrade refusals above exist to prevent). The caller
+ *  passes `deferMark` for a role bundle and advances at the point the load is
+ *  complete (§12.4: "the mark must record the highest version that actually loaded"). */
+export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): LoadedBundle {
     // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
     // (verifyManifest already shape-checked it). Refuse a load below the persisted
     // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
@@ -1023,15 +1034,17 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     for (const { ref, kernelName } of refs) {
         host.bindHandler(kernelName, ref);
     }
-    // Advance the freshness mark only now — after a fully successful load. Advancing it
-    // during the downgrade check above would brick rollback: a partially written or corrupt
-    // *newer* bundle — manifest intact and signed, but one module or the guest wrong —
-    // would raise the mark to the new version, then throw. Nothing runs, yet reloading the
-    // known-good older bundle is now refused as a downgrade until an operator hand-edits
-    // the freshness file. The mark must record the highest version that actually loaded
-    // (README §12.4). Integrity was verified by verifyBundle before this function was
-    // called, so the freshness advance is always behind a successful verify.
-    if (freshness) {
+    // Advance the freshness mark only now — after a fully successful load (or, with
+    // `deferMark`, leave it to the caller at its own completion point). Advancing it
+    // during the downgrade check above would brick rollback: a partially written or
+    // corrupt *newer* bundle — manifest intact and signed, but one module or the guest
+    // wrong — would raise the mark to the new version, then throw. Nothing runs, yet
+    // reloading the known-good older bundle is now refused as a downgrade until an
+    // operator hand-edits the freshness file. The mark must record the highest version
+    // that actually loaded (README §12.4). Integrity was verified by verifyBundle before
+    // this function was called, so the freshness advance is always behind a successful
+    // verify — and, with `deferMark`, behind the driver standing as well.
+    if (freshness && !deferMark) {
         freshness.set(v.author, v.manifest.app, version);
         if (v.manifest.role !== undefined)
             freshness.setRole(v.manifest.role, version);

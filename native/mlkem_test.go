@@ -57,10 +57,6 @@ type mlkemKat struct {
 	} `json:"decapsKeyCheck"`
 }
 
-// capCrypto is the cap-bridge CAP.CRYPTO op number (cap-bridge.ts). Declared here
-// rather than shared so this file stands alone.
-
-
 func TestMlKemAcvpVectors(t *testing.T) {
 	bootRealm(t)
 	raw, err := os.ReadFile("../WASM/tests/fixtures/mlkem768-acvp.json")
@@ -142,9 +138,9 @@ func TestMlKemAcvpVectors(t *testing.T) {
 // TestMlKemThroughCatalog drives the KEM the way a guest does — by name, through the
 // one CAP_CRYPTO op — rather than through the Go wrapper. That is the path that has
 // to work end to end on this target: `PRIMITIVE_NAMES` is what a manifest's
-// `guest.primitives` is checked against, so a host whose `__sodium` lacked these
-// methods would admit a bundle by name and then fail it at first use — the legibility
-// failure `checkPrimitives` exists to prevent.
+// `guest.primitives` is checked against in `verifyManifest` (bundle.ts), so a host
+// whose `__sodium` lacked these methods would admit a bundle by name and then fail it
+// at first use — the legibility failure the check exists to prevent.
 //
 // It also pins the thing the Go wrapper alone cannot: that the shared cap-bridge, the
 // sodium shim's ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract

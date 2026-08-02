@@ -81,9 +81,10 @@ export interface CapSodium {
     ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): Uint8Array | null;
 }
 
-/** The request/response transport the net op drives. `Transport` satisfies it. A
- *  confined guest fans out itself with `Promise.all` over `NET_SEND`, so the bridge
- *  needs only single-peer request/response — no host-side scatter-gather. */
+/** The request/response transport the net op drives. The transport slot's driver
+ *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
+ *  over `NET_SEND`, so the bridge needs only single-peer request/response — no
+ *  host-side scatter-gather. */
 export interface CapTransport {
     request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
 }
@@ -329,8 +330,9 @@ export const CAP = {
  *  catalog stays functional and the grant stays where it belongs.
  *
  *  Names are the seam, not the numbers: a host that lacks one refuses the load by name
- *  (`checkPrimitives`), and a bundle that wants a new algorithm needs a host carrying it
- *  — which is why a core vocabulary is provisioned ahead of need (README §14.1). */
+ *  (verifyManifest, bundle.ts), and a bundle that wants a new algorithm needs a host
+ *  carrying it — which is why a core vocabulary is provisioned ahead of need
+ *  (README §14.1). */
 /** Build the catalog. The return type is keyed by `PRIMITIVE_NAMES` (declared in
  *  domains.ts, with the ABI version and the suite ids), so the list a manifest is checked
  *  against and the map the bridge dispatches through cannot drift — adding one without
@@ -616,24 +618,15 @@ export function opsForCaps(domains: Iterable<string>): number[] {
     }
     return out;
 }
-/** Check a manifest's declared `guest.primitives` against this host's catalog, throwing
- *  the missing name (phase 3a, task 8).
- *
- *  **This is a compatibility check, not an authorization one** — the distinction the
- *  primitive/authority split turns on. It grants nothing, because after `CAP_DOMAINS`
- *  dropped the pure transforms there is nothing to grant; it exists so a host that cannot
- *  serve a name refuses the load *by name* rather than failing at the guest's first call,
- *  which is exactly the legibility `guest.abi` buys for the seam version (§12.4). That is
- *  why the field sits beside `abi` in the manifest and not inside `caps`. */
-export function checkPrimitives(names: Iterable<string> | undefined): void {
-    if (!names)
-        return;
-    for (const n of names) {
-        if (!(PRIMITIVE_NAMES as readonly string[]).includes(n)) {
-            throw new Error(`bundle: this host has no primitive "${n}" (manifest guest.primitives; this host serves: ${PRIMITIVE_NAMES.join(", ")})`);
-        }
-    }
-}
+/**
+ * The manifest's declared `guest.primitives` are checked against this catalog in
+ * bundle.ts `verifyManifest`, which refuses the load by the missing name — a
+ * compatibility check, not an authorization one: it grants nothing (after
+ * `CAP_DOMAINS` dropped the pure transforms there is nothing to grant), it exists so a
+ * host that cannot serve a name refuses the load *by name* rather than failing at the
+ * guest's first call. That is why the field sits beside `abi` in the manifest and not
+ * inside `caps`.
+ */
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
 // Two of the deps below govern how far a guest reaches: `allowedOps` (which ops resolve

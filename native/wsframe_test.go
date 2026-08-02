@@ -16,7 +16,7 @@ func randBytes(n int) []byte {
 // Unit tests for the WS wire codec primitive — the embedded ws.wasm driven over
 // wazero (__ws). The RFC 6455 handshake/framing on top is the shared host JS
 // (net-frame.ts + ws-codec.ts), exercised end-to-end over a real socket in
-// peerlink_test.go (PeerLink) and transport_test.go (NodeNetworkCore + Transport).
+// transport_test.go (two nodes through the transport bundle over a WS listener).
 
 // The RFC 6455 §1.3 worked example pins the accept-key transform byte-for-byte, so
 // a Go node's 101 reply is identical to what a browser (and a Bun node) expect.

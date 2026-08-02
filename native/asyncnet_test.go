@@ -13,7 +13,7 @@ import (
 // guest's only net surface is `await host.call(CAP_NET_SEND, …)`; the engine has no
 // Asyncify, so that op returns a callId-backed Promise instead of blocking. This
 // proves the cross-realm async seam end to end: the guest's await suspends, the host
-// realm's Transport dials a responder over a loopback socket, and when its promise
+// realm's transport bundle dials a responder over a loopback socket, and when its promise
 // settles the shared loop (loop.go) resolves the guest's promise and resumes the
 // awaiting entrypoint — all driven by one loop pumping both realms.
 //

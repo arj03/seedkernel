@@ -342,8 +342,14 @@ export async function main(): Promise<void> {
     });
     const nodeNet = shell.net as unknown as TransportHost;
     // Cohort peers the guest may reach: teach the transport their addresses so it
-    // can dial them. The transport owns connectivity (§12.10).
+    // can dial them. The transport owns connectivity (§12.10). A policy that admits
+    // no transport bundle leaves `shell.net` as a null face whose members throw
+    // "no transport" — say what is wrong rather than surfacing a raw TypeError off
+    // the fallback object's missing members.
     if (args["peers"]) {
+        if (!(nodeNet instanceof TransportHost)) {
+            throw new Error("shell: --peers given, but the policy admits no transport bundle — there is nothing to dial from");
+        }
         for (const spec of str(args, "peers")!.split(",").map((s) => s.trim()).filter(Boolean)) {
             const { peerId, addr } = parsePeerSpec(spec, "tcp");
             nodeNet.addPeerAddr(peerId, addr);
