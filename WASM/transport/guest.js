@@ -45,7 +45,7 @@
 //     reports its structured OUTPUT (an attributed peer, a protocol id, a
 //     correlation), which every app then reaches through the ordinary `net` domain.
 //
-//     The roster gate is deliberately NOT ours to apply. It is host policy over the
+//     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
 //     attribution this program reports (NET_LINK_AUTH answers with the verdict, and
 //     the host has already closed the channel on a refusal); a gate this program
 //     applied to itself would be one a hostile occupant of the slot would simply skip.
@@ -371,7 +371,7 @@ function netDeliver(corr, noReply, fromBytes, proto, payload) {
   host.call(OP_DELIVER, args([corr], [noReply ? 1 : 0], concatBytes([fromBytes, head, payload])));
 }
 function netSettle(corr, ok, payload) { host.call(OP_SETTLE, args([corr], [ok ? 1 : 0], payload)); }
-/** Ask the host's ROSTER whether this peer may link. Asked at the FIRST point the
+/** Ask the host's WHITELIST whether this peer may link. Asked at the FIRST point the
  *  peer is known and — critically — before this end has revealed anything about
  *  itself: msg3 when accepting, msg4 when dialing. `conceal` tells the host a refusal
  *  must be silent, which is true exactly when we have not yet sent our identity.
@@ -700,7 +700,7 @@ class Link {
     const idI = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
-    // The roster gate runs HERE — after decryption and signature, never on a claimed
+    // The whitelist gate runs HERE — after decryption and signature, never on a claimed
     // key, and before msg4 puts our identity and signature on the wire. A refusal is
     // silence, so being turned away is indistinguishable from a msg3 that simply never
     // arrived, and the caller learns nothing about who lives at this address. Nothing
@@ -728,7 +728,7 @@ class Link {
     // A mismatch here is a local fault, not a probe to hide from — we already
     // revealed ourselves at msg3 — so it aborts rather than stalls.
     if (this.expectPeerId && peerId !== toHex(this.expectPeerId)) { this.abort(); return; }
-    // Our own roster gate, on the end that dialed. Not concealed: we named ourselves at
+    // Our own whitelist gate, on the end that dialed. Not concealed: we named ourselves at
     // msg3, so there is nothing left to hide from this peer and an abort is honest.
     if (!netLinkAuth(this.linkId, idR, false)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
@@ -922,7 +922,7 @@ class Router {
   // Install a freshly-authenticated link: the double-connect tie-break and the up edge
   // on a peer's first link. Returns false — the link closed — when it lost the tie-break.
   //
-  // The roster gate is NOT here. It is the host's policy, and a gate this program is
+  // The whitelist gate is NOT here. It is the host's policy, and a gate this program is
   // asked to apply to itself is one a hostile occupant of this slot simply skips; the
   // driver enforces it on the attribution this program reports (LINK_AUTH / PEER_UP),
   // where it cannot be bypassed.
@@ -1159,7 +1159,7 @@ class Core {
   onAuth(peerId, link) {
     this.inbound.delete(link);
     Core.drop(this.connecting, peerId, link);
-    // The roster already answered, at msg3 or msg4 — a link that reaches auth is one
+    // The whitelist already answered, at msg3 or msg4 — a link that reaches auth is one
     // the host admitted, so a refused peer never appears on a cohort edge it would
     // immediately have to be taken off again. All that is left here is routing.
     router.promote(peerId, link);
@@ -1353,7 +1353,7 @@ entry("linkOpen", (r) => {
   // auth goes to the shared router, and the host tracks the link by its id.
   const link = new Link(Object.assign({}, spec, {
     onAuth: (peerId, l) => {
-      // The host's roster answered at msg3/msg4; what is left is ours — the
+      // The host's whitelist answered at msg3/msg4; what is left is ours — the
       // double-connect tie-break.
       if (!router.promote(peerId, l)) l.close();
     },

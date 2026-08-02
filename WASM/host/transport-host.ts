@@ -41,7 +41,7 @@
 // timers, the promises of outbound requests (keyed by the corr the host assigns),
 // the address book for dialing, the flood caps (net-limits.ts — the module never
 // declares the number that bounds it, it only learns it at init to size its own send
-// budget), and the ROSTER GATE, which is applied to the attribution the guest
+// budget), and the WHITELIST GATE, which is applied to the attribution the guest
 // reports rather than handed to the guest to apply to itself (see `admits`).
 
 import { toHex, fromHex, writeU32BE } from "../core/util.js";
@@ -145,7 +145,7 @@ export interface TransportHostOptions {
   maxHalfOpenUnverified?: number;
   maxHalfOpenPerSource?: number;
   maxHalfOpenVerified?: number;
-  /** Roster gate, called with a signature-verified peer key when a link
+  /** Whitelist gate, called with a signature-verified peer key when a link
  *  authenticates and again on the cohort edge. Absent ⇒ admit all. */
   admitPeer?: (pk: Uint8Array) => boolean;
   /** Cohort edges (fired on a peer's FIRST authenticated link / LAST lost). */

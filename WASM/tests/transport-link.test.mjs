@@ -171,7 +171,7 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
   }
 });
 
-await test("CONCEALMENT: a responder says NOTHING to a caller outside the roster", async (keep) => {
+await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
   // The enumeration primitive. A node that speaks first is a directory service: one
   // connect reads its identity straight off the wire. A caller without the contact secret
   // must get silence — not an error, not a close, nothing that distinguishes this node
@@ -213,7 +213,7 @@ await test("CONTACT SECRET: the address book alone does not grant a probe", asyn
   // The property the contact secret exists for. Every peer holding this node's ADDRESS also
   // holds its static key, so without a contact secret an address book leak is a probe
   // capability: elicit msg2, confirm which identity lives at that host, and keep doing
-  // it after being removed from the roster. With one, probing needs a secret no address
+  // it after being removed from the member set. With one, probing needs a secret no address
   // contains — so an address leak costs the address and nothing more.
   const chans = wirePair();
   // The caller knows B's address (and so its static key) but not B's contact secret.
@@ -483,7 +483,7 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   // receiver has said anything about itself, so a caller off the whitelist is turned
   // away without learning whether the identity it dialed is even here. Under the old
   // 1-RTT ordering the receiver signed and sent its identity at msg2 — before it knew
-  // who was calling — so any roster member could confirm who lived at any address.
+  // who was calling — so any whitelist member could confirm who lived at any address.
   //
   // This one caught a real regression when the suite was ported. Moving the whitelist to
   // the host is right — a predicate the guest applies to itself gates nothing against a
@@ -495,7 +495,7 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   const st = keep(await linked(chans, {}, { admitPeer: () => false }));
   await settle();
   assert(!st.b.authed, "a refused caller must not be authenticated by the receiver");
-  // One message back (msg2, an ephemeral and a roster proof), then silence. The
+  // One message back (msg2, an ephemeral and a contact proof), then silence. The
   // receiver's identity and signature must never go out.
   assert(chans[1].sent.length === 1, `refused caller drew ${chans[1].sent.length} messages, want 1 (msg4 leaked)`);
   assert(!chans[1].sent.join("").includes(st.B.driver.peerId),

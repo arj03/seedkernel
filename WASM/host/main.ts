@@ -291,7 +291,7 @@ function loadNodeKeys(sodium: Sodium, keyPath: string): NodeKeys {
  *  Omitting it is the DEFAULT and does not weaken identity concealment: with four
  *  messages the caller names itself before the receiver does, so a caller the receiver
  *  declines learns nothing either way, and both identities ride the ephemeral-ephemeral
- *  secret regardless. What a roster key adds is a cheap gate in front of the responder's
+ *  secret regardless. What the contact secret adds is a cheap gate in front of the responder's
  *  keypair — so a stranger costs one AEAD open rather than a keygen and a scalarmult —
  *  plus protection of the CALLER's identity against an active attacker who is not a
  *  member. It costs one secret shared by the whole deployment, which a single compromised

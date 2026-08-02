@@ -132,7 +132,7 @@ export interface ShellPlatform {
     /** Parallel connections per dialed peer (default 1) — the transport's dial
      *  fan-out. */
     connsPerPeer?: number;
-    /** Roster gate for the transport slot: called with a signature-verified peer
+    /** Whitelist gate for the transport slot: called with a signature-verified peer
      *  key during the handshake and again before a link is routed. Absent ⇒ the
      *  node admits every peer that completes the handshake. */
     admitPeer?: (pk: Uint8Array) => boolean;
@@ -170,7 +170,7 @@ export interface CreateShellOptions {
      *  willing to spend on one message is a property of the deployment. */
     guestDeadlineMs?: number;
     /** Half-open budgets for the transport slot: concurrent links that have not
-     *  yet proven roster membership (unverified), per source address, and proven-
+     *  yet proven whitelist membership (unverified), per source address, and proven-
      *  but-mid-handshake (verified). Defaults match the transport bundle's
      *  (1024 / 8 / 256); tests shrink them. Enforced inside the transport guest. */
     transportHalfOpen?: {

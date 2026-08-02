@@ -122,7 +122,7 @@ The op numbers are a **shared guest↔host identifier**, not a wire value: the g
 | 20 | `TIMER_CLEAR` | `[id u32]` | (empty) |
 | 21 | `NET_DELIVER` | `[corr u32][noReply u8][from 32][pidLen u8][proto][payload ..]` | (empty) — an inbound request, attributed. Answered later through the `respond` entrypoint, never inline |
 | 22 | `NET_SETTLE` | `[corr u32][ok u8][payload \| utf8 message]` | (empty) — settle an app's outbound request under the corr the host assigned |
-| 23 | `NET_LINK_AUTH` | `[linkId u32][pk 32]` | `[admitted u8]` — this link authenticated as `pk`; the host's roster gate answers |
+| 23 | `NET_LINK_AUTH` | `[linkId u32][pk 32]` | `[admitted u8]` — this link authenticated as `pk`; the host's whitelist gate answers |
 | 24 | `NET_PEER_EDGE` | `[up u8][pk 32]` | (empty) — a peer's first link came up / last went down |
 | 25 | `NET_READY` | `[ok u8]` | (empty) — answer to the `ready` entrypoint |
 | 26 | `NET_LINK_DOWN` | `[linkId u32][reason u8]` | (empty) — a link the host handed over tore down, with why |
@@ -340,7 +340,7 @@ The *guest's* §12.2 cap domains are **not** gated by this file — they come fr
 
 ### 12.6 Node↔node transport: channel identity binding
 
-**Everything in this section is the transport bundle's guest program** (`transport/guest.js`, §1) — the handshake, the record layer, the link router and the request/response frame codec — not host code. It reaches sockets through the `rawnet` ops and is driven through named entrypoints (§12.2), and the host side of that is one driver, `host/transport-host.ts`, which owns the channels by the link id it mints, the timers, the outbound promises, the address book and the roster gate, and knows no protocol. What follows is therefore *content*: replaceable by a second signed bundle claiming the slot (§12.4, §12.5), which is the property the rest of §12.6 exists to make safe.
+**Everything in this section is the transport bundle's guest program** (`transport/guest.js`, §1) — the handshake, the record layer, the link router and the request/response frame codec — not host code. It reaches sockets through the `rawnet` ops and is driven through named entrypoints (§12.2), and the host side of that is one driver, `host/transport-host.ts`, which owns the channels by the link id it mints, the timers, the outbound promises, the address book and the whitelist gate, and knows no protocol. What follows is therefore *content*: replaceable by a second signed bundle claiming the slot (§12.4, §12.5), which is the property the rest of §12.6 exists to make safe.
 
 A real socket carries no trustworthy "from" field, so before a connection delivers frames the bundle runs a mutual challenge/response proving each end holds the kernel private key for the pubkey it claims — the same binding applied to each WebRTC data channel (§11, §12.7). The channel is transport-agnostic over anything that delivers whole messages: raw TCP (length-prefix framing) node↔node, RFC 6455 WebSocket (`ws.wasm` framing) browser↔node (`host/net-node.ts`, `host/net-ws.ts`), or a WebRTC `RTCDataChannel` peer↔peer (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Every socket seam checks a frame cap against the length prefix (TCP) or frame length (WS) **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). TCP and WebSocket cap identically.
 
@@ -509,7 +509,7 @@ The contact secret is mixed at msg1 together with the initiator's ephemeral, and
 later key. The network key is applied as a prologue: it seeds the transcript root, so every
 derived key *and* every signature preimage differs between networks and a cross-network
 handshake fails at the first message. `admitPeer` runs at both gates — inside the handshake at
-msg3, before msg4 is built, refusing by silence; and again as the host's **roster gate**,
+msg3, before msg4 is built, refusing by silence; and again as the host's **whitelist gate**,
 which the bundle asks through `NET_LINK_AUTH` (§12.2) before the link is installed or
 delivers a frame. The second is applied by the host to the attribution the occupant
 *reports*, rather than handed to the occupant to apply to itself.

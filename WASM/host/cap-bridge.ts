@@ -147,7 +147,7 @@ export interface TransportSink {
     /** Settle an app's outbound request: `ok` ⇒ `payload` is the response, otherwise it is
      *  a utf8 failure message. */
     settle(corr: number, ok: boolean, payload: Uint8Array): void;
-    /** A link authenticated as `pk`. Returns false when the ROSTER refuses the peer. The
+    /** A link authenticated as `pk`. Returns false when the WHITELIST refuses the peer. The
      *  predicate lives here and is not handed to the slot to apply to itself, because a
      *  predicate the occupant applies to itself gates nothing against a hostile one.
      *
@@ -309,7 +309,7 @@ export const CAP = {
     NET_SETTLE: 22, // [corr u32][ok u8][payload | utf8 message] -> []  settle an app's
     //   outbound request under the corr the host assigned
     NET_LINK_AUTH: 23, // [linkId u32][conceal u8][pk 32] -> [admitted u8]  this link
-    //   authenticated as `pk`. The ROSTER GATE answers. Asked at the
+    //   authenticated as `pk`. The WHITELIST GATE answers. Asked at the
     //   first point the peer is known and before we have revealed
     //   ourselves — msg3 accepting, msg4 dialing — so the verdict can
     //   still suppress our identity. `conceal` marks the accepting

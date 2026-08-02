@@ -59,7 +59,7 @@ interface SignalMsg {
 export interface RtcNetworkOptions {
     /** The transport driver — the shell's `net` once the transport bundle is
      *  admitted. It holds the node identity, the network key, the contact secret
-     *  and the roster gate; this file only manages connections. */
+     *  and the whitelist gate; this file only manages connections. */
     driver: TransportHost;
     /** Resolve a peer's contact secret when dialing it. Signaling already names the
      *  peer, so it can carry the credential too. */
@@ -76,7 +76,7 @@ export interface RtcNetworkOptions {
      *  stays safe. */
     peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
     /** Optional peer whitelist, applied to SIGNALING messages. Absent (the default)
-     *  admits every peer to the rendezvous; the in-channel roster gate (the
+     *  admits every peer to the rendezvous; the in-channel whitelist gate (the
      *  driver's, run on a signature-verified id) is separate and always on. */
     admitPeer?: (peerId: PeerId) => boolean;
     /** Called when a peer's link authenticates / drops. The storage demo uses these
