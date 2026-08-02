@@ -1,21 +1,23 @@
 // The inbound flood bounds — core, because they belong to whoever holds the file
 // descriptor (README §12.6, §16.1).
 //
-// **Why these are not in net-link.ts.** The check is already in the right place: the
-// socket seams (net-node.ts, net-ws.ts, net-rtc.ts) test the declared length against the
-// cap *before* buffering, so an over-cap frame is refused without its bytes ever being
-// allocated. Only the declaration was on the wrong side of the line. net-link.ts is the
-// AKE and record layer, which becomes an ordinary signed bundle — and a host that
-// imported its own flood bound from the module it is bounding would be taking the
-// bounded party's word for the bound. So the numbers live here, in the core, and the
-// module imports them rather than the other way round.
+// **Why these are not in the transport bundle.** The check is already in the right
+// place: the socket seams (net-node.ts, net-ws.ts, net-rtc.ts) test the declared length
+// against the cap *before* buffering, so an over-cap frame is refused without its bytes
+// ever being allocated. Only the declaration was on the wrong side of the line. The AKE
+// and record layer used to live here under that name, as the shared net-link.ts; it is
+// now the transport bundle's guest program (transport/guest.js, driven by
+// host/transport-host.ts) — and a host that imported its own flood bound from the module
+// it is bounding would be taking the bounded party's word for the bound. So the numbers
+// live here, in the core, and the module learns them at init rather than the other way
+// round.
 //
-// The distinction is not "net-link is untrusted" — a transport admitted at boot is
-// trusted exactly as much as host code. It is that a limit protecting a resource must be
-// declared by whoever owns the resource, so that replacing the transport cannot silently
-// replace the bound. MAX_QUEUE_BYTES is the other side of the same rule and correctly
-// stays in net-link.ts: it bounds PeerLink's *own* pre-auth send queue, which is the
-// module's memory to spend.
+// The distinction is not "the transport bundle is untrusted" — a transport admitted at
+// boot is trusted exactly as much as host code. It is that a limit protecting a resource
+// must be declared by whoever owns the resource, so that replacing the transport cannot
+// silently replace the bound. MAX_QUEUE_BYTES is the other side of the same rule and
+// correctly stays in the bundle: it bounds the transport's *own* pre-auth send queue,
+// which is the module's memory to spend.
 //
 // Nothing here is negotiated and nothing is per-suite. Both caps apply identically on
 // TCP, WebSocket and WebRTC, so a frame that crosses one crosses the other.
