@@ -1401,13 +1401,12 @@ entry("addr", (r) => {
 
 entry("ready", (r) => { core.ready(r.u32()); });
 
-entry("shutdown", () => {
-  core.close();
-  reqres.close();
-  clearAllTimers();
-  openLinks.clear();
-  deferQueue.length = 0;
-});
+// There is no `shutdown` entrypoint, deliberately. Teardown releases the sockets and the
+// timers, and both are the HOST's — it closes them itself (transport-host.ts `close`)
+// rather than asking the occupant, because it owns the descriptor and a wedged occupant
+// must not be able to refuse. What is left is this realm's own heap, which dies with the
+// realm. An entrypoint whose only effect would be tidying memory about to be freed is one
+// more thing to keep in step for nothing.
 
 // ── the host-managed link handle (openLink's LinkHandle) ──────────────────────
 

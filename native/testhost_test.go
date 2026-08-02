@@ -139,6 +139,10 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
   return __capBridge;
 };
 globalThis.__callBridge = (op, ab) => __capBridge(op, new Uint8Array(ab));
+// The round-tripping ops — NET_SEND and every FS_* — hand back a Promise (§12.2), so a
+// caller that wants their bytes has to settle it. Driven through callRealm,
+// which already knows how to pump the loop until a realm promise settles.
+globalThis.__callBridgeAwait = async (op, ab) => __capBridge(op, new Uint8Array(ab));
 `
 
 // capBridgeRealm boots a realm and adds the test-only cap-bridge builder above.

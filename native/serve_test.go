@@ -18,15 +18,16 @@ import (
 // function the Node and browser shells run.
 
 // The holder guest: type 1 = STORE (payload already framed for FS_PUT), type 2 = FETCH
-// (payload = key). Local fs + crypto only — fully synchronous, so it answers without
-// yielding, which is what lets it serve while an initiator is parked mid-await.
+// (payload = key). Local fs only — and it AWAITS, because the fs ops round-trip (§12.2).
+// A holder is therefore an ordinary async entrypoint like an initiator, and the
+// realm serializes the two rather than running one inside the other's parked window.
 const holderGuestSource = `
-	register("handle", (arg) => {
+	register("handle", async (arg) => {
 	  const sender = arg.slice(0, 32);
 	  const type = arg[32];
 	  const payload = arg.slice(33);
-	  if (type === 1) { host.call(CAP_FS_PUT, payload); return new Uint8Array([1]); }
-	  if (type === 2) { return host.call(CAP_FS_GET, payload); }
+	  if (type === 1) { await host.call(CAP_FS_PUT, payload); return new Uint8Array([1]); }
+	  if (type === 2) { return await host.call(CAP_FS_GET, payload); }
 	  return new Uint8Array(0);
 	});
 `

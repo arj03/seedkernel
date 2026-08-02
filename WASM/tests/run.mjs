@@ -372,26 +372,28 @@ async function testFs() {
   for (const { name, make } of backends) {
     const { fs, cleanup } = make();
     try {
+      // The seam is async on every backend (core/fs.ts), so every call awaits — the
+      // point of the change being that a browser backend can satisfy this shape at all.
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-      assert(fs.size("a.blk") < 0, `${name}: absent before put`);
-      assertEqual(fs.size("a.blk"), -1, `${name}: size -1 when absent`);
-      assertEqual(fs.get("a.blk"), null, `${name}: get null when absent`);
+      assert(await fs.size("a.blk") < 0, `${name}: absent before put`);
+      assertEqual(await fs.size("a.blk"), -1, `${name}: size -1 when absent`);
+      assertEqual(await fs.get("a.blk"), null, `${name}: get null when absent`);
 
-      fs.put("a.blk", bytes);
-      assert(fs.size("a.blk") >= 0, `${name}: present after put`);
-      assertEqual(fs.size("a.blk"), 5, `${name}: size reflects bytes`);
-      assert(bytesEqual(fs.get("a.blk"), bytes), `${name}: get round-trips`);
+      await fs.put("a.blk", bytes);
+      assert(await fs.size("a.blk") >= 0, `${name}: present after put`);
+      assertEqual(await fs.size("a.blk"), 5, `${name}: size reflects bytes`);
+      assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: get round-trips`);
 
-      fs.put("a.dsc", new Uint8Array([9]));
-      fs.put("b.blk", new Uint8Array([7, 7]));
-      assertEqual(fs.list().sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
-      assertEqual(fs.list("a.").sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
-      assertEqual(fs.stat().used, 5 + 1 + 2, `${name}: stat.used sums all values`);
-      assert(fs.stat().available > 0, `${name}: stat.available is positive`);
+      await fs.put("a.dsc", new Uint8Array([9]));
+      await fs.put("b.blk", new Uint8Array([7, 7]));
+      assertEqual((await fs.list()).sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
+      assertEqual((await fs.list("a.")).sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
+      assertEqual((await fs.stat()).used, 5 + 1 + 2, `${name}: stat.used sums all values`);
+      assert((await fs.stat()).available > 0, `${name}: stat.available is positive`);
 
-      assert(fs.delete("a.blk"), `${name}: delete reports removal`);
-      assert(fs.size("a.blk") < 0, `${name}: absent after delete`);
-      assert(!fs.delete("a.blk"), `${name}: second delete is false`);
+      assert(await fs.delete("a.blk"), `${name}: delete reports removal`);
+      assert(await fs.size("a.blk") < 0, `${name}: absent after delete`);
+      assert(!(await fs.delete("a.blk")), `${name}: second delete is false`);
     } finally {
       cleanup();
     }
@@ -401,12 +403,14 @@ async function testFs() {
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-"));
   try {
     const fs = new NodeFs(dir);
+    // The key check throws inside an async method, so it surfaces as a rejection —
+    // still a refusal the caller cannot miss, and still before any syscall.
     let threw = false;
-    try { fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
+    try { await fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects a path-traversal key on put");
-    assertEqual(fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
+    assertEqual(await fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
     threw = false;
-    try { fs.put("..", new Uint8Array([0])); } catch { threw = true; }
+    try { await fs.put("..", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects the bare '..' key");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -519,11 +523,12 @@ async function testCapBridge() {
     const szAbsent = await bridge(CAP.FS_SIZE, new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "CAP_FS_SIZE of an absent key → -1 (0xFFFFFFFF)");
 
-    // Sync vs async: every op resolves synchronously (returns bytes, not a
-    // Promise) except the net ops, which round-trip — this is exactly what lets a
-    // SYNC realm host the holder side while the async realm awaits net.
-    assert(!(prim("blake2b-256", msg) instanceof Promise), "CAP_HASH resolves synchronously (bytes, no Promise)");
-    assert(!(bridge(CAP.FS_SIZE, fk) instanceof Promise), "CAP_FS_SIZE resolves synchronously");
+    // Sync vs async, and which side of that line an op sits on is the ABI (§12.2): a
+    // primitive is a function of its arguments and resolves inline; net and fs genuinely
+    // round-trip and hand back a Promise. Which side an op sits on is what `guest.abi`
+    // versions, which is why it is declared and checked rather than assumed.
+    assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
+    assert(bridge(CAP.FS_SIZE, fk) instanceof Promise, "CAP_FS_SIZE returns a Promise (fs round-trips)");
     assert(bridge(CAP.NET_PEERS, U()) instanceof Uint8Array, "CAP_NET_PEERS is synchronous");
     const protoEnc = new TextEncoder().encode("_test");
     const sendFrame = concatBytes([id.publicKey, U(protoEnc.length), protoEnc, U(7)]);
@@ -769,7 +774,7 @@ async function testShellBoot() {
     // The shell boots under the policy and wires its backends. Admitting an allowed
     // author's code is the bundle path, covered end-to-end by testBundle (§12.4) — the
     // only way code arrives now that the wire install path is gone.
-    assert(shell.fs.list().length === 0, "fs.* backend is wired over the data dir");
+    assert((await shell.fs.list()).length === 0, "fs.* backend is wired over the data dir");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1084,19 +1089,21 @@ async function testSafeJs() {
   console.log("  OK\n");
 }
 
-// ─── Test: callSync — the holder request side on the one realm (step 8) ──
+// ─── Test: one entry seam, serialized per realm (§12.3) ─────────────────
 //
-// realm.callSync runs a guest entrypoint straight through to its bytes without
-// yielding the event loop or pumping the job queue. This is what lets a confined
-// request handler (storage's holder side) respond synchronously while an initiator
-// call() is parked mid-await *in the same realm* — a suspended async function is
-// just heap state, so re-entering to run a sync handler is ordinary JS.
+// There used to be two ways into a realm: `call`, which could yield, and `callSync`,
+// which could not. `callSync` existed because a holder answered from local fs and fs
+// answered in the same turn; once fs became async (core/fs.ts — no browser backend can
+// implement a synchronous `get`) nothing distinguished it any more. What it gave for
+// free was that one invocation ran to completion before the next began, and that is now
+// the realm's own FIFO queue (host/realm-queue.ts) rather than a property of the host's
+// call stack.
 
-async function testHolderCallSync() {
-  console.log("Test: callSync — synchronous holder side sharing the initiator realm (step 8)");
+async function testRealmSerialization() {
+  console.log("Test: one entry seam, serialized per realm (§12.3)");
 
-  // 1. A synchronous bridge round-trips, and the realm is reusable. callSync()
-  //    returns bytes directly (no Promise) — no event-loop turn in between.
+  // 1. A synchronous entrypoint over a synchronous bridge still round-trips, and the
+  //    realm is reusable — it just resolves through a promise like everything else.
   {
     let calls = 0;
     const bridge = (op, payload) => { calls++; return op === 1 ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
@@ -1104,22 +1111,22 @@ async function testHolderCallSync() {
       source: `register("inc", (arg) => host.call(1, arg));`,
       bridge,
     });
-    const out = realm.callSync("inc", new Uint8Array([0, 9, 255]));
-    assert(out instanceof Uint8Array && !(out instanceof Promise), "callSync returns bytes directly, not a Promise");
+    const out = await realm.call("inc", new Uint8Array([0, 9, 255]));
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
-    assertEqual([...realm.callSync("inc", new Uint8Array([41]))], [42], "callSync is reusable across calls");
+    assertEqual([...(await realm.call("inc", new Uint8Array([41])))], [42], "the realm is reusable across calls");
     assertEqual(calls, 2, "the synchronous bridge was invoked once per call");
     realm.dispose();
   }
 
-  // 2. A holder can answer re-entrantly while an initiator is parked mid-await on the
-  //    SAME realm — the whole point of the single-realm design. Start a net call() that
-  //    parks, callSync a holder in the meantime, then let the initiator settle.
+  // 2. An invocation accepted while another is parked mid-await does NOT interleave with
+  //    it: it waits for the queue. This is the guarantee stack discipline used to give,
+  //    and the reason it is worth its head-of-line cost — two frames resuming into each
+  //    other at every await is state no guest author can reason about.
   {
     let release;
     const gate = new Promise((r) => { release = r; });
     const bridge = (op, payload) => {
-      if (op === 7) return gate.then(() => new Uint8Array([42]));   // net — parks until released
+      if (op === 7) return gate.then(() => new Uint8Array([42]));   // parks until released
       if (op === 1) return payload.map((b) => (b + 1) & 0xff);      // sync — holder path
       return new Uint8Array();
     };
@@ -1128,22 +1135,29 @@ async function testHolderCallSync() {
                register("hold", (arg) => host.call(1, arg));`,
       bridge,
     });
-    const initP = realm.call("init", new Uint8Array());            // parks at the net await
-    const held = realm.callSync("hold", new Uint8Array([7]));       // answered while init parks
-    assertEqual([...held], [8], "holder answered synchronously while the initiator was parked mid-await");
+    const order = [];
+    const initP = realm.call("init", new Uint8Array()).then((r) => { order.push("init"); return r; });
+    const heldP = realm.call("hold", new Uint8Array([7])).then((r) => { order.push("hold"); return r; });
+
+    // Give the holder every chance to jump the queue before the initiator is released.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    assertEqual(order.length, 0, "the holder did not run while the initiator was parked");
+
     release();
-    assertEqual([...(await initP)], [42], "the parked initiator resumed and settled after the holder ran");
+    assertEqual([...(await initP)], [42], "the parked initiator resumed and settled");
+    assertEqual([...(await heldP)], [8], "and the holder ran after it, on its own budget");
+    assertEqual(order.join(","), "init,hold", "the queue preserved acceptance order");
     realm.dispose();
   }
 
-  // 3. Still airtight — callSync is the same zero-authority sandbox.
+  // 3. Still airtight — the one seam is the same zero-authority sandbox.
   {
     const realm = await createSafeRealm({
       source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
       bridge: () => new Uint8Array(),
     });
-    const r = realm.callSync("probe", new Uint8Array());
-    assertEqual([...r], [0, 0], "process / fetch are unreachable under callSync too");
+    const r = await realm.call("probe", new Uint8Array());
+    assertEqual([...r], [0, 0], "process / fetch are unreachable from an entrypoint");
     realm.dispose();
   }
 
@@ -1897,7 +1911,7 @@ await testGuestlessBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testWsFraming();
 await testSafeJs();
-await testHolderCallSync();
+await testRealmSerialization();
 await testCapBridgeEnforcement();
 await testCallHandlerGuards();
 await testManifestSuiteByte();

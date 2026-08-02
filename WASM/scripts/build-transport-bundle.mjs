@@ -102,7 +102,7 @@ async function main() {
     modules: [],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
-      abi: 2,
+      abi: 1,
       // The AUTHORITIES this program is granted, and the whole of them: SIGN (scoped by
       // the transport slot to DOMAIN_channel), RANDOM and CLOCK; `rawnet`, the sockets
       // behind opaque link ids; `timer`, because a zero-authority realm has no

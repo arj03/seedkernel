@@ -21,6 +21,7 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
 const { KernelHost } = await imp("build/core/kernel-host.js");
+const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
@@ -45,7 +46,9 @@ function transportBundleAt(version, keys) {
     app: "transport", version, role: "transport", modules: [],
     guest: {
       hash: Buffer.from(sodium.crypto_generichash(32, guest)).toString("hex"),
-      abi: 2,
+      // Read, never restated: a hardcoded number here would pass a test that the
+      // production loader would refuse the moment the seam revved (§12.4).
+      abi: GUEST_ABI_VERSION,
       caps: ["crypto", "clock", "timer", "rawnet", "transport"],
       primitives: ["blake2b-256", "ed25519/verify", "chacha20poly1305-ietf/seal",
                    "chacha20poly1305-ietf/open", "x25519/dh"],

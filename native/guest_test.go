@@ -27,18 +27,18 @@ function fsPutArg(key, bytes) {
   out.set(k, 4); out.set(bytes, 4 + k.length);
   return out;
 }
-register("put", (data) => {
+register("put", async (data) => {
   // A primitive is reached BY NAME through the one CAP_CRYPTO op:
   // [nameLen u8][name utf8][args].
   const nm = new TextEncoder().encode("blake2b-256");
   const call = new Uint8Array(1 + nm.length + data.length);
   call[0] = nm.length; call.set(nm, 1); call.set(data, 1 + nm.length);
   const id = host.call(CAP_CRYPTO, call);
-  host.call(CAP_FS_PUT, fsPutArg(hex(id), data));
+  await host.call(CAP_FS_PUT, fsPutArg(hex(id), data));
   return id;
 });
-register("get", (id) => {
-  const r = host.call(CAP_FS_GET, new TextEncoder().encode(hex(id)));
+register("get", async (id) => {
+  const r = await host.call(CAP_FS_GET, new TextEncoder().encode(hex(id)));
   if (r.length < 1 || r[0] !== 1) throw new Error("not found");
   return r.slice(1);
 });

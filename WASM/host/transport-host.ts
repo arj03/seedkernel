@@ -15,7 +15,7 @@
 //                  `TIMER_*` for deadlines and the `transport` domain the slot
 //                  reports its structured output through. Adding one is an op, not
 //                  an action id with a decoder on both sides.
-//   host → guest ordinary entrypoint invocation (`realm.callSync(name, bytes)`),
+//   host → guest ordinary entrypoint invocation (`realm.call(name, bytes)`),
 //                  exactly as an app's holder `handle` is invoked. A payload shape
 //                  per entrypoint rather than one tagged union, so there is no
 //                  unknown-tag case to desync on: an entrypoint this guest does not
@@ -347,17 +347,19 @@ export class TransportHost implements Network, HostTransport {
 
   // ── entering the guest ──────────────────────────────────────────────────────
 
-  /** Invoke a guest entrypoint synchronously. The occupant answers by calling ops
- *  back out through the cap-bridge, so there is nothing to decode here — the
- *  return value is unused, and an entrypoint that throws is a wedged transport
- *  whose links are moot, not a reason to take the host down. */
+  /** Invoke a guest entrypoint. The occupant answers by calling ops back out through
+ *  the cap-bridge, so there is nothing to decode here — the return value is unused,
+ *  and an entrypoint that throws is a wedged transport whose links are moot, not a
+ *  reason to take the host down.
+ *
+ *  Fire-and-forget, but not unordered: the realm serializes invocations in the order
+ *  they were accepted (realm-queue.ts), so frames arriving on one link reach the occupant
+ *  in arrival order and one entrypoint completes before the next begins. */
   private enter(entry: string, args: Uint8Array): void {
     if (this.closed || !this.realm) return;
-    try {
-      this.realm.callSync(entry, args);
-    } catch (err) {
+    void this.realm.call(entry, args).catch((err: unknown) => {
       console.error("[transport] guest error in " + entry + ": " + ((err as Error).message || String(err)));
-    }
+    });
   }
 
   /** The peer whitelist. Absent ⇒ admit every peer that completes the handshake. */
@@ -672,15 +674,25 @@ export class TransportHost implements Network, HostTransport {
 
   // ── lifecycle ───────────────────────────────────────────────────────────────
 
+  /** Tear the driver down. Everything released here is the **host's** — the sockets, the
+ *  timers, the outbound promises — and **none of it goes through the occupant**. The host
+ *  owns the descriptor for the life of the process (README §1), so a teardown that needed
+ *  the occupant's cooperation to release one would be a teardown a wedged occupant could
+ *  refuse; and an entrypoint invocation queues (§12.3) while the caller disposes the realm
+ *  on return, so asking would not even be reliable. */
   close(): void {
     if (this.closed) return;
-    try { this.enter("shutdown", EMPTY); } catch { /* realm already gone */ }
+    // First, so nothing below re-enters a realm the caller is about to dispose: the
+    // channel closes fire `onClose`, which would otherwise queue a `linkClosed`.
     this.closed = true;
     for (const p of this.pending.values()) p.reject(new Error("transport closed"));
     this.pending.clear();
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
     if (this.readyWaiter) { clearTimeout(this.readyWaiter.timer); this.readyWaiter.resolve(); this.readyWaiter = null; }
+    for (const c of this.channels.values()) {
+      try { c.close(false); } catch { /* already gone */ }
+    }
     this.channels.clear();
     this.opts.channels?.close();
   }

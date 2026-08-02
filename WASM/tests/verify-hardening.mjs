@@ -57,19 +57,22 @@ console.log("\n§12.2 — fs is scoped per app key");
   const A = new Uint8Array(32).fill(0xaa), B = new Uint8Array(32).fill(0xbb);
   const alice = scopedFs(disk, appScopeFor(sodium, A, "chat"));
   const bob = scopedFs(disk, appScopeFor(sodium, B, "chat"));
-  alice.put("secret", new Uint8Array([1, 2, 3]));
-  bob.put("secret", new Uint8Array([9]));
-  ok(alice.get("secret").length === 3, "alice reads her own key");
-  ok(bob.get("secret").length === 1, "bob's same-named key is a different value");
-  ok(bob.list("").length === 1 && bob.list("")[0] === "secret", "list() shows only this app's keys, unprefixed");
-  ok(bob.delete("secret") && alice.get("secret") !== null, "bob's delete cannot reach alice's key");
-  ok(disk.list("").length === 1, "the backend holds both under distinct physical keys");
+  // Every method awaits: the seam is async so a browser backend can implement it
+  // (core/fs.ts), and MemoryFs answers in a microtask like any other.
+  await alice.put("secret", new Uint8Array([1, 2, 3]));
+  await bob.put("secret", new Uint8Array([9]));
+  ok((await alice.get("secret")).length === 3, "alice reads her own key");
+  ok((await bob.get("secret")).length === 1, "bob's same-named key is a different value");
+  const bobKeys = await bob.list("");
+  ok(bobKeys.length === 1 && bobKeys[0] === "secret", "list() shows only this app's keys, unprefixed");
+  ok(await bob.delete("secret") && (await alice.get("secret")) !== null, "bob's delete cannot reach alice's key");
+  ok((await disk.list("")).length === 1, "the backend holds both under distinct physical keys");
 
   // Colons in an app name cannot make two scopes overlap, and cannot reach the backend.
   const amb1 = scopedFs(disk, appScopeFor(sodium, A, "x:y"));
   const amb2 = scopedFs(disk, appScopeFor(sodium, A, "x"));
-  amb1.put("z", new Uint8Array([1]));
-  ok(amb2.get("y:z") === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
+  await amb1.put("z", new Uint8Array([1]));
+  ok((await amb2.get("y:z")) === null, "app 'x:y' key 'z' does not collide with app 'x' key 'y:z'");
   ok(/^[A-Za-z0-9._-]+$/.test(appScopeFor(sodium, A, "x:y")), "the derived scope is inside the backend key charset");
   // The real backends reject anything outside that charset, so an unsafe scope must
   // fail at construction rather than on the first write.
@@ -128,7 +131,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   });
   const t0 = Date.now();
   let interrupted = false;
-  try { spinner.callSync("handle", new Uint8Array()); } catch { interrupted = true; }
+  try { await spinner.call("handle", new Uint8Array()); } catch { interrupted = true; }
   const spent = Date.now() - t0;
   ok(interrupted, "an infinite loop in a holder entrypoint is interrupted");
   ok(spent < 3000, `it is interrupted near its budget, not eventually (${spent}ms)`);
@@ -148,23 +151,42 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(out.length === 1 && out[0] === 9, "an initiator parked 400ms on a 200ms budget still completes");
   waiter.dispose();
 
-  // A re-entrant holder call gets its own budget rather than spending the initiator's.
+  // Invocations are serialized per realm: a holder invoked while an initiator is parked
+  // waits for it rather than interleaving with it, and then runs on a budget of its own
+  // rather than on what the initiator left. This is the guarantee the old re-entrant
+  // callSync got from the host's call stack, now that every role can yield (§12.3).
+  const order = [];
   const both = await createSafeRealm({
     source: 'register("go", async () => { await host.call(7, new Uint8Array()); return new Uint8Array([1]); });'
           + 'register("handle", () => new Uint8Array([2]));',
     bridge: slowBridge, deadlineMs: 200,
   });
-  const parked = both.call("go", new Uint8Array());
-  ok(both.callSync("handle", new Uint8Array())[0] === 2, "a holder runs re-entrantly while an initiator is parked");
-  ok((await parked)[0] === 1, "and the initiator still completes on its own budget");
+  const parked = both.call("go", new Uint8Array()).then((r) => { order.push("initiator"); return r; });
+  const holder = both.call("handle", new Uint8Array()).then((r) => { order.push("holder"); return r; });
+  ok((await holder)[0] === 2, "a holder queued behind a parked initiator still runs");
+  ok((await parked)[0] === 1, "and the initiator completes on its own budget");
+  ok(order[0] === "initiator" && order[1] === "holder",
+    `the queue runs them in acceptance order, never interleaved (got ${order.join(",")})`);
   both.dispose();
+
+  // The queue does not strand callers on dispose: one still in it fails rather than
+  // entering a torn-down realm, which is what aborts the whole wasm module.
+  const closing = await createSafeRealm({
+    source: 'register("go", async () => { await host.call(7, new Uint8Array()); return new Uint8Array([1]); });',
+    bridge: slowBridge, deadlineMs: 5000,
+  });
+  const first = closing.call("go", new Uint8Array()).catch(() => "failed");
+  const queued = closing.call("go", new Uint8Array()).catch(() => "failed");
+  closing.dispose();
+  ok(await first === "failed", "a parked call is failed by dispose rather than left pending");
+  ok(await queued === "failed", "and so is one still waiting in the queue");
 
   // Default is a real number, so forgetting the field bounds the guest rather than
   // unbounding it — the same posture as the cap gates above.
   const defaulted = await createSafeRealm({ source: 'register("handle", () => { for(;;){} });', bridge: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
-  try { defaulted.callSync("handle", new Uint8Array()); } catch { defaultInterrupted = true; }
+  try { await defaulted.call("handle", new Uint8Array()); } catch { defaultInterrupted = true; }
   ok(defaultInterrupted, "with no deadlineMs configured the 5s default still interrupts");
   ok(Date.now() - t1 >= 4000, "the default budget is the documented 5s, not something tighter");
   defaulted.dispose();
@@ -194,7 +216,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen = o;
-        return { call: async () => new Uint8Array(), callSync: () => new Uint8Array(), dispose() {} };
+        return { call: async () => new Uint8Array(), dispose() {} };
       },
     },
     admit: admitAll,
@@ -217,7 +239,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen2 = o;
-        return { call: async () => new Uint8Array(), callSync: () => new Uint8Array(), dispose() {} };
+        return { call: async () => new Uint8Array(), dispose() {} };
       },
     },
     admit: admitAll,

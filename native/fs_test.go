@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -75,34 +76,44 @@ func TestNodeFsNoEscape(t *testing.T) {
 	}
 }
 
-// The `fs` object exposed into the realm presents the host/fs.ts shape (Uint8Array
-// on a hit, null on a miss) end to end through the QuickJS shim.
+// The `fs` seam the shared code consumes (core/fs.ts) presents its shape — Uint8Array on
+// a hit, null on a miss — end to end over Go's synchronous primitive.
+//
+// Every call awaits, because the seam is async on every target: a synchronous `get` is a
+// shape no browser backend can implement, so it is not one the native target may offer
+// either. Go still answers from the disk in the call; the wrap that makes that a promise
+// is host/native-shim.ts, and this drives it rather than a copy of it.
 func TestFsExposedToRealm(t *testing.T) {
 	bootRealm(t)
 	if err := exposeFs(qc, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	res, err := qc.Eval("fs-realm-test.js", qjs.Code(`
+	if _, err := qc.Eval("fs-realm-test.js", qjs.Code(`
 		const enc = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 		const dec = (b) => { let s = ""; for (const x of b) s += String.fromCharCode(x); return s; };
-		fs.put("blk1", enc("payload-one"));
-		fs.put("blk2", enc("payload-two"));
-		[
-			dec(fs.get("blk1")),
-			fs.get("nope") === null ? "null" : "notnull",
-			String(fs.size("blk1")), String(fs.size("nope")),
-			fs.list("blk").sort().join(","),
-			String(fs.list("zzz").length),
-			String(fs.delete("blk1")), String(fs.size("blk1")),
-			String(fs.stat().used),
-		].join("|");
-	`))
-	if err != nil {
+		globalThis.__fsProbe = async () => {
+			await fs.put("blk1", enc("payload-one"));
+			await fs.put("blk2", enc("payload-two"));
+			return enc([
+				dec(await fs.get("blk1")),
+				(await fs.get("nope")) === null ? "null" : "notnull",
+				String(await fs.size("blk1")), String(await fs.size("nope")),
+				(await fs.list("blk")).sort().join(","),
+				String((await fs.list("zzz")).length),
+				String(await fs.delete("blk1")), String(await fs.size("blk1")),
+				String((await fs.stat()).used),
+			].join("|"));
+		};
+	`)); err != nil {
 		t.Fatalf("eval: %v", err)
+	}
+	got, err := callRealm("__fsProbe", 5*time.Second)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
 	}
 	// Existence is size ≥ 0 now (no `has`): present blk1 = 11, absent = -1.
 	const want = "payload-one|null|11|-1|blk1,blk2|0|true|-1|11"
-	if got := res.String(); got != want {
-		t.Fatalf("fs realm round trip:\n got %q\nwant %q", got, want)
+	if string(got) != want {
+		t.Fatalf("fs realm round trip:\n got %q\nwant %q", string(got), want)
 	}
 }

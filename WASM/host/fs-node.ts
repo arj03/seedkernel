@@ -4,9 +4,14 @@
 // syscalls now live in the runtime, and the storage app layers content-addressing
 // and quota on top (the runtime split).
 
+import { mkdirSync } from "node:fs";
+// The seam is async (core/fs.ts), so this backend is genuinely async rather than sync
+// calls in an async wrapper: a node serving requests should not block its only thread on
+// a disk read. `mkdirSync` is the exception and stays sync — it runs once, in the
+// constructor, where there is no promise to return.
 import {
-  mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, statSync, statfsSync,
-} from "node:fs";
+  readdir, readFile, writeFile, unlink, stat, statfs,
+} from "node:fs/promises";
 import { join } from "node:path";
 
 import type { Fs, FsStat } from "../core/fs.js";
@@ -43,27 +48,32 @@ export class NodeFs implements Fs {
     return join(this.dir, key);
   }
 
-  get(key: string): Uint8Array | null {
-    try { return new Uint8Array(readFileSync(this.path(key))); } catch { return null; }
+  async get(key: string): Promise<Uint8Array | null> {
+    try { return new Uint8Array(await readFile(this.path(key))); } catch { return null; }
   }
-  put(key: string, bytes: Uint8Array): void { writeFileSync(this.path(key), bytes); }
-  size(key: string): number {
-    try { return statSync(this.path(key)).size; } catch { return -1; }
+  async put(key: string, bytes: Uint8Array): Promise<void> { await writeFile(this.path(key), bytes); }
+  async size(key: string): Promise<number> {
+    try { return (await stat(this.path(key))).size; } catch { return -1; }
   }
-  list(prefix?: string): string[] {
+  async list(prefix?: string): Promise<string[]> {
     let names: string[];
-    try { names = readdirSync(this.dir); } catch { return []; }
+    try { names = await readdir(this.dir); } catch { return []; }
     return prefix ? names.filter((n) => n.startsWith(prefix)) : names;
   }
-  delete(key: string): boolean {
-    try { unlinkSync(this.path(key)); return true; } catch { return false; }
+  async delete(key: string): Promise<boolean> {
+    try { await unlink(this.path(key)); return true; } catch { return false; }
   }
-  stat(): FsStat {
+  async stat(): Promise<FsStat> {
     let used = 0;
-    try { for (const n of readdirSync(this.dir)) { const s = this.size(n); if (s >= 0) used += s; } }
-    catch { /* dir absent */ }
+    try {
+      // One pass, concurrently: a directory of a few thousand keys is a few thousand
+      // stats, and awaiting them in sequence would make `stat()` the slowest op on the
+      // seam for no reason. Absent entries (-1) are simply not counted.
+      const sizes = await Promise.all((await readdir(this.dir)).map((n) => this.size(n)));
+      for (const s of sizes) if (s >= 0) used += s;
+    } catch { /* dir absent */ }
     let available = Number.MAX_SAFE_INTEGER;
-    try { const s = statfsSync(this.dir); available = s.bavail * s.bsize; }
+    try { const s = await statfs(this.dir); available = s.bavail * s.bsize; }
     catch { /* statfs unsupported on this platform/runtime */ }
     return { used, available };
   }

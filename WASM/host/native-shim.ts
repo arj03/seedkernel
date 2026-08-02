@@ -23,6 +23,7 @@ import {
   createShell, type KernelBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
+import { serializeCalls } from "./realm-queue.js";
 import type { ChannelFactory, Identity, RawChannel, RawByteStream, TransportCrypto } from "../core/socket-seam.js";
 import type { Fs } from "../core/fs.js";
 import { parsePeerSpec } from "../core/socket-seam.js";
@@ -51,7 +52,6 @@ declare const bridge: {
   createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;
   realmCall(realm: number, entry: string, payload: Uint8Array,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): void;
-  realmCallSync(realm: number, entry: string, payload: Uint8Array): ArrayBuffer;
   realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
   realmDispose(realm: number): void;
 };
@@ -62,8 +62,44 @@ declare const bridge: {
  *  fails the build rather than a handshake. */
 declare const sodium: ShellSodium & TransportCrypto;
 
-/** The `fs.*` backend over Go's data directory (native/fs.go). */
-declare const fs: Fs;
+/** The `fs.*` primitive over Go's data directory (native/fs.go).
+ *
+ *  Declared with its real, **synchronous** shape: Go answers a read from the local disk
+ *  in the call, and qjs has no promise primitive to hand back anyway. The seam the shared
+ *  code consumes is async (`Fs`, core/fs.ts), so the adaptation happens here — which is
+ *  the right place for it, because "this target's storage is synchronous" is exactly the
+ *  kind of platform fact a shim exists to absorb. Go grows with primitives, never with
+ *  logic; making it construct promises would be the latter. */
+declare const __fs: {
+  get(key: string): ArrayBuffer | null;
+  put(key: string, bytes: Uint8Array): void;
+  size(key: string): number;
+  /** One `\n`-joined string, not an array: building a JS array on the Go side costs an
+   *  engine call (plus a C string) per key, so a content store with tens of thousands of
+   *  blocks paid tens of thousands of crossings per listing. A key may not contain `\n`
+   *  (`fsKeyChars`), so the join is unambiguous. */
+  list(prefix?: string): string;
+  delete(key: string): boolean;
+  stat(): { used: number; available: number };
+};
+
+/** The async `Fs` seam over that synchronous primitive: a get miss is null, a hit is a
+ *  Uint8Array, and list's joined string becomes the string[].
+ *
+ *  `async` rather than `Promise.resolve(...)` so a throw from Go becomes a rejection like
+ *  every other backend's, instead of a synchronous throw out of a method the caller
+ *  awaits. */
+// Exported so the native target's tests drive the SAME wrapper production does, rather
+// than a second one in a test harness that could quietly disagree with it.
+export const fs: Fs = {
+  async get(key) { const r = __fs.get(key); return r === null ? null : new Uint8Array(r); },
+  async put(key, bytes) { __fs.put(key, bytes); },
+  async size(key) { return __fs.size(key); },
+  // An empty listing arrives as "", which must map to [] — split would yield [""].
+  async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
+  async delete(key) { return __fs.delete(key); },
+  async stat() { return __fs.stat(); },
+};
 
 /** ws.wasm over wazero (native/wsframe.go): the same RFC 6455 byte transform the
  *  browser/Node targets drive, reached through the codec's one backend seam. */
@@ -184,12 +220,19 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
         return null;
     };
     realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0, deadlineMs === undefined ? 0 : (deadlineMs === Infinity ? -1 : deadlineMs));
+    let disposed = false;
     return {
-        call: (entry: string, payload: Uint8Array) => new Promise((resolve, reject) => {
-            bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg)));
-        }),
-        callSync: (entry: string, payload: Uint8Array) => new Uint8Array(bridge.realmCallSync(realm, entry, payload)),
-        dispose: () => { bridge.realmDispose(realm); },
+        // Serialized here, in the shared TS, rather than in Go: the guarantee is the
+        // realm contract's (realm-queue.ts) and one implementation of it is what keeps
+        // the two targets from differing about when a second entrypoint may begin. Go
+        // grows with primitives, never with logic.
+        call: serializeCalls(
+            (entry: string, payload: Uint8Array) => new Promise((resolve, reject) => {
+                bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg)));
+            }),
+            () => (disposed ? new Error("guest realm disposed") : null),
+        ),
+        dispose: () => { disposed = true; bridge.realmDispose(realm); },
     };
 };
 /** Everything that crosses back to Go crosses as BYTES — that is the currency of this

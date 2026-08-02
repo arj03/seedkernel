@@ -36,9 +36,9 @@ export type ShellSodium = BundleCrypto & CapSodium;
 /** How a target creates the confined realm a guest runs in (§12.3). The JS platform's
  *  factory is `createSafeRealm` (safe-js.ts: QuickJS-over-wasm, driven by
  *  quickjs-emscripten's job pump); the native target's is a second quickjs-ng realm
- *  driven by Go's event loop (native/guest.go). Both honor the same contract —
- *  `call` may await net, `callSync` must not yield — so the shell drives either
- *  without knowing which it holds. */
+ *  driven by Go's event loop (native/guest.go). Both honor the same contract — one
+ *  `call`, which may await, and invocations serialized per realm — so the shell drives
+ *  either without knowing which it holds. */
 export type RealmFactory = (opts: {
     source: string;
     bridge: SafeRealmBridge;
@@ -293,11 +293,11 @@ export function createShell(opts: CreateShellOptions & {
         return [...apps.values()][0];
     };
     /** The confined realm for `slot`, created lazily on first use through the
-     *  platform's factory. Both roles share it: the async initiator (`runGuest` →
-     *  realm.call) and the synchronous holder (`dispatch` → realm.callSync), so the
-     *  holder can answer re-entrantly while an initiator is parked mid-await in the
-     *  same realm (§2.1). Lazy because the JS factory pulls in a heavy engine, and
-     *  because a node may serve for a long time before its first guest call. */
+     *  platform's factory. Both roles share it and both reach it the same way — the
+     *  initiator (`runGuest`) and the holder (`dispatch`) each `realm.call`, and the
+     *  realm serializes them, so one runs to completion before the next begins. Lazy
+     *  because the JS factory pulls in a heavy engine, and because a node may serve for
+     *  a long time before its first guest call. */
     const ensureRealm = async (slot: AppSlot | RoleSlot) => {
         if (slot.realm)
             return slot.realm;
@@ -465,7 +465,11 @@ export function createShell(opts: CreateShellOptions & {
             const input = new Uint8Array(senderBytes.length + payload.length);
             input.set(senderBytes, 0);
             input.set(payload, senderBytes.length);
-            return slot.realm.callSync("handle", input);
+            // A Promise, which the driver already expects from `RequestHandler`: it
+            // answers through the `respond` entrypoint on a later turn, never inline
+            // (transport-host.ts). That was designed for exactly this — a holder that
+            // reads fs now awaits, because fs is async (core/fs.ts).
+            return slot.realm.call("handle", input);
         }
         if (!slot.handleName)
             return null;

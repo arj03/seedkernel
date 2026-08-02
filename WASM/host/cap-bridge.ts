@@ -96,10 +96,10 @@ export interface CapTransport {
  *  machines over whole messages, which the endpoints can implement and therefore do
  *  (the transport bundle). What has no substitute is moving the bytes.
  *
- *  **Nothing here may re-enter the guest realm synchronously.** The slot occupant calls
- *  these from inside a `callSync` entrypoint, so anything that would call back into the
- *  realm has to reach it on a later turn — which every implementation does anyway,
- *  because a socket does not deliver during the write that provoked it. */
+ *  **Nothing here may re-enter the guest realm.** The slot occupant calls these from
+ *  inside an entrypoint, so anything that would call back into the realm has to reach it
+ *  on a later turn — which every implementation does anyway, because a socket does not
+ *  deliver during the write that provoked it. */
 export interface RawNet {
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats exactly as a fabric dropping a
@@ -409,9 +409,10 @@ export function capPreamble(): string {
  *
  *    __host_call(op, callId, payload: ArrayBuffer) -> ArrayBuffer | null
  *
- *  Returning bytes completes a **sync** op (crypto/fs/clock/module) inline. Returning
- *  `null` means the host started an **async** (net) op under `callId`; the guest parks a
- *  Promise here and the host later calls `__netResolve(callId, bytes)` or
+ *  Returning bytes completes a **sync** op (the primitive catalog, clock, module, the
+ *  raw-link and transport ops) inline. Returning `null` means the host started an
+ *  **async** op under `callId` — `NET_SEND` and every `FS_*` — and the guest parks a
+ *  Promise here, which the host later settles with `__netResolve(callId, bytes)` or
  *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync op that ever returned
  *  null/undefined would be read as async and leave a Promise pending forever.
  *
@@ -440,9 +441,9 @@ globalThis.__netReject = (callId, msg) => {
   p.reject(new Error(msg));
 };
 globalThis.host = {
-  // A sync op resolves to its bytes directly; a net op returns a real Promise, so a
-  // guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op) and a
-  // fan-out is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
+  // A sync op resolves to its bytes directly; a net or fs op returns a real Promise, so
+  // a guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op) and
+  // a fan-out is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
   //
   // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
   // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
@@ -457,7 +458,7 @@ globalThis.host = {
         : bytes.slice().buffer;
     const r = __host_call(op, callId, ab);
     if (r !== null) return new Uint8Array(r);          // sync op — bytes directly
-    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net op
+    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net / fs
   },
   // The primitive seam, by name: host.crypto("x25519/dh", sk_pk). Framing the
   // [nameLen][name][args] envelope here rather than in every guest is the point of a
@@ -665,12 +666,15 @@ function u64be(value: number): Uint8Array {
     writeU32BE(out, 4, value >>> 0);
     return out;
 }
-/** Build the single capability funnel for one node. Every op resolves
- *  *synchronously* (returns bytes) except `NET_SEND`, which genuinely round-trips and
- *  returns a Promise the initiator guest `await`s. Because the non-net ops are
- *  synchronous, the very same bridge also drives the holder side — which never touches
- *  net (it answers purely from local fs + crypto), so it responds synchronously while an
- *  initiator is parked mid-await in the same realm. */
+/** Build the single capability funnel for one node. Most ops resolve *synchronously*
+ *  (returns bytes); the ones that genuinely round-trip — `NET_SEND` and every `FS_*` —
+ *  return a Promise the guest `await`s.
+ *
+ *  One bridge serves both roles. The **holder** path awaits like the initiator does — it
+ *  answers from local fs, and fs is not answerable in the same turn on a target whose
+ *  storage backend is asynchronous — so the two are the same shape, and what keeps one
+ *  entrypoint invocation from interleaving with the next is the realm's serialization
+ *  queue (realm-queue.ts) rather than anything here. */
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     const { sodium, identity, callHandler, transport } = deps;
     const now = deps.now ?? (() => Date.now());
@@ -771,43 +775,45 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
                 return concatBytes([head, ...peers.map(fromHex)]);
             }
             // ── fs (raw bytes under an opaque key) ───────────────────────────────
-            case CAP.FS_GET: {
-                const v = fs().get(dec.decode(payload));
-                return v ? concatBytes([ONE, v]) : ZERO;
-            }
+            //
+            // Every one of these round-trips, so each returns a Promise and the guest
+            // reads it with `await`. The seam is what is async, not the backend: a
+            // synchronous `get` is a shape no browser backend can implement — IndexedDB
+            // cannot, and OPFS only inside a Worker — so a sync fs would make the browser
+            // the one target unable to carry a core capability. `MemoryFs` and Go's
+            // primitive both answer in the call, and still resolve in a microtask.
+            case CAP.FS_GET:
+                return fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO));
             case CAP.FS_PUT: {
                 const klen = readU32BE(payload, 0);
                 const key = dec.decode(payload.slice(4, 4 + klen));
-                fs().put(key, payload.slice(4 + klen));
-                return NONE;
+                return fs().put(key, payload.slice(4 + klen)).then(() => NONE);
             }
             case CAP.FS_LIST: {
                 const prefix = payload.length ? dec.decode(payload) : undefined;
-                const keys = fs().list(prefix);
-                const head = new Uint8Array(4);
-                writeU32BE(head, 0, keys.length);
-                const parts = [head];
-                for (const k of keys) {
-                    const kb = enc.encode(k);
-                    const kh = new Uint8Array(4);
-                    writeU32BE(kh, 0, kb.length);
-                    parts.push(kh, kb);
-                }
-                return concatBytes(parts);
+                return fs().list(prefix).then((keys) => {
+                    const head = new Uint8Array(4);
+                    writeU32BE(head, 0, keys.length);
+                    const parts = [head];
+                    for (const k of keys) {
+                        const kb = enc.encode(k);
+                        const kh = new Uint8Array(4);
+                        writeU32BE(kh, 0, kb.length);
+                        parts.push(kh, kb);
+                    }
+                    return concatBytes(parts);
+                });
             }
             case CAP.FS_DELETE:
-                fs().delete(dec.decode(payload));
-                return NONE;
-            case CAP.FS_SIZE: {
-                const sz = fs().size(dec.decode(payload));
-                const out = new Uint8Array(4);
-                writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
-                return out;
-            }
-            case CAP.FS_STAT: {
-                const s = fs().stat();
-                return concatBytes([u64be(s.used), u64be(s.available)]);
-            }
+                return fs().delete(dec.decode(payload)).then(() => NONE);
+            case CAP.FS_SIZE:
+                return fs().size(dec.decode(payload)).then((sz) => {
+                    const out = new Uint8Array(4);
+                    writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
+                    return out;
+                });
+            case CAP.FS_STAT:
+                return fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)]));
             // ── installed-handler call + clock ───────────────────────────────────
             case CAP.MODULE_CALL: {
                 // The guest calls its own modules by the logical name from its manifest

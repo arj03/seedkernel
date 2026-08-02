@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"time"
 	"testing"
 
 	"seedloader/qjs"
@@ -108,15 +109,26 @@ func TestCapBridgeOps(t *testing.T) {
 		t.Fatalf("ed25519/verify(raw msg) = %v, want [0] (SIGN is scoped, never raw)", v)
 	}
 
-	// FS_PUT then FS_GET: content-addressed round trip.
+	// FS_PUT then FS_GET: content-addressed round trip. Both AWAIT — fs round-trips at
+	// the seam is async, because a synchronous `get` is a shape no browser backend can
+	// implement and the seam is one shape on every target (core/fs.ts).
+	awaitBytes := func(op int, payload []byte) []byte {
+		t.Helper()
+		b, err := callRealm("__callBridgeAwait", 5*time.Second,
+			qc.NewInt32(int32(op)), qc.NewArrayBuffer(payload))
+		if err != nil {
+			t.Fatalf("op %d: %v", op, err)
+		}
+		return b
+	}
 	key := []byte("blk")
 	value := []byte("a content-addressed block")
 	put := make([]byte, 4+len(key)+len(value)) // [klen u32][key][bytes]
 	binary.BigEndian.PutUint32(put, uint32(len(key)))
 	copy(put[4:], key)
 	copy(put[4+len(key):], value)
-	callBytes(capFsPut, put)
-	got := callBytes(capFsGet, key) // [1][bytes] on hit
+	awaitBytes(capFsPut, put)
+	got := awaitBytes(capFsGet, key) // [1][bytes] on hit
 	if len(got) == 0 || got[0] != 1 || !bytes.Equal(got[1:], value) {
 		t.Fatalf("FS_GET = %v, want [1] ++ %q", got, value)
 	}

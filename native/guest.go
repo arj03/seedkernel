@@ -10,13 +10,20 @@
 // knows what an op means or which ops an app may reach; that is the cap-bridge's, and
 // the manifest's, business.
 //
-// The net seam: a sync op (crypto/fs/clock/module) returns its bytes immediately. A net
-// op genuinely round-trips, so the cap call returns null and the guest preamble hands the
-// guest a real Promise it `await`s; when the host realm's Transport promise settles, the
-// shim calls bridge.realmSettle and this file resolves the parked guest Promise. The
-// shared loop (loop.go) then pumps the guest realm so the awaiting entrypoint resumes.
-// There is no blocking and no Asyncify — a suspended async guest is just heap state, so
-// the same realm answers a request (callSync) while an initiator is parked mid-await.
+// The async seam: a sync op (the primitive catalog, clock, module, the raw-link and
+// transport ops) returns its bytes immediately. A round-tripping op — NET_SEND and every
+// FS_* — returns null from the cap call, and the guest preamble hands the guest a real
+// Promise it `await`s; when the shim's promise settles it calls bridge.realmSettle and
+// this file resolves the parked guest Promise. The shared loop (loop.go) then pumps the
+// guest realm so the awaiting entrypoint resumes. There is no blocking and no Asyncify —
+// a suspended async guest is just heap state.
+//
+// There is one way in, `realmCall`, and it is asynchronous — for the initiator and the
+// holder alike. A synchronous second entry is not on offer: a holder answers from local
+// storage, and the fs seam is async on every target because a browser backend cannot make
+// it anything else. One entrypoint still runs to completion before the next begins, but
+// that comes from the shim's per-realm queue (host/realm-queue.ts) — shared TS, so both
+// targets get the same guarantee from one implementation.
 package main
 
 import (
@@ -145,21 +152,6 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		}
 		g.call(t.Args()[1].String(), payload, t.Args()[3], t.Args()[4])
 		return nil, nil
-	}))
-	b.SetPropertyStr("realmCallSync", fn(func(t *qjs.This) (*qjs.Value, error) {
-		g := realms[t.Args()[0].Int64()]
-		if g == nil {
-			return nil, fmt.Errorf("realmCallSync: no such realm")
-		}
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
-		if err != nil {
-			return nil, err
-		}
-		out, err := g.callSync(t.Args()[1].String(), payload)
-		if err != nil {
-			return nil, err
-		}
-		return t.Context().NewArrayBuffer(out), nil
 	}))
 	b.SetPropertyStr("realmSettle", fn(func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a realm that has since been disposed is a no-op: the
@@ -462,43 +454,9 @@ func (g *guestRealm) checkAlive() error {
 	return nil
 }
 
-// enterNested suspends the current budget and starts a fresh one, returning the
-// suspended total. A re-entrant holder callSync runs while an initiator sits parked in
-// the same realm; it gets its own budget rather than spending — or clearing — the
-// initiator's. Mirrors safe-js.ts.
-func (g *guestRealm) enterNested() time.Duration {
-	saved := g.consumed
-	g.consumed = 0
-	return saved
-}
-
-// callSync invokes an entrypoint synchronously — the request side (README §12.8). The
-// arg is the raw payload from the req frame; the guest reads its own dispatch byte from
-// it if it needs one. A holder answers from local fs + crypto (no net), so it returns
-// bytes without yielding. Called re-entrantly from the host realm's transport.onRequest,
-// which is what lets it answer while an initiator is parked mid-await in this realm.
-func (g *guestRealm) callSync(entry string, payload []byte) ([]byte, error) {
-	if err := g.checkAlive(); err != nil {
-		return nil, err
-	}
-	name := g.handle
-	if entry != "handle" {
-		name = g.qc.NewString(entry)
-		defer name.Free()
-	}
-	argv := g.qc.NewArrayBuffer(payload)
-	defer argv.Free()
-	saved := g.enterNested()
-	res, err := g.within(func() (*qjs.Value, error) {
-		return g.qc.Invoke(g.invoke, g.qc.NewUndefined(), name, argv)
-	})
-	g.consumed = saved
-	if err != nil {
-		return nil, err
-	}
-	defer res.Free()
-	return qjs.JsTypedArrayToGo(res)
-}
+// There is no nested-budget case: the shim's per-realm queue leaves exactly one budget
+// window open at a time, so resetting `consumed` per call is the whole of the accounting
+// — same as safe-js.ts.
 
 // settleNet resolves or rejects the guest Promise parked under callID when the host
 // realm's Transport promise settles (`bytes` fulfils, `msg` rejects). A fresh,
@@ -558,6 +516,15 @@ func (g *guestRealm) reportCall(cb *qjs.Value, arg *qjs.Value) {
 	if err != nil {
 		fmt.Println("guest: call settlement error:", err)
 	}
+	// Settling a host promise only QUEUES a host microtask, and one pumpAll round pumps
+	// the host realm before the guest realms — so the reaction to this settlement lands
+	// after this round has passed it. That matters now that a reaction can be the next
+	// entrypoint in the realm's serialization queue (host/realm-queue.ts): without a
+	// nudge the chain advances one step per round and then stalls on an idle loop,
+	// which to a caller awaiting the result is indistinguishable from a hang. Same rule
+	// markDead follows — anything settling a promise from Go outside a task/timer path
+	// has to wake the loop.
+	g.loop.wake()
 }
 
 func (c *initiatorCall) free() {

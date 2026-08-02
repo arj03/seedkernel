@@ -287,29 +287,10 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		return s, nil
 	}))
 	qc.Global().SetPropertyStr("__fs", o)
-	if _, err := qc.Eval("fs-shim.js", qjs.Code(fsShimJS)); err != nil {
-		return fmt.Errorf("fs shim: %w", err)
-	}
 	return nil
 }
 
-// fsShimJS shapes the Go primitives into the host/fs.ts `Fs` interface the
-// cap-bridge consumes: a get miss is null, a hit is a Uint8Array, and list's
-// single \n-joined string becomes the string[]. The rest (put/size/delete/stat)
-// pass straight through. Existence is size ≥ 0, so there is no separate `has`.
-const fsShimJS = `
-"use strict";
-(function () {
-  const N = __fs;
-  globalThis.fs = {
-    get: (key) => { const r = N.get(key); return r === null ? null : new Uint8Array(r); },
-    put: (key, bytes) => N.put(key, bytes),
-    size: (key) => N.size(key),
-    // Keys cross as one \n-joined string (a single engine call); an empty listing
-    // arrives as "", which must map to [] — split would yield [""].
-    list: (prefix) => { const s = N.list(prefix); return s === "" ? [] : s.split("\n"); },
-    delete: (key) => N.delete(key),
-    stat: () => N.stat(),
-  };
-})();
-`
+// Go stops at the primitive. The shaping — get's null/Uint8Array, list's \n-joined string
+// back into a string[] — and the wrap that presents it as the async `Fs` seam (core/fs.ts)
+// both live in host/native-shim.ts. Both are adaptation rather than platform, so both
+// belong on the shared side of the line: Go grows with primitives, never with logic.
