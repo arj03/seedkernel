@@ -430,14 +430,28 @@ export class TransportHost implements Network, HostTransport {
         if (ok) p.resolve(payload.slice());
         else p.reject(new Error(dec.decode(payload)));
       },
-      linkAuth: (linkId, pk) => {
-        // The peer whitelist, host-side. It runs on the attribution
-        // the transport reports, which is the only place it cannot be skipped — a
-        // predicate handed to the guest to apply to itself gates nothing against a
-        // hostile occupant of the slot. The channel is closed here, by the holder of
-        // the descriptor, so the refusal holds whatever the guest does with the answer.
+      linkAuth: (linkId, pk, conceal) => {
+        // The peer whitelist, host-side. It runs on the attribution the transport
+        // reports, which is the only place it cannot be skipped — a predicate handed to
+        // the guest to apply to itself gates nothing against a hostile occupant of the
+        // slot.
+        //
+        // A refusal does NOT close the channel when the guest asked us to conceal it.
+        // The accepting end asks at msg3, before it has sent msg4, so closing here would
+        // answer the one question the four-message ordering exists to leave unanswered:
+        // whether the identity the caller dialed lives at this address. Silence, and the
+        // guest's own handshake deadline, is the refusal (§12.6.2).
+        //
+        // Nothing is given up by not closing. Against a *hostile* occupant the close was
+        // never the guarantee it looked like — an occupant that ignores this verdict can
+        // equally decline to close any socket, and can forge `from` on delivery without a
+        // link at all. What actually holds the refusal is that we never fire `onAuth` and
+        // `peerEdge` re-checks `admits` before a peer enters `connected`, so a refused
+        // peer reaches no cohort edge and no `linkedPeers()` regardless.
         if (!this.admits(pk)) {
-          try { this.channels.get(linkId)?.close(false); } catch { /* already gone */ }
+          if (!conceal) {
+            try { this.channels.get(linkId)?.close(false); } catch { /* already gone */ }
+          }
           return false;
         }
         this.openLinks.get(linkId)?.onAuth?.(toHex(pk));

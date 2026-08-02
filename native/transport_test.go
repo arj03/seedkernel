@@ -10,9 +10,9 @@ import (
 )
 
 // The full routing + transport runs as the
-// shared net-route.ts NodeNetworkCore + net.ts Transport inside QuickJS, over the
-// Go socket primitive. Two independent nodes (each its own NodeNetworkCore +
-// Transport) complete the PeerLink handshake, route, and exchange a typed
+// transport bundle's guest program inside QuickJS, over the
+// Go socket primitive. Two independent nodes (each running its own transport
+// guest) complete the PeerLink handshake, route, and exchange a typed
 // request/response over a real loopback socket — the dial/accept/promote/deliver
 // path and the correlation/timeout layer, none of it logic in Go.
 //

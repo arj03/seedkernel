@@ -371,10 +371,14 @@ function netDeliver(corr, noReply, fromBytes, proto, payload) {
   host.call(OP_DELIVER, args([corr], [noReply ? 1 : 0], concatBytes([fromBytes, head, payload])));
 }
 function netSettle(corr, ok, payload) { host.call(OP_SETTLE, args([corr], [ok ? 1 : 0], payload)); }
-/** Report an authenticated link. The answer is the host's ROSTER verdict; on a
- *  refusal it has already closed the channel, so this is a report, not a request. */
-function netLinkAuth(linkId, peerBytes) {
-  return host.call(OP_LINK_AUTH, args([linkId], [], peerBytes))[0] === 1;
+/** Ask the host's ROSTER whether this peer may link. Asked at the FIRST point the
+ *  peer is known and — critically — before this end has revealed anything about
+ *  itself: msg3 when accepting, msg4 when dialing. `conceal` tells the host a refusal
+ *  must be silent, which is true exactly when we have not yet sent our identity.
+ *  The gate is the host's because a predicate we applied to ourselves would gate
+ *  nothing; the ORDER is ours, and it is what keeps a refusal from being an oracle. */
+function netLinkAuth(linkId, peerBytes, conceal) {
+  return host.call(OP_LINK_AUTH, args([linkId], [conceal ? 1 : 0], peerBytes))[0] === 1;
 }
 function netPeerEdge(up, peerBytes) { host.call(OP_PEER_EDGE, args([], [up ? 1 : 0], peerBytes)); }
 function netReady(ok) { host.call(OP_READY, args([], [ok ? 1 : 0])); }
@@ -696,6 +700,14 @@ class Link {
     const idI = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
+    // The roster gate runs HERE — after decryption and signature, never on a claimed
+    // key, and before msg4 puts our identity and signature on the wire. A refusal is
+    // silence, so being turned away is indistinguishable from a msg3 that simply never
+    // arrived, and the caller learns nothing about who lives at this address. Nothing
+    // about us has gone out yet, and that is the whole point of the second round trip
+    // (§12.6.2, CHANNEL §10 invariant 5). Asking at becomeAuthed() instead would be one
+    // message too late.
+    if (!netLinkAuth(this.linkId, idI, true)) { this.stall(); return; }
     this.peerPubkey = idI; this.peerId = peerId;
 
     const h3 = this.h(this.th, w3);
@@ -716,6 +728,9 @@ class Link {
     // A mismatch here is a local fault, not a probe to hide from — we already
     // revealed ourselves at msg3 — so it aborts rather than stalls.
     if (this.expectPeerId && peerId !== toHex(this.expectPeerId)) { this.abort(); return; }
+    // Our own roster gate, on the end that dialed. Not concealed: we named ourselves at
+    // msg3, so there is nothing left to hide from this peer and an abort is honest.
+    if (!netLinkAuth(this.linkId, idR, false)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
     this.th = this.h(this.th, w4);
     try { this.deriveConcealedSession(); } catch { this.abort(); return; }
@@ -1144,11 +1159,9 @@ class Core {
   onAuth(peerId, link) {
     this.inbound.delete(link);
     Core.drop(this.connecting, peerId, link);
-    // The ROSTER first, then routing. The gate is the host's — it answers on the
-    // attribution reported here and has already closed the channel on a refusal —
-    // and asking before promoting is what keeps a refused peer from ever appearing
-    // on a cohort edge it would immediately have to be taken off again.
-    if (!netLinkAuth(link.linkId, link.peerPubkey)) { link.abort(true); return; }
+    // The roster already answered, at msg3 or msg4 — a link that reaches auth is one
+    // the host admitted, so a refused peer never appears on a cohort edge it would
+    // immediately have to be taken off again. All that is left here is routing.
     router.promote(peerId, link);
   }
 
@@ -1340,9 +1353,8 @@ entry("linkOpen", (r) => {
   // auth goes to the shared router, and the host tracks the link by its id.
   const link = new Link(Object.assign({}, spec, {
     onAuth: (peerId, l) => {
-      // The HOST's gate (the roster) first, then ours (the double-connect
-      // tie-break) — same order as a core link's, for the same reason.
-      if (!netLinkAuth(linkId, fromHex(peerId))) { l.abort(true); return; }
+      // The host's roster answered at msg3/msg4; what is left is ours — the
+      // double-connect tie-break.
       if (!router.promote(peerId, l)) l.close();
     },
     onFrame: (peerId, frame) => router.deliver(peerId, frame),

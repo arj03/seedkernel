@@ -4,20 +4,23 @@
 // program), signs a `role: "transport"` manifest with the transport author key,
 // packs the container, and writes:
 //
-//   build/transport.skb the bundle blob (--transport for the CLI)
-//   host/transport-bundle.ts base64 inline for the JS targets (like ws-wasm.ts)
-//                             — committed, so the artifact carries its own net
+//   build/transport.skb        the bundle blob (--transport for the CLI)
+//   host/transport-bundle.ts   base64 inline for the JS targets (like ws-wasm.ts)
 //
-// and prints the author id. THE AUTHOR ID IS WHAT POLICY PINS: the node admits
+// Both outputs are generated and gitignored. host/main.ts imports the second, so a
+// clean checkout cannot typecheck until this script has run — which is why both
+// `build` and `build:loader` sequence it ahead of tsc.
+//
+// It also prints the author id. THE AUTHOR ID IS WHAT POLICY PINS: the node admits
 // the transport only when the operator's `roles.transport` lists it (§12.5), so
 // a different build with a different key simply needs a different policy entry.
 //
 // The author key: `--key <32-byte seed hex>`. The default seed lives at
-// transport/author.key, generated on first run and NOT committed — the committed
-// transport-bundle.ts pins whichever author produced it, and rebuilding with a
-// fresh key produces a fresh author (update the policy). This is a well-known
-// developer identity, not a trust boundary: the operator's policy pin is the
-// trust decision.
+// transport/author.key, generated on first run and gitignored, so a fresh clone
+// mints its own transport author. Nothing in-repo pins a fixed id — a policy entry
+// is derived from the built artifact (`verifyBundle(blob).author`), which is what
+// the tests do. This is a well-known developer identity, not a trust boundary: the
+// operator's policy pin is the trust decision.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -48,7 +51,7 @@ async function main() {
   } else {
     seed = sodium.randombytes_buf(32);
     writeFileSync(keyPath, toHex(seed) + "\n", { mode: 0o600 });
-    console.log("  wrote transport/author.key (keep it; the committed bundle is signed by it)");
+    console.log("  wrote transport/author.key (keep it; this clone's bundle is signed by it)");
   }
   if (seed.length !== 32) throw new Error("--key must be 32 bytes of hex");
 

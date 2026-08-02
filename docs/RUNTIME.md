@@ -449,7 +449,7 @@ works against are the *host's* (`core/net-limits.ts`), because a limit protectin
 must be declared by whoever owns the resource — a host importing its own flood bound from
 the module it is bounding would be taking the bounded party's word for the bound. Measured
 behaviour lives in
-`tests/net-link.load.test.mjs`; the reasoning is in [CHANNEL](CHANNEL.md) §5.
+`tests/transport-load.test.mjs`; the reasoning is in [CHANNEL](CHANNEL.md) §5.
 
 - **No cryptography before proof.** An accepting link generates its ephemeral keypair only
   once a msg1 opens; verifying msg1 is a hash and a Poly1305 check. A stranger costs a

@@ -25,11 +25,11 @@ const {
 // rule (README §12.1), and these tests have to follow it like any other consumer.
 const sodium = await loadSodium();
 
-// Transport + WS module surface (moved up from seedstore in the runtime split,
-// the runtime split). These are seedkernel's own public exports — `./net-node`
-// (NodeNetwork) and the no-cap `./ws` framing module — so they are exercised here,
-// where they live, rather than only from a downstream consumer.
-const { NodeNetwork } = await imp("build/core/net-node.js");
+// Transport + WS module surface (moved up from seedstore in the runtime split).
+// These are seedkernel's own public exports — `./net-node` (NodeNetwork) and the
+// no-cap `./ws` framing module — so they are exercised here, where they live,
+// rather than only from a downstream consumer.
+const { NodeNetwork } = await imp("build/host/net-node.js");
 
 // One contact secret for the whole harness. In production each node has its own and
 // hands it out with its address; a single value here just means every test node is
@@ -41,7 +41,7 @@ const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host
 const { MemoryFs } = await imp("build/core/fs.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
-const { NodeFs } = await imp("build/core/fs-node.js");
+const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/core/util.js");
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
@@ -1284,26 +1284,6 @@ async function testSafeRealmConcurrency() {
   }
 
   console.log("  OK\n");
-}
-
-// ─── Test: RtcChannel drives PeerLink over a data channel (net-rtc) ──────
-//
-// WebRTC as a first-class Network: an RTCDataChannel is wrapped as a RawChannel
-// and the unchanged PeerLink runs its identity handshake over it. We exercise the
-// genuinely new code — RtcChannel, including its pre-open send buffering — with a
-// fake whole-message channel pair (no real ICE), driving a full mutual handshake
-// and a post-auth frame. RtcNetwork's signaling/perfect-negotiation needs a real
-// RTCPeerConnection (browser or node-datachannel) and is exercised there.
-
-function signalingPair() {
-  // Two endpoints that forward to each other. JSON round-tripping each message
-  // mirrors the relay wire (and proves the sdp/candidate objects RtcNetwork emits
-  // are plain and serialisable). Delivery is deferred, like a real socket.
-  let aCb = () => {}, bCb = () => {};
-  const post = (cb, msg) => { const m = JSON.parse(JSON.stringify(msg)); queueMicrotask(() => cb(m)); };
-  const a = { send: (m) => post(bCb, m), onMessage: (cb) => { aCb = cb; }, close() {} };
-  const b = { send: (m) => post(aCb, m), onMessage: (cb) => { bCb = cb; }, close() {} };
-  return [a, b];
 }
 
 // ─── Test: manifest suite byte — signed, so it cannot be edited in flight ────────

@@ -105,9 +105,10 @@ var sodiumExports = map[string]string{
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
 	// The §12.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
-	// wasm (handshake-only, amortized over the link). PeerLink (shared net-link.ts)
-	// drives them through the `sodium` object below. The ChaCha20-Poly1305-IETF record
-	// layer is native Go (see aeadEncrypt / the file header), so it needs no export here.
+	// wasm (handshake-only, amortized over the link). The transport bundle's guest
+	// reaches them through the cap-bridge's primitive catalog, which resolves to the
+	// `sodium` object below. The ChaCha20-Poly1305-IETF record layer is native Go
+	// (see aeadEncrypt / the file header), so it needs no export here.
 	"crypto_box_keypair": "Ua",
 	"crypto_scalarmult":  "Dg",
 }

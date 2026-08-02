@@ -3,7 +3,7 @@
 // cap). The kernel knows nothing about content-addressing or quota —
 // those are the storage guest's business, layered on top of these primitives. This
 // mirrors host/fs-node.ts (NodeFs) so a Go node's on-disk store behaves like a
-// Bun node's. Exposed into QuickJS as an `fs` object with the host/fs.ts `Fs`
+// Bun node's. Exposed into QuickJS as an `fs` object with the core/fs.ts `Fs`
 // shape, ready for the cap-bridge to wire as its fs backend.
 package main
 
@@ -231,7 +231,7 @@ func (f *nodeFs) delete(key string) bool {
 func (f *nodeFs) stat() int64 { return f.used }
 
 // exposeFs installs the `fs` object into the realm: Go byte primitives (ArrayBuffer
-// in / out) wrapped by a thin JS shim into the host/fs.ts `Fs` shape (Uint8Array,
+// in / out) wrapped by a thin JS shim into the core/fs.ts `Fs` shape (Uint8Array,
 // null for a miss). Keeping bytes in Go and the API shape in JS follows the project
 // rule — Go grows with primitives, the reusable interface lives in JS.
 func exposeFs(qc *qjs.Context, dir string) error {

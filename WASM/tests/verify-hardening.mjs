@@ -23,7 +23,6 @@ const { entryModuleOf, appScopeFor, genesisHash, signManifest, packBundle, MANIF
 const { createShell } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { LoopbackNetwork } = await imp("build/host/net.js");
 const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
 let pass = 0, fail = 0;

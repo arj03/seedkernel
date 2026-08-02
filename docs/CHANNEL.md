@@ -123,7 +123,7 @@ connection that opened a socket and said nothing already held a slot for the ful
 Silence only made garbage cost the same as silence.
 
 Constants and measured numbers: [RUNTIME](RUNTIME.md) §12.6.2 and
-`tests/net-link.load.test.mjs`.
+`tests/transport-load.test.mjs`.
 
 ## 6. Why three secrets and not one
 
@@ -336,7 +336,20 @@ about what guests are told, not a §12.6 one, and it is deliberately left open.
 13. The channel Ed25519 key is never an argument to `crypto_scalarmult`. Worth a grep test
     in CI — the invariant most likely to be lost to a convenient refactor.
 
-All but 13 are covered by `tests/net-link.test.mjs` and `tests/net-link.load.test.mjs`.
+All but 13 are covered by `tests/transport-link.test.mjs` and `tests/transport-load.test.mjs`,
+which pin them against the shipped transport bundle — through the real host stack, over an
+instrumented in-process channel — rather than against a library object a test could hold.
+
+**Where 5 lives, and why it is easy to lose.** The whitelist is the *host's* — a predicate
+handed to the guest to apply to itself gates nothing against a hostile occupant of the slot —
+but the *order* is the guest's, and the invariant is entirely about order. The gate is asked
+at the first point the peer is known and before this end has revealed anything about itself:
+`onMsg3` when accepting, `onMsg4` when dialing. Asking it from `becomeAuthed()` instead
+would be one message too late on the accepting side, because that is reached only after
+msg4 — the receiver's identity and signature — is already on the wire. A concealed refusal
+is also silence rather than a close: closing at msg3 would answer the same question the
+ordering exists to leave unanswered. `NET_LINK_AUTH` carries a `conceal` flag for exactly
+that distinction.
 
 ---
 
@@ -363,7 +376,7 @@ young.
 and network-key mixes, the silence discipline, the address format, and the record layer.
 
 **The DoS interaction.** A refused connection is held to its deadline, and msg1 grows ~16×.
-`tests/net-link.load.test.mjs` exists and the budgets are hardened, but its numbers are for
+`tests/transport-load.test.mjs` exists and the budgets are hardened, but its numbers are for
 an 81-byte msg1: re-run it against the new widths and re-check `MAX_HALF_OPEN_UNVERIFIED`
 against the resulting memory profile rather than against connection count. Keep the ordering
 when porting — the contact-secret seal on msg1 must be checked *before* KEM decapsulation,

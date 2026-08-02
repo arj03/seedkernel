@@ -6,7 +6,7 @@
 // This is the only networking that stays in Go. The
 // protocol that used to live here — the PeerLink handshake, the NodeNetwork routing
 // table, and the request/response + bulk Transport — now runs as the shared host JS
-// (net-link.ts, net-route.ts, net.ts) inside QuickJS, driven over this primitive via
+// (transport/guest.js, driven by host/transport-host.ts) inside QuickJS, over this via
 // __net (sock.go). ws.go is the WebSocket twin of this channel. Wire framing is
 // byte-identical to the TypeScript so a Go node and a Bun node interop.
 package main
@@ -22,7 +22,7 @@ import (
 
 // MAX_FRAME_BYTES (§12.6, §16.1): one wire-visible frame cap. This target holds its own
 // descriptors, so it declares and enforces its own copy — the same rule that puts the
-// declaration in host/net-limits.ts rather than in the transport it bounds. Keep the two
+// declaration in core/net-limits.ts rather than in the transport it bounds. Keep the two
 // in step; a socket seam must never read this number out of the module it is bounding.
 const maxFrameBytes = 16 << 20
 
@@ -58,7 +58,7 @@ func dialTCP(addr string) (net.Conn, error) {
 
 // ───────────────────────── RawChannel: a whole-message duplex ─────────────────
 
-// rawChannel delivers whole messages atomically (net-link.ts RawChannel). TCP gets
+// rawChannel delivers whole messages atomically (core/socket-seam.ts RawChannel). TCP gets
 // message boundaries from a length prefix; WS already has them. A channel owns one
 // socket, one read goroutine, and one writer goroutine; send only queues (it is safe
 // from any goroutine and never blocks on the socket) and takes ownership of its
@@ -76,7 +76,7 @@ type rawChannel interface {
 // ── sockChannel: the shared connection core (framed or raw) ────────────────────
 //
 // Both wire shapes are the same connection with a swappable strategy: length-framed
-// whole messages (net-link.ts RawChannel over TCP) and a raw byte duplex (the
+// whole messages (RawChannel over TCP) and a raw byte duplex (the
 // transport under the JS WebSocket codec, which does its own RFC 6455 framing). The
 // subtle parts live here exactly once — the writer goroutine with its bounded queue,
 // the dead lifecycle, and the close vs fail split. Only how a single send reaches

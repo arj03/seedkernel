@@ -147,11 +147,16 @@ export interface TransportSink {
     /** Settle an app's outbound request: `ok` ⇒ `payload` is the response, otherwise it is
      *  a utf8 failure message. */
     settle(corr: number, ok: boolean, payload: Uint8Array): void;
-    /** A link authenticated as `pk`. Returns false when the ROSTER refuses the peer — in
-     *  which case the host has already closed the channel, so the gate holds regardless of
-     *  what the occupant does with the answer. That is the whole reason the predicate lives
-     *  here and is not handed to the slot to apply to itself. */
-    linkAuth(linkId: number, pk: Uint8Array): boolean;
+    /** A link authenticated as `pk`. Returns false when the ROSTER refuses the peer. The
+     *  predicate lives here and is not handed to the slot to apply to itself, because a
+     *  predicate the occupant applies to itself gates nothing against a hostile one.
+     *
+     *  `conceal` says a refusal must be SILENT. The accepting end asks at msg3 — after it
+     *  has verified the caller and before it has said anything about itself — so an
+     *  immediate close there is exactly the oracle the four-message ordering exists to
+     *  remove (§12.6.2, CHANNEL §10 invariant 5). The dialing end asks at msg4, having
+     *  already named itself at msg3, and so has nothing left to conceal. */
+    linkAuth(linkId: number, pk: Uint8Array, conceal: boolean): boolean;
     /** A peer's first link came up (`up`) or its last one went down. */
     peerEdge(up: boolean, pk: Uint8Array): void;
     /** The answer to a `ready` entrypoint call. */
@@ -303,10 +308,12 @@ export const CAP = {
     //   may itself be async and because no op may re-enter the realm.
     NET_SETTLE: 22, // [corr u32][ok u8][payload | utf8 message] -> []  settle an app's
     //   outbound request under the corr the host assigned
-    NET_LINK_AUTH: 23, // [linkId u32][pk 32] -> [admitted u8]  this link authenticated as
-    //   `pk`. The ROSTER GATE answers: on a refusal the host has
-    //   already closed the channel, so the gate holds whatever the
-    //   slot occupant does with the answer.
+    NET_LINK_AUTH: 23, // [linkId u32][conceal u8][pk 32] -> [admitted u8]  this link
+    //   authenticated as `pk`. The ROSTER GATE answers. Asked at the
+    //   first point the peer is known and before we have revealed
+    //   ourselves — msg3 accepting, msg4 dialing — so the verdict can
+    //   still suppress our identity. `conceal` marks the accepting
+    //   case, where a refusal must be silence rather than a close.
     NET_PEER_EDGE: 24, // [up u8][pk 32] -> []  a peer's first link came up / last went down
     NET_READY: 25, // [ok u8] -> []  answer to the `ready` entrypoint
     NET_LINK_DOWN: 26, // [linkId u32][reason u8] -> []  a link the host handed over
@@ -878,7 +885,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
                 sink().settle(readU32BE(payload, 0), payload[4] === 1, payload.slice(5));
                 return NONE;
             case CAP.NET_LINK_AUTH:
-                return sink().linkAuth(readU32BE(payload, 0), payload.slice(4, 36)) ? ONE : ZERO;
+                return sink().linkAuth(readU32BE(payload, 0), payload.slice(5, 37), payload[4] === 1) ? ONE : ZERO;
             case CAP.NET_PEER_EDGE:
                 sink().peerEdge(payload[0] === 1, payload.slice(1, 33));
                 return NONE;

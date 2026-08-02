@@ -6,8 +6,8 @@
 // promise reactions run. quickjs's own os.setTimeout is overridden with Go-backed
 // timers, which means js_std_loop never has an os timer to block on (it just
 // drains jobs and returns — see qjs.Context.Pump). This is what lets the shared
-// host JS (net.ts Transport, net-link.ts PeerLink, net-node.ts NodeNetwork) run
-// unmodified instead of being re-implemented in Go.
+// host JS (transport-host.ts's driver, the transport bundle's guest program,
+// net-node.ts NodeNetwork) run unmodified instead of being re-implemented in Go.
 //
 // Threading: all QuickJS calls happen on the one goroutine that runs the loop.
 // Other goroutines (socket readers, in later phases) hand work in via post(),

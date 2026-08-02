@@ -16,7 +16,7 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 | `./net-rtc-node` | ✓ | |
 | `./libsodium` | | ✓ |
 | `./libsodium-core`, `./libsodium.wasm` | *(no direct importer — `libsodium-wrappers.mjs` resolves both relative to its own URL, so all three must stay in one directory)* | |
-| `./net-link`, `./ws` | | |
+| `./ws` | | |
 
 One consumer reaches something that is **not** an export: seedchat's WASM modules import `seedkernel-wasm/assembly/seedkernel/handler` — the guest half of the handler ABI (§4). AssemblyScript resolves that straight off the filesystem under `node_modules`, bypassing `exports` entirely, so it works today only because `package.json` has no `files` field and `assembly/` is not gitignored. **Adding a `files` field without including `assembly/` would silently break every app's build.** Nothing inside this repo imports that file either, so it looks like an orphan from in here and is not.
 

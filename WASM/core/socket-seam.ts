@@ -1,4 +1,4 @@
-// transport-seam.ts — the socket-side types shared by the host's raw-I/O layers
+// socket-seam.ts — the socket-side types shared by the host's raw-I/O layers
 // after the transport itself moved into the signed transport bundle
 // (§12.6).
 //

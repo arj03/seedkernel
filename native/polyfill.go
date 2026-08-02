@@ -8,7 +8,7 @@ import (
 
 // installPolyfills adds the few Web globals the shared host TS assumes but
 // quickjs-ng does not provide. TextEncoder/TextDecoder are used
-// at module-load time (e.g. net-link.ts's DOMAIN constant), so this must run
+// at module-load time (e.g. core/domains.ts's DOMAIN constants), so this must run
 // before any shared bundle is evaluated. UTF-8 only, which is all the host code
 // needs. Guarded so a future quickjs-ng with native versions wins.
 func installPolyfills(qc *qjs.Context) {
