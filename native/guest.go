@@ -219,8 +219,8 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	loop.addContext(g.qc, g.pump)
 
 	// The single seam. Read (op, callId, payload) from the guest and shuttle the call to
-	// the cap-bridge in the host realm. A sync op returns its bytes here; a net op returns
-	// null (its Transport promise isn't settled yet) and we return null too — the guest
+	// the cap-bridge in the host realm. A sync op returns its bytes here; an async op
+	// returns null (its promise isn't settled yet) and we return null too — the guest
 	// preamble then parks a Promise under callId, which settleNet resolves later.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
@@ -238,12 +238,28 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 			return nil, err
 		}
 		defer res.Free() // the cap call's own-ref result (sync bytes, or the JS_NULL immediate)
-		// CONTRACT: null is RESERVED for an async (net) op whose Transport promise hasn't
-		// settled. Every sync op (crypto/fs/clock/module) returns its bytes here. A future
-		// sync op returning null/undefined would be mistaken for a net op and leave a guest
+		// CONTRACT: null is RESERVED for an async op whose promise hasn't settled — NET_SEND
+		// and every FS_* (core/fs.ts is async on every target, so the native shim's
+		// synchronous __fs primitives are still wrapped into a resolved Promise). The
+		// remaining sync ops (crypto/clock/module) return their bytes here. A sync op
+		// returning null/undefined would be mistaken for an async one and leave a guest
 		// Promise pending forever — which is why cap-bridge.ts maps an empty MODULE_CALL
 		// reply to NONE rather than null.
 		if res.IsNull() {
+			// The op parked, and its settlement will arrive as a HOST-realm microtask
+			// (native-shim.ts capCall attaches `.then` → bridge.realmSettle). We are running
+			// inside the guest pump of some round, i.e. AFTER pumpAll already drained el.c
+			// this round — so without a nudge that microtask sits unqueued-for until
+			// something else happens to wake the loop, and step() blocks with no timer and
+			// no task. Nothing else is coming: a holder answering from local fs generates no
+			// I/O of its own, so the continuation (and the response it would produce) never
+			// runs and the peer sees silence until its stall clock fires. This is the same
+			// rule reportCall and markDead follow — anything that settles or parks a promise
+			// outside a task/timer path has to wake the loop (see eventLoop.wake).
+			//
+			// Cheap and self-limiting: only an op that actually parked wakes the loop, and
+			// wake() is a non-blocking send onto a buffered channel.
+			g.loop.wake()
 			return t.Context().NewNull(), nil
 		}
 		out, err := qjs.JsTypedArrayToGo(res)
