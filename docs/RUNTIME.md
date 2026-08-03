@@ -10,7 +10,7 @@
 
 ## 10. Performance
 
-The message path does **no asymmetric cryptography and no recursion**: routing a frame to a handler is a name lookup (§3) plus two scratch copies and the transform's own work (§4). The per-message signature verify that used to dominate is gone — authenticity is the channel's (§12.6), established once when the link opens, not checked per message.
+The message path does **no asymmetric cryptography and no recursion**: routing a frame to a handler is a name lookup (§3) plus two scratch copies and the transform's own work (§4). No per-message signature verify sits on that path: authenticity is the channel's (§12.6), established once when the link opens rather than checked per message.
 
 ### 10.1 Where the crypto is now
 
@@ -173,7 +173,7 @@ This is the chat shell's sandboxed-iframe confinement (§11) generalised: "run z
 - **Heap** — the realm's QuickJS runtime is capped (64 MiB default, `realmMemoryBytes` / `--guest-memory`). A runaway allocation fails inside the realm instead of taking the host's memory.
 - **Execution time** — a budget per entrypoint invocation (5s default, `guestDeadlineMs` / `--guest-timeout`, §16.1), enforced by a QuickJS interrupt handler on the browser/Node target and by a wazero deadline on the native one (§14 — QuickJS's own `maxExecutionTime` is inert in the vendored `qjs.wasm`, so a spinning guest there is stopped by terminating the wasm call, which costs the realm). It covers every path guest code runs on — the entrypoint, a continuation resumed after a host bridge settles, and one the event loop pumps directly (a plain `await`), which is the one that would otherwise let a guest buy an unbounded loop for the price of a single `await`. It measures the time the guest is **running**, not wall clock: the budget is suspended whenever the guest is parked awaiting a host bridge and resumed when its continuation runs. That split is what lets one number serve both roles — an initiator legitimately spends seconds parked on a `NET_SEND` without spending any budget, while a holder that loops forever burns it in a single segment. There is no nested-budget case, because serialization leaves exactly one budget window open at a time.
 
-Both cross every seam between the operator and the realm — CLI flag, `boot()`, `createShell`, `RealmFactory` — because a bound the shell accepts but no target can set is a bound nobody has. `deadlineMs` existed in the realm factory before any of those carried it, and was therefore dead: the default applied and nothing could change it. `--guest-timeout 0` reads as "no budget", so disabling one is something an operator says rather than something a missing flag does.
+Both cross every seam between the operator and the realm — CLI flag, `boot()`, `createShell`, `RealmFactory` — because a bound the shell accepts but no target can set is a bound nobody has — one the realm factory takes and nothing upstream carries is dead, since the default applies and nothing can change it. `--guest-timeout 0` reads as "no budget", so disabling one is something an operator says rather than something a missing flag does.
 
 Execution time is the operator's number, not the author's — unlike the handler memory ceiling (§4.1), which a bundle declares in its signed manifest. How long *this* node is willing to spend on one message is a property of the deployment, not of the code.
 
@@ -472,12 +472,12 @@ behaviour lives in
   both numbers stay the host's (`core/net-limits.ts`), and the occupant may only ask for
   the transition. Applying the 16 MiB application cap to an unauthenticated peer let a
   stranger reserve megabytes per connection. No handshake message today exceeds 113 bytes,
-  but the cap is 8 KiB rather than the 512 it started at because an ML-KEM-768
-  encapsulation key is 1,184 bytes: with `ml-kem-768` in the primitive catalog (§12.1), a
-  512-byte cap would have been the one remaining reason a post-quantum handshake still
-  needed a core rev — the socket seam refusing the message the catalog had just made
-  expressible (§14.1). At 8 KiB against the 1,024 unverified budget the bound is 8 MiB,
-  still small, and it no longer decides which suites are expressible.
+  but the cap is 8 KiB because an ML-KEM-768 encapsulation key is 1,184 bytes: with
+  `ml-kem-768` in the primitive catalog (§12.1), a cap tight enough to refuse one would be
+  the one remaining reason a post-quantum handshake needed a core rev — the socket seam
+  refusing the message the catalog had already made expressible (§14.1). At 8 KiB against
+  the 1,024 unverified budget the bound is 8 MiB, still small, and it decides nothing about
+  which suites are expressible.
 
 #### 12.6.2b One master seed, purpose-bound keys
 
@@ -602,7 +602,7 @@ pointing at the `"<author hex>:<app>"` of §12.4. To deliver, the host reads the
 
 **The `_offer` protocol.** The protocol id `_offer` is reserved for bundle transit (§12.4) — a peer sends a signed bundle blob, the recipient verifies and optionally admits it. It is never bound through the bindings table; the shell intercepts it before dispatch and handles it directly.
 
-**Declaring is free, so it is not worth attacking.** Any number of bundles may declare `handles: ["chat"]`; none receives a byte until the user points a binding at it. This is why no register is needed to keep names apart *and* no race replaces it: the two acts an ownership register used to conflate — landing code, and receiving traffic — are now separate, one authorized by policy and one chosen by the user.
+**Declaring is free, so it is not worth attacking.** Any number of bundles may declare `handles: ["chat"]`; none receives a byte until the user points a binding at it. This is why no register is needed to keep names apart *and* no race replaces it: the two acts an ownership register would conflate — landing code, and receiving traffic — are separate here, one authorized by policy and one chosen by the user.
 
 **Binding rules.** Three, and they are the whole of it:
 
