@@ -117,6 +117,10 @@ export interface RawNet {
      *  `MAX_FRAME_BYTES`. Both numbers are the host's (net-limits.ts) — this asks for
      *  the one transition, it does not name a bound. */
     raiseCap(linkId: number): void;
+    /** Bytes written to this link that are not yet on the wire (socket-seam.ts
+     *  `RawChannel.buffered`). Optional: a host whose channels cannot say omits it,
+     *  and the occupant's stall clock degrades to a plain deadline. */
+    buffered?(linkId: number): number;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -292,6 +296,11 @@ export const CAP = {
     //   book it was configured with, exactly as `fs` resolves a key)
     NET_LINK_SEND: 16, // [linkId u32][bytes ..] -> []
     NET_LINK_CLOSE: 17, // [linkId u32][graceful u8] -> []
+    NET_LINK_STAT: 27, // [linkId u32] -> [buffered u32 BE]  bytes written to this link
+    //   that are not yet on the wire. A READ, not an authority: it
+    //   tells the slot occupant whether an exchange is progressing
+    //   or stalled, which is the difference between a slow peer and
+    //   a dead one. 0 for a link that is gone or cannot say.
     NET_LINK_CAP: 18, // [linkId u32] -> []  raise this link's inbound frame cap from
     //   MAX_HANDSHAKE_FRAME_BYTES to MAX_FRAME_BYTES (net-limits.ts).
     //   Both numbers stay the host's; this asks for the transition.
@@ -527,7 +536,8 @@ export const CAP_DOMAINS = {
     module: [CAP.MODULE_CALL],
     clock: [CAP.CLOCK],
     timer: [CAP.TIMER_ARM, CAP.TIMER_CLEAR],
-    rawnet: [CAP.NET_LINK_OPEN, CAP.NET_LINK_SEND, CAP.NET_LINK_CLOSE, CAP.NET_LINK_CAP],
+    rawnet: [CAP.NET_LINK_OPEN, CAP.NET_LINK_SEND, CAP.NET_LINK_CLOSE, CAP.NET_LINK_CAP,
+        CAP.NET_LINK_STAT],
     transport: [CAP.NET_DELIVER, CAP.NET_SETTLE, CAP.NET_LINK_AUTH, CAP.NET_PEER_EDGE,
         CAP.NET_READY, CAP.NET_LINK_DOWN],
 };
@@ -851,6 +861,11 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             case CAP.NET_LINK_CAP:
                 rawNet().raiseCap(readU32BE(payload, 0));
                 return NONE;
+            case CAP.NET_LINK_STAT: {
+                const out = new Uint8Array(4);
+                writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
+                return out;
+            }
             // ── timers ───────────────────────────────────────────────────────────
             case CAP.TIMER_ARM:
                 // How many deadlines one guest may hold at once is bounded by the BACKEND,

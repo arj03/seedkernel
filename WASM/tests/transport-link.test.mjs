@@ -38,6 +38,11 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive 
     name, remoteAddr,
     sent: [], closeArgs: [], capRaised: false, dead: false, inFlight: 0,
     msg: null, cls: null, peer: null,
+    // The stall clock's progress signal (core/socket-seam.ts `RawChannel.buffered`):
+    // bytes written but not yet on the wire. A test drives it directly to model a
+    // backpressured socket — draining, or stuck.
+    backlog: 0,
+    buffered() { return this.backlog; },
     send(bytes) {
       if (this.dead) return;
       this.sent.push(Buffer.from(bytes).toString("hex"));
@@ -179,6 +184,58 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   long.then(() => { longSettled = true; });
   await new Promise((r) => setTimeout(r, 50));
   assert(!longSettled, "a peer's short-deadline request must not settle its long-deadline one");
+});
+
+await test("the deadline is a STALL clock: a request still draining out is not late", async (keep) => {
+  // The failure this exists to stop: a 50 MB PUT queued ~42 MB behind its sockets and
+  // every request in the window was cancelled at its 5 s deadline while the wire was
+  // moving perfectly. The clock was armed when the request was QUEUED, so it timed our
+  // own upload and blamed the holders for our backlog.
+  const chans = wirePair();
+  const st = keep(await linked(chans));
+  const proto = new TextEncoder().encode("_t");
+  st.B.driver.onRequest(() => new Promise(() => {}));   // never answers: only the clock can settle it
+
+  // A backpressured socket holding 40 KB of this request, draining 4 KB at a time —
+  // slower than the 100 ms deadline, so a queue-time clock would fire ~9 times over.
+  chans[0].backlog = 40_000;
+  const drain = setInterval(() => { chans[0].backlog = Math.max(0, chans[0].backlog - 4_000); }, 40);
+
+  const t0 = Date.now();
+  const settled = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+    .then(() => "resolved", () => Date.now() - t0);
+
+  // While it drains, the request must survive well past its own deadline.
+  await new Promise((r) => setTimeout(r, 300));
+  let done = false;
+  settled.then(() => { done = true; });
+  await new Promise((r) => setTimeout(r, 0));
+  assert(!done, `a request whose bytes are still going out must not be timed out (backlog ${chans[0].backlog})`);
+
+  // Once drained the peer genuinely owes an answer, so the clock becomes a plain
+  // silence window and settles — a stall clock is not a licence to hang.
+  const ms = await settled;
+  clearInterval(drain);
+  assert(typeof ms === "number", "an unanswered request must still reject once its bytes are out");
+  assert(ms > 300, `it must have outlived the queueing phase (settled after ${ms}ms)`);
+  assert(ms < 3000, `it must settle soon after draining, not hang (took ${ms}ms)`);
+});
+
+await test("a stalled link still settles on the deadline", async (keep) => {
+  // The other half: a backlog that never moves is a stuck wire, and no amount of
+  // "bytes are queued" may excuse it. Same 100 ms, same never-answering peer, but
+  // nothing drains.
+  const chans = wirePair();
+  const st = keep(await linked(chans));
+  const proto = new TextEncoder().encode("_t");
+  st.B.driver.onRequest(() => new Promise(() => {}));
+
+  chans[0].backlog = 40_000;                            // frozen: no drain interval
+  const t0 = Date.now();
+  const ms = await st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+    .then(() => "resolved", () => Date.now() - t0);
+  assert(typeof ms === "number", "a stalled request must reject");
+  assert(ms < 1500, `a frozen backlog must settle on the deadline, not wait forever (took ${ms}ms)`);
 });
 
 await test("handshake messages are exact-length: a trailing byte is refused", async (keep) => {

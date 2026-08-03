@@ -25,6 +25,10 @@ import type { TransportHost, LinkHandle } from "./transport-host.js";
 export interface WsLike {
   binaryType: string;
   readyState: number;
+  /** Bytes queued but not yet on the wire — the stall clock's progress signal
+   *  (socket-seam.ts `RawChannel.buffered`). Optional: not every WebSocket-shaped
+   *  object in a test double reports it. */
+  bufferedAmount?: number;
   send(data: Uint8Array): void;
   close(): void;
   addEventListener(type: "open" | "close" | "error", cb: () => void): void;
@@ -50,6 +54,9 @@ export class WsChannel extends BufferedChannel {
   }
 
   protected write(bytes: Uint8Array): void { this.ws.send(bytes); }
+
+  /** The WebSocket's own send backlog. */
+  protected backlog(): number { return this.ws.bufferedAmount ?? 0; }
 
   // WebSocket.close() sends the queued frames before the close frame, so a graceful
   // stop needs nothing extra here.

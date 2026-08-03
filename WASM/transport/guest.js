@@ -143,6 +143,9 @@ const OP_LINK_OPEN = 15;
 const OP_LINK_SEND = 16;
 const OP_LINK_CLOSE = 17;
 const OP_LINK_CAP = 18;
+// A READ of a link's unsent backlog — the only way this program can tell a slow
+// exchange from a stalled one, since everything else it sees is its own bookkeeping.
+const OP_LINK_STAT = 27;
 
 // The platform's event loop.
 const OP_TIMER_ARM = 19;
@@ -361,6 +364,10 @@ function netLinkOpen(destBytes) { return readU32BE(host.call(OP_LINK_OPEN, destB
 function netLinkSend(linkId, bytes) { host.call(OP_LINK_SEND, args([linkId], [], bytes)); }
 function netLinkClose(linkId, graceful) { host.call(OP_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
 function netLinkCap(linkId) { host.call(OP_LINK_CAP, args([linkId], [])); }
+/** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
+ *  or a channel that cannot say — both read as "nothing queued", which leaves the
+ *  stall clock to the deadline alone. */
+function netLinkBuffered(linkId) { return readU32BE(host.call(OP_LINK_STAT, args([linkId], [])), 0); }
 
 function netDeliver(corr, noReply, fromBytes, proto, payload) {
   const head = new Uint8Array(1 + proto.length);
@@ -907,6 +914,11 @@ class Router {
 
   linkedPeers() { return [...this.links.keys()]; }
   linkCount(peerId) { const a = this.links.get(peerId); return a ? a.length : 0; }
+  /** This peer's routable links, for the stall clock's backlog read. Empty for a peer
+   *  still dialing — whose frames sit in the pre-auth pool instead (Core.sendFrame),
+   *  where a handshake that never completes is the half-open deadline's business, not
+   *  this one's. */
+  linksTo(peerId) { return this.links.get(peerId) || []; }
 
   send(to, frame) {
     const pool = this.links.get(to);
@@ -992,10 +1004,77 @@ class Router {
 // backstop, which made a request's lifetime depend on unrelated traffic to the same
 // peer — a chatty request kept a stalled one alive, and a quiet-but-progressing
 // transfer died. The caller knows what it sent; it says so (`request` entrypoint).
+//
+// The deadline is a STALL clock, not a budget for the whole exchange. Arming it at
+// enqueue and letting it expire measured our OWN upload: a request whose bytes are
+// still draining out of a backpressured socket has not been answered late, it has not
+// finished being asked. A 50 MB PUT across two holders queued ~42 MB behind four
+// sockets and every request in the window was cancelled at 5 s while the wire was
+// working perfectly — the holders were blamed for our backlog.
+//
+// So on expiry this asks whether OUR OWN REQUEST is still going out, and only gives up
+// if it is not. Two numbers say it, both from bytes rather than from traffic:
+//
+//   flushed = sent − buffered   bytes for this peer that actually left (monotone)
+//   owed                        `sent` at the moment this request was handed over
+//
+// A link is FIFO, so `flushed ≥ owed` means precisely "this request's last byte is on
+// the wire". Until then the exchange has not begun — we are still asking — and an
+// expiry that finds `flushed` moving re-arms. After that the clock is a pure silence
+// window and settles on schedule.
+//
+// Bounding the re-arm by `owed` is what keeps this from being the old silence window
+// under a new name. Progress measured per PEER would let unrelated frames to the same
+// peer keep a request alive — a chatty caller resurrecting a stalled request, exactly
+// the flaw that got the previous design deleted. Later frames raise `sent`, never this
+// request's `owed`, so nothing another request does can extend this one past its own
+// transmission.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to}
     this.timers = new Map();    // corr → timerId
+    this.sent = new Map();      // peerId → bytes handed to its links, ever
+  }
+
+  /** Count bytes on their way to a peer — the numerator of the progress measure. */
+  note(to, n) { this.sent.set(to, (this.sent.get(to) || 0) + n); }
+
+  /** Bytes of ours that have actually left for this peer: everything handed over,
+   *  less what its links are still holding. Monotone non-decreasing while the wire
+   *  moves, flat while it does not. */
+  flushed(to) {
+    let buffered = 0;
+    for (const link of router.linksTo(to)) buffered += netLinkBuffered(link.linkId);
+    return (this.sent.get(to) || 0) - buffered;
+  }
+
+  /** Arm one request's stall clock. `owed` is `sent` including this request's own
+   *  frame — the point at which it has finished being asked. */
+  armStall(corr, to, deadlineMs, owed) {
+    // The baseline is taken on the FIRST expiry, not here. A frame handed over while the
+    // peer is still being dialled routes through the pre-auth pool, where there is no
+    // link to read a backlog from — so a baseline taken now would be `sent` with nothing
+    // subtracted, an over-estimate no later reading could ever beat, and every such
+    // request would settle on its first tick however hard the wire was working. One
+    // deadline of grace to find the link is the cost, and it is bounded by `owed` like
+    // everything else here.
+    let mark = null;
+    const tick = () => {
+      this.timers.delete(corr);
+      if (!this.pending.has(corr)) return;
+      const now = this.flushed(to);
+      // Still going out, and moving: we have not finished asking, so nothing here is
+      // late. Anything else — drained (the peer owes us an answer) or not moving (the
+      // wire is stuck) — settles.
+      if (now < owed && (mark === null || now > mark)) {
+        mark = now;
+        this.timers.set(corr, armTimer(deadlineMs, tick));
+        return;
+      }
+      this.pending.delete(corr);
+      netSettle(corr, false, utf8Encode("net.send: timeout to " + to.slice(0, 8)));
+    };
+    this.timers.set(corr, armTimer(deadlineMs, tick));
   }
 
   attach(sendFrame) {
@@ -1008,13 +1087,13 @@ class ReqRes {
       // A noReply send carries corr 0 and never resolves — the host keeps no
       // promise for it, so nothing here is parked on its behalf.
       this.pending.set(corr, { to });
-      this.timers.set(corr, armTimer(deadlineMs, () => {
-        this.timers.delete(corr);
-        if (!this.pending.delete(corr)) return;
-        netSettle(corr, false, utf8Encode("net.send: timeout to " + to.slice(0, 8)));
-      }));
     }
+    // Count the frame BEFORE it is handed over, so the first stall check cannot read a
+    // `flushed` that already includes bytes this request has not yet contributed.
+    this.note(to, frame.length);
+    const owed = this.sent.get(to);
     this.sendFrame(to, frame);
+    if (!noReply) this.armStall(corr, to, deadlineMs, owed);
   }
 
   buildReq(corr, noReply, proto, payload) {

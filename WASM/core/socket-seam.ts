@@ -60,6 +60,15 @@ export interface RawChannel {
  *  because a transport with its own message boundaries (an RTCDataChannel) has
  *  nothing to reassemble and so nothing to bound. */
   allowLargeFrames?(): void;
+  /** Bytes written to this channel that the transport has NOT yet put on the wire.
+ *  The one thing that distinguishes a slow exchange from a stalled one: a request
+ *  whose bytes are still draining is progressing, however long it is taking, while
+ *  one whose backlog has not moved is waiting on the far end. The transport
+ *  bundle's stall clock polls it (NET_LINK_STAT) instead of timing an exchange from
+ *  the moment it was *queued*, which measured our own upload and cancelled healthy
+ *  requests under backpressure. Optional: a transport that cannot say returns
+ *  nothing and the clock falls back to a plain deadline. */
+  buffered?(): number;
   /** Optional transport-supplied identifier for the far end (an IP, say), used
  *  only to bucket the per-source half-open cap — enforced in the transport
  *  bundle. Optional because not every transport has one. NEVER an identity. */
@@ -74,6 +83,9 @@ export interface RawByteStream {
   onData(cb: (chunk: Uint8Array) => void): void;
   onClose(cb: () => void): void;
   close(): void;
+  /** Written-but-unsent bytes, if this stream's backend can say — the same progress
+   *  signal `RawChannel.buffered` reports, one layer down. */
+  buffered?(): number;
 }
 
 /** How a peer is reachable (README §12.6). The optional contact secret is THE

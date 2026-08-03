@@ -396,6 +396,12 @@ export class TransportHost implements Network, HostTransport {
       raiseCap: (linkId) => {
         try { this.channels.get(linkId)?.allowLargeFrames?.(); } catch { /* no cap */ }
       },
+      // A link that is gone, or a channel that cannot say, both read 0 — indistinguishable
+      // from "nothing queued", which is the safe answer: the occupant's stall clock then
+      // sees no progress and lets the deadline decide, exactly as before this existed.
+      buffered: (linkId) => {
+        try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
+      },
     };
   }
 

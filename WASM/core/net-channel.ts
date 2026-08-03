@@ -12,15 +12,25 @@ export abstract class BufferedChannel {
     private readonly pending: Uint8Array[] = [];
     protected opened = false;
     protected dead = false;
+    private pendingBytes = 0;
     protected abstract write(bytes: Uint8Array): void;
     protected abstract stop(graceful: boolean): void;
+    /** Bytes this transport is still holding — its own socket backlog, which only the
+     *  subclass can name (`writableLength`, `bufferedAmount`, …). Default 0 for a
+     *  transport that cannot say; `buffered()` still reports the pre-open queue. */
+    protected backlog(): number { return 0; }
+    /** Written-but-not-yet-on-the-wire bytes: the pre-open queue plus the transport's
+     *  own backlog. Feeds the transport bundle's stall clock (socket-seam.ts). */
+    buffered(): number { return this.pendingBytes + this.backlog(); }
     send(bytes: Uint8Array): void {
         if (this.dead)
             return;
         if (this.opened)
             this.write(bytes);
-        else
+        else {
             this.pending.push(bytes);
+            this.pendingBytes += bytes.length;
+        }
     }
     onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
     onClose(cb: () => void): void { this.onCls = cb; }
@@ -43,6 +53,7 @@ export abstract class BufferedChannel {
         for (const b of this.pending)
             this.write(b);
         this.pending.length = 0;
+        this.pendingBytes = 0;
     }
     /** A whole message arrived. */
     protected deliver(bytes: Uint8Array): void { if (!this.dead)

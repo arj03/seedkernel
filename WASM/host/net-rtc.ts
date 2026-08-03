@@ -112,6 +112,8 @@ export class RtcChannel extends BufferedChannel {
         dc.addEventListener("error", () => this.fail());
     }
     write(bytes: Uint8Array): void { this.dc.send(bytes as unknown as ArrayBuffer); }
+    /** The data channel's own send backlog. */
+    protected backlog(): number { return this.dc.bufferedAmount ?? 0; }
     // RTCDataChannel.close() drains bufferedAmount before the channel goes away, so a
     // graceful stop needs nothing extra here.
     stop(_graceful: boolean): void { this.dc.close(); }

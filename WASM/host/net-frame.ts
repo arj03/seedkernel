@@ -36,6 +36,8 @@ abstract class WsChannelBase extends BufferedChannel {
     write(bytes: Uint8Array): void {
         this.stream.write(encodeFrame(WS_OPCODES.OP_BINARY, bytes, this.mask()));
     }
+    /** The byte stream's backlog, when its backend reports one (a Node socket does). */
+    protected backlog(): number { return this.stream.buffered?.() ?? 0; }
     // A graceful stop sends the RFC 6455 close frame first. It rides the same byte
     // stream as the binary frame PeerLink just wrote, so it cannot overtake it — which
     // is the ordering the end-of-stream record depends on. RawByteStream.close() has no

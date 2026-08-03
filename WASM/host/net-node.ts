@@ -55,6 +55,9 @@ class TcpChannel extends BufferedChannel {
         socket.on("close", () => this.fail());
         socket.on("error", () => this.fail());
     }
+    /** Node's own write backlog for this socket — bytes accepted by `write()` that the
+     *  kernel has not taken yet. */
+    protected backlog(): number { return this.socket.writableLength; }
     write(bytes: Uint8Array) {
         const out = new Uint8Array(4 + bytes.length);
         writeU32BE(out, 0, bytes.length);
@@ -116,6 +119,7 @@ function nodeRawStream(socket: Socket): RawByteStream {
         // error and close both mean "gone"; WsChannelBase.fail() is idempotent.
         onClose: (cb: () => void) => { socket.on("close", cb); socket.on("error", cb); },
         close: () => { socket.destroy(); },
+        buffered: () => socket.writableLength,
     };
 }
 function listenOn(server: TcpServer, opt: { host: string; port: number }): Promise<number> {
