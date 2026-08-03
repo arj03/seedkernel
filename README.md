@@ -31,18 +31,7 @@ Every binding is three orthogonal pieces: the **name** is the kernel's opaque di
 
 > **A function belongs in a lower layer only if it cannot be correctly implemented at the endpoints.**
 
-Applied to everything usually called "the network":
-
-| Function | Endpoint substitute | Verdict |
-| --- | --- | --- |
-| Authenticity of distributed code | The bundle signature, which travels with the bundle | **Content** |
-| Authenticity of relayed messages | Per-message signing by the app that relays | **Content** |
-| Confidentiality | The endpoints hold the keys | **Content** |
-| Framing, ordering, correlation, routing | State machines over whole messages | **Content** |
-| Content-addressing, quota, encryption at rest | The app that stores the bytes | **Content** |
-| **Moving bytes from A to B, or to disk and back** | **None. There is no such thing.** | **Core** |
-
-Transmission and persistence are the only functions definitionally the platform's. That is the argument for raw I/O being core — not bootstrapping, not convenience, not that the crypto is already linked in. There is nowhere else to put it.
+Almost nothing usually called "the network" survives it, because almost all of it has an endpoint substitute: authenticity of code is the bundle signature that travels with it, and of a relayed message the relaying app's own signature; confidentiality is the endpoints holding the keys; framing, ordering, correlation and routing are state machines over whole messages; content-addressing, quota and encryption at rest belong to whichever app stores the bytes. All of it is content. **Moving bytes from A to B, or to disk and back, has no substitute — there is no such thing.** That is the argument for raw I/O being core: not bootstrapping, not convenience, not that the crypto is already linked in. There is nowhere else to put it.
 
 The end-to-end test decides *which side* of the line a function is on. A second rule decides *what shape the line has*:
 
@@ -176,7 +165,7 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 474 |
 | Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 386 |
 | Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, suite ids, the primitive catalog | `core/*.ts` (8 files) | 369 |
-| WS codec and framing | `host/ws/*`, `host/net-frame.ts` | 261 |
+| WebSocket codec and framing | `host/ws/*`, `host/net-frame.ts` | 261 |
 
 **Per-target platform — the seam, written once per target**
 
