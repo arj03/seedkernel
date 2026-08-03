@@ -54,10 +54,9 @@ The channel handshake, the record layer, link routing and the request/response f
 
 What this buys is that the **protocol** is replaceable without a fork: the handshake's messages, its transcript, the record framing and the dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime.
 
-Three properties make that safe:
+Two properties make that safe:
 
 - **A transport module is an authority grant, not a preference.** Admitting an ordinary app risks that app; admitting a transport risks the channel, which sees all plaintext and holds the session keys. `roleAllowlist` admits per slot, and an author trusted for apps cannot land a transport without a second deliberate `roles` entry (§12.5).
-- **The version floor is keyed to the slot, not the author.** A slot whose occupant everyone else must interoperate with needs a floor keyed to the *role*, or A's transport v5 would do nothing to stop B's transport v1 (§12.4).
 - **The suite byte makes a mixed period a rollout rather than a corruption.** One suite per link, unknown ids close the connection, and the byte is covered by both signatures and read before verification (§12.6). An in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies.
 
 **It can be swapped under a running node.** A second bundle claiming the slot goes through the ordinary `loadBundle` path: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the occupant confineable. An upgrade is a **reconnect**.

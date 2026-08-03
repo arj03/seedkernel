@@ -511,18 +511,15 @@ export function createShell(opts: CreateShellOptions & {
             if (!ok)
                 throw new Error("bundle: rejected by admission predicate");
             // A slot occupant's load is not "done" when its modules bind — the driver
-            // must STAND — so its marks are deferred (installBundle `deferMark`) and
+            // must STAND — so its mark is deferred (installBundle `deferMark`) and
             // advanced only after installTransport below: a transport guest that fails
             // to compile raises nothing, and the node — still running the transport it
             // had — can still roll back to the previous version. The mark must record
             // the highest version that actually loaded (README §12.4).
             const loaded = installBundle(host, v, platform.freshnessStore, v.manifest.role !== undefined);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
-            const advanceMarks = (): void => {
-                const fs = platform.freshnessStore;
-                fs.set(loaded.author, loaded.manifest.app, v.manifest.version);
-                if (v.manifest.role !== undefined)
-                    fs.setRole(v.manifest.role, v.manifest.version);
+            const advanceMark = (): void => {
+                platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
             };
             // A slot occupant is not an app: it binds no protocol ids (its handles
             // would claim a dispatch the runtime itself performs), receives no inbound
@@ -538,7 +535,7 @@ export function createShell(opts: CreateShellOptions & {
                     await installTransport(slot);
                 roles.set(role, slot);
                 roleKeys.set(role, key);
-                advanceMarks();
+                advanceMark();
                 return loaded;
             }
             bindings.autoBind(key, handlesOf(loaded.manifest));

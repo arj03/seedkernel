@@ -692,10 +692,10 @@ async function testGuestAbi() {
   console.log("  OK\n");
 }
 
-// ─── Test: the slot freshness floor (§12.4) ─────────────────────────────
+// ─── Test: a slot occupant's freshness (§12.4) ──────────────────────────
 
-async function testSlotFreshnessFloor() {
-  console.log("Test: a slot's freshness floor is keyed by the slot, not by the signer");
+async function testSlotFreshness() {
+  console.log("Test: a slot occupant carries the ordinary (author, app) freshness mark");
 
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { KernelHost } = await imp("build/core/kernel-host.js");
@@ -711,44 +711,38 @@ async function testSlotFreshnessFloor() {
     installBundle(host, verifyBundle(sodium, blobFrom(author, version, role)), freshness);
   };
 
-  // The case the (author, app) key cannot see: A's v5 lands, then B — a DIFFERENT
-  // trusted author, whose own mark is still −∞ — offers v1 of the same slot. Under the
-  // per-author key alone that is a fresh install; under the slot floor it is a
-  // downgrade, which is the whole point (§12.4).
+  // Versions are an author's own lineage, slot or no slot. A's v5 landing does NOT bind
+  // B to number above it: a floor keyed to the slot would put two independent authors on
+  // one shared version line with no owner, and would only pay where an attacker chooses
+  // which signed bundle arrives — which nothing delivering a bundle allows (§12.4).
   {
     const freshness = new FreshnessMarks();
     const host = new KernelHost();
     land(host, freshness, a, 5, "transport");
-    assertEqual(freshness.getRole("transport"), 5, "landing a slot occupant raises the slot floor");
+    assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a slot occupant advances its (author, app) mark");
+    land(host, freshness, b, 1, "transport");
+    assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's slot bundle answers to its own lineage");
+  }
+
+  // Each author is still held to their own mark — dropping the slot floor weakens
+  // nothing about the downgrade that has always been in scope.
+  {
+    const freshness = new FreshnessMarks();
+    const host = new KernelHost();
+    land(host, freshness, a, 5, "transport");
     let refused = false;
-    try { land(host, freshness, b, 1, "transport"); } catch { refused = true; }
-    assert(refused, "a second author's stale slot bundle is refused by the slot floor");
-    land(host, freshness, b, 6, "transport");
-    assertEqual(freshness.getRole("transport"), 6, "a newer bundle from another author advances the floor");
+    try { land(host, freshness, a, 4, "transport"); } catch { refused = true; }
+    assert(refused, "an author's own stale slot bundle is still refused as a downgrade");
   }
 
-  // The floor is the slot's alone: an ordinary app at v1 is untouched by it, and
-  // claiming no slot writes no floor.
+  // The store holds marks and revocations only. A file written by a host that also kept
+  // per-slot floors still loads — an unrecognized key is ignored, not refused — and is
+  // rewritten without it.
   {
-    const freshness = new FreshnessMarks();
-    const host = new KernelHost();
-    land(host, freshness, a, 5, "transport");
-    land(host, freshness, b, 1, undefined);
-    assertEqual(freshness.get(b.publicKey, "link"), 1, "an app is governed by its own (author, app) mark");
-    assertEqual(freshness.getRole("transport"), 5, "an app load leaves the slot floor alone");
-  }
-
-  // It survives a reboot through the same serialization as the marks, and a store
-  // written before slot floors existed reads as no floor rather than throwing.
-  {
-    const freshness = new FreshnessMarks();
-    freshness.setRole("transport", 4);
-    const json = JSON.stringify({ marks: {}, roles: { transport: 4 }, revoked: [] });
-    const reloaded = new FreshnessMarks(json);
-    assertEqual(reloaded.getRole("transport"), 4, "the floor round-trips through the persisted store");
-    const old = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, revoked: [] }));
-    assertEqual(old.getRole("transport"), -Infinity, "a store predating slot floors reads as no floor");
-    assertEqual(old.get(new Uint8Array(0), "app"), -Infinity, "…and its existing marks are untouched");
+    const legacy = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, roles: { transport: 4 }, revoked: [] }));
+    const round = JSON.parse(legacy.serialize());
+    assertEqual(round.marks["aa:app"], 2, "a store carrying slot floors still loads its marks");
+    assert(round.roles === undefined, "…and is rewritten with no slot floors");
   }
 
   console.log("  OK\n");
@@ -1919,7 +1913,7 @@ await testFs();
 await testCapBridge();
 await testPolicy();
 await testGuestAbi();
-await testSlotFreshnessFloor();
+await testSlotFreshness();
 await testShellBoot();
 await testBundle();
 await testGuestlessBundleAndArchive();

@@ -126,12 +126,11 @@ export interface BundleManifest {
      *  Signed, so what a bundle claims to be is the author's statement and not the
      *  deliverer's, and one of `BUNDLE_ROLES` or the load is refused.
      *
-     *  Two things key off it, and both are the ways a slot differs from an app. Admission:
-     *  a slot occupant is an authority grant, not a preference, so the ordinary author
-     *  allowlist does NOT admit one — it needs a per-slot decision (`roleAllowlist`).
-     *  Freshness: the high-water mark is keyed by the slot as well as by `(author, app)`,
-     *  because a floor keyed only to the signer says nothing about a *different* trusted
-     *  author's stale v1 (see `FreshnessStore.getRole`). */
+     *  Admission is what keys off it, and it is the way a slot differs from an app: a slot
+     *  occupant is an authority grant, not a preference, so the ordinary author allowlist
+     *  does NOT admit one — it needs a per-slot decision (`roleAllowlist`). Freshness is
+     *  not: a slot occupant carries the same `(author, app)` high-water mark as any other
+     *  bundle, so each author keeps their own version lineage (§12.4). */
     role?: BundleRole;
     modules: BundleModule[];
     /** Which module receives inbound dispatch for a handler-only bundle — the `name` of
@@ -235,19 +234,6 @@ export interface FreshnessStore {
     get(author: Uint8Array, app: string): number;
     /** Advance the mark to `version` (monotonic; a lower value never rewinds it). */
     set(author: Uint8Array, app: string, version: number): void;
-    /** The highest `version` ever loaded into this SLOT, by any author, or −Infinity.
-     *
-     *  A second floor, not a replacement: `(author, app)` is the right key for an app,
-     *  because versions are an author's own lineage and two authors' apps are unrelated
-     *  things that happen to share a name. A slot is the opposite — its occupant is a role
-     *  every peer must interoperate with (§12.4) — so a floor keyed to whoever signed says
-     *  nothing about the case that matters. If policy trusts authors A and B for the
-     *  transport slot, A's v5 landing leaves B's mark at −∞, and an adversary controlling
-     *  the path serves B's validly signed v1 with a weaker suite and it is admitted as
-     *  fresh. Keying the floor to the slot is what makes that a refused downgrade. */
-    getRole(role: string): number;
-    /** Advance a slot's floor (monotonic, like `set`). */
-    setRole(role: string, version: number): void;
     /** Has this author key been written off (§12.5)? Checked on every load. */
     isRevoked(author: Uint8Array): boolean;
     /** Write off an author key permanently. Monotonic like the marks: nothing in the
@@ -787,12 +773,10 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
  *  nothing, which is exactly right for a test. */
 export class FreshnessMarks {
     marks = new Map();
-    /** Slot floors, keyed by role name — author-independent by construction (§12.4). */
-    roleMarks = new Map();
     /** Author keys written off (§12.5), as lowercase hex. */
     revoked = new Set();
     /** Seed from a persisted
-     *  `{ marks: { "authorHex:app": version }, roles: { role: version }, revoked: [hex] }`
+     *  `{ marks: { "authorHex:app": version }, revoked: [hex] }`
      *  blob. Absent or unreadable input ⇒ start empty (−∞ for every key, nothing
      *  revoked); a target's loader hands in null rather than throwing, since a missing
      *  store is the first-boot case.
@@ -806,12 +790,8 @@ export class FreshnessMarks {
      *  upgrade, with the next stale bundle accepted and nothing anywhere saying why. An
      *  operator must be told to migrate or delete the file; the shape is unambiguous
      *  (a bare map has neither key), so this can never fire on a store this version
-     *  wrote.
-     *
-     *  A store written before slot floors existed has no `roles` and needs no migration:
-     *  it reads as no floors, which is exactly true — nothing could have claimed a slot on
-     *  a host that had none. That is the difference from the case above, where the missing
-     *  key would have silently dropped guards that HAD been earned. */
+     *  wrote. Any other unrecognized key is ignored rather than refused — dropping one
+     *  discards nothing a guard was ever earned on. */
     constructor(json?: string | null) {
         if (json) {
             let raw;
@@ -835,13 +815,6 @@ export class FreshnessMarks {
                             this.marks.set(k, v);
                     }
                 }
-                const roles = raw.roles;
-                if (typeof roles === "object" && roles !== null && !Array.isArray(roles)) {
-                    for (const [k, v] of Object.entries(roles)) {
-                        if (typeof v === "number")
-                            this.roleMarks.set(k, v);
-                    }
-                }
                 if (Array.isArray(raw.revoked)) {
                     for (const a of raw.revoked)
                         if (typeof a === "string")
@@ -850,15 +823,12 @@ export class FreshnessMarks {
             }
         }
     }
-    /** Serialize the marks, the slot floors and the dead-key set for `persist`. */
+    /** Serialize the marks and the dead-key set for `persist`. */
     serialize(): string {
         const marks: Record<string, number> = {};
         for (const [k, v] of this.marks)
             marks[k] = v;
-        const roles: Record<string, number> = {};
-        for (const [k, v] of this.roleMarks)
-            roles[k] = v;
-        return JSON.stringify({ marks, roles, revoked: [...this.revoked] });
+        return JSON.stringify({ marks, revoked: [...this.revoked] });
     }
     /** Write the serialized state durably. The base store is in-memory only; a target
      *  overrides this with its atomic-write seam (README §12.4 requires the write be
@@ -876,17 +846,6 @@ export class FreshnessMarks {
         if (cur !== undefined && cur >= version)
             return; // monotonic: never rewound
         this.marks.set(k, version);
-        this.persist(this.serialize());
-    }
-    getRole(role: string): number {
-        const v = this.roleMarks.get(role);
-        return v === undefined ? -Infinity : v;
-    }
-    setRole(role: string, version: number): void {
-        const cur = this.roleMarks.get(role);
-        if (cur !== undefined && cur >= version)
-            return; // monotonic: never rewound
-        this.roleMarks.set(role, version);
         this.persist(this.serialize());
     }
     isRevoked(author: Uint8Array): boolean {
@@ -962,8 +921,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  function's: a slot occupant is only loaded once its driver STANDS, which happens
  *  after this returns (shell-core `loadBundleBlob` → `installTransport`). A realm
  *  built from the guest source can fail there, and the node then keeps the transport
- *  it had — so advancing the mark inside would raise the (author, app) mark and the
- *  role floor before that was known, bricking a rollback to the last good version
+ *  it had — so advancing the mark inside would raise the (author, app) mark before that
+ *  was known, bricking a rollback to the last good version
  *  (the exact outcome the downgrade refusals above exist to prevent). The caller
  *  passes `deferMark` for a role bundle and advances at the point the load is
  *  complete (§12.4: "the mark must record the highest version that actually loaded"). */
@@ -989,16 +948,14 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
         if (version < highWater) {
             throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
         }
-        // The slot floor, for a bundle that claims one. Checked in ADDITION to the mark
-        // above and keyed only by the role, so a second trusted author cannot reset the
-        // floor to −∞ by signing an old transport with a key that has never occupied the
-        // slot (FreshnessStore.getRole).
-        if (v.manifest.role !== undefined) {
-            const roleFloor = freshness.getRole(v.manifest.role);
-            if (version < roleFloor) {
-                throw new Error(`bundle: version ${version} is below the "${v.manifest.role}" slot freshness floor ${roleFloor} — downgrade refused`);
-            }
-        }
+        // A slot occupant is checked no differently: versions are an author's own lineage,
+        // so a bundle claiming a slot carries the ordinary `(author, app)` mark and nothing
+        // second keyed to the role. A floor keyed to the slot would bind every author of it
+        // to one shared version line — B could not replace A's v5 without numbering above
+        // it, a sequence with no owner — and it would buy protection only where an attacker
+        // chooses which signed bundle arrives. Nothing delivers a bundle but the operator
+        // (§12.4), so the answer to "two trusted authors, one stale" is to trust one author
+        // per slot at a time (§12.5).
         // NB: the mark is advanced at the *end* of this function, only after every module
         // has instantiated and bound — not here. See below.
     }
@@ -1046,8 +1003,6 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // verify — and, with `deferMark`, behind the driver standing as well.
     if (freshness && !deferMark) {
         freshness.set(v.author, v.manifest.app, version);
-        if (v.manifest.role !== undefined)
-            freshness.setRole(v.manifest.role, version);
     }
     return {
         manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, suite: v.suite,
