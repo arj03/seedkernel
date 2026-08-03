@@ -8,10 +8,6 @@
       "types": "./build/host/node.d.ts",
       "default": "./build/host/node.js"
     },
-    "./browser": {
-      "types": "./build/host/browser.d.ts",
-      "default": "./build/host/browser.js"
-    },
     "./net": {
       "types": "./build/core/net.d.ts",
       "default": "./build/core/net.js"
@@ -31,10 +27,6 @@
     "./net-rtc-node": {
       "types": "./build/host/net-rtc-node.d.ts",
       "default": "./build/host/net-rtc-node.js"
-    },
-    "./ws": {
-      "types": "./build/host/ws.d.ts",
-      "default": "./build/host/ws.js"
     },
     "./fs": {
       "types": "./build/core/fs.d.ts",
@@ -78,12 +70,7 @@
     },
     "./libsodium": "./browser/libsodium-wrappers.mjs",
     "./libsodium-core": "./browser/libsodium-core.mjs",
-    "./libsodium.wasm": "./browser/libsodium.wasm",
-    "./package.json": "./package.json",
-    "./kem": {
-      "types": "./build/core/kem.d.ts",
-      "default": "./build/core/kem.js"
-    }
+    "./libsodium.wasm": "./browser/libsodium.wasm"
   },
   "scripts": {
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release && node scripts/inline-ws.mjs",
