@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"time"
 	"testing"
 
 	"seedloader/qjs"
@@ -13,6 +14,20 @@ import (
 // single `__capBridge(op, bytes)` funnel and checked against the underlying
 // primitive, plus the cap-domain gate (an undeclared op is refused).
 
+// The op numbers of cap-bridge.ts's CAP catalog, named here so a renumbering shows up as
+// one edit rather than as bare integers scattered through the assertions.
+const (
+	capCrypto      = 1
+	capSign        = 2
+	capIdentity    = 3
+	capNetSend     = 5
+	capNetPeers    = 6
+	capFsGet       = 7
+	capFsPut       = 8
+	capClock       = 14
+	capNetLinkSend = 16
+)
+
 func TestCapBridgeOps(t *testing.T) {
 	capBridgeRealm(t)
 
@@ -21,7 +36,11 @@ func TestCapBridgeOps(t *testing.T) {
 	// derives it from the manifest's (author, app), here a throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		globalThis.__scope = guestSignScope(__id.publicKey, "testapp");
+		// What SIGN signs under is a SLOT-derived scope — domain, scope bytes and the key
+		// that signs, all three. __scopeBytes is the middle third, which this test
+		// reconstructs the preimage from.
+		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
+		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
 		__buildCapBridge(["crypto", "fs", "clock"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
@@ -48,61 +67,87 @@ func TestCapBridgeOps(t *testing.T) {
 	// for the bridge's own use, so it can be read directly.
 	pk := jsBytes(t, qc, `__id.publicKey`)
 
-	// CAP.HASH (1): 32-byte generic hash, must equal sodium.crypto_generichash.
-	h := callBytes(1, []byte("hello seedkernel"))
+	// A primitive is reached BY NAME through the one CAP_CRYPTO op, so there is no op
+	// number per algorithm and no ABI rev to add one.
+	prim := func(name string, args []byte) []byte {
+		t.Helper()
+		out := append([]byte{byte(len(name))}, name...)
+		return callBytes(capCrypto, append(out, args...))
+	}
+
+	// blake2b-256: must equal sodium.crypto_generichash.
+	h := prim("blake2b-256", []byte("hello seedkernel"))
 	if len(h) != 32 {
-		t.Fatalf("HASH len = %d, want 32", len(h))
+		t.Fatalf("blake2b-256 len = %d, want 32", len(h))
 	}
 	want := jsBytes(t, qc, `sodium.crypto_generichash(32, new TextEncoder().encode("hello seedkernel"))`)
 	if !bytes.Equal(h, want) {
-		t.Fatalf("HASH = %x, want %x", h, want)
+		t.Fatalf("blake2b-256 = %x, want %x", h, want)
 	}
 
-	// CAP.IDENTITY (5): this node's public key.
-	if id := callBytes(5, nil); !bytes.Equal(id, pk) {
+	// IDENTITY: this node's public key.
+	if id := callBytes(capIdentity, nil); !bytes.Equal(id, pk) {
 		t.Fatalf("IDENTITY = %x, want node pubkey %x", id, pk)
 	}
 
-	// CAP.SIGN (3) + CAP.VERIFY (4): SIGN is scoped, so it signs DOMAIN_guest ‖ scope ‖
-	// msg, not raw msg. VERIFY stays raw, so we reconstruct the prefixed preimage.
+	// SIGN is scoped, so it signs DOMAIN_guest ‖ scope ‖ msg, not raw msg. The verify
+	// primitive stays raw, so we reconstruct the prefixed preimage.
 	msg := []byte("a message to sign")
-	sig := callBytes(3, msg)
+	sig := callBytes(capSign, msg)
 	if len(sig) != 64 {
 		t.Fatalf("SIGN len = %d, want 64", len(sig))
 	}
-	scope := jsBytes(t, qc, `__scope`)
+	scope := jsBytes(t, qc, `__scopeBytes`)
 	preimage := append(append(append([]byte{}, []byte("seedkernel-guest-sig-v1\x00")...), scope...), msg...)
 	verifyGood := append(append(append([]byte{}, pk...), sig...), preimage...) // [pk 32][sig 64][preimage]
-	if v := callBytes(4, verifyGood); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("VERIFY(scoped preimage) = %v, want [1]", v)
+	if v := prim("ed25519/verify", verifyGood); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("ed25519/verify(scoped preimage) = %v, want [1]", v)
 	}
 	// The raw message must NOT verify — proof the signature is bound to the scope.
 	verifyRaw := append(append(append([]byte{}, pk...), sig...), msg...)
-	if v := callBytes(4, verifyRaw); len(v) != 1 || v[0] != 0 {
-		t.Fatalf("VERIFY(raw msg) = %v, want [0] (SIGN is scoped, never raw)", v)
+	if v := prim("ed25519/verify", verifyRaw); len(v) != 1 || v[0] != 0 {
+		t.Fatalf("ed25519/verify(raw msg) = %v, want [0] (SIGN is scoped, never raw)", v)
 	}
 
-	// CAP.FS_PUT (10) then CAP.FS_GET (9): content-addressed round trip.
+	// FS_PUT then FS_GET: content-addressed round trip. Both AWAIT — fs round-trips at
+	// the seam is async, because a synchronous `get` is a shape no browser backend can
+	// implement and the seam is one shape on every target (core/fs.ts).
+	awaitBytes := func(op int, payload []byte) []byte {
+		t.Helper()
+		b, err := callRealm("__callBridgeAwait", 5*time.Second,
+			qc.NewInt32(int32(op)), qc.NewArrayBuffer(payload))
+		if err != nil {
+			t.Fatalf("op %d: %v", op, err)
+		}
+		return b
+	}
 	key := []byte("blk")
 	value := []byte("a content-addressed block")
 	put := make([]byte, 4+len(key)+len(value)) // [klen u32][key][bytes]
 	binary.BigEndian.PutUint32(put, uint32(len(key)))
 	copy(put[4:], key)
 	copy(put[4+len(key):], value)
-	callBytes(10, put)
-	got := callBytes(9, key) // [1][bytes] on hit
+	awaitBytes(capFsPut, put)
+	got := awaitBytes(capFsGet, key) // [1][bytes] on hit
 	if len(got) == 0 || got[0] != 1 || !bytes.Equal(got[1:], value) {
 		t.Fatalf("FS_GET = %v, want [1] ++ %q", got, value)
 	}
 
-	// CAP.CLOCK (16): 8-byte big-endian millis, nonzero.
-	if clk := callBytes(16, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
+	// CLOCK: 8-byte big-endian millis, nonzero.
+	if clk := callBytes(capClock, nil); len(clk) != 8 || (clk[0]|clk[1]|clk[2]|clk[3]|clk[4]|clk[5]|clk[6]|clk[7]) == 0 {
 		t.Fatalf("CLOCK = %v, want nonzero u64", clk)
 	}
 
-	// Gate: CAP.NET_SEND (7) is not in the declared caps → refused.
-	if _, err := call(7, make([]byte, 33)); err == nil {
-		t.Fatal("NET_SEND resolved despite not being a declared cap")
+	// Gate: an undeclared op is refused. NET_PEERS rather than NET_SEND because the
+	// gate has to be observed SYNCHRONOUSLY here — NET_SEND is a real round trip, so a
+	// refusal comes back as a rejected promise rather than a thrown error.
+	if _, err := call(capNetPeers, nil); err == nil {
+		t.Fatal("NET_PEERS resolved despite not being a declared cap")
+	}
+	// And RAW net is not merely undeclared here — it is the transport slot's, so no app
+	// bridge is ever wired one.
+	if _, err := call(capNetLinkSend, make([]byte, 8)); err == nil {
+		t.Fatal("a raw-link op resolved on an app bridge")
 	}
 }
 

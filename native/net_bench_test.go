@@ -1,13 +1,14 @@
 package main
 
 // Networking round-trip perf for the Go loader — the net twin of BenchmarkKernelDispatch.
-// Where that bench times the kernel pipeline, this one times the full Transport
-// request/response over a real loopback socket: dial/accept, the PeerLink handshake
+// Where that bench times the kernel pipeline, this one times the transport bundle's
+// request/response over a real loopback socket: dial/accept, the AKE + record layer
 // (amortized — the warmup request establishes the link, steady-state requests reuse it),
 // routing, the [len][bytes] TCP framing (net.go), the Go↔JS frame-delivery boundary
 // (sock.go: reader goroutine → el.post → __netDeliver → pump), and the correlation /
-// timeout layer (net.ts) — none of which is Go logic, all driven by one loop. This is
-// the wall-clock that wraps the crypto/RS arithmetic the other benches already cover.
+// timeout layer (transport-host.ts + the transport guest) — none of which is Go logic,
+// all driven by one loop. This is the wall-clock that wraps the crypto/RS arithmetic the
+// other benches already cover.
 //
 //   - BenchmarkNetRoundTrip — a tiny control-plane request (HAVE/OFFER-shaped); ns/op is
 //     the per-request latency, 1e9/ns ≈ serial req/s.
@@ -32,46 +33,63 @@ import (
 // netBenchHarness wires two nodes in one realm: A listens and answers (type 7 → a fixed
 // 64 KB block for the FETCH bench; anything else → an echo of payload), B is
 // the requester. benchPingN/benchFetchN issue n sequential requests over the one link.
+// The nodes are stood up by makeTransportNode — the factory bootNode uses — and the
+// policy has to admit the artifact's own transport author before either has a network
+// at all (the shared bench realm boots deny-all, ensureBooted).
 const netBenchHarness = `
 	globalThis.idA = sodium.crypto_sign_keypair();
 	globalThis.idB = sodium.crypto_sign_keypair();
 	globalThis.aId = toHex(idA.publicKey);
 	globalThis.bId = toHex(idB.publicKey);
-	globalThis.netA = makeNetwork(idA, { host: "127.0.0.1", port: 0 }, undefined);
-	globalThis.netB = makeNetwork(idB, undefined, undefined);
-	globalThis.tA = new Transport(aId, netA, 2000);
-	globalThis.tB = new Transport(bId, netB, 2000);
+	setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
+	                           roles: { transport: [embeddedTransportAuthor] } }));
+	globalThis.__netSetup = (async () => {
+	  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
+	  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
+	  globalThis.netA = a.net;
+	  globalThis.netB = b.net;
 
-	const block64k = new Uint8Array(65536); block64k.fill(0x5a);
-	tA.onRequest((from, proto, payload) => {
-	  if (payload.length > 0 && payload[0] === 7) return block64k;     // FETCH-shaped: bulk response (type=7 in payload[0])
-	  if (payload.length > 0 && payload[0] === 9) return new Uint8Array([(payload.slice(1).length ^ payload[payload.length - 1]) & 255]); // UPLOAD-shaped: 1-byte ack folding in length + last byte
-	  return payload;                                                   // control-plane: echo
-	});
+	  const block64k = new Uint8Array(65536); block64k.fill(0x5a);
+	  netA.onRequest((from, proto, payload) => {
+	    if (payload.length > 0 && payload[0] === 7) return block64k;     // FETCH-shaped: bulk response (type=7 in payload[0])
+	    if (payload.length > 0 && payload[0] === 9) return new Uint8Array([(payload.slice(1).length ^ payload[payload.length - 1]) & 255]); // UPLOAD-shaped: 1-byte ack folding in length + last byte
+	    return payload;                                                   // control-plane: echo
+	  });
 
-	globalThis.__ping = new Uint8Array([10, 20, 30]);
-	globalThis.__fid = new Uint8Array([7, ...new Array(31).fill(0)]);      // type=7 fetch id (type byte inside payload)
-	globalThis.__big = new Uint8Array(1 << 20); __big.fill(0x5a);          // 1 MiB upload payload (a STORE group)
-	globalThis.__big9 = new Uint8Array(1 + __big.length); __big9[0] = 9; __big9.set(__big, 1); // type=9 upload (type byte inside payload)
-	globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await tB.request(aId, new TextEncoder().encode("_test"), __ping); return new Uint8Array(0); };
-	globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), __fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
-	globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await tB.request(aId, new TextEncoder().encode("_test"), __big9); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
+	  globalThis.__ping = new Uint8Array([10, 20, 30]);
+	  globalThis.__fid = new Uint8Array([7, ...new Array(31).fill(0)]);      // type=7 fetch id (type byte inside payload)
+	  globalThis.__big = new Uint8Array(1 << 20); __big.fill(0x5a);          // 1 MiB upload payload (a STORE group)
+	  globalThis.__big9 = new Uint8Array(1 + __big.length); __big9[0] = 9; __big9.set(__big, 1); // type=9 upload (type byte inside payload)
+	  globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await netB.request(aId, new TextEncoder().encode("_test"), __ping); return new Uint8Array(0); };
+	  globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await netB.request(aId, new TextEncoder().encode("_test"), __fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
+	  globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await netB.request(aId, new TextEncoder().encode("_test"), __big9); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
+	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
+	})();
 `
 
-// setupNetBench stands up the harness in the shared benchmark realm, binds A's
-// listener, and points B at it. The returned loop drives benchPingN/benchFetchN.
+// setupNetBench stands up the harness in the shared benchmark realm: A's listeners are
+// bound inside __netSetup (makeTransportNode awaits start()), and B is pointed at A's
+// bound port. The returned loop drives benchPingN/benchFetchN/benchUploadN.
 func setupNetBench(b *testing.B) *eventLoop {
 	ensureBooted(b)
-	if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
-		b.Fatal("harness:", err)
+	// Once per REALM, not once per call. The realm is shared across benchmarks
+	// (ensureBooted) and the framework re-enters each benchmark to grow b.N, so a second
+	// eval of the harness would redeclare its top-level consts and fail as a SyntaxError.
+	// Asking the realm what it already holds keeps this correct however the benchmarks are
+	// ordered or filtered — a Go-side "did I do this" flag would drift from the realm.
+	v, err := qc.Eval("net-bench-installed.js", qjs.Code(`typeof benchPingN`))
+	if err != nil {
+		b.Fatal("harness probe:", err)
 	}
-	if kind, _, msg, err := el.await(`(async () => { await netA.start(); return new Uint8Array(0); })()`, 8*time.Second); err != nil || kind != 0 {
-		b.Fatalf("netA.start: kind=%d msg=%q err=%v", kind, msg, err)
+	if v.String() != "function" {
+		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
+			b.Fatal("harness:", err)
+		}
+		if kind, _, msg, err := el.await(`__netSetup`, 8*time.Second); err != nil || kind != 0 {
+			b.Fatalf("__netSetup: kind=%d msg=%q err=%v", kind, msg, err)
+		}
 	}
-	if _, err := qc.Eval("net-bench-peer.js", qjs.Code(`netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });`)); err != nil {
-		b.Fatal("addPeerAddr:", err)
-	}
-	return el
+	return el // already wired: listeners bound, peer addressed
 }
 
 // benchAwait drives one JS request loop to completion and fails the bench if it rejects

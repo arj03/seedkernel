@@ -7,26 +7,29 @@
 // libsodium-wrappers method names — so the shared host JS (and, later, cap-bridge.ts)
 // calls `sodium.*` unchanged.
 //
-// Two primitives run on native Go instead — both are fully standardized, so native
-// output is byte-identical to libsodium's, and both sit on the storage data path
-// where wazero runs the wasm materially slower:
+// Two primitives run on native Go instead, under the native fast-path rule (§12.9):
+// *where a primitive is standardized, a target may substitute a native implementation,
+// because the bytes are identical and only the speed differs* — subject to the three
+// conditions stated there (standardized, byte-identical and KAT-pinned, no protocol
+// judgement inside). The rule is written down once in the docs rather than re-derived
+// here per primitive; what belongs in this file is which primitives took it and what
+// pins them:
 //
-//   - genericHash (BLAKE2b-256, the content-address block-id hash;
-//     golang.org/x/crypto/blake2b). Unkeyed BLAKE2b-256 is standardized, so native
-//     output matches libsodium (pinned by a KAT in TestSodiumGenericHash); every
-//     block is hashed on PUT and verified on bulk receive (§12.6), and it's the one
-//     hash wazero runs slower than V8 (~600 vs ~390 MB/s native).
+//   - genericHash — BLAKE2b-256, the content-address block-id hash
+//     (golang.org/x/crypto/blake2b). Pinned by TestSodiumGenericHash. Every block is
+//     hashed on PUT and verified on bulk receive (§12.6), and it is the one hash
+//     wazero runs slower than V8 (~600 vs ~390 MB/s native).
 //
-//   - the ChaCha20-Poly1305-IETF record layer (RFC 8439;
-//     golang.org/x/crypto/chacha20poly1305). Every post-AUTH frame is a seal on send
-//     and an open on receive (§12.6), so it's a per-frame cost on the bulk frame path.
-//     RFC 8439 is byte-exact, so native ciphertext is identical to libsodium's (pinned
-//     by TestSodiumAead, captured from this build's binary); native runs it ~8× faster
-//     than the wasm, and — needing no scratch arena — takes no lock.
+//   - the ChaCha20-Poly1305-IETF record layer — RFC 8439
+//     (golang.org/x/crypto/chacha20poly1305). Pinned by TestSodiumAead, captured from
+//     this build's own binary. Every post-AUTH frame is a seal on send and an open on
+//     receive (§12.6); native runs it ~8× faster and, needing no scratch arena, takes
+//     no lock.
 //
-// Ed25519 stays on libsodium (consensus-critical: a signature a Go node accepts every
-// node must accept), and X25519/scalarmult stays wasm (handshake-only, amortized over
-// the link, so speed doesn't matter). Both keep the exact-binary guarantee for free.
+// Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm on condition 3, not on
+// speed: a verifier decides whether to *accept*, and its accept/reject boundary is
+// consensus. X25519/scalarmult stays wasm because there is nothing to win —
+// handshake-only, amortized over the link.
 package main
 
 import (
@@ -102,9 +105,10 @@ var sodiumExports = map[string]string{
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
 	// The §12.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
-	// wasm (handshake-only, amortized over the link). PeerLink (shared net-link.ts)
-	// drives them through the `sodium` object below. The ChaCha20-Poly1305-IETF record
-	// layer is native Go (see aeadEncrypt / the file header), so it needs no export here.
+	// wasm (handshake-only, amortized over the link). The transport bundle's guest
+	// reaches them through the cap-bridge's primitive catalog, which resolves to the
+	// `sodium` object below. The ChaCha20-Poly1305-IETF record layer is native Go
+	// (see aeadEncrypt / the file header), so it needs no export here.
 	"crypto_box_keypair": "Ua",
 	"crypto_scalarmult":  "Dg",
 }
@@ -523,6 +527,13 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		crand.Read(b)
 		return ab(t, b), nil
 	}))
+	// The PQ half of the manifest suite lives in its own module (mldsa.go) but on the
+	// same object: the shared loader's crypto surface is one `sodium`, and it
+	// feature-detects suite 0x02 by the presence of this method.
+	exposeMlDsa(qc, o, md)
+	// And the catalog's KEM, on the same object for the same reason — the cap-bridge
+	// reaches every primitive through one `sodium` (mlkem.go).
+	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)
 	if _, err := qc.Eval("sodium-shim.js", qjs.Code(sodiumShimJS)); err != nil {
 		panic(fmt.Sprintf("sodium shim: %v", err))
@@ -549,6 +560,7 @@ const sodiumShimJS = `
     crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
     crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
     crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
+    ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
     crypto_sign_ed25519_pk_to_curve25519: (pk) => u8(N.crypto_sign_ed25519_pk_to_curve25519(pk)),
     crypto_sign_ed25519_sk_to_curve25519: (sk) => u8(N.crypto_sign_ed25519_sk_to_curve25519(sk)),
     crypto_box_seal: (m, pk) => u8(N.crypto_box_seal(m, pk)),
@@ -583,6 +595,22 @@ const sodiumShimJS = `
     crypto_sign_seed_keypair: (seed) => {
       const k = N.crypto_sign_seed_keypair(seed);
       return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ed25519" };
+    },
+    // ML-KEM-768, the primitive catalog's KEM (§14.1, mlkem.go). null is a rejection
+    // the caller must be able to read — a public key that fails FIPS 203 §7.2's modulus
+    // check, or a secret key that fails §7.3's hash check — so unlike the libsodium
+    // wrappers above it is passed through rather than thrown.
+    ml_kem768_keypair_from_seed: (seed) => {
+      const k = N.ml_kem768_keypair_from_seed(seed);
+      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ml-kem-768" };
+    },
+    ml_kem768_encaps: (pk, coins) => {
+      const r = N.ml_kem768_encaps(pk, coins);
+      return r === null ? null : { ciphertext: u8(r.ciphertext), sharedSecret: u8(r.sharedSecret) };
+    },
+    ml_kem768_decaps: (sk, ct) => {
+      const r = N.ml_kem768_decaps(sk, ct);
+      return r === null ? null : u8(r);
     },
     randombytes_buf: (n) => u8(N.randombytes_buf(n)),
   };

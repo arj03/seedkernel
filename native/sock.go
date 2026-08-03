@@ -2,7 +2,7 @@
 // only networking that stays in Go: open a
 // socket, frame whole messages over it, deliver them to JS, send, close. The
 // protocol on top — the PeerLink handshake, routing, request/response — runs as
-// the shared host JS (net-link.ts, net.ts, net-node.ts) over the RawChannel shape
+// the transport bundle's guest program (transport/guest.js) over the RawChannel shape
 // this module hands it. It reuses sockChannel (net.go) for the [len][bytes] framing.
 //
 // Bytes cross the Go↔JS boundary only on the event-loop goroutine: socket reader
@@ -94,8 +94,8 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		// A deliberate close() sets dead WITHOUT firing onClose (net.go: the owner asked
 		// for it), and the readLoop error chasing it short-circuits in fail() on dead — so
 		// the onClose registry-drop (below) never runs for a locally-initiated close. Drop
-		// the entry here instead, or every local close (net-link.ts closes on each rejected
-		// handshake, net-route.ts on a duplicate-dial resolution) leaks its n.chans slot
+		// the entry here instead, or every local close (the guest closes on each rejected
+		// handshake, and again on a duplicate-dial resolution) leaks its n.chans slot
 		// without bound — an attacker-triggerable memory exhaustion. The JS shim mirrors
 		// this by deleting from its own chans Map in close(). This deletes without firing
 		// onClose, preserving the deliberate-close semantic (fail() is already short-circuited).
@@ -189,8 +189,8 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 
 // closeListeners closes every bound listener, which makes each accept goroutine's
 // ln.Accept() return an error and exit — releasing the listener fd and the goroutine.
-// Wired to makeNetwork's channels.close so a realm/network teardown (tests, any future
-// re-serve) doesn't leak a listener + accept goroutine until os.Exit.
+// Wired to the driver's channels.close (native-shim.ts) so a realm/network teardown
+// (tests, any future re-serve) doesn't leak a listener + accept goroutine until os.Exit.
 func (n *netHost) closeListeners() {
 	n.mu.Lock()
 	lns := n.listeners
@@ -249,7 +249,7 @@ func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 	}
 }
 
-// netShimJS turns the byte-level __net into the RawChannel shape net-link.ts wants,
+// netShimJS turns the byte-level __net into the RawChannel shape the host JS wants,
 // and routes Go's deliver/close/accept callbacks to the right channel. Loader glue
 // (platform binding), not shared TS — like sodiumShimJS.
 const netShimJS = `
@@ -317,6 +317,6 @@ const netShimJS = `
 })();
 `
 
-// The ChannelFactory over these primitives — and the NodeNetworkCore built on it —
+// The ChannelFactory over these primitives — and the transport driver built on it —
 // live in host/native-shim.ts, where they are typed against the shared interfaces.
 // Go's networking stops at the socket.

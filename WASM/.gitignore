@@ -1,3 +1,6 @@
 node_modules/
 build/
 *.key
+build-min/
+host/transport-bundle.ts
+transport/author.key

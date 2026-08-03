@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -72,53 +73,47 @@ func BenchmarkNodeFsGet64K(b *testing.B) {
 }
 
 // ── through the QuickJS shim (the storage guest's actual fs surface) ─────────
+//
+// The `fs` the guest reaches is the async `Fs` seam (native-shim.ts over fs.go's
+// synchronous primitive), so a put/get settles through the event loop like every
+// other promised op — batching b.N ops in one JS await loop keeps the el.await
+// boundary out of the per-op number, exactly as the net benches do.
 
 func BenchmarkFsPutJS64K(b *testing.B) {
-	put := setupFsJS(b)
-	und := qc.NewUndefined()
+	el := setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r, err := qc.Invoke(put, und)
-		if err != nil {
-			b.Fatal(err)
-		}
-		r.Free()
-	}
+	benchAwait(b, el, fmt.Sprintf("__benchPut(%d)", b.N))
+	b.StopTimer()
 }
 
 func BenchmarkFsGetJS64K(b *testing.B) {
-	_ = setupFsJS(b)
-	get := qc.Global().GetPropertyStr("__benchGet")
-	und := qc.NewUndefined()
+	el := setupFsJS(b)
 	b.SetBytes(blockBytes)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r, err := qc.Invoke(get, und) // each call rebuilds a Uint8Array from the Go bytes
-		if err != nil {
-			b.Fatal(err)
-		}
-		r.Free()
-	}
+	benchAwait(b, el, fmt.Sprintf("__benchGet(%d)", b.N))
+	b.StopTimer()
 }
 
 // setupFsJS boots the shared shell, wires fs.go's `fs` object onto a fresh data dir,
-// seeds one block, and returns the retained __benchPut function (callers fetch
-// __benchGet themselves). The boot is shared via ensureBooted, like the dispatch bench.
-func setupFsJS(b *testing.B) *qjs.Value {
+// seeds one block, and returns the loop the benches drive. The seed put is itself an
+// awaited async call — `fs.put` returning a Promise is the whole point of the seam.
+func setupFsJS(b *testing.B) *eventLoop {
 	ensureBooted(b)
 	if err := exposeFs(qc, b.TempDir()); err != nil {
 		b.Fatal(err)
 	}
 	if _, err := qc.Eval("fs-bench-setup.js", qjs.Code(`
 		globalThis.__benchBlock = new Uint8Array(65536); __benchBlock.fill(0x5a);
-		fs.put("benchblk", __benchBlock);
-		globalThis.__benchGet = () => fs.get("benchblk");
-		globalThis.__benchPut = () => fs.put("benchblk", __benchBlock);
+		globalThis.__benchPut = async (n) => { for (let i = 0; i < n; i++) await fs.put("benchblk", __benchBlock); return new Uint8Array(0); };
+		globalThis.__benchGet = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await fs.get("benchblk"); if (r && r.length) acc ^= r[0]; } return new Uint8Array([acc & 255]); };
 	`)); err != nil {
 		b.Fatal(err)
 	}
-	return qc.Global().GetPropertyStr("__benchPut")
+	if kind, _, msg, err := el.await(`__benchPut(1)`, 8*time.Second); err != nil || kind != 0 {
+		b.Fatalf("seed put: kind=%d msg=%q err=%v", kind, msg, err)
+	}
+	return el
 }
 
 // ── node-open index scan (FsBlobStore constructor: one ReadDir + N stats) ────

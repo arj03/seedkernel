@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -34,9 +35,46 @@ func bootRealmIn(tb testing.TB, dir string) {
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
+// withTransportRole adds the artifact's own transport author to a policy's
+// roles.transport. A node whose policy does not admit a transport bundle has no
+// network at all — which is also what a deliberate deny-all looks like, so the two
+// must not be confused by accident in a test.
+func withTransportRole(tb testing.TB, policyJSON string) string {
+	tb.Helper()
+	author := evalString(tb, "embeddedTransportAuthor")
+	if author == "" {
+		return policyJSON
+	}
+	var p map[string]any
+	if policyJSON == "" {
+		p = map[string]any{}
+	} else if err := json.Unmarshal([]byte(policyJSON), &p); err != nil {
+		tb.Fatal("policy json:", err)
+	}
+	authors, _ := p["authors"].([]any)
+	p["authors"] = append(authors, author)
+	p["roles"] = map[string]any{"transport": []string{author}}
+	out, err := json.Marshal(p)
+	if err != nil {
+		tb.Fatal("policy json:", err)
+	}
+	return string(out)
+}
+
+// evalString evaluates a JS expression in the host realm and returns it as a string.
+func evalString(tb testing.TB, expr string) string {
+	tb.Helper()
+	v, err := qc.Eval("<evalString>", qjs.Code(expr))
+	if err != nil {
+		tb.Fatal("eval:", err)
+	}
+	return v.String()
+}
+
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
+	policyJSON = withTransportRole(tb, policyJSON)
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, TimeoutMs: 2000}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON
@@ -101,6 +139,10 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
   return __capBridge;
 };
 globalThis.__callBridge = (op, ab) => __capBridge(op, new Uint8Array(ab));
+// The round-tripping ops — NET_SEND and every FS_* — hand back a Promise (§12.2), so a
+// caller that wants their bytes has to settle it. Driven through callRealm,
+// which already knows how to pump the loop until a realm promise settles.
+globalThis.__callBridgeAwait = async (op, ab) => __capBridge(op, new Uint8Array(ab));
 `
 
 // capBridgeRealm boots a realm and adds the test-only cap-bridge builder above.

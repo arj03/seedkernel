@@ -4,27 +4,20 @@
 // a port-forward — the simplest path is the oldest one: the browser opens a
 // WebSocket straight at the node's --ws-listen endpoint.
 //
-// A browser WebSocket is already an ordered, whole-message binary pipe — exactly
-// the RawChannel shape — so the whole stack above is unchanged, identical to
-// net-rtc.ts with only the bottom swapped and no signaling:
-//   Transport (unchanged) → WsNetwork → PeerLink (unchanged identity handshake)
-//                                         → WsChannel (this file) → WebSocket
-// There is no rendezvous: the browser dials a known set of `pubkey@host:port`
-// peers (the cohort), exactly like a node's --peers flag. The node side is
-// net-node.ts's WsServerChannel — a standard RFC 6455 server — so the same
-// Go/Node `--ws-listen` that accepts a node peer accepts a browser tab.
+// The transport itself — the identity handshake, the record layer, the routing —
+// runs in the transport bundle's guest program, driven by the shared TransportHost
+// (transport-host.ts). This file is what remains of the old WsNetwork: the browser
+// side of the socket seam. It opens platform WebSockets and hands them to the
+// driver's openLink() — everything above is the bundle's, identical to the TCP
+// path with only the bottom swapped.
 //
 // Platform-neutral: the WebSocket global is touched only inside a dial (or an
-// injected factory), so importing this module where WebSocket is absent is safe. A
-// Node/Bun *node* uses net-node.ts's WsClientChannel (raw-socket WS codec); this is
-// the browser's native-WebSocket counterpart, and also runs under Node ≥22 / Bun
-// (which expose a global WebSocket) for headless testing.
+// injected factory), so importing this module where WebSocket is absent is safe.
 
-import type { Network, Endpoint, PeerId } from "./net.js";
-import { PeerLink, type Identity, type TransportCrypto } from "./net-link.js";
-import { BufferedChannel } from "./net-channel.js";
-import { LinkRouter } from "./link-router.js";
-import { toHex, fromHex } from "./util.js";
+import type { Network, Endpoint, PeerId } from "../core/net.js";
+import { BufferedChannel } from "../core/net-channel.js";
+import { fromHex } from "../core/util.js";
+import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
  *  this module type-checks without committing to a DOM lib and accepts any
@@ -39,44 +32,35 @@ export interface WsLike {
 }
 
 // ── RawChannel over one WebSocket ─────────────────────────────────────────────
-// A WebSocket delivers whole binary messages in order, so this is a thin adapter —
-// the role RtcChannel plays for an RTCDataChannel. BufferedChannel (net-channel.ts)
-// carries the shared machinery, including the pre-open send buffer PeerLink needs
-// because it emits its HELLO the instant the link is constructed.
+// A WebSocket delivers whole binary messages in order, so this is a thin adapter.
+// BufferedChannel (net-channel.ts) carries the shared machinery, including the
+// pre-open send buffer the transport needs because it emits its HELLO the instant
+// a link is constructed.
 export class WsChannel extends BufferedChannel {
   constructor(private readonly ws: WsLike) {
     super();
     ws.binaryType = "arraybuffer";
     ws.addEventListener("message", (ev: { data: unknown }) => {
-      // Only binary frames are PeerLink messages; a string frame is never ours.
+      // Only binary frames are transport messages; a string frame is never ours.
       if (typeof ev.data !== "string") this.deliver(new Uint8Array(ev.data as ArrayBuffer));
     });
     ws.addEventListener("open", () => this.open());
     ws.addEventListener("close", () => this.fail());
     ws.addEventListener("error", () => this.fail());
   }
+
   protected write(bytes: Uint8Array): void { this.ws.send(bytes); }
+
   // WebSocket.close() sends the queued frames before the close frame, so a graceful
   // stop needs nothing extra here.
   protected stop(_graceful: boolean): void { this.ws.close(); }
 }
 
 export interface WsNetworkOptions {
-  identity: Identity;
-  /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published with
-   *  our address to the peers we want to be able to reach us. A caller that cannot
-   *  produce it draws no response at all. Absent, this node is open: it answers anyone.
-   *
-   *  Per node, so a leak is contained to this node's inbound side — rotate it, re-issue
-   *  the address to our own peers, and nothing else in the network moves. See
-   *  PeerLinkOptions.contactSecret. */
-  contactSecret?: Uint8Array;
-  /** OPTIONAL network key: which network this node belongs to (staging vs production,
-   *  say). An isolation boundary, not a gate — nodes on different network keys cannot
-   *  complete a handshake under any circumstances. Public by design; see
-   *  PeerLinkOptions.networkKey. */
-  networkKey?: Uint8Array;
-  sodium: TransportCrypto;
+  /** The transport driver — the shell's `net` once the transport bundle is
+   *  admitted. It holds the node identity, the network key, the contact secret
+   *  and the peer whitelist; this file only opens sockets. */
+  driver: TransportHost;
   /** Open a WebSocket to `url`. Defaults to the platform global, which is what a
    *  browser tab (and Node ≥22 / Bun) provide. Referenced only here, so importing
    *  this module where WebSocket is absent stays safe. */
@@ -85,129 +69,94 @@ export interface WsNetworkOptions {
    *  these into a StorageNode's cohort (addPeer / removePeer), same as RtcNetwork. */
   onPeerUp?: (peerId: PeerId) => void;
   onPeerDown?: (peerId: PeerId) => void;
-  /** Optional peer whitelist. Absent (the default) admits everyone.
-   *
-   *  One hook, wired to BOTH gates on every transport: PeerLink refuses during the
-   *  handshake, silently, before it will finish authenticating; LinkRouter refuses again
-   *  before the link is installed or delivers a frame. Same predicate, so a deployment
-   *  sets one thing and gets both.
-   *
-   *  Called with a peer id whose signature has already verified — never with a claimed
-   *  key, which is what let the old pre-signature filter be used as a membership oracle
-   *  (§12.6.2 §2.3). Keep it pure and fast; it runs per handshake. */
-  admitPeer?: (peerId: PeerId) => boolean;
   /** How many parallel connections to open per peer (default 1). Bulk PUT/GET
-   *  stripes its frames round-robin across them — each still its own PeerLink and
-   *  record session — so a high-RTT/lossy link that a single TCP flow can't fill is
-   *  filled by N flows. The peer must keep multiple inbound links per peer for this
-   *  to take effect (NodeNetworkCore does; a full holder cohort must be built with
-   *  the multi-link routing core). */
+   *  stripes its frames round-robin across them — each still its own link and
+   *  record session — so a high-RTT/lossy link that a single TCP flow can't fill
+   *  is filled by N flows. The peer must keep multiple inbound links per peer for
+   *  this to take effect (the routing core does). */
   connsPerPeer?: number;
 }
 
 export class WsNetwork implements Network {
-  private readonly opts: WsNetworkOptions;
+  private readonly driver: TransportHost;
   private readonly ownId: PeerId;
   private readonly mkWs: (url: string) => WsLike;
   private readonly conns: number;
-  private readonly router: LinkRouter;
-  private readonly dialing = new Map<PeerId, PeerLink[]>();  // every link we have dialed to a peer
+  private readonly dialing = new Map<PeerId, LinkHandle[]>(); // every link we have dialed to a peer
 
-  constructor(opts: WsNetworkOptions) {
-    this.opts = opts;
-    this.ownId = toHex(opts.identity.publicKey);
-    this.mkWs = opts.webSocketFactory ?? ((url: string) => new WebSocket(url) as unknown as WsLike);
+  constructor(private readonly opts: WsNetworkOptions) {
+    this.driver = opts.driver;
+    this.ownId = opts.driver.peerId;
+    this.mkWs = opts.webSocketFactory
+      ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => WsLike }).WebSocket(url));
     this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
-    // Authenticated-pool routing, the roster gate, and the up/down edges the cohort
-    // mirrors are all the shared LinkRouter (link-router.ts). All links here are
-    // outbound (weDialed = true), so its double-connect tie-break never fires.
-    this.router = new LinkRouter({
-      ownPubkey: opts.identity.publicKey, ownId: this.ownId,
-      admit: opts.admitPeer, onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown,
-    });
+    this.driver.setPeerHooks({ onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
   }
 
-  /** Frames delivered to the Transport's sink — a diagnostic mirroring LoopbackNetwork. */
-  get framesDelivered(): number { return this.router.framesDelivered; }
+  /** Frames delivered to the app side — the driver's diagnostic mirror. */
+  get framesDelivered(): number { return this.driver.framesDelivered; }
 
   // ── Network interface ──────────────────────────────────────────────────────────
+
   /** A single-identity fabric: it vends exactly one endpoint, its own. */
   endpoint(id: PeerId): Endpoint {
     if (id !== this.ownId) throw new Error("WsNetwork is bound to one identity");
-    return this.router.endpoint((to, frame) => this.sendFrame(to, frame), () => this.close());
-  }
-  private sendFrame(to: PeerId, frame: Uint8Array): void {
-    // The router stripes across the peer's flows, or drops if it has no authenticated
-    // link — the Transport's timeout copes, exactly as the other Networks' drops.
-    this.router.send(to, frame);
+    return this.driver.endpoint(id);
   }
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
-   *  `wss://…` for TLS). The link authenticates in-channel (PeerLink), pinned to the
-   *  declared `pubkey`, and onPeerUp fires once it does. Idempotent top-up, mirroring
-   *  NodeNetworkCore.dial(): it opens only the shortfall to connsPerPeer, so the first
-   *  call opens the full fan-out and a re-connect() after some of the parallel flows
-   *  dropped restores just the lost ones instead of no-op'ing on the survivors (an
-   *  early-return on "already dialing" would leave the pool permanently degraded to
-   *  whatever survived). Returns the parsed peer id either way. */
+   *  `wss://…` for TLS). The link authenticates in-channel, pinned to the declared
+   *  `pubkey`, and onPeerUp fires once it does. Idempotent top-up, mirroring the
+   *  routing core's dial(): it opens only the shortfall to connsPerPeer. Returns
+   *  the parsed peer id either way. */
   connect(spec: string): PeerId {
     const { peerId, contactSecret, url } = parseWsPeer(spec);
     if (peerId === this.ownId) return peerId;
-    // `dialing` holds every live link we dialed to this peer — pre-auth AND post-auth
-    // (promote() leaves them here; forget() removes one the instant it closes) — so its
-    // length is the current outbound flow count. Open connsPerPeer parallel connections,
-    // each its own PeerLink over its own WebSocket. They authenticate independently;
-    // onPeerUp fires on the first to reach a peer that had none.
+    // `dialing` holds every live link we dialed to this peer — pre-auth AND
+    // post-auth (the guest forgets one the instant it closes) — so its length is
+    // the current outbound flow count. Open connsPerPeer parallel connections,
+    // each its own link over its own WebSocket.
     let arr = this.dialing.get(peerId);
-    if (!arr) { arr = []; this.dialing.set(peerId, arr); }
+    if (!arr) {
+      arr = [];
+      this.dialing.set(peerId, arr);
+    }
     for (let i = arr.length; i < this.conns; i++) {
-      const link: PeerLink = new PeerLink({
+      const handle: LinkHandle = this.driver.openLink({
         channel: new WsChannel(this.mkWs(url)),
-        identity: this.opts.identity,
-        sodium: this.opts.sodium,
         weDialed: true,
         expectPeerId: peerId, // pin the far key to the address we dialed
-        // DIALING: the secret gating the far end is THEIRS, from the peer spec — not
-        // ours. Passing our own here seals msg1 under a secret the peer has never seen,
-        // so every dial to a gated peer draws silence.
+        // DIALING: the secret gating the far end is THEIRS, from the peer spec —
+        // not ours. Passing our own here would seal msg1 under a secret the peer
+        // has never seen, so every dial to a gated peer would draw silence.
         contactSecret,
-        networkKey: this.opts.networkKey,
-        admitPeer: this.opts.admitPeer,
-        // On auth the router installs the link and fires onPeerUp; if it declines
-        // (off-roster), drop the link from `dialing` too so it isn't counted as a
-        // live flow — a rejected link never fires its channel-close forget().
-        onAuth: (pid, l) => { if (!this.router.promote(pid, l)) this.forget(peerId, l); },
-        onFrame: (pid, frame) => this.router.deliver(pid, frame),
-        onClose: () => this.forget(peerId, link),
+        onClose: () => this.forget(peerId, handle),
       });
-      arr.push(link);
+      arr.push(handle);
     }
     return peerId;
   }
 
   /** The peers we currently hold at least one authenticated link to (for UI / cohort). */
-  linkedPeers(): PeerId[] { return this.router.linkedPeers(); }
+  linkedPeers(): PeerId[] { return this.driver.linkedPeers(); }
 
-  /** Tear down every link. */
+  /** Tear down every link and the driver's channels. */
   close(): void {
-    // Snapshot and clear first: PeerLink.close() now reaches opts.onClose on every path,
-    // so forget() runs synchronously inside each close() and splices the arrays this
-    // loop is walking. Clearing up front also makes those forget() calls no-ops.
-    const pending: PeerLink[] = [];
+    const pending: LinkHandle[] = [];
     for (const arr of this.dialing.values()) for (const l of arr) pending.push(l);
     this.dialing.clear();
-    this.router.closeAll(); // authenticated links also live in `dialing`; double-close is a no-op
     for (const l of pending) l.close();
   }
 
-  // A link died (channel close) or was declined by the roster: remove it from the
-  // outbound `dialing` pool, then from the router (which fires onPeerDown when the
-  // peer's LAST authenticated link goes — losing one of several parallel flows
-  // leaves the peer reachable, so the cohort must not evict it).
-  private forget(peerId: PeerId, link: PeerLink): void {
+  // A link died (or was declined by the whitelist): remove it from the outbound
+  // `dialing` pool. The router bookkeeping is the guest's.
+  private forget(peerId: PeerId, handle: LinkHandle): void {
     const dl = this.dialing.get(peerId);
-    if (dl) { const i = dl.indexOf(link); if (i >= 0) dl.splice(i, 1); if (dl.length === 0) this.dialing.delete(peerId); }
-    this.router.remove(link);
+    if (dl) {
+      const i = dl.indexOf(handle);
+      if (i >= 0) dl.splice(i, 1);
+      if (dl.length === 0) this.dialing.delete(peerId);
+    }
   }
 }
 

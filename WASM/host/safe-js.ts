@@ -8,21 +8,27 @@
 // access through a copy-model byte boundary, the same shape as the KernelHost handler
 // bridges.
 //
-// Async seam: a guest is typically multi-step, and the net steps genuinely round-trip.
-// `host.call` resolves a **sync op** (crypto/fs/clock/module) to its bytes immediately and
-// a **net op** to a real Promise the guest `await`s. The guest builds that Promise itself
-// (the shared preamble parks it under a `callId`); this host returns `null` to say "started
-// async", then settles it with `__netResolve`/`__netReject` and pumps `executePendingJobs()`
-// so the awaiting continuation runs. Deliberately NOT quickjs-emscripten's `newPromise()`
-// deferred: keeping the async half in plain ECMAScript is what lets this host and the
-// native loader (guest.go, quickjs-ng over wazero, which has no promise primitive) share
-// ONE preamble — see `guestPreamble` in cap-bridge.ts.
+// Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
+// `host.call` resolves a **sync op** (the primitive catalog, clock, module, the raw-link
+// and transport ops) to its bytes immediately, and a **round-tripping op** — `NET_SEND`
+// and every `FS_*` — to a real Promise the guest `await`s. The guest builds that Promise
+// itself (the shared preamble parks it under a `callId`); this host returns `null` to say
+// "started async", then settles it with `__netResolve`/`__netReject` and pumps
+// `executePendingJobs()` so the awaiting continuation runs. Deliberately NOT
+// quickjs-emscripten's `newPromise()` deferred: keeping the async half in plain
+// ECMAScript is what lets this host and the native loader (guest.go, quickjs-ng over
+// wazero, which has no promise primitive) share ONE preamble — see `guestPreamble` in
+// cap-bridge.ts.
 //
 // There is no Asyncify and no host-driven step loop: a suspended async guest is just heap
-// state, so the same realm can be re-entered synchronously to serve a request (`callSync`,
-// the holder path) while an initiator (`call`) is parked mid-`await`. One `quickjs.wasm`
-// build serves both roles. An app builds its own guest confinement on top of this generic
-// primitive (README §12.3).
+// state. There is exactly ONE way in — `call` — serving both roles, the initiator that
+// awaits the network and the holder that awaits `fs`. A synchronous second entry is not
+// on offer, because a holder answers from local storage and storage does not answer in
+// the same turn on a target whose backend is asynchronous (core/fs.ts). What a
+// synchronous entry would have given for free — one entrypoint invocation running to
+// completion before the next begins — is an explicit per-realm FIFO queue instead
+// (realm-queue.ts). One `quickjs.wasm` build serves both roles. An app builds its own
+// guest confinement on top of this generic primitive (README §12.3).
 
 import {
   newQuickJSWASMModule,
@@ -45,11 +51,12 @@ const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble } from "./cap-bridge.js";
+import { serializeCalls } from "./realm-queue.js";
 
-/** The one capability seam. `op` selects a host capability (net / store / crypto / clock /
+/** The one capability seam. `op` selects a host capability (net / fs / crypto / clock /
  *  rand, mapped by the host); `payload`/return are opaque bytes, exactly like
- *  `kernel.call(name, payload) -> bytes`. A sync op returns bytes directly; a net op — the
- *  only genuinely async one — returns a Promise the guest awaits. */
+ *  `kernel.call(name, payload) -> bytes`. A sync op returns bytes directly; a
+ *  round-tripping one — `NET_SEND` and every `FS_*` — returns a Promise the guest awaits. */
 export type SafeRealmBridge = (op: number, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
 
 export interface SafeRealmOptions {
@@ -79,20 +86,24 @@ export interface SafeRealmOptions {
 }
 
 export interface SafeRealm {
-  /** Invoke a guest entrypoint as an *initiator* (may `await` net). The arg and result
-   *  cross as raw bytes (the copy model). Resolves when the guest promise settles —
-   *  including all awaited host bridges. Concurrent `call()`s on one realm are safe: the
-   *  arg is consumed synchronously before the first `await`, so they never clobber. */
+  /** Invoke a guest entrypoint — the **only** way into the realm, for both roles: the
+   *  initiator that may `await` net, and the holder answering an inbound request. The arg
+   *  and result cross as raw bytes (the copy model). Resolves when the guest promise
+   *  settles, including all awaited host bridges.
+   *
+   *  **Invocations are serialized per realm.** A call does not begin until the previous
+   *  one has settled, so no two guest frames are ever in flight in one realm and neither
+   *  can observe the other's half-updated state at an await point. Both roles can yield,
+   *  so this is a queue rather than a property of the host's call stack (realm-queue.ts).
+   *
+   *  The cost is head-of-line blocking, and it is a real one: an initiator parked on a
+   *  network round trip holds the queue, so an inbound request to the same app waits for
+   *  it rather than being answered around. That is the price
+   *  of the guarantee — the alternative is two frames interleaving at every `await`, which
+   *  is exactly what a guest author has no way to reason about. An app that wants
+   *  concurrency across the two roles wants two realms, which the shell can give it,
+   *  rather than one realm with two frames inside it. */
   call(entry: string, payload: Uint8Array): Promise<Uint8Array>;
-  /** Invoke a guest entrypoint synchronously — the *holder* request side (README §12.8).
-   *  The entrypoint runs straight through to its bytes without yielding, so it can run
-   *  *while* an initiator `call()` is parked mid-`await` in the same realm (a suspended
-   *  async function is heap state; this is an ordinary re-entrant JS call). The
-   *  entrypoint must reach only sync ops — a net op returns a Promise a sync entrypoint
-   *  cannot resolve, which surfaces as an error here by design. Never pumps the job
-   *  queue, so a re-entrant holder call cannot advance a parked initiator's continuation
-   *  out of order. */
-  callSync(entry: string, payload: Uint8Array): Uint8Array;
   dispose(): void;
 }
 
@@ -128,21 +139,17 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
  *
  *  Without the split, one number cannot serve both roles: an initiator parked 2s on a
  *  network request would be killed by any budget tight enough to catch a holder's
- *  infinite loop. */
+ *  infinite loop.
+ *
+ *  There is no nested-budget case: invocations are serialized (see `call`), so exactly
+ *  one budget window is open at a time and `reset` is the whole of it. */
 interface ExecClock {
   /** Guest code is about to run. */
   begin(): void;
   /** Guest code has returned control to the host. */
   end(): void;
-  /** Start a fresh budget — one top-level entrypoint invocation. */
+  /** Start a fresh budget — one entrypoint invocation. */
   reset(): void;
-  /** Suspend the current budget and start a fresh one, returning the suspended total.
-   *  A re-entrant holder `callSync` runs while an initiator sits parked in the same
-   *  realm; it gets its own budget rather than spending — or clearing — the
-   *  initiator's. */
-  enterNested(): number;
-  /** Restore a budget suspended by `enterNested`. */
-  exitNested(saved: number): void;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
@@ -163,8 +170,6 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
     begin() { segmentStart = Date.now(); running = true; },
     end() { if (running) { consumedMs += Date.now() - segmentStart; running = false; } },
     reset() { consumedMs = 0; },
-    enterNested() { const saved = consumedMs; consumedMs = 0; return saved; },
-    exitNested(saved) { consumedMs = saved; },
   };
 }
 
@@ -306,68 +311,69 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
+  /** One entrypoint invocation, assuming the queue has already given it the realm. */
+  const invoke = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
+    // Safe unconditionally because the queue guarantees nothing else is in flight: this
+    // is one invocation's own budget window, from here to the moment it settles. If two
+    // calls could overlap, this reset would be an escape hatch a guest's own traffic
+    // could open — a second call clearing an in-flight call's accumulated time.
+    clock.reset();
+    stageArg(ctx, payload);
+    // evalCode runs the entrypoint synchronously up to its first await; the completion
+    // value is either the bytes (sync entrypoint) or a pending guest promise (async
+    // entrypoint). resolvePromise normalizes both to a native promise, but it settles
+    // only once the job queue is pumped — hence resolvePromise → executePendingJobs →
+    // await, in that order (awaiting before the first pump would stall a sync entrypoint).
+    // Awaits are then driven by each deferred's own executePendingJobs on settle.
+    let evalResult: QuickJSHandle;
+    let settledNative: Promise<unknown>;
+    clock.begin();
+    try {
+      evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js"));
+      settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
+      pumpJobs();
+    } finally {
+      // Closed before the await below: everything past this point is the host
+      // waiting on a bridge, which is not the guest's time to spend.
+      clock.end();
+    }
+    let rejectThis!: (err: Error) => void;
+    const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
+    pending.add(rejectThis);
+    try {
+      const settled = await Promise.race([settledNative, failed]);
+      return takeBytes(ctx, ctx.unwrapResult(settled as never));
+    } finally {
+      pending.delete(rejectThis);
+      // In `finally` for the same reason as settleNet's handles: an interrupted or
+      // failed call must not leave this alive, or dispose() aborts the module.
+      // Unconditional because dispose() defers the context teardown (see below):
+      // whether the call completed or was interrupted by failPending, this finally
+      // runs while the context is still alive, so the handle is always releasable.
+      evalResult.dispose();
+    }
+  };
+
   return {
-    async call(entry: string, payload: Uint8Array): Promise<Uint8Array> {
-      // Reset only when nothing else is in flight. The interrupt handler is per-realm and
-      // cannot tell whose code is running, so concurrent initiator calls necessarily
-      // share one budget window; resetting unconditionally would let a second call clear
-      // an in-flight call's accumulated time, which is an escape hatch a guest's own
-      // traffic could open. One idle realm ⇒ one fresh budget per busy period.
-      if (pending.size === 0) clock.reset();
-      stageArg(ctx, payload);
-      // evalCode runs the entrypoint synchronously up to its first await; the completion
-      // value is either the bytes (sync entrypoint) or a pending guest promise (async
-      // entrypoint). resolvePromise normalizes both to a native promise, but it settles
-      // only once the job queue is pumped — hence resolvePromise → executePendingJobs →
-      // await, in that order (awaiting before the first pump would stall a sync entrypoint).
-      // Net awaits are then driven by each deferred's own executePendingJobs on settle.
-      let evalResult: QuickJSHandle;
-      let settledNative: Promise<unknown>;
-      clock.begin();
-      try {
-        evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js"));
-        settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
-        pumpJobs();
-      } finally {
-        // Closed before the await below: everything past this point is the host
-        // waiting on a bridge, which is not the guest's time to spend.
-        clock.end();
-      }
-      let rejectThis!: (err: Error) => void;
-      const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
-      pending.add(rejectThis);
-      try {
-        const settled = await Promise.race([settledNative, failed]);
-        return takeBytes(ctx, ctx.unwrapResult(settled as never));
-      } finally {
-        pending.delete(rejectThis);
-        // In `finally` for the same reason as settleNet's handles: an interrupted or
-        // failed call must not leave this alive, or dispose() aborts the module.
-        if (ctx.alive) evalResult.dispose();
-      }
-    },
-    callSync(entry: string, payload: Uint8Array): Uint8Array {
-      const saved = clock.enterNested();
-      stageArg(ctx, payload);
-      // A sync (holder) entrypoint returns its ArrayBuffer directly. Deliberately no
-      // executePendingJobs: a re-entrant holder call must not advance a parked
-      // initiator's continuation. If a net op slipped in, the result is a guest promise
-      // and getArrayBuffer throws — by design (a holder answers from local fs + crypto).
-      clock.begin();
-      try {
-        return takeBytes(ctx, ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js")));
-      } finally {
-        clock.end();
-        clock.exitNested(saved);
-      }
-    },
+    call: serializeCalls(invoke, () =>
+      (disposed || !ctx.alive) ? new Error("guest realm disposed") : null),
     dispose(): void {
       disposed = true;
       // Fail anyone still awaiting a guest promise before tearing the realm down: those
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller.
       failPending(new Error("guest realm disposed"));
-      ctx.dispose();
+      // ...but the context itself must NOT die in the same turn. A parked invocation's
+      // rejection continuation — the `finally` above, which releases its evalResult
+      // handle — runs as a microtask after failPending, and the quickjs-ng build
+      // asserts an empty gc object list at JS_FreeRuntime, so a handle released after
+      // the context died would abort the whole wasm module. Deferring the teardown to
+      // the NEXT MACROTASK (setTimeout 0) runs it after every microtask of the parked
+      // continuations, by which point nothing can re-enter (the queue fails on
+      // `disposed`): the context is quiescent when it dies.
+      setTimeout(() => {
+        if (disposed && ctx.alive) ctx.dispose();
+      }, 0);
     },
   };
 }

@@ -19,17 +19,28 @@ export interface FsStat {
   available: number;
 }
 
+/** The storage seam. **Every method is async**, and that is a property of the seam
+ *  rather than of any backend: a synchronous `get(key): Uint8Array | null` is a shape no
+ *  browser backend can implement — IndexedDB is asynchronous by construction and OPFS is
+ *  synchronous only inside a Worker — so a sync seam would have made the browser the one
+ *  target that could not carry `fs`, which is core (README §1). A backend that genuinely
+ *  is synchronous (`MemoryFs`) returns an already-resolved promise and costs a microtask.
+ *
+ *  It is ABI-visible: `FS_*` are round-tripping ops (§12.2), so a guest reads them with
+ *  `await`. Which side of that line an op sits on is exactly what `guest.abi` versions, so
+ *  a guest written against another shape is refused by name at load rather than handed a
+ *  Promise where it expected bytes. */
 export interface Fs {
-  get(key: string): Uint8Array | null;
-  put(key: string, bytes: Uint8Array): void;
+  get(key: string): Promise<Uint8Array | null>;
+  put(key: string, bytes: Uint8Array): Promise<void>;
   /** Byte length of the value under `key`, or -1 if absent. Existence is `size ≥ 0`
    *  (there is no separate `has`); also lets a policy layer rebuild an index without
    *  reading every value back. */
-  size(key: string): number;
-  list(prefix?: string): string[];
+  size(key: string): Promise<number>;
+  list(prefix?: string): Promise<string[]>;
   /** true if a value was removed, false if the key was already absent. */
-  delete(key: string): boolean;
-  stat(): FsStat;
+  delete(key: string): Promise<boolean>;
+  stat(): Promise<FsStat>;
 }
 
 /** A scope prefix must survive the backend's key rules. Both real backends map a key
@@ -70,7 +81,7 @@ export function scopedFs(inner: Fs, scope: string): Fs {
     // An absent prefix means "everything I can see", which is now everything in this
     // scope and nothing else. Keys come back stripped, so the guest only ever handles
     // the names it chose and the scope stays a host-side fact.
-    list: (prefix) => inner.list(outward(prefix ?? "")).map((k) => k.slice(scope.length)),
+    list: async (prefix) => (await inner.list(outward(prefix ?? ""))).map((k) => k.slice(scope.length)),
     delete: (key) => inner.delete(outward(key)),
     stat: () => inner.stat(),
   };
@@ -78,26 +89,30 @@ export function scopedFs(inner: Fs, scope: string): Fs {
 
 /** In-RAM Fs. The portable backend for tests and ephemeral nodes, and the shape
  *  a browser backend (OPFS/IndexedDB) will mirror. Stores copies so callers can
- *  reuse their buffers. */
+ *  reuse their buffers.
+ *
+ *  Every method is `async` even though the map behind them is not: the seam is what is
+ *  asynchronous, and a backend that resolved sometimes-immediately would let a caller
+ *  work by accident on this one and fail on the backend it ships against. */
 export class MemoryFs implements Fs {
   private readonly map = new Map<string, Uint8Array>();
 
-  get(key: string): Uint8Array | null {
+  async get(key: string): Promise<Uint8Array | null> {
     const v = this.map.get(key);
     return v ? v.slice() : null;
   }
-  put(key: string, bytes: Uint8Array): void { this.map.set(key, bytes.slice()); }
-  size(key: string): number {
+  async put(key: string, bytes: Uint8Array): Promise<void> { this.map.set(key, bytes.slice()); }
+  async size(key: string): Promise<number> {
     const v = this.map.get(key);
     return v ? v.length : -1;
   }
-  list(prefix?: string): string[] {
+  async list(prefix?: string): Promise<string[]> {
     const out: string[] = [];
     for (const k of this.map.keys()) if (!prefix || k.startsWith(prefix)) out.push(k);
     return out;
   }
-  delete(key: string): boolean { return this.map.delete(key); }
-  stat(): FsStat {
+  async delete(key: string): Promise<boolean> { return this.map.delete(key); }
+  async stat(): Promise<FsStat> {
     let used = 0;
     for (const v of this.map.values()) used += v.length;
     return { used, available: Number.MAX_SAFE_INTEGER };

@@ -4,6 +4,6 @@
     "noEmit": true,
     "declaration": false
   },
-  "include": ["**/*.ts"],
+  "include": ["core/**/*.ts", "host/**/*.ts"],
   "exclude": []
 }

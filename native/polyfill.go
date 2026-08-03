@@ -8,7 +8,7 @@ import (
 
 // installPolyfills adds the few Web globals the shared host TS assumes but
 // quickjs-ng does not provide. TextEncoder/TextDecoder are used
-// at module-load time (e.g. net-link.ts's DOMAIN constant), so this must run
+// at module-load time (e.g. core/domains.ts's DOMAIN constants), so this must run
 // before any shared bundle is evaluated. UTF-8 only, which is all the host code
 // needs. Guarded so a future quickjs-ng with native versions wins.
 func installPolyfills(qc *qjs.Context) {
@@ -61,6 +61,36 @@ const polyfillsJS = `
         return s;
       }
     };
+  }
+
+  // atob — the artifact-embedded transport bundle is inlined as base64
+  // (transport-bundle.ts) and decoded at module scope. Without this the decode threw,
+  // the blob read as ABSENT, and the node came up with no network at all — which is
+  // also what a deliberate deny-all policy looks like, so nothing said so.
+  if (typeof globalThis.atob === "undefined") {
+    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    globalThis.atob = function (b64) {
+      let out = "", bits = 0, acc = 0;
+      for (let i = 0; i < b64.length; i++) {
+        const c = b64[i];
+        if (c === "=" || c === "\n" || c === "\r") continue;
+        const v = B64.indexOf(c);
+        if (v < 0) throw new Error("atob: bad base64 character");
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          out += String.fromCharCode((acc >> bits) & 0xff);
+        }
+      }
+      return out;
+    };
+  }
+
+  // queueMicrotask — the transport driver's deliver path answers on a LATER turn, so
+  // that no op re-enters a live guest frame. Without it the turn boundary is gone.
+  if (typeof globalThis.queueMicrotask === "undefined") {
+    globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
   }
 })();
 `

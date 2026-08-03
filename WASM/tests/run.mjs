@@ -9,6 +9,7 @@ import { performance } from "node:perf_hooks";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
+import { makeTransportHost } from "./transport-harness.mjs";
 
 const {
   createKernelHost,
@@ -24,40 +25,45 @@ const {
 // rule (README §12.1), and these tests have to follow it like any other consumer.
 const sodium = await loadSodium();
 
-// Transport + WS module surface (moved up from seedstore in the runtime split,
-// the runtime split). These are seedkernel's own public exports — `./net-node`
-// (NodeNetwork) and the no-cap `./ws` framing module — so they are exercised here,
-// where they live, rather than only from a downstream consumer.
+// Transport + WS module surface (moved up from seedstore in the runtime split).
+// These are seedkernel's own public exports — `./net-node` (NodeNetwork) and the
+// no-cap `./ws` framing module — so they are exercised here, where they live,
+// rather than only from a downstream consumer.
 const { NodeNetwork } = await imp("build/host/net-node.js");
 
 // One contact secret for the whole harness. In production each node has its own and
 // hands it out with its address; a single value here just means every test node is
 // reachable by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { Transport, LoopbackNetwork } = await imp("build/host/net.js");
-const { CAP, createCapBridge, opsForCaps, guestSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES }
+const { CAP, createCapBridge, opsForCaps, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION }
   = await imp("build/host/cap-bridge.js");
 const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
-const { MemoryFs } = await imp("build/host/fs.js");
+const { MemoryFs } = await imp("build/core/fs.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/host/util.js");
+const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/core/util.js");
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
-         signManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
+         signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
+const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/core/pq.js");
+const { withMlKem768, loadMlKem768 } = await imp("build/core/kem.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own KernelHost without a shell. */
-function loadBundle(host, blob, admit) {
+// The two halves of a load with the admission seam between them (§12.4). `admit` may
+// answer with a Promise — a composed policy does — so this awaits it: reading an
+// unawaited Promise as a verdict is fail-OPEN, which is the one way this seam must never
+// be wrong.
+async function loadBundle(host, blob, admit) {
   const v = verifyBundle(sodium, blob);
-  if (!admit(v)) throw new Error("admit rejected");
+  if (!(await admit(v))) throw new Error("admit rejected");
   return installBundle(host, v);
 }
 
@@ -92,6 +98,15 @@ async function makeHost() {
 
 const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
+
+// ML-DSA-65 onto the test instance, exactly as a target does at its crypto seam
+// (node.ts) — the hybrid manifest suite is "a sodium that knows this method" (§12.4).
+// Same browser/mldsa65.wasm the browser fetches and the Go loader embeds.
+withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
+// And ML-KEM-768, the catalog primitive the same seam mixes in (kem.ts): a manifest is
+// checked against PRIMITIVE_NAMES, so the methods behind those names have to be on the
+// object every target hands the cap-bridge.
+withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm"))));
 
 // Install a verified module directly under `targetName`. Bundles are the only way code
 // arrives (§12.4); there is no wire install envelope. Throws on structural failure.
@@ -154,7 +169,7 @@ async function testInstallRejectsUntrustedAuthor() {
   const stranger = generateKeyPair();
   const admit = authorAllowlist([toHex(stranger.publicKey)]);
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "installBundle throws when the author is not in the policy");
 
   console.log("  OK\n");
@@ -203,7 +218,7 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
 
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a deny-all admit predicate prevents install");
 
   console.log("  OK\n");
@@ -235,7 +250,7 @@ async function testBundleRefusesNonHandler() {
 
   const admit = authorAllowlist([toHex(author.publicKey)]);
   let threw = false;
-  try { loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
   assert(!host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is NOT bound (the load failed atomically)");
@@ -357,26 +372,28 @@ async function testFs() {
   for (const { name, make } of backends) {
     const { fs, cleanup } = make();
     try {
+      // The seam is async on every backend (core/fs.ts), so every call awaits — the
+      // point of the change being that a browser backend can satisfy this shape at all.
       const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-      assert(fs.size("a.blk") < 0, `${name}: absent before put`);
-      assertEqual(fs.size("a.blk"), -1, `${name}: size -1 when absent`);
-      assertEqual(fs.get("a.blk"), null, `${name}: get null when absent`);
+      assert(await fs.size("a.blk") < 0, `${name}: absent before put`);
+      assertEqual(await fs.size("a.blk"), -1, `${name}: size -1 when absent`);
+      assertEqual(await fs.get("a.blk"), null, `${name}: get null when absent`);
 
-      fs.put("a.blk", bytes);
-      assert(fs.size("a.blk") >= 0, `${name}: present after put`);
-      assertEqual(fs.size("a.blk"), 5, `${name}: size reflects bytes`);
-      assert(bytesEqual(fs.get("a.blk"), bytes), `${name}: get round-trips`);
+      await fs.put("a.blk", bytes);
+      assert(await fs.size("a.blk") >= 0, `${name}: present after put`);
+      assertEqual(await fs.size("a.blk"), 5, `${name}: size reflects bytes`);
+      assert(bytesEqual(await fs.get("a.blk"), bytes), `${name}: get round-trips`);
 
-      fs.put("a.dsc", new Uint8Array([9]));
-      fs.put("b.blk", new Uint8Array([7, 7]));
-      assertEqual(fs.list().sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
-      assertEqual(fs.list("a.").sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
-      assertEqual(fs.stat().used, 5 + 1 + 2, `${name}: stat.used sums all values`);
-      assert(fs.stat().available > 0, `${name}: stat.available is positive`);
+      await fs.put("a.dsc", new Uint8Array([9]));
+      await fs.put("b.blk", new Uint8Array([7, 7]));
+      assertEqual((await fs.list()).sort().join(","), "a.blk,a.dsc,b.blk", `${name}: list sees all keys`);
+      assertEqual((await fs.list("a.")).sort().join(","), "a.blk,a.dsc", `${name}: list filters by prefix`);
+      assertEqual((await fs.stat()).used, 5 + 1 + 2, `${name}: stat.used sums all values`);
+      assert((await fs.stat()).available > 0, `${name}: stat.available is positive`);
 
-      assert(fs.delete("a.blk"), `${name}: delete reports removal`);
-      assert(fs.size("a.blk") < 0, `${name}: absent after delete`);
-      assert(!fs.delete("a.blk"), `${name}: second delete is false`);
+      assert(await fs.delete("a.blk"), `${name}: delete reports removal`);
+      assert(await fs.size("a.blk") < 0, `${name}: absent after delete`);
+      assert(!(await fs.delete("a.blk")), `${name}: second delete is false`);
     } finally {
       cleanup();
     }
@@ -386,12 +403,14 @@ async function testFs() {
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-fs-"));
   try {
     const fs = new NodeFs(dir);
+    // The key check throws inside an async method, so it surfaces as a rejection —
+    // still a refusal the caller cannot miss, and still before any syscall.
     let threw = false;
-    try { fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
+    try { await fs.put("../escape", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects a path-traversal key on put");
-    assertEqual(fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
+    assertEqual(await fs.get("../escape"), null, "NodeFs reads an unsafe key as absent");
     threw = false;
-    try { fs.put("..", new Uint8Array([0])); } catch { threw = true; }
+    try { await fs.put("..", new Uint8Array([0])); } catch { threw = true; }
     assert(threw, "NodeFs rejects the bare '..' key");
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -408,108 +427,14 @@ async function testFs() {
 // it through the cap-bridge's single-peer NET_SEND op, concurrently, from an async
 // safe-js realm — proving the round trips genuinely overlap in one realm.
 
-async function testGuestNetFanout() {
-  console.log("Test: guest-side net fan-out — Promise.all over NET_SEND (no host sendMany)");
-
-  const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
-  const net = new LoopbackNetwork();
-  const ta = new Transport(toHex(a.publicKey), net, 40);
-  const tb = new Transport(toHex(b.publicKey), net, 40);
-  const tc = new Transport(toHex(c.publicKey), net, 40);
-  // Each peer echoes the payload directly.
-  tb.onRequest((_from, _proto, payload) => payload);
-  tc.onRequest((_from, _proto, payload) => payload);
-
-  const bId = toHex(b.publicKey), cId = toHex(c.publicKey);
-  const dead = toHex(generateKeyPair().publicKey);
-  const bridge = createCapBridge({
-    sodium, identity: a, callHandler: () => null,
-    transport: ta, peers: () => [], fs: new MemoryFs(),
-    allowedOps: UNRESTRICTED_OPS, modules: UNSCOPED_MODULES,
-  });
-  // The guest fans out over NET_SEND itself: build [peer 32][pidLen u8][proto utf8][payload]
-  // per peer and Promise.all them. NET_SEND returns [ok u8][resp]; an unreachable peer
-  // resolves [0] (ok:false), never rejecting the batch.
-  const src = `
-    register("fanout", async (arg) => {
-      // arg = count u8, then count * (peer 32 | type u8 | plen u8 | data)
-      const count = arg[0];
-      let o = 1;
-      const reqs = [];
-      const protoEnc = new Uint8Array([0x5f, 0x74, 0x65, 0x73, 0x74]); // "_test"
-      for (let i = 0; i < count; i++) {
-        const peer = arg.slice(o, o + 32); o += 32;
-        const type = arg[o]; o += 1;
-        const plen = arg[o]; o += 1;
-        const data = arg.slice(o, o + plen); o += plen;
-        const payload = new Uint8Array(1 + data.length);
-        payload[0] = type; payload.set(data, 1);                 // type folded into payload
-        const frame = new Uint8Array(32 + 1 + protoEnc.length + payload.length);
-        frame.set(peer, 0); frame[32] = protoEnc.length; frame.set(protoEnc, 33);
-        frame.set(payload, 33 + protoEnc.length);
-        reqs.push(host.call(CAP_NET_SEND, frame));
-      }
-      const results = await Promise.all(reqs);            // real concurrent round trips
-      // Concatenate [ok u8][len u8][resp] per result, in request order.
-      const parts = [];
-      for (const r of results) {
-        const ok = r[0];
-        const resp = r.slice(1);
-        parts.push(new Uint8Array([ok, resp.length]), resp);
-      }
-      let total = 0; for (const p of parts) total += p.length;
-      const out = new Uint8Array(total); let w = 0;
-      for (const p of parts) { out.set(p, w); w += p.length; }
-      return out;
-    });
-  `;
-  const CAP_NET_SEND = CAP.NET_SEND;
-  const realm = await createSafeRealm({
-    source: `const CAP_NET_SEND = ${CAP_NET_SEND};\n` + src,
-    bridge,
-  });
-  try {
-    const U = (...xs) => new Uint8Array(xs);
-    // Distinct payloads to b and c, plus one unreachable peer, in order.
-    const arg = concatBytes([
-      U(3),
-      fromHex(bId), U(7, 2), U(1, 1),
-      fromHex(cId), U(7, 2), U(2, 2),
-      fromHex(dead), U(7, 1), U(9),
-    ]);
-    const out = await realm.call("fanout", arg);
-    // Decode [ok u8][len u8][resp] × 3, in request order.
-    let o = 0;
-    const dec = [];
-    for (let i = 0; i < 3; i++) {
-      const ok = out[o]; o += 1;
-      const len = out[o]; o += 1;
-      dec.push({ ok, bytes: out.slice(o, o + len) }); o += len;
-    }
-    assert(dec[0].ok === 1 && bytesEqual(dec[0].bytes, U(7, 1, 1)), "peer b got ITS payload (distinct fan-out, order preserved)");
-    assert(dec[1].ok === 1 && bytesEqual(dec[1].bytes, U(7, 2, 2)), "peer c got ITS payload");
-    assert(dec[2].ok === 0 && dec[2].bytes.length === 0, "the unreachable peer → ok:false, no bytes (partial, no reject)");
-  } finally {
-    realm.dispose();
-    ta.close(); tb.close(); tc.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: cap-bridge generic primitives (step 7) ───────────────────────
-//
-// The capability counterpart to safe-js: a guest reaches only application-neutral
-// primitives (crypto / net / fs / module-call / clock / identity) — never any
-// storage vocabulary. seedstore's whole orchestration runs over exactly these.
-
 async function testCapBridge() {
   console.log("Test: cap-bridge — generic primitive capabilities, no app vocabulary (step 7)");
 
   const id = generateKeyPair();
   const fs = new MemoryFs();
-  const net = new LoopbackNetwork();
-  const transport = new Transport(toHex(id.publicKey), net, 40);
+  // A transport host for the net ops: its peer id is the identity's, and a request
+  // to itself drops at the guest's own-frame guard, so NET_SEND drains.
+  const { driver: transport } = await makeTransportHost({ identity: id, timeoutMs: 200 });
 
   // A handler reachable by name, to exercise CAP_MODULE_CALL. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).
@@ -519,7 +444,8 @@ async function testCapBridge() {
 
   // A host-derived signing scope binds the guest's SIGN op to a bundle namespace
   // (README §12.2); a real node derives it from the manifest's (author, app).
-  const signScope = guestSignScope(id.publicKey, "testapp");
+  const signScope = appSignScope(id, id.publicKey, "testapp");
+  const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const bridge = createCapBridge({
     sodium, identity: id,
     callHandler: (name, p) => host.callHandler(name, p),
@@ -529,20 +455,59 @@ async function testCapBridge() {
   const U = (...xs) => new Uint8Array(xs);
 
   try {
-    // crypto primitives match sumo directly (the guest does all framing)
+    // Primitives are reached BY NAME through the one CAP_CRYPTO op: there is no op
+    // number per algorithm, so adding one is a catalog entry and the seam never learns
+    // what a cipher suite is.
+    const prim = (name, argBytes) => bridge(CAP.CRYPTO,
+      concatBytes([U(name.length), new TextEncoder().encode(name), argBytes]));
     const msg = U(1, 2, 3, 4, 5);
-    assert(bytesEqual(await bridge(CAP.HASH, msg), sodium.crypto_generichash(32, msg)), "CAP_HASH = blake2b");
+    assert(bytesEqual(await prim("blake2b-256", msg), sodium.crypto_generichash(32, msg)), "blake2b-256, by name");
     const key = sodium.randombytes_buf(32), nonce = sodium.randombytes_buf(24);
-    assert(bytesEqual(await bridge(CAP.STREAM_XOR, concatBytes([nonce, key, msg])),
-      sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "CAP_STREAM_XOR = xchacha20 keystream");
+    assert(bytesEqual(await prim("xchacha20/xor", concatBytes([nonce, key, msg])),
+      sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "xchacha20/xor, by name");
     // CAP_SIGN is scoped, never raw (README §12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
     const sig = await bridge(CAP.SIGN, msg);
-    const preimage = concatBytes([DOMAIN_GUEST, signScope, msg]);
+    const preimage = concatBytes([DOMAIN_GUEST, scopeBytes, msg]);
     assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "CAP_SIGN signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
     assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "CAP_SIGN never signs the raw message (scoped, not raw)");
-    assertEqual((await bridge(CAP.VERIFY, concatBytes([id.publicKey, sig, preimage])))[0], 1, "CAP_VERIFY (raw) accepts the scoped preimage");
-    assertEqual((await bridge(CAP.VERIFY, concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "CAP_VERIFY rejects a forged message");
+    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "ed25519/verify accepts the scoped preimage");
+    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "ed25519/verify rejects a forged message");
+    // ML-KEM-768 is in the catalog ahead of any caller — a bundle is replaceable, the
+    // vocabulary it draws on is not — so what is checked here is that it is REACHABLE
+    // the same way every other primitive is: by name, through the one op, with no
+    // capability declared. Derandomized, so the coins come from CAP_RANDOM (an authority
+    // the guest holds) and the entry stays a pure function.
+    {
+      const seed = await bridge(CAP.RANDOM, U(0, 0, 0, 64));
+      const kp = await prim("ml-kem-768/keypair", seed);
+      assertEqual(kp.length, 1184 + 2400, "ml-kem-768/keypair returns [pk 1184][sk 2400]");
+      const kemPk = kp.slice(0, 1184), kemSk = kp.slice(1184);
+      const coins = await bridge(CAP.RANDOM, U(0, 0, 0, 32));
+      const enc = await prim("ml-kem-768/encaps", concatBytes([kemPk, coins]));
+      assertEqual(enc[0], 1, "ml-kem-768/encaps accepts a well-formed encapsulation key");
+      assertEqual(enc.length, 1 + 1088 + 32, "encaps returns [ok][ct 1088][ss 32]");
+      const ct = enc.slice(1, 1 + 1088), ss = enc.slice(1 + 1088);
+      const dec = await prim("ml-kem-768/decaps", concatBytes([kemSk, ct]));
+      assertEqual(dec[0], 1, "ml-kem-768/decaps accepts a well-formed decapsulation key");
+      assert(bytesEqual(dec.slice(1), ss), "both ends derive the same shared secret");
+      // Encapsulation is deterministic in its coins — that is what makes it a catalog
+      // entry rather than an authority.
+      const again = await prim("ml-kem-768/encaps", concatBytes([kemPk, coins]));
+      assert(bytesEqual(again, enc), "encaps is a pure function of (key, coins)");
+      // A malformed peer key is an answer, not a throw: the caller did not choose it.
+      // 12-bit little-endian packing: 0xff,0xff decodes to 4095, out of [0, q-1].
+      const badPk = kemPk.slice(); badPk[0] = 0xff; badPk[1] = 0xff;
+      assertEqual((await prim("ml-kem-768/encaps", concatBytes([badPk, coins]))).length, 1,
+        "a key failing the FIPS 203 modulus check answers [0], not an exception");
+      // A tampered ciphertext is NOT an error — implicit rejection returns a different
+      // shared secret in constant time, and saying so would be the oracle.
+      const badCt = ct.slice(); badCt[0] ^= 1;
+      const implicit = await prim("ml-kem-768/decaps", concatBytes([kemSk, badCt]));
+      assertEqual(implicit[0], 1, "a bad ciphertext still succeeds — ML-KEM rejects implicitly");
+      assert(!bytesEqual(implicit.slice(1), ss), "…but derives an unrelated shared secret");
+    }
+
     assert(bytesEqual(await bridge(CAP.IDENTITY, U()), id.publicKey), "CAP_IDENTITY = the node pubkey");
     assertEqual((await bridge(CAP.RANDOM, U(0, 0, 0, 16))).length, 16, "CAP_RANDOM returns n bytes");
     assertEqual((await bridge(CAP.CLOCK, U())).length, 8, "CAP_CLOCK returns a u64");
@@ -558,11 +523,12 @@ async function testCapBridge() {
     const szAbsent = await bridge(CAP.FS_SIZE, new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "CAP_FS_SIZE of an absent key → -1 (0xFFFFFFFF)");
 
-    // Sync vs async: every op resolves synchronously (returns bytes, not a
-    // Promise) except the net ops, which round-trip — this is exactly what lets a
-    // SYNC realm host the holder side while the async realm awaits net.
-    assert(!(bridge(CAP.HASH, msg) instanceof Promise), "CAP_HASH resolves synchronously (bytes, no Promise)");
-    assert(!(bridge(CAP.FS_SIZE, fk) instanceof Promise), "CAP_FS_SIZE resolves synchronously");
+    // Sync vs async, and which side of that line an op sits on is the ABI (§12.2): a
+    // primitive is a function of its arguments and resolves inline; net and fs genuinely
+    // round-trip and hand back a Promise. Which side an op sits on is what `guest.abi`
+    // versions, which is why it is declared and checked rather than assumed.
+    assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
+    assert(bridge(CAP.FS_SIZE, fk) instanceof Promise, "CAP_FS_SIZE returns a Promise (fs round-trips)");
     assert(bridge(CAP.NET_PEERS, U()) instanceof Uint8Array, "CAP_NET_PEERS is synchronous");
     const protoEnc = new TextEncoder().encode("_test");
     const sendFrame = concatBytes([id.publicKey, U(protoEnc.length), protoEnc, U(7)]);
@@ -612,43 +578,6 @@ async function testWsFraming() {
 
 // ─── Test: channel identity pinning (transport §12.6) ─────────────────────
 
-async function testChannelPinning() {
-  console.log("Test: a connection is pinned to the peer's key — wrong key → no delivery");
-
-  const idS = generateKeyPair(), idB = generateKeyPair();
-  const netS = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port: 0 } });
-  await netS.start();
-  let received = 0;
-  netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
-
-  const netB = new NodeNetwork({ identity: idB, contactSecret: TEST_CONTACT, sodium }); // dials out only
-  const epB = netB.endpoint(toHex(idB.publicKey));
-  epB.onFrame(() => {});
-
-  try {
-    // Point a made-up peerId at S's real address. S presents its true key, which
-    // won't match what B was told to expect → the link must refuse to auth.
-    const wrongId = toHex(sodium.randombytes_buf(32));
-    netB.addPeerAddr(wrongId, { host: "127.0.0.1", port: netS.port, transport: "tcp" });
-    epB.send(wrongId, new Uint8Array([1, 2, 3]));
-    await sleep(200);
-    assertEqual(received, 0, "frame to a mismatched identity is never delivered");
-
-    // Now address S by its true id: the handshake succeeds and the frame arrives.
-    netB.addPeerAddr(toHex(idS.publicKey),
-      { host: "127.0.0.1", port: netS.port, transport: "tcp", contactSecret: TEST_CONTACT });
-    epB.send(toHex(idS.publicKey), new Uint8Array([4, 5, 6]));
-    await sleep(200);
-    assertEqual(received, 1, "frame to the correct identity is delivered");
-  } finally {
-    netS.close(); netB.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: shell install policy + boot (step 5) ─────────────────────────
-
 async function testPolicy() {
   console.log("Test: shell install policy — closed author set gates bundle loads");
   const { parsePolicy } = await imp("build/host/policy.js");
@@ -657,25 +586,47 @@ async function testPolicy() {
   const bad = generateKeyPair();
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
-  const { KernelHost } = await imp("build/host/kernel-host.js");
-  const tryLoad = (policyJson, author) => {
+  const { KernelHost } = await imp("build/core/kernel-host.js");
+  const tryLoad = async (policyJson, author, extra = {}) => {
     const host = new KernelHost();
-    const manifest = { app: "mod", version: 1,
+    const manifest = { app: "mod", version: 1, ...extra,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
   // ── author allowlist ───────────────────────────────────────────────────
-  const okAuthor = tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), good);
+  const okAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), good);
   assert(okAuthor, "install by an allowed author is accepted");
 
-  const badAuthor = tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
+  const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
+
+  // ── the slot admission class (§12.5) ───────────────────────────────────
+  // A bundle claiming a slot is an authority grant — the transport sees all plaintext
+  // and holds the session keys — so the ordinary author allowlist must NOT admit one,
+  // even for an author it already trusts with apps. Only a `roles` entry does.
+  const goodHex = toHex(good.publicKey);
+  const appOnly = JSON.stringify({ authors: [goodHex] });
+  const withSlot = JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } });
+
+  const slotLanded = await tryLoad(appOnly, good, { role: "transport" });
+  assert(!slotLanded, "an author trusted for apps does NOT thereby occupy the transport slot");
+  const slotAllowed = await tryLoad(withSlot, good, { role: "transport" });
+  assert(slotAllowed, "a roles entry admits that author into the slot it names");
+  const strangerSlot = await tryLoad(withSlot, bad, { role: "transport" });
+  assert(!strangerSlot, "an author outside the slot's list is refused the slot");
+  const appStillOk = await tryLoad(withSlot, good, {});
+  assert(appStillOk, "adding a slot entry does not disturb ordinary app admission");
+
+  // The two classes partition the bundles: a slot list alone admits no apps.
+  const slotsOnly = JSON.stringify({ authors: [toHex(bad.publicKey)], roles: { transport: [goodHex] } });
+  const appUnderSlotList = await tryLoad(slotsOnly, good, {});
+  assert(!appUnderSlotList, "a slot entry is not an app grant — the app allowlist still decides apps");
 
   // ── parse validation ───────────────────────────────────────────────────
   let threw = false;
@@ -684,6 +635,115 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
   assert(threw, "an empty author set is rejected");
+  threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transprot: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "a typo'd slot name fails the boot rather than silently admitting nothing");
+  threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [] } })); } catch { threw = true; }
+  assert(threw, "an empty slot list is rejected (omit the slot to allow none)");
+
+  // A manifest may only claim a slot this host knows (§12.4) — an unknown role is a
+  // malformed manifest, not an ignored field that lands as an ordinary app.
+  threw = false;
+  try {
+    verifyManifest(sodium, signManifest(sodium, good.privateKey, good.publicKey,
+      { app: "mod", version: 1, role: "quantum-relay", modules: [] }));
+  } catch { threw = true; }
+  assert(threw, "a manifest claiming an unknown slot is refused as malformed");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the guest ABI field (§12.2, §12.4) ───────────────────────────
+
+async function testGuestAbi() {
+  console.log("Test: a guest declares the host ABI it was written against");
+
+  const author = generateKeyPair();
+  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestBytes = new TextEncoder().encode(guestText);
+  const mk = (guest) => signManifest(sodium, author.privateKey, author.publicKey,
+    { app: "abi", version: 1, modules: [], guest });
+  const hash = toHex(gHash(guestBytes));
+
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, caps: [] })) !== null,
+    "a guest declaring this host's ABI verifies");
+
+  // Missing: the field is required, not defaulted. A guest author who never thought
+  // about the seam version is indistinguishable from one who meant the old one, and
+  // defaulting would silently pick the population a bump exists to catch.
+  let threw = false;
+  try { verifyManifest(sodium, mk({ hash, caps: [] })); } catch { threw = true; }
+  assert(threw, "a guest with no declared ABI is refused as malformed");
+
+  // Present but unimplemented: a legibility failure ("this bundle wants a host I am
+  // not"), so it throws with its own message rather than reading as a bad signature.
+  let msg = "";
+  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION + 1, caps: [] })); }
+  catch (e) { msg = e.message; }
+  assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
+
+  // A handler-only bundle declares no guest and therefore no ABI — the seam it never
+  // touches is not a field it has to fill in.
+  assert(verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+    { app: "abi", version: 1, modules: [] })) !== null,
+    "a handler-only bundle needs no ABI declaration");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: a slot occupant's freshness (§12.4) ──────────────────────────
+
+async function testSlotFreshness() {
+  console.log("Test: a slot occupant carries the ordinary (author, app) freshness mark");
+
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { KernelHost } = await imp("build/core/kernel-host.js");
+
+  const a = generateKeyPair();
+  const b = generateKeyPair();
+  const blobFrom = (author, version, role) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey,
+      { app: "link", version, ...(role ? { role } : {}), modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] }),
+    [moduleFile("fwd")]: forwarderBytes,
+  });
+  const land = (host, freshness, author, version, role) => {
+    installBundle(host, verifyBundle(sodium, blobFrom(author, version, role)), freshness);
+  };
+
+  // Versions are an author's own lineage, slot or no slot. A's v5 landing does NOT bind
+  // B to number above it: a floor keyed to the slot would put two independent authors on
+  // one shared version line with no owner, and would only pay where an attacker chooses
+  // which signed bundle arrives — which nothing delivering a bundle allows (§12.4).
+  {
+    const freshness = new FreshnessMarks();
+    const host = new KernelHost();
+    land(host, freshness, a, 5, "transport");
+    assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a slot occupant advances its (author, app) mark");
+    land(host, freshness, b, 1, "transport");
+    assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's slot bundle answers to its own lineage");
+  }
+
+  // Each author is still held to their own mark — dropping the slot floor weakens
+  // nothing about the downgrade that has always been in scope.
+  {
+    const freshness = new FreshnessMarks();
+    const host = new KernelHost();
+    land(host, freshness, a, 5, "transport");
+    let refused = false;
+    try { land(host, freshness, a, 4, "transport"); } catch { refused = true; }
+    assert(refused, "an author's own stale slot bundle is still refused as a downgrade");
+  }
+
+  // The store holds marks and revocations only. A file written by a host that also kept
+  // per-slot floors still loads — an unrecognized key is ignored, not refused — and is
+  // rewritten without it.
+  {
+    const legacy = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, roles: { transport: 4 }, revoked: [] }));
+    const round = JSON.parse(legacy.serialize());
+    assertEqual(round.marks["aa:app"], 2, "a store carrying slot floors still loads its marks");
+    assert(round.roles === undefined, "…and is rewritten with no slot floors");
+  }
 
   console.log("  OK\n");
 }
@@ -708,7 +768,7 @@ async function testShellBoot() {
     // The shell boots under the policy and wires its backends. Admitting an allowed
     // author's code is the bundle path, covered end-to-end by testBundle (§12.4) — the
     // only way code arrives now that the wire install path is gone.
-    assert(shell.fs.list().length === 0, "fs.* backend is wired over the data dir");
+    assert((await shell.fs.list()).length === 0, "fs.* backend is wired over the data dir");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -748,6 +808,7 @@ async function testBundle() {
       // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        abi: GUEST_ABI_VERSION,
         caps: [],
       },
     };
@@ -1022,19 +1083,21 @@ async function testSafeJs() {
   console.log("  OK\n");
 }
 
-// ─── Test: callSync — the holder request side on the one realm (step 8) ──
+// ─── Test: one entry seam, serialized per realm (§12.3) ─────────────────
 //
-// realm.callSync runs a guest entrypoint straight through to its bytes without
-// yielding the event loop or pumping the job queue. This is what lets a confined
-// request handler (storage's holder side) respond synchronously while an initiator
-// call() is parked mid-await *in the same realm* — a suspended async function is
-// just heap state, so re-entering to run a sync handler is ordinary JS.
+// There used to be two ways into a realm: `call`, which could yield, and `callSync`,
+// which could not. `callSync` existed because a holder answered from local fs and fs
+// answered in the same turn; once fs became async (core/fs.ts — no browser backend can
+// implement a synchronous `get`) nothing distinguished it any more. What it gave for
+// free was that one invocation ran to completion before the next began, and that is now
+// the realm's own FIFO queue (host/realm-queue.ts) rather than a property of the host's
+// call stack.
 
-async function testHolderCallSync() {
-  console.log("Test: callSync — synchronous holder side sharing the initiator realm (step 8)");
+async function testRealmSerialization() {
+  console.log("Test: one entry seam, serialized per realm (§12.3)");
 
-  // 1. A synchronous bridge round-trips, and the realm is reusable. callSync()
-  //    returns bytes directly (no Promise) — no event-loop turn in between.
+  // 1. A synchronous entrypoint over a synchronous bridge still round-trips, and the
+  //    realm is reusable — it just resolves through a promise like everything else.
   {
     let calls = 0;
     const bridge = (op, payload) => { calls++; return op === 1 ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
@@ -1042,22 +1105,22 @@ async function testHolderCallSync() {
       source: `register("inc", (arg) => host.call(1, arg));`,
       bridge,
     });
-    const out = realm.callSync("inc", new Uint8Array([0, 9, 255]));
-    assert(out instanceof Uint8Array && !(out instanceof Promise), "callSync returns bytes directly, not a Promise");
+    const out = await realm.call("inc", new Uint8Array([0, 9, 255]));
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
-    assertEqual([...realm.callSync("inc", new Uint8Array([41]))], [42], "callSync is reusable across calls");
+    assertEqual([...(await realm.call("inc", new Uint8Array([41])))], [42], "the realm is reusable across calls");
     assertEqual(calls, 2, "the synchronous bridge was invoked once per call");
     realm.dispose();
   }
 
-  // 2. A holder can answer re-entrantly while an initiator is parked mid-await on the
-  //    SAME realm — the whole point of the single-realm design. Start a net call() that
-  //    parks, callSync a holder in the meantime, then let the initiator settle.
+  // 2. An invocation accepted while another is parked mid-await does NOT interleave with
+  //    it: it waits for the queue. This is the guarantee stack discipline used to give,
+  //    and the reason it is worth its head-of-line cost — two frames resuming into each
+  //    other at every await is state no guest author can reason about.
   {
     let release;
     const gate = new Promise((r) => { release = r; });
     const bridge = (op, payload) => {
-      if (op === 7) return gate.then(() => new Uint8Array([42]));   // net — parks until released
+      if (op === 7) return gate.then(() => new Uint8Array([42]));   // parks until released
       if (op === 1) return payload.map((b) => (b + 1) & 0xff);      // sync — holder path
       return new Uint8Array();
     };
@@ -1066,23 +1129,65 @@ async function testHolderCallSync() {
                register("hold", (arg) => host.call(1, arg));`,
       bridge,
     });
-    const initP = realm.call("init", new Uint8Array());            // parks at the net await
-    const held = realm.callSync("hold", new Uint8Array([7]));       // answered while init parks
-    assertEqual([...held], [8], "holder answered synchronously while the initiator was parked mid-await");
+    const order = [];
+    const initP = realm.call("init", new Uint8Array()).then((r) => { order.push("init"); return r; });
+    const heldP = realm.call("hold", new Uint8Array([7])).then((r) => { order.push("hold"); return r; });
+
+    // Give the holder every chance to jump the queue before the initiator is released.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    assertEqual(order.length, 0, "the holder did not run while the initiator was parked");
+
     release();
-    assertEqual([...(await initP)], [42], "the parked initiator resumed and settled after the holder ran");
+    assertEqual([...(await initP)], [42], "the parked initiator resumed and settled");
+    assertEqual([...(await heldP)], [8], "and the holder ran after it, on its own budget");
+    assertEqual(order.join(","), "init,hold", "the queue preserved acceptance order");
     realm.dispose();
   }
 
-  // 3. Still airtight — callSync is the same zero-authority sandbox.
+  // 3. Still airtight — the one seam is the same zero-authority sandbox.
   {
     const realm = await createSafeRealm({
       source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
       bridge: () => new Uint8Array(),
     });
-    const r = realm.callSync("probe", new Uint8Array());
-    assertEqual([...r], [0, 0], "process / fetch are unreachable under callSync too");
+    const r = await realm.call("probe", new Uint8Array());
+    assertEqual([...r], [0, 0], "process / fetch are unreachable from an entrypoint");
     realm.dispose();
+  }
+
+  // 4. Disposing a realm while an invocation is parked mid-await — the ordinary state of
+  //    a node whose initiator is waiting on the network — fails the parked caller and
+  //    frees the context WITHOUT taking the wasm module with it. The engine asserts an
+  //    empty gc object list when a runtime is freed, and a parked call releases its own
+  //    handle from a `finally` that runs as a MICROTASK after dispose() returns: freeing
+  //    the context in the same turn aborts the whole module, which is every realm in the
+  //    process, not just this one. Hence the teardown is deferred a macrotask, and this
+  //    pins it — a regression here is a host crash, not a failed assertion.
+  {
+    const realm = await createSafeRealm({
+      source: `register("park", async () => await host.call(7, new Uint8Array()));`,
+      bridge: (op) => (op === 7 ? new Promise(() => {}) : new Uint8Array()),  // op 7 never settles
+    });
+    const parked = realm.call("park", new Uint8Array());
+    for (let i = 0; i < 10; i++) await Promise.resolve();   // let it reach its await
+    realm.dispose();
+
+    let msg = "";
+    try { await parked; } catch (e) { msg = e.message; }
+    assertEqual(msg, "guest realm disposed", "the parked invocation is failed by dispose, not stranded");
+    let after = "";
+    try { await realm.call("park", new Uint8Array()); } catch (e) { after = e.message; }
+    assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
+
+    // A realm built after the deferred teardown has run proves the module survived it.
+    await sleep(1);
+    const next = await createSafeRealm({
+      source: `register("ping", (arg) => arg);`,
+      bridge: () => new Uint8Array(),
+    });
+    assertEqual([...(await next.call("ping", new Uint8Array([7])))], [7],
+      "the engine is still alive after the parked realm's context was freed");
+    next.dispose();
   }
 
   console.log("  OK\n");
@@ -1103,35 +1208,53 @@ async function testCapBridgeEnforcement() {
   });
   const U = (...xs) => new Uint8Array(xs);
 
-  // declared-op filtering: only ops in the manifest catalog resolve
-  const restricted = mk([CAP.HASH]);
-  assertEqual((await restricted(CAP.HASH, U(1, 2))).length, 32, "a declared op (HASH) works");
+  // A PRIMITIVE is exempt from the gate by construction: it reaches nothing, so there
+  // is nothing to grant. A bridge built for a bundle declaring NO domains still hashes.
+  const clockOnly = mk(opsForCaps(["clock"]));
+  const hashCall = concatBytes([U(11), new TextEncoder().encode("blake2b-256"), U(1, 2)]);
+  assertEqual((await clockOnly(CAP.CRYPTO, hashCall)).length, 32,
+    "CAP_CRYPTO resolves for a bundle declaring no crypto domain — a pure transform is not a grant");
+
+  // Authorities are gated, and each one names something no confined module can hold.
   let threw = false;
-  try { await restricted(CAP.SIGN, U(1)); } catch { threw = true; }
-  assert(threw, "an undeclared op (SIGN) is refused by the bridge");
+  try { await clockOnly(CAP.SIGN, U(1)); } catch { threw = true; }
+  assert(threw, "an undeclared authority (SIGN) is refused by the bridge");
   threw = false;
-  try { await restricted(CAP.FS_DELETE, U(120)); } catch { threw = true; }
-  assert(threw, "an undeclared op (FS_DELETE) is refused by the bridge");
+  try { await clockOnly(CAP.FS_DELETE, U(120)); } catch { threw = true; }
+  assert(threw, "an undeclared authority (FS_DELETE) is refused by the bridge");
 
   // guest-controlled allocation caps. UNRESTRICTED_OPS is the host-side caller that
   // opts out of gating *by name* — omitting allowedOps entirely now throws (§12.2).
   const open = mk(UNRESTRICTED_OPS);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
-  assert(omitted, 'omitting allowedOps throws rather than granting every op');
+  assert(omitted, "omitting allowedOps throws rather than granting every op");
   assertEqual((await open(CAP.RANDOM, U(0, 0, 4, 0))).length, 1024, "RANDOM under the cap works");
   threw = false;
   try { await open(CAP.RANDOM, U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "RANDOM over the cap is refused");
 
-  // caps → ops: a bundle declares capability DOMAINS, the shell expands them to the
-  // op set the bridge enforces (the "wire the caps" path). A guest that declared
-  // only "crypto" hashes fine but cannot touch fs, and a typo'd domain fails loudly.
-  const cryptoOnly = mk(opsForCaps(["crypto"]));
-  assertEqual((await cryptoOnly(CAP.HASH, U(1, 2))).length, 32, "a declared domain (crypto) grants its ops");
+  // caps → ops: a bundle declares capability DOMAINS and the shell expands them to the
+  // op set the bridge enforces. `crypto` is now the AUTHORITY half only — SIGN,
+  // IDENTITY, RANDOM — because the transform half was never a grant.
+  const authorityOnly = createCapBridge({
+    sodium, identity: id, callHandler: () => null,
+    transport: stubTransport, peers: () => [], fs: new MemoryFs(),
+    allowedOps: opsForCaps(["crypto"]), modules: UNSCOPED_MODULES,
+    signScope: appSignScope(id, new Uint8Array(32), "probe"),
+  });
+  assertEqual((await authorityOnly(CAP.SIGN, U(1, 2))).length, 64, "crypto grants the node-key ops");
+  assertEqual((await authorityOnly(CAP.CRYPTO, hashCall)).length, 32,
+    "…and hashing needs no domain at all");
   threw = false;
-  try { await cryptoOnly(CAP.FS_GET, U(120)); } catch { threw = true; }
+  try { await authorityOnly(CAP.FS_GET, U(120)); } catch { threw = true; }
   assert(threw, "an op outside the declared domains (fs) is refused");
+
+  // The vocabulary is closed: a domain that no longer exists fails loudly rather than
+  // being ignored, which is what makes a stale manifest a refused load.
+  threw = false;
+  try { opsForCaps(["transform"]); } catch { threw = true; }
+  assert(threw, "`transform` is gone from the vocabulary — a manifest naming it is refused");
   threw = false;
   try { opsForCaps(["crypto", "nope"]); } catch { threw = true; }
   assert(threw, "an unknown capability domain throws (a manifest typo fails loudly)");
@@ -1167,395 +1290,6 @@ async function testCallHandlerGuards() {
   console.log("  OK\n");
 }
 
-async function testTransportResponseBinding() {
-  console.log("Test: a transport response only resolves from the peer it was sent to");
-
-  const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
-  const A = toHex(a.publicKey), B = toHex(b.publicKey), C = toHex(c.publicKey);
-  const net = new LoopbackNetwork();
-  const ta = new Transport(A, net, 200);
-  const tb = new Transport(B, net, 200);
-  const tc = new Transport(C, net, 200);
-  tb.onRequest((_from, _proto, _payload) => new Uint8Array([42]));
-
-  try {
-    const reqP = ta.request(B, _testProto, new Uint8Array());
-    // C (an authenticated cohort member in real life) races a spoofed response
-    // with the predictable first correlation id. It must be ignored.
-    net.endpoint(C).send(A, Uint8Array.from([1, 0, 0, 0, 1, 7, 99]));
-    const resp = await reqP;
-    assertEqual([...resp], [42], "the real peer's response resolves, not the spoof");
-  } finally {
-    ta.close(); tb.close(); tc.close();
-  }
-
-  console.log("  OK\n");
-}
-
-async function testTransportStallTimeout() {
-  console.log("Test: the request timeout is a stall bound — frames from the peer re-arm it");
-
-  const a = generateKeyPair(), b = generateKeyPair();
-  const A = toHex(a.publicKey), B = toHex(b.publicKey);
-  const net = new LoopbackNetwork();
-  const ta = new Transport(A, net, 250);
-  const tb = new Transport(B, net, 250);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  // B answers each request after 150·type ms: 150 / 300 / 450. Issued together at
-  // t≈0, responses 2 and 3 land past the 250 ms timeout — but each arriving
-  // response is a frame from B that re-arms the later requests' stall clocks
-  // (every inter-frame gap is 150 ms < 250 ms), so all three must resolve. This is
-  // the PUT STORE round in miniature: many requests against one issue instant,
-  // with the tail alive only because the transfer is visibly progressing.
-  tb.onRequest(async (_from, _proto, payload) => { const t = payload[0] || 1; await sleep(150 * t); return new Uint8Array([t]); });
-
-  try {
-    const rs = await Promise.all([1, 2, 3].map((t) => ta.request(B, _testProto, new Uint8Array([t]))));
-    assertEqual(rs.map((r) => r[0]), [1, 2, 3], "a slow-but-streaming peer never times out");
-
-    // A silent peer still fails after ~timeoutMs — the stall clock is a real bound.
-    const t0 = Date.now();
-    let failed = false;
-    try { await ta.request(toHex(generateKeyPair().publicKey), _testProto, new Uint8Array()); }
-    catch { failed = true; }
-    assert(failed, "a silent peer still times out");
-    assert(Date.now() - t0 < 2000, "silence is detected promptly, not hung");
-  } finally {
-    ta.close(); tb.close();
-  }
-
-  console.log("  OK\n");
-}
-
-async function testTransportBackstop() {
-  console.log("Test: an absolute backstop rejects a withheld response even from a 'live' peer");
-
-  const a = generateKeyPair(), b = generateKeyPair();
-  const A = toHex(a.publicKey), B = toHex(b.publicKey);
-  const net = new LoopbackNetwork();
-  // timeoutMs 50, maxStallWindows 3 → backstop ≈ 150 ms. There is no Transport for B, so
-  // it never answers A's request; we keep B "live" from A's view by dribbling an unrelated
-  // frame every 20 ms (< the 50 ms silence window), which re-arms A's stall clock forever.
-  // This is the buggy/hostile peer: it withholds THIS response while keeping the wire warm,
-  // so silence alone would never fire — only the absolute backstop bounds the request.
-  const ta = new Transport(A, net, 50, 3);
-  const epB = net.endpoint(B);
-  let alive = true;
-  (async () => {
-    // A KIND_RES frame for a corr with no pending entry: onFrame stamps lastFrameAt[B]
-    // (re-arming every request pending to B) then drops it — nothing ever resolves.
-    while (alive) { epB.send(A, Uint8Array.from([1, 0, 0, 0, 255, 0])); await sleep(20); }
-  })();
-
-  try {
-    const t0 = Date.now();
-    let failed = false, msg = "";
-    try { await ta.request(B, _testProto, new Uint8Array()); }
-    catch (e) { failed = true; msg = String(e?.message ?? e); }
-    const dt = Date.now() - t0;
-    assert(failed, "a request whose response never comes still rejects, despite a live peer");
-    assert(/backstop/.test(msg), `it rejects via the absolute backstop, not silence (got: ${msg})`);
-    assert(dt >= 140, `the backstop waits out ~maxStallWindows×timeoutMs before firing (got ${dt}ms)`);
-    assert(dt < 900, `but it DOES fire — the request is not pinned forever (got ${dt}ms)`);
-  } finally {
-    alive = false;
-    ta.close();
-  }
-
-  console.log("  OK\n");
-}
-
-async function testWsFragmentation() {
-  console.log("Test: WS fragmented messages reassemble (FIN=0 + continuation frames)");
-
-  const mask = new Uint8Array([9, 8, 7, 6]);
-  const p1 = new Uint8Array([1, 2, 3]), p2 = new Uint8Array([4, 5]), p3 = new Uint8Array([6]);
-  // encodeFrame always emits FIN=1; craft fragments by clearing the FIN bit.
-  const first = encodeFrame(WS_OPCODES.OP_BINARY, p1, mask); first[0] &= 0x7f;
-  const middle = encodeFrame(0x0, p2, mask); middle[0] &= 0x7f; // continuation, FIN=0
-  const ping = encodeFrame(WS_OPCODES.OP_PING, new Uint8Array([0xaa]), mask); // may interleave (§5.4)
-  const last = encodeFrame(0x0, p3, mask); // continuation, FIN=1
-
-  const parser = new WsParser(true);
-  const frames = [
-    ...parser.push(first), ...parser.push(middle),
-    ...parser.push(ping), ...parser.push(last),
-  ];
-  assertEqual(frames.length, 2, "the ping + one reassembled message");
-  assertEqual(frames[0].opcode, WS_OPCODES.OP_PING, "interleaved control frame passes through");
-  assertEqual(frames[1].opcode, WS_OPCODES.OP_BINARY, "reassembled message keeps the first opcode");
-  assertEqual([...frames[1].payload], [1, 2, 3, 4, 5, 6], "fragment payloads concatenate in order");
-
-  // A continuation with nothing in flight is a protocol error → channel teardown.
-  const parser2 = new WsParser(true);
-  let threw = false;
-  try { parser2.push(encodeFrame(0x0, p2, mask)); } catch { threw = true; }
-  assert(threw, "an orphan continuation frame is a protocol error");
-
-  // A fragmented control frame is a protocol error (RFC 6455 §5.5).
-  const parser3 = new WsParser(true);
-  const badPing = encodeFrame(WS_OPCODES.OP_PING, new Uint8Array([1]), mask); badPing[0] &= 0x7f;
-  threw = false;
-  try { parser3.push(badPing); } catch { threw = true; }
-  assert(threw, "a fragmented control frame is a protocol error");
-
-  console.log("  OK\n");
-}
-
-async function testRedialAfterFailedDial() {
-  console.log("Test: a failed dial is forgotten — the peer is reachable once it comes back");
-
-  const idS = generateKeyPair(), idB = generateKeyPair();
-  // Reserve a port, then free it so the first dial hits ECONNREFUSED.
-  const probe = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port: 0 } });
-  await probe.start();
-  const port = probe.port;
-  probe.close();
-  await sleep(50);
-
-  const netB = new NodeNetwork({ identity: idB, contactSecret: TEST_CONTACT, sodium });
-  const epB = netB.endpoint(toHex(idB.publicKey));
-  epB.onFrame(() => {});
-  let netS = null;
-  try {
-    // Dialing gates on the secret of the far end, so it rides on the ADDRESS, not on
-    // our own constructor (which only says what we demand of callers we accept).
-    netB.addPeerAddr(toHex(idS.publicKey),
-      { host: "127.0.0.1", port, transport: "tcp", contactSecret: TEST_CONTACT });
-    epB.send(toHex(idS.publicKey), new Uint8Array([1]));
-    await sleep(200); // the dial fails; the stale connecting entry must be cleaned up
-
-    netS = new NodeNetwork({ identity: idS, contactSecret: TEST_CONTACT, sodium, listen: { host: "127.0.0.1", port } });
-    await netS.start();
-    let received = 0;
-    netS.endpoint(toHex(idS.publicKey)).onFrame(() => { received++; });
-    epB.send(toHex(idS.publicKey), new Uint8Array([2]));
-    await sleep(300);
-    assertEqual(received, 1, "send() redials after the peer comes back (no permanent blackhole)");
-  } finally {
-    if (netS) netS.close();
-    netB.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: connsPerPeer opens N parallel flows and stripes across them ──────
-//
-// The multi-flow upload feature (net-route / net-ws): a dialer opens connsPerPeer
-// parallel links to one peer and stripes frames round-robin over them, so N TCP
-// flows fill a high-RTT/lossy link a single CUBIC flow can't. We drive two
-// NodeNetworkCores through an in-memory ChannelFactory (no sockets) so we can
-// count the dials and the per-link sends directly:
-//   • connsPerPeer=3 opens exactly 3 dials, and ready() is idempotent (no over-dial);
-//   • post-auth frames stripe evenly round-robin across the 3 links;
-//   • the peer stays reachable while ≥1 link survives — losing one flow is not a down.
-
-async function testConnsPerPeerFanout() {
-  console.log("Test: connsPerPeer opens N parallel flows and stripes frames round-robin");
-  const { NodeNetworkCore } = await imp("build/host/net-route.js");
-
-  // An in-memory RawChannel pair: whole-message, async delivery, closing either
-  // end notifies both. Each end tallies how many frames it has carried.
-  function rawPair() {
-    const mk = () => ({
-      twin: null, onMsg: null, onCls: null, open: true, sends: 0,
-      send(bytes) {
-        this.sends++;
-        const t = this.twin, copy = bytes.slice();
-        queueMicrotask(() => { if (t.open) t.onMsg?.(copy); });
-      },
-      onMessage(cb) { this.onMsg = cb; },
-      onClose(cb) { this.onCls = cb; },
-      close() {
-        if (!this.open) return;
-        this.open = false; this.twin.open = false;
-        queueMicrotask(() => { this.onCls?.(); this.twin.onCls?.(); });
-      },
-    });
-    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
-  }
-
-  let onAccept = null;
-  const serverFactory = {
-    connect() { throw new Error("server does not dial"); },
-    listen(_tcp, _ws, cb) { onAccept = cb; return Promise.resolve({ port: 1, wsPort: 0 }); },
-    close() {},
-  };
-  const clientLinks = []; // every client-side channel we dialed, in dial order
-  const clientFactory = {
-    connect(_addr) { const [c, s] = rawPair(); clientLinks.push(c); queueMicrotask(() => onAccept(s)); return c; },
-    listen() { return Promise.resolve({ port: 0, wsPort: 0 }); },
-    close() {},
-  };
-
-  const idS = generateKeyPair(), idC = generateKeyPair();
-  const server = new NodeNetworkCore({ identity: idS, contactSecret: TEST_CONTACT, sodium, channels: serverFactory, listen: { host: "x", port: 0 } });
-  await server.start();
-  const got = [];
-  server.endpoint(toHex(idS.publicKey)).onFrame((_from, frame) => got.push(frame));
-
-  const client = new NodeNetworkCore({ identity: idC, contactSecret: TEST_CONTACT, sodium, channels: clientFactory, connsPerPeer: 3 });
-  const epC = client.endpoint(toHex(idC.publicKey));
-  epC.onFrame(() => {});
-  client.addPeerAddr(toHex(idS.publicKey),
-    { host: "x", port: 1, transport: "tcp", contactSecret: TEST_CONTACT });
-  const sendC = (bytes) => epC.send(toHex(idS.publicKey), bytes);
-
-  try {
-    await client.ready(2000);
-    assertEqual(clientLinks.length, 3, "connsPerPeer=3 opens exactly 3 parallel dials");
-
-    // ready() resolves on the FIRST link up; let the other two finish their handshake.
-    await sleep(50);
-    // A second ready() must not over-dial — the shortfall is zero once all three are up.
-    await client.ready(2000);
-    assertEqual(clientLinks.length, 3, "a second ready() is idempotent — no redundant dials");
-
-    // Round-robin striping: 6 post-auth frames over 3 links → 2 each (each PeerLink.send
-    // is exactly one channel send post-auth, so per-link tallies read the routing directly).
-    const base = clientLinks.map((l) => l.sends);
-    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
-    await sleep(50);
-    const deltas = clientLinks.map((l, i) => l.sends - base[i]);
-    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 parallel links");
-    assertEqual(got.length, 6, "all 6 striped frames are delivered to the peer");
-
-    // Resilience: drop one link — the peer is still reachable over the other two.
-    clientLinks[0].close();
-    await sleep(50);
-    const before = got.length;
-    for (let i = 0; i < 4; i++) sendC(new Uint8Array([9]));
-    await sleep(50);
-    assertEqual(got.length - before, 4, "losing one of three flows leaves the peer reachable over the rest");
-  } finally {
-    client.close(); server.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: WsNetwork connsPerPeer — N parallel WS flows, up/down fire once ──
-//
-// The browser-edge counterpart to testConnsPerPeerFanout: WsNetwork (what p2p.html
-// and p2p-cli dial with) opens connsPerPeer WebSockets to one peer and stripes over
-// them. The cohort/quorum logic keys off onPeerUp/onPeerDown, so those must fire
-// exactly once per peer regardless of how many parallel links back it. We drive the
-// client through an in-memory WsLike factory whose twin runs a hand-wired server
-// PeerLink, so no real socket is opened:
-//   • connsPerPeer=3 opens 3 WebSockets but onPeerUp fires once;
-//   • frames stripe evenly round-robin across the 3 links;
-//   • dropping links keeps the peer up until the LAST one goes — onPeerDown fires once.
-
-async function testWsNetworkFanout() {
-  console.log("Test: WsNetwork connsPerPeer — 3 parallel WS flows, onPeerUp/Down fire once");
-  const { WsNetwork, WsChannel } = await imp("build/host/net-ws.js");
-  const { PeerLink } = await imp("build/host/net-link.js");
-
-  // An in-memory WsLike pair (numeric readyState, as WsChannel checks === OPEN):
-  // whole-message async delivery, open on next tick, close notifies both ends.
-  function wsPair() {
-    const mk = () => ({
-      binaryType: "blob", readyState: 0 /* CONNECTING */, sends: 0,
-      _l: { open: [], close: [], error: [], message: [] }, twin: null,
-      addEventListener(t, cb) { this._l[t].push(cb); },
-      send(bytes) {
-        this.sends++;
-        const t = this.twin, buf = bytes.slice().buffer;
-        queueMicrotask(() => { if (t.readyState === 1) for (const cb of t._l.message) cb({ data: buf }); });
-      },
-      close() {
-        if (this.readyState === 3) return;
-        this.readyState = 3; for (const cb of this._l.close) cb();
-        const t = this.twin; if (t.readyState !== 3) { t.readyState = 3; for (const cb of t._l.close) cb(); }
-      },
-      open() { this.readyState = 1; for (const cb of this._l.open) cb(); },
-    });
-    const a = mk(), b = mk(); a.twin = b; b.twin = a; return [a, b];
-  }
-
-  const idS = generateKeyPair(), idC = generateKeyPair();
-  const clientWs = [];   // client-side WsLike per parallel link, in dial order
-  const serverGot = [];  // frames the server received
-  let serverAuthed = 0;  // server-side auths (one per accepted link)
-
-  // Each dial: make a pair, wrap the server twin in a server-side PeerLink, and open
-  // both ends next tick so the buffered HELLOs flush and the handshake runs.
-  const factory = (_url) => {
-    const [cli, srv] = wsPair();
-    clientWs.push(cli);
-    new PeerLink({
-      channel: new WsChannel(srv), identity: idS, sodium, weDialed: false,
-      onAuth: () => { serverAuthed++; }, onFrame: (_pid, f) => serverGot.push(f), onClose: () => {},
-    });
-    queueMicrotask(() => { cli.open(); srv.open(); });
-    return cli;
-  };
-
-  let ups = 0, downs = 0;
-  const client = new WsNetwork({
-    identity: idC, sodium, webSocketFactory: factory, connsPerPeer: 3,
-    onPeerUp: () => { ups++; }, onPeerDown: () => { downs++; },
-  });
-  const epC = client.endpoint(toHex(idC.publicKey));
-  const sendC = (bytes) => epC.send(toHex(idS.publicKey), bytes);
-
-  try {
-    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
-    await sleep(80); // let all three handshakes complete
-    assertEqual(clientWs.length, 3, "connsPerPeer=3 opens exactly 3 WebSockets");
-    assertEqual(serverAuthed, 3, "all three parallel links authenticate on the server");
-    assertEqual(ups, 1, "onPeerUp fires once, when the peer first becomes reachable");
-    assertEqual(client.linkedPeers().length, 1, "the three links are one logical peer");
-
-    // Round-robin striping: 6 post-auth frames over 3 links → 2 each.
-    const base = clientWs.map((w) => w.sends);
-    for (let i = 0; i < 6; i++) sendC(new Uint8Array([i]));
-    await sleep(50);
-    const deltas = clientWs.map((w, i) => w.sends - base[i]);
-    assertEqual(deltas, [2, 2, 2], "6 frames stripe evenly across the 3 WS links");
-    assertEqual(serverGot.length, 6, "all 6 striped frames reach the peer");
-
-    // Drop two of three links: the peer stays up (no onPeerDown yet) and still routes.
-    clientWs[0].close();
-    clientWs[1].close();
-    await sleep(50);
-    assertEqual(downs, 0, "losing 2 of 3 flows does not down the peer");
-    const before = serverGot.length;
-    for (let i = 0; i < 3; i++) sendC(new Uint8Array([9]));
-    await sleep(50);
-    assertEqual(serverGot.length - before, 3, "the peer is still reachable over the surviving flow");
-
-    // Re-dial: connect() is an idempotent top-up, so it re-opens ONLY the two dropped
-    // flows (not a fresh three) — the browser/CLI recovers the striping win after a
-    // partial drop instead of running degraded to one flow for the rest of the session.
-    client.connect(`${toHex(idS.publicKey)}@127.0.0.1:1`);
-    await sleep(80);
-    assertEqual(clientWs.length, 5, "re-connect() opens exactly the 2-flow shortfall, not 3 more");
-    assertEqual(serverAuthed, 5, "the two topped-up links authenticate too");
-    assertEqual(ups, 1, "onPeerUp does NOT fire again — the peer was already reachable");
-    assertEqual(client.linkedPeers().length, 1, "still one logical peer after the top-up");
-
-    // Striping is back to three flows: 6 frames over the survivor + 2 re-opened links.
-    const survivors = [clientWs[2], clientWs[3], clientWs[4]];
-    const base2 = survivors.map((w) => w.sends);
-    for (let i = 0; i < 6; i++) sendC(new Uint8Array([7]));
-    await sleep(50);
-    assertEqual(survivors.map((w, i) => w.sends - base2[i]), [2, 2, 2],
-      "after the top-up, 6 frames stripe evenly across all 3 restored flows");
-
-    // Every remaining flow drops → onPeerDown fires exactly once.
-    for (const w of survivors) w.close();
-    await sleep(50);
-    assertEqual(downs, 1, "onPeerDown fires once, only when the last flow drops");
-    assertEqual(client.linkedPeers().length, 0, "the peer is no longer linked once every flow is gone");
-  } finally {
-    client.close();
-  }
-
-  console.log("  OK\n");
-}
-
 async function testSafeRealmConcurrency() {
   console.log("Test: concurrent call()s on one safe-js realm interleave without __arg clobber");
 
@@ -1576,357 +1310,6 @@ async function testSafeRealmConcurrency() {
     assertEqual([...r2], [2], "second concurrent call returns its own bytes");
   } finally {
     realm.dispose();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: RtcChannel drives PeerLink over a data channel (net-rtc) ──────
-//
-// WebRTC as a first-class Network: an RTCDataChannel is wrapped as a RawChannel
-// and the unchanged PeerLink runs its identity handshake over it. We exercise the
-// genuinely new code — RtcChannel, including its pre-open send buffering — with a
-// fake whole-message channel pair (no real ICE), driving a full mutual handshake
-// and a post-auth frame. RtcNetwork's signaling/perfect-negotiation needs a real
-// RTCPeerConnection (browser or node-datachannel) and is exercised there.
-
-async function testRtcNetwork() {
-  console.log("Test: net-rtc — RtcChannel + PeerLink handshake over a (fake) data channel");
-  const { RtcChannel } = await imp("build/host/net-rtc.js");
-  const { PeerLink } = await imp("build/host/net-link.js");
-
-  // A minimal RTCDataChannel stand-in: an ordered whole-message binary pipe with
-  // controllable open timing, wired to its twin. Delivery is async (a microtask)
-  // to mirror a real channel; send() ships an ArrayBuffer, as binaryType
-  // "arraybuffer" does on the wire.
-  function fakeChannelPair() {
-    const mk = () => ({
-      binaryType: "blob",
-      readyState: "connecting",
-      _l: { message: [], open: [], close: [], error: [] },
-      _twin: null,
-      addEventListener(t, cb) { (this._l[t] ??= []).push(cb); },
-      send(bytes) {
-        const buf = bytes.slice().buffer; // copy → fresh ArrayBuffer, like the wire
-        const twin = this._twin;
-        queueMicrotask(() => { for (const cb of twin._l.message) cb({ data: buf }); });
-      },
-      close() { this.readyState = "closed"; for (const cb of this._l.close) cb(); },
-      _open() { this.readyState = "open"; for (const cb of this._l.open) cb(); },
-    });
-    const a = mk(), b = mk();
-    a._twin = b; b._twin = a;
-    return [a, b];
-  }
-
-  const idA = generateKeyPair(), idB = generateKeyPair();
-  const [dcA, dcB] = fakeChannelPair();
-
-  // Construct both PeerLinks BEFORE the channels open: each emits its HELLO
-  // immediately, which must queue inside RtcChannel until "open" (the pre-open
-  // buffering path — the one thing RtcChannel adds over a raw pipe).
-  let authA = null, authB = null;
-  const framesB = [];
-  const linkA = new PeerLink({
-    channel: new RtcChannel(dcA), identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
-    onAuth: (pid) => { authA = pid; }, onFrame: () => {}, onClose: () => {},
-  });
-  const linkB = new PeerLink({
-    channel: new RtcChannel(dcB), identity: idB, sodium, weDialed: false, expectPeerId: toHex(idA.publicKey),
-    onAuth: (pid) => { authB = pid; }, onFrame: (_p, f) => framesB.push(f), onClose: () => {},
-  });
-
-  try {
-    // Nothing crosses while both ends are still "connecting".
-    await sleep(10);
-    assert(authA === null && authB === null, "no auth while channels are unopened (HELLO is buffered, not lost)");
-
-    // Open both ends: buffered HELLOs flush and the mutual challenge completes.
-    dcA._open(); dcB._open();
-    await sleep(20);
-    assertEqual(authA, toHex(idB.publicKey), "A authenticated B over the data channel");
-    assertEqual(authB, toHex(idA.publicKey), "B authenticated A over the data channel");
-
-    // A post-auth Network frame round-trips, attributed to the authenticated id.
-    linkA.send(new Uint8Array([9, 8, 7]));
-    await sleep(20);
-    assert(framesB.length === 1 && bytesEqual(framesB[0], new Uint8Array([9, 8, 7])),
-      "a frame sent after auth is delivered to the peer");
-
-    // A wrong-key expectation must refuse: B presents idB, but we expect a random id.
-    const [dcC, dcD] = fakeChannelPair();
-    let authC = null;
-    const linkC = new PeerLink({
-      channel: new RtcChannel(dcC), identity: idA, sodium, weDialed: true, expectPeerId: toHex(generateKeyPair().publicKey),
-      onAuth: (pid) => { authC = pid; }, onFrame: () => {}, onClose: () => {},
-    });
-    const linkD = new PeerLink({
-      channel: new RtcChannel(dcD), identity: idB, sodium, weDialed: false, expectPeerId: toHex(idA.publicKey),
-      onAuth: () => {}, onFrame: () => {}, onClose: () => {},
-    });
-    dcC._open(); dcD._open();
-    await sleep(20);
-    assert(authC === null, "a channel to a mismatched identity never authenticates");
-    linkC.close(); linkD.close();
-  } finally {
-    linkA.close(); linkB.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: RtcNetwork media tracks + ICE restart (net-rtc) ──────────────────
-//
-// addLocalTrack / removeLocalTracks / onTrack and the ICE-restart recovery
-// (restartAllIce, plus restartIce on a "disconnected" connectionstatechange)
-// all act on the peer's RTCPeerConnection, so a fake pc lets us assert the
-// mechanics deterministically without standing up real ICE. We create one peer
-// entry by feeding the signaling a `hello`, drive it to "connected", then check
-// that tracks are published/removed, remote tracks surface via onTrack, and ICE
-// restarts fire on demand and on a transient drop.
-
-async function testRtcNetworkMedia() {
-  console.log("Test: net-rtc — media tracks + ICE restart over a fake RTCPeerConnection");
-  const { RtcNetwork } = await imp("build/host/net-rtc.js");
-
-  // A minimal RTCPeerConnection stand-in: records track/ICE calls and can emit
-  // the events RtcNetwork listens for. createDataChannel hands back an inert dc
-  // (RtcChannel wraps it and buffers a HELLO that never flushes — harmless).
-  function fakePc() {
-    const l = {};
-    return {
-      connectionState: "new",
-      signalingState: "stable",
-      localDescription: null,
-      remoteDescription: null,
-      addedTracks: [],
-      removedSenders: [],
-      restartIceCount: 0,
-      addEventListener(t, cb) { (l[t] ??= []).push(cb); },
-      _emit(t, ev) { for (const cb of (l[t] || [])) cb(ev || {}); },
-      createDataChannel() {
-        return { binaryType: "blob", readyState: "connecting", addEventListener() {}, send() {}, close() {} };
-      },
-      addTrack(track, stream) { const s = { track, stream }; this.addedTracks.push(s); return s; },
-      removeTrack(sender) { this.removedSenders.push(sender); },
-      restartIce() { this.restartIceCount++; },
-      async setLocalDescription() {},
-      async setRemoteDescription() {},
-      async addIceCandidate() {},
-      close() { this.connectionState = "closed"; },
-    };
-  }
-
-  const id = generateKeyPair();
-  const peerId = toHex(generateKeyPair().publicKey);
-  let pc = null, sigCb = null;
-  const onTrackCalls = [];
-
-  const net = new RtcNetwork({
-    identity: id,
-    sodium,
-    signaling: { send() {}, onMessage(cb) { sigCb = cb; }, close() {} },
-    peerConnectionFactory: () => { pc = fakePc(); return pc; },
-    onTrack: (pid, track) => onTrackCalls.push({ pid, track }),
-  });
-
-  // A `hello` from a peer creates its entry (and its pc via the factory).
-  sigCb({ type: "hello", from: peerId });
-  await sleep(5);
-  assert(pc !== null, "a hello creates a peer connection via the factory");
-
-  // Bring the link to "connected" — tracks are only published to connected peers.
-  pc.connectionState = "connected";
-  pc._emit("connectionstatechange");
-
-  // Publishing two local tracks adds both to the connected peer, once each.
-  const t1 = { kind: "audio" }, t2 = { kind: "video" }, stream = { id: "local" };
-  net.addLocalTrack(t1, stream);
-  net.addLocalTrack(t2, stream);
-  assert(pc.addedTracks.length === 2, "both local tracks are added to the connected peer");
-  assert(pc.addedTracks[0].track === t1 && pc.addedTracks[1].track === t2, "the exact tracks are published");
-
-  // A remote track surfaces through onTrack, attributed to the authenticated id.
-  const remoteTrack = { kind: "video" };
-  pc._emit("track", { track: remoteTrack });
-  assert(onTrackCalls.length === 1 && onTrackCalls[0].pid === peerId && onTrackCalls[0].track === remoteTrack,
-    "a remote track is delivered to onTrack with the peer id");
-
-  // restartAllIce kicks every peer; a transient "disconnected" also self-heals.
-  net.restartAllIce();
-  assert(pc.restartIceCount === 1, "restartAllIce restarts ICE on each peer");
-  pc.connectionState = "disconnected";
-  pc._emit("connectionstatechange");
-  assert(pc.restartIceCount === 2, "a 'disconnected' connection restarts ICE rather than tearing down");
-
-  // Hanging up removes exactly the senders we added.
-  net.removeLocalTracks();
-  assert(pc.removedSenders.length === 2, "removeLocalTracks removes every sender it added");
-
-  net.close();
-  console.log("  OK\n");
-}
-
-// ─── Test: two werift RtcNetworks connect over REAL WebRTC (net-rtc-node) ────
-//
-// The companion to testRtcNetwork: where that drives RtcChannel over a fake pipe,
-// this stands up two *real* RtcNetworks on a werift-backed peerConnectionFactory
-// and lets them complete a genuine ICE → DTLS → SCTP bring-up, then PeerLink's
-// identity handshake, then a Transport request/response — all over an actual data
-// channel. The relay is replaced by an in-process Signaling pair (a 2-party room
-// that forwards each JSON message to the other side, as the relay would), so the
-// test has no network dependency beyond loopback. This is the console side of the
-// browser↔console-through-NAT story: the same stack a browser tab runs, off-browser.
-
-function signalingPair() {
-  // Two endpoints that forward to each other. JSON round-tripping each message
-  // mirrors the relay wire (and proves the sdp/candidate objects RtcNetwork emits
-  // are plain and serialisable). Delivery is deferred, like a real socket.
-  let aCb = () => {}, bCb = () => {};
-  const post = (cb, msg) => { const m = JSON.parse(JSON.stringify(msg)); queueMicrotask(() => cb(m)); };
-  const a = { send: (m) => post(bCb, m), onMessage: (cb) => { aCb = cb; }, close() {} };
-  const b = { send: (m) => post(aCb, m), onMessage: (cb) => { bCb = cb; }, close() {} };
-  return [a, b];
-}
-
-async function testWeriftRtcNetwork() {
-  console.log("Test: net-rtc-node — two werift RtcNetworks connect over real WebRTC (ICE/DTLS/SCTP)");
-  const { RtcNetwork } = await imp("build/host/net-rtc.js");
-  const { weriftPeerConnectionFactory } = await imp("build/host/net-rtc-node.js");
-
-  const idA = generateKeyPair(), idB = generateKeyPair();
-  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
-  const [sigA, sigB] = signalingPair();
-  // Loopback host candidate so two peers on one machine connect with no STUN.
-  const pcFactory = weriftPeerConnectionFactory({ iceAdditionalHostAddresses: ["127.0.0.1"] });
-
-  const netA = new RtcNetwork({ identity: idA, sodium, signaling: sigA, peerConnectionFactory: pcFactory });
-  const netB = new RtcNetwork({ identity: idB, sodium, signaling: sigB, peerConnectionFactory: pcFactory });
-
-  // Generous timeout: werift's pure-JS DTLS/SCTP bring-up is slower than native.
-  const ta = new Transport(aId, netA, 4000);
-  const tb = new Transport(bId, netB, 4000);
-  tb.onRequest((_from, _proto, payload) => payload);
-
-  try {
-    netA.join(); netB.join(); // announce into the room → the WebRTC dance begins
-
-    const t0 = Date.now();
-    while ((!netA.linkedPeers().includes(bId) || !netB.linkedPeers().includes(aId)) && Date.now() - t0 < 15000) {
-      await sleep(100);
-    }
-    assert(netA.linkedPeers().includes(bId), "A holds an authenticated link to B over real WebRTC");
-    assert(netB.linkedPeers().includes(aId), "B holds an authenticated link to A over real WebRTC");
-
-    // A real request crosses the data channel and the response comes back.
-    const res = await ta.request(bId, _testProto, new Uint8Array([3, 4]));
-    assert(bytesEqual(res, new Uint8Array([3, 4])), "request/response round-trips over the werift data channel");
-  } finally {
-    ta.close(); tb.close();
-    netA.close(); netB.close();
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: PeerLink record layer — tamper / replay / reorder tears the link down ──
-//
-// The core security property of the §12.6 record layer: after the AKE, every FRAME is
-// an AEAD record under a forward-secret key with an implicit monotonic counter as its
-// nonce, and any record that fails to decrypt in strict counter order tears the link
-// down. We drive two real PeerLinks over an in-memory channel pair, let the handshake
-// complete untouched, then intercept the sender's post-auth records to tamper, replay,
-// or reorder them — each must fail the receiver's decrypt and drop the connection.
-async function testRecordLayerIntegrity() {
-  console.log("Test: PeerLink record layer — tampered / replayed / reordered records tear the link down");
-  const { PeerLink } = await imp("build/host/net-link.js");
-
-  // An in-memory RawChannel pair. HELLO(1)/AUTH(2) always pass through so the handshake
-  // runs; a post-auth FRAME(3) from A is routed through `hook.fn(record, deliver)` when a
-  // test installs one, so it can tamper / replay / reorder / drop. B→A always passes.
-  function pair(hook) {
-    const mk = () => ({
-      msg: null, cls: null, closed: false, twin: null,
-      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
-      close() {
-        if (this.closed) return;
-        this.closed = true;
-        queueMicrotask(() => this.cls && this.cls());
-        const t = this.twin;
-        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
-      },
-    });
-    const a = mk(), b = mk(); a.twin = b; b.twin = a;
-    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
-    a.send = (bytes) => {
-      const m = bytes.slice();
-      if (m[0] === 3 /* MSG_FRAME */ && hook.fn) hook.fn(m, (out) => deliver(b, out));
-      else deliver(b, m);
-    };
-    b.send = (bytes) => deliver(a, bytes.slice());
-    return { a, b, injectB: (bytes) => deliver(b, bytes.slice()) };
-  }
-
-  // Build an authenticated pair, returning handles + a live state snapshot.
-  async function authedPair() {
-    const hook = { fn: null };
-    const { a: chA, b: chB, injectB } = pair(hook);
-    const idA = generateKeyPair(), idB = generateKeyPair();
-    const st = { aAuthed: false, bAuthed: false, aClosed: false, bGot: [] };
-    const linkB = new PeerLink({
-      channel: chB, identity: idB, sodium, weDialed: false,
-      onAuth: () => { st.bAuthed = true; }, onFrame: (_p, f) => st.bGot.push(f), onClose: () => {},
-    });
-    const linkA = new PeerLink({
-      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
-      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => { st.aClosed = true; },
-    });
-    for (let i = 0; i < 20 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
-    return { hook, linkA, linkB, injectB, st };
-  }
-
-  // 1. Tamper: flip a byte of the sealed ciphertext → Poly1305 tag check fails → drop.
-  {
-    const p = await authedPair();
-    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before tampering");
-    p.hook.fn = (rec, deliver) => { rec[1] ^= 0x01; deliver(rec); };
-    p.linkA.send(new Uint8Array([1, 2, 3]));
-    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
-    assert(p.st.aClosed, "a tampered record tears the link down");
-    assertEqual(p.st.bGot.length, 0, "the tampered frame is never delivered to the guest");
-  }
-
-  // 2. Replay: deliver a valid record, then re-deliver the identical bytes — the receiver's
-  //    counter has advanced, so the reconstructed nonce no longer matches → drop.
-  {
-    const p = await authedPair();
-    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before replay");
-    let captured = null;
-    p.hook.fn = (rec, deliver) => { captured = rec.slice(); deliver(rec); };
-    p.linkA.send(new Uint8Array([7]));
-    for (let i = 0; i < 20 && p.st.bGot.length < 1; i++) await sleep(2);
-    assertEqual(p.st.bGot.length, 1, "the first record decrypts and is delivered");
-    p.injectB(captured); // replay the exact same sealed record
-    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
-    assert(p.st.aClosed, "a replayed record tears the link down");
-    assertEqual(p.st.bGot.length, 1, "the replayed record is not delivered a second time");
-  }
-
-  // 3. Reorder: hold record ctr0, then deliver ctr1 before ctr0 — the receiver expects
-  //    ctr0's nonce, so the out-of-order record fails to decrypt → drop.
-  {
-    const p = await authedPair();
-    assert(p.st.aAuthed && p.st.bAuthed, "handshake completes before reorder");
-    const recs = [];
-    p.hook.fn = (rec, deliver) => {
-      recs.push(rec.slice());
-      if (recs.length === 2) { deliver(recs[1]); deliver(recs[0]); } // ctr1 then ctr0
-    };
-    p.linkA.send(new Uint8Array([10])); // ctr0 (held)
-    p.linkA.send(new Uint8Array([20])); // ctr1 → triggers reordered delivery
-    for (let i = 0; i < 20 && !p.st.aClosed; i++) await sleep(2);
-    assert(p.st.aClosed, "an out-of-order record tears the link down");
-    assertEqual(p.st.bGot.length, 0, "no reordered frame is delivered");
   }
 
   console.log("  OK\n");
@@ -1994,86 +1377,306 @@ async function testManifestSuiteByte() {
   console.log("  OK\n");
 }
 
-// ─── Test: HELLO suite byte — unknown suite refused, flipped suite cannot downgrade ──
+// ─── Test: ML-DSA-65 against NIST's own vectors (ACVP known-answer test) ─────────
 //
-// The §12.6 suite byte makes HELLO self-describing so a future (post-quantum) handshake
-// is a negotiated rollout rather than a network-wide flag day. Two properties carry it:
-// an unrecognised suite is refused cleanly, and — because the byte lives inside the
-// signed transcript — an in-path flip cannot force a peer onto another suite, it only
-// breaks AUTH. The second is the load-bearing one: a suite is *chosen* by endpoints,
-// never *forced* by the network.
-async function testHelloSuiteByte() {
-  console.log("Test: HELLO suite byte — unknown suite refused, flipped suite breaks AUTH (no downgrade)");
-  const { PeerLink } = await imp("build/host/net-link.js");
+// Round-trip tests — sign, verify, flip a bit, verify again — are satisfied by an
+// implementation that is wrong but self-consistent, and they say nothing about
+// whether two targets will agree. These are NIST's published ACVP vectors for
+// ML-DSA-65 (external interface, pure, FIPS 204): fixed public keys, messages and
+// signatures with a verdict attached, plus sigGen cases where the signature itself
+// must match byte for byte.
+//
+// This is what makes "one implementation across three targets" checkable rather
+// than asserted: the browser fetches these bytes, Node reads them, and the Go
+// loader embeds them (native/mldsa.go), so a build that drifts — wrong parameter
+// set, a bad compiler flag, a resurrected second implementation — fails here
+// instead of silently splitting the network into nodes that admit a bundle and
+// nodes that refuse it.
+async function testMlDsaAcvpVectors() {
+  console.log("Test: ML-DSA-65 ACVP known-answer vectors (FIPS 204, external/pure)");
+  const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mldsa65-acvp.json"), "utf8"));
+  const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
+  const mldsa = await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm")));
 
-  // In-memory pair; `hook.fn` may rewrite any message A sends before B sees it.
-  function pair(hook) {
-    const mk = () => ({
-      msg: null, cls: null, closed: false, twin: null,
-      onMessage(cb) { this.msg = cb; }, onClose(cb) { this.cls = cb; },
-      close() {
-        if (this.closed) return;
-        this.closed = true;
-        queueMicrotask(() => this.cls && this.cls());
-        const t = this.twin;
-        if (t && !t.closed) { t.closed = true; queueMicrotask(() => t.cls && t.cls()); }
-      },
-    });
-    const a = mk(), b = mk(); a.twin = b; b.twin = a;
-    const deliver = (to, bytes) => queueMicrotask(() => { if (!to.closed && to.msg) to.msg(bytes); });
-    a.send = (bytes) => { const m = hook.fn ? hook.fn(bytes.slice()) : bytes.slice(); if (m) deliver(b, m); };
-    b.send = (bytes) => deliver(a, bytes.slice());
-    return { a, b };
+  // The vectors carry FIPS 204 context strings; the runtime always signs with an
+  // empty one (§12.4), so the raw module is exercised through the same low-level
+  // entry the adapter wraps.
+  const inst = (await WebAssembly.instantiate(readFileSync(join(root, "browser/mldsa65.wasm")), {})).instance;
+  const e = inst.exports;
+  const base = e.__heap_base.value;
+  let top = base;
+  const alloc = (n) => {
+    const p = (top + 15) & ~15;
+    top = p + n;
+    const short = top - e.memory.buffer.byteLength;
+    if (short > 0) e.memory.grow(Math.ceil(short / 65536) + 1);
+    return p;
+  };
+  const put = (b) => { const p = alloc(b.length); new Uint8Array(e.memory.buffer).set(b, p); return p; };
+
+  let checked = 0;
+  for (const t of kat.sigVer) {
+    top = base;
+    const sig = put(hex(t.sig)), msg = hex(t.msg), m = put(msg);
+    const ctx = hex(t.ctx), c = put(ctx), pk = put(hex(t.pk));
+    const got = e.mldsa65_verify(sig, m, msg.length, c, ctx.length, pk) === 1;
+    assertEqual(got, t.pass, `ACVP sigVer tc${t.tcId} (${t.reason})`);
+    checked++;
+  }
+  for (const t of kat.sigGen) {
+    top = base;
+    const sk = put(hex(t.sk)), msg = hex(t.msg), m = put(msg);
+    const ctx = hex(t.ctx), c = put(ctx), rnd = put(hex(t.rnd)), sig = alloc(ML_DSA65_SIG_LEN);
+    assertEqual(e.mldsa65_sign(sig, m, msg.length, c, ctx.length, rnd, sk), 1, `ACVP sigGen tc${t.tcId} signs`);
+    const out = new Uint8Array(e.memory.buffer).slice(sig, sig + ML_DSA65_SIG_LEN);
+    assertEqual(toHex(out), t.sig, `ACVP sigGen tc${t.tcId} signature is byte-exact`);
+    checked++;
   }
 
-  // Teardown is observed on the channel: a PeerLink that closes *itself* sets `closed`
-  // before closing the channel, so its own onClose opt does not re-fire (onChannelClose
-  // reports only externally-originated closes). The channel flag is the unambiguous signal.
-  async function run(hookFn) {
-    const hook = { fn: hookFn };
-    const { a: chA, b: chB } = pair(hook);
-    const idA = generateKeyPair(), idB = generateKeyPair();
-    const st = { aAuthed: false, bAuthed: false, get bClosed() { return chB.closed; } };
-    const linkB = new PeerLink({
-      channel: chB, identity: idB, sodium, weDialed: false,
-      onAuth: () => { st.bAuthed = true; }, onFrame: () => {}, onClose: () => {},
-    });
-    const linkA = new PeerLink({
-      channel: chA, identity: idA, sodium, weDialed: true, expectPeerId: toHex(idB.publicKey),
-      onAuth: () => { st.aAuthed = true; }, onFrame: () => {}, onClose: () => {},
-    });
-    void linkA; void linkB;
-    for (let i = 0; i < 25 && !(st.aAuthed && st.bAuthed); i++) await sleep(2);
-    return st;
-  }
-
-  // 0. Control: untouched, the genesis suite handshake completes.
+  // The adapter's own path (empty context, the runtime's only mode) must agree with
+  // the raw module — a wrapper that quietly passed a stray context byte would still
+  // pass every vector above.
   {
-    const st = await run(null);
-    assert(st.aAuthed && st.bAuthed, "an untouched genesis-suite handshake authenticates");
+    const seed = new Uint8Array(32).fill(9);
+    const kp = mldsa.ml_dsa65_keypair_from_seed(seed);
+    assertEqual(kp.publicKey.length, ML_DSA65_PK_LEN, "keygen returns a full-width public key");
+    const msg = new TextEncoder().encode("adapter path");
+    const sig = mldsa.ml_dsa65_sign_detached(msg, kp.privateKey);
+    assert(mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "adapter verifies its own signature");
+    top = base;
+    const sp = put(sig), mp = put(msg), pp = put(kp.publicKey);
+    assertEqual(e.mldsa65_verify(sp, mp, msg.length, 0, 0, pp), 1,
+      "the raw module verifies what the adapter signed, with an empty context");
+    sig[0] ^= 1;
+    assert(!mldsa.ml_dsa65_verify_detached(sig, msg, kp.publicKey), "a flipped bit fails");
+    assert(!mldsa.ml_dsa65_verify_detached(sig.slice(0, 10), msg, kp.publicKey),
+      "a wrong-width signature is false, not a throw");
   }
 
-  // 1. An unknown suite id in HELLO is refused outright — the link never authenticates.
-  //    This is the clean-failure property: a node meeting a handshake it does not speak
-  //    refuses, instead of parsing another format's bytes at this format's offsets.
-  //    Under suite 0x02 the refusal is SILENT (PeerLink.stall, §12.6.2): closing would
-  //    tell the prober it had reached a seedkernel node, which is the oracle this suite
-  //    exists to remove. So the assertion is "never authenticates, never answers" —
-  //    the link is left to the handshake deadline, indistinguishable from a dead port.
-  {
-    const st = await run((m) => { if (m[0] === 1 /* MSG_HELLO */) m[1] = 0x7f; return m; });
-    assert(!st.bAuthed, "a HELLO carrying an unknown suite id never authenticates");
-    assert(!st.bClosed, "an unknown suite is refused silently — no close to probe with");
+  console.log(`  OK (${checked} NIST vectors)\n`);
+}
+
+// ─── Test: hybrid manifest suite 0x02 — Ed25519 + ML-DSA-65, both required ───────
+//
+// The §14.1 migration that cannot be delivered through its own mechanism: a PQ verifier
+// shipped as a bundle would be admitted by the classical verifier, so the manifest suite
+// goes into the artifact ahead of need. What the tests below pin is the *shape* of that
+// suite rather than the algorithm — both signatures required, the author id bound to
+// both keys, and a host without the PQ half refusing rather than falling back.
+// ─── Test: ML-KEM-768 against NIST's own vectors (ACVP known-answer test) ────────
+//
+// The same argument testMlDsaAcvpVectors makes, applied to the catalog's KEM: a round
+// trip is satisfied by an implementation that is wrong but self-consistent, and it says
+// nothing about whether two targets will agree. These are NIST's published ACVP vectors
+// for ML-KEM-768 (FIPS 203) — fixed coins with the key, ciphertext and shared secret
+// that must come out of them byte for byte.
+//
+// Three of the five groups exist because they pin behaviour a round trip cannot reach at
+// all: `decaps` over MODIFIED ciphertexts, where implicit rejection must produce NIST's
+// specific unrelated secret rather than an error; and the two key checks, where a key
+// failing §7.2's modulus check or §7.3's hash check must be refused.
+async function testMlKemAcvpVectors() {
+  console.log("Test: ML-KEM-768 ACVP known-answer vectors (FIPS 203)");
+  const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mlkem768-acvp.json"), "utf8"));
+  const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
+  const kem = await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm")));
+
+  let checked = 0;
+  for (const t of kat.keyGen) {
+    const kp = kem.ml_kem768_keypair_from_seed(hex(t.d + t.z));
+    assertEqual(toHex(kp.publicKey), t.ek, `ACVP keyGen tc${t.tcId} encapsulation key is byte-exact`);
+    assertEqual(toHex(kp.privateKey), t.dk, `ACVP keyGen tc${t.tcId} decapsulation key is byte-exact`);
+    checked++;
+  }
+  for (const t of kat.encaps) {
+    const r = kem.ml_kem768_encaps(hex(t.ek), hex(t.m));
+    assert(r !== null, `ACVP encaps tc${t.tcId} accepts the vector's key`);
+    assertEqual(toHex(r.ciphertext), t.c, `ACVP encaps tc${t.tcId} ciphertext is byte-exact`);
+    assertEqual(toHex(r.sharedSecret), t.k, `ACVP encaps tc${t.tcId} shared secret is byte-exact`);
+    checked++;
+  }
+  for (const t of kat.decaps) {
+    const ss = kem.ml_kem768_decaps(hex(t.dk), hex(t.c));
+    assert(ss !== null, `ACVP decaps tc${t.tcId} accepts the vector's key`);
+    // Both "valid decapsulation" and "modified ciphertext" cases run through here and
+    // both must match: the modified ones are implicit rejection, which has one right
+    // answer, not an error.
+    assertEqual(toHex(ss), t.k, `ACVP decaps tc${t.tcId} shared secret is byte-exact (${t.reason})`);
+    checked++;
+  }
+  for (const t of kat.encapsKeyCheck) {
+    const r = kem.ml_kem768_encaps(hex(t.ek), new Uint8Array(32));
+    assertEqual(r !== null, t.pass, `ACVP encapsulationKeyCheck tc${t.tcId} (${t.reason})`);
+    checked++;
+  }
+  for (const t of kat.decapsKeyCheck) {
+    const ss = kem.ml_kem768_decaps(hex(t.dk), new Uint8Array(1088));
+    assertEqual(ss !== null, t.pass, `ACVP decapsulationKeyCheck tc${t.tcId} (${t.reason})`);
+    checked++;
   }
 
-  // 2. Downgrade: flipping the suite byte in flight does not select another suite. The
-  //    byte is hashed into the transcript both AUTHs cover, so a flip B *did* accept
-  //    would still leave B hashing a different half than A signed and deny the attacker
-  //    a completed session; today B refuses at parse, one suite earlier. Either way
-  //    NEITHER side ends up authenticated — the byte cannot be forced.
+  // Wrong-width arguments are the same rejection as a malformed key, never a throw: the
+  // cap-bridge turns `null` into a leading zero byte, and there is no second channel for
+  // a structural failure to come back through.
+  assertEqual(kem.ml_kem768_encaps(new Uint8Array(10), new Uint8Array(32)), null,
+    "a wrong-width encapsulation key is null, not a throw");
+  assertEqual(kem.ml_kem768_decaps(new Uint8Array(10), new Uint8Array(1088)), null,
+    "a wrong-width decapsulation key is null, not a throw");
+
+  console.log(`  OK (${checked} NIST vectors)\n`);
+}
+
+async function testHybridManifestSuite() {
+  console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
+  const { signManifest, signManifestHybrid, verifyManifest, hybridAuthorId,
+          verifyBundle, packBundle, kernelNameFor, MANIFEST_FILE }
+    = await imp("build/host/bundle.js");
+  const { generatePqKeyPair } = await imp("build/host/node.js");
+
+  const ed = generateKeyPair();
+  const pq = generatePqKeyPair();
+  const keys = { ed, mlDsa: pq };
+  const manifest = { app: "pq-probe", version: 1, modules: [] };
+  const env = signManifestHybrid(sodium, keys, manifest);
+
+  // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
+  //    lead, so a verifier reads the whole key set before either signature.
+  const OFF_ML_PK = 33, OFF_ED_SIG = OFF_ML_PK + ML_DSA65_PK_LEN;
+  const OFF_ML_SIG = OFF_ED_SIG + 64, OFF_JSON = OFF_ML_SIG + ML_DSA65_SIG_LEN;
+  assertEqual(env[0], 0x02, "the envelope opens with the hybrid manifest suite id");
+  assertEqual(toHex(env.slice(1, 33)), toHex(ed.publicKey), "the Ed25519 key follows the suite byte");
+  assertEqual(toHex(env.slice(OFF_ML_PK, OFF_ED_SIG)), toHex(pq.publicKey), "the ML-DSA key follows it");
+  assertEqual(new TextDecoder().decode(env.slice(OFF_JSON)), JSON.stringify(manifest),
+    "the manifest JSON is carried verbatim after both signatures");
+
+  // 2. Untouched, it verifies — and the author id is NOT either public key, it is the
+  //    hash over both (§12.4). That is the property hybrid signing actually rests on:
+  //    an attacker who breaks one algorithm cannot reach this identity while holding a
+  //    key of their own choosing for the other half.
   {
-    const st = await run((m) => { if (m[0] === 1) m[1] = 0x01; return m; });
-    assert(!st.aAuthed && !st.bAuthed, "a suite byte flipped in flight yields no authenticated session");
+    const v = verifyManifest(sodium, env);
+    assert(v !== null, "an untouched hybrid manifest verifies");
+    assertEqual(v.suite, 0x02, "the verified result reports the suite it was signed under");
+    assertEqual(toHex(v.author), toHex(hybridAuthorId(sodium, ed.publicKey, pq.publicKey)),
+      "the author id is the derived key-set hash");
+    assert(toHex(v.author) !== toHex(ed.publicKey), "the author id is not the Ed25519 key");
+    assertEqual(toHex(v.authorKeys.ed), toHex(ed.publicKey), "both signing keys are reported");
+    assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey), "including the PQ one");
+    assertEqual(v.manifest.app, "pq-probe", "the manifest round-trips");
+  }
+
+  // 3. Both halves are load-bearing: tampering with either signature fails the whole
+  //    manifest. "Either verifies" would be exactly as strong as the weaker algorithm.
+  {
+    const badEd = env.slice(); badEd[OFF_ED_SIG] ^= 0x01;
+    assert(verifyManifest(sodium, badEd) === null, "a broken Ed25519 half fails the manifest");
+    const badMl = env.slice(); badMl[OFF_ML_SIG] ^= 0x01;
+    assert(verifyManifest(sodium, badMl) === null, "a broken ML-DSA half fails the manifest");
+  }
+
+  // 4. The splice a hybrid format has to survive: swap in a different Ed25519 key with a
+  //    validly-made signature of its own, keeping the original PQ key and signature.
+  //    Both preimages commit to BOTH keys, so the surviving half no longer verifies —
+  //    the pair cannot be taken apart and half-replaced.
+  {
+    const attacker = generateKeyPair();
+    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const pre = concatBytes([
+      new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x02),
+      attacker.publicKey, pq.publicKey, json,
+    ]);
+    const spliced = concatBytes([
+      Uint8Array.of(0x02), attacker.publicKey, pq.publicKey,
+      sodium.crypto_sign_detached(pre, attacker.privateKey),
+      env.slice(OFF_ML_SIG, OFF_JSON), json,
+    ]);
+    assert(verifyManifest(sodium, spliced) === null,
+      "an Ed25519 key swap invalidates the untouched ML-DSA half");
+  }
+
+  // 5. A host with no ML-DSA verifier REFUSES rather than falling back to the Ed25519
+  //    signature alone — the downgrade the suite exists to prevent. It throws with its
+  //    own message, the same way an unknown suite does: this is a legibility failure,
+  //    not a verdict on the bundle.
+  {
+    const classicalOnly = {
+      crypto_sign_verify_detached: (...a) => sodium.crypto_sign_verify_detached(...a),
+      crypto_generichash: (...a) => sodium.crypto_generichash(...a),
+    };
+    let msg = "";
+    try { verifyManifest(classicalOnly, env); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("unsupported manifest suite 0x02"),
+      `a host without ML-DSA refuses 0x02 (got: ${msg || "no throw"})`);
+    assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");
+  }
+
+  // 6. End to end: a hybrid-signed bundle loads, and its modules bind under names
+  //    derived from the DERIVED id — so nothing downstream of the verifier knows or
+  //    cares which suite signed. Same-content bundles under the two suites are two
+  //    different authors, which is the honest reading of a stronger statement.
+  {
+    const wasm = forwarderBytes;
+    const m = { app: "pq-app", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
+    const blob = packBundle({
+      [MANIFEST_FILE]: signManifestHybrid(sodium, keys, m),
+      [moduleFile("codec")]: wasm,
+    });
+    const v = verifyBundle(sodium, blob);
+    assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
+    const host = await createKernelHost();
+    installBundle(host, v);
+    const derived = kernelNameFor(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app", "codec");
+    assert(host.isBound(derived), "the module binds under the derived hybrid author id");
+
+    const edOnly = packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, ed.privateKey, ed.publicKey, m),
+      [moduleFile("codec")]: wasm,
+    });
+    assert(toHex(verifyBundle(sodium, edOnly).author) !== toHex(v.author),
+      "the same author's 0x01 and 0x02 identities are distinct");
+  }
+
+  console.log("  OK\n");
+}
+
+// ─── Test: policy may require a manifest suite (§12.5) ───────────────────────────
+//
+// The verifier accepts every suite it can check; which ones a deployment TRUSTS is a
+// separate, operator-owned question. Without it there is no way to finish a migration —
+// the classical suite would stay acceptable forever on every host that can still verify
+// it.
+async function testPolicyManifestSuite() {
+  console.log("Test: policy manifestSuites — a deployment can insist on PQ-signed manifests");
+  const { signManifest, signManifestHybrid, verifyBundle, packBundle, MANIFEST_FILE }
+    = await imp("build/host/bundle.js");
+  const { generatePqKeyPair } = await imp("build/host/node.js");
+
+  const ed = generateKeyPair();
+  const pq = generatePqKeyPair();
+  const wasm = forwarderBytes;
+  const m = { app: "suite-policy", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
+  const pack = (envelope) => packBundle({ [MANIFEST_FILE]: envelope, [moduleFile("codec")]: wasm });
+
+  const classical = verifyBundle(sodium, pack(signManifest(sodium, ed.privateKey, ed.publicKey, m)));
+  const hybrid = verifyBundle(sodium, pack(signManifestHybrid(sodium, { ed, mlDsa: pq }, m)));
+
+  const pqOnly = policyFromJson(JSON.stringify({
+    authors: [toHex(classical.author), toHex(hybrid.author)],
+    manifestSuites: [2],
+  }));
+  assert(await pqOnly(hybrid) === true, "a hybrid-signed bundle is admitted");
+  assert(await pqOnly(classical) === false, "an Ed25519-only bundle from a trusted author is refused");
+
+  // Absent, the field constrains nothing — an existing policy file keeps its meaning.
+  const anySuite = policyFromJson(JSON.stringify({ authors: [toHex(classical.author)] }));
+  assert(await anySuite(classical) === true, "a policy without manifestSuites admits any suite");
+
+  // Strict parsing, like every other field: a typo fails the boot loudly.
+  for (const bad of [{ manifestSuites: 2 }, { manifestSuites: [] }, { manifestSuites: ["2"] }]) {
+    let threw = false;
+    try { policyFromJson(JSON.stringify({ authors: [toHex(classical.author)], ...bad })); }
+    catch { threw = true; }
+    assert(threw, `malformed manifestSuites is rejected: ${JSON.stringify(bad)}`);
   }
 
   console.log("  OK\n");
@@ -2109,6 +1712,7 @@ async function testBundleCorruptNewerRollback() {
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
+        abi: GUEST_ABI_VERSION,
         caps: [],
       },
     });
@@ -2216,14 +1820,12 @@ async function testAuthorRevocation() {
     //     failing once they say yes — is the wrong order to ask in.
     {
       const { createShell: mkShell, KernelHost: KH } = await imp("build/host/shell-core.js");
-      const { LoopbackNetwork } = await imp("build/host/net.js");
       const { FreshnessMarks } = await imp("build/host/bundle.js");
       const store = new FreshnessMarks();
       let admitCalls = 0;
       const probe = mkShell({
         platform: {
           sodium, identity, kernel: new KH(), freshnessStore: store,
-          network: new LoopbackNetwork(toHex(identity.publicKey)),
         },
         admit: () => { admitCalls++; return true; },
       });
@@ -2308,32 +1910,24 @@ await testDerivedNamesKeepAuthorsApart();
 await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();
 await testFs();
-await testGuestNetFanout();
 await testCapBridge();
 await testPolicy();
+await testGuestAbi();
+await testSlotFreshness();
 await testShellBoot();
 await testBundle();
 await testGuestlessBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testWsFraming();
-await testChannelPinning();
-await testRtcNetwork();
-await testRtcNetworkMedia();
-await testWeriftRtcNetwork();
 await testSafeJs();
-await testHolderCallSync();
+await testRealmSerialization();
 await testCapBridgeEnforcement();
 await testCallHandlerGuards();
-await testTransportResponseBinding();
-await testTransportStallTimeout();
-await testTransportBackstop();
-await testWsFragmentation();
-await testRedialAfterFailedDial();
-await testConnsPerPeerFanout();
-await testWsNetworkFanout();
-await testRecordLayerIntegrity();
-await testHelloSuiteByte();
 await testManifestSuiteByte();
+await testMlDsaAcvpVectors();
+await testMlKemAcvpVectors();
+await testHybridManifestSuite();
+await testPolicyManifestSuite();
 await testSafeRealmConcurrency();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();

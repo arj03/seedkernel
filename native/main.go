@@ -231,11 +231,31 @@ func boot(dataDir string) error {
 	shutdown()
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the realm's bundle verification routes to it
-	// Every installed handler is a pure transform (README §4): the only host import it
-	// takes is the AssemblyScript `env.abort` shim. There is no kernel.call / kernel.caller
-	// seam and no env.invoke_handler dispatch callback.
+	// ML-DSA-65 for manifest suite 0x02 (§12.4) — the same wasm the browser and Node
+	// use, so this target's answer to "is this bundle authentic" cannot differ from
+	// theirs (mldsa.go).
+	md = bootMlDsa(rt)
+	// ML-KEM-768 for the primitive catalog (§14.1) — provisioned ahead of any caller,
+	// because a primitive is the one thing a bundle cannot deliver (mlkem.go).
+	mk = bootMlKem(rt)
+	// Every installed handler is a pure transform (README §4): the only host imports it
+	// takes are its language runtime's shims — for AssemblyScript the three below, which
+	// are exactly the set the JS host resolves (WASM/core/kernel-host.ts). Resolving a
+	// subset would make "does this module load" a property of which target it landed on:
+	// one `trace()` or `Math.random()` anywhere in a handler is the difference between
+	// loading and a missing-import failure. There is no kernel.call / kernel.caller seam
+	// and no env.invoke_handler dispatch callback.
+	//
+	// All three are inert, which is what keeps them shims rather than a seam. `seed` is a
+	// constant, not the clock: a pure transform is deterministic and reaches no clock
+	// (§4.2) — a handler that needs entropy takes it in its input. `trace` drops its
+	// arguments rather than writing them where anything could observe them, so a handler's
+	// only effect stays the bytes it returns (§4.3). `abort` need not trap here: AS emits
+	// `unreachable` immediately after the call, so the module traps either way.
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
+	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
 	if _, err := env.Instantiate(ctx); err != nil {
 		return fmt.Errorf("handler imports: %w", err)
 	}

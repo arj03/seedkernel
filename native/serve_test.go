@@ -18,15 +18,16 @@ import (
 // function the Node and browser shells run.
 
 // The holder guest: type 1 = STORE (payload already framed for FS_PUT), type 2 = FETCH
-// (payload = key). Local fs + crypto only — fully synchronous, so it answers without
-// yielding, which is what lets it serve while an initiator is parked mid-await.
+// (payload = key). Local fs only — and it AWAITS, because the fs ops round-trip (§12.2).
+// A holder is therefore an ordinary async entrypoint like an initiator, and the
+// realm serializes the two rather than running one inside the other's parked window.
 const holderGuestSource = `
-	register("handle", (arg) => {
+	register("handle", async (arg) => {
 	  const sender = arg.slice(0, 32);
 	  const type = arg[32];
 	  const payload = arg.slice(33);
-	  if (type === 1) { host.call(CAP_FS_PUT, payload); return new Uint8Array([1]); }
-	  if (type === 2) { return host.call(CAP_FS_GET, payload); }
+	  if (type === 1) { await host.call(CAP_FS_PUT, payload); return new Uint8Array([1]); }
+	  if (type === 2) { return await host.call(CAP_FS_GET, payload); }
 	  return new Uint8Array(0);
 	});
 `
@@ -36,18 +37,27 @@ const holderGuestSource = `
 // test is the one bootNode built; this is only the peer knocking on its door.
 const requesterJS = `
 "use strict";
-globalThis.startRequester = async function (holderId, port) {
+globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
-  globalThis.__net2 = makeNetwork(id, undefined, undefined);
-  globalThis.__t2 = new Transport(__peerId, __net2, 2000);
-  __net2.addPeerAddr(holderId, { host: "127.0.0.1", port, transport: "tcp" });
+  const { net } = await makeTransportNode({
+    identity: id, contactSecret: fromHex(contactSecretHex), timeoutMs: 2000,
+  });
+  globalThis.__net2 = net;
+  // The secret rides in the ADDRESS, not in this node's own config: on a dial it is the
+  // PEER's contact secret (§12.6), and without it the holder answers a stranger's msg1
+  // with silence — which is the whole point of the gate, and would show up here only as
+  // a request timeout.
+  __net2.addPeerAddr(holderId, {
+    host: "127.0.0.1", port, transport: "tcp", contactSecret: fromHex(contactSecretHex),
+  });
+  await __net2.start();
   return new Uint8Array(0);
 };
-// Go stages bytes as ArrayBuffers; Transport.request takes the Uint8Array view every
-// other caller hands it, so make one here rather than loosening the shared signature.
+// Go stages bytes as ArrayBuffers; request takes the Uint8Array view every other
+// caller hands it, so make one here rather than loosening the shared signature.
 globalThis.ask = (holderId, proto, payload) =>
-  __t2.request(holderId, new TextEncoder().encode(proto), new Uint8Array(payload));
+  __net2.request(holderId, new TextEncoder().encode(proto), new Uint8Array(payload));
 `
 
 // startRequester boots the second node and returns its peer id.
@@ -56,7 +66,8 @@ func startRequester(t *testing.T, holderID string, port int) string {
 	if _, err := qc.Eval("requester.js", qjs.Code(requesterJS)); err != nil {
 		t.Fatal("requester:", err)
 	}
-	if _, err := callRealm("startRequester", 5*time.Second, qc.NewString(holderID), qc.NewInt32(int32(port))); err != nil {
+	if _, err := callRealm("startRequester", 5*time.Second,
+		qc.NewString(holderID), qc.NewInt32(int32(port)), qc.NewString(testContactSecretHex)); err != nil {
 		t.Fatal("startRequester:", err)
 	}
 	return mustEvalString(t, qc, `__peerId`)
@@ -89,7 +100,7 @@ func serveNode(t *testing.T, authorPub []byte) nodeStatus {
 func TestServeGuestApp(t *testing.T) {
 	author, authorPub := testAuthor(t)
 	st := serveNode(t, authorPub)
-	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"crypto", "fs"})
+	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(bundlePath); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("bundle load: %s", status)
 	}
@@ -132,7 +143,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// app names — so they derive disjoint kernel names (§5.1) and bind their own
 	// protocols. The forwarder module echoes its input, so the echo app's response IS
 	// whatever the shell handed it.
-	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"crypto", "fs"})
+	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("guest bundle load: %s", status)
 	}

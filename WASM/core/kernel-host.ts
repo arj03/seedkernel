@@ -70,9 +70,9 @@ export class KernelHost {
    *  binding to the handler table. Throws on any structural failure so the caller can
    *  collect all failures before any name is written (two-phase bundle install).
    *
-   *  A handler is a pure transform: it imports only the AssemblyScript runtime shims
-   *  (`env.*`) — no `kernel.*` seam — and exports `memory`, a `scratch` global, and
-   *  `handle`. */
+   *  A handler is a pure transform: it imports nothing from the runtime — no `kernel.*`
+   *  seam, only its own language runtime's shims (`env.*`, §4.2) — and exports `memory`,
+   *  a `scratch` global, and `handle`. */
   instantiateWasm(wasmBytes: Uint8Array): WasmHandlerRef {
     if (wasmBytes.length === 0) throw new Error("kernel: empty wasm bytes");
     // BEFORE instantiation, not after: `new WebAssembly.Instance` allocates the module's
@@ -84,12 +84,19 @@ export class KernelHost {
     let instance: WebAssembly.Instance;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);
+      // The three AssemblyScript runtime shims and nothing else — the same set every
+      // other target resolves (native/main.go), so "does this module load" is never a
+      // property of which target it landed on. All three are inert: `seed` is a constant
+      // rather than `Date.now()`, because a pure transform is deterministic and reaches
+      // no clock (§4.2) — a handler needing entropy takes it in its input — and `trace`
+      // drops its arguments rather than writing them where anything could observe them,
+      // so a handler's only effect stays the bytes it returns (§4.3).
       const imports: WebAssembly.Imports = {
         env: {
           abort: (_m: number, _f: number, l: number, c: number) => {
             throw new Error(`dynamic handler abort at ${l}:${c}`);
           },
-          seed: () => Date.now(),
+          seed: () => 0,
           trace: () => {},
         },
       };

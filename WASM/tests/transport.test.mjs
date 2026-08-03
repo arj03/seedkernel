@@ -14,7 +14,7 @@
 import { WsParser } from "../build/host/ws/ws-codec.js";
 import { installWasmWsBackend } from "../build/host/ws/ws-wasm-backend.js";
 import { parseWsPeer } from "../build/host/net-ws.js";
-import { parsePeerSpec } from "../build/host/net-route.js";
+import { parsePeerSpec } from "../build/core/socket-seam.js";
 
 installWasmWsBackend();
 

@@ -6,8 +6,8 @@
 // promise reactions run. quickjs's own os.setTimeout is overridden with Go-backed
 // timers, which means js_std_loop never has an os timer to block on (it just
 // drains jobs and returns — see qjs.Context.Pump). This is what lets the shared
-// host JS (net.ts Transport, net-link.ts PeerLink, net-node.ts NodeNetwork) run
-// unmodified instead of being re-implemented in Go.
+// host JS (transport-host.ts's driver, the transport bundle's guest program,
+// the socket seams) run unmodified instead of being re-implemented in Go.
 //
 // Threading: all QuickJS calls happen on the one goroutine that runs the loop.
 // Other goroutines (socket readers, in later phases) hand work in via post(),
@@ -126,6 +126,15 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 // pumpAll drains the job queue of el.c and every registered extra context. A host
 // job that schedules a guest job (e.g. resolving the guest entrypoint's promise) is
 // pumped first (el.c) so that guest job runs in the same round.
+//
+// The REVERSE direction does not fit in one round and deliberately does not try to: a
+// guest job that schedules a host job — which every parked `host.call` does, since the
+// settlement is a host-realm `.then` — queues it after el.c has already been drained
+// here. That job waits for the NEXT round, so something has to schedule one. __host_call
+// wakes the loop whenever an op parks, which is exactly the case that would otherwise
+// have nothing else coming (see guest.go). Ordering the pumps the other way would only
+// move the problem, and looping to a fixpoint would need a "did any queue advance"
+// signal that qjs.Context.Pump does not report.
 func (el *eventLoop) pumpAll() {
 	el.c.Pump()
 	for _, x := range el.extra {
