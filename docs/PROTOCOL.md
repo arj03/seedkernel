@@ -98,7 +98,11 @@ Memory outside the scratch region is the handler's private state — statics, gl
 
 ### 4.2 No imports — the pure-transform boundary
 
-A handler imports **nothing from the runtime** — no `kernel.*` seam, no host functions. The only imports it carries are its own language runtime's shims (for AssemblyScript, `env.abort` / `seed` / `trace`), which are not a route to the outside world. Concretely, a handler **cannot**:
+A handler imports **nothing from the runtime** — no `kernel.*` seam, no host functions. The only imports it carries are its own language runtime's shims (for AssemblyScript, `env.abort` / `seed` / `trace`), which are not a route to the outside world.
+
+**Every target resolves exactly that set, and every member of it is inert.** `abort` traps, `seed` is a constant rather than a clock read, and `trace` drops its arguments — so the shims cost the handler its determinism nowhere and give it no effect beyond the bytes it returns (§4.3). The set is fixed rather than per-target because one `trace()` or `Math.random()` anywhere in a module is the difference between loading and a missing-import failure: a host resolving a subset would refuse handlers another host accepts, and would do it at instantiation, far from anything that reads like an import problem.
+
+Concretely, a handler **cannot**:
 
 - reach the filesystem, network, clock, or any I/O;
 - call another handler, or resolve a name — it cannot reach the table, and has no cross-module call;

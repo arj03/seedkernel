@@ -99,9 +99,10 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
     const end = c.i + size;
     if (end > wasm.length) throw new Error("wasm: truncated section");
     if (id === 2) {
-      // Import section. Handlers import only the AssemblyScript runtime shims, which are
-      // functions (§4.2); an imported memory is the one import that would hand a pure
-      // transform bytes it did not declare, so it is refused rather than counted.
+      // Import section. A handler imports nothing from the runtime — only its own
+      // language runtime's shims, which are functions (§4.2); an imported memory is the
+      // one import that would hand a pure transform bytes it did not declare, so it is
+      // refused rather than counted.
       const count = readVarU32(c);
       for (let k = 0; k < count; k++) {
         skipName(c);

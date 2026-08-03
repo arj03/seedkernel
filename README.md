@@ -10,14 +10,15 @@ A minimal runtime built around a kernel that does one thing: look up a **name** 
 
 Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
 
-**The whole runtime is five components.** Everything after this table is detail:
+**The whole runtime is six components.** Everything after this table is detail:
 
 | Component | Role |
 | --- | --- |
 | **Kernel** | Routes names to handlers: a flat `handlers[name]` table (§3). It is a *contract*, not an artifact — the table, the handler ABI and `SetHandler` semantics — implemented as one map inside each host. Handlers are pure transforms; there is no dispatch loop, no signature logic, no I/O. |
 | **Raw I/O** | Two capabilities of the same shape: `net` is `send(link, bytes)` / `onBytes` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
 | **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — reaches a handler by name (`callHandler`), and provides `loadBundle`, the single admin path that admits new code (§12.4). |
-| **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import nothing but the AssemblyScript runtime — no kernel seam, no I/O of their own. |
+| **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no kernel seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. |
+| **Guests** | Confined JS programs (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(op, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here. |
 | **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits each module into the flat table — a policy decision, then `SetHandler`. **The transport is one of these.** |
 
 There are no special cases and exactly one way to do everything: one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through ops and is driven through named entrypoints, exactly as an app is.

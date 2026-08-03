@@ -13,10 +13,16 @@ import (
 )
 
 // forwarderWasm is a minimal, valid pure-transform handler module
-// (WASM/tests/fixtures/forwarder: exports scratch + handle, imports only env.abort,
-// echoes its input). Embedded so the native tests build a self-contained signed bundle
-// right here — no dependency on the seedstore app or any other sibling repo. Refresh it
-// with `cp ../WASM/build/forwarder.wasm testdata/`.
+// (WASM/tests/fixtures/forwarder: exports scratch + handle, echoes its input). Embedded
+// so the native tests build a self-contained signed bundle right here — no dependency on
+// the seedstore app or any other sibling repo. Refresh it with
+// `cp ../WASM/build/forwarder.wasm testdata/`.
+//
+// It carries the full AssemblyScript shim set — `env.abort`, `env.seed`, `env.trace` —
+// so every test that installs it proves this target resolves all three, the same set the
+// JS host resolves (WASM/core/kernel-host.ts). A target resolving a subset would refuse
+// real AS handlers that a browser accepts, and would do it at instantiation, far from
+// anything that reads like an import problem.
 //
 //go:embed testdata/forwarder.wasm
 var forwarderWasm []byte
