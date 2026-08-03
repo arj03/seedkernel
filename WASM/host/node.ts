@@ -1,6 +1,6 @@
 // Node entry point — bridges the portable KernelHost to libsodium-wrappers. Use
-// this when running on Node / Bun / Deno (with Node compat); for the browser see
-// ./browser.ts.
+// this when running on Node / Bun / Deno (with Node compat). A browser page reaches
+// the runtime through `./shell-core` and readies its own libsodium (docs/EXPORTS.md).
 
 import { readFileSync } from "node:fs";
 import { KernelHost } from "../core/kernel-host.js";
