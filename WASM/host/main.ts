@@ -75,8 +75,9 @@ export interface ShellOptions {
     /** Live connected peers for the NET_PEERS cap. The transport owns
      *  connectivity; this closure feeds it into the cap-bridge. */
     livePeers?: () => PeerId[];
-    /** net.send timeout in ms (how long before a peer is treated unreachable). */
-    timeoutMs?: number;
+    /** Default per-request deadline in ms — how long one net request may take before
+     *  it settles as unreachable, for a caller that names none of its own (§12.6). */
+    requestDeadlineMs?: number;
     /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3, §16.1).
      *  Omitted ⇒ the 5s default. Counts time the guest is running, not time it spends
      *  parked on a host bridge, so it bounds a wedged guest without penalising one
@@ -172,7 +173,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
             createRealm, livePeers: opts.livePeers,
         },
         admit: policyFromJson(opts.policyJson),
-        timeoutMs: opts.timeoutMs,
+        requestDeadlineMs: opts.requestDeadlineMs,
         guestDeadlineMs: opts.guestDeadlineMs,
         realmMemoryBytes: opts.realmMemoryBytes,
         config: opts.config,
@@ -324,7 +325,7 @@ export async function main(): Promise<void> {
         policyJson, dir: dir!, identity, contactSecret,
         listen: args["listen"] ? parseHostPort(str(args, "listen")!) : undefined,
         wsListen: args["ws-listen"] ? parseHostPort(str(args, "ws-listen")!) : undefined,
-        timeoutMs: args["timeout"] ? Number(str(args, "timeout")!) : undefined,
+        requestDeadlineMs: args["request-deadline"] ? Number(str(args, "request-deadline")!) : undefined,
         transportBundle: args["transport"]
             ? new Uint8Array(readFileSync(str(args, "transport")!))
             : undefined,

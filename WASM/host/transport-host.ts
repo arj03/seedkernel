@@ -79,6 +79,13 @@ export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
 export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
 export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
 
+/** How long one request may take when its caller names no deadline (§12.6). Generous
+ *  on purpose: it is the number that has to be right for a caller who did not think
+ *  about it, which includes every app guest, since NET_SEND carries no deadline of its
+ *  own. A caller moving something large, or one that wants to fail fast, passes its own
+ *  to `request` rather than moving this. */
+export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
+
 /** Concurrent deadlines the slot occupant may hold. One per half-open link plus one
  *  per in-flight request is the real demand, so this is headroom over both budgets
  *  rather than a tuning knob — it exists so a wedged occupant cannot grow the host's
@@ -127,12 +134,11 @@ export interface TransportHostOptions {
  *  with our address; the gate a caller must produce before msg1 opens. Absent ⇒
  *  an open node. Per node, never per deployment (§12.6.3). */
   contactSecret?: Uint8Array;
-  /** net.send stall bound in ms — how long a peer may stay SILENT before a
- *  request to it is treated as unreachable (§12.6). Small in tests. */
-  timeoutMs?: number;
-  /** Hard ceiling on a single request's lifetime, as a multiple of timeoutMs —
- *  the backstop the silence clock lacks. Default 50. */
-  maxStallWindows?: number;
+  /** How long ONE request may take before it settles as unreachable, in ms, for a
+ *  caller that names no deadline of its own (default `DEFAULT_REQUEST_DEADLINE_MS`).
+ *  A deployment-wide fallback, not a policy: a caller that knows what it is sending
+ *  passes its own to `request` (§12.6). Small in tests. */
+  requestDeadlineMs?: number;
   /** Parallel connections per dialed peer (default 1). */
   connsPerPeer?: number;
   /** The host's inbound flood cap (default net-limits MAX_FRAME_BYTES), which the
@@ -200,7 +206,7 @@ export interface OpenLinkOptions {
  *  cap-bridge wiring and the shell's `transport` field consume. */
 export interface HostTransport {
   readonly peerId: PeerId;
-  request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
+  request(to: PeerId, proto: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
   send(to: PeerId, proto: Uint8Array, payload: Uint8Array): void;
   onRequest(handler: RequestHandler): void;
   close(): void;
@@ -291,13 +297,11 @@ export class TransportHost implements Network, HostTransport {
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
-      .u32(o.timeoutMs ?? 200)
       .u32(o.connsPerPeer ?? 1)
       .u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED)
       .u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE)
       .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
       .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
-      .u32(o.maxStallWindows ?? 50)
       .build());
   }
 
@@ -601,10 +605,16 @@ export class TransportHost implements Network, HostTransport {
 
   // ── the request/response facade ─────────────────────────────────────────────
 
-  /** Send a typed request and await the typed response. The stall clock and the
- *  absolute backstop run in the guest (host-armed timers); this side holds the
- *  promise the guest settles with NET_SETTLE. */
-  request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array> {
+  /** Send a typed request and await the typed response. The deadline clock runs in the
+ *  guest (host-armed timers); this side holds the promise the guest settles with
+ *  NET_SETTLE.
+ *
+ *  `deadlineMs` is how long THIS exchange may take, and the caller supplies it because
+ *  the caller is the only party that knows what it sent: a 200-byte control message and
+ *  a 4 MB block deserve different answers, and nothing below this line can tell them
+ *  apart. Omitted ⇒ the node's `requestDeadlineMs` default. Resolved here rather than
+ *  in the guest, so the default lives in exactly one place. */
+  request(to: PeerId, proto: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> {
     const corr = this.nextCorr++;
     this.framesSent++;
     return new Promise<Uint8Array>((resolve, reject) => {
@@ -612,6 +622,7 @@ export class TransportHost implements Network, HostTransport {
       this.enter("request", new Args()
         .u32(corr)
         .u8(0)
+        .u32(deadlineMs ?? this.opts.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
         .blob(fromHex(to))
         .blob(proto)
         .blob(payload)
@@ -626,6 +637,7 @@ export class TransportHost implements Network, HostTransport {
     this.enter("request", new Args()
       .u32(0) // noReply requests carry no meaningful correlation
       .u8(1)
+      .u32(0) // ...and no deadline: nothing is waiting on it
       .blob(fromHex(to))
       .blob(proto)
       .blob(payload)

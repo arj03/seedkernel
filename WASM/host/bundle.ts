@@ -243,28 +243,30 @@ export interface FreshnessStore {
     revoke(author: Uint8Array): void;
 }
 
-/** The one host power a bundle load needs: compile, instantiate, and validate handler bytes
- *  against the §4 ABI (instantiateWasm — pure, no table effect), then bind them at `name`
- *  (bindHandler). Separating them is what lets a bundle install atomically: instantiate
- *  every module first, and bind only when all succeed. `KernelHost` satisfies this; the
- *  native loader forwards the same calls over its Go bridge (README §12.9).
+/** The one host power a bundle load needs, as one call: land a bundle's modules on the
+ *  handler table, all or none. `KernelHost` satisfies it; the native loader forwards it
+ *  over its Go bridge (README §12.9).
+ *
+ *  **Atomicity is the host's, not the caller's.** A bundle is admitted as a unit (§12.4),
+ *  so "every module lands or none does" is a property of the install itself — and the
+ *  host is the only party that can honor it, because it is the party holding the
+ *  half-built instances when the third module turns out to be malformed. Handing the
+ *  caller an instantiate/bind/discard triad instead would make every target re-implement
+ *  the same accumulate-and-release loop, and a target that forgot the release would leak
+ *  a linear memory plus its compiled code per rejected bundle — silently, on the path
+ *  that runs when something is already wrong.
  *
  *  Hashing is deliberately NOT here — it is `genesisHash(sodium, …)`, so the component
  *  that owns the handler table needs no crypto at all (§3). */
 export interface BundleHost {
-    /** Compile, instantiate, and validate a handler module against the §4 ABI. No table
-     *  effect — the returned opaque ref must be passed to bindHandler to land the module.
+    /** Compile, instantiate and validate every module against the §4 ABI, then bind each
+     *  at its `name`. Binding displaces whatever was at a name — the caller already ran
+     *  the admission policy (§12.4, §12.5).
+     *
      *  Throws on any structural failure (not valid wasm, missing exports, scratch out of
-     *  bounds, invalid scratchSize). */
-    instantiateWasm(wasm: Uint8Array): unknown;
-    /** Bind a pre-instantiated handler ref at `name` on the kernel table. The caller
-     *  guarantees the ref came from this host's own instantiateWasm. Displaces whatever
-     *  was at the name — the caller already ran the admission policy. */
-    bindHandler(name: string, ref: unknown): void;
-    /** Release a handler ref that will never be bound (the bundle failed). JS GC reclaims
-     *  abandoned instances on its own, so the JS implementation is a no-op; the native
-     *  implementation releases the wazero instance + compiled code. */
-    discardHandler(ref: unknown): void;
+     *  bounds, invalid scratchSize) **with the table untouched**: nothing is bound unless
+     *  everything validated, and whatever was built before the failure is released. */
+    bindAll(mods: { name: string; wasm: Uint8Array }[]): void;
 }
 
 export interface VerifiedBundle {
@@ -959,37 +961,30 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
         // NB: the mark is advanced at the *end* of this function, only after every module
         // has instantiated and bound — not here. See below.
     }
-    // Phase 1: instantiate every module (pure, no table effect). Read as "compile,
-    // validate §4 exports, confirm it IS a handler." Any failure here fails the whole
-    // load — nothing has landed — so the kernel table is never left half-populated.
-    // Accumulated refs are discarded on failure: JS reclaims them on its own, but the
-    // native host must release the wazero instance + compiled code.
-    const refs = [];
-    try {
-        for (const { mod, wasm } of v.modules) {
-            const kernelName = kernelNameFor(v.author, v.manifest.app, mod.name);
-            // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
-            // instantiation is what allocates the declared initial memory, so a host-side
-            // check could only run after the damage. It sits here, on the shared admission
-            // path, rather than in each host's instantiateWasm: this is an admission rule, and
-            // §3 puts admission rules in the one compiled implementation both targets evaluate.
-            checkHandlerMemory(wasm, DEFAULT_MAX_HANDLER_MEMORY_BYTES);
-            refs.push({ mod, ref: host.instantiateWasm(wasm), kernelName });
-        }
+    // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
+    // instantiation is what allocates the declared initial memory, so a host-side check
+    // could only run after the damage. It sits here, on the shared admission path, rather
+    // than inside each host's bind: this is an admission rule, and §3 puts admission rules
+    // in the one compiled implementation both targets evaluate. Every module is checked
+    // before ANY is handed down, so a bundle whose second module is over the ceiling never
+    // reaches the host at all.
+    for (const { wasm } of v.modules) {
+        checkHandlerMemory(wasm, DEFAULT_MAX_HANDLER_MEMORY_BYTES);
     }
-    catch (e) {
-        for (const r of refs)
-            host.discardHandler(r.ref);
-        throw new Error(`bundle: module ${(e as Error).message}`);
-    }
-    // Phase 2: bind every module. instantiateWasm already validated each — these cannot
-    // fail. Each module lands under the kernel name DERIVED from the signed
+    // One transactional call: every module lands or none does, and the host owns that
+    // guarantee (BundleHost). Each lands under the kernel name DERIVED from the signed
     // `(author, app, name)` triple (§5.1). No per-module `.install` envelope means no
     // 64 KB envelope cap and no boot-time seq — an equal-version reload just re-installs,
     // and a higher-version bundle from the same author lands on the same names because the
     // same key derives them.
-    for (const { ref, kernelName } of refs) {
-        host.bindHandler(kernelName, ref);
+    try {
+        host.bindAll(v.modules.map(({ mod, wasm }) => ({
+            name: kernelNameFor(v.author, v.manifest.app, mod.name),
+            wasm,
+        })));
+    }
+    catch (e) {
+        throw new Error(`bundle: module ${(e as Error).message}`);
     }
     // Advance the freshness mark only now — after a fully successful load (or, with
     // `deferMark`, leave it to the caller at its own completion point). Advancing it

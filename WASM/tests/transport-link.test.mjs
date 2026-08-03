@@ -153,6 +153,34 @@ await test("baseline: two ends authenticate and exchange frames", async (keep) =
   assert(st.b.peer === st.A.driver.peerId, "the acceptor must attribute the link to the caller");
 });
 
+await test("a request's deadline is the CALLER's, not a node-wide clock", async (keep) => {
+  // Two requests to the same peer, over the same live link, with different deadlines —
+  // and the short one must settle on its own schedule. This is what the old silence
+  // clock could not do: it re-armed on ANY frame from the peer, so a request's lifetime
+  // depended on unrelated traffic, and every request on a node shared one window.
+  const st = keep(await upPair());
+  const proto = new TextEncoder().encode("_t");
+  // A holder that never answers: the deadline is the only thing that can settle these.
+  st.B.driver.onRequest(() => new Promise(() => {}));
+
+  const t0 = Date.now();
+  const short = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 150)
+    .then(() => "resolved", () => Date.now() - t0);
+  const long = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([2]), 5000)
+    .then(() => "resolved", () => Date.now() - t0);
+
+  const shortMs = await short;
+  assert(typeof shortMs === "number", "an unanswered request must reject, not resolve");
+  assert(shortMs < 1200, `the 150ms deadline must settle on its own schedule (took ${shortMs}ms)`);
+
+  // ...and it must not have taken the other request down with it: the 5s one is still
+  // pending, so per-request means per request, not per peer.
+  let longSettled = false;
+  long.then(() => { longSettled = true; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert(!longSettled, "a peer's short-deadline request must not settle its long-deadline one");
+});
+
 await test("handshake messages are exact-length: a trailing byte is refused", async (keep) => {
   // Trailing bytes would ride outside the transcript hash, and so outside what both
   // signatures cover. Exact, not minimum, for every message in the flight.

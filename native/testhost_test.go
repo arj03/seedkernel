@@ -75,7 +75,7 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 	tb.Helper()
 	bootRealmIn(tb, dir)
 	policyJSON = withTransportRole(tb, policyJSON)
-	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, TimeoutMs: 2000}
+	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, RequestDeadline: 2000}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON
 	}

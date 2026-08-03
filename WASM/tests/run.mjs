@@ -111,8 +111,7 @@ withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem76
 // Install a verified module directly under `targetName`. Bundles are the only way code
 // arrives (§12.4); there is no wire install envelope. Throws on structural failure.
 function installMod(host, targetName, wasm) {
-  const ref = host.instantiateWasm(wasm);
-  host.bindHandler(targetName, ref);
+  host.bindAll([{ name: targetName, wasm }]);
 }
 
 // The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real
@@ -320,30 +319,40 @@ async function testHandlesIsADeclarationNotAClaim() {
   console.log("  OK\n");
 }
 
-// ─── Test: removeHandler + suite slot removal ───────────────────────────
+// ─── Test: removePrefix, the per-app unbind ─────────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: removeHandler frees the kernel slot (§12.5)");
+  console.log("Test: removePrefix unbinds exactly one app's names (§3.1, §12.5)");
 
   const { host } = await makeHost();
 
+  // Two apps of one author, plus a SECOND author's app sharing the app name — the
+  // case the app-key prefix exists to separate (§5.1).
   const { publicKey: pk } = generateKeyPair();
-  const chatTextName = modName(pk, "chat", "text");
+  const { publicKey: other } = generateKeyPair();
+  const text = modName(pk, "chat", "text");
+  const media = modName(pk, "chat", "media");
+  const notes = modName(pk, "notes", "text");
+  const theirs = modName(other, "chat", "text");
 
-  installMod(host, chatTextName, forwarderBytes);
-  assert(host.isBound(chatTextName), "install ok");
+  for (const n of [text, media, notes, theirs]) installMod(host, n, forwarderBytes);
+  for (const n of [text, media, notes, theirs]) assert(host.isBound(n), "install ok: " + n);
 
-  assert(host.removeHandler(chatTextName), "remove returned true");
-  assert(!host.isBound(chatTextName), "kernel slot cleared");
+  // The unbind is per APP, not per name: one pass takes every module the app landed
+  // and nothing else, because the app key prefixes all of them and leads with the
+  // author. A second author's identically-named app is untouched.
+  const prefix = appKeyFor(pk, "chat") + ":";
+  assertEqual(host.removePrefix(prefix), 2, "both modules of the app went in one pass");
+  assert(!host.isBound(text) && !host.isBound(media), "the app's names are free");
+  assert(host.isBound(notes), "the same author's other app is untouched");
+  assert(host.isBound(theirs), "another author's same-named app is untouched");
+
   // Nothing else to clear: a freed name can only be re-occupied by the author whose key
-  // derives it (§5.1), so there is no stale ownership to misattribute onto new bytes.
-
-  // removeHandler is idempotent — a second call on an empty slot returns false.
-  assert(!host.removeHandler(chatTextName), "second remove returns false");
-
-  // Re-installing at the same name after a remove succeeds (no tombstone).
-  installMod(host, chatTextName, forwarderBytes);
-  assert(host.isBound(chatTextName), "reinstall after remove succeeds");
+  // derives it (§5.1), so there is no stale ownership to misattribute onto new bytes —
+  // and no tombstone, so the same name accepts bytes again immediately.
+  assertEqual(host.removePrefix(prefix), 0, "a second pass removes nothing");
+  installMod(host, text, forwarderBytes);
+  assert(host.isBound(text), "reinstall after remove succeeds");
 
   console.log("  OK\n");
 }
@@ -434,7 +443,7 @@ async function testCapBridge() {
   const fs = new MemoryFs();
   // A transport host for the net ops: its peer id is the identity's, and a request
   // to itself drops at the guest's own-frame guard, so NET_SEND drains.
-  const { driver: transport } = await makeTransportHost({ identity: id, timeoutMs: 200 });
+  const { driver: transport } = await makeTransportHost({ identity: id, requestDeadlineMs: 200 });
 
   // A handler reachable by name, to exercise CAP_MODULE_CALL. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).

@@ -45,7 +45,7 @@ export function transportPolicy(authorHex) {
 /** One transport host: a shell over a fresh identity + the transport bundle. The
  *  driver (shell.net) is the node's network. Options pass through to the shell's
  *  platform (admitPeer for the peer whitelist, networkKey, contactSecret, channels)
- *  and to the shell's createShell opts (timeoutMs, transportHalfOpen). */
+ *  and to the shell's createShell opts (requestDeadlineMs, transportHalfOpen). */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const shell = createShell({
@@ -63,9 +63,8 @@ export async function makeTransportHost(opts = {}) {
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: transportPolicy(opts.transportAuthorHex ?? transportAuthor()),
-    timeoutMs: opts.timeoutMs,
+    requestDeadlineMs: opts.requestDeadlineMs,
     transportHalfOpen: opts.transportHalfOpen,
-    transportMaxStallWindows: opts.maxStallWindows,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
   return { shell, driver: shell.net, identity };

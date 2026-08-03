@@ -64,14 +64,10 @@ var (
 	el *eventLoop
 	// handlers is the handler table (README §3): the whole kernel, which is a contract
 	// rather than an artifact. A name is bound exactly when it is a key here, so the §3.1
-	// SetHandler / remove / resolve operations are map assignment, delete and lookup —
-	// there is no id indirection and no second table to drift from this one. Every value
-	// is an installed module: bundles are the one way code arrives (§12.4).
+	// bind / unbind / resolve operations are map assignment, delete and lookup — there is
+	// no id indirection and no second table to drift from this one. Every value is an
+	// installed module: bundles are the one way code arrives (§12.4).
 	handlers = map[string]*wasmHandler{}
-	// unbound holds handlers that instantiateWasm created but bindWasm has not yet placed
-	// on the handler table. Keyed by an integer token the JS bridge carries across.
-	unbound    = map[int64]*wasmHandler{}
-	unboundSeq int64
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
@@ -83,8 +79,8 @@ var (
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
-// bind binds `n` to `w`, releasing whatever the name held before — SetHandler's
-// replace-in-place (§3.1). The one place a displaced wasm instance is closed: Go frees
+// bind binds `n` to `w`, releasing whatever the name held before — the §3.1
+// replace-in-place. The one place a displaced wasm instance is closed: Go frees
 // neither the instance nor its compiled code on its own, so dropping the map value alone
 // would leak one linear memory + its JITed code per replace for the process's life.
 func bind(n string, w *wasmHandler) {
@@ -157,9 +153,36 @@ func callHandler(n string, payload []byte) []byte {
 	return out
 }
 
+// bindAll lands a bundle's modules on the handler table, all or none (README §3.1) — the
+// one way code arrives on this target, reached from JS as bridge.bindAll.
+//
+// The transaction is HERE rather than in the loader because this is the side holding the
+// half-built instances: wazero frees neither a module instance nor its compiled code, so
+// a bundle rejected at its third module has to close the first two, and a loader that
+// forgot would leak a linear memory plus its JITed code per rejected bundle. Making it a
+// two-phase seam across the bridge is what would put that duty on the caller.
+func bindAll(names []string, wasms [][]byte) error {
+	built := make([]*wasmHandler, 0, len(wasms))
+	for i, wasm := range wasms {
+		w, err := instantiateWasm(wasm)
+		if err != nil {
+			for _, h := range built {
+				closeHandler(h)
+			}
+			return fmt.Errorf("%s: %w", names[i], err)
+		}
+		built = append(built, w)
+	}
+	// Nothing above touched the table and nothing below can fail.
+	for i, w := range built {
+		bind(names[i], w)
+	}
+	return nil
+}
+
 // instantiateWasm compiles, instantiates, and validates handler bytes against the §4
-// ABI. No table effect — returns an opaque token the caller must later pass to bindWasm.
-// Exposed to JS as bridge.instantiateWasm (only the host can instantiate wasm, §12.4).
+// ABI. No table effect: the result is an intermediate of bindAll's transaction, never
+// something that crosses the bridge.
 func instantiateWasm(wasm []byte) (*wasmHandler, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
@@ -303,7 +326,6 @@ func shutdown() {
 		rt = nil
 	}
 	handlers = map[string]*wasmHandler{}
-	unbound = map[int64]*wasmHandler{}
 }
 
 // exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
@@ -314,34 +336,33 @@ func exposeBridge(qc *qjs.Context) {
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 
 	// ── the handler table (§3) ──
-	b.SetPropertyStr("instantiateWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		wb, _ := qjs.JsTypedArrayToGo(t.Args()[0])
-		w, err := instantiateWasm(wb)
-		if err != nil {
-			return nil, fmt.Errorf("instantiateWasm: %w", err)
+	// One transactional install (§3.1). The argument is the loader's `{name, wasm}[]`,
+	// read out here rather than flattened on the JS side so the bridge shape and the
+	// BundleHost interface are the same shape.
+	b.SetPropertyStr("bindAll", fn(func(t *qjs.This) (*qjs.Value, error) {
+		mods := t.Args()[0]
+		lenv := mods.GetPropertyStr("length")
+		n := int(lenv.Int64())
+		lenv.Free()
+		names := make([]string, n)
+		wasms := make([][]byte, n)
+		for i := 0; i < n; i++ {
+			m := mods.GetPropertyStr(strconv.Itoa(i))
+			nv := m.GetPropertyStr("name")
+			names[i] = nv.String()
+			nv.Free()
+			wv := m.GetPropertyStr("wasm")
+			wb, err := qjs.JsTypedArrayToGo(wv)
+			wv.Free()
+			m.Free()
+			if err != nil {
+				return nil, fmt.Errorf("bindAll: %s: %w", names[i], err)
+			}
+			wasms[i] = wb
 		}
-		unboundSeq++
-		unbound[unboundSeq] = w
-		return t.Context().NewInt64(unboundSeq), nil
-	}))
-	b.SetPropertyStr("bindWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		tok := t.Args()[1].Int64()
-		w := unbound[tok]
-		if w == nil {
-			return nil, fmt.Errorf("bindWasm: token %d not found", tok)
+		if err := bindAll(names, wasms); err != nil {
+			return nil, err
 		}
-		delete(unbound, tok)
-		bind(t.Args()[0].String(), w)
-		return t.Context().NewNull(), nil
-	}))
-	b.SetPropertyStr("discardWasm", fn(func(t *qjs.This) (*qjs.Value, error) {
-		tok := t.Args()[0].Int64()
-		w := unbound[tok]
-		if w == nil {
-			return t.Context().NewNull(), nil // token already consumed (bind or double discard) — harmless
-		}
-		delete(unbound, tok)
-		closeHandler(w)
 		return t.Context().NewNull(), nil
 	}))
 	b.SetPropertyStr("callHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
@@ -432,7 +453,7 @@ type nodeConfig struct {
 	Listen           *hostPort      `json:"listen,omitempty"`
 	WsListen         *hostPort      `json:"wsListen,omitempty"`
 	Peers            []string       `json:"peers,omitempty"`
-	TimeoutMs        int            `json:"timeoutMs,omitempty"`
+	RequestDeadline  int            `json:"requestDeadlineMs,omitempty"`
 	Config           map[string]any `json:"config,omitempty"`
 }
 
@@ -573,7 +594,7 @@ type cliArgs struct {
 	contactSecret                           string
 	put, get, out, appConfig                string
 	revokeKeys, uninstallApps               string
-	timeoutMs                               int
+	requestDeadlineMs                       int
 }
 
 func parseCLI() cliArgs {
@@ -592,7 +613,7 @@ func parseCLI() cliArgs {
 	flag.StringVar(&a.appConfig, "app-config", "", "app config JSON")
 	flag.StringVar(&a.revokeKeys, "revoke", "", "write off compromised author keys (hex,…): refuse their bundles and uninstall what they landed")
 	flag.StringVar(&a.uninstallApps, "uninstall", "", "uninstall app keys (authorHex:app,…) without revoking the author")
-	flag.IntVar(&a.timeoutMs, "timeout", 2000, "network start timeout (ms)")
+	flag.IntVar(&a.requestDeadlineMs, "request-deadline", 0, "default per-request deadline in ms (0 = the transport's own default)")
 	flag.Parse()
 	if flag.NArg() > 0 {
 		a.bundleDir = flag.Arg(0)
@@ -745,7 +766,7 @@ func parseContactSecret(hexStr string) (string, error) {
 // to an empty author set, so the node serves and nothing installs — including the
 // bundle below, whose manifest author must be listed too (README §14).
 func configFromCLI(a cliArgs) (nodeConfig, error) {
-	cfg := nodeConfig{Peers: splitList(a.peers), TimeoutMs: a.timeoutMs}
+	cfg := nodeConfig{Peers: splitList(a.peers), RequestDeadline: a.requestDeadlineMs}
 	if a.policyPath != "" {
 		pj, err := os.ReadFile(a.policyPath)
 		if err != nil {

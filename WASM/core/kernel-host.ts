@@ -1,7 +1,7 @@
 // The host and the handler table it owns (README §3, §4).
 //
 // The kernel is a **contract, not an artifact**: the table (`handlers[name] → handler`),
-// the pure-transform handler ABI (§4), and the `SetHandler` semantics (§3.1). Its whole
+// the pure-transform handler ABI (§4), and the bind/unbind semantics (§3.1). Its whole
 // implementation is the one `Map` below. §1's vision sentence — "installing a handler is
 // nothing more than `handlers[name] = wasm_bytes`" — is literally this map, so there is no
 // kernel module to instantiate, no handler-id indirection, and no second table to keep in
@@ -53,7 +53,7 @@ interface WasmHandlerRef {
 
 export class KernelHost {
   /** The handler table (README §3). A name is bound exactly when it is a key here, so
-   *  the §3.1 SetHandler / remove / resolve operations are `set` / `delete` / `get` and
+   *  the §3.1 bind / unbind / resolve operations are `set` / `delete` / `get` and
    *  nothing else can disagree about what a name resolves to. */
   private readonly handlers = new Map<string, WasmHandlerRef>();
 
@@ -66,14 +66,35 @@ export class KernelHost {
 
   // ─── installing WASM handlers ─────────────────────────────────────────
 
+  /** Land a bundle's modules on the table, all or none (§3.1) — the one way code
+   *  arrives, and the only mutating entry point besides `removePrefix`.
+   *
+   *  Every module is instantiated and validated BEFORE any name is written, so a bundle
+   *  whose third module is malformed leaves the table exactly as it was rather than
+   *  half-replaced. That the caller cannot observe the intermediate state is the point:
+   *  atomicity belongs to whoever holds the half-built instances, which is this class.
+   *
+   *  Instances abandoned by a failure need no explicit release here — JS reclaims an
+   *  unreferenced `WebAssembly.Instance` on its own. A host whose instances are not
+   *  garbage-collected frees them on this same path (native/main.go), which is exactly
+   *  why the release is the host's business and not a step in the loader. */
+  bindAll(mods: { name: string; wasm: Uint8Array }[]): void {
+    const refs = mods.map((m) => {
+      if (m.name.length === 0) throw new Error("kernel: empty handler name");
+      return { name: m.name, ref: this.instantiate(m.wasm) };
+    });
+    // Nothing above can have written to the table, and nothing below can fail.
+    for (const { name, ref } of refs) this.handlers.set(name, ref);
+  }
+
   /** Instantiate handler `wasmBytes` — compile, validate, check §4 exports — without
-   *  binding to the handler table. Throws on any structural failure so the caller can
-   *  collect all failures before any name is written (two-phase bundle install).
+   *  binding to the handler table. Private: a ref that is not on the table is an
+   *  intermediate of `bindAll`'s transaction and never something a caller holds.
    *
    *  A handler is a pure transform: it imports nothing from the runtime — no `kernel.*`
    *  seam, only its own language runtime's shims (`env.*`, §4.2) — and exports `memory`,
    *  a `scratch` global, and `handle`. */
-  instantiateWasm(wasmBytes: Uint8Array): WasmHandlerRef {
+  private instantiate(wasmBytes: Uint8Array): WasmHandlerRef {
     if (wasmBytes.length === 0) throw new Error("kernel: empty wasm bytes");
     // BEFORE instantiation, not after: `new WebAssembly.Instance` allocates the module's
     // declared initial memory, so a module asking for 4 GiB has already OOMed this host
@@ -136,19 +157,6 @@ export class KernelHost {
     };
   }
 
-  /** Bind an instantiated handler ref at `targetName`. Displaces whatever was at the
-   *  name without ceremony — the admission policy already ran. */
-  bindHandler(targetName: string, ref: WasmHandlerRef): void {
-    if (targetName.length === 0) throw new Error("kernel: empty handler name");
-    this.handlers.set(targetName, ref);
-  }
-
-  /** Release a handler ref that will never be bound (the bundle failed). JS GC
-   *  reclaims abandoned WebAssembly instances on its own, so this is a no-op — but
-   *  it satisfies the BundleHost contract so the JS/native implementations share
-   *  one interface. */
-  discardHandler(_ref: WasmHandlerRef): void {}
-
   // ─── public API ──────────────────────────────────────────────────────
 
   /** Invoke a handler by name with `payload`, returning its response bytes, or null if
@@ -173,17 +181,15 @@ export class KernelHost {
     return new Uint8Array(w.memory.buffer, w.scratch, responseLen).slice();
   }
 
-  /** Remove a handler, the `SetHandler(name, null)` case in §3.1 — and the loader's
-   *  `remove(name)` revocation path (§12.5). It frees the name and nothing else: there is
-   *  no side table to keep in step, and a freed name can only ever be re-occupied by the
-   *  author whose key derives it (§5.1), so a removal can never hand a slot to anyone. */
-  removeHandler(name: string): boolean {
-    return this.handlers.delete(name);
-  }
-
-  /** Remove every handler whose name starts with `prefix`. Returns the count of
-   *  handlers removed. Used by the shell's `uninstall` to clean up all kernel names
-   *  derived from one app key in a single pass. */
+  /** Remove every handler whose name starts with `prefix`, returning how many went —
+   *  the §3.1 unbind, and the whole of it. The unit is an APP, not a name: the shell's
+   *  `uninstall` and `revoke` (§12.5) are the only callers, and every kernel name an app
+   *  landed shares its app key as a prefix (§5.1), so one pass frees exactly that app.
+   *
+   *  There is no single-name remove. Nothing wants one — a name is not a unit anything
+   *  installs or revokes — and it frees the name and nothing else anyway: a freed name
+   *  can only ever be re-occupied by the author whose key derives it, so there is no
+   *  stale ownership to keep in step and no tombstone to leave behind. */
   removePrefix(prefix: string): number {
     let removed = 0;
     for (const name of this.handlers.keys()) {

@@ -1,6 +1,6 @@
 # Seed kernel — Protocol
 
-*The message model, the kernel's handler table, host-level `SetHandler`, the pure-transform WASM handler contract, and layering. §16 collects the protocol constants.*
+*The message model, the kernel's handler table, host-level handler management, the pure-transform WASM handler contract, and layering. §16 collects the protocol constants.*
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
@@ -30,7 +30,7 @@ That leaves three orthogonal pieces in every binding, none of which the kernel i
 
 The kernel is a **named table of handlers**: bind a name to a handler, resolve a name to the handler bound there. It holds no cryptography, no authorization, no installation logic, and no message dispatch. The host resolves a name and invokes the handler itself.
 
-The kernel is a **contract, not an artifact**. It is this section — the table, the pure-transform ABI (§4), and the `SetHandler` semantics (§3.1) — and each host implements it as one map:
+The kernel is a **contract, not an artifact**. It is this section — the table, the pure-transform ABI (§4), and the bind/unbind semantics (§3.1) — and each host implements it as one map:
 
 ```
 handlers[name] → handler    bind / replace / resolve / remove   (§3.1)
@@ -46,26 +46,28 @@ handlers[name] → handler    bind / replace / resolve / remove   (§3.1)
 
 **No re-entrancy to reason about.** A handler is a pure transform that runs to completion and returns before anything else runs (§4). Handlers cannot call one another, so there is no call stack, no depth limit, no current-signer or caller state living across a call. Concurrency is the host's concern: it drives one transform at a time, typically on a single event loop.
 
-### 3.1 Host-level handler management (`SetHandler`)
+### 3.1 Host-level handler management
 
-The host manages the table through two operations:
+The table has two mutating operations, and they are **not symmetric** — because the thing that lands and the thing that leaves are not the same unit:
 
 ```
-SetHandler(name, handler)    install or replace the handler for name
-SetHandler(name, null)       remove it
+bindAll([{name, wasm}, ...])   admit a bundle's modules, all or none   (the loader's)
+removePrefix(appKey + ":")     unbind one app's modules                 (the shell's)
 ```
 
-`SetHandler` installs or replaces in place, so the table never holds two entries for one name. Together these are the **only** way handlers enter or leave it — no install message, no privileged "register" path, no protected-vs-unprotected distinction; every entry arrived the same way. The reference host exposes them as `installBundleModule(name, wasm, author)` and `removeHandler(name)`.
+**The bind belongs to the loader, and there is only one.** Nothing hands the host a ready-made handler to drop into a slot, and there is no per-name install: the sole caller is the loader's admission (§12.4), which reaches `bindAll` only after the manifest signature and the policy have both passed, and hands it a whole bundle's modules at once. So every entry in the table is a bundle module admitted under a verified manifest — there is no second kind of occupant, and no question of who authored what a name resolves to, because the author is the first thing the name says (§5.1). That is what makes "one install path" (§1) literally true rather than nearly true.
 
-**The bind is not a public host method.** Nothing hands the host a ready-made handler to drop into a slot: the only caller of the bind is the loader's admission (§12.4), which reaches it after the manifest signature and the policy have both passed. So every entry in the table is a bundle module admitted under a verified manifest — there is no second kind of occupant, and no question of who authored what a name resolves to, because the author is the first thing the name says (§5.1). That is what makes "one install path" (§1) literally true rather than nearly true.
+**The bind is atomic, and that is the host's guarantee rather than the caller's.** `bindAll` either binds every module or binds none: it validates all of them against the §4 ABI first, and a failure anywhere releases whatever it had already built and throws with the table untouched. A partially-installed bundle is therefore not a state a caller has to avoid reaching — it is one no caller can express. This matters most where a wasm instance is a real resource: on a host whose modules are not garbage-collected, the release path is the host's own, so no target can forget it.
 
-`SetHandler` is internal to the host process — never reachable from inbound frames or from a WASM handler. The host controls access through its own authentication (process permissions, operator console, HSM); the kernel defines no access-control policy for it.
+Binding an occupied name **replaces in place**, so the table never holds two entries for one name — this is how a same-author, higher-`version` bundle lands (§12.4). It is internal to the host process, never reachable from an inbound frame or from a WASM handler; the host controls access through its own authentication (process permissions, operator console, HSM), and the kernel defines no access-control policy for it.
 
-**Removing a name frees only that name.** `removeHandler` deletes the entry and nothing else — there is no side table to keep in step. A freed name can only ever be re-occupied by the author whose key derives it (§5.1), so a removal cannot hand a slot to anyone, and the misattribution a stale ownership record would invite has no way to arise. This is the loader's `remove(name)` revocation path (§12.5).
+**The unbind belongs to the shell, and its unit is an app.** `removePrefix` frees every name beginning with an app key — the shell's `uninstall`, and `revoke`'s teardown of everything a written-off key landed (§12.5). One pass is all it needs, because every kernel name an app landed shares its app key as a prefix (§5.1). There is no single-name remove: a name is not a unit anything installs, so it is not one anything revokes either.
+
+**Freeing a name frees only that name.** There is no side table to keep in step, and a freed name can only ever be re-occupied by the author whose key derives it (§5.1) — so an unbind cannot hand a slot to anyone, the misattribution a stale ownership record would invite has no way to arise, and there is no tombstone: the name accepts the author's next bundle immediately.
 
 ### 3.2 Growth is the loader's job, not the kernel's
 
-Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits each verified module — a policy decision (§12.5) followed by `SetHandler` at the name it derives from the manifest (§5.1). None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting bind. Frozen-config deployments load no bundles and grow no further.
+Most deployments grow by loading signed bundles (§12.4), not by wiring every handler by hand. The bundle loader admits a bundle's modules — a policy decision (§12.5) followed by one `bindAll` at the names it derives from the manifest (§5.1). None of that is the kernel's: admission is host-side, off any wire path, and the kernel sees only the resulting bind. Frozen-config deployments load no bundles and grow no further.
 
 **Standing a host up.** Because the kernel is a map rather than an artifact, there is no bootstrap sequence to speak of: ready libsodium, construct the host, and the table is live — empty, resolving nothing. Growth is then two ordered steps, and the order is the only constraint: wire an admission policy (§12.5), then load a bundle (§12.4). A host whose policy is never wired is not misconfigured but *frozen* — deny-all is the default, so it boots, serves, and admits nothing (§14). There is no step for instantiating a kernel module, seeding a signature handler, or wiring a slot by hand.
 
@@ -207,7 +209,7 @@ These belong to the reference runtime (§12), not the kernel protocol — a diff
 | `REKEY_AFTER_FRAMES` | `16777216` (2²⁴) | transport bundle records (§12.6) | Frames per epoch before the sending direction ratchets its key. Must match on both ends; a mismatch desynchronises the link. |
 | `REJECT_AFTER_EPOCHS` | `65536` (2¹⁶) | transport bundle records (§12.6) | Epoch ceiling. Reaching it retires the link — a deliberate shutdown that announces itself, not a fault — rather than producing a record under a repeated nonce. |
 | Transport frame kinds | `req 0x00`, `res 0x01`, <br>`FLAG_NO_REPLY 0x80` | transport bundle (§12.6) | Single request/response plane, carried inside the §12.6 AEAD record layer. A req names a protocol id so a node hosting several apps can route it (§12.10). `FLAG_NO_REPLY` is OR'd into the kind byte for fire-and-forget sends: the receiver still runs its handler but skips the response frame. |
-| Default request timeout | `2000` ms | shell boot (§12.8) | Response deadline before a peer counts as unreachable (`--timeout`). |
+| `DEFAULT_REQUEST_DEADLINE_MS` | `10000` ms | transport driver (§12.6) | How long one request may take before it settles as unreachable, for a caller that names no deadline of its own. A **deadline is per request, not per node**: only the caller knows whether it sent a 200-byte control message or a 4 MB block, so `request(to, proto, payload, deadlineMs)` takes one and this is merely the fallback (operator default `requestDeadlineMs`, CLI `--request-deadline`). App guests take it as-is — `NET_SEND` carries no deadline — which is why it is generous rather than tight. |
 | Guest execution budget | `5000` ms | Confined realm (§12.3) | Per entrypoint invocation, measured over guest **run** time rather than wall clock: a guest parked awaiting a host bridge spends none of it. Exceeding it interrupts the guest, which surfaces to the caller as a thrown error; on the native target the interruption terminates the realm rather than throwing inside it (§14). Operator-set (`guestDeadlineMs`, CLI `--guest-timeout`), not author-declared; `Infinity` — CLI `0` — disables it. The realm heap cap alongside it is 64 MiB (`realmMemoryBytes`, CLI `--guest-memory`, in MiB). |
 
 **The `DOMAIN_*` family lives in one file.** The four prefixes above are a *family*, and the only thing they are for is disjointness: no signature made under one may verify under another, over any bytes, ever — and no derived id may collide with a signed preimage. That is a property of the whole set rather than of any member, so the set is declared together in `core/domains.ts` — where adding a member means reading the others on the same screen — and imported by the modules that sign (`bundle.ts`, `cap-bridge.ts`). The transport bundle's guest program never sees one: it asks for a signature through `SIGN` and the *host* chooses the prefix from the asking bundle's slot (§12.2), so a prefix cannot be restated in content either. The Go/native target evaluates that same file through its generated bundles (§12.9) and reads its prefixes from the evaluated module, so every prefix on every target derives from this one file by construction, not by a copy that could drift. There is **no** hand-copied member anywhere.

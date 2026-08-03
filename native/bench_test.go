@@ -31,7 +31,7 @@ func ensureBooted(tb testing.TB) {
 		if benchBootErr = boot(dir); benchBootErr != nil {
 			return
 		}
-		cfg := nodeConfig{KeyHex: testKeyHex(tb), TimeoutMs: 2000}
+		cfg := nodeConfig{KeyHex: testKeyHex(tb), RequestDeadline: 2000}
 		_, benchBootErr = startNode(cfg)
 	})
 	if benchBootErr != nil {

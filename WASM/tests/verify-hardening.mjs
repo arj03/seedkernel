@@ -44,10 +44,23 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkHandlerMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
   const host = new KernelHost();
-  ok(host.instantiateWasm(withMax) !== null, "KernelHost instantiates a bounded handler");
-  throws(() => host.instantiateWasm(noMax), "KernelHost refuses an unbounded handler at install");
+  host.bindAll([{ name: "aa:app:ok", wasm: withMax }]);
+  ok(host.isBound("aa:app:ok"), "KernelHost binds a bounded handler");
+  throws(() => host.bindAll([{ name: "aa:app:bad", wasm: noMax }]),
+    "KernelHost refuses an unbounded handler at install");
   const tiny = new KernelHost({ maxHandlerMemoryBytes: 1024 * 1024 });
-  throws(() => tiny.instantiateWasm(withMax), "the budget is configurable per host");
+  throws(() => tiny.bindAll([{ name: "aa:app:ok", wasm: withMax }]), "the budget is configurable per host");
+
+  // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
+  // table exactly as it was, rather than with its first module landed. Atomicity is the
+  // host's guarantee, so it holds without the caller doing anything to earn it.
+  const atomic = new KernelHost();
+  throws(() => atomic.bindAll([
+    { name: "aa:app:first", wasm: withMax },
+    { name: "aa:app:second", wasm: noMax },
+  ]), "a bundle with one bad module is refused whole");
+  ok(!atomic.isBound("aa:app:first"), "the good module of a refused bundle did not land");
+  ok(!atomic.isBound("aa:app:second"), "neither did the bad one");
 }
 
 console.log("\n§12.2 — fs is scoped per app key");

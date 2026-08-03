@@ -61,12 +61,13 @@ export interface KernelTable {
     isBound(name: string): boolean;
 }
 
-/** The §3 handler table as the shell uses it: the two install powers a bundle load
- *  needs (`BundleHost`), plus reaching and releasing what landed. A platform
- *  primitive, not shell logic — `KernelHost` is the JS implementation over
+/** The §3 handler table as the shell uses it: the one transactional install a bundle
+ *  load needs (`BundleHost.bindAll`), plus reaching and releasing what landed. A
+ *  platform primitive, not shell logic — `KernelHost` is the JS implementation over
  *  `WebAssembly`, and the native target's is Go's wazero map behind its byte bridge
  *  (§12.9). The table is the same contract either way; only who owns the instances
- *  differs. */
+ *  differs — which is precisely why both the all-or-none bind and the release live
+ *  behind it rather than in the loader. */
 export interface KernelBackend extends BundleHost, KernelTable {
     /** Remove every handler whose name starts with `prefix`, returning how many went.
      *  One pass is all `uninstall` needs: every kernel name of an app shares its app
@@ -152,7 +153,11 @@ export interface CreateShellOptions {
      *  allowlist, a consent dialog, and "the bundle my operator handed me" are
      *  three constructors of the same predicate type (§12.5). */
     admit?: AdmitCallback;
-    timeoutMs?: number;
+    /** How long one net request may take before it settles as unreachable, in ms, for
+     *  a caller that names no deadline of its own (§12.6). Omitted ⇒ the transport's
+     *  `DEFAULT_REQUEST_DEADLINE_MS`. A deployment-wide fallback, not a policy — the
+     *  caller of `transport.request` overrides it per call. */
+    requestDeadlineMs?: number;
     /** Operator-supplied app config, merged *over* the bundle manifest's `config`
      *  into the guest's `const APP = …`. Opaque to the shell. */
     config?: Record<string, string | number>;
@@ -178,9 +183,6 @@ export interface CreateShellOptions {
         perSource?: number;
         verified?: number;
     };
-    /** The absolute backstop for the transport's requests, as a multiple of
-     *  timeoutMs (net.ts §12.6). Default 50. */
-    transportMaxStallWindows?: number;
 }
 
 export interface Shell {
@@ -226,11 +228,15 @@ export interface Shell {
      *  only loaded app; throws when more than one is loaded and no key is
      *  given. Throws for handler-only bundles (no guest source). */
     runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
-    /** Dispatch inbound request to the right app via protocol bindings (§12.10).
-     *  For a guest app: calls the confined realm's `handle` synchronously.
-     *  For a handler-only app: calls the kernel handler with senderPk ‖ payload.
-     *  Returns the response bytes, or null if no bound app handles the protocol. */
-    dispatch(from: PeerId, proto: string, payload: Uint8Array): Uint8Array | null;
+    /** Dispatch an inbound request to the right app via protocol bindings (§12.10):
+     *  resolve the protocol to an app and call that app's one entrypoint with
+     *  `senderPk ‖ payload`. Null when no bound app handles the protocol.
+     *
+     *  A guest app answers with a Promise and a handler-only app with bytes — the
+     *  same union `RequestHandler` (core/net.ts) accepts, because the transport driver
+     *  is the consumer either way and awaits what it is handed. Callers must not assume
+     *  the synchronous arm. */
+    dispatch(from: PeerId, proto: string, payload: Uint8Array): Uint8Array | Promise<Uint8Array> | null;
     /** Wire transport.onRequest to the shell's dispatch. After this, every
      *  inbound frame resolves through the bindings table to its app (§12.10). */
     serve(): Promise<void>;
@@ -248,10 +254,18 @@ export { KernelHost } from "../core/kernel-host.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
  *  re-implementing the kernel host, cap-bridge wiring, preamble assembly, realm
  *  creation, and transport routing. */
+/** An app's ONE inbound entrypoint (§12.10): the authenticated `senderPk ‖ payload`
+ *  in, the response bytes out, or null for "this app answers nothing". A guest app's
+ *  resolves to its realm's `handle` and therefore returns a Promise; a handler-only
+ *  app's resolves to a WASM handler and returns bytes. Dispatch consumes the union
+ *  without distinguishing them, exactly as `RequestHandler` (core/net.ts) already
+ *  does — the driver awaits whatever it is handed. */
+type AppEntry = (input: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
+
 interface AppSlot {
   loaded: LoadedBundle;
   realm: SafeRealm | null;
-  handleName: string;
+  entry: AppEntry;
 }
 
 interface RoleSlot {
@@ -359,6 +373,34 @@ export function createShell(opts: CreateShellOptions & {
         + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
         + b.guestSource;
     const hasGuest = (b: LoadedBundle) => b.guestSource.length > 0;
+    /** Resolve an app's one inbound entrypoint, ONCE, at install (§12.10).
+     *
+     *  An app has exactly one way in. Which mechanism serves it — a confined realm's
+     *  `handle` (§12.2) or the WASM module the manifest names as `entry` (§12.4) — is a
+     *  property of the bundle, so it is decided here rather than re-decided per message:
+     *  `dispatch` neither branches on how an app is implemented nor re-derives a kernel
+     *  name for every inbound frame. A multi-module handler bundle's other modules are
+     *  library code its `entry` calls, never a second inbound seam.
+     *
+     *  `entryModuleOf` throws on a manifest that declares several modules and no `entry`,
+     *  and this runs on the load path, so an ambiguous bundle fails to install rather
+     *  than binding traffic to whichever module happened to be first.
+     *
+     *  It closes over the SLOT, not over `slot.realm`: the entrypoint is fixed at
+     *  install, but the realm behind it is created lazily (`ensureRealm`, on serve() or
+     *  first use), so a guest entry that captured today's `null` would never see it. */
+    const entryFor = (slot: AppSlot): AppEntry => {
+        if (hasGuest(slot.loaded)) {
+            // No realm yet ⇒ nothing to dispatch to. serve() creates every guest app's
+            // realm before it routes a single frame, so this is the pre-serve() case.
+            return (input) => slot.realm ? slot.realm.call("handle", input) : null;
+        }
+        const mod = entryModuleOf(slot.loaded.manifest);
+        if (!mod)
+            return () => null;
+        const name = kernelNameFor(slot.loaded.author, slot.loaded.manifest.app, mod);
+        return (input) => host.callHandler(name, input);
+    };
     /** Stand a transport driver up over an admitted transport bundle's realm.
      *  The driver is the shell's Network: it answers the guest's DIAL actions
      *  through the platform's socket seam, and its request/response face is what
@@ -380,7 +422,7 @@ export function createShell(opts: CreateShellOptions & {
             identity: platform.identity,
             networkKey: platform.networkKey,
             contactSecret: platform.contactSecret,
-            timeoutMs: opts.timeoutMs ?? 2000,
+            requestDeadlineMs: opts.requestDeadlineMs,
             connsPerPeer: platform.connsPerPeer,
             admitPeer: platform.admitPeer,
             channels: platform.channels,
@@ -389,7 +431,6 @@ export function createShell(opts: CreateShellOptions & {
             maxHalfOpenUnverified: opts.transportHalfOpen?.unverified,
             maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
             maxHalfOpenVerified: opts.transportHalfOpen?.verified,
-            maxStallWindows: opts.transportMaxStallWindows,
         });
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
@@ -451,33 +492,25 @@ export function createShell(opts: CreateShellOptions & {
         }
         return removed > 0;
     };
+    /** Route an inbound request to its app (§12.10): resolve the protocol to an app key,
+     *  prepend the authenticated sender, hand it to that app's one entrypoint.
+     *
+     *  There is no branch on how the app is implemented — every app presents the same
+     *  `senderPk ‖ payload` shape and the same single entry, resolved at install
+     *  (`entryFor`). A guest app's answer is a Promise, which the driver already expects
+     *  from `RequestHandler` and answers through the `respond` entrypoint on a later turn
+     *  rather than inline (transport-host.ts) — the seam an asynchronous holder needs,
+     *  since `fs` is async (core/fs.ts). */
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
         const key = bindings.boundApp(proto);
-        if (!key)
-            return null;
-        const slot = apps.get(key);
+        const slot = key ? apps.get(key) : undefined;
         if (!slot)
-            return null;
-        if (hasGuest(slot.loaded)) {
-            if (!slot.realm)
-                return null; // realm not yet created — serve() must be called first
-            const senderBytes = fromHex(from);
-            const input = new Uint8Array(senderBytes.length + payload.length);
-            input.set(senderBytes, 0);
-            input.set(payload, senderBytes.length);
-            // A Promise, which the driver already expects from `RequestHandler`: it
-            // answers through the `respond` entrypoint on a later turn, never inline
-            // (transport-host.ts). That was designed for exactly this — a holder that
-            // reads fs now awaits, because fs is async (core/fs.ts).
-            return slot.realm.call("handle", input);
-        }
-        if (!slot.handleName)
             return null;
         const senderBytes = fromHex(from);
         const input = new Uint8Array(senderBytes.length + payload.length);
         input.set(senderBytes, 0);
         input.set(payload, senderBytes.length);
-        return host.callHandler(slot.handleName, input);
+        return slot.entry(input);
     };
     return {
         host,
@@ -539,12 +572,13 @@ export function createShell(opts: CreateShellOptions & {
                 return loaded;
             }
             bindings.autoBind(key, handlesOf(loaded.manifest));
-            // Which module receives inbound traffic is the manifest's `entry`, not the first
-            // array element (§12.10). entryModuleOf throws on an ambiguous manifest, so the
-            // load fails loudly rather than binding traffic to an arbitrary module.
-            const entry = entryModuleOf(loaded.manifest);
-            const handleName = entry ? kernelNameFor(loaded.author, loaded.manifest.app, entry) : "";
-            apps.set(key, { loaded, realm: null, handleName });
+            // The app's one inbound entrypoint, resolved here and not per message.
+            // `entryFor` closes over the slot, so the slot is built first and its entry
+            // attached immediately — nothing can observe the placeholder between the two
+            // statements, since neither yields.
+            const slot: AppSlot = { loaded, realm: null, entry: () => null };
+            slot.entry = entryFor(slot);
+            apps.set(key, slot);
             // An app's marks were already advanced inside installBundle — nothing can fail
             // between that return and here — so the app path advances exactly as before.
             return loaded;

@@ -245,9 +245,7 @@ let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
 // two sides have to agree on, and getting it wrong is a handshake that never
 // completes rather than one that completes wrongly.
 let signPrefix = null;
-let timeoutMs = 200;
 let connsPerPeer = 1;
-let maxStallWindows = 50;
 // The HOST's flood cap, learned at INIT — this module never declares the number
 // that bounds it (net-limits.ts stays core); it only sizes its own send budget
 // against it.
@@ -984,43 +982,37 @@ class Router {
 
 // The event-driven twin of net.ts's Promise-based Transport: the HOST holds the
 // promises (keyed by the corr it assigned) and this layer holds the wire state —
-// correlation, the silence-based stall clock, the response binding — driven by
-// host timer events. `to`/`from` are hex peer ids; proto is opaque bytes.
+// correlation, the response binding, one deadline per request — driven by host timer
+// events. `to`/`from` are hex peer ids; proto is opaque bytes.
+//
+// The deadline arrives WITH each request rather than being inferred here, and that is
+// the whole of the timing policy. This layer cannot tell a 200-byte control message
+// from a 4 MB block, so anything it computed would be a guess: what it used to do was
+// re-arm a silence window whenever ANY frame arrived from the peer, under an absolute
+// backstop, which made a request's lifetime depend on unrelated traffic to the same
+// peer — a chatty request kept a stalled one alive, and a quiet-but-progressing
+// transfer died. The caller knows what it sent; it says so (`request` entrypoint).
 class ReqRes {
   constructor() {
-    this.pending = new Map();   // corr → {to, issuedAt, deadline}
-    this.lastFrameAt = new Map();
+    this.pending = new Map();   // corr → {to}
     this.timers = new Map();    // corr → timerId
   }
 
-  attach(sendFrame, now) {
+  attach(sendFrame) {
     this.sendFrame = sendFrame;
-    this.now = now;
   }
 
-  request(corr, to, proto, payload, noReply) {
+  request(corr, to, proto, payload, noReply, deadlineMs) {
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
       // A noReply send carries corr 0 and never resolves — the host keeps no
       // promise for it, so nothing here is parked on its behalf.
-      const issuedAt = this.now();
-      const deadline = issuedAt + timeoutMs * maxStallWindows;
-      this.pending.set(corr, { to, issuedAt, deadline });
-      const check = () => {
-        const p = this.pending.get(corr);
-        if (!p) return;
+      this.pending.set(corr, { to });
+      this.timers.set(corr, armTimer(deadlineMs, () => {
         this.timers.delete(corr);
-        const now = this.now();
-        const last = Math.max(p.issuedAt, this.lastFrameAt.get(to) || 0);
-        const remaining = last + timeoutMs - now;
-        if (remaining > 0 && now < p.deadline) {
-          this.timers.set(corr, armTimer(Math.min(remaining, p.deadline - now), check));
-          return;
-        }
-        this.pending.delete(corr);
-        netSettle(corr, false, utf8Encode("net.send: " + (remaining > 0 ? "backstop" : "timeout") + " to " + to.slice(0, 8)));
-      };
-      this.timers.set(corr, armTimer(timeoutMs, check));
+        if (!this.pending.delete(corr)) return;
+        netSettle(corr, false, utf8Encode("net.send: timeout to " + to.slice(0, 8)));
+      }));
     }
     this.sendFrame(to, frame);
   }
@@ -1036,12 +1028,11 @@ class ReqRes {
   }
 
   onFrame(from, frame) {
-    this.lastFrameAt.set(from, this.now());
     // A response is `[1][corr u32][payload]`, so an EMPTY response is exactly five
     // bytes — the shortest legal frame. Requiring six here dropped it, and since a
     // request nobody is bound to answers empty by contract, that made "no app serves
     // this protocol" indistinguishable from an unreachable peer: the caller waited out
-    // its stall clock instead of being told nothing was there. The six-byte floor is
+    // its whole deadline instead of being told nothing was there. The six-byte floor is
     // the REQUEST branch's (it needs the protocol-id length at offset 5) and is
     // checked there.
     if (frame.length < 5) return;
@@ -1084,7 +1075,6 @@ class ReqRes {
     for (const t of this.timers.values()) clearTimer(t);
     this.timers.clear();
     this.pending.clear();
-    this.lastFrameAt.clear();
   }
 }
 
@@ -1227,10 +1217,8 @@ function init(cfg) {
   networkKey = cfg.networkKey;
   signPrefix = concatBytes([DOMAIN_CHANNEL, networkKey]);
   contactSecret = cfg.contactSecret;
-  timeoutMs = cfg.timeoutMs;
   connsPerPeer = Math.max(1, Math.floor(cfg.connsPerPeer || 1));
   maxFrameBytes = cfg.maxFrameBytes;
-  maxStallWindows = cfg.maxStallWindows;
   maxUnverified = cfg.maxUnverified;
   maxPerSource = cfg.maxPerSource;
   maxVerified = cfg.maxVerified;
@@ -1238,7 +1226,7 @@ function init(cfg) {
   router = new Router(ownPk, ownId);
   reqres = new ReqRes();
   core = new Core();
-  reqres.attach((to, frame) => core.sendFrame(to, frame), clockNow);
+  reqres.attach((to, frame) => core.sendFrame(to, frame));
   router.sink = (from, frame) => reqres.onFrame(from, frame);
   router.onPeerUp = (peerId) => {
     core.checkReady();
@@ -1311,13 +1299,17 @@ function entry(name, fn) {
 }
 
 /** The one config turn: who we are, which network, and the budgets — including the
- *  HOST's flood cap, which this module learns rather than declares. */
+ *  HOST's flood cap, which this module learns rather than declares.
+ *
+ *  There is no request-timing config here. A deadline is per request, not per node, so
+ *  it rides on `request` instead — which is also what leaves the host's default in one
+ *  place (transport-host.ts) rather than mirrored on both sides of the seam. */
 entry("init", (r) => {
   init({
     ownPk: r.blob(), networkKey: r.blob(), contactSecret: r.blob(),
-    timeoutMs: r.u32(), connsPerPeer: r.u32(),
+    connsPerPeer: r.u32(),
     maxUnverified: r.u32(), maxPerSource: r.u32(), maxVerified: r.u32(),
-    maxFrameBytes: r.u32(), maxStallWindows: r.u32(),
+    maxFrameBytes: r.u32(),
   });
 });
 
@@ -1381,13 +1373,18 @@ entry("timer", (r) => { fireTimer(r.u32()); });
 
 /** An app wants a typed request sent. The host holds the promise under `corr` and
  *  this side holds the wire state; the stall clock is a host-armed timer. */
+/** One request out. `deadlineMs` is the CALLER's — how long this particular exchange
+ *  may take before it settles as unreachable — resolved host-side against its default
+ *  and always concrete by the time it arrives here (§12.6). Ignored for a noReply send,
+ *  which nothing is waiting on. */
 entry("request", (r) => {
   const corr = r.u32();
   const noReply = r.u8() === 1;
+  const deadlineMs = r.u32();
   const to = r.blob();
   const proto = r.blob().slice();
   const payload = r.blob().slice();
-  reqres.request(corr, toHex(to), proto, payload, noReply);
+  reqres.request(corr, toHex(to), proto, payload, noReply, deadlineMs);
 });
 
 /** The raw Endpoint face: one whole frame to one peer, no correlation. */

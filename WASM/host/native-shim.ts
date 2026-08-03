@@ -41,9 +41,7 @@ type CapCall = (op: number, payload: ArrayBuffer, callId: number) => Uint8Array 
 
 /** The handler table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
-  instantiateWasm(wasm: Uint8Array): number;
-  bindWasm(name: string, ref: number): void;
-  discardWasm(ref: number): void;
+  bindAll(mods: { name: string; wasm: Uint8Array }[]): void;
   callHandler(name: string, payload: Uint8Array): ArrayBuffer | null;
   isBound(name: string): boolean;
   removePrefix(prefix: string): number;
@@ -123,9 +121,10 @@ setWsHandle((req) => new Uint8Array(__ws.handle(req)));
 /** The §3 handler table, which on this target lives in Go (wazero instances cannot
  *  be JS values). Shape only — every rule about what may land is the shared loader's. */
 const kernel: KernelBackend = {
-    instantiateWasm(wasm) { return bridge.instantiateWasm(wasm); },
-    bindHandler(name, ref) { bridge.bindWasm(name, ref as number); },
-    discardHandler(ref) { bridge.discardWasm(ref as number); },
+    // Straight through: the all-or-none guarantee is Go's, because Go holds the
+    // half-built wazero instances — and has to close them, since neither an instance nor
+    // its compiled code is reclaimed on its own (main.go `bindAll`).
+    bindAll(mods) { bridge.bindAll(mods); },
     callHandler(name, payload) {
         const r = bridge.callHandler(name, payload);
         return r === null ? null : new Uint8Array(r);
@@ -278,7 +277,7 @@ async function makeTransportNode(cfg: {
         host: string;
         port: number;
     };
-    timeoutMs?: number;
+    requestDeadlineMs?: number;
     config?: Record<string, string | number>;
 }): Promise<{
     shell: Shell;
@@ -292,7 +291,7 @@ async function makeTransportNode(cfg: {
             contactSecret: cfg.contactSecret, createRealm,
         },
         admit: (v) => admitPredicate(v),
-        timeoutMs: cfg.timeoutMs,
+        requestDeadlineMs: cfg.requestDeadlineMs,
         config: cfg.config,
     });
     // The transport bundle IS the node's network: verify + govern under policy
@@ -329,7 +328,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
-        timeoutMs: cfg.timeoutMs,
+        requestDeadlineMs: cfg.requestDeadlineMs,
         config: cfg.config,
     });
     shell = s;

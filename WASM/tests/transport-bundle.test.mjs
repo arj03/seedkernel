@@ -75,7 +75,7 @@ async function makeNode(channels, listen) {
       authors: [transportAuthor, upgradeAuthor],
       roles: { transport: [transportAuthor, upgradeAuthor] },
     })),
-    timeoutMs: 800,
+    requestDeadlineMs: 800,
   });
   await shell.loadBundleBlob(transportBlob);
   return shell;
