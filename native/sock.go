@@ -46,18 +46,17 @@ type netHost struct {
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]rawChannel{}}
 	o := qc.NewObject()
-	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 
 	// One socket kind: a raw byte duplex. Which codec runs over it — length-prefixed
 	// or RFC 6455 — is the transport bundle's, never Go's.
-	o.SetPropertyStr("connect", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("connect", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
 		}
 		addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
 		return t.Context().NewInt64(n.dial(addr)), nil
 	}))
-	o.SetPropertyStr("listen", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("listen", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
 		}
@@ -67,7 +66,7 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return t.Context().NewInt32(int32(bound)), nil
 	}))
-	o.SetPropertyStr("send", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("send", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return nil, nil
 		}
@@ -82,11 +81,11 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return nil, nil
 	}))
-	o.SetPropertyStr("closeListeners", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("closeListeners", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		n.closeListeners()
 		return nil, nil
 	}))
-	o.SetPropertyStr("close", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("close", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 1 {
 			return nil, nil
 		}

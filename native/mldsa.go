@@ -21,7 +21,6 @@ package main
 import (
 	_ "embed"
 	"fmt"
-	"sync"
 
 	"seedloader/qjs"
 
@@ -40,43 +39,8 @@ const (
 )
 
 type mldsa struct {
-	mem      api.Memory
-	verify   api.Function
-	heapBase uint32
-	// Bump pointer over the module's own heap, valid only while mu is held. The
-	// module never allocates and never retains anything across a call — the host
-	// writes arguments in, it runs to completion, the host reads a number back — so
-	// a rewind at the start of each call is the whole memory manager and there is no
-	// free list to corrupt.
-	top uint32
-
-	// One shared linear memory and a bump allocator over it, so an op must not
-	// interleave with another. Verification is driven from the realm (bundle loads)
-	// and, like the libsodium ops next door, is serialized by this lock. Held only
-	// for the duration of one call — never across a callback into JS or Go.
-	mu sync.Mutex
-}
-
-// reset rewinds the arena. Call once at the top of every op, under mu.
-func (m *mldsa) reset() { m.top = m.heapBase }
-
-func (m *mldsa) alloc(n int) uint32 {
-	p := (m.top + 15) &^ 15
-	m.top = p + uint32(n)
-	if need := int64(m.top) - int64(m.mem.Size()); need > 0 {
-		if _, ok := m.mem.Grow(uint32(need/0x10000) + 1); !ok {
-			panic("mldsa65: out of memory")
-		}
-	}
-	return p
-}
-
-func (m *mldsa) put(b []byte) uint32 {
-	p := m.alloc(len(b))
-	if !m.mem.Write(p, b) {
-		panic("mldsa65: memory write out of range")
-	}
-	return p
+	*wasmModule
+	verify api.Function
 }
 
 var md *mldsa // the process-wide ML-DSA-65 instance (manifest suite 0x02)
@@ -86,43 +50,15 @@ var md *mldsa // the process-wide ML-DSA-65 instance (manifest suite 0x02)
 // job, and a loader that cannot sign is a loader that cannot be turned into a
 // signing oracle (§12.4).
 func bootMlDsa(rt wazero.Runtime) *mldsa {
-	cm, err := rt.CompileModule(ctx, mldsaWasm)
-	if err != nil {
-		panic(fmt.Sprintf("mldsa65: compile: %v", err))
-	}
-	mod, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName("mldsa65").WithStartFunctions())
-	if err != nil {
-		panic(fmt.Sprintf("mldsa65: instantiate: %v", err))
-	}
-	m := &mldsa{mem: mod.Memory(), verify: mod.ExportedFunction("mldsa65_verify")}
-	if m.verify == nil {
+	m := newWasmModule(rt, "mldsa65", mldsaWasm, map[string]uint64{
+		"mldsa65_publickeybytes": mldsaPkBytes,
+		"mldsa65_signaturebytes": mldsaSigBytes,
+	})
+	verify := m.mod.ExportedFunction("mldsa65_verify")
+	if verify == nil {
 		panic("mldsa65: missing export mldsa65_verify")
 	}
-	// A module built for another parameter set would otherwise look like a working
-	// ML-DSA-65 verifier right up until a real bundle arrived, and then report it as
-	// a bad signature. Fail at boot instead.
-	for _, w := range []struct {
-		export string
-		want   uint64
-	}{
-		{"mldsa65_publickeybytes", mldsaPkBytes},
-		{"mldsa65_signaturebytes", mldsaSigBytes},
-	} {
-		f := mod.ExportedFunction(w.export)
-		if f == nil {
-			panic(fmt.Sprintf("mldsa65: missing export %q", w.export))
-		}
-		r, err := f.Call(ctx)
-		if err != nil || r[0] != w.want {
-			panic(fmt.Sprintf("mldsa65: %s reported %v, expected %d", w.export, r, w.want))
-		}
-	}
-	hb := mod.ExportedGlobal("__heap_base")
-	if hb == nil {
-		panic("mldsa65: missing __heap_base")
-	}
-	m.heapBase = uint32(hb.Get())
-	return m
+	return &mldsa{wasmModule: m, verify: verify}
 }
 
 // verifyDetached reports whether sig is a valid ML-DSA-65 signature over msg under
@@ -153,8 +89,7 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 // host verifies manifest suite 0x02; absent, it refuses those bundles rather than
 // falling back to the Ed25519 half alone.
 func exposeMlDsa(qc *qjs.Context, o *qjs.Value, m *mldsa) {
-	arg := func(t *qjs.This, i int) []byte { b, _ := qjs.JsTypedArrayToGo(t.Args()[i]); return b }
-	o.SetPropertyStr("ml_dsa65_verify_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(m.verifyDetached(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	o.SetPropertyStr("ml_dsa65_verify_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewBool(m.verifyDetached(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
 }

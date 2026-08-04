@@ -25,7 +25,6 @@ package main
 import (
 	_ "embed"
 	"fmt"
-	"sync"
 
 	"seedloader/qjs"
 
@@ -48,105 +47,41 @@ const (
 )
 
 type mlkem struct {
-	mem api.Memory
+	*wasmModule
 	keypair api.Function
-	encaps api.Function
-	decaps api.Function
-
-	heapBase uint32
-	// Bump pointer over the module's own heap, valid only while mu is held. The
-	// module never allocates and never retains anything across a call, so a rewind at
-	// the top of each op is the whole memory manager.
-	top uint32
-
-	// One shared linear memory and a bump allocator over it, so an op must not
-	// interleave with another. Held only for the duration of one call.
-	mu sync.Mutex
-}
-
-func (m *mlkem) reset() { m.top = m.heapBase }
-
-func (m *mlkem) alloc(n int) uint32 {
-	p := (m.top + 15) &^ 15
-	m.top = p + uint32(n)
-	if need := int64(m.top) - int64(m.mem.Size()); need > 0 {
-		if _, ok := m.mem.Grow(uint32(need/0x10000) + 1); !ok {
-			panic("mlkem768: out of memory")
-		}
-	}
-	return p
-}
-
-func (m *mlkem) put(b []byte) uint32 {
-	p := m.alloc(len(b))
-	if !m.mem.Write(p, b) {
-		panic("mlkem768: memory write out of range")
-	}
-	return p
-}
-
-func (m *mlkem) read(p uint32, n int) []byte {
-	b, ok := m.mem.Read(p, uint32(n))
-	if !ok {
-		panic("mlkem768: memory read out of range")
-	}
-	out := make([]byte, n)
-	copy(out, b)
-	return out
+	encaps  api.Function
+	decaps  api.Function
 }
 
 var mk *mlkem // the process-wide ML-KEM-768 instance
 
 // bootMlKem instantiates mlkem768.wasm and binds the three ops the catalog serves.
 func bootMlKem(rt wazero.Runtime) *mlkem {
-	cm, err := rt.CompileModule(ctx, mlkemWasm)
-	if err != nil {
-		panic(fmt.Sprintf("mlkem768: compile: %v", err))
+	m := newWasmModule(rt, "mlkem768", mlkemWasm, map[string]uint64{
+		"mlkem768_publickeybytes":  mlkemPkBytes,
+		"mlkem768_secretkeybytes":  mlkemSkBytes,
+		"mlkem768_ciphertextbytes": mlkemCtBytes,
+		"mlkem768_bytes":           mlkemSsBytes,
+	})
+	k := &mlkem{
+		wasmModule: m,
+		keypair:    m.mod.ExportedFunction("mlkem768_keypair"),
+		encaps:     m.mod.ExportedFunction("mlkem768_encaps"),
+		decaps:     m.mod.ExportedFunction("mlkem768_decaps"),
 	}
-	mod, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName("mlkem768").WithStartFunctions())
-	if err != nil {
-		panic(fmt.Sprintf("mlkem768: instantiate: %v", err))
-	}
-	m := &mlkem{
-		mem:     mod.Memory(),
-		keypair: mod.ExportedFunction("mlkem768_keypair"),
-		encaps:  mod.ExportedFunction("mlkem768_encaps"),
-		decaps:  mod.ExportedFunction("mlkem768_decaps"),
-	}
-	for name, f := range map[string]api.Function{
-		"mlkem768_keypair": m.keypair, "mlkem768_encaps": m.encaps, "mlkem768_decaps": m.decaps,
-	} {
-		if f == nil {
-			panic(fmt.Sprintf("mlkem768: missing export %q", name))
-		}
-	}
-	// A module built for another parameter set would otherwise look like a working
-	// ML-KEM-768 right up until two nodes tried to agree on a key and silently did
-	// not. Fail at boot instead.
-	for _, w := range []struct {
-		export string
-		want uint64
+	for _, op := range []struct {
+		name string
+		fn   api.Function
 	}{
-		{"mlkem768_publickeybytes", mlkemPkBytes},
-		{"mlkem768_secretkeybytes", mlkemSkBytes},
-		{"mlkem768_ciphertextbytes", mlkemCtBytes},
-		{"mlkem768_bytes", mlkemSsBytes},
+		{"mlkem768_keypair", k.keypair},
+		{"mlkem768_encaps", k.encaps},
+		{"mlkem768_decaps", k.decaps},
 	} {
-		f := mod.ExportedFunction(w.export)
-		if f == nil {
-			panic(fmt.Sprintf("mlkem768: missing export %q", w.export))
-		}
-		r, err := f.Call(ctx)
-		if err != nil || r[0] != w.want {
-			panic(fmt.Sprintf("mlkem768: %s reported %v, expected %d", w.export, r, w.want))
+		if op.fn == nil {
+			panic(fmt.Sprintf("mlkem768: missing export %q", op.name))
 		}
 	}
-	hb := mod.ExportedGlobal("__heap_base")
-	if hb == nil {
-		panic("mlkem768: missing __heap_base")
-	}
-	m.heapBase = uint32(hb.Get())
-	return m
+	return k
 }
 
 // keypairFromSeed is FIPS 203 KeyGen_Internal over caller-supplied coins (d ‖ z).
@@ -220,13 +155,12 @@ func (m *mlkem) decapsulate(sk, ct []byte) (ss []byte, ok bool) {
 // in the shape kem.ts gives the JS targets — the cap-bridge's catalog calls them by
 // those names, so the shared TS runs unchanged here.
 func exposeMlKem(qc *qjs.Context, o *qjs.Value, m *mlkem) {
-	arg := func(t *qjs.This, i int) []byte { b, _ := qjs.JsTypedArrayToGo(t.Args()[i]); return b }
-	o.SetPropertyStr("ml_kem768_keypair_from_seed", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		pk, sk := m.keypairFromSeed(arg(t, 0))
+	o.SetPropertyStr("ml_kem768_keypair_from_seed", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		pk, sk := m.keypairFromSeed(argBytes(t, 0))
 		return keypairObj(t.Context(), pk, sk), nil
 	}))
-	o.SetPropertyStr("ml_kem768_encaps", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		ct, ss, ok := m.encapsulate(arg(t, 0), arg(t, 1))
+	o.SetPropertyStr("ml_kem768_encaps", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		ct, ss, ok := m.encapsulate(argBytes(t, 0), argBytes(t, 1))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}
@@ -235,8 +169,8 @@ func exposeMlKem(qc *qjs.Context, o *qjs.Value, m *mlkem) {
 		obj.SetPropertyStr("sharedSecret", t.Context().NewArrayBuffer(ss))
 		return obj, nil
 	}))
-	o.SetPropertyStr("ml_kem768_decaps", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		ss, ok := m.decapsulate(arg(t, 0), arg(t, 1))
+	o.SetPropertyStr("ml_kem768_decaps", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		ss, ok := m.decapsulate(argBytes(t, 0), argBytes(t, 1))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}

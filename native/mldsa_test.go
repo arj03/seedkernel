@@ -53,10 +53,11 @@ func newMlDsaSigner(t *testing.T) *mldsaSigner {
 		t.Fatal("mldsa65 test signer: instantiate:", err)
 	}
 	s := &mldsaSigner{
-		sign: mod.ExportedFunction("mldsa65_sign"),
-		keys: mod.ExportedFunction("mldsa65_keypair"),
+		mldsa: mldsa{wasmModule: &wasmModule{mod: mod, mem: mod.Memory(), name: "mldsa65-test-signer"}},
+		sign:  mod.ExportedFunction("mldsa65_sign"),
+		keys:  mod.ExportedFunction("mldsa65_keypair"),
 	}
-	s.mem, s.verify = mod.Memory(), mod.ExportedFunction("mldsa65_verify")
+	s.verify = mod.ExportedFunction("mldsa65_verify")
 	hb := mod.ExportedGlobal("__heap_base")
 	if s.sign == nil || s.keys == nil || s.verify == nil || hb == nil {
 		t.Fatal("mldsa65 test signer: missing an export")

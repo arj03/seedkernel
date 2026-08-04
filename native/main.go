@@ -342,7 +342,6 @@ func shutdown() {
 // typechecked — in host/native-shim.ts.
 func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
-	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 
 	// ── the handler table (§3) ──
 	// One transactional install (§3.1). The argument is the loader's `{name, wasm}[]`,
@@ -350,7 +349,7 @@ func exposeBridge(qc *qjs.Context) {
 	// BundleHost interface are the same shape — plus the §4.1 scratch default, which
 	// the shim passes from the shared host (core/wasm-limits.ts) rather than Go owning
 	// a copy of the number the JS table enforces.
-	b.SetPropertyStr("bindAll", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("bindAll", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		mods := t.Args()[0]
 		lenv := mods.GetPropertyStr("length")
 		n := int(lenv.Int64())
@@ -376,7 +375,7 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewNull(), nil
 	}))
-	b.SetPropertyStr("callHandler", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("callHandler", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		pl, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return t.Context().NewNull(), nil
@@ -387,17 +386,17 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
-	b.SetPropertyStr("isBound", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("isBound", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(handlers[t.Args()[0].String()] != nil), nil
 	}))
-	b.SetPropertyStr("removePrefix", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("removePrefix", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewInt64(int64(removePrefix(t.Args()[0].String()))), nil
 	}))
 
 	// ── bundle-freshness persistence (§12.4) ──
 	// The arithmetic is shared JS, the durable write is ours: a truncated store reads
 	// back as "no marks", silently dropping every downgrade guard, so it must be atomic.
-	b.SetPropertyStr("readFreshness", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("readFreshness", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if freshnessStorePath == "" {
 			return t.Context().NewNull(), nil
 		}
@@ -407,13 +406,13 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewString(string(fb)), nil
 	}))
-	b.SetPropertyStr("writeFreshness", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("writeFreshness", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		if freshnessStorePath == "" {
 			return t.Context().NewNull(), nil // no store configured (tests) ⇒ in-memory only
 		}
 		// Logged, not fatal: the in-memory mark still guards the running process; only
 		// the next boot would be unprotected, which the operator must see.
-		if err := writeFileAtomic(freshnessStorePath, []byte(t.Args()[0].String())); err != nil {
+		if err := writeFileAtomic(freshnessStorePath, []byte(t.Args()[0].String()), ".freshness-", 0); err != nil {
 			fmt.Fprintf(os.Stderr, "seedkernel: could not persist freshness mark to %s: %v\n", freshnessStorePath, err)
 		}
 		return t.Context().NewNull(), nil
@@ -567,33 +566,9 @@ func revoke(authorHex string) string {
 
 // freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
 // (README §12.4). The marks and the monotonic rule live in JS (bundle.ts FreshnessMarks);
-// Go owns only the path and the atomic write. Empty ⇒ purely in-memory, so a fresh
-// process starts with −∞ for every key.
+// Go owns only the path and the atomic write (writeFileAtomic in fs.go). Empty ⇒ purely
+// in-memory, so a fresh process starts with −∞ for every key.
 var freshnessStorePath string
-
-// writeFileAtomic writes b to path via a sibling temp file + rename, so a reader (or a
-// crash) only ever sees the old or the complete new contents — never a truncated write.
-func writeFileAtomic(path string, b []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".freshness-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		os.Remove(name)
-		return err
-	}
-	return nil
-}
 
 // ───────────────────────── entry ─────────────────────────
 

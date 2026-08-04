@@ -438,11 +438,8 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 // exercised directly by sodium_test.go), so they are not published into the realm.
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
-	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
-	arg := func(t *qjs.This, i int) []byte { b, _ := qjs.JsTypedArrayToGo(t.Args()[i]); return b }
-	ab := func(t *qjs.This, b []byte) *qjs.Value { return t.Context().NewArrayBuffer(b) }
 
-	o.SetPropertyStr("crypto_generichash", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_generichash", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// libsodium-wrappers is crypto_generichash(hashLength, message, key?). The native
 		// blake2b shim computes only the UNKEYED hash, so a key arg would be SILENTLY
 		// dropped — a plain hash where libsodium computes a MAC. Reject it loudly instead.
@@ -451,46 +448,46 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 				return nil, fmt.Errorf("crypto_generichash: keyed hashing not supported by the native blake2b shim")
 			}
 		}
-		return ab(t, s.genericHash(int(t.Args()[0].Int32()), arg(t, 1))), nil
+		return bytesAB(t, s.genericHash(int(t.Args()[0].Int32()), argBytes(t, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_stream_xchacha20_xor", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.streamXor(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	o.SetPropertyStr("crypto_stream_xchacha20_xor", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return bytesAB(t, s.streamXor(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_detached", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.signDetached(arg(t, 0), arg(t, 1))), nil
+	o.SetPropertyStr("crypto_sign_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return bytesAB(t, s.signDetached(argBytes(t, 0), argBytes(t, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_verify_detached", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(s.verifyDetached(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	o.SetPropertyStr("crypto_sign_verify_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewBool(s.verifyDetached(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_scalarmult", fn(func(t *qjs.This) (*qjs.Value, error) {
-		q, ok := s.scalarmult(arg(t, 0), arg(t, 1))
+	o.SetPropertyStr("crypto_scalarmult", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		q, ok := s.scalarmult(argBytes(t, 0), argBytes(t, 1))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}
-		return ab(t, q), nil
+		return bytesAB(t, q), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.aeadEncrypt(arg(t, 0), arg(t, 1), arg(t, 2))), nil
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return bytesAB(t, s.aeadEncrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", fn(func(t *qjs.This) (*qjs.Value, error) {
-		pt, ok := s.aeadDecrypt(arg(t, 0), arg(t, 1), arg(t, 2))
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		pt, ok := s.aeadDecrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}
-		return ab(t, pt), nil
+		return bytesAB(t, pt), nil
 	}))
-	o.SetPropertyStr("crypto_sign_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_keypair", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		pk, skv := s.signKeypair()
 		return keypairObj(t.Context(), pk, skv), nil
 	}))
-	o.SetPropertyStr("crypto_sign_seed_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
-		pk, skv := s.signSeedKeypair(arg(t, 0))
+	o.SetPropertyStr("crypto_sign_seed_keypair", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		pk, skv := s.signSeedKeypair(argBytes(t, 0))
 		return keypairObj(t.Context(), pk, skv), nil
 	}))
-	o.SetPropertyStr("randombytes_buf", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("randombytes_buf", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		b := make([]byte, t.Args()[0].Int32())
 		crand.Read(b)
-		return ab(t, b), nil
+		return bytesAB(t, b), nil
 	}))
 	// The PQ half of the manifest suite lives in its own module (mldsa.go) but on the
 	// same object: the shared loader's crypto surface is one `sodium`, and it
@@ -508,4 +505,3 @@ func keypairObj(qc *qjs.Context, pk, sk []byte) *qjs.Value {
 	o.SetPropertyStr("privateKey", qc.NewArrayBuffer(sk))
 	return o
 }
-

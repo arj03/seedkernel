@@ -110,26 +110,13 @@ func (f *nodeFs) put(key string, b []byte) error {
 	if fi, err := os.Stat(p); err == nil {
 		old = fi.Size()
 	}
-	// Write atomically: land the bytes in a temp file, then rename onto the key. os.WriteFile
-	// truncates the key in place, so a crash mid-write would leave a short/corrupt block that
-	// size() ≥ 0 still reports as held — the node advertises it, then fails the verification-fetch.
-	// Rename swaps the whole file in one step (atomic within a dir on POSIX; MoveFileEx with
-	// REPLACE_EXISTING on Windows), so a reader only ever sees the old or the complete new
-	// block. A crash can at worst orphan the temp file, which scanUsed reclaims at open. We
-	// skip fsync: the property needed is crash-atomicity of the visible block, not power-loss
-	// durability (a lost block is content-addressed and simply re-fetched), and an fsync per
-	// put would tax the storage hot path.
-	tmp, err := os.CreateTemp(f.dir, fsTmpPrefix+"*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	if err := writeTemp(tmp, b); err != nil {
-		os.Remove(name)
-		return err
-	}
-	if err := os.Rename(name, p); err != nil {
-		os.Remove(name)
+	// Write atomically (writeFileAtomic): a crash mid-write must not leave a short or
+	// corrupt block that size() ≥ 0 still reports as held — the node advertises it, then
+	// fails the verification-fetch. A crash can at worst orphan the temp, which scanUsed
+	// reclaims at open. No fsync: the property needed is crash-atomicity of the visible
+	// block, not power-loss durability (a lost block is content-addressed and simply
+	// re-fetched), and an fsync per put would tax the storage hot path.
+	if err := writeFileAtomic(p, b, fsTmpPrefix, 0o644); err != nil {
 		return err
 	}
 	if old >= 0 {
@@ -140,19 +127,41 @@ func (f *nodeFs) put(key string, b []byte) error {
 	return nil
 }
 
-// writeTemp fills the freshly-created temp file, restores the 0o644 mode os.WriteFile
-// used before (CreateTemp opens 0o600), and closes it. Every error path closes the
-// handle first so the caller can remove the temp without leaking a descriptor.
-func writeTemp(tmp *os.File, b []byte) error {
+// writeFileAtomic writes b to path via a sibling temp file + rename, so a reader
+// (or a crash) only ever sees the old or the complete new contents — never a
+// truncated write. tmpPrefix names the temp file; the store passes fsTmpPrefix,
+// whose '~' the shared key charset forbids, so a temp can never collide with a
+// real key and list()/scanUsed() can skip it. mode 0 keeps CreateTemp's 0600 (the
+// freshness store); otherwise the temp is chmod'd before the rename. Every error
+// path closes the handle first, so the caller can remove the temp without leaking
+// a descriptor.
+func writeFileAtomic(path string, b []byte, tmpPrefix string, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPrefix+"*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
+		os.Remove(name)
 		return err
 	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
+	if mode != 0 {
+		if err := tmp.Chmod(mode); err != nil {
+			tmp.Close()
+			os.Remove(name)
+			return err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
 		return err
 	}
-	return tmp.Close()
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return nil
 }
 
 func (f *nodeFs) size(key string) int {
@@ -220,36 +229,34 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		return err
 	}
 	o := qc.NewObject()
-	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
-	str := func(t *qjs.This, i int) string { return t.Args()[i].String() }
 
-	o.SetPropertyStr("get", fn(func(t *qjs.This) (*qjs.Value, error) {
-		b := fs.get(str(t, 0))
+	o.SetPropertyStr("get", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		b := fs.get(argString(t, 0))
 		if b == nil {
 			return t.Context().NewNull(), nil
 		}
 		return t.Context().NewArrayBuffer(b), nil
 	}))
-	o.SetPropertyStr("put", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("put", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		b, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return nil, err // non-bytes arg throws, like NodeFs — not a silent empty write
 		}
-		if err := fs.put(str(t, 0), b); err != nil {
+		if err := fs.put(argString(t, 0), b); err != nil {
 			return nil, err // surfaces as a JS exception, like NodeFs writeFileSync
 		}
 		return t.Context().NewUndefined(), nil
 	}))
-	o.SetPropertyStr("size", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("size", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// NewInt64, not NewInt32: fs.size returns a 64-bit length, and a ≥2 GiB file
 		// would wrap to a negative int32 and read back as "missing" (-1). (-1 itself,
 		// the genuine miss, is unaffected.)
-		return t.Context().NewInt64(int64(fs.size(str(t, 0)))), nil
+		return t.Context().NewInt64(int64(fs.size(argString(t, 0)))), nil
 	}))
-	o.SetPropertyStr("list", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("list", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		prefix := ""
 		if len(t.Args()) > 0 && !t.Args()[0].IsUndefined() && !t.Args()[0].IsNull() {
-			prefix = str(t, 0)
+			prefix = argString(t, 0)
 		}
 		// One \n-joined string, split back into an array by the shim: building a JS
 		// array here costs an engine call (plus a C string) per key, so a content store
@@ -258,10 +265,10 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		// unambiguous.
 		return t.Context().NewString(strings.Join(fs.list(prefix), "\n")), nil
 	}))
-	o.SetPropertyStr("delete", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(fs.delete(str(t, 0))), nil
+	o.SetPropertyStr("delete", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewBool(fs.delete(argString(t, 0))), nil
 	}))
-	o.SetPropertyStr("stat", fn(func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("stat", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		s := t.Context().NewObject()
 		s.SetPropertyStr("used", t.Context().NewInt64(fs.stat()))
 		s.SetPropertyStr("available", t.Context().NewInt64(-1)) // unknown — the shim maps it to FS_AVAILABLE_UNKNOWN

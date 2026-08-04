@@ -88,9 +88,7 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 // This is the whole of Go's involvement with a guest — no cap-bridge, no preamble
 // assembly, no bundle facts, no dispatch.
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
-	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
-
-	b.SetPropertyStr("createRealm", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("createRealm", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		mem := uint64(t.Args()[2].Int64())
 		if mem == 0 {
 			// The shim always resolves the shared default (core/wasm-limits.ts) before
@@ -113,7 +111,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		realms[realmSeq] = g
 		return t.Context().NewInt64(realmSeq), nil
 	}))
-	b.SetPropertyStr("realmCall", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmCall", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]
 		if g == nil {
 			return nil, fmt.Errorf("realmCall: no such realm")
@@ -125,7 +123,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		g.call(t.Args()[1].String(), payload, t.Args()[3], t.Args()[4])
 		return nil, nil
 	}))
-	b.SetPropertyStr("realmSettle", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmSettle", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a realm that has since been disposed is a no-op: the
 		// Transport promise behind it outlives an uninstall, and there is nothing
 		// left to resume.
@@ -146,7 +144,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		g.settleNet(callID, bytes, "")
 		return nil, nil
 	}))
-	b.SetPropertyStr("realmDispose", fn(func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmDispose", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
 		if g := realms[id]; g != nil {
 			delete(realms, id)
@@ -390,34 +388,39 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 	return v, err
 }
 
-// markDead ends the realm's life and settles every call it still owes.
-//
-// The settling is the point. A realm dies with continuations outstanding — the kill
-// typically lands inside settleNet, after the initiator's promise reached the shell but
-// before anything resolved it — and a dead realm cannot reject them itself. Without this
-// the shell's promise never settles and the caller hangs forever, which is strictly worse
-// than an error: it cannot retry, time out, or even observe that anything went wrong.
-// safe-js has no equivalent path because its interrupt throws inside the guest and the
-// guest's own promise rejects; on this target the host has to do it.
-//
-// Callbacks are HOST-realm values, so reporting works even though the guest runtime is
-// gone. Returns err so callers can `return nil, g.markDead(...)`.
+// markDead ends the realm's life and settles every call it still owes (settleAll).
+// Returns err so callers can `return nil, g.markDead(...)`.
 func (g *guestRealm) markDead(err error) error {
 	g.dead = true
+	g.settleAll(err.Error())
+	return err
+}
+
+// settleAll rejects every in-flight initiator call with msg, releasing the
+// callbacks. The settling is the point: a realm dying with continuations
+// outstanding — the budget kill typically lands inside settleNet, after the
+// initiator's promise reached the shell but before anything resolved it — must
+// not leave its callers hanging forever, which is strictly worse than an error:
+// they cannot retry, time out, or even observe that anything went wrong. safe-js
+// has no equivalent path because its interrupt throws inside the guest and the
+// guest's own promise rejects; on this target the host has to do it.
+//
+// Callbacks are HOST-realm values, so reporting works even though the guest
+// runtime may be gone. Rejecting those promises only queues a microtask on the
+// host realm; if this ran inside a pump that has already drained, nothing would
+// deliver it and the caller would wait out its whole timeout — so the loop is
+// woken (eventLoop.wake).
+func (g *guestRealm) settleAll(msg string) {
 	settled := false
 	for id, c := range g.calls {
 		delete(g.calls, id)
-		g.reportCall(c.onFail, g.hostQc.NewString(err.Error()))
+		g.reportCall(c.onFail, g.hostQc.NewString(msg))
 		c.free()
 		settled = true
 	}
-	// Rejecting those promises only queues a microtask on the host realm. If this ran
-	// inside a pump that has already drained, nothing would deliver it and the caller
-	// would wait out its whole timeout — a hang instead of the error we just produced.
 	if settled {
 		g.loop.wake()
 	}
-	return err
 }
 
 // pump drains this realm's job queue under its execution budget.
@@ -533,27 +536,16 @@ func (c *initiatorCall) free() {
 
 // close disposes the realm: detach from the loop, release the host-realm references it
 // holds (those outlive the guest runtime, so rt.Close alone would leak them), and tear
-// the runtime down. Any call still in flight is abandoned — its Promise never settles,
-// which is the truthful outcome for a realm that no longer exists.
+// the runtime down. Settling before freeing, not instead of it: an initiator's promise
+// can only be resolved from inside this realm, so tearing it down with calls outstanding
+// leaves every parked caller waiting on something that can no longer happen — the same
+// hang markDead exists to prevent, and the one safe-js's dispose() fixes on that target.
 func (g *guestRealm) close() {
 	if g.rt == nil {
 		return
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
-	// Settle before freeing, not instead of it. An initiator's promise can only be
-	// resolved from inside this realm, so tearing it down with calls outstanding leaves
-	// every parked caller waiting on something that can no longer happen — the same hang
-	// markDead exists to prevent, and the one safe-js's dispose() fixes on that target.
-	settled := false
-	for id, c := range g.calls {
-		delete(g.calls, id)
-		g.reportCall(c.onFail, g.hostQc.NewString("guest realm closed"))
-		c.free()
-		settled = true
-	}
-	if settled {
-		g.loop.wake() // rejecting only queues a microtask; see eventLoop.wake
-	}
+	g.settleAll("guest realm closed")
 	g.capCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil

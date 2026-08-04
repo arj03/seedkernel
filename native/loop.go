@@ -310,6 +310,26 @@ func (el *eventLoop) run() {
 	}
 }
 
+// armSafety arms a gen-guarded safety timer for the current run: after timeout,
+// onFire runs on the loop goroutine, but only if no newer run has since bumped
+// runGen — a late fire (Stop can't unschedule an already-fired AfterFunc, so its
+// closure may sit queued in el.tasks) is ignored once a newer run has bumped
+// runGen, instead of aborting that run — and only if the run has not already
+// completed (el.stopped), so a timeout can't clobber a result a late settle just
+// delivered. The returned stop func is what the caller defers.
+func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func() bool) {
+	el.runGen++
+	gen := el.runGen
+	safety := time.AfterFunc(timeout, func() {
+		el.post(func() {
+			if el.runGen == gen && !el.stopped {
+				onFire()
+			}
+		})
+	})
+	return safety.Stop
+}
+
 // runUntilSignal evaluates kick (which starts some event-driven JS activity) and
 // then drives the loop until the JS calls __signal() or the safety timeout fires.
 // Used to drive event-driven flows (a PeerLink handshake, the serve loop) that
@@ -320,19 +340,7 @@ func (el *eventLoop) runUntilSignal(kick string, timeout time.Duration) error {
 		return err
 	}
 	if !el.stopped && timeout > 0 {
-		el.runGen++
-		gen := el.runGen
-		// Tag the stop with this run's gen: a late fire (Stop can't unschedule an
-		// already-fired AfterFunc, so its closure may sit queued in el.tasks) is ignored
-		// once a newer run has bumped runGen, instead of aborting that run.
-		safety := time.AfterFunc(timeout, func() {
-			el.post(func() {
-				if el.runGen == gen {
-					el.stopped = true
-				}
-			})
-		})
-		defer safety.Stop()
+		defer el.armSafety(timeout, func() { el.stopped = true })()
 	}
 	el.run()
 	return nil
@@ -409,18 +417,9 @@ func (el *eventLoop) awaitIn(c *qjs.Context, callExpr string, timeout time.Durat
 		return
 	}
 	if !el.stopped && timeout > 0 {
-		el.runGen++
-		gen := el.runGen
-		// gen-guarded so a late fire (Stop can't unschedule an already-fired AfterFunc)
-		// can't flag a timeout on a later await that reused this loop — see runUntilSignal.
-		safety := time.AfterFunc(timeout, func() {
-			el.post(func() {
-				if el.runGen == gen && !el.stopped {
-					kind, msg, el.stopped = 2, "await: timed out", true
-				}
-			})
-		})
-		defer safety.Stop()
+		defer el.armSafety(timeout, func() {
+			kind, msg, el.stopped = 2, "await: timed out", true
+		})()
 	}
 	el.run()
 	return

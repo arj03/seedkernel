@@ -180,7 +180,7 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,518 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (341), the Go binding, which is TypeScript and rides in the shared bundle | 2,431 Go + 341 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (341), the Go binding, which is TypeScript and rides in the shared bundle | 2,381 Go + 341 TS |
 
 **Signed content — not host code at all**
 
