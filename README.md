@@ -164,7 +164,7 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 440 |
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 471 |
 | Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 409 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 215 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 247 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 

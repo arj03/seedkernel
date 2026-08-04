@@ -584,6 +584,11 @@ seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --bundle ./app-bundle [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
 ```
 
+The `--key` file holds the node's 32-byte master seed (§12.6.2b) — the same file format
+and derivation as the JS shell's `--key`: Go reads it (or mints one from `crypto/rand`)
+and `bootNode` in the shared seam derives the `channel` and `guest` subkeys from it, so
+both targets hold one secret on disk and no key signs for two purposes.
+
 Because the wire and the bundles are shared, a Go node and a Node/Bun node interoperate directly in one cohort — `put` on either, `get` on the other, in both directions, against the same signed bundle and genesis (verified end-to-end for seed store by `WASM/scripts/loader-interop.sh`).
 
 **Scope: the native target is a bundle-runner.** Its app path is the §12.4 bundle — load, verify, install the modules, run the guest — and its request path is transport → shared route bundle → cap-bridge → the installed handlers, each reached by name through `callHandler`. Both targets install code only from a signed bundle (§12.4), so the app-delivery surface is identical. There is no dispatch loop and no signature pipeline to keep in parity: the kernel is a name→id table (§3) and handlers are pure transforms (§4), so Go's only handler-facing duties are staging input into a handler's `scratch`, reading its output, and honoring a declared `scratchSize` (§4.1) — byte-identical to the JS host. The loader's admission and policy (§12.4–§12.5), bundle freshness (§12.4), and the domain prefixes (§16.1) are the same shared TS both targets run in QuickJS; the manifest and channel signatures the loader checks read their `DOMAIN_*` prefixes from that one evaluated `domains.ts`, so every signed preimage is byte-identical across the cohort by construction, not by a hand-copied constant.

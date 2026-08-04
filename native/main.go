@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -855,15 +856,17 @@ func parseHostPort(s string) (*hostPort, error) {
 	return &hostPort{Host: host, Port: port}, nil
 }
 
-// loadOrMintKey returns the node's 64-byte ed25519 secret key as hex: read from
-// keyPath if present, else minted via the shared realm (`mintNodeKey`,
-// host/native-shim.ts — byte-identical to a browser/Bun node's keypair) and
-// persisted. The public key is its 32-byte tail.
+// loadOrMintKey returns the node's 32-byte master seed as hex: read from keyPath if
+// present, else minted from crypto/rand — the same entropy source that backs the
+// realm's randombytes_buf (sodium.go) — and persisted 0600. The seed is the whole
+// secret a node stores: every purpose-bound keypair (channel, guest) is derived from
+// it inside the shared realm at boot (deriveNodeKeys, core/subkeys.ts — the same
+// derivation the JS CLI runs), so Go never holds a derived key or a second format.
 func loadOrMintKey(keyPath string) (string, error) {
 	if b, err := os.ReadFile(keyPath); err == nil {
 		skHex := strings.TrimSpace(string(b))
-		if len(skHex) != 128 {
-			return "", fmt.Errorf("--key must hold a 64-byte secret key (hex), got %d chars", len(skHex))
+		if len(skHex) != 64 {
+			return "", fmt.Errorf("--key must hold a 32-byte master seed (hex), got %d chars", len(skHex))
 		}
 		// Validate here: the JS fromHex maps non-hex pairs to 0, so a corrupt key
 		// file would silently boot the node under a different identity.
@@ -872,13 +875,11 @@ func loadOrMintKey(keyPath string) (string, error) {
 		}
 		return skHex, nil
 	}
-	// The mint used to be a JS string spliced into qc.Eval here; it is ordinary
-	// shaping code over the shared toHex, so it lives in native-shim.ts.
-	out, err := callRealm("mintNodeKey", 30*time.Second)
-	if err != nil {
+	seed := make([]byte, 32)
+	if _, err := crand.Read(seed); err != nil {
 		return "", err
 	}
-	skHex := string(out)
+	skHex := hex.EncodeToString(seed)
 	if err := os.WriteFile(keyPath, []byte(skHex), 0o600); err != nil {
 		return "", err
 	}

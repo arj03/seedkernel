@@ -26,6 +26,7 @@ import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
+import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { parsePeerSpec } from "./transport-host.js";
@@ -433,6 +434,9 @@ function theShell() {
  *  positional signature drifting against a Go harness string is a silent break. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
+    /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`. Defaults to
+     *  `identity` so a test or embedding host that supplies one keypair still works. */
+    guestIdentity?: Keypair;
     contactSecret?: Uint8Array;
     listen?: {
         host: string;
@@ -450,7 +454,7 @@ async function makeTransportNode(cfg: {
 }> {
     const s = createShell({
         platform: {
-            sodium, identity: cfg.identity, kernel, fs,
+            sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, kernel, fs,
             freshnessStore: new NativeFreshnessStore(),
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
             contactSecret: cfg.contactSecret, createRealm,
@@ -485,11 +489,16 @@ async function makeTransportNode(cfg: {
  *  Go can print the real ports. */
 async function bootNode(cfgJson: string): Promise<Uint8Array> {
     const cfg = JSON.parse(cfgJson);
-    const sk = fromHex(cfg.keyHex);
-    const identity = { privateKey: sk, publicKey: sk.slice(32) };
+    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Every
+    // purpose-bound keypair is derived from it HERE, in the shared subkey code — the
+    // exact derivation the JS CLI runs (host/main.ts loadNodeKeys) — so this target's
+    // channel and guest roles hold different keys too, instead of one raw keypair
+    // signing for both. Go holds the seed and nothing derived from it.
+    const keys = deriveNodeKeys(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
     const { shell: s, net: network } = await makeTransportNode({
-        identity,
+        identity: keys.channel,
+        guestIdentity: keys.guest,
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
@@ -508,7 +517,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
             await network.ready();
     }
     const status = {
-        peerId: toHex(identity.publicKey), port: network.port, wsPort: network.wsPort,
+        peerId: toHex(keys.channel.publicKey), port: network.port, wsPort: network.wsPort,
     };
     return utf8.encode(JSON.stringify(status));
 }
@@ -557,15 +566,6 @@ function revoke(authorHex: string): Uint8Array {
     return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
 }
 
-/** Mint a fresh node identity: a libsodium-form 64-byte ed25519 secret key, hex —
- *  the `--key` file format (native/main.go loadOrMintKey). The mint used to be a JS
- *  string spliced into `qc.Eval` in Go; it is ordinary shaping code over the shared
- *  `toHex` and this target's sodium wrapper, so it lives here where TypeScript
- *  checks it. Returns bytes because that is all the realm bridge marshals. */
-function mintNodeKey(): Uint8Array {
-    return utf8.encode(toHex(sodium.crypto_sign_keypair().privateKey));
-}
-
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): a microtask
  *  queue over the shared loop and one pre-compiled `__start` wrapper, so an initiator
  *  call costs an Invoke rather than a parse. Not the guest ABI (that is
@@ -592,4 +592,4 @@ globalThis.__start = function (id, entry, arg) {
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, mintNodeKey, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

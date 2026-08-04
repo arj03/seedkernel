@@ -8,7 +8,6 @@ package main
 // have (README §12.9).
 
 import (
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -91,15 +90,16 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 // invisible. One value here means one deployment.
 const testContactSecretHex = "0303030303030303030303030303030303030303030303030303030303030303"
 
-// testKeyHex mints a node identity. Go's ed25519 private key is seed‖public, which is
-// byte-for-byte what libsodium calls a secret key — the same 128 hex chars --key holds.
+// testKeyHex mints a node identity master seed: 32 bytes of entropy, hex — the same
+// 64 hex chars --key holds. bootNode derives the channel and guest subkeys from it
+// inside the shared realm (deriveNodeKeys, core/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
+	seed := make([]byte, 32)
+	if _, err := rand.Read(seed); err != nil {
 		tb.Fatal(err)
 	}
-	return hex.EncodeToString(priv)
+	return hex.EncodeToString(seed)
 }
 
 // applyPolicy narrows (or widens) the running node's admission predicate — the
