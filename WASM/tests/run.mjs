@@ -10,6 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 import { makeTransportHost } from "./transport-harness.mjs";
+import { testkit } from "./testkit.mjs";
 
 const {
   createKernelHost,
@@ -37,7 +38,6 @@ const { CAP, createCapBridge, opsForCaps, guestSignScope, appSignScope, transpor
   = await imp("build/host/cap-bridge.js");
 // ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
 // itself is the bundle's now, so what is reachable from here is the module.
-const { wsAcceptKey, encodeFrame, decodeOne, WS_OP } = await import("./ws-module.mjs");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
@@ -71,14 +71,10 @@ async function loadBundle(host, blob, admit) {
 // The empty payload — a handler whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
 
-let passed = 0;
-let failed = 0;
-
-function assert(condition, msg) {
-  if (!condition) { console.error(`  FAIL: ${msg}`); failed++; }
-  else passed++;
-}
-function assertEqual(actual, expected, msg) {
+const { ok, summary } = testkit({ verbose: false });
+// Report-style: a failed check is logged and counted, and the suite keeps going.
+const assert = ok;
+const assertEqual = (actual, expected, msg) => {
   const norm = (v) => {
     if (v === null || v === undefined) return String(v);
     if (typeof v === "object") return JSON.stringify([...v]);
@@ -87,7 +83,7 @@ function assertEqual(actual, expected, msg) {
   const a = norm(actual);
   const e = norm(expected);
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
-}
+};
 
 // Standard bootstrap (README §3): a fresh handler table. The host holds no policy — it
 // is the §3 map and nothing else. Handlers are pure transforms with no
@@ -624,29 +620,7 @@ async function testCapBridge() {
   console.log("  OK\n");
 }
 
-// ─── Test: WebSocket framing primitives (RFC 6455) ──────────────────────
-
-async function testWsFraming() {
-  console.log("Test: WebSocket framing primitives (RFC 6455) — the no-cap ws module");
-
-  // RFC 6455 §1.3 worked example — exercises the WASM SHA-1 + base64 end-to-end
-  // (the only SHA-1/base64 in the runtime; the former JS copy is deleted).
-  assertEqual(wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "WS accept known vector");
-
-  // Encode a masked client frame and decode it back as the server would. Reassembly
-  // across chunk boundaries is the framer's job, not the module's — it lives in the
-  // transport bundle now and is covered over real sockets by transport-tcp.test.mjs.
-  const payload = new Uint8Array(300);
-  for (let i = 0; i < payload.length; i++) payload[i] = (i * 31 + 28) & 255;
-  const mask = new Uint8Array([0x12, 0x34, 0x56, 0x78]);
-  const got = decodeOne(encodeFrame(WS_OP.BINARY, payload, mask), true);
-  assert(got !== null, "a well-formed masked frame decodes");
-  assert(bytesEqual(got.payload, payload), "unmasked payload matches after demasking");
-
-  console.log("  OK\n");
-}
-
-// ─── Test: channel identity pinning (transport §12.6) ─────────────────────
+// ──── Test: channel identity pinning (transport §12.6) ────
 
 async function testPolicy() {
   console.log("Test: shell install policy — closed author set gates bundle loads");
@@ -1989,7 +1963,6 @@ await testShellBoot();
 await testBundle();
 await testGuestlessBundleAndArchive();
 await testBundleCorruptNewerRollback();
-await testWsFraming();
 await testSafeJs();
 await testRealmSerialization();
 await testCapBridgeEnforcement();
@@ -2003,5 +1976,4 @@ await testSafeRealmConcurrency();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();
 
-console.log(`\nResults: ${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+summary("Results");

@@ -11,15 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const browserDir = resolve(here, "../browser");
 
 const mime = { ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm" };
-const srv = createServer(async (req, res) => {
-  const path = req.url === "/" ? "/index.html" : req.url.split("?")[0];
-  try {
-    const buf = await readFile(resolve(browserDir, "." + path));
-    const ext = path.slice(path.lastIndexOf("."));
-    res.setHeader("Content-Type", mime[ext] ?? "application/octet-stream");
-    res.end(buf);
-  } catch { res.statusCode = 404; res.end(); }
-});
+const srv = createServer(() => { /* handlers are installed below, after the overrides are known */ });
 await new Promise(r => srv.listen(0, "127.0.0.1", r));
 const port = srv.address().port;
 const base = `http://127.0.0.1:${port}/`;
@@ -42,7 +34,6 @@ const overrides = new Map([
   ["/wrap.mjs", { body: wrapperRewritten, type: "text/javascript" }],
   ["/libsodium-core.mjs", { body: coreSrc, type: "text/javascript" }],
 ]);
-srv.removeAllListeners("request");
 srv.on("request", async (req, res) => {
   const path = req.url.split("?")[0];
   if (overrides.has(path)) {

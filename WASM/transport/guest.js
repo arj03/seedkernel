@@ -135,7 +135,6 @@ function utf8Decode(b) {
 const OP_SIGN = 2;
 const OP_RANDOM = 4;
 const OP_MODULE_CALL = 13;
-const OP_CLOCK = 14;
 
 // The raw net capability: bytes over an opaque link id, opened and closed. This is
 // the whole of what the platform contributes — there is no peer here, no framing and
@@ -338,10 +337,6 @@ function channelSign(root, th, id) {
   out.set(root, 0); out.set(th, 32); out.set(id, 64);
   return { ok: true, sig: host.call(OP_SIGN, out) };
 }
-function clockNow() {
-  const r = host.call(OP_CLOCK, new Uint8Array(0));
-  return readU32BE(r, 0) * 0x100000000 + readU32BE(r, 4);
-}
 
 // ── calling out: the ops, each one argument-encoded and issued immediately ────
 //
@@ -420,10 +415,6 @@ function clearTimer(id) {
 function fireTimer(id) {
   const fn = timers.get(id);
   if (fn) { timers.delete(id); fn(); }
-}
-function clearAllTimers() {
-  for (const id of [...timers.keys()]) host.call(OP_TIMER_CLEAR, args([id], []));
-  timers.clear();
 }
 
 // ── the link (PeerLink port, ex net-link.ts) ─────────────────────────────────
@@ -865,8 +856,6 @@ class Link {
     return "truncated";
   }
 
-  wasTruncated() { return this.closeReason === "truncated"; }
-
   // ── handshake ───────────────────────────────────────────────────────────────
 
   tag(type, payload) {
@@ -1215,8 +1204,6 @@ class HalfOpenLimiter {
     if (n === undefined) return;
     if (n <= 1) this.perSource.delete(slot.source); else this.perSource.set(slot.source, n - 1);
   }
-
-  get outstanding() { return this.unverifiedCount + this.verifiedCount; }
 }
 
 // ── the router (ex link-router.ts) ────────────────────────────────────────────
@@ -1228,12 +1215,10 @@ class Router {
     this.links = new Map();      // peerId → Link[] (authenticated, routable)
     this.rr = new Map();         // peerId → round-robin cursor
     this.sink = null;            // the request/response layer's frame intake
-    this.framesDelivered = 0;
     this.onPeerUp = () => {};
     this.onPeerDown = () => {};
   }
 
-  linkedPeers() { return [...this.links.keys()]; }
   linkCount(peerId) { const a = this.links.get(peerId); return a ? a.length : 0; }
   /** This peer's routable links, for the stall clock's backlog read. Empty for a peer
    *  still dialing — whose frames sit in the pre-auth pool instead (Core.sendFrame),
@@ -1287,7 +1272,6 @@ class Router {
 
   deliver(peerId, frame) {
     if (!this.sink || peerId === this.ownId) return;
-    this.framesDelivered++;
     this.sink(peerId, frame);
   }
 
@@ -1485,7 +1469,6 @@ class Core {
     this.connecting = new Map(); // peerId → Link[] (outbound, pre-auth)
     this.inbound = new Set();    // accepted, pre-auth
     this.addrs = new Map();      // peerId → 32B contact secret (or null = open)
-    this.framesSent = 0;
     this.readyWaiter = null;     // {check, timer}
     this.halfOpen = new HalfOpenLimiter(maxUnverified, maxPerSource, maxVerified);
   }
@@ -1569,7 +1552,6 @@ class Core {
 
   sendFrame(to, frame) {
     if (to === ownId) return;
-    this.framesSent++;
     if (router.send(to, frame)) return;
     let pool = this.connecting.get(to);
     // Dialing lands the link synchronously now, so the frame goes straight into its

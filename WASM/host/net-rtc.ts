@@ -26,8 +26,8 @@
 // the stack" move net-node.ts documents for the engine build. The browser globals
 // are referenced only inside RtcNetwork / relaySignaling, never at module scope,
 // so importing this module under Node (e.g. to unit-test RtcChannel) is safe.
-import { BufferedChannel } from "./net-channel.js";
-import { type Endpoint, type PeerId } from "../core/net.js";
+import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
+import { type PeerId } from "../core/net.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it. */
@@ -92,68 +92,39 @@ export interface RtcNetworkOptions {
 
 // ── RawLink over one RTCDataChannel ────────────────────────────────────────
 // An RTCDataChannel is already an ordered, whole-message binary pipe (WebRTC does
-// framing + ordering), so this is a thin adapter over BufferedChannel (net-channel.ts) —
+// framing + ordering), so this is a thin adapter over MessageChannel (net-channel.ts) —
 // with the same pre-open send buffer the transport needs because it emits its HELLO
 // the instant a link is constructed.
-export class RtcChannel extends BufferedChannel {
-    dc;
-    constructor(dc: RTCDataChannel) {
-        super();
-        this.dc = dc;
-        dc.binaryType = "arraybuffer";
-        dc.addEventListener("message", (ev) => {
-            // String frames are not ours (a host may multiplex renegotiation signaling over
-            // the same channel — see chat-shell.js); only binary frames are transport messages.
-            if (typeof ev.data !== "string")
-                this.deliver(new Uint8Array(ev.data));
-        });
-        dc.addEventListener("open", () => this.open());
-        dc.addEventListener("close", () => this.fail());
-        dc.addEventListener("error", () => this.fail());
-    }
-    write(bytes: Uint8Array): void { this.dc.send(bytes as unknown as ArrayBuffer); }
-    /** The data channel's own send backlog. */
-    protected backlog(): number { return this.dc.bufferedAmount ?? 0; }
-    // RTCDataChannel.close() drains bufferedAmount before the channel goes away, so a
-    // graceful stop needs nothing extra here.
-    stop(_graceful: boolean): void { this.dc.close(); }
+export class RtcChannel extends MessageChannel {
+  constructor(dc: RTCDataChannel) { super(dc); }
 }
 // Cap on speculative (unauthenticated) peer entries the relay can force us to
 // allocate by spamming `hello`s with arbitrary `from` values. Authenticated peers
 // do not count, so genuine fleet size is unconstrained (mirrors chat-shell.js's
 // MAX_UNAUTHED_PEERS). 256 is comfortable headroom for a churn storm.
 const MAX_UNAUTHED_PEERS = 256;
-export class RtcNetwork {
+export class RtcNetwork extends SingleIdentityNetwork {
     opts;
-    driver;
-    ownId;
     readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-auth)
+    private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
     // Local media tracks to publish to every peer (now and as new ones connect).
     // Empty unless the app started a call via addLocalTrack().
     private readonly localTracks: { track: MediaStreamTrack; stream: MediaStream }[] = [];
     constructor(opts: RtcNetworkOptions) {
+        super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
         this.opts = opts;
-        this.driver = opts.driver;
-        this.ownId = opts.driver.peerId;
+        // The peer-connection factory is fixed per network; defaulting to the platform
+        // global here (not per ensurePeer) keeps a browser tab's RTCPeerConnection the
+        // default and a werift-backed one the Node/Bun path.
+        this.makePc = opts.peerConnectionFactory ?? ((cfg) => new RTCPeerConnection(cfg));
         // Cohort edges come from the driver's router (the transport bundle's).
-        this.driver.setPeerHooks({ onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
         opts.signaling.onMessage((m) => this.onSignal(m));
     }
-    /** Frames delivered to the app side — the driver's diagnostic mirror. */
-    get framesDelivered(): number { return this.driver.framesDelivered; }
     // ── Network interface ────────────────────────────────────────────────────────
-    /** A single-identity fabric: it vends exactly one endpoint, its own. */
-    endpoint(id: PeerId): Endpoint {
-        if (id !== this.ownId)
-            throw new Error("RtcNetwork is bound to one identity");
-        return this.driver.endpoint(id);
-    }
     /** Announce ourselves into the room so present peers begin the WebRTC dance.
      *  Call once after registering the sink (or constructing a StorageNode/Transport
      *  over this network). */
     join(): void { this.opts.signaling.send({ type: "hello", from: this.ownId }); }
-    /** The peers we currently hold an authenticated link to (for broadcast / UI). */
-    linkedPeers(): PeerId[] { return this.driver.linkedPeers(); }
     // ── live media (audio/video) ──────────────────────────────────────────────────
     // Calls ride the same RTCPeerConnections as the data channel. addTrack triggers
     // negotiationneeded, and the offer it produces flows through the same perfect-
@@ -228,8 +199,7 @@ export class RtcNetwork {
         const existing = this.peers.get(peerId);
         if (existing)
             return existing;
-        const makePc = this.opts.peerConnectionFactory ?? ((cfg) => new RTCPeerConnection(cfg));
-        const pc = makePc(this.opts.rtcConfig);
+        const pc = this.makePc(this.opts.rtcConfig);
         const e = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] as RTCIceCandidateInit[], callSenders: null };
         this.peers.set(peerId, e);
         pc.addEventListener("icecandidate", (ev) => {

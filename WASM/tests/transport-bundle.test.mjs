@@ -8,6 +8,7 @@
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
+import { testkit } from "./testkit.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -25,6 +26,9 @@ const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
+const { ok, summary } = testkit();
+// Report-style: a failed check is logged and counted, and the suite keeps going.
+const assert = ok;
 // Read out of the artifact rather than restated: a hard-coded author is drift waiting
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
@@ -82,9 +86,6 @@ async function makeNode(channels, listen) {
   await shell.loadBundleBlob(transportBlob);
   return shell;
 }
-
-let passed = 0, failed = 0;
-const assert = (c, m) => { if (!c) { console.error("  FAIL: " + m); failed++; } else { passed++; console.log("  ok: " + m); } };
 
 console.log("Test: transport bundle drives two nodes over loopback");
 
@@ -173,5 +174,4 @@ assert(a.net !== aNet2, "…as a genuinely re-stood driver, not the old one left
 
 a.close();
 b.close();
-console.log(failed === 0 ? `transport bundle smoke: ${passed} ok` : `transport bundle smoke: ${failed} FAILED`);
-process.exit(failed === 0 ? 0 : 1);
+summary("transport bundle smoke");

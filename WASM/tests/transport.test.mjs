@@ -10,13 +10,9 @@
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP } from "./ws-module.mjs";
 import { parseWsPeer } from "../build/host/net-ws.js";
 import { parsePeerSpec } from "../build/host/transport-host.js";
+import { testkit } from "./testkit.mjs";
 
-let pass = 0, fail = 0;
-function test(name, fn) {
-  try { fn(); pass++; console.log(`  OK   ${name}`); }
-  catch (e) { fail++; console.log(`  FAIL ${name}\n       ${e.message}`); }
-}
-const assert = (c, m) => { if (!c) throw new Error(m); };
+const { test, assert, summary } = testkit();
 
 console.log("\nRFC 6455 module conformance (ws.wasm, a module of the transport bundle)\n");
 
@@ -96,5 +92,4 @@ test("peer specs: a malformed secret is rejected, not silently ignored", () => {
   }
 });
 
-console.log(`\n${pass} passed, ${fail} failed\n`);
-process.exit(fail === 0 ? 0 : 1);
+summary("RFC 6455 module conformance");

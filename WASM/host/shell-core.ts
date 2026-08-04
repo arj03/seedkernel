@@ -24,7 +24,7 @@ import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { toHex, fromHex } from "../core/util.js";
+import { toHex, fromHex, errMessage } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
@@ -34,6 +34,18 @@ import type { Keypair } from "../core/subkeys.js";
  *  (BundleCrypto) plus the cap-bridge crypto ops (CapSodium). Any sumo libsodium
  *  build satisfies both. */
 export type ShellSodium = BundleCrypto & CapSodium;
+
+/** The one reason a bundle load is refused without being an error worth reporting:
+ *  the policy predicate said no (§12.4). The transport role's installers treat this
+ *  as "a node without a network — a deliberate configuration", not a failure, so
+ *  the message is a shared constant rather than a string the caller re-matches. */
+export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
+
+/** True iff a loadBundleBlob failure was the policy's refusal (see ADMISSION_REJECTED),
+ *  whatever shape the thrown value took. */
+export function isAdmissionRejected(err: unknown): boolean {
+    return errMessage(err).includes(ADMISSION_REJECTED);
+}
 
 /** How a target creates the confined realm a guest runs in (§12.3). The JS platform's
  *  factory is `createSafeRealm` (safe-js.ts: QuickJS-over-wasm, driven by
@@ -632,7 +644,7 @@ export function createShell(opts: CreateShellOptions & {
             }
             const ok = await admit(v);
             if (!ok)
-                throw new Error("bundle: rejected by admission predicate");
+                throw new Error(ADMISSION_REJECTED);
             // A slot occupant's load is not "done" when its modules bind — the driver
             // must STAND — so its mark is deferred (installBundle `deferMark`) and
             // advanced only after installTransport below: a transport guest that fails

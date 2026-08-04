@@ -23,6 +23,7 @@
 import {
   makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until,
 } from "./transport-harness.mjs";
+import { testkit } from "./testkit.mjs";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
 // The RawLink shape (core/socket-seam.ts), with the hooks these tests need:
@@ -134,15 +135,7 @@ async function upPair(chanOpts, aOpts, bOpts, linkOpts) {
 }
 
 // ── harness ──────────────────────────────────────────────────────────────────
-let pass = 0, fail = 0;
-async function test(name, fn) {
-  let st = null;
-  const keep = (s) => { st = s; return s; };
-  try { await fn(keep); console.log(`  OK   ${name}`); pass++; }
-  catch (e) { console.log(`  FAIL ${name}\n       ${e.message}`); fail++; }
-  finally { st?.close?.(); }
-}
-function assert(cond, msg) { if (!cond) throw new Error(msg); }
+const { test, assert, summary } = testkit();
 
 const hexOf = (u) => Buffer.from(u).toString("hex");
 
@@ -619,5 +612,4 @@ await test("default caps are sane", async () => {
     "the per-source cap must bound one source well below the whole budget");
 });
 
-console.log(`\n${pass} passed, ${fail} failed\n`);
-process.exit(fail === 0 ? 0 : 1);
+summary("transport link hardening");

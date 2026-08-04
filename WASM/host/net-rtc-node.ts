@@ -51,9 +51,10 @@ class Emitter {
     }
 }
 // ── RTCDataChannel facade over a werift data channel ──────────────────────────
-// RtcChannel (net-rtc.ts) consumes exactly: binaryType (set), readyState,
-// addEventListener("message"|"open"|"close"|"error"), send(Uint8Array), close().
-// werift gives us .onMessage/.stateChanged/.error Events and a Buffer-only send.
+// MessageChannel (net-channel.ts) consumes exactly: binaryType (set),
+// addEventListener("message"|"open"|"close"|"error"), send(Uint8Array), close(),
+// and optional bufferedAmount. werift gives us .onMessage/.stateChanged/.error
+// Events and a Buffer-only send.
 export class WeriftRtcDataChannel extends Emitter {
     dc;
     // RtcChannel sets this to "arraybuffer"; werift always hands us a Buffer, so it
@@ -86,7 +87,6 @@ export class WeriftRtcDataChannel extends Emitter {
         this.opened = true;
         this.dispatch("open");
     }
-    get readyState(): string { return this.dc.readyState; }
     send(bytes: Uint8Array): void { this.dc.send(Buffer.from(bytes)); }
     close(): void { this.dc.close(); }
 }

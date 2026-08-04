@@ -41,6 +41,7 @@ import {
 // ceiling and the same budget whether its realm is this one or the native target's
 // (native/guest.go, whose bridge used to carry its own copies of these numbers).
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { errMessage } from "../core/util.js";
 // Use the actively-maintained quickjs-ng build rather than quickjs-emscripten's default
 // (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed now — net is
 // a real Promise resolved by the host, not an Asyncify stack unwind.
@@ -336,7 +337,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       },
       (err) => {
         if (disposed || !ctx.alive) return;
-        settleNet("__netReject", callId, ctx.newString(String((err && (err as Error).message) || err)));
+        settleNet("__netReject", callId, ctx.newString(errMessage(err)));
       },
     );
     return ctx.null;

@@ -14,7 +14,7 @@
 // §12.2). A host-side caller that holds the same primitives constructs the
 // identical bridge, so output orchestrated through the confined guest is
 // byte-compatible with a host-side reference path.
-import { toHex, fromHex, concatBytes, writeU32BE, readU32BE } from "../core/util.js";
+import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_CHANNEL, PRIMITIVE_NAMES, type PrimitiveName } from "../core/domains.js";
 import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
@@ -662,8 +662,6 @@ const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per CAP_RANDOM call
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);
-const enc = new TextEncoder();
-const dec = new TextDecoder();
 function u64be(value: number): Uint8Array {
     const out = new Uint8Array(8);
     writeU32BE(out, 0, Math.floor(value / 0x100000000));

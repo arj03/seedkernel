@@ -27,7 +27,7 @@
 // (§12.4) — there is no separate per-module install envelope. A live update is not a
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
-import { concatBytes, toHex } from "../core/util.js";
+import { concatBytes, toHex, enc, dec } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
 import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
 
@@ -380,7 +380,7 @@ export const BUNDLE_ROLES = ["transport"];
  *  reaching another app's data still requires forging its author key, which is what
  *  actually holds the boundary. */
 export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: string): string {
-    const key = new TextEncoder().encode(appKeyFor(author, app));
+    const key = enc.encode(appKeyFor(author, app));
     return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
 }
 /** The module name inbound dispatch goes to for a handler-only bundle, or null when the
@@ -437,7 +437,7 @@ const NAME_RE = /^[A-Za-z0-9_-]+$/;
  *  verifier parses the exact bytes it checked, so no separate canonicalisation is
  *  needed — the bytes *are* the manifest. */
 export function encodeManifest(m: BundleManifest): Uint8Array {
-    return new TextEncoder().encode(JSON.stringify(m));
+    return enc.encode(JSON.stringify(m));
 }
 /** The signed preimage: `DOMAIN_manifest ‖ suite ‖ json`. The prefix is signed but not
  *  stored; the suite byte is signed *and* stored (envelope byte 0), which is the point —
@@ -664,7 +664,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     }
     let parsed;
     try {
-        parsed = JSON.parse(new TextDecoder().decode(json));
+        parsed = JSON.parse(dec.decode(json));
     }
     catch {
         throw new Error("bundle: malformed manifest (not JSON)");
@@ -719,7 +719,6 @@ const ARCHIVE_MAGIC = [0x53, 0x4b, 0x42, 0x31]; // "SKB1"
 /** Serialize a set of named bundle files into one bundle blob (format above). */
 export function packBundle(files: Record<string, Uint8Array>): Uint8Array {
     const names = Object.keys(files);
-    const enc = new TextEncoder();
     const header = new Uint8Array(6);
     header.set(ARCHIVE_MAGIC, 0);
     new DataView(header.buffer).setUint16(4, names.length, false);
@@ -745,7 +744,6 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     }
     const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
     const count = dv.getUint16(4, false);
-    const dec = new TextDecoder();
     const files: Record<string, Uint8Array> = {};
     let off = 6;
     for (let i = 0; i < count; i++) {
@@ -888,7 +886,7 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
         suite: v.suite,
         manifest: v.manifest,
         modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
-        guestSource: v.manifest.guest ? new TextDecoder().decode(read(GUEST_FILE)) : "",
+        guestSource: v.manifest.guest ? dec.decode(read(GUEST_FILE)) : "",
     };
     // Integrity: hash every module and the guest against the manifest's signed hashes.
     // This is inside verifyBundle (not a separate step) because the manifest hashes are
@@ -900,7 +898,7 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
         }
     }
     if (v.manifest.guest) {
-        if (!contentMatches(new TextEncoder().encode(result.guestSource), v.manifest.guest.hash, (b) => genesisHash(sodium, b))) {
+        if (!contentMatches(enc.encode(result.guestSource), v.manifest.guest.hash, (b) => genesisHash(sodium, b))) {
             throw new Error("bundle: guest content hash mismatch");
         }
     }

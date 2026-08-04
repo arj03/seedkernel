@@ -27,6 +27,7 @@
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, until,
 } from "./transport-harness.mjs";
+import { testkit } from "./testkit.mjs";
 
 const CONTACT = new Uint8Array(32).fill(3);
 
@@ -86,17 +87,7 @@ async function member(fabric, serverNode, host) {
   return m;
 }
 
-let pass = 0, fail = 0;
-const shells = [];
-function assert(c, m) { if (!c) throw new Error(m); }
-async function test(name, fn) {
-  try { await fn(); pass++; console.log(`  OK   ${name}`); }
-  catch (e) { fail++; console.log(`  FAIL ${name}\n       ${e.message}`); }
-  finally { for (const s of shells.splice(0)) { try { s.shell.close(); } catch { /* down */ } } }
-}
-const keep = (n) => { shells.push(n); return n; };
-const note = (s) => console.log(`       · ${s}`);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const { test, assert, keep, note, sleep, summary } = testkit();
 
 console.log("\nTransport load behaviour (§12.6.2 §6.5)\n");
 
@@ -287,5 +278,4 @@ await test("sustained-rate headroom", async () => {
   assert(DEFAULT_MAX_HALF_OPEN_VERIFIED >= 64, "the members' budget should not be tight");
 });
 
-console.log(`\n${pass} passed, ${fail} failed\n`);
-process.exit(fail === 0 ? 0 : 1);
+summary("transport load behaviour");

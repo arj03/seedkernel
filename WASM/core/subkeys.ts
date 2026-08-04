@@ -23,9 +23,7 @@
 // constructed from runtime data, so two purposes cannot collide by accident.
 
 import { DOMAIN_SUBKEY } from "./domains.js";
-import { concatBytes } from "./util.js";
-
-const enc = new TextEncoder();
+import { concatBytes, enc } from "./util.js";
 
 /** Labels are closed, literal and versioned — never built from runtime data. Adding a
  *  purpose means adding a constant here, which is the point: the set of things this
@@ -55,8 +53,9 @@ export interface Keypair {
  *
  *  Deterministic: the same seed and label always give the same keypair, so a node
  *  rebuilds every subkey at boot from the one secret it stores and there is nothing extra
- *  to persist, back up or keep in sync. */
-export function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Array): Keypair {
+ *  to persist, back up or keep in sync. Internal to this file: the public surface is
+ *  `deriveNodeKeys`, which is what a host calls with the label constants above. */
+function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Array): Keypair {
   if (master.length !== 32) throw new Error(`subkey: master seed must be 32 bytes (got ${master.length})`);
   const seed = sodium.crypto_generichash(32, concatBytes([DOMAIN_SUBKEY, label, master]), null);
   const kp = sodium.crypto_sign_seed_keypair(seed);

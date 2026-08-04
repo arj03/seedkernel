@@ -12,6 +12,7 @@
 // shutdown reads at the far end as the truncation that record exists to rule out.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
+import { testkit } from "./testkit.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -54,8 +55,9 @@ async function makeNode(ws = false) {
   return shell;
 }
 
-let passed = 0, failed = 0;
-const assert = (c, m) => { if (!c) { console.error("  FAIL: " + m); failed++; } else { passed++; console.log("  ok: " + m); } };
+const { ok, summary } = testkit();
+// Report-style: a failed check is logged and counted, and the suite keeps going.
+const assert = ok;
 
 console.log("Test: transport bundle frames its own TCP links (unframed RawLink)");
 
@@ -149,5 +151,4 @@ assert(wsIntact, "every byte survived WS framing + reassembly");
 await cNet.close();
 await dNet.close();
 
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+summary("transport TCP smoke");

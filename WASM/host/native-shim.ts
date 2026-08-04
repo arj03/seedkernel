@@ -30,7 +30,8 @@ import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { parsePeerSpec } from "./transport-host.js";
-import { toHex, fromHex } from "../core/util.js";
+import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
+import { isAdmissionRejected } from "./shell-core.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
@@ -330,11 +331,7 @@ const channels: ChannelFactory = {
 /** The artifact-shipped transport bundle, as raw bytes (transport-bundle.js). */
 const embeddedTransport = (() => {
     try {
-        const bin = atob(TRANSPORT_BUNDLE_B64);
-        const out = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++)
-            out[i] = bin.charCodeAt(i);
-        return out;
+        return fromBase64(TRANSPORT_BUNDLE_B64);
     }
     catch {
         return null;
@@ -381,7 +378,7 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
         const r = capBridge(op, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
             return r as Uint8Array;
-        (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, String((e as Error)?.message ?? e)));
+        (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)));
         return null;
     };
     realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
@@ -471,10 +468,8 @@ async function makeTransportNode(cfg: {
             await s.loadBundleBlob(embeddedTransport);
         }
         catch (err) {
-            if (String((err as Error).message).includes("rejected by admission predicate")) {
+            if (!isAdmissionRejected(err)) {
                 // A deliberate configuration: this node does not speak to anyone.
-            }
-            else {
                 throw err;
             }
         }

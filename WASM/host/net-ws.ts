@@ -14,8 +14,8 @@
 // Platform-neutral: the WebSocket global is touched only inside a dial (or an
 // injected factory), so importing this module where WebSocket is absent is safe.
 
-import type { Network, Endpoint, PeerId } from "../core/net.js";
-import { BufferedChannel } from "./net-channel.js";
+import type { Network, PeerId } from "../core/net.js";
+import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { parsePeerRef, type TransportHost, type LinkHandle } from "./transport-host.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
@@ -23,7 +23,6 @@ import { parsePeerRef, type TransportHost, type LinkHandle } from "./transport-h
  *  conforming implementation (the browser global, Bun's, or a test double). */
 export interface WsLike {
   binaryType: string;
-  readyState: number;
   /** Bytes queued but not yet on the wire — the stall clock's progress signal
    *  (socket-seam.ts `RawLink.buffered`). Optional: not every WebSocket-shaped
    *  object in a test double reports it. */
@@ -36,30 +35,11 @@ export interface WsLike {
 
 // ── RawLink over one WebSocket ─────────────────────────────────────────────
 // A WebSocket delivers whole binary messages in order, so this is a thin adapter.
-// BufferedChannel (net-channel.ts) carries the shared machinery, including the
+// MessageChannel (net-channel.ts) carries the shared machinery, including the
 // pre-open send buffer the transport needs because it emits its HELLO the instant
 // a link is constructed.
-export class WsChannel extends BufferedChannel {
-  constructor(private readonly ws: WsLike) {
-    super();
-    ws.binaryType = "arraybuffer";
-    ws.addEventListener("message", (ev: { data: unknown }) => {
-      // Only binary frames are transport messages; a string frame is never ours.
-      if (typeof ev.data !== "string") this.deliver(new Uint8Array(ev.data as ArrayBuffer));
-    });
-    ws.addEventListener("open", () => this.open());
-    ws.addEventListener("close", () => this.fail());
-    ws.addEventListener("error", () => this.fail());
-  }
-
-  protected write(bytes: Uint8Array): void { this.ws.send(bytes); }
-
-  /** The WebSocket's own send backlog. */
-  protected backlog(): number { return this.ws.bufferedAmount ?? 0; }
-
-  // WebSocket.close() sends the queued frames before the close frame, so a graceful
-  // stop needs nothing extra here.
-  protected stop(_graceful: boolean): void { this.ws.close(); }
+export class WsChannel extends MessageChannel {
+  constructor(ws: WsLike) { super(ws); }
 }
 
 export interface WsNetworkOptions {
@@ -83,32 +63,19 @@ export interface WsNetworkOptions {
   connsPerPeer?: number;
 }
 
-export class WsNetwork implements Network {
-  private readonly driver: TransportHost;
-  private readonly ownId: PeerId;
+export class WsNetwork extends SingleIdentityNetwork implements Network {
   private readonly mkWs: (url: string) => WsLike;
   private readonly conns: number;
   private readonly dialing = new Map<PeerId, LinkHandle[]>(); // every link we have dialed to a peer
 
   constructor(private readonly opts: WsNetworkOptions) {
-    this.driver = opts.driver;
-    this.ownId = opts.driver.peerId;
+    super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
     this.mkWs = opts.webSocketFactory
       ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => WsLike }).WebSocket(url));
     this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
-    this.driver.setPeerHooks({ onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
   }
-
-  /** Frames delivered to the app side — the driver's diagnostic mirror. */
-  get framesDelivered(): number { return this.driver.framesDelivered; }
 
   // ── Network interface ──────────────────────────────────────────────────────────
-
-  /** A single-identity fabric: it vends exactly one endpoint, its own. */
-  endpoint(id: PeerId): Endpoint {
-    if (id !== this.ownId) throw new Error("WsNetwork is bound to one identity");
-    return this.driver.endpoint(id);
-  }
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
    *  `wss://…` for TLS). The link authenticates in-channel, pinned to the declared
@@ -142,9 +109,6 @@ export class WsNetwork implements Network {
     }
     return peerId;
   }
-
-  /** The peers we currently hold at least one authenticated link to (for UI / cohort). */
-  linkedPeers(): PeerId[] { return this.driver.linkedPeers(); }
 
   /** Tear down every link and the driver's channels. */
   close(): void {

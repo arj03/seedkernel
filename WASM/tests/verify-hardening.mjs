@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import _sodium from "libsodium-wrappers-sumo";
+import { testkit } from "./testkit.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
@@ -25,9 +26,7 @@ const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
-let pass = 0, fail = 0;
-const ok = (c, m) => { if (c) { pass++; console.log(`  ok   ${m}`); } else { fail++; console.log(`  FAIL ${m}`); } };
-const throws = (fn, m) => { try { fn(); ok(false, m); } catch { ok(true, m); } };
+const { ok, throws, summary } = testkit();
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
@@ -264,5 +263,4 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   bare.close();
 }
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail === 0 ? 0 : 1);
+summary("hardening checks");

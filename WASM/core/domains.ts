@@ -18,7 +18,8 @@
 //
 // The Go/native loader evaluates this very file via the generated bundles (§12.9),
 // so its prefixes match by construction, not by a hand-copied constant.
-const domain = (s: string) => new TextEncoder().encode(s);
+import { enc } from "./util.js";
+const domain = (s: string) => enc.encode(s);
 /** Bundle manifest (§12.4): prefixes the manifest JSON, so a manifest signature
  *  can't double as an envelope wrapper over the same bytes. */
 export const DOMAIN_MANIFEST = domain("seedkernel-manifest-sig-v1\0");
