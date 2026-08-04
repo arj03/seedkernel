@@ -16,8 +16,7 @@
 
 import type { Network, Endpoint, PeerId } from "../core/net.js";
 import { BufferedChannel } from "./net-channel.js";
-import { fromHex } from "../core/util.js";
-import type { TransportHost, LinkHandle } from "./transport-host.js";
+import { parsePeerRef, type TransportHost, type LinkHandle } from "./transport-host.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
  *  this module type-checks without committing to a DOM lib and accepts any
@@ -169,35 +168,13 @@ export class WsNetwork implements Network {
 
 /** Parse a `pubkey@host:port` (or `pubkey@ws://host:port[/path]`) cohort peer spec
  *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
- *  ws:// scheme; pass wss:// explicitly for TLS. */
+ *  ws:// scheme; pass wss:// explicitly for TLS.
+ *
+ *  Who the peer is comes from `parsePeerRef` (transport-host.ts) — the one place that
+ *  grammar is written. All that is left here is this edge's own address form, which is a
+ *  URL rather than a host:port and is the only reason a second entry point exists. */
 export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
-  const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`ws peer must be pubkey[.secret]@host:port, got ${spec}`);
-  // `pk` names WHO lives there and keys the peer table; the optional `.secret` is THAT
-  // PEER's contact secret, which is what our opening message must be sealed under. They
-  // do different jobs — the pk is routing, the secret is the credential.
-  const idPart = spec.slice(0, at).trim().toLowerCase();
-  const dot = idPart.indexOf(".");
-  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
-  if (!isHex64(peerId)) throw new Error(`ws peer id must be 32-byte hex, got ${peerId}`);
-  let contactSecret: Uint8Array | undefined;
-  if (dot >= 0) {
-    const hex = idPart.slice(dot + 1);
-    if (!isHex64(hex)) throw new Error(`ws peer contact secret must be 32-byte hex, got ${hex}`);
-    contactSecret = fromHex(hex);
-  }
-  let url = spec.slice(at + 1).trim();
-  if (!url.startsWith("ws://") && !url.startsWith("wss://")) url = "ws://" + url;
+  const { peerId, contactSecret, location } = parsePeerRef(spec);
+  const url = (location.startsWith("ws://") || location.startsWith("wss://")) ? location : "ws://" + location;
   return { peerId, contactSecret, url };
-}
-
-// The host JS carries no regex literals (the minifier treats every `/` as
-// division), so the 32-byte-hex check is a manual scan rather than /^[0-9a-f]{64}$/.
-function isHex64(s: string): boolean {
-  if (s.length !== 64) return false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false; // 0-9 / a-f
-  }
-  return true;
 }

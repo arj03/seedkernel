@@ -24,7 +24,7 @@ const { NodeChannelFactory } = await imp("build/host/net-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
-const { KernelHost } = await imp("build/core/kernel-host.js");
+const { KernelHost } = await imp("build/host/kernel-host.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));

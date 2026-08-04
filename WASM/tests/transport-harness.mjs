@@ -19,7 +19,7 @@ export const { createShell } = await imp("build/host/shell-core.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
-export const { KernelHost } = await imp("build/core/kernel-host.js");
+export const { KernelHost } = await imp("build/host/kernel-host.js");
 export const { CLOSE_REASON, TransportHost, LoopbackChannels } = await imp("build/host/transport-host.js");
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 

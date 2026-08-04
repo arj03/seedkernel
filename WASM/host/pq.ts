@@ -3,6 +3,13 @@
 // libsodium-wrappers-shaped method names so it mixes straight into the `sodium`
 // object the shared loader already consumes.
 //
+// **Host code, not core**, for the same reason `native/mldsa.go` is not: it is a
+// *driver* — a bump arena over a wasm module's linear memory — and which library a
+// target reaches its primitives through decides nothing about the protocol. What is
+// core here is the vocabulary (`PRIMITIVE_NAMES`, core/domains.ts) and the manifest
+// suite that names ML-DSA-65 (§12.4); the field widths below are format constants of
+// that suite, kept beside the driver only because it cross-checks them at load.
+//
 // **One implementation, three targets.** The wasm is built from mldsa-native
 // (pq/mldsa-native, pinned; scripts/build-mldsa.mjs) and the same bytes are
 // instantiated by the browser, by Node, and by wazero in the Go loader

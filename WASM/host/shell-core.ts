@@ -22,7 +22,7 @@ import { kernelNameFor, appKeyFor, appScopeFor, handlesOf, entryModuleOf, verify
 import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
-import { scopedFs, type Fs } from "../core/fs.js";
+import { scopedFs, validatedFs, type Fs } from "../core/fs.js";
 import { toHex, fromHex } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
@@ -244,7 +244,7 @@ export interface Shell {
 // re-export keeps that a one-line seam rather than a second import.
 export { denyAll, admitAll, authorAllowlist, roleAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
 export { Bindings } from "./bindings.js";
-export { KernelHost } from "../core/kernel-host.js";
+export { KernelHost } from "./kernel-host.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
  *  re-implementing the kernel host, cap-bridge wiring, preamble assembly, realm
  *  creation, and transport routing. */
@@ -272,6 +272,11 @@ export function createShell(opts: CreateShellOptions & {
 }): Shell {
     const { platform } = opts;
     const sodium = platform.sodium;
+    // The key rule (core/fs.ts) applied once, here, over whatever backend this target
+    // supplied — so every host admits exactly the same key space, which is what decides
+    // the contents a node stores and advertises. Under `scopedFs` below, so what gets
+    // checked is the composite key the medium actually sees.
+    const fs = platform.fs ? validatedFs(platform.fs) : undefined;
     const host = platform.kernel;
     const bindings = new Bindings();
     const admit = opts.admit ?? denyAll;
@@ -342,8 +347,8 @@ export function createShell(opts: CreateShellOptions & {
             // not the node's (fs.ts). Two admitted apps can no longer read, enumerate or
             // delete each other's data, which brings `fs` into line with the structural
             // ownership kernel names already have (§5.1).
-            fs: caps.has("fs") && platform.fs
-                ? scopedFs(platform.fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
+            fs: caps.has("fs") && fs
+                ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
                 : undefined,
             now: platform.now ?? (() => Date.now()),
             allowedOps: opsForCaps(caps),
@@ -521,7 +526,7 @@ export function createShell(opts: CreateShellOptions & {
                 close: () => noTransport("close"),
             };
         },
-        fs: platform.fs,
+        fs,
         sodium,
         async loadBundleBlob(blob) {
             const v = verifyBundle(sodium, blob);

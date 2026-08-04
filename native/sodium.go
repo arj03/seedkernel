@@ -426,11 +426,16 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
-// exposeSodium installs `__sodium` (ArrayBuffer-returning primitives) into the
-// realm; sodiumShimJS then wraps it as `sodium` with libsodium-wrappers semantics
-// (Uint8Array results, the {publicKey,privateKey,keyType} keypair shape). Keeping
-// the byte primitives in Go and the API shaping in JS follows the project rule:
-// Go grows with primitives, the reusable shape lives in JS.
+// exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and
+// the whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the
+// shared code consumes (Uint8Array results, {publicKey,privateKey} keypairs, a throw
+// where the wrappers throw) is `wrapNativeSodium` in host/native-shim.ts, which is
+// where it is typechecked against `ShellSodium`. Go grows with primitives; the
+// reusable shape lives in JS, and in TypeScript rather than in a string constant.
+//
+// Only what JS actually reaches is registered here. The curve25519 conversions and
+// crypto_box_seal are Go-side primitives with no caller above this seam (they are
+// exercised directly by sodium_test.go), so they are not published into the realm.
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
@@ -456,22 +461,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	}))
 	o.SetPropertyStr("crypto_sign_verify_detached", fn(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(s.verifyDetached(arg(t, 0), arg(t, 1), arg(t, 2))), nil
-	}))
-	o.SetPropertyStr("crypto_sign_ed25519_pk_to_curve25519", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.edPkToCurve(arg(t, 0))), nil
-	}))
-	o.SetPropertyStr("crypto_sign_ed25519_sk_to_curve25519", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.edSkToCurve(arg(t, 0))), nil
-	}))
-	o.SetPropertyStr("crypto_box_seal", fn(func(t *qjs.This) (*qjs.Value, error) {
-		return ab(t, s.boxSeal(arg(t, 0), arg(t, 1))), nil
-	}))
-	o.SetPropertyStr("crypto_box_seal_open", fn(func(t *qjs.This) (*qjs.Value, error) {
-		pt, ok := s.boxSealOpen(arg(t, 0), arg(t, 1), arg(t, 2))
-		if !ok {
-			return t.Context().NewNull(), nil
-		}
-		return ab(t, pt), nil
 	}))
 	o.SetPropertyStr("crypto_scalarmult", fn(func(t *qjs.This) (*qjs.Value, error) {
 		q, ok := s.scalarmult(arg(t, 0), arg(t, 1))
@@ -511,9 +500,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	// reaches every primitive through one `sodium` (mlkem.go).
 	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)
-	if _, err := qc.Eval("sodium-shim.js", qjs.Code(sodiumShimJS)); err != nil {
-		panic(fmt.Sprintf("sodium shim: %v", err))
-	}
 }
 
 func keypairObj(qc *qjs.Context, pk, sk []byte) *qjs.Value {
@@ -523,68 +509,3 @@ func keypairObj(qc *qjs.Context, pk, sk []byte) *qjs.Value {
 	return o
 }
 
-// sodiumShimJS shapes the Go primitives into the libsodium-wrappers surface the
-// shared host JS expects: byte results as Uint8Array, keypairs as
-// {publicKey,privateKey,keyType}, and crypto_box_seal_open throwing on failure.
-const sodiumShimJS = `
-"use strict";
-(function () {
-  const N = __sodium;
-  const u8 = (b) => new Uint8Array(b);
-  globalThis.sodium = {
-    crypto_generichash: (len, m) => u8(N.crypto_generichash(len, m)),
-    crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
-    crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
-    crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
-    ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
-    crypto_sign_ed25519_pk_to_curve25519: (pk) => u8(N.crypto_sign_ed25519_pk_to_curve25519(pk)),
-    crypto_sign_ed25519_sk_to_curve25519: (sk) => u8(N.crypto_sign_ed25519_sk_to_curve25519(sk)),
-    crypto_box_seal: (m, pk) => u8(N.crypto_box_seal(m, pk)),
-    crypto_box_seal_open: (c, pk, sk) => {
-      const r = N.crypto_box_seal_open(c, pk, sk);
-      if (r === null) throw new Error("crypto_box_seal_open: incorrect key pair for the given ciphertext");
-      return u8(r);
-    },
-    // §12.6 transport AKE: X25519 + ChaCha20-Poly1305-IETF record layer.
-    crypto_scalarmult: (sk, pk) => {
-      const r = N.crypto_scalarmult(sk, pk);
-      if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");
-      return u8(r);
-    },
-    // libsodium-wrappers' signature is (message, ad, nsec, npub, key); the record
-    // layer uses no additional data, so the native primitive takes just (m, npub, key).
-    crypto_aead_chacha20poly1305_ietf_encrypt: (m, _ad, _nsec, npub, key) =>
-      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, npub, key)),
-    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, _ad, npub, key) => {
-      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, npub, key);
-      if (r === null) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
-      return u8(r);
-    },
-    crypto_sign_keypair: () => {
-      const k = N.crypto_sign_keypair();
-      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ed25519" };
-    },
-    crypto_sign_seed_keypair: (seed) => {
-      const k = N.crypto_sign_seed_keypair(seed);
-      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ed25519" };
-    },
-    // ML-KEM-768, the primitive catalog's KEM (§14.1, mlkem.go). null is a rejection
-    // the caller must be able to read — a public key that fails FIPS 203 §7.2's modulus
-    // check, or a secret key that fails §7.3's hash check — so unlike the libsodium
-    // wrappers above it is passed through rather than thrown.
-    ml_kem768_keypair_from_seed: (seed) => {
-      const k = N.ml_kem768_keypair_from_seed(seed);
-      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "ml-kem-768" };
-    },
-    ml_kem768_encaps: (pk, coins) => {
-      const r = N.ml_kem768_encaps(pk, coins);
-      return r === null ? null : { ciphertext: u8(r.ciphertext), sharedSecret: u8(r.sharedSecret) };
-    },
-    ml_kem768_decaps: (sk, ct) => {
-      const r = N.ml_kem768_decaps(sk, ct);
-      return r === null ? null : u8(r);
-    },
-    randombytes_buf: (n) => u8(N.randombytes_buf(n)),
-  };
-})();
-`

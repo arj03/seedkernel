@@ -1,4 +1,11 @@
-// The host and the handler table it owns (README §3, §4).
+// The handler table (README §3, §4), as the JS targets implement it.
+//
+// **Host code, not core.** What is core about the kernel is the CONTRACT — the table,
+// the §4 handler ABI, the bind/unbind semantics, and the §4.3 memory ceiling
+// (core/wasm-limits.ts). This file is one platform's implementation of it, over
+// `WebAssembly`; the native target's is a wazero map in Go behind its byte bridge
+// (native/main.go), and neither is more canonical than the other. It sits with the
+// other backends — `fs-node.ts`, `safe-js.ts` — for the same reason they do.
 //
 // The kernel is a **contract, not an artifact**: the table (`handlers[name] → handler`),
 // the pure-transform handler ABI (§4), and the bind/unbind semantics (§3.1). Its whole
@@ -25,7 +32,7 @@
 // Authenticity is the transport's job (the AKE channel attributes every frame), not a
 // per-message signature — so there is no signature wrapper and no signer scoping here.
 
-import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "./wasm-limits.js";
+import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 // ─── handler routing ─────────────────────────────────────────────────────
 

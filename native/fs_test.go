@@ -50,13 +50,18 @@ func TestNodeFsRoundTrip(t *testing.T) {
 	}
 }
 
-// Unsafe keys are rejected on write and never resolve on read/delete, so a guest
-// cannot escape the data directory, use a path separator, or (on a Windows holder)
-// address a reserved device name like CON/NUL/COM1 — case- and extension-insensitively.
+// Containment: a key that could name something other than a plain file inside the data
+// directory is rejected on write and never resolves on read/delete. This is the whole of
+// what this backend decides. WHICH keys are legal — the charset, and the Windows device
+// names like CON/NUL/COM1 — is `isSafeFsKey` in WASM/core/fs.ts, one rule for every
+// target, applied before a key reaches Go and tested there ("fs key space is one rule",
+// WASM/tests/run.mjs). A copy of it here is what used to let the two drift.
+//
+// "" is in the list for a reason that is this layer's alone: filepath.Join(dir, "") is
+// the data directory itself, so an unchecked empty key makes delete("") remove the store.
 func TestNodeFsRejectsUnsafeKeys(t *testing.T) {
 	fs, _ := newNodeFs(t.TempDir())
-	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`, "a b", "a\x00b"}
-	unsafe = append(unsafe, "CON", "nul", "Aux", "COM1", "COM0", "LPT9", "con.txt", "NUL.tar.gz")
+	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`, "a\x00b"}
 	for _, k := range unsafe {
 		if err := fs.put(k, []byte("x")); err == nil {
 			t.Fatalf("put(%q) accepted an unsafe key", k)

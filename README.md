@@ -156,15 +156,15 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded.
 
-**Shared — compiled once, run by all three targets (2,125 LOC)**
+**Shared — compiled once, run by all three targets (2,177 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 536 |
-| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 529 |
-| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 471 |
-| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 381 |
-| Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 208 |
+| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 539 |
+| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 486 |
+| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 382 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 234 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 
@@ -179,8 +179,8 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,520 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (224), the Go binding, which is TypeScript and rides in the shared bundle | 2,600 Go + 224 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,500 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (281), the Go binding, which is TypeScript and rides in the shared bundle | 2,490 Go + 281 TS |
 
 **Signed content — not host code at all**
 
@@ -188,15 +188,9 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,236 + 5 KB |
 
-Each target therefore runs 2,125 shared lines over roughly 1,500–2,600 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,177 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
-Shared binaries, byte-identical on every target:
-
-| Artifact | What | Size |
-| --- | --- | --- |
-| `libsodium.wasm` | Ed25519, BLAKE2b, ChaCha20/XChaCha20 (sumo build) | 278 KB |
-| `mldsa65.wasm` | ML-DSA-65, the `0x02` hybrid manifest suite verifier | 17 KB |
-| `mlkem768.wasm` | ML-KEM-768, the primitive catalog's KEM | 11 KB |
+Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 
 The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go. The `core/` and `host/` split inside `WASM/` is the *other* axis: `core/` is what has no endpoint substitute, `host/` is the runtime around it, and both contribute to the shared set and to the JS platform.
 

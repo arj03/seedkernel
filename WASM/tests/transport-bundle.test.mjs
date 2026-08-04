@@ -20,7 +20,7 @@ const { LoopbackChannels } = await imp("build/host/transport-host.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
-const { KernelHost } = await imp("build/core/kernel-host.js");
+const { KernelHost } = await imp("build/host/kernel-host.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 

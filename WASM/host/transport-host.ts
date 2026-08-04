@@ -47,35 +47,63 @@ import type { RawNet, HostTimers, TransportSink } from "./cap-bridge.js";
 import type { SafeRealm } from "./safe-js.js";
 import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
 
-/** Parse a `pk[.secret]@host:port` peer spec into the peer id + address to dial.
- *  `pk` names WHO lives there and keys the address book; the optional `.secret` is
- *  THAT PEER's contact secret, which is what makes the address a credential.
+/** 32-byte lowercase hex. A manual scan rather than a regex literal, so it stays safe
+ *  under the minifier (scripts/minify.mjs), which has no lexer to tell a regex from a
+ *  division. */
+export function isHex64(s: string): boolean {
+  if (s.length !== 64) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false; // 0-9 / a-f
+  }
+  return true;
+}
+
+/** The credential half of a peer spec — `pk[.secret]` — plus whatever followed the `@`.
  *
- *  Host code, with the driver that consumes what it produces. It parses a flag into a
- *  `PeerAddr` and decides nothing — the seam is `PeerAddr` itself (socket-seam.ts) and
- *  every check here is a syntax check, so nothing about admission or trust would change
- *  if a target hand-rolled its own parser and never called this. */
-export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
+ *  `pk` names WHO lives there and keys the address book; the optional `.secret` is THAT
+ *  PEER's contact secret, which is what makes an address a credential rather than merely
+ *  a location. They do different jobs: the pk is routing, the secret is the gate our
+ *  opening message must be sealed under.
+ *
+ *  **The grammar is written once.** Where a peer LIVES differs by transport — a
+ *  `host:port` to dial, a whole `ws://` URL for the browser edge — but who they are does
+ *  not, and it used to be parsed twice, here and in net-ws.ts, by two functions that had
+ *  already drifted on trimming and on how much they validated. `location` comes back
+ *  unparsed, so each caller reads its own address form out of it and nothing else is
+ *  duplicated.
+ *
+ *  Host code, with the driver that consumes what it produces: every check here is a
+ *  syntax check, so nothing about admission or trust would change if a target hand-rolled
+ *  its own parser and never called this. */
+export function parsePeerRef(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; location: string } {
   const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@host:port): ${spec}`);
-  const idPart = spec.slice(0, at).toLowerCase();
+  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@location): ${spec}`);
+  const idPart = spec.slice(0, at).trim().toLowerCase();
   const dot = idPart.indexOf(".");
   const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
-  if (peerId.length !== 64 || /[^0-9a-f]/.test(peerId)) throw new Error(`bad peer pubkey hex: ${spec}`);
+  if (!isHex64(peerId)) throw new Error(`bad peer pubkey hex (want 32 bytes): ${spec}`);
   let contactSecret: Uint8Array | undefined;
   if (dot >= 0) {
     const hex = idPart.slice(dot + 1);
-    if (hex.length !== 64 || /[^0-9a-f]/.test(hex)) {
-      throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
-    }
+    if (!isHex64(hex)) throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
     contactSecret = fromHex(hex);
   }
-  const hostPort = spec.slice(at + 1);
-  const colon = hostPort.lastIndexOf(":");
+  return { peerId, contactSecret, location: spec.slice(at + 1).trim() };
+}
+
+/** Parse a `pk[.secret]@host:port` peer spec into the peer id + the address to dial:
+ *  the socket-seam form (`PeerAddr`), for a target that opens its own TCP/WS sockets. */
+export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
+  const { peerId, contactSecret, location } = parsePeerRef(spec);
+  const colon = location.lastIndexOf(":");
   if (colon < 0) throw new Error(`bad peer host:port: ${spec}`);
-  const host = hostPort.slice(0, colon);
-  const port = Number(hostPort.slice(colon + 1));
-  if (!Number.isInteger(port) || port <= 0) throw new Error(`bad peer port: ${spec}`);
+  const host = location.slice(0, colon);
+  const port = Number(location.slice(colon + 1));
+  if (!host) throw new Error(`bad peer host: ${spec}`);
+  // Bounded, not merely positive: a port outside the 16-bit range names nothing, and
+  // learning that at connect time makes a typo look like an unreachable peer.
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`bad peer port: ${spec}`);
   return { peerId, addr: { host, port, transport, contactSecret } };
 }
 

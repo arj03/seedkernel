@@ -3,6 +3,11 @@
 // mixes straight into the object the cap-bridge already consumes, exactly as pq.ts
 // does for ML-DSA-65.
 //
+// **Host code, not core**, on the same grounds as pq.ts: this is the JS targets'
+// *driver* for mlkem768.wasm, the twin of native/mlkem.go. What is core is the catalog
+// NAME a guest reaches (`ml-kem-768/*`, core/domains.ts) — which is the thing every
+// host must agree on — not which driver serves it.
+//
 // **Why it is here before anything asks for it.** A bundle is replaceable; the
 // vocabulary it draws on is not. The channel's post-quantum suite is content — a
 // signed transport bundle and one policy entry — but only once the primitive it

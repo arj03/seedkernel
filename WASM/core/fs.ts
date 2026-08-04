@@ -45,11 +45,76 @@ export interface Fs {
   stat(): Promise<FsStat>;
 }
 
-/** A scope prefix must survive the backend's key rules. Both real backends map a key
- *  to a *filename* and enforce this class (`fs-node.ts`, `native/fs.go`), so a prefix
- *  outside it makes every scoped write fail — checked here, at construction, rather
- *  than on the first `put`. */
-const SAFE_SCOPE = /^[A-Za-z0-9._-]+$/;
+// ─── what a key may be ───────────────────────────────────────────────────────
+//
+// A key is opaque to the runtime but it is not opaque to the *medium*: both real
+// backends map it to a filename verbatim, so it must be flat and safe — no separators,
+// nothing that escapes a directory, nothing a platform resolves to something other
+// than a file. seedstore's keys (hex block-ids plus a short suffix) satisfy this.
+//
+// **It lives here because it is a consensus predicate, not a backend detail.** Which
+// keys a node admits decides which blocks it stores and advertises, so two nodes that
+// disagree about it disagree about their contents — the same argument that keeps one
+// ML-DSA verifier for all three targets (`pq.ts`). It was previously written twice, in
+// `host/fs-node.ts` and again in `native/fs.go`, with a comment on each saying the two
+// had to match. Now the rule is applied once, in shared JS, over whichever backend a
+// target supplies (`validatedFs`), and a backend's own path check is defence in depth
+// rather than the thing being relied on.
+
+/** The key charset. Also the scope charset: a scope is a prefix of a key, so anything
+ *  it could not be part of is not a scope either. */
+const SAFE_CHARS = /^[A-Za-z0-9._-]+$/;
+
+/** Names Windows resolves to a *device* before it ever touches the filesystem: opening
+ *  "CON"/"NUL"/"COM1"… — with or without an extension — reaches the console, the null
+ *  device or a serial port, not a file. Refused on every OS, not only Windows, because
+ *  the key space must not depend on where a node runs. */
+const RESERVED_DEVICE_NAMES = new Set<string>(["CON", "PRN", "AUX", "NUL"]);
+for (let i = 0; i <= 9; i++) { // COM0/LPT0 are reserved on current Windows too
+  RESERVED_DEVICE_NAMES.add("COM" + i);
+  RESERVED_DEVICE_NAMES.add("LPT" + i);
+}
+
+/** Windows ignores the extension, so the stem before the first `.` decides it:
+ *  "NUL.txt" is still NUL. */
+function isReservedDeviceName(key: string): boolean {
+  const dot = key.indexOf(".");
+  return RESERVED_DEVICE_NAMES.has((dot >= 0 ? key.slice(0, dot) : key).toUpperCase());
+}
+
+/** Whether `key` is representable on every backend. The bare dot names are excluded
+ *  explicitly: they are directory references, not files. */
+export function isSafeFsKey(key: string): boolean {
+  return key !== "." && key !== ".." && SAFE_CHARS.test(key) && !isReservedDeviceName(key);
+}
+
+/** Apply the key rule over a backend, once, for every target.
+ *
+ *  A rejected key **throws** rather than reading as absent. An unrepresentable key is a
+ *  caller bug, and answering `null`/`-1`/`false` would hide it on a read while `put`
+ *  failed anyway — so the one behaviour is the loud one, on every op that names a key.
+ *  `list` is not one of them: its argument is a prefix, and the empty prefix ("every key
+ *  I can see") is exactly the call a key rule would wrongly refuse. `stat` names nothing.
+ *
+ *  Wrapping happens where a backend enters the shell (`createShell`), so it sits UNDER
+ *  `scopedFs` and therefore validates the composite `scope + key` a guest actually
+ *  reaches — which is the string the medium sees. */
+export function validatedFs(inner: Fs): Fs {
+  const check = (key: string): string => {
+    if (!isSafeFsKey(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
+    return key;
+  };
+  // `async` so a refusal is a REJECTION, like every other failure on this seam. A
+  // synchronous throw would reach a caller that only attached `.catch` as an exception.
+  return {
+    async get(key) { return inner.get(check(key)); },
+    async put(key, bytes) { return inner.put(check(key), bytes); },
+    async size(key) { return inner.size(check(key)); },
+    list: (prefix) => inner.list(prefix),
+    async delete(key) { return inner.delete(check(key)); },
+    stat: () => inner.stat(),
+  };
+}
 
 /** Scope a backend to one app's private keyspace (README §12.2).
  *
@@ -74,7 +139,11 @@ const SAFE_SCOPE = /^[A-Za-z0-9._-]+$/;
  *  that wants its own footprint sums `size()` over its own `list()`, which is now
  *  exactly its own keys. */
 export function scopedFs(inner: Fs, scope: string): Fs {
-  if (!SAFE_SCOPE.test(scope)) throw new Error(`fs: unsafe scope ${JSON.stringify(scope)}`);
+  // A scope prefix must survive the key rule above — it is the head of every key this
+  // app will ever reach — so it is checked here, at construction, rather than on the
+  // first `put`. The charset only: a scope is not a whole key, so the bare-dot and
+  // device-name cases (which are about a complete name) do not apply to it.
+  if (!SAFE_CHARS.test(scope)) throw new Error(`fs: unsafe scope ${JSON.stringify(scope)}`);
   const outward = (key: string): string => scope + key;
   return {
     get: (key) => inner.get(outward(key)),

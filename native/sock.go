@@ -242,7 +242,8 @@ func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 
 // netShimJS turns the byte-level __net into the RawLink shape the host JS wants,
 // and routes Go's deliver/close/accept callbacks to the right channel. Loader glue
-// (platform binding), not shared TS — like sodiumShimJS.
+// (platform binding), not shared TS: it wires Go callbacks to the right channel and
+// hands out the RawLink objects host/native-shim.ts declares.
 const netShimJS = `
 "use strict";
 (function () {

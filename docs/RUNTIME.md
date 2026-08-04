@@ -24,18 +24,22 @@ The Go/native target carries `*_bench_test.go` benchmarks over these hot paths (
 
 ### 10.2 Distribution Size
 
+This is the one place these figures live; the README's shared-artifact list points here rather than restating them.
+
 | Component | Size |
 |---|---|
-| host/*.js — minified (`build/host-min`; ~29 KB gzipped) | ~117 KB |
+| host/*.js — minified (`build-min`, runtime code only; ~40 KB gzipped) | ~132 KB |
+| the embedded transport bundle (`host/transport-bundle.js` — the signed `.skb` as base64, so 4/3 of its 84 KB; ~40 KB gzipped) | ~112 KB |
 | libsodium.wasm (sumo build: Ed25519 + BLAKE2b + XChaCha20, the §12.1 backends) | 278 KB |
 | libsodium-wrappers.mjs + libsodium-core.mjs | 152 KB |
 | mldsa65.wasm (ML-DSA-65, the PQ half of manifest suite `0x02`, §12.4) | 18 KB |
-| **Total browser deployment** | **~565 KB** |
+| **Total browser deployment** | **~692 KB** |
+| mlkem768.wasm (ML-KEM-768, the primitive catalog's KEM, §14.1) — loaded by the Node and native hosts; the browser demo does not fetch it, because nothing in it calls the KEM yet | 12 KB |
 | QuickJS realm engine (the single release-sync build, from `quickjs-emscripten`) — only loaded when a bundle's guest runs (§12.3) | ~750 KB |
 
-The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — the raw net and fs seams, the cap-bridge, safe-js, bundle verification, policy, and the transport *driver* (§12.6), which is shared JS rather than a per-target reimplementation. The transport protocol itself is not in this figure at all: it is the guest program of a signed bundle (`transport/guest.js`), which ships inside the artifact but is content. libsodium is the host's crypto library — it backs the whole primitive catalog (§12.1) plus content hashing and the manifest signature: BLAKE2b-256, Ed25519, ChaCha20 / XChaCha20; the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). `mldsa65.wasm` is small for the opposite reason: one parameter set, no libc and no imports at all (§12.4), so it is 18 KB rather than a library. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
+The kernel costs nothing to ship: it is a map inside the host (§3), not a module. The `host/*.js` layer is the whole runtime — it holds the table, reaches handlers by name (`callHandler`), admits bundles under policy (§12.4–§12.5), and carries the whole shell (§12) — the raw net and fs seams, the cap-bridge, safe-js, bundle verification, policy, and the transport *driver* (§12.6), which is shared JS rather than a per-target reimplementation. The transport *protocol* is the row beneath it and not part of that figure: it is the guest program of a signed bundle (`transport/guest.js` plus `ws.wasm`), and it ships inside the artifact — inlined as base64 so a first fetch cannot open a metadata window — but it is content, replaceable by a second signed bundle without touching a byte above. libsodium is the host's crypto library — it backs the whole primitive catalog (§12.1) plus content hashing and the manifest signature: BLAKE2b-256, Ed25519, ChaCha20 / XChaCha20; the sumo build is larger than a sign-only build because it backs all of them. Content hashing is BLAKE2b (`crypto_generichash`), the one hash the whole system uses (§5.1). `mldsa65.wasm` is small for the opposite reason: one parameter set, no libc and no imports at all (§12.4), so it is 18 KB rather than a library. The QuickJS engine is lazy: a node that only relays and dispatches never pays for it.
 
-`npm run build` emits the host twice: the readable `build/host` (~203 KB, doc comments intact) for debugging and a comment-stripped `build/host-min` (~117 KB, ~29 KB gzipped) for shipping. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does the cut — no bundler, no new dependencies. The table's host figure is the shipped, minified build.
+`npm run build` emits the host twice: the readable `build/` (~287 KB of runtime code, doc comments intact) for debugging and a comment-stripped `build-min/` (~132 KB, ~40 KB gzipped) for shipping — the sources are more than half doc comment, which is where the halving comes from. A small dependency-free stripper (`scripts/minify.mjs`, each output gated through `node --check`) does the cut — no bundler, no new dependencies. The table's host figure is the shipped, minified build.
 
 ---
 

@@ -11,51 +11,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"seedloader/qjs"
 )
 
-// A key becomes a filename verbatim, so it must be safe + flat: no separators,
-// nothing that could escape the directory. RE2 has no lookahead, so the bare dot
-// names (directory references, not files) are excluded explicitly. seedstore's keys
-// (hex block-ids + a short suffix) satisfy this.
-var fsKeyChars = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-
-// fsReserved is the case-insensitive set of names Windows resolves to a device before
-// ever touching the filesystem: opening "CON"/"NUL"/"COM1"… (with or without an
-// extension) hits the console/null/serial device, not a file. Since a key becomes a
-// filename verbatim, a compromised guest could otherwise `put` to the console on a
-// Windows holder. Rejected on every OS so the key space — and thus which blocks a node
-// admits and advertises — is identical across Go and Bun nodes.
-var fsReserved = func() map[string]bool {
-	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
-	for i := 0; i <= 9; i++ { // COM0/LPT0 are reserved on current Windows too
-		m[fmt.Sprintf("COM%d", i)] = true
-		m[fmt.Sprintf("LPT%d", i)] = true
-	}
-	return m
-}()
-
-// fsReservedName reports whether k resolves to a Windows device. The stem before the
-// first '.' decides it, since Windows ignores the extension: "NUL.txt" is still NUL.
-func fsReservedName(k string) bool {
-	stem := k
-	if i := strings.IndexByte(stem, '.'); i >= 0 {
-		stem = stem[:i]
-	}
-	return fsReserved[strings.ToUpper(stem)]
-}
-
+// WHICH KEYS ARE LEGAL IS NOT DECIDED HERE. The charset, the bare-dot names and the
+// Windows device names are one rule shared by every target — `isSafeFsKey` in
+// WASM/core/fs.ts, applied over this backend by `validatedFs` before a key reaches Go.
+// It lives there because it is a consensus predicate: which keys a node admits decides
+// which blocks it stores and advertises, and a second copy here is exactly how a Go
+// node and a Bun node would come to disagree about their contents. This file used to
+// carry that copy, under a comment saying the two had to match.
+//
+// What stays is containment, which is this backend's own business: a key becomes a
+// filename verbatim under f.dir, so anything that could name something outside it is
+// refused whatever admitted it. Defence in depth, not the rule being relied on.
+// The empty key is refused first and explicitly: filepath.Join(dir, "") is the DATA
+// DIRECTORY itself, so an unchecked "" would make delete("") an os.Remove of the store.
 func fsKeySafe(k string) bool {
-	return k != "." && k != ".." && fsKeyChars.MatchString(k) && !fsReservedName(k)
+	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, `/\`) && !strings.ContainsRune(k, 0)
 }
 
 // fsTmpPrefix marks the scratch files put() writes before renaming onto a key. It
-// carries a '~', which fsKeyChars forbids, so a temp name can never collide with a real
-// key — and list()/scanUsed() skip it, so an in-flight or crash-orphaned temp is never
-// mistaken for a stored block.
+// carries a '~', which the shared key charset forbids, so a temp name can never collide
+// with a real key — and list()/scanUsed() skip it, so an in-flight or crash-orphaned
+// temp is never mistaken for a stored block.
 const fsTmpPrefix = "~put-"
 
 // fsMaxAvailable mirrors fs-node.ts's fallback (Number.MAX_SAFE_INTEGER): a large
@@ -230,10 +211,10 @@ func (f *nodeFs) delete(key string) bool {
 // O(N) directory walk the storage guest's per-offer admission check would otherwise pay.
 func (f *nodeFs) stat() int64 { return f.used }
 
-// exposeFs installs the `fs` object into the realm: Go byte primitives (ArrayBuffer
-// in / out) wrapped by a thin JS shim into the core/fs.ts `Fs` shape (Uint8Array,
-// null for a miss). Keeping bytes in Go and the API shape in JS follows the project
-// rule — Go grows with primitives, the reusable interface lives in JS.
+// exposeFs installs `__fs` into the realm: Go byte primitives, ArrayBuffer in and out.
+// Shaping them into the async core/fs.ts `Fs` seam (Uint8Array, null for a miss) is
+// host/native-shim.ts, and the key rule is applied above that again by the shell
+// (`validatedFs`). Go grows with primitives; the reusable interface lives in JS.
 func exposeFs(qc *qjs.Context, dir string) error {
 	fs, err := newNodeFs(dir)
 	if err != nil {
@@ -274,7 +255,8 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		// One \n-joined string, split back into an array by the shim: building a JS
 		// array here costs an engine call (plus a C string) per key, so a content store
 		// with tens of thousands of blocks paid tens of thousands of crossings per
-		// listing. fsKeyChars forbids '\n' in a key, so the join is unambiguous.
+		// listing. The shared key charset (core/fs.ts) forbids '\n', so the join is
+		// unambiguous.
 		return t.Context().NewString(strings.Join(fs.list(prefix), "\n")), nil
 	}))
 	o.SetPropertyStr("delete", fn(func(t *qjs.This) (*qjs.Value, error) {

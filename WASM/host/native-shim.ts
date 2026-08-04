@@ -53,11 +53,103 @@ declare const bridge: {
   realmDispose(realm: number): void;
 };
 
-/** libsodium, in libsodium-wrappers method names (native/sodium.go), plus the PQ
- *  half (native/mldsa.go) and the catalog's KEM (native/mlkem.go). Typed as the full
- *  surface the shared code consumes, so a Go shim that stops satisfying one of them
- *  fails the build rather than a handshake. */
-declare const sodium: ShellSodium;
+/** Go's raw crypto primitives (native/sodium.go, plus native/mldsa.go and
+ *  native/mlkem.go on the same object). Bytes come back as ArrayBuffers and a failure
+ *  comes back as `null`, because that is what the bridge can carry — every method here
+ *  is one wazero or Go call and nothing more.
+ *
+ *  `crypto_generichash` takes its optional key so the native blake2b shim can REFUSE a
+ *  keyed hash loudly; dropping the argument here would turn a MAC into a plain hash. */
+declare const __sodium: {
+  crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): ArrayBuffer;
+  crypto_stream_xchacha20_xor(message: Uint8Array, nonce: Uint8Array, key: Uint8Array): ArrayBuffer;
+  crypto_sign_detached(message: Uint8Array, sk: Uint8Array): ArrayBuffer;
+  crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
+  crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): ArrayBuffer | null;
+  /** libsodium-wrappers' signature is (message, ad, nsec, npub, key); the record layer
+   *  uses no additional data, so the native primitive takes just (m, npub, key). */
+  crypto_aead_chacha20poly1305_ietf_encrypt(message: Uint8Array, npub: Uint8Array, key: Uint8Array): ArrayBuffer;
+  crypto_aead_chacha20poly1305_ietf_decrypt(ciphertext: Uint8Array, npub: Uint8Array, key: Uint8Array): ArrayBuffer | null;
+  crypto_sign_keypair(): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
+  crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
+  randombytes_buf(n: number): ArrayBuffer;
+  ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
+  ml_kem768_keypair_from_seed(seed: Uint8Array): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
+  ml_kem768_encaps(pk: Uint8Array, coins: Uint8Array): { ciphertext: ArrayBuffer; sharedSecret: ArrayBuffer } | null;
+  ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): ArrayBuffer | null;
+};
+
+/** The crypto surface this target serves: everything the shared code consumes
+ *  (`ShellSodium`), plus the two keypair producers a node's identity comes out of
+ *  (`SubkeyCrypto`, core/subkeys.ts, is the narrower of the two).
+ *
+ *  `crypto_generichash` is restated with its key OPTIONAL, which is what satisfies both
+ *  halves of `ShellSodium` at once: the loader calls it with an explicit `null` key and
+ *  the cap-bridge calls it with two arguments. */
+export interface NativeSodium extends ShellSodium {
+  crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
+  crypto_sign_keypair(): Keypair;
+  crypto_sign_seed_keypair(seed: Uint8Array): Keypair;
+}
+
+/** libsodium, in libsodium-wrappers method names, over Go's primitives: Uint8Array
+ *  results, `{publicKey, privateKey}` keypairs, and a throw where the wrappers throw.
+ *
+ *  **This adaptation is here rather than in Go**, where it used to be a JS string
+ *  literal (`sodiumShimJS`). It is ordinary shaping code — the kind that must be
+ *  identical on every target — and as a string it was the one part of the seam
+ *  TypeScript never saw: the `ShellSodium` annotation below was an assertion about a
+ *  Go constant rather than a check of it. Now a primitive that stops satisfying the
+ *  surface fails the build, which is what the annotation always claimed. Go keeps the
+ *  byte primitives and nothing else.
+ *
+ *  `null` means different things on the two halves and both are preserved: libsodium's
+ *  wrappers throw on a failed open or a bad scalarmult, while ML-KEM's `null` is a
+ *  *rejection* the caller must be able to read (a key failing FIPS 203's checks), so it
+ *  is passed through. */
+function wrapNativeSodium(N: typeof __sodium): NativeSodium {
+  const u8 = (b: ArrayBuffer) => new Uint8Array(b);
+  const kp = (k: { publicKey: ArrayBuffer; privateKey: ArrayBuffer }): Keypair =>
+    ({ publicKey: u8(k.publicKey), privateKey: u8(k.privateKey) });
+  return {
+    crypto_generichash: (len: number, m: Uint8Array, key?: Uint8Array | null) => u8(N.crypto_generichash(len, m, key)),
+    crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
+    crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
+    crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
+    ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
+    crypto_scalarmult: (sk, pk) => {
+      const r = N.crypto_scalarmult(sk, pk);
+      if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");
+      return u8(r);
+    },
+    crypto_aead_chacha20poly1305_ietf_encrypt: (m, _ad, _nsec, npub, key) =>
+      u8(N.crypto_aead_chacha20poly1305_ietf_encrypt(m, npub, key)),
+    crypto_aead_chacha20poly1305_ietf_decrypt: (_nsec, c, _ad, npub, key) => {
+      const r = N.crypto_aead_chacha20poly1305_ietf_decrypt(c, npub, key);
+      if (r === null) throw new Error("crypto_aead_chacha20poly1305_ietf_decrypt: verification failed");
+      return u8(r);
+    },
+    crypto_sign_keypair: () => kp(N.crypto_sign_keypair()),
+    crypto_sign_seed_keypair: (seed) => kp(N.crypto_sign_seed_keypair(seed)),
+    randombytes_buf: (n) => u8(N.randombytes_buf(n)),
+    ml_kem768_keypair_from_seed: (seed) => kp(N.ml_kem768_keypair_from_seed(seed)),
+    ml_kem768_encaps: (pk, coins) => {
+      const r = N.ml_kem768_encaps(pk, coins);
+      return r === null ? null : { ciphertext: u8(r.ciphertext), sharedSecret: u8(r.sharedSecret) };
+    },
+    ml_kem768_decaps: (sk, ct) => {
+      const r = N.ml_kem768_decaps(sk, ct);
+      return r === null ? null : u8(r);
+    },
+  };
+}
+
+/** The one `sodium` this target has. Exported — and published as a global by the loader
+ *  bundle — so the native tests drive the same wrapper production does, for the reason
+ *  `fs` below is exported: a second shaping in a harness is a second thing to keep in
+ *  step. Built at module scope because `embeddedTransportAuthor` verifies a bundle with
+ *  it further down this file. */
+export const sodium: NativeSodium = wrapNativeSodium(__sodium);
 
 /** The `fs.*` primitive over Go's data directory (native/fs.go).
  *
@@ -74,7 +166,7 @@ declare const __fs: {
   /** One `\n`-joined string, not an array: building a JS array on the Go side costs an
    *  engine call (plus a C string) per key, so a content store with tens of thousands of
    *  blocks paid tens of thousands of crossings per listing. A key may not contain `\n`
-   *  (`fsKeyChars`), so the join is unambiguous. */
+   *  (`isSafeFsKey`, core/fs.ts), so the join is unambiguous. */
   list(prefix?: string): string;
   delete(key: string): boolean;
   stat(): { used: number; available: number };

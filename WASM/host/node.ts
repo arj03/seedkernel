@@ -3,9 +3,9 @@
 // the runtime through `./shell-core` and readies its own libsodium (docs/EXPORTS.md).
 
 import { readFileSync } from "node:fs";
-import { KernelHost } from "../core/kernel-host.js";
-import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "../core/pq.js";
-import { withMlKem768, loadMlKem768 } from "../core/kem.js";
+import { KernelHost } from "./kernel-host.js";
+import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "./pq.js";
+import { withMlKem768, loadMlKem768 } from "./kem.js";
 
 // The runtime bundles the sumo build so apps that need symbols beyond the
 // kernel's own Ed25519 + BLAKE2b (e.g. seedstore's crypto_stream_xchacha20_xor)
@@ -74,7 +74,7 @@ export function generatePqKeyPair(): {
   publicKey: Uint8Array;
   privateKey: Uint8Array;
 } {
-  const pq = sodium as unknown as Partial<import("../core/pq.js").MlDsa65Signer>;
+  const pq = sodium as unknown as Partial<import("./pq.js").MlDsa65Signer>;
   if (!pq.ml_dsa65_keypair_from_seed) throw new Error("node: call ensureSodium() before generatePqKeyPair()");
   return pq.ml_dsa65_keypair_from_seed(sodium.randombytes_buf(ML_DSA65_SEED_LEN));
 }
@@ -87,4 +87,4 @@ export function generateKeyPair(): {
   return { publicKey: kp.publicKey, privateKey: kp.privateKey };
 }
 
-export { KernelHost } from "../core/kernel-host.js";
+export { KernelHost } from "./kernel-host.js";

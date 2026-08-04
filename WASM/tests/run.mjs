@@ -51,8 +51,8 @@ const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNa
          signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
-const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/core/pq.js");
-const { withMlKem768, loadMlKem768 } = await imp("build/core/kem.js");
+const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
+const { withMlKem768, loadMlKem768 } = await imp("build/host/kem.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -429,6 +429,65 @@ async function testFs() {
   console.log("  OK\n");
 }
 
+// ─── Test: the fs key space is ONE rule, shared by every target ──────────
+//
+// Which keys a node admits decides which blocks it stores and advertises, so it is a
+// consensus predicate: a Go node and a Bun node that disagree about it disagree about
+// their contents. The rule therefore lives in shared JS (core/fs.ts `isSafeFsKey`) and
+// is applied over whatever backend a target supplies (`validatedFs`), rather than being
+// written once in host/fs-node.ts and again in native/fs.go — which is where it was,
+// under a comment on each copy saying the two had to match.
+
+async function testFsKeyRule() {
+  console.log("Test: fs key space is one rule — isSafeFsKey over any backend (validatedFs)");
+
+  const { isSafeFsKey, validatedFs, scopedFs } = await imp("build/core/fs.js");
+
+  const legal = ["a", "a.blk", "A_b-c.9", "0".repeat(64) + ".blk", "_", "-", "..a", "a.."];
+  for (const k of legal) assert(isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should hold`);
+
+  const illegal = [
+    "", ".", "..",                       // names nothing, or names a directory
+    "a/b", "..\\escape", "../escape",     // separators and traversal
+    "a b", "a\x00b", "a:b", "a*b", "~tmp", "é",  // outside the charset
+    "CON", "nul", "Aux", "COM1", "COM0", "LPT9", "con.txt", "NUL.tar.gz", // Windows devices,
+  ];                                     // case- and extension-insensitively
+  for (const k of illegal) assert(!isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should not hold`);
+
+  // validatedFs applies it to every op that NAMES a key, as a rejection rather than a
+  // silent miss: an unrepresentable key is a caller bug on read exactly as on write.
+  const fs = validatedFs(new MemoryFs());
+  await fs.put("ok.blk", new Uint8Array([1]));
+  for (const [what, call] of [
+    ["put", () => fs.put("a/b", new Uint8Array([1]))],
+    ["get", () => fs.get("a/b")],
+    ["size", () => fs.size("CON")],
+    ["delete", () => fs.delete("")],
+  ]) {
+    let rejected = false;
+    try { await call(); } catch { rejected = true; }
+    assert(rejected, `validatedFs rejects an unsafe key on ${what}`);
+  }
+
+  // …and to none that does not. `list()` takes a PREFIX, and the empty prefix — "every
+  // key I can see" — is exactly the call a key rule applied here would wrongly refuse.
+  assertEqual((await fs.list()).join(","), "ok.blk", "validatedFs leaves list(undefined) alone");
+  assertEqual((await fs.list("ok")).join(","), "ok.blk", "validatedFs leaves a list prefix alone");
+  assert((await fs.stat()).used === 1, "validatedFs leaves stat alone");
+
+  // The shell wraps the backend UNDER scopedFs, so what the rule sees is the composite
+  // key the medium sees — a guest key that would escape its scope is refused even though
+  // the scope prefix is itself legal.
+  const scoped = scopedFs(fs, "abcd1234");
+  await scoped.put("mine.blk", new Uint8Array([2]));
+  assert((await fs.get("abcd1234mine.blk")) !== null, "scoped put lands under the scope");
+  let escaped = false;
+  try { await scoped.put("../../etc", new Uint8Array([3])); } catch { escaped = true; }
+  assert(escaped, "a scoped key with separators is refused on the composite");
+
+  console.log("  OK\n");
+}
+
 // ─── Test: guest-side net fan-out over NET_SEND (Promise.all) ────────────
 //
 // Fan-out is no longer a host op: with real promises at the seam, a confined guest
@@ -595,7 +654,7 @@ async function testPolicy() {
   const bad = generateKeyPair();
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
-  const { KernelHost } = await imp("build/core/kernel-host.js");
+  const { KernelHost } = await imp("build/host/kernel-host.js");
   const tryLoad = async (policyJson, author, extra = {}) => {
     const host = new KernelHost();
     const manifest = { app: "mod", version: 1, ...extra,
@@ -707,7 +766,7 @@ async function testSlotFreshness() {
   console.log("Test: a slot occupant carries the ordinary (author, app) freshness mark");
 
   const { FreshnessMarks } = await imp("build/host/bundle.js");
-  const { KernelHost } = await imp("build/core/kernel-host.js");
+  const { KernelHost } = await imp("build/host/kernel-host.js");
 
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -1919,6 +1978,7 @@ await testDerivedNamesKeepAuthorsApart();
 await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();
 await testFs();
+await testFsKeyRule();
 await testCapBridge();
 await testPolicy();
 await testGuestAbi();

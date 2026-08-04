@@ -15,7 +15,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 await _sodium.ready;
 const sodium = _sodium;
 
-const { KernelHost } = await imp("build/core/kernel-host.js");
+const { KernelHost } = await imp("build/host/kernel-host.js");
 const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
 const { scopedFs } = await imp("build/core/fs.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
