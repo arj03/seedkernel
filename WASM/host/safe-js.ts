@@ -189,54 +189,63 @@ function copyPayload(ctx: QuickJSContext, payloadHandle: QuickJSHandle): Uint8Ar
   return payload;
 }
 
-/** Take ownership of a result handle and copy its bytes out (copy boundary). */
+/** Take ownership of a result handle and copy its bytes out (copy boundary). The
+ *  handle must go back even when the value is not an ArrayBuffer — a guest entrypoint
+ *  that returns a non-bytes value must not leave an orphaned handle behind, because
+ *  an orphaned handle keeps its object on the runtime's GC list, which aborts the
+ *  module at runtime free. */
 function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
   const lt = ctx.getArrayBuffer(handle);
-  const out = lt.value.slice();
-  lt.dispose();
-  handle.dispose();
-  return out;
+  try {
+    return lt.value.slice();
+  } finally {
+    lt.dispose();
+    handle.dispose();
+  }
 }
 
 const invokeSrc = (entry: string): string => `__invoke(${JSON.stringify(entry)}, __arg)`;
 
-/** A realm's QuickJS **runtime** is created separately from its context and deliberately
- *  never freed: `dispose()` frees the context, and `JS_FreeRuntime` is never called.
+/** Release a settled `resolvePromise` result (a `DisposableResult` carrying a dup'd
+ *  handle) that no invocation will ever consume. Best-effort: the handle may already
+ *  be gone (e.g. `unwrapResult` disposed the error it threw), and a throw here would
+ *  surface as an unhandled rejection long after the caller left. */
+const disposeDisposableResult = (result: unknown): void => {
+  try {
+    const disposable = result as { alive?: boolean; dispose?: () => void } | null;
+    if (disposable && disposable.dispose && disposable.alive !== false) disposable.dispose();
+  } catch {
+    // Nothing left to release — exactly the state this is for.
+  }
+};
+
+/** A realm's QuickJS **runtime** is created separately from its context, and `dispose()`
+ *  frees both: the context first, its runtime in the same deferred turn.
  *
- *  Not tidiness — the alternative is a process abort. Under many concurrent live realms, a
- *  realm reaches teardown with its JSContext refcount still above one, so `JS_FreeContext`
- *  returns early, the context stays on the GC object list, and `JS_FreeRuntime` fails its
- *  `list_empty(&rt->gc_obj_list)` assertion. That assertion aborts the whole wasm module —
- *  every other realm in the process with it — and it is reached from ordinary teardown of
- *  a realm that did nothing wrong.
+ *  The ordering is required by `JS_FreeRuntime`, which asserts an empty GC object list
+ *  (`list_empty(&rt->gc_obj_list)`): any object still referenced — for example by an
+ *  undisposed host handle — aborts the whole wasm module, every other realm in the
+ *  process with it. The realm releases every handle it owns before teardown, so nothing
+ *  survives to the runtime's free.
  *
- *  Nothing observable across the host seam is outstanding when it happens: no pending job,
- *  no invocation in flight, no parked caller, no rejected or dropped bridge call, no
- *  undisposed handle beyond the scope-managed global, no FFI pointer reuse. Every
- *  "abnormal state at teardown" shape — an unsettled guest promise, a suspended async
- *  function, a queued job, an unhandled rejection, a budget interrupt inside a
- *  continuation, OOM — tears down cleanly in isolation. The extra reference is held inside
- *  the engine, outside the GC graph, by something that never crosses this seam.
+ *  Teardown is deferred one macrotask so a parked invocation's rejection continuation —
+ *  the `finally` in `invoke` — can run as a microtask after `failPending` while the
+ *  context is still alive. By the macrotask, nothing can re-enter (the queue fails on
+ *  `disposed`), so the realm is quiescent when it dies. The context goes first because
+ *  `JS_FreeRuntime`'s assertion is satisfiable only once the context and its GC objects
+ *  are gone.
  *
- *  Deferring the free does not help, and that is worth recording so nobody tries it again:
- *  the failure is a race, not a settling time. Swept against a suite that reproduces it,
- *  50 ms aborts, 100 ms is clean, 150 / 200 / 250 ms abort, 300 ms and up are clean —
- *  non-monotone, so there is no threshold and no margin to buy. Freeing the runtime one
- *  turn after the context is the same lottery.
- *
- *  Leaving the runtime alive cannot hit the assertion, because the assertion is only in
- *  `JS_FreeRuntime`. What it costs is roughly 1.2 MB RSS per realm ever created, held for
- *  the life of the process. A host that stands up realms in bulk — a test suite, a CLI
- *  run — pays it once and exits; a long-lived node pays per app install and upgrade, which
- *  is the case to watch. Bounding it properly means finding the reference: a quickjs-ng
- *  build whose leak dump names ref holders, or an instrumented `JS_DupContext`. */
-const newLeakedRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
+ *  `dispose()` thus returns the realm's memory — roughly 1.2 MB per runtime — to the
+ *  wasm heap. */
+const newRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
 
 export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
   const mod = await getModule();
-  // NOT `mod.newContext()`: that makes the context own the runtime and free it in the same
-  // breath, which is the abort described at newLeakedRuntime.
-  const ctx: QuickJSContext = newLeakedRuntime(mod).newContext();
+  // NOT `mod.newContext()`: that couples the runtime's lifetime to the context's, freeing
+  // both in the same breath — the teardown order described above, which dispose() must
+  // control itself.
+  const runtime = newRuntime(mod);
+  const ctx: QuickJSContext = runtime.newContext();
   const clock = configureRealm(ctx, opts);
   let disposed = false;
 
@@ -360,8 +369,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // only once the job queue is pumped — hence resolvePromise → executePendingJobs →
     // await, in that order (awaiting before the first pump would stall a sync entrypoint).
     // Awaits are then driven by each deferred's own executePendingJobs on settle.
-    let evalResult: QuickJSHandle;
-    let settledNative: Promise<unknown>;
+    let evalResult: QuickJSHandle | undefined;
+    let settledNative: Promise<unknown> | undefined;
     clock.begin();
     try {
       evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js"));
@@ -371,21 +380,31 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // Closed before the await below: everything past this point is the host
       // waiting on a bridge, which is not the guest's time to spend.
       clock.end();
+      // resolvePromise has consumed the value; the eval handle is no longer needed
+      // and must go back even when pumpJobs throws above — an orphaned handle keeps
+      // its object on the runtime's GC list, which aborts the module at runtime free.
+      evalResult?.dispose();
     }
     let rejectThis!: (err: Error) => void;
     const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
     pending.add(rejectThis);
+    let consumed = false;
     try {
-      const settled = await Promise.race([settledNative, failed]);
+      const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
+      consumed = true;
       return takeBytes(ctx, ctx.unwrapResult(settled as never));
     } finally {
       pending.delete(rejectThis);
-      // In `finally` for the same reason as settleNet's handles: an interrupted or
-      // failed call must not leave this alive, or dispose() aborts the module.
-      // Unconditional because dispose() defers the context teardown (see below):
-      // whether the call completed or was interrupted by failPending, this finally
-      // runs while the context is still alive, so the handle is always releasable.
-      evalResult.dispose();
+      // An invocation that lost the race to failPending — a budget interrupt or
+      // dispose() — has no consumer for the settled result. If the guest promise
+      // still settles afterwards (a bridge op resolving after the interrupt), its
+      // dup'd result handle would be orphaned, keeping the value on the runtime's
+      // GC list and aborting the module at runtime free. Release it when it lands.
+      // Safe by construction: `consumed` is set by the await continuation above,
+      // which always runs before this finally.
+      if (!consumed) {
+        void (settledNative as Promise<unknown>).then(disposeDisposableResult);
+      }
     }
   };
 
@@ -398,17 +417,19 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller.
       failPending(new Error("guest realm disposed"));
-      // ...but the context itself must NOT die in the same turn. A parked invocation's
-      // rejection continuation — the `finally` above, which releases its evalResult
-      // handle — runs as a microtask after failPending, and the quickjs-ng build
-      // asserts an empty gc object list at JS_FreeRuntime, so a handle released after
-      // the context died would abort the whole wasm module. Deferring the teardown to a
-      // later macrotask runs it after every microtask of the parked continuations, by
-      // which point nothing can re-enter (the queue fails on `disposed`): the context is
-      // quiescent when it dies. Only the context goes: its runtime is left alive on
-      // purpose, for the reason at newLeakedRuntime.
+      // ...but the engine must NOT die in the same turn. A parked invocation's
+      // rejection continuation — the `finally` above — runs as a microtask after
+      // failPending, and a handle released after its context died would abort the whole
+      // wasm module. Deferring the teardown to a later macrotask runs it after every
+      // microtask of the parked continuations, by which point nothing can re-enter (the
+      // queue fails on `disposed`): the realm is quiescent when it dies. The context goes
+      // first and its runtime in the same turn — JS_FreeRuntime's empty-GC-list assertion
+      // is only satisfiable once the context is gone (see newRuntime above).
       const timer = setTimeout(() => {
-        if (disposed && ctx.alive) ctx.dispose();
+        if (disposed && ctx.alive) {
+          ctx.dispose();
+          runtime.dispose();
+        }
       }, 0) as unknown as { unref?: () => void };
       // Freeing a realm is housekeeping, so it must not be a reason for a process to stay
       // up: a host that disposes its last realm and exits should not wait a turn to
