@@ -82,18 +82,14 @@ func (h *timerHeap) Pop() any {
 	return t
 }
 
-// newEventLoop binds a loop to a QuickJS context and installs the browser-like
-// async surface (setTimeout/clearTimeout/queueMicrotask) the shared JS expects.
+// newEventLoop binds a loop to a QuickJS context and installs the timer surface the
+// shared JS expects (setTimeout/clearTimeout), which only a Go-owned loop can back.
 func newEventLoop(c *qjs.Context) *eventLoop {
 	el := &eventLoop{c: c, byID: map[int64]*jsTimer{}, tasks: make(chan func(), 256), settleInstalled: map[*qjs.Context]bool{}}
 	el.install()
 	return el
 }
 
-// addContext registers another QuickJS context to be pumped alongside el.c, so a
-// promise reaction in that realm (e.g. a guest entrypoint's settling __settle) runs as
-// part of this loop. The guest realm uses native Promises only (no Go timers), so it
-// needs no separate loop — just its job queue drained.
 // pumpEntry pairs a registered context with the func that drains it, so removeContext
 // can still identify the entry by context while pumpAll goes through the realm's guard.
 type pumpEntry struct {
@@ -101,8 +97,11 @@ type pumpEntry struct {
 	pump func()
 }
 
-// addContext registers a context pumped alongside el.c. pump is how it gets drained —
-// a guest realm passes its budget-guarded pump; anything else passes a bare Pump.
+// addContext registers another QuickJS context to be pumped alongside el.c, so a promise
+// reaction in that realm (e.g. a guest entrypoint's settling __settle) runs as part of
+// this loop. The guest realm uses native Promises only (no Go timers), so it needs no
+// separate loop — just its job queue drained. pump is how that draining happens: a guest
+// realm passes its budget-guarded pump; anything else passes nil for a bare Pump.
 func (el *eventLoop) addContext(c *qjs.Context, pump func()) {
 	if pump == nil {
 		pump = func() { _ = c.Pump() }
@@ -181,11 +180,9 @@ func (el *eventLoop) install() {
 		el.stopped = true
 		return nil, nil
 	}))
-	// queueMicrotask isn't a quickjs-ng global; polyfill over a settled promise
-	// (its reaction is a job, drained by Pump).
-	if _, err := el.c.Eval("<loop-setup>", qjs.Code(`globalThis.queueMicrotask = (f) => { Promise.resolve().then(f); };`)); err != nil {
-		panic(fmt.Sprintf("eventLoop install: %v", err))
-	}
+	// queueMicrotask is not installed here: it is not loop state but a missing Web
+	// global, so it lives with the rest of them in polyfill.go — one polyfill per
+	// global, installed on every realm the same way.
 }
 
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.
@@ -347,12 +344,6 @@ func (el *eventLoop) await(callExpr string, timeout time.Duration) (kind int, va
 	return el.awaitIn(el.c, callExpr, timeout)
 }
 
-// awaitIn evaluates an async JS expression in context c and drives the loop (pumping
-// every registered context) until it settles: kind 0 (fulfilled, with the resolved
-// Uint8Array/ArrayBuffer bytes) or kind 1 (rejected, with the error string). timeout
-// bounds the wait as a safety net. c may be the host realm (a serve op) or a guest
-// realm (runGuest) — either way the whole loop is driven, so a guest awaiting net is
-// resumed by the host realm's socket I/O.
 // ensureSettle lazily installs context c's persistent __settle resolver — the JS hook
 // awaitIn's wrapped promise calls. It routes into el.onSettle (the in-flight await's
 // result sink), so each await reuses one callback instead of registering a fresh one;
@@ -382,7 +373,14 @@ func (el *eventLoop) ensureSettle(c *qjs.Context) {
 	el.settleInstalled[c] = true
 }
 
-// awaitIn is NOT re-entrant: el.onSettle is a single shared slot, and the defer below
+// awaitIn evaluates an async JS expression in context c and drives the loop (pumping
+// every registered context) until it settles: kind 0 (fulfilled, with the resolved
+// Uint8Array/ArrayBuffer bytes) or kind 1 (rejected, with the error string). timeout
+// bounds the wait as a safety net. c may be the host realm (a serve op) or a guest realm
+// (runGuest) — either way the whole loop is driven, so a guest awaiting net is resumed by
+// the host realm's socket I/O.
+//
+// It is NOT re-entrant: el.onSettle is a single shared slot, and the defer below
 // resets it to nil (not a saved previous value), so a nested awaitIn would orphan the
 // outer await's result sink. The loader never nests it — only one await is in flight at a
 // time. A guest's net host.call settles through its own realm's callbacks (guest.go

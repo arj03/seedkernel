@@ -97,20 +97,19 @@ var sodiumExports = map[string]string{
 	"crypto_stream_xchacha20_xor":          "jm",
 	"crypto_sign_detached":                 "Nh",
 	"crypto_sign_verify_detached":          "Oh",
-	"crypto_core_ed25519_is_valid_point":   "uk",
 	"crypto_sign_keypair":                  "Kh",
 	"crypto_sign_seed_keypair":             "Jh",
 	"crypto_sign_ed25519_pk_to_curve25519": "fi",
 	"crypto_sign_ed25519_sk_to_curve25519": "gi",
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
-	// The §12.6 transport AKE's ephemeral X25519 — box keypair + scalarmult — stays on
-	// wasm (handshake-only, amortized over the link). The transport bundle's guest
-	// reaches them through the cap-bridge's primitive catalog, which resolves to the
-	// `sodium` object below. The ChaCha20-Poly1305-IETF record layer is native Go
+	// The §12.6 transport AKE's X25519 stays on wasm (handshake-only, amortized over
+	// the link). One export covers it: the transport bundle reaches scalarmult through
+	// the cap-bridge's `x25519/dh`, and derives its ephemeral PUBLIC key with that same
+	// entry against the base point — so there is no separate keypair primitive to export
+	// (cap-bridge.ts says as much). The ChaCha20-Poly1305-IETF record layer is native Go
 	// (see aeadEncrypt / the file header), so it needs no export here.
-	"crypto_box_keypair": "Ua",
-	"crypto_scalarmult":  "Dg",
+	"crypto_scalarmult": "Dg",
 }
 
 // EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes
@@ -309,20 +308,10 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
 }
 
-// isValidPoint gates a public key on crypto_core_ed25519_is_valid_point: canonical
-// encoding, on the curve, prime-order subgroup, not the identity. The genesis verifier
-// applies it before verifying, matching the JS host's _pubkeyIsValidPoint
-// (kernel-host.ts) — a key one target accepts must be a key the other accepts, or two
-// nodes disagree on whether a message is signed (§12.6).
-func (s *libsodium) isValidPoint(pk []byte) bool {
-	if len(pk) != 32 {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(pk)))
-	return s.call("crypto_core_ed25519_is_valid_point", uint64(s.takeIn(pk))) == 1
-}
+// There is no separate public-key point check. crypto_core_ed25519_is_valid_point used
+// to gate keys here to match a JS-side _pubkeyIsValidPoint, but no target does that any
+// more — Ed25519 verification is the one gate, on every target, and a second one on only
+// this one would be the exact disagreement it was added to prevent (§12.6).
 
 func (s *libsodium) signKeypair() (pk, sk []byte) {
 	s.mu.Lock()
@@ -388,20 +377,11 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 
 // ── §12.6 transport AKE primitives ──
 
-// boxKeypair mints a fresh ephemeral X25519 keypair (32-byte pk + sk) for one
-// PeerLink connection's key exchange.
-func (s *libsodium) boxKeypair() (pk, sk []byte) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(32) + alignUp(32))
-	pkp, skp := s.take(32), s.take(32)
-	s.call("crypto_box_keypair", uint64(pkp), uint64(skp))
-	return s.read(pkp, 32), s.read(skp, 32)
-}
-
-// scalarmult computes the X25519 shared point q = n·p (32 bytes). Returns
-// ok=false on a low-order / all-zero result (return -1), which PeerLink treats as
-// a failed handshake — mirroring libsodium-wrappers throwing there.
+// scalarmult computes the X25519 shared point q = n·p (32 bytes). Against the base
+// point it is also the ephemeral public-key derivation, which is why the AKE needs no
+// keypair primitive of its own. Returns ok=false on a low-order / all-zero result
+// (return -1), which the handshake treats as failed — mirroring libsodium-wrappers
+// throwing there.
 func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -493,10 +473,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		}
 		return ab(t, pt), nil
 	}))
-	o.SetPropertyStr("crypto_box_keypair", fn(func(t *qjs.This) (*qjs.Value, error) {
-		pk, skv := s.boxKeypair()
-		return keypairObj(t.Context(), pk, skv), nil
-	}))
 	o.SetPropertyStr("crypto_scalarmult", fn(func(t *qjs.This) (*qjs.Value, error) {
 		q, ok := s.scalarmult(arg(t, 0), arg(t, 1))
 		if !ok {
@@ -569,11 +545,7 @@ const sodiumShimJS = `
       if (r === null) throw new Error("crypto_box_seal_open: incorrect key pair for the given ciphertext");
       return u8(r);
     },
-    // §12.6 transport AKE: ephemeral X25519 + ChaCha20-Poly1305-IETF record layer.
-    crypto_box_keypair: () => {
-      const k = N.crypto_box_keypair();
-      return { publicKey: u8(k.publicKey), privateKey: u8(k.privateKey), keyType: "x25519" };
-    },
+    // §12.6 transport AKE: X25519 + ChaCha20-Poly1305-IETF record layer.
     crypto_scalarmult: (sk, pk) => {
       const r = N.crypto_scalarmult(sk, pk);
       if (r === null) throw new Error("crypto_scalarmult: unexpected result of the multiplication");

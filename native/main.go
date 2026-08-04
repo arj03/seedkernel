@@ -75,7 +75,7 @@ var (
 
 // defaultScratchSize is the I/O region a handler reserves at `scratch` when it declares
 // none (README §4.1). One needing more exports a `scratchSize` global — seedstore's codec
-// reserves 2 MB for whole-chunk shards — which installWasm reads once and clamps its
+// reserves 2 MB for whole-chunk shards — which instantiateWasm reads once and clamps its
 // cross-module copies to.
 const defaultScratchSize = 0x20000 // 128 KB
 
@@ -230,7 +230,8 @@ func instantiateWasm(wasm []byte) (*wasmHandler, error) {
 }
 
 // installWasm compiles, instantiates, validates, and binds in one call. Kept as a
-// convenience for the direct tests; the two-phase path is instantiateWasm + bindWasm.
+// convenience for the direct tests; the production path is bindAll, which needs the
+// instantiate and the bind as separate phases to stay all-or-none.
 func installWasm(n string, wasm []byte) error {
 	w, err := instantiateWasm(wasm)
 	if err != nil {
@@ -413,7 +414,7 @@ func exposeBridge(qc *qjs.Context) {
 
 // ───────────────────────── driving the shell ─────────────────────────
 
-// callShell drives one of the shim's entry points (host/native-shim.ts) to completion:
+// callRealm drives one of the shim's entry points (host/native-shim.ts) to completion:
 // it stages the arguments as __a0…__aN in the host realm, evaluates `name(__a0, …)`,
 // and pumps the loop until the returned promise settles — resolving to the bytes it
 // produced, or to the realm's error message. Every Go→shell call goes through here, so

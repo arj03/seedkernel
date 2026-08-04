@@ -195,8 +195,8 @@ func (n *netHost) closeListeners() {
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
 func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
-	// Socket buffers are already set on the listener (pre-bind, via ListenConfig.Control)
-	// and inherited here, so the accepted connection's window scale is sized correctly.
+	// The accepted socket keeps the kernel's default buffers, inherited from a listener
+	// that sets none — deliberately, so receive autotuning stays on (see listen above).
 	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id))
 	return c, func() { go c.readLoop() }
 }

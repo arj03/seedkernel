@@ -63,9 +63,7 @@ type guestRealm struct {
 	loop   *eventLoop
 
 	capCall *qjs.Value // retained host-realm cap call — this app's whole authority
-	invoke  *qjs.Value // guest-realm __invoke (the synchronous holder hot path)
-	start   *qjs.Value // guest-realm __start (an initiator call, settled by callback)
-	handle  *qjs.Value // retained "handle" entry name, re-used per inbound request
+	start   *qjs.Value // guest-realm __start — the one way in (see the file header)
 
 	netResolve *qjs.Value // guest-realm __netResolve (a net op fulfilled)
 	netReject  *qjs.Value // guest-realm __netReject (a net op failed)
@@ -100,7 +98,6 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 // like any other failure, so realmCall's contract is "always settles via a callback".
 const guestDriverJS = `
 "use strict";
-globalThis.queueMicrotask = (f) => { Promise.resolve().then(f); };
 globalThis.__start = function (id, entry, arg) {
   try {
     Promise.resolve(__invoke(entry, arg)).then(
@@ -305,9 +302,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	// Retain the entry points once: the holder path runs per inbound request, so
 	// re-resolving (and freeing) them each call is needless churn. All are guest-realm
 	// values, freed when rt.Close() tears the realm down.
-	g.invoke = g.qc.Global().GetPropertyStr("__invoke")
 	g.start = g.qc.Global().GetPropertyStr("__start")
-	g.handle = g.qc.NewString("handle")
 	g.netResolve = g.qc.Global().GetPropertyStr("__netResolve")
 	g.netReject = g.qc.Global().GetPropertyStr("__netReject")
 	return g, nil

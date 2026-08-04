@@ -87,24 +87,6 @@ func (r *registry) get(id uint64) goFunc {
 	return fn
 }
 
-// CallbackCount returns the number of registered Go callbacks. The registry has no
-// unregister (a function proxy lives for its context), so this is exposed for leak
-// diagnostics: a count that climbs with work signals callbacks created per-call
-// instead of reused (see the loader's persistent __settle / __signal).
-func (r *Runtime) CallbackCount() int {
-	r.reg.mu.RLock()
-	defer r.reg.mu.RUnlock()
-	return len(r.reg.m)
-}
-
-// MemorySize returns the runtime's current wasm linear-memory size in bytes — the
-// QuickJS heap floor. wasm memory only ever grows (it is never released back), so a
-// size that stays flat across steady-state work is the strongest available leak
-// signal: anything the engine fails to free eventually forces a grow. Exposed (like
-// CallbackCount) for leak diagnostics; must be read on the runtime's own goroutine,
-// as it observes live wasm state. See qjs/leak_test.go and the loader soak tests.
-func (r *Runtime) MemorySize() uint32 { return r.mem.Size() }
-
 // Option configures a Runtime at creation. Options exist for limits that QuickJS can
 // only take at JS_NewRuntime time, so they cannot be applied to a live runtime.
 type Option func(*config)

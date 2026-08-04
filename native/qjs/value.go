@@ -28,12 +28,6 @@ type This struct {
 	args    []*Value
 }
 
-// Array is a thin JS array wrapper (only what the fs shim needs).
-type Array struct {
-	*Value
-	n int64 // next index; tracked so Push avoids a .length property round-trip per append
-}
-
 func (c *Context) value(raw uint64) *Value { return &Value{c: c, raw: raw} }
 
 // call dispatches a wasm export and wraps the i64 result as a *Value.
@@ -113,46 +107,17 @@ func (c *Context) NewString(s string) *Value {
 	return c.callV("QJS_NewString", c.handle, ptr)
 }
 
-// NewArrayBuffer creates a JS ArrayBuffer copy of b.
+// NewArrayBuffer creates a JS ArrayBuffer copy of b. It stages the bytes straight into
+// one wasm buffer rather than through a Go-side scratch slice, so the payload is walked
+// once; QJS_NewArrayBufferCopy then makes the engine-owned copy.
 func (c *Context) NewArrayBuffer(b []byte) *Value {
-	return c.NewArrayBufferParts(b)
-}
-
-// NewArrayBufferParts creates a JS ArrayBuffer holding the concatenation of parts.
-// It stages them directly into one wasm buffer rather than building a concatenated
-// Go slice and copying that in — saving a full pass over the payload (and a Go heap
-// alloc) when a small header is prepended (e.g. serveHandle's [type][payload]). The
-// single-copy staging mirrors the host codec's scratch discipline; the subsequent
-// QJS_NewArrayBufferCopy still makes the engine-owned copy as before.
-func (c *Context) NewArrayBufferParts(parts ...[]byte) *Value {
-	total := 0
-	for _, p := range parts {
-		total += len(p)
-	}
-	if total == 0 {
+	if len(b) == 0 {
 		return c.callV("QJS_NewArrayBufferCopy", c.handle, 0, 0)
 	}
-	ptr := c.rt.mallocN(total)
+	ptr := c.rt.mallocN(len(b))
 	defer c.rt.freeAt(ptr)
-	off := uint32(ptr)
-	for _, p := range parts {
-		if len(p) > 0 {
-			c.rt.mem.Write(off, p)
-			off += uint32(len(p))
-		}
-	}
-	return c.callV("QJS_NewArrayBufferCopy", c.handle, ptr, uint64(total))
-}
-
-func (c *Context) NewArray() *Array {
-	return &Array{Value: c.callV("JS_NewArray", c.handle)}
-}
-
-// Push appends one element to the array, tracking the index Go-side so it never has to
-// read .length back (a full JS property round-trip) on each append.
-func (a *Array) Push(v *Value) {
-	a.Value.c.rt.call("JS_SetPropertyUint32", a.Value.c.handle, a.Value.raw, uint64(a.n), v.raw)
-	a.n++
+	c.rt.mem.Write(uint32(ptr), b)
+	return c.callV("QJS_NewArrayBufferCopy", c.handle, ptr, uint64(len(b)))
 }
 
 // Function wraps a Go func as a JS function. The callback id is registered and
@@ -200,7 +165,6 @@ func (v *Value) boolCall(name string, args ...uint64) bool {
 func (v *Value) IsUndefined() bool { return v.boolCall("QJS_IsUndefined", v.raw) }
 func (v *Value) IsNull() bool      { return v.boolCall("QJS_IsNull", v.raw) }
 func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
-func (v *Value) IsError() bool     { return v.boolCall("QJS_IsError", v.c.handle, v.raw) }
 
 // isByteArray reports whether the value is an ArrayBuffer.
 // isByteArray reports whether v is an ArrayBuffer (a bare buffer toByteArray can read
@@ -361,18 +325,6 @@ func (c *Context) Invoke(fn, this *Value, args ...*Value) (*Value, error) {
 	}
 	res := c.callV("QJS_Call", c.handle, fn.raw, this.raw, argc, argvPtr)
 	return c.normalize(res)
-}
-
-// invokeJS calls obj[name](args...).
-func (v *Value) invokeJS(name string, args ...*Value) (*Value, error) {
-	fn := v.GetPropertyStr(name)
-	defer fn.Free()
-	argc, argvPtr := v.c.marshalArgs(args...)
-	if argvPtr != 0 {
-		defer v.c.rt.freeAt(argvPtr)
-	}
-	res := v.c.callV("QJS_Call", v.c.handle, fn.raw, v.raw, argc, argvPtr)
-	return v.c.normalize(res)
 }
 
 // marshalArgs writes the JSValue args contiguously into wasm memory. The 8-byte

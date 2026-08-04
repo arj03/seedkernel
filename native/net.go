@@ -16,19 +16,16 @@ import (
 	"time"
 )
 
-// MAX_FRAME_BYTES (§12.6, §16.1): one wire-visible frame cap. This target holds its own
-// descriptors, so it declares and enforces its own copy — the same rule that puts the
-// declaration in core/net-limits.ts rather than in the transport it bounds. Keep the two
-// in step; a socket seam must never read this number out of the module it is bounding.
-const maxFrameBytes = 2 << 20
-
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
 // protocol is a single request/response plane — even a block upload awaits an ack per
 // chunk — so a healthy link's queue stays a few messages deep; hitting the cap means
 // the peer has stopped draining (or JS is pushing unpaced), and the channel fails
-// rather than buffering without bound. Must exceed maxFrameBytes or a single
-// max-size frame could never be queued; it stays at 2x the frame cap, so "how deep may a
-// stalled peer's queue get" does not drift when the cap moves.
+// rather than buffering without bound.
+//
+// It is 2× core/net-limits.ts's MAX_FRAME_BYTES, so a single max-size frame can always
+// be queued. Deliberately not a copy of that constant: Go imposes no frame boundaries
+// and so has nothing to enforce it on (see the wire note below) — the cap is the
+// transport bundle's, and this is only a queue depth chosen to clear it.
 const sendQueueLimit = 4 << 20
 
 // closeGrace bounds how long a deliberate close() lets the writer flush queued
