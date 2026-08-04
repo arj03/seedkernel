@@ -23,6 +23,7 @@ import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, appSignScope,
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { toHex, fromHex } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
@@ -39,16 +40,19 @@ export type ShellSodium = BundleCrypto & CapSodium;
  *  quickjs-emscripten's job pump); the native target's is a second quickjs-ng realm
  *  driven by Go's event loop (native/guest.go). Both honor the same contract — one
  *  `call`, which may await, and invocations serialized per realm — so the shell drives
- *  either without knowing which it holds. */
+ *  either without knowing which it holds. The shell always supplies both bounds (it
+ *  resolves the shared defaults, core/wasm-limits.ts), so a factory never has to
+ *  decide "omitted means what"; a factory that is called directly may still default. */
 export type RealmFactory = (opts: {
     source: string;
     bridge: SafeRealmBridge;
     memoryLimitBytes?: number;
     /** Budget of guest *execution* time per entrypoint invocation, in ms. Omitted ⇒ the
-     *  factory's own default (safe-js: 5s). Both resource bounds cross this seam, so a
-     *  guard a factory implements is one the shell can actually reach — `deadlineMs`
-     *  existed in safe-js before this field did and was therefore dead code, since the
-     *  shell is the only caller and had no way to pass it. */
+     *  factory's own default — which is the shared `DEFAULT_GUEST_DEADLINE_MS` on both
+     *  targets. Both resource bounds cross this seam, so a guard a factory implements
+     *  is one the shell can actually reach — `deadlineMs` existed in safe-js before
+     *  this field did and was therefore dead code, since the shell is the only caller
+     *  and had no way to pass it. */
     deadlineMs?: number;
 }) => Promise<SafeRealm>;
 
@@ -155,12 +159,15 @@ export interface CreateShellOptions {
     /** Operator-supplied app config, merged *over* the bundle manifest's `config`
      *  into the guest's `const APP = …`. Opaque to the shell. */
     config?: Record<string, string | number>;
-    /** QuickJS heap limit for the guest realm, in bytes. Omitted ⇒ the safe-js
-     *  default (64 MiB). A target that streams large windows through the guest raises
-     *  it to run without the realm OOMing (seedstore's `realmMemoryBytes`). */
+    /** QuickJS heap limit for the guest realm, in bytes. Omitted ⇒ the shared default
+     *  (`DEFAULT_REALM_MEMORY_BYTES`, core/wasm-limits.ts — 64 MiB, the same ceiling
+     *  as a handler's declared memory). A target that streams large windows through
+     *  the guest raises it to run without the realm OOMing (seedstore's
+     *  `realmMemoryBytes`). */
     realmMemoryBytes?: number;
     /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
-     *  realm factory's default (5s, §16.1). Counts time the guest is *running*, not time
+     *  shared default (`DEFAULT_GUEST_DEADLINE_MS`, core/wasm-limits.ts — 5s, §16.1).
+     *  Counts time the guest is *running*, not time
      *  it spends parked on a host bridge, so it bounds a wedged guest without penalising
      *  one legitimately awaiting the network. `Infinity` disables it.
      *
@@ -404,8 +411,8 @@ export function createShell(opts: CreateShellOptions & {
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
             bridge: buildBridge(slot.loaded, null),
-            memoryLimitBytes: opts.realmMemoryBytes,
-            deadlineMs: opts.guestDeadlineMs,
+            memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+            deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
         return slot.realm;
     };
@@ -518,8 +525,8 @@ export function createShell(opts: CreateShellOptions & {
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
             bridge: buildBridge(slot.loaded, driver),
-            memoryLimitBytes: opts.realmMemoryBytes,
-            deadlineMs: opts.guestDeadlineMs,
+            memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+            deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
         driver.attach(slot.realm);
         return driver;

@@ -15,6 +15,7 @@ import {
 import { join } from "node:path";
 
 import type { Fs, FsStat } from "../core/fs.js";
+import { FS_AVAILABLE_UNKNOWN } from "../core/fs.js";
 
 export class NodeFs implements Fs {
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }
@@ -56,7 +57,7 @@ export class NodeFs implements Fs {
       const sizes = await Promise.all((await readdir(this.dir)).map((n) => this.size(n)));
       for (const s of sizes) if (s >= 0) used += s;
     } catch { /* dir absent */ }
-    let available = Number.MAX_SAFE_INTEGER;
+    let available = FS_AVAILABLE_UNKNOWN;
     try { const s = await statfs(this.dir); available = s.bavail * s.bsize; }
     catch { /* statfs unsupported on this platform/runtime */ }
     return { used, available };

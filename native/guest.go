@@ -34,19 +34,12 @@ import (
 	"seedloader/qjs"
 )
 
-// defaultRealmMemory caps a confined realm's heap when the shell names no limit,
-// matching safe-js.ts's default on the node/browser target so the same signed guest
-// meets the same ceiling on either. It is a confinement property, not a tuning knob:
-// the admission policy (§12.5) decides *which* guest runs, but an admitted guest that
-// runs away must exhaust its own realm rather than the host — including on the request
-// path, which a remote peer drives. QuickJS takes it at runtime creation only, hence
-// qjs.WithMemoryLimit rather than a setter.
-const defaultRealmMemory = 64 << 20 // 64 MiB
-
-// defaultRealmBudget mirrors safe-js.ts's DEFAULT_DEADLINE_MS (README §16.1) so the two
-// targets hold a guest to the same number. Like the memory cap it is a real default, not
-// an absent one: a shell that configures nothing still gets a bounded guest.
-const defaultRealmBudget = 5 * time.Second
+// The realm's resource bounds (heap cap, execution budget) are the shared host's
+// numbers — core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES / DEFAULT_GUEST_DEADLINE_MS
+// — resolved by the shell and sent across by the shim (host/native-shim.ts
+// createRealm) on every call, so this file no longer owns copies that could drift
+// from safe-js.ts's. A direct caller that sends 0 is refused rather than defaulted:
+// an unbounded realm is a confinement hole, not a fallback.
 
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. A
@@ -90,25 +83,6 @@ type guestRealm struct {
 
 type initiatorCall struct{ onDone, onFail *qjs.Value }
 
-// guestDriverJS is the realm's own plumbing — not the guest ABI (that is the shared
-// guestPreamble, which a signed guest is written against), but this driver's twin of
-// what safe-js.ts does in TypeScript: a microtask queue over the shared loop, and one
-// pre-compiled entry wrapper so an initiator call costs an Invoke rather than a parse.
-// __start never throws: a synchronously-throwing entrypoint settles through __callFail
-// like any other failure, so realmCall's contract is "always settles via a callback".
-const guestDriverJS = `
-"use strict";
-globalThis.__start = function (id, entry, arg) {
-  try {
-    Promise.resolve(__invoke(entry, arg)).then(
-      (v) => __callDone(id, v),
-      (e) => __callFail(id, String(e && e.message || e)));
-  } catch (e) {
-    __callFail(id, String(e && e.message || e));
-  }
-};
-`
-
 // installRealmBridge adds the confined-realm powers to the `bridge` object: create a
 // realm, call into it (as initiator or synchronously), settle a parked net op, dispose.
 // This is the whole of Go's involvement with a guest — no cap-bridge, no preamble
@@ -119,15 +93,16 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 	b.SetPropertyStr("createRealm", fn(func(t *qjs.This) (*qjs.Value, error) {
 		mem := uint64(t.Args()[2].Int64())
 		if mem == 0 {
-			mem = defaultRealmMemory
+			// The shim always resolves the shared default (core/wasm-limits.ts) before
+			// calling; a 0 here is a direct caller that forgot, and an unbounded realm
+			// is a confinement hole rather than a fallback.
+			return nil, errors.New("createRealm: no memory limit supplied (the shim resolves the shared default)")
 		}
-		// 0 from the shim means "the target's default", matching how mem is read above —
-		// so a shell that configures nothing still gets a bounded realm on both targets.
-		// A negative value is the shim's encoding of Infinity: no budget, said explicitly.
-		budget := defaultRealmBudget
-		if ms := t.Args()[3].Int64(); ms < 0 {
-			budget = 0
-		} else if ms > 0 {
+		// A negative value is the shim's encoding of Infinity — no budget, said
+		// explicitly. 0 is not "default" anymore (the shim sends the shared default);
+		// treat it as no budget rather than as an accident of encoding.
+		budget := time.Duration(0)
+		if ms := t.Args()[3].Int64(); ms > 0 {
 			budget = time.Duration(ms) * time.Millisecond
 		}
 		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget)
@@ -208,7 +183,10 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		return nil, err
 	}
 	installPolyfills(g.qc)
-	if _, err := g.qc.Eval("guest-driver.js", qjs.Code(guestDriverJS)); err != nil {
+	// The driver's __start wrapper is fetched from the host realm like the guest
+	// preamble below (native-shim.ts `guestDriver`) — the same shape as safe-js.ts's
+	// internals, so it is shared TS rather than a Go string TypeScript never saw.
+	if _, err := g.qc.Eval("guest-driver.js", qjs.Code(hostFnString(hostQc, "guestDriver"))); err != nil {
 		return fail(fmt.Errorf("guest driver: %w", err))
 	}
 	// The guest shares the host loop rather than owning one, so it just needs its job
@@ -315,11 +293,21 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 // contract with signed content, not a per-target detail. Go's side of that contract is
 // the __host_call installed above (null ⇒ async under callId) plus settleNet.
 func hostGuestPreamble(hostQc *qjs.Context) string {
-	fn := hostQc.Global().GetPropertyStr("guestPreamble")
+	return hostFnString(hostQc, "guestPreamble")
+}
+
+// hostFnString asks the host realm for one zero-argument string-valued export —
+// `guestPreamble` and `guestDriver` (host/native-shim.ts) are fetched this way so the
+// driver plumbing a guest runs on is the shared TS, never a Go string that could drift.
+func hostFnString(hostQc *qjs.Context, name string) string {
+	fn := hostQc.Global().GetPropertyStr(name)
+	if fn == nil {
+		panic("hostFnString: " + name + " not defined (host/native-shim.ts)")
+	}
 	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
 	fn.Free()
 	if err != nil {
-		panic(fmt.Sprintf("guestPreamble: %v", err))
+		panic(fmt.Sprintf("%s: %v", name, err))
 	}
 	defer v.Free()
 	return v.String()

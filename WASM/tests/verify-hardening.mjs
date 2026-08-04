@@ -242,8 +242,9 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen && seen.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
   shell.close();
 
-  // Omitted ⇒ undefined at the seam, which the factory reads as its own default —
-  // not as "unbounded". safe-js turns undefined into 5000ms / 64 MiB.
+  // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts) — not
+  // undefined, and not "unbounded". The shell resolves them so a factory never has
+  // to own the numbers (safe-js and the native realm once carried their own copies).
   let seen2 = null;
   const bare = createShell({
     platform: {
@@ -258,7 +259,8 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   });
   await bare.loadBundleBlob(blob);
   await bare.runGuest("handle", new Uint8Array());
-  ok(seen2 && seen2.deadlineMs === undefined, "an unset budget arrives undefined, for the factory to default");
+  ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
+  ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
 }
 

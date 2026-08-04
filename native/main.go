@@ -73,11 +73,12 @@ var (
 	modSeq = 0
 )
 
-// defaultScratchSize is the I/O region a handler reserves at `scratch` when it declares
-// none (README §4.1). One needing more exports a `scratchSize` global — seedstore's codec
-// reserves 2 MB for whole-chunk shards — which instantiateWasm reads once and clamps its
-// cross-module copies to.
-const defaultScratchSize = 0x20000 // 128 KB
+// The §4.1 scratch default (how much I/O space a handler reserves at `scratch` when it
+// declares no `scratchSize`) is the shared host's number — core/wasm-limits.ts
+// DEFAULT_SCRATCH_SIZE — passed across by the shim with every bindAll, so Go's table
+// never owns a copy that could drift from the JS table's. A handler needing more
+// exports a `scratchSize` global — seedstore's codec reserves 2 MB for whole-chunk
+// shards — which instantiateWasm reads once and clamps its cross-module copies to.
 
 // bind binds `n` to `w`, releasing whatever the name held before — the §3.1
 // replace-in-place. The one place a displaced wasm instance is closed: Go frees
@@ -161,10 +162,10 @@ func callHandler(n string, payload []byte) []byte {
 // a bundle rejected at its third module has to close the first two, and a loader that
 // forgot would leak a linear memory plus its JITed code per rejected bundle. Making it a
 // two-phase seam across the bridge is what would put that duty on the caller.
-func bindAll(names []string, wasms [][]byte) error {
+func bindAll(names []string, wasms [][]byte, scratchDefault uint32) error {
 	built := make([]*wasmHandler, 0, len(wasms))
 	for i, wasm := range wasms {
-		w, err := instantiateWasm(wasm)
+		w, err := instantiateWasm(wasm, scratchDefault)
 		if err != nil {
 			for _, h := range built {
 				closeHandler(h)
@@ -183,7 +184,7 @@ func bindAll(names []string, wasms [][]byte) error {
 // instantiateWasm compiles, instantiates, and validates handler bytes against the §4
 // ABI. No table effect: the result is an intermediate of bindAll's transaction, never
 // something that crosses the bridge.
-func instantiateWasm(wasm []byte) (*wasmHandler, error) {
+func instantiateWasm(wasm []byte, scratchDefault uint32) (*wasmHandler, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
@@ -211,14 +212,14 @@ func instantiateWasm(wasm []byte) (*wasmHandler, error) {
 	// declare more than the default — honored only if it names real, in-bounds memory, and
 	// never below the default. A negative i32 arrives as a huge uint32 the bounds refuse.
 	mem, s := uint64(m.Memory().Size()), uint32(g.Get())
-	if s == 0 || uint64(s)+defaultScratchSize > mem {
+	if s == 0 || uint64(s)+uint64(scratchDefault) > mem {
 		return nil, fmt.Errorf("scratch offset %d out of bounds (mem %d)", s, mem)
 	}
-	size := uint32(defaultScratchSize)
+	size := scratchDefault
 	if sg := m.ExportedGlobal("scratchSize"); sg != nil {
 		d := uint32(sg.Get())
-		if d < defaultScratchSize {
-			return nil, fmt.Errorf("scratchSize %d is below the %d default", d, defaultScratchSize)
+		if d < scratchDefault {
+			return nil, fmt.Errorf("scratchSize %d is below the %d default", d, scratchDefault)
 		}
 		if uint64(s)+uint64(d) > mem {
 			return nil, fmt.Errorf("scratchSize %d overflows memory (scratch %d, mem %d)", d, s, mem)
@@ -231,9 +232,10 @@ func instantiateWasm(wasm []byte) (*wasmHandler, error) {
 
 // installWasm compiles, instantiates, validates, and binds in one call. Kept as a
 // convenience for the direct tests; the production path is bindAll, which needs the
-// instantiate and the bind as separate phases to stay all-or-none.
-func installWasm(n string, wasm []byte) error {
-	w, err := instantiateWasm(wasm)
+// instantiate and the bind as separate phases to stay all-or-none. `scratchDefault`
+// is the §4.1 default, passed by the tests (production gets it from the shim).
+func installWasm(n string, wasm []byte, scratchDefault uint32) error {
+	w, err := instantiateWasm(wasm, scratchDefault)
 	if err != nil {
 		return err
 	}
@@ -298,13 +300,19 @@ func boot(dataDir string) error {
 	if err := exposeFs(qc, dataDir); err != nil {
 		return fmt.Errorf("fs: %w", err)
 	}
-	exposeNet(qc, el)
+	nh := exposeNet(qc, el)
 	exposeBridge(qc)
 	// The freshness high-water marks live in a SIBLING of the data dir, so a fs-capable
 	// guest — whose keys are files inside the dir — can never tamper with its own mark.
 	freshnessStorePath = filepath.Clean(dataDir) + ".freshness.json"
 	if _, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS)); err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
+	}
+	// The shared shim defined the __net dispatchers at module scope of the bundle
+	// (host/native-shim.ts); retain them now that it has evaluated (sock.go). Before
+	// this, the shaping was a Go string evaluated here — moved out so TypeScript sees it.
+	if err := nh.retain(); err != nil {
+		return fmt.Errorf("net retain: %w", err)
 	}
 	return nil
 }
@@ -338,7 +346,9 @@ func exposeBridge(qc *qjs.Context) {
 	// ── the handler table (§3) ──
 	// One transactional install (§3.1). The argument is the loader's `{name, wasm}[]`,
 	// read out here rather than flattened on the JS side so the bridge shape and the
-	// BundleHost interface are the same shape.
+	// BundleHost interface are the same shape — plus the §4.1 scratch default, which
+	// the shim passes from the shared host (core/wasm-limits.ts) rather than Go owning
+	// a copy of the number the JS table enforces.
 	b.SetPropertyStr("bindAll", fn(func(t *qjs.This) (*qjs.Value, error) {
 		mods := t.Args()[0]
 		lenv := mods.GetPropertyStr("length")
@@ -360,7 +370,7 @@ func exposeBridge(qc *qjs.Context) {
 			}
 			wasms[i] = wb
 		}
-		if err := bindAll(names, wasms); err != nil {
+		if err := bindAll(names, wasms, uint32(t.Args()[1].Int64())); err != nil {
 			return nil, err
 		}
 		return t.Context().NewNull(), nil
@@ -846,8 +856,9 @@ func parseHostPort(s string) (*hostPort, error) {
 }
 
 // loadOrMintKey returns the node's 64-byte ed25519 secret key as hex: read from
-// keyPath if present, else minted via libsodium (byte-identical to a browser/Bun
-// node's keypair) and persisted. The public key is its 32-byte tail.
+// keyPath if present, else minted via the shared realm (`mintNodeKey`,
+// host/native-shim.ts — byte-identical to a browser/Bun node's keypair) and
+// persisted. The public key is its 32-byte tail.
 func loadOrMintKey(keyPath string) (string, error) {
 	if b, err := os.ReadFile(keyPath); err == nil {
 		skHex := strings.TrimSpace(string(b))
@@ -861,14 +872,13 @@ func loadOrMintKey(keyPath string) (string, error) {
 		}
 		return skHex, nil
 	}
-	v, err := qc.Eval("<mint>", qjs.Code(
-		`(function(){ const kp = sodium.crypto_sign_keypair(); return Array.from(kp.privateKey, b => b.toString(16).padStart(2,"0")).join(""); })()`,
-	))
+	// The mint used to be a JS string spliced into qc.Eval here; it is ordinary
+	// shaping code over the shared toHex, so it lives in native-shim.ts.
+	out, err := callRealm("mintNodeKey", 30*time.Second)
 	if err != nil {
 		return "", err
 	}
-	skHex := v.String()
-	v.Free()
+	skHex := string(out)
 	if err := os.WriteFile(keyPath, []byte(skHex), 0o600); err != nil {
 		return "", err
 	}

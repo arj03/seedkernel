@@ -9,7 +9,7 @@
 // medium the bytes land in decides nothing, so a target picks a backend the way it
 // picks a socket implementation.
 
-import type { Fs, FsStat } from "../core/fs.js";
+import { FS_AVAILABLE_UNKNOWN, type Fs, type FsStat } from "../core/fs.js";
 
 /** In-RAM Fs. Stores copies so callers can reuse their buffers.
  *
@@ -37,6 +37,6 @@ export class MemoryFs implements Fs {
   async stat(): Promise<FsStat> {
     let used = 0;
     for (const v of this.map.values()) used += v.length;
-    return { used, available: Number.MAX_SAFE_INTEGER };
+    return { used, available: FS_AVAILABLE_UNKNOWN };
   }
 }

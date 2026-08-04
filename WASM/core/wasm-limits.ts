@@ -1,4 +1,7 @@
-// Pre-instantiation bounds on a handler module's declared linear memory (README §4.3).
+// Pre-instantiation bounds on a handler module's declared linear memory (README §4.3),
+// plus the shared §12.3 guest-realm bounds that are deliberately the same number
+// (the realm heap cap and the handler memory ceiling — see DEFAULT_REALM_MEMORY_BYTES)
+// and the §4.1 scratch default every host's table must agree on.
 //
 // §4.3 names this as a residual: "an installed handler can still infinite-loop or declare
 // a huge linear memory and OOM the single-threaded host." The memory half of that cannot
@@ -24,6 +27,28 @@
 
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
+
+/** The I/O region a handler reserves at its `scratch` export when it declares no
+ *  `scratchSize` (README §4.1). One number on every target: the JS table
+ *  (kernel-host.ts) and the Go table (native/main.go) must not disagree about how
+ *  much of a handler's memory is its staging area — a payload the JS host admits
+ *  and Go refuses (or vice versa) is a handler that loads on one node and not
+ *  another. The Go side receives it from the shared shim at every bindAll. */
+export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
+
+/** Default heap cap for a confined guest realm (README §12.3, §16.1) — applied by
+ *  the shell when no target overrides it, and by the realm factories for a direct
+ *  caller. It deliberately equals `DEFAULT_MAX_HANDLER_MEMORY_BYTES` below, so the
+ *  two kinds of untrusted code a bundle can ship are held to one number; the two
+ *  factories used to each own their own 64 MiB copy that could drift from this. */
+export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
+
+/** Default budget of guest execution time per entrypoint invocation (README §12.3,
+ *  §16.1). Generous for any real request — the storage guest's heaviest local pass
+ *  is orders of magnitude under it — and short enough that a wedged guest frees
+ *  the single host thread rather than holding it forever. The shell applies it
+ *  when no target overrides; the realm factories use it for a direct caller. */
+export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
 /** Default ceiling on a handler's declared linear memory. Matches the guest realm's
  *  default heap cap (safe-js.ts), so the two kinds of untrusted code a bundle can ship

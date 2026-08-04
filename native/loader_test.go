@@ -19,16 +19,20 @@ func boundToWasm(n string) bool {
 // second buffer past `scratch`, so an over-default payload would physically fit its memory —
 // only the clamp refuses it. (The declared-scratchSize branch belongs to handlers like
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
+//
+// The default itself is the shared host's number (core/wasm-limits.ts
+// DEFAULT_SCRATCH_SIZE), passed by the shim at every bindAll; the test mirrors it,
+// since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
 	n := kernelNameFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp", "fwd")
-	if err := installWasm(n, forwarderWasm); err != nil {
+	if err := installWasm(n, forwarderWasm, 0x20000); err != nil {
 		t.Fatalf("installWasm(forwarder) refused: %v", err)
 	}
 	w := handlers[n]
-	if w.size != defaultScratchSize {
-		t.Fatalf("a handler exporting no scratchSize should get the %d B default, got %d",
-			defaultScratchSize, w.size)
+	if w.size != 0x20000 {
+		t.Fatalf("a handler exporting no scratchSize should get the 128 KB default, got %d",
+			w.size)
 	}
 	// The installed module actually runs: an in-bounds payload echoes back unchanged,
 	// proving the host stages input at `scratch`, calls handle, and reads the response

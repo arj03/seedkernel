@@ -26,7 +26,8 @@ import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
-import type { Fs } from "../core/fs.js";
+import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { parsePeerSpec } from "./transport-host.js";
 import { toHex, fromHex } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
@@ -40,7 +41,7 @@ type CapCall = (op: number, payload: ArrayBuffer, callId: number) => Uint8Array 
 
 /** The handler table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
-  bindAll(mods: { name: string; wasm: Uint8Array }[]): void;
+  bindAll(mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
   callHandler(name: string, payload: Uint8Array): ArrayBuffer | null;
   isBound(name: string): boolean;
   removePrefix(prefix: string): number;
@@ -187,10 +188,12 @@ export const fs: Fs = {
   // An empty listing arrives as "", which must map to [] — split would yield [""].
   async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
   async delete(key) { return __fs.delete(key); },
-  async stat() { return __fs.stat(); },
+  // Go answers -1 when it cannot ask the OS for free space; the sentinel is the
+  // seam's (core/fs.ts), so the value a guest reads cannot differ by backend.
+  async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
-/** Go's TCP socket primitive (native/sock.go): a raw byte duplex and nothing else.
+/** Go's socket byte primitives (native/sock.go): a raw byte duplex and nothing else.
  *  `listen` returns the bound port. This is the whole networking seam — the wire codec,
  *  the channel handshake, the routing table and the request/response layer above it are
  *  all the transport bundle's, over the same primitive every other target hands it.
@@ -198,9 +201,86 @@ export const fs: Fs = {
  *  A link arrives WITHOUT a `framing`: which codec applies follows from the address,
  *  which is this file's to read and never Go's. */
 type GoLink = Omit<RawLink, "framing">;
-declare function netConnectRaw(host: string, port: number): GoLink;
-declare function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void): number;
-declare function netCloseListeners(): void;
+declare const __net: {
+  /** Open an outbound byte duplex. The id is never 0, and the channel buffers
+   *  pre-connect sends, so JS can write the transport's HELLO immediately. */
+  connect(host: string, port: number): number;
+  /** Bind a listener; returns the bound port, or -1 on failure. */
+  listen(host: string, port: number): number;
+  /** Queue bytes for the writer goroutine (never blocks the loop goroutine). */
+  send(id: number, bytes: Uint8Array): void;
+  /** A deliberate close — never fires `__netClosed` (Go closes silently). */
+  close(id: number): void;
+  closeListeners(): void;
+};
+
+// ── the RawLink shaping — ex sock.go's `netShimJS` string ────────────────────
+//
+// Go's byte-level `__net` becomes the RawLink objects below, and Go's socket
+// reader goroutines route deliveries through the three dispatchers defined at the
+// end of this block. The dispatchers used to be a JS string literal in Go (the
+// `netShimJS` constant), evaluated before the shared bundle loaded so Go could
+// retain them early; they are typed TS now, and Go picks them up AFTER the bundle
+// evaluates (main.go boot: exposeNet → eval host-shell.gen.js → netHost.retain) —
+// the deferred retention is what lets the shaping live where TypeScript sees it.
+
+/** Channel table + accept registry, keyed by Go's socket ids / bound ports. */
+const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
+const netAccepts = new Map<number, (id: number) => void>();
+
+/** One RawLink (core/socket-seam.ts), minus its framing: Go vends one socket kind
+ *  and this file says which codec runs over it. */
+function makeGoLink(id: number): GoLink {
+  let onData: (bytes: Uint8Array) => void = () => {};
+  let onClose: () => void = () => {};
+  netChans.set(id, {
+    deliver: (bytes) => onData(bytes),
+    closed: () => { netChans.delete(id); onClose(); },
+  });
+  return {
+    send: (bytes) => __net.send(id, bytes),
+    onData: (cb) => { onData = cb; },
+    onClose: (cb) => { onClose = cb; },
+    // A deliberate close never fires __netClosed (Go closes silently), so drop our own
+    // map entry here too — otherwise every local close leaks a chans entry unbounded
+    // (the mirror of the guard in native/sock.go's close()).
+    close: () => { __net.close(id); netChans.delete(id); },
+  };
+}
+
+function netConnectRaw(host: string, port: number): GoLink {
+  return makeGoLink(__net.connect(host, port));
+}
+
+function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void): number {
+  const bound = __net.listen(host, port);
+  if (bound < 0) throw new Error("netListenRaw: bind failed");
+  netAccepts.set(bound, (id) => onAccept(makeGoLink(id)));
+  return bound;
+}
+
+function netCloseListeners(): void {
+  __net.closeListeners();
+  // Teardown closes every bound listener in Go, so every accept closure here is
+  // stale — clear them too, or they pin their onAccept graphs for the process
+  // lifetime in a long-lived holder that re-serves.
+  netAccepts.clear();
+}
+
+declare global {
+  /** A socket read landed — routes to the channel's onData (sock.go). */
+  var __netDeliver: (id: number, bytes: ArrayBuffer) => void;
+  /** A channel's fail path fired — the RawLink's onClose (sock.go). */
+  var __netClosed: (id: number) => void;
+  /** An accepted socket landed — routes to the port's accept closure (sock.go). */
+  var __netAccept: (port: number, id: number) => void;
+}
+
+// Defined at module scope — i.e. when host-shell.gen.js is evaluated, after Go has
+// installed `__net` — and retained by Go once the bundle is up (netHost.retain).
+globalThis.__netDeliver = (id, bytes) => { const c = netChans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
+globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed(); };
+globalThis.__netAccept = (port, id) => { const a = netAccepts.get(port); if (a) a(id); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
 /** The §3 handler table, which on this target lives in Go (wazero instances cannot
@@ -208,8 +288,10 @@ declare function netCloseListeners(): void;
 const kernel: KernelBackend = {
     // Straight through: the all-or-none guarantee is Go's, because Go holds the
     // half-built wazero instances — and has to close them, since neither an instance nor
-    // its compiled code is reclaimed on its own (main.go `bindAll`).
-    bindAll(mods) { bridge.bindAll(mods); },
+    // its compiled code is reclaimed on its own (main.go `bindAll`). The §4.1 scratch
+    // default crosses with it: it is the shared host's number (core/wasm-limits.ts),
+    // so Go's table never owns a copy of the default the JS table enforces.
+    bindAll(mods) { bridge.bindAll(mods, DEFAULT_SCRATCH_SIZE); },
     callHandler(name, payload) {
         const r = bridge.callHandler(name, payload);
         return r === null ? null : new Uint8Array(r);
@@ -279,10 +361,12 @@ const embeddedTransportAuthor = (() => {
  *  realm, so a settled net op routes to the realm that parked it structurally, and
  *  an initiator's result is delivered into a Promise built in plain ECMAScript. Go
  *  needs no promise primitive of its own. */
-// `deadlineMs` crosses as milliseconds with two sentinel encodings, because the bridge
-// carries numbers and not `undefined`/`Infinity`: 0 means "the target's default" (matching
-// how memoryLimitBytes is read on the Go side) and a negative value means Infinity — no
-// budget, said explicitly rather than reached by omission.
+// The shell resolves both resource bounds to the shared defaults (core/wasm-limits.ts)
+// before calling — see shell-core's `ensureRealm` — so `memoryLimitBytes` here is a
+// real number or the same shared default for a direct caller, never "0 means default".
+// `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers
+// and not `undefined`/`Infinity`: a negative value means Infinity — no budget, said
+// explicitly rather than reached by omission — and everything else is milliseconds.
 //
 // Note the native realm does NOT enforce this through QuickJS: New_QJS's maxExecutionTime
 // argument is inert in the vendored qjs.wasm (a 1 ms limit does not interrupt a spinning
@@ -299,7 +383,7 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
         (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, String((e as Error)?.message ?? e)));
         return null;
     };
-    realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? 0, deadlineMs === undefined ? 0 : (deadlineMs === Infinity ? -1 : deadlineMs));
+    realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
     let disposed = false;
     return {
         // Serialized here, in the shared TS, rather than in Go: the guarantee is the
@@ -472,8 +556,40 @@ function uninstall(appKey: string): Uint8Array {
 function revoke(authorHex: string): Uint8Array {
     return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
 }
+
+/** Mint a fresh node identity: a libsodium-form 64-byte ed25519 secret key, hex —
+ *  the `--key` file format (native/main.go loadOrMintKey). The mint used to be a JS
+ *  string spliced into `qc.Eval` in Go; it is ordinary shaping code over the shared
+ *  `toHex` and this target's sodium wrapper, so it lives here where TypeScript
+ *  checks it. Returns bytes because that is all the realm bridge marshals. */
+function mintNodeKey(): Uint8Array {
+    return utf8.encode(toHex(sodium.crypto_sign_keypair().privateKey));
+}
+
+/** The confined realm's own plumbing (native/guest.go `guestDriverJS`): a microtask
+ *  queue over the shared loop and one pre-compiled `__start` wrapper, so an initiator
+ *  call costs an Invoke rather than a parse. Not the guest ABI (that is
+ *  `guestPreamble`, cap-bridge.ts), but this driver's twin of what safe-js.ts does in
+ *  TypeScript — fetched by Go like the preamble is, rather than restated as a Go
+ *  string that TypeScript never saw. */
+function guestDriver(): string {
+    return GUEST_DRIVER;
+}
+const GUEST_DRIVER = `
+"use strict";
+globalThis.__start = function (id, entry, arg) {
+  try {
+    Promise.resolve(__invoke(entry, arg)).then(
+      (v) => __callDone(id, v),
+      (e) => __callFail(id, String(e && e.message || e)));
+  } catch (e) {
+    __callFail(id, String(e && e.message || e));
+  }
+};
+`;
+
 // What Go reaches by name in the realm. `createRealm` and the transport bundle
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, mintNodeKey, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

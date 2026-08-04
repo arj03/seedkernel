@@ -39,10 +39,9 @@ func fsKeySafe(k string) bool {
 // temp is never mistaken for a stored block.
 const fsTmpPrefix = "~put-"
 
-// fsMaxAvailable mirrors fs-node.ts's fallback (Number.MAX_SAFE_INTEGER): a large
-// sentinel for free space, since portable free-disk queries need a syscall per OS
-// and the storage guest only needs a monotone budget signal, not an exact figure.
-const fsMaxAvailable = 1<<53 - 1
+// stat() answers -1 free bytes: this backend cannot ask the OS for a portable free-disk
+// figure, and the sentinel a guest reads is the seam's (FS_AVAILABLE_UNKNOWN,
+// core/fs.ts), mapped by the shim — one value on every target, never a Go copy.
 
 // nodeFs is driven only from the single event-loop goroutine (all JS→Go fs calls land
 // there), so `used` needs no synchronization. It is the live total size of all regular
@@ -265,7 +264,7 @@ func exposeFs(qc *qjs.Context, dir string) error {
 	o.SetPropertyStr("stat", fn(func(t *qjs.This) (*qjs.Value, error) {
 		s := t.Context().NewObject()
 		s.SetPropertyStr("used", t.Context().NewInt64(fs.stat()))
-		s.SetPropertyStr("available", t.Context().NewInt64(fsMaxAvailable))
+		s.SetPropertyStr("available", t.Context().NewInt64(-1)) // unknown — the shim maps it to FS_AVAILABLE_UNKNOWN
 		return s, nil
 	}))
 	qc.Global().SetPropertyStr("__fs", o)

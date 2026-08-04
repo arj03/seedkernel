@@ -6,7 +6,10 @@
 //
 // Bytes cross the Go↔JS boundary only on the event-loop goroutine: socket reader
 // goroutines hand each message to el.post, which the loop delivers into JS via the
-// retained __netDeliver/__netClosed/__netAccept dispatchers and then pumps.
+// retained __netDeliver/__netClosed/__netAccept dispatchers and then pumps. Those
+// dispatchers are defined by the shared shim (host/native-shim.ts — the ex-netShimJS
+// shaping, moved out of Go) at host-shell.gen.js evaluation time, and retained by
+// `netHost.retain` once the bundle is up.
 package main
 
 import (
@@ -35,8 +38,11 @@ type netHost struct {
 	fnAccept  *qjs.Value
 }
 
-// exposeNet installs `__net` into the realm and the `netShimJS` glue that turns a
-// channel id into a RawLink. Returns the netHost (kept alive for the process).
+// exposeNet installs `__net` into the realm: the byte-level socket primitive. The
+// shaping that turns it into RawLink objects — and the __netDeliver/__netClosed/
+// __netAccept dispatchers Go's reader goroutines route through — is typed TS in
+// host/native-shim.ts, evaluated with the shared bundle; `netHost.retain` picks the
+// dispatchers up once that bundle is up (main.go boot).
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]rawChannel{}}
 	o := qc.NewObject()
@@ -102,15 +108,22 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		return nil, nil
 	}))
 	qc.Global().SetPropertyStr("__net", o)
+	return n
+}
 
-	if _, err := qc.Eval("net-shim.js", qjs.Code(netShimJS)); err != nil {
-		panic(fmt.Sprintf("net shim: %v", err))
-	}
-	g := qc.Global()
-	n.fnDeliver = g.GetPropertyStr("__netDeliver") // owned refs, kept for process lifetime
+// retain picks up the three dispatchers the shared shim defines at module scope
+// (host/native-shim.ts), which runs when host-shell.gen.js is evaluated — AFTER
+// exposeNet installed `__net`, and before any socket delivers. The shaping that used
+// to live here as a Go string (netShimJS) is typed TS now; Go only retains callbacks.
+func (n *netHost) retain() error {
+	g := n.qc.Global()
+	n.fnDeliver = g.GetPropertyStr("__netDeliver")
 	n.fnClosed = g.GetPropertyStr("__netClosed")
 	n.fnAccept = g.GetPropertyStr("__netAccept")
-	return n
+	if n.fnDeliver == nil || n.fnClosed == nil || n.fnAccept == nil {
+		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
+	}
+	return nil
 }
 
 func (n *netHost) get(id int64) rawChannel {
@@ -239,52 +252,6 @@ func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 		a.Free()
 	}
 }
-
-// netShimJS turns the byte-level __net into the RawLink shape the host JS wants,
-// and routes Go's deliver/close/accept callbacks to the right channel. Loader glue
-// (platform binding), not shared TS: it wires Go callbacks to the right channel and
-// hands out the RawLink objects host/native-shim.ts declares.
-const netShimJS = `
-"use strict";
-(function () {
-  const N = __net;
-  const chans = new Map();     // id -> { deliver, closed }
-  const listeners = new Map(); // bound port -> accept(id)
-
-  // One RawLink (core/socket-seam.ts), minus its framing: Go vends one socket kind and
-  // native-shim.ts says which codec runs over it.
-  function makeLink(id) {
-    let onData = () => {}, onClose = () => {};
-    chans.set(id, {
-      deliver: (bytes) => onData(bytes),
-      closed: () => { chans.delete(id); onClose(); },
-    });
-    return {
-      send: (bytes) => N.send(id, bytes),
-      onData: (cb) => { onData = cb; },
-      onClose: (cb) => { onClose = cb; },
-      // A deliberate close never fires __netClosed (Go closes silently), so drop our own
-      // map entry here too — otherwise every local close leaks a chans entry unbounded.
-      close: () => { N.close(id); chans.delete(id); },
-    };
-  }
-
-  globalThis.netConnectRaw = (host, port) => makeLink(N.connect(host, port));
-  globalThis.netListenRaw = (host, port, onAccept) => {
-    const bound = N.listen(host, port);
-    if (bound < 0) throw new Error("netListenRaw: bind failed");
-    listeners.set(bound, (id) => onAccept(makeLink(id)));
-    return bound;
-  };
-  // Teardown closes every bound listener in Go, so every accept closure here is
-  // stale — clear them too, or they pin their onAccept graphs for the process
-  // lifetime in a long-lived holder that re-serves.
-  globalThis.netCloseListeners = () => { N.closeListeners(); listeners.clear(); };
-  globalThis.__netDeliver = (id, bytes) => { const c = chans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
-  globalThis.__netClosed = (id) => { const c = chans.get(id); if (c) c.closed(); };
-  globalThis.__netAccept = (port, id) => { const a = listeners.get(port); if (a) a(id); };
-})();
-`
 
 // The ChannelFactory over these primitives — and the transport driver built on it —
 // live in host/native-shim.ts, where they are typed against the shared interfaces.

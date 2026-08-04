@@ -19,6 +19,14 @@ export interface FsStat {
   available: number;
 }
 
+/** The `available` sentinel a backend reports when it cannot ask the OS for free
+ *  space (MemoryFs, the native primitive) — a large number that never reads as
+ *  "nearly full". Backends that CAN answer (NodeFs on POSIX, via statfs)
+ *  substitute the real figure. One value on every target: a guest that sizes its
+ *  writes against `stat()` must see the same answer whatever the backend is, so
+ *  the sentinel is part of the seam rather than a per-backend choice. */
+export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
+
 /** The storage seam. **Every method is async**, and that is a property of the seam
  *  rather than of any backend: a synchronous `get(key): Uint8Array | null` is a shape no
  *  browser backend can implement — IndexedDB is asynchronous by construction and OPFS is

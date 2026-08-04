@@ -32,13 +32,9 @@
 // Authenticity is the transport's job (the AKE channel attributes every frame), not a
 // per-message signature — so there is no signature wrapper and no signer scoping here.
 
-import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 
 // ─── handler routing ─────────────────────────────────────────────────────
-
-// Default scratch size mirrored by the host — handlers must reserve at least
-// this much I/O space at their `scratch` offset (README §4.1).
-const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
 export interface KernelHostOptions {
   /** Ceiling on a handler's declared initial *and* maximum linear memory, in bytes.

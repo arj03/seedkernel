@@ -37,6 +37,10 @@ import {
   type QuickJSContext,
   type QuickJSHandle,
 } from "quickjs-emscripten";
+// The shared §12.3 defaults — one copy on every target, so a guest meets the same
+// ceiling and the same budget whether its realm is this one or the native target's
+// (native/guest.go, whose bridge used to carry its own copies of these numbers).
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 // Use the actively-maintained quickjs-ng build rather than quickjs-emscripten's default
 // (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed now — net is
 // a real Promise resolved by the host, not an Asyncify stack unwind.
@@ -108,15 +112,6 @@ export interface SafeRealm {
   dispose(): void;
 }
 
-/** Default heap cap for a realm (README §16.1). */
-const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
-
-/** Default budget of guest execution time per entrypoint invocation (README §16.1).
- *  Generous for any real request — the storage guest's heaviest local pass is orders
- *  of magnitude under it — and short enough that a wedged guest frees the single
- *  host thread rather than holding it forever. */
-const DEFAULT_DEADLINE_MS = 5000;
-
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
 function getModule(): Promise<QuickJSWASMModule> {
@@ -156,7 +151,7 @@ interface ExecClock {
 /** Heap cap, and the execution-time guard the clock above drives. */
 function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock {
   ctx.runtime.setMemoryLimit(opts.memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES);
-  const budgetMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
+  const budgetMs = opts.deadlineMs ?? DEFAULT_GUEST_DEADLINE_MS;
   let consumedMs = 0;
   let segmentStart = 0;
   let running = false;

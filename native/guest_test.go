@@ -110,10 +110,12 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
+	// Twice the shared 64 MiB default (core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
+	// resolved by the shim) — mirrored here because the runtime no longer owns a copy.
 	src := fmt.Sprintf(`
 		register("ok",  () => new Uint8Array(1 << 20));  // well under the cap
 		register("hog", () => new Uint8Array(%d));       // twice the cap
-	`, 2*defaultRealmMemory)
+	`, 2*(64<<20))
 	newTestRealm(t, "{}", src)
 
 	out, err := realmCall("ok", nil)
