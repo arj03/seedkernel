@@ -204,10 +204,16 @@ const M2_LEN = EPH_LEN + NONCE_LEN + TAG_LEN;             //  80
 const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 
-// The one suite this transport speaks. A suite byte is not negotiated: it makes
-// the wire self-describing, and because it sits inside every signed transcript
-// half, an in-path attacker who flips it only makes the two ends sign different
-// bytes (domains.ts / §12.6, §14.1).
+// The one suite this transport speaks, and the bundle's own number: a channel suite
+// is read by the AKE, which is entirely this program, so it lives here rather than in
+// the host's core (§14.1 — the manifest suite is the host's for the opposite reason,
+// the loader reads it before anything is trusted). The cleartext-identity genesis
+// suite 0x01 was removed rather than disabled, because a node accepting both would
+// have the concealment of neither.
+//
+// A suite byte is not negotiated: it makes the wire self-describing, and because it
+// sits inside every signed transcript half, an in-path attacker who flips it only
+// makes the two ends sign different bytes (§12.6, §14.1).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
 const ZERO_NPUB = new Uint8Array(NPUB_LEN);

@@ -32,7 +32,8 @@ import { TransportHost } from "./transport-host.js";
 // author (see its header). Loading it is what stands the node's network up; an
 // operator who pins a different transport author in policy builds their own.
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
-import { type ChannelFactory, type Identity } from "../core/socket-seam.js";
+import { type ChannelFactory } from "../core/socket-seam.js";
+import type { Keypair } from "../core/subkeys.js";
 import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
 
@@ -45,12 +46,12 @@ export interface ShellOptions {
     dir: string;
     /** This node's kernel keypair (README §12.6) — the CHANNEL subkey, whose public half
      *  is the peer id. */
-    identity: Identity;
+    identity: Keypair;
     /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`, used only by
      *  the cap-bridge SIGN op. Separate so guest signing structurally cannot produce a
      *  channel handshake signature, whatever happens to the domain prefixes. Defaults to
      *  `identity`, so an embedding host that supplies one keypair still works. */
-    guestIdentity?: Identity;
+    guestIdentity?: Keypair;
     /** Optional deployment secret (§12.6.3). */
     contactSecret?: Uint8Array;
     listen?: {

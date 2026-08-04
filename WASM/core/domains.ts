@@ -124,40 +124,23 @@ export const SLOT_ONLY_DOMAINS: readonly string[] = ["rawnet", "transport"];
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility
  *  failure as an unsupported manifest suite (§12.4). */
 export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
-// ── Algorithm suites ────────────────────────────────────────────────────────────
+// ── The manifest suite ──────────────────────────────────────────────────────────
 //
 // A suite id is the first byte of the structure it governs *and* part of what that
 // structure's signature covers, so an attacker can never edit it in flight: doing so
-// only makes the two sides compute different preimages and the verify fail. Neither is
-// negotiated — one suite per link, one per manifest, unknown ids refused — because the
-// id's job is to make the format *self-describing*, not to pick between formats. That is
-// what lets a later suite change every field width (an ML-KEM-768 encapsulation key is
-// 1184 bytes where X25519 uses 32) while old and new stay unambiguous on the wire.
+// only makes the two sides compute different preimages and the verify fail. It is not
+// negotiated — one suite per manifest, unknown ids refused — because the id's job is to
+// make the format *self-describing*, not to pick between formats. That is what lets a
+// later suite change every field width while old and new stay unambiguous on the wire.
 //
-// The two are INDEPENDENT namespaces on independent clocks, and that is the whole reason
-// they are named apart rather than sharing one constant. The channel suite protects a
-// live key exchange, so it is exposed to harvest-now-decrypt-later and is the one under
-// time pressure; the manifest suite protects an at-rest signature, which has no
-// retroactive attack and can migrate late. They both read `0x01` today only because each
-// is at its own genesis algorithms. Never read one as the other, and never assume they
-// move together. See §14.1.
-/** Channel handshake (§12.6): Ed25519 identity · ephemeral X25519 · ChaCha20-Poly1305.
- *  Both identities ride in cleartext; see SUITE_CHANNEL_CONCEALED. */
-export const SUITE_CHANNEL_GENESIS = 0x01;
-/** Channel handshake with concealed identities (§12.6.2): a long-term X25519 key per
- *  node in addition to the Ed25519 identity, and neither identity on the wire in clear.
- *
- *  The initiator proves prior knowledge of the responder's static key in its first
- *  message, so a node never speaks to a peer that does not already know it — which is
- *  what stops a scanner from reading identities off any listener it can reach. Both
- *  identities then travel under keys derived from the ephemeral-ephemeral DH, so
- *  seizing a node's long-term key later does not retroactively deanonymise the peers
- *  that dialled it. Same record layer as 0x01 below the handshake.
- *
- *  A node that accepts BOTH suites has the concealment of neither: a scanner offers
- *  0x01 and reads the cleartext HELLO. 0x01 acceptance is therefore a deployment
- *  setting to be turned off, not a permanent compatibility mode (§12.6.2). */
-export const SUITE_CHANNEL_CONCEALED = 0x02;
+// **The CHANNEL suite is not here, and the asymmetry is the point.** A manifest suite
+// is read by the loader before anything is trusted, so it is the host's to declare — the
+// same argument that puts the flood bounds in net-limits.ts. A channel suite is read by
+// the AKE, which is entirely the transport bundle's program (transport/guest.js declares
+// its own), so it is content: replaceable by shipping a new signed bundle, on its own
+// clock. They are independent namespaces and always were; the channel half sat here only
+// as a leftover of the pre-bundle transport. See §14.1, and docs/PROTOCOL.md for the
+// channel suite ids themselves.
 /** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
 export const SUITE_MANIFEST_GENESIS = 0x01;
 /** Bundle manifest (§12.4): **hybrid** Ed25519 + ML-DSA-65 (FIPS 204). Both signatures

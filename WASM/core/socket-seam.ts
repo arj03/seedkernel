@@ -5,39 +5,15 @@
 // the wire codec, the AKE, the record layer, link routing, the request/response layer
 // — is the transport bundle's guest program, driven through host/transport-host.ts.
 // This file is the shapes the socket adapters (net-node, net-ws, net-rtc, net-channel)
-// compile against, and the identity/crypto shapes the driver passes through.
-
-import { fromHex } from "./util.js";
-import type { PeerId } from "./net.js";
-
-/** A peer identity — the node's kernel ed25519 keypair (README §12.6). */
-export interface Identity {
-  publicKey: Uint8Array;
-  privateKey: Uint8Array;
-}
-
-/** The narrow libsodium surface the channel handshake needs: sign/verify the
- *  handshake transcript, an ephemeral X25519 key exchange, a KDF (BLAKE2b) for
- *  the session keys, ChaCha20-Poly1305 for the record layer, and a CSPRNG for
- *  nonces. Any libsodium build satisfies it structurally, so the seam need not
- *  depend on a specific sodium type. */
-export interface TransportCrypto {
-  crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
-  crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
-  crypto_box_keypair: { publicKey: Uint8Array; privateKey: Uint8Array };
-  crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
-  crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
-  crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
-  crypto_aead_chacha20poly1305_ietf_encrypt(
-    message: Uint8Array, additional_data: Uint8Array | null, secret_nonce: Uint8Array | null,
-    public_nonce: Uint8Array, key: Uint8Array,
-  ): Uint8Array;
-  crypto_aead_chacha20poly1305_ietf_decrypt(
-    secret_nonce: Uint8Array | null, ciphertext: Uint8Array, additional_data: Uint8Array | null,
-    public_nonce: Uint8Array, key: Uint8Array,
-  ): Uint8Array;
-  randombytes_buf(length: number): Uint8Array;
-}
+// compile against — bytes, links, addresses, and nothing above them.
+//
+// It carries no crypto shape. The `TransportCrypto` interface that used to sit here
+// described "the narrow libsodium surface the channel handshake needs", and the channel
+// handshake is now the transport bundle's program, which reaches crypto through the
+// cap-bridge's one `CRYPTO` op (`CapSodium`, cap-bridge.ts) like any other guest. A
+// second, parallel declaration of the host's crypto surface had stopped describing
+// anything: the native shim already refuses the keyed `crypto_generichash` that
+// interface promised, and nothing noticed, because nothing called it.
 
 /** One link, as the platform hands it to the driver. The transport bundle never sees
  *  the object: the driver (transport-host.ts) wires it to the guest by a host-supplied
@@ -128,35 +104,4 @@ export interface ChannelFactory {
   ): Promise<{ port: number; wsPort: number }>;
   /** Stop the listeners. Open channels are closed by the core. */
   close(): void;
-}
-
-// ── peer-spec parsing ─────────────────────────────────────────────────────────
-
-/** Parse a `pk[.secret]@host:port` peer spec into the peer id + address to dial.
- *  Here rather than with the driver because what it produces is a `PeerAddr` — a core
- *  type — and a target parses its own `--peer` flags long before any transport stands.
- *  `pk` names WHO lives there and keys the address book; the optional `.secret`
- *  is THAT PEER's contact secret, which is what makes the address a credential. */
-export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
-  const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@host:port): ${spec}`);
-  const idPart = spec.slice(0, at).toLowerCase();
-  const dot = idPart.indexOf(".");
-  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
-  if (peerId.length !== 64 || /[^0-9a-f]/.test(peerId)) throw new Error(`bad peer pubkey hex: ${spec}`);
-  let contactSecret: Uint8Array | undefined;
-  if (dot >= 0) {
-    const hex = idPart.slice(dot + 1);
-    if (hex.length !== 64 || /[^0-9a-f]/.test(hex)) {
-      throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
-    }
-    contactSecret = fromHex(hex);
-  }
-  const hostPort = spec.slice(at + 1);
-  const colon = hostPort.lastIndexOf(":");
-  if (colon < 0) throw new Error(`bad peer host:port: ${spec}`);
-  const host = hostPort.slice(0, colon);
-  const port = Number(hostPort.slice(colon + 1));
-  if (!Number.isInteger(port) || port <= 0) throw new Error(`bad peer port: ${spec}`);
-  return { peerId, addr: { host, port, transport, contactSecret } };
 }

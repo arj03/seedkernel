@@ -38,12 +38,13 @@ const { CAP, createCapBridge, opsForCaps, guestSignScope, appSignScope, transpor
 // ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
 // itself is the bundle's now, so what is reachable from here is the module.
 const { wsAcceptKey, encodeFrame, decodeOne, WS_OP } = await import("./ws-module.mjs");
-const { MemoryFs } = await imp("build/core/fs.js");
+const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { toHex, fromHex, bytesEqual, concatBytes } = await imp("build/core/util.js");
+const { toHex, fromHex, concatBytes } = await imp("build/core/util.js");
+import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,

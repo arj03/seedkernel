@@ -9,7 +9,7 @@
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP } from "./ws-module.mjs";
 import { parseWsPeer } from "../build/host/net-ws.js";
-import { parsePeerSpec } from "../build/core/socket-seam.js";
+import { parsePeerSpec } from "../build/host/transport-host.js";
 
 let pass = 0, fail = 0;
 function test(name, fn) {

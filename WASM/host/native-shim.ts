@@ -24,9 +24,10 @@ import {
 } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
-import { FRAMING, type ChannelFactory, type Framing, type Identity, type RawLink, type TransportCrypto } from "../core/socket-seam.js";
+import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
+import type { Keypair } from "../core/subkeys.js";
 import type { Fs } from "../core/fs.js";
-import { parsePeerSpec } from "../core/socket-seam.js";
+import { parsePeerSpec } from "./transport-host.js";
 import { toHex, fromHex } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
@@ -56,7 +57,7 @@ declare const bridge: {
  *  half (native/mldsa.go) and the catalog's KEM (native/mlkem.go). Typed as the full
  *  surface the shared code consumes, so a Go shim that stops satisfying one of them
  *  fails the build rather than a handshake. */
-declare const sodium: ShellSodium & TransportCrypto;
+declare const sodium: ShellSodium;
 
 /** The `fs.*` primitive over Go's data directory (native/fs.go).
  *
@@ -255,7 +256,7 @@ function theShell() {
  *  surfaced as a network timeout. The config is an OBJECT for the same reason — a
  *  positional signature drifting against a Go harness string is a silent break. */
 async function makeTransportNode(cfg: {
-    identity: Identity;
+    identity: Keypair;
     contactSecret?: Uint8Array;
     listen?: {
         host: string;

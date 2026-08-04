@@ -17,7 +17,8 @@ const sodium = _sodium;
 
 const { KernelHost } = await imp("build/core/kernel-host.js");
 const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
-const { MemoryFs, scopedFs } = await imp("build/core/fs.js");
+const { scopedFs } = await imp("build/core/fs.js");
+const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { entryModuleOf, appScopeFor, genesisHash, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { createShell } = await imp("build/host/shell-core.js");

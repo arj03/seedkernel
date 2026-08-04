@@ -18,7 +18,7 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
 
 
-export { parsePeerSpec } from "../core/socket-seam.js";
+export { parsePeerSpec } from "./transport-host.js";
 // ── An unframed RawLink over a node:net socket ────────────────────────────────
 // Raw bytes in and out, no boundaries: node↔node TCP is handed to the transport
 // bundle exactly like this, and a WS link is the same socket with a different codec

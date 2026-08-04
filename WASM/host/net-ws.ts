@@ -15,7 +15,7 @@
 // injected factory), so importing this module where WebSocket is absent is safe.
 
 import type { Network, Endpoint, PeerId } from "../core/net.js";
-import { BufferedChannel } from "../core/net-channel.js";
+import { BufferedChannel } from "./net-channel.js";
 import { fromHex } from "../core/util.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 

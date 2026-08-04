@@ -47,6 +47,38 @@ import type { RawNet, HostTimers, TransportSink } from "./cap-bridge.js";
 import type { SafeRealm } from "./safe-js.js";
 import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
 
+/** Parse a `pk[.secret]@host:port` peer spec into the peer id + address to dial.
+ *  `pk` names WHO lives there and keys the address book; the optional `.secret` is
+ *  THAT PEER's contact secret, which is what makes the address a credential.
+ *
+ *  Host code, with the driver that consumes what it produces. It parses a flag into a
+ *  `PeerAddr` and decides nothing — the seam is `PeerAddr` itself (socket-seam.ts) and
+ *  every check here is a syntax check, so nothing about admission or trust would change
+ *  if a target hand-rolled its own parser and never called this. */
+export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
+  const at = spec.indexOf("@");
+  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@host:port): ${spec}`);
+  const idPart = spec.slice(0, at).toLowerCase();
+  const dot = idPart.indexOf(".");
+  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
+  if (peerId.length !== 64 || /[^0-9a-f]/.test(peerId)) throw new Error(`bad peer pubkey hex: ${spec}`);
+  let contactSecret: Uint8Array | undefined;
+  if (dot >= 0) {
+    const hex = idPart.slice(dot + 1);
+    if (hex.length !== 64 || /[^0-9a-f]/.test(hex)) {
+      throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
+    }
+    contactSecret = fromHex(hex);
+  }
+  const hostPort = spec.slice(at + 1);
+  const colon = hostPort.lastIndexOf(":");
+  if (colon < 0) throw new Error(`bad peer host:port: ${spec}`);
+  const host = hostPort.slice(0, colon);
+  const port = Number(hostPort.slice(colon + 1));
+  if (!Number.isInteger(port) || port <= 0) throw new Error(`bad peer port: ${spec}`);
+  return { peerId, addr: { host, port, transport, contactSecret } };
+}
+
 /** Kinds of link, as `linkOpen` declares them: CORE is the routing core's own
  *  (accepted through the channel factory, dial bookkeeping and the half-open limiter
  *  apply); OPEN is a host-managed transport — WebRTC, browser WS — that opened the

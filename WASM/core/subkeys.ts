@@ -40,6 +40,12 @@ export interface SubkeyCrypto {
   crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
 
+/** An Ed25519 keypair — the one name for this shape in the tree. It lives here, with
+ *  the derivation that is the only thing in the runtime that *produces* one: every
+ *  keypair a node holds comes out of `deriveNodeKeys` below. It was previously also
+ *  spelled `Identity` (socket-seam.ts) and twice more as an inline literal in
+ *  shell-core.ts, which is three names for one four-line record and no way to tell
+ *  from a signature which of them a caller meant. */
 export interface Keypair {
   publicKey: Uint8Array;
   privateKey: Uint8Array;

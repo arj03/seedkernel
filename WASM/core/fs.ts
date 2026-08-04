@@ -24,7 +24,9 @@ export interface FsStat {
  *  browser backend can implement — IndexedDB is asynchronous by construction and OPFS is
  *  synchronous only inside a Worker — so a sync seam would have made the browser the one
  *  target that could not carry `fs`, which is core (README §1). A backend that genuinely
- *  is synchronous (`MemoryFs`) returns an already-resolved promise and costs a microtask.
+ *  is synchronous (`MemoryFs`, host/fs-memory.ts) returns an already-resolved promise and
+ *  costs a microtask. The backends themselves are host code — this file is the seam they
+ *  satisfy plus the scoping every host must apply over it, and nothing else.
  *
  *  It is ABI-visible: `FS_*` are round-tripping ops (§12.2), so a guest reads them with
  *  `await`. Which side of that line an op sits on is exactly what `guest.abi` versions, so
@@ -85,36 +87,4 @@ export function scopedFs(inner: Fs, scope: string): Fs {
     delete: (key) => inner.delete(outward(key)),
     stat: () => inner.stat(),
   };
-}
-
-/** In-RAM Fs. The portable backend for tests and ephemeral nodes, and the shape
- *  a browser backend (OPFS/IndexedDB) will mirror. Stores copies so callers can
- *  reuse their buffers.
- *
- *  Every method is `async` even though the map behind them is not: the seam is what is
- *  asynchronous, and a backend that resolved sometimes-immediately would let a caller
- *  work by accident on this one and fail on the backend it ships against. */
-export class MemoryFs implements Fs {
-  private readonly map = new Map<string, Uint8Array>();
-
-  async get(key: string): Promise<Uint8Array | null> {
-    const v = this.map.get(key);
-    return v ? v.slice() : null;
-  }
-  async put(key: string, bytes: Uint8Array): Promise<void> { this.map.set(key, bytes.slice()); }
-  async size(key: string): Promise<number> {
-    const v = this.map.get(key);
-    return v ? v.length : -1;
-  }
-  async list(prefix?: string): Promise<string[]> {
-    const out: string[] = [];
-    for (const k of this.map.keys()) if (!prefix || k.startsWith(prefix)) out.push(k);
-    return out;
-  }
-  async delete(key: string): Promise<boolean> { return this.map.delete(key); }
-  async stat(): Promise<FsStat> {
-    let used = 0;
-    for (const v of this.map.values()) used += v.length;
-    return { used, available: Number.MAX_SAFE_INTEGER };
-  }
 }

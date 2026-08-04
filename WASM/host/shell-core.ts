@@ -27,6 +27,7 @@ import { toHex, fromHex } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
+import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
  *  (BundleCrypto) plus the cap-bridge crypto ops (CapSodium). Any sumo libsodium
@@ -90,17 +91,11 @@ export interface KernelBackend extends BundleHost, KernelTable {
 export interface ShellPlatform {
     sodium: ShellSodium;
     /** The CHANNEL keypair — its public half is this node's peer id. */
-    identity: {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
+    identity: Keypair;
     /** The GUEST signing keypair (§12.9), a sibling subkey. The cap-bridge SIGN op uses
      *  this and nothing else, so a guest can never elicit a channel signature. Defaults to
      *  `identity` for hosts that supply a single keypair. */
-    guestIdentity?: {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
+    guestIdentity?: Keypair;
     /** The handler table this shell binds bundle modules into (§3). */
     kernel: KernelBackend;
     fs?: Fs;

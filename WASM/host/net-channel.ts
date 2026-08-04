@@ -8,7 +8,12 @@
 // emits HELLO before the transport is writable), and the close/fail teardown are
 // written once here; a subclass only wires its transport's events to
 // open()/deliver()/fail() and says how to write bytes and tear the transport down.
-import { FRAMING } from "./socket-seam.js";
+//
+// Host code, not core: it defines no seam. `RawLink` — the shape it satisfies — is the
+// core seam (socket-seam.ts), and this is one convenience for the two host adapters
+// that implement it against a platform object. A target with its own message transport
+// is free to satisfy RawLink without ever touching this file.
+import { FRAMING } from "../core/socket-seam.js";
 
 export abstract class BufferedChannel {
     /** Every subclass here wraps a transport that already has message boundaries. */

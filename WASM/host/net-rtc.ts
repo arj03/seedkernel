@@ -26,7 +26,7 @@
 // the stack" move net-node.ts documents for the engine build. The browser globals
 // are referenced only inside RtcNetwork / relaySignaling, never at module scope,
 // so importing this module under Node (e.g. to unit-test RtcChannel) is safe.
-import { BufferedChannel } from "../core/net-channel.js";
+import { BufferedChannel } from "./net-channel.js";
 import { type Endpoint, type PeerId } from "../core/net.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
