@@ -243,7 +243,7 @@ func installWasm(n string, wasm []byte) error {
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
 // boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
-// event loop, the platform primitives (sodium, fs on dataDir, TCP sockets, ws.wasm,
+// event loop, the platform primitives (sodium, fs on dataDir, TCP sockets,
 // the byte-level `bridge` below), and then the ONE shared bundle. After this the realm
 // holds `createShell` and the native platform binding over it — but no node yet; that
 // is bootNode, which needs an identity and listen addresses.
@@ -298,7 +298,6 @@ func boot(dataDir string) error {
 		return fmt.Errorf("fs: %w", err)
 	}
 	exposeNet(qc, el)
-	exposeWs(qc)
 	exposeBridge(qc)
 	// The freshness high-water marks live in a SIBLING of the data dir, so a fs-capable
 	// guest — whose keys are files inside the dir — can never tamper with its own mark.

@@ -25,11 +25,9 @@ const {
 // rule (README §12.1), and these tests have to follow it like any other consumer.
 const sodium = await loadSodium();
 
-// Transport + WS module surface (moved up from seedstore in the runtime split).
-// These are seedkernel's own public exports — `./net-node` (NodeNetwork) and the
-// no-cap `./ws` framing module — so they are exercised here, where they live,
-// rather than only from a downstream consumer.
-const { NodeNetwork } = await imp("build/host/net-node.js");
+// `./net-node`'s own coverage is transport-tcp.test.mjs, which stands two nodes on
+// real sockets through `NodeChannelFactory` — the only path that exercises the
+// transport bundle's framing.
 
 // One contact secret for the whole harness. In production each node has its own and
 // hands it out with its address; a single value here just means every test node is
@@ -37,7 +35,9 @@ const { NodeNetwork } = await imp("build/host/net-node.js");
 const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { CAP, createCapBridge, opsForCaps, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION }
   = await imp("build/host/cap-bridge.js");
-const { wsAcceptKey, encodeFrame, WsParser, WS_OPCODES } = await imp("build/host/ws.js");
+// ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
+// itself is the bundle's now, so what is reachable from here is the module.
+const { wsAcceptKey, encodeFrame, decodeOne, WS_OP } = await import("./ws-module.mjs");
 const { MemoryFs } = await imp("build/core/fs.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
@@ -571,16 +571,15 @@ async function testWsFraming() {
   // (the only SHA-1/base64 in the runtime; the former JS copy is deleted).
   assertEqual(wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "WS accept known vector");
 
-  // Encode a masked client frame, parse it back through the server parser,
-  // split across a chunk boundary to exercise the incremental reader.
+  // Encode a masked client frame and decode it back as the server would. Reassembly
+  // across chunk boundaries is the framer's job, not the module's — it lives in the
+  // transport bundle now and is covered over real sockets by transport-tcp.test.mjs.
   const payload = new Uint8Array(300);
   for (let i = 0; i < payload.length; i++) payload[i] = (i * 31 + 28) & 255;
   const mask = new Uint8Array([0x12, 0x34, 0x56, 0x78]);
-  const wire = encodeFrame(WS_OPCODES.OP_BINARY, payload, mask);
-  const parser = new WsParser(true);
-  const frames = [...parser.push(wire.subarray(0, 7)), ...parser.push(wire.subarray(7))];
-  assertEqual(frames.length, 1, "one frame parsed across chunk boundary");
-  assert(frames[0] && bytesEqual(frames[0].payload, payload), "unmasked payload matches after demasking");
+  const got = decodeOne(encodeFrame(WS_OP.BINARY, payload, mask), true);
+  assert(got !== null, "a well-formed masked frame decodes");
+  assert(bytesEqual(got.payload, payload), "unmasked payload matches after demasking");
 
   console.log("  OK\n");
 }

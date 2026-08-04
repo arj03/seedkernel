@@ -45,20 +45,22 @@ const upgradeAuthor = Buffer.from(upgradeKeys.publicKey).toString("hex");
 // rather than at verify.
 function transportBundleAt(version, keys, guestSource) {
   const guest = guestSource ?? new Uint8Array(readFileSync(join(root, "transport/guest.js")));
+  const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const manifest = {
-    app: "transport", version, role: "transport", modules: [],
+    app: "transport", version, role: "transport",
+    modules: [{ name: "ws", hash: Buffer.from(sodium.crypto_generichash(32, wsWasm)).toString("hex") }],
     guest: {
       hash: Buffer.from(sodium.crypto_generichash(32, guest)).toString("hex"),
       // Read, never restated: a hardcoded number here would pass a test that the
       // production loader would refuse the moment the seam revved (§12.4).
       abi: GUEST_ABI_VERSION,
-      caps: ["crypto", "clock", "timer", "rawnet", "transport"],
+      caps: ["crypto", "clock", "timer", "rawnet", "transport", "module"],
       primitives: ["blake2b-256", "ed25519/verify", "chacha20poly1305-ietf/seal",
                    "chacha20poly1305-ietf/open", "x25519/dh"],
     },
   };
   const env = signManifest(sodium, keys.privateKey, keys.publicKey, manifest);
-  return packBundle({ [MANIFEST_FILE]: env, "guest.js": guest });
+  return packBundle({ [MANIFEST_FILE]: env, "guest.js": guest, "ws.wasm": wsWasm });
 }
 
 async function makeNode(channels, listen) {

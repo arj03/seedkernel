@@ -1,9 +1,8 @@
-// sock.go — the TCP socket primitive exposed to QuickJS as `__net`. This is the
-// only networking that stays in Go: open a
-// socket, frame whole messages over it, deliver them to JS, send, close. The
-// protocol on top — the PeerLink handshake, routing, request/response — runs as
-// the transport bundle's guest program (transport/guest.js) over the RawChannel shape
-// this module hands it. It reuses sockChannel (net.go) for the [len][bytes] framing.
+// sock.go — the TCP socket primitive exposed to QuickJS as `__net`. This is the only
+// networking that stays in Go: open a socket, hand its bytes to JS, send, close. There
+// are no message boundaries here — the wire codec, the PeerLink handshake, routing and
+// request/response all run as the transport bundle's guest program (transport/guest.js)
+// over the unframed RawLink shape this module hands it.
 //
 // Bytes cross the Go↔JS boundary only on the event-loop goroutine: socket reader
 // goroutines hand each message to el.post, which the loop delivers into JS via the
@@ -37,37 +36,31 @@ type netHost struct {
 }
 
 // exposeNet installs `__net` into the realm and the `netShimJS` glue that turns a
-// channel id into a RawChannel. Returns the netHost (kept alive for the process).
+// channel id into a RawLink. Returns the netHost (kept alive for the process).
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]rawChannel{}}
 	o := qc.NewObject()
 	fn := func(g func(*qjs.This) (*qjs.Value, error)) *qjs.Value { return qc.Function(g) }
 
-	connect := func(raw bool) *qjs.Value {
-		return fn(func(t *qjs.This) (*qjs.Value, error) {
-			if len(t.Args()) < 2 {
-				return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
-			}
-			addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
-			return t.Context().NewInt64(n.dial(addr, raw)), nil
-		})
-	}
-	listen := func(raw bool) *qjs.Value {
-		return fn(func(t *qjs.This) (*qjs.Value, error) {
-			if len(t.Args()) < 2 {
-				return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
-			}
-			bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()), raw)
-			if err != nil {
-				return t.Context().NewInt32(-1), nil
-			}
-			return t.Context().NewInt32(int32(bound)), nil
-		})
-	}
-	o.SetPropertyStr("connect", connect(false))   // node↔node, length-framed TCP
-	o.SetPropertyStr("connectRaw", connect(true)) // raw byte stream (under the JS WS codec)
-	o.SetPropertyStr("listen", listen(false))     // accept node↔node TCP
-	o.SetPropertyStr("listenRaw", listen(true))   // accept raw byte streams (browser↔node WS)
+	// One socket kind: a raw byte duplex. Which codec runs over it — length-prefixed
+	// or RFC 6455 — is the transport bundle's, never Go's.
+	o.SetPropertyStr("connect", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 2 {
+			return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
+		}
+		addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
+		return t.Context().NewInt64(n.dial(addr)), nil
+	}))
+	o.SetPropertyStr("listen", fn(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 2 {
+			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
+		}
+		bound, err := n.listen(t.Args()[0].String(), int(t.Args()[1].Int32()))
+		if err != nil {
+			return t.Context().NewInt32(-1), nil
+		}
+		return t.Context().NewInt32(int32(bound)), nil
+	}))
 	o.SetPropertyStr("send", fn(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return nil, nil
@@ -133,26 +126,24 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
-// dial opens an outbound channel: length-framed TCP, or a raw byte stream when raw
-// (the transport under the JS WebSocket codec). Both connect in the background and
-// buffer pre-connect sends, so JS can wrap the id and PeerLink can sendHello() (or
+// dial opens an outbound byte duplex. It connects in the background and
+// buffers pre-connect sends, so JS can wrap the id and PeerLink can sendHello() (or
 // the WS client can write its upgrade request) immediately; the JS channel is
 // registered (synchronously, in the same JS turn) before the loop ever processes a
 // delivered frame.
-func (n *netHost) dial(addr string, raw bool) int64 {
+func (n *netHost) dial(addr string) int64 {
 	id := n.alloc()
-	ch := newDialChannel(addr, framingFor(raw), n.onMsg(id), n.onClose(id))
+	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id))
 	n.mu.Lock()
 	n.chans[id] = ch
 	n.mu.Unlock()
 	return id
 }
 
-// listen accepts inbound channels (length-framed TCP, or raw byte streams when
-// raw). The read goroutine is started only from inside the posted task, AFTER
+// listen accepts inbound byte duplexes. The read goroutine is started only from inside the posted task, AFTER
 // __netAccept has created the JS channel — otherwise the read goroutine could
 // deliver a frame before JS has a channel to route it to.
-func (n *netHost) listen(host string, port int, raw bool) (int, error) {
+func (n *netHost) listen(host string, port int) (int, error) {
 	// Accepted sockets keep default buffer options on purpose: a fixed SO_RCVBUF set
 	// pre-bind is clamped to net.core.rmem_max (208 KiB stock) and locks out receive
 	// autotuning, pinning a high-RTT PUT into a holder near a 64 KiB window (~2.5 MB/s
@@ -174,7 +165,7 @@ func (n *netHost) listen(host string, port int, raw bool) (int, error) {
 				return // listener closed (closeListeners) or fatal accept error — exit the goroutine
 			}
 			id := n.alloc()
-			ch, start := n.wrapInbound(id, conn, raw)
+			ch, start := n.wrapInbound(id, conn)
 			n.mu.Lock()
 			n.chans[id] = ch
 			n.mu.Unlock()
@@ -203,11 +194,11 @@ func (n *netHost) closeListeners() {
 
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
-func (n *netHost) wrapInbound(id int64, conn net.Conn, raw bool) (rawChannel, func()) {
+func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
 	// Socket buffers are already set on the listener (pre-bind, via ListenConfig.Control)
 	// and inherited here, so the accepted connection's window scale is sized correctly.
-	c := newInboundChannel(framingFor(raw), conn, n.onMsg(id), n.onClose(id))
-	return c, func() { go c.proto.readLoop(c) }
+	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id))
+	return c, func() { go c.readLoop() }
 }
 
 // onMsg/onClose run on a socket reader goroutine; they hand the work to the loop
@@ -249,7 +240,7 @@ func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 	}
 }
 
-// netShimJS turns the byte-level __net into the RawChannel shape the host JS wants,
+// netShimJS turns the byte-level __net into the RawLink shape the host JS wants,
 // and routes Go's deliver/close/accept callbacks to the right channel. Loader glue
 // (platform binding), not shared TS — like sodiumShimJS.
 const netShimJS = `
@@ -259,17 +250,17 @@ const netShimJS = `
   const chans = new Map();     // id -> { deliver, closed }
   const listeners = new Map(); // bound port -> accept(id)
 
-  // A whole-message RawChannel (TCP, length-framed in Go): the routing core's
-  // PeerLink drives this directly.
-  function makeRawChannel(id) {
-    let onMsg = () => {}, onClose = () => {};
+  // One RawLink (core/socket-seam.ts), minus its framing: Go vends one socket kind and
+  // native-shim.ts says which codec runs over it.
+  function makeLink(id) {
+    let onData = () => {}, onClose = () => {};
     chans.set(id, {
-      deliver: (bytes) => onMsg(bytes),
+      deliver: (bytes) => onData(bytes),
       closed: () => { chans.delete(id); onClose(); },
     });
     return {
       send: (bytes) => N.send(id, bytes),
-      onMessage: (cb) => { onMsg = cb; },
+      onData: (cb) => { onData = cb; },
       onClose: (cb) => { onClose = cb; },
       // A deliberate close never fires __netClosed (Go closes silently), so drop our own
       // map entry here too — otherwise every local close leaks a chans entry unbounded.
@@ -277,34 +268,11 @@ const netShimJS = `
     };
   }
 
-  // A raw byte duplex (no framing): the transport under the JS WebSocket codec
-  // (net-frame.ts WsClientChannel/WsServerChannel), which frames on top.
-  function makeRawStream(id) {
-    let onData = () => {}, onClose = () => {};
-    chans.set(id, {
-      deliver: (bytes) => onData(bytes),
-      closed: () => { chans.delete(id); onClose(); },
-    });
-    return {
-      write: (bytes) => N.send(id, bytes),
-      onData: (cb) => { onData = cb; },
-      onClose: (cb) => { onClose = cb; },
-      close: () => { N.close(id); chans.delete(id); }, // see makeRawChannel: drop on deliberate close
-    };
-  }
-
-  globalThis.netConnect = (host, port) => makeRawChannel(N.connect(host, port));
-  globalThis.netConnectRaw = (host, port) => makeRawStream(N.connectRaw(host, port));
-  globalThis.netListen = (host, port, onAccept) => {
-    const bound = N.listen(host, port);
-    if (bound < 0) throw new Error("netListen: bind failed");
-    listeners.set(bound, (id) => onAccept(makeRawChannel(id)));
-    return bound;
-  };
+  globalThis.netConnectRaw = (host, port) => makeLink(N.connect(host, port));
   globalThis.netListenRaw = (host, port, onAccept) => {
-    const bound = N.listenRaw(host, port);
+    const bound = N.listen(host, port);
     if (bound < 0) throw new Error("netListenRaw: bind failed");
-    listeners.set(bound, (id) => onAccept(makeRawStream(id)));
+    listeners.set(bound, (id) => onAccept(makeLink(id)));
     return bound;
   };
   // Teardown closes every bound listener in Go, so every accept closure here is

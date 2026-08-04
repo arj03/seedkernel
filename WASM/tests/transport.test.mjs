@@ -1,22 +1,15 @@
-// Transport-level behaviour: WebSocket frame-cap ordering and peer-address parsing.
+// The ws.wasm module's RFC 6455 conformance, plus peer-address parsing.
 //
-// Transports reassemble inbound frames under MAX_HANDSHAKE_FRAME_BYTES until a link
-// authenticates, then raise the cap. On the WS path the cap lives in WsParser and is
-// raised by the channel from inside frame delivery — so the parser MUST deliver each
-// frame as it is parsed rather than parsing a whole chunk and delivering afterwards.
-//
-// The distinction is not theoretical. A responder authenticates at msg3 and may send
-// application data alongside msg4, and TCP will happily deliver both in one segment. A
-// batch-then-deliver parser measures that application frame against the cap that was in
-// force before msg4 was seen — the pre-auth cap — and fails the connection. Every
-// browser-to-node link would drop on its first sizeable frame.
+// The framing STATE MACHINE — the residual buffer, the two-stage cap, fragment
+// reassembly — belongs to the transport bundle's guest (transport/guest.js `WsFramer`)
+// and is covered end to end by transport-tcp.test.mjs, which stands two nodes over a
+// real WS upgrade. What is tested here is the module those framers call: one whole
+// frame in, one decoded frame out, and the refusals it owes its callers — far easier to
+// provoke here than over a socket.
 
-import { WsParser } from "../build/host/ws/ws-codec.js";
-import { installWasmWsBackend } from "../build/host/ws/ws-wasm-backend.js";
+import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP } from "./ws-module.mjs";
 import { parseWsPeer } from "../build/host/net-ws.js";
 import { parsePeerSpec } from "../build/core/socket-seam.js";
-
-installWasmWsBackend();
 
 let pass = 0, fail = 0;
 function test(name, fn) {
@@ -25,46 +18,54 @@ function test(name, fn) {
 }
 const assert = (c, m) => { if (!c) throw new Error(m); };
 
-/** One unmasked binary frame, built by hand — servers read masked frames, clients
- *  unmasked, and this exercises the client direction. */
-function binaryFrame(n) {
-  const payload = new Uint8Array(n);
-  for (let i = 0; i < n; i++) payload[i] = i & 255;
-  if (n < 126) return Uint8Array.from([0x82, n, ...payload]);
-  return Uint8Array.from([0x82, 126, (n >> 8) & 255, n & 255, ...payload]);
-}
+console.log("\nRFC 6455 module conformance (ws.wasm, a module of the transport bundle)\n");
 
-console.log("\nWebSocket frame cap ordering (§12.6.2)\n");
+const MASK = new Uint8Array([0x12, 0x34, 0x56, 0x78]);
+const body = (n) => {
+  const p = new Uint8Array(n);
+  for (let i = 0; i < n; i++) p[i] = (i * 31 + 28) & 255;
+  return p;
+};
 
-test("a cap raised during delivery applies to the next frame in the SAME chunk", () => {
-  const small = binaryFrame(100), big = binaryFrame(2000);
-  const chunk = new Uint8Array(small.length + big.length);
-  chunk.set(small, 0); chunk.set(big, small.length);
-
-  const parser = new WsParser(false, 512); // pre-auth cap
-  const got = [];
-  parser.push(chunk, (f) => {
-    got.push(f.payload.length);
-    if (got.length === 1) parser.setCap(1 << 20); // what authentication does
-  });
-  assert(got.length === 2, `expected 2 frames, got ${got.length}`);
-  assert(got[1] === 2000, `expected the second frame at full size, got ${got[1]}`);
+test("RFC 6455 §1.3 accept vector — the runtime's only SHA-1, and its base64", () => {
+  assert(wsAcceptKey("dGhlIHNhbXBsZSBub25jZQ==") === "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "known vector");
+  assert(wsBase64(new Uint8Array([0, 1, 2, 3])) === "AAECAw==", "base64 with padding");
 });
 
-test("the cap still rejects an oversize frame that arrives before any raise", () => {
-  const parser = new WsParser(false, 512);
-  let threw = false;
-  try { parser.push(binaryFrame(2000), () => {}); } catch { threw = true; }
-  assert(threw, "an oversize pre-auth frame must be rejected");
+test("a masked client frame round-trips through a server decode", () => {
+  const payload = body(300);
+  const got = decodeOne(encodeFrame(WS_OP.BINARY, payload, MASK), true);
+  assert(got !== null, "decode refused a well-formed masked frame");
+  assert(got.fin && got.opcode === WS_OP.BINARY, "fin/opcode");
+  assert(Buffer.compare(Buffer.from(got.payload), Buffer.from(payload)) === 0, "payload survived demasking");
 });
 
-test("the callback form and the array form agree", () => {
-  const chunk = binaryFrame(50);
-  const viaArray = new WsParser(false, 512).push(chunk);
-  const viaCb = [];
-  new WsParser(false, 512).push(chunk, (f) => viaCb.push(f));
-  assert(viaArray.length === 1 && viaCb.length === 1, "both forms should yield one frame");
-  assert(viaArray[0].payload.length === viaCb[0].payload.length, "payloads should match");
+test("each length encoding decodes to the length it declares", () => {
+  // 125 / 126 / 65535 / 65536 straddle the 7-bit, 16-bit and 64-bit header forms.
+  for (const n of [0, 125, 126, 65535, 65536]) {
+    const got = decodeOne(encodeFrame(WS_OP.BINARY, body(n), null), false);
+    assert(got !== null && got.payload.length === n, `length ${n}`);
+  }
+});
+
+test("the mask direction is enforced in BOTH directions", () => {
+  // The RFC is not asymmetric by accident: an unmasked client frame is the one an
+  // off-path attacker can smuggle through a cache, which is what masking exists to stop.
+  assert(decodeOne(encodeFrame(WS_OP.BINARY, body(8), null), true) === null,
+    "a server must refuse an UNmasked client frame");
+  assert(decodeOne(encodeFrame(WS_OP.BINARY, body(8), MASK), false) === null,
+    "a client must refuse a MASKED server frame");
+});
+
+test("a fragmented control frame is refused (RFC 6455 §5.5)", () => {
+  const f = encodeFrame(WS_OP.PING, body(4), null);
+  f[0] &= 0x7f; // clear FIN — a control frame may never be fragmented
+  assert(decodeOne(f, false) === null, "a FIN-less control frame must be a protocol error");
+});
+
+test("a truncated frame decodes to nothing rather than reading past its end", () => {
+  const f = encodeFrame(WS_OP.BINARY, body(200), null);
+  assert(decodeOne(f.subarray(0, f.length - 10), false) === null, "short frame");
 });
 
 // ── peer specs ───────────────────────────────────────────────────────────────

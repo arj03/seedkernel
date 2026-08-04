@@ -1,12 +1,18 @@
-// net-channel.ts — shared plumbing for the RawChannel adapters that wrap an
-// already-ordered binary transport: TcpChannel (net-node, length-prefix framed),
-// WsChannel (net-ws, a browser WebSocket), RtcChannel (net-rtc, an RTCDataChannel).
-// The onMessage/onClose sinks, the `dead` flag, the pre-open send buffer (PeerLink
+// net-channel.ts — shared plumbing for the RawLink adapters that wrap an
+// already-ordered binary transport: WsChannel (net-ws, a browser WebSocket) and
+// RtcChannel (net-rtc, an RTCDataChannel). Every one of them delivers whole messages,
+// so this base is FRAMING.PLATFORM; a byte duplex (a raw socket, handed to the
+// transport bundle to frame itself) has no boundaries to buffer per message and does
+// not come through here.
+// The onData/onClose sinks, the `dead` flag, the pre-open send buffer (PeerLink
 // emits HELLO before the transport is writable), and the close/fail teardown are
 // written once here; a subclass only wires its transport's events to
 // open()/deliver()/fail() and says how to write bytes and tear the transport down.
-// net-frame.ts's WsChannelBase extends this, adding the RFC 6455 codec.
+import { FRAMING } from "./socket-seam.js";
+
 export abstract class BufferedChannel {
+    /** Every subclass here wraps a transport that already has message boundaries. */
+    readonly framing = FRAMING.PLATFORM;
     protected onMsg: ((bytes: Uint8Array) => void) | null = null;
     protected onCls: (() => void) | null = null;
     private readonly pending: Uint8Array[] = [];
@@ -32,7 +38,7 @@ export abstract class BufferedChannel {
             this.pendingBytes += bytes.length;
         }
     }
-    onMessage(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
+    onData(cb: (bytes: Uint8Array) => void): void { this.onMsg = cb; }
     onClose(cb: () => void): void { this.onCls = cb; }
     close(graceful = false): void {
         if (this.dead)

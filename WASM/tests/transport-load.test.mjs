@@ -72,7 +72,7 @@ async function server(fabric, halfOpen, opts = {}) {
 function silentDial(fabric, port, host) {
   const ch = fabric.connect({ host, port, transport: "tcp" });
   const st = { ch, closed: false };
-  ch.onMessage(() => {});
+  ch.onData(() => {});
   ch.onClose(() => { st.closed = true; });
   return st;
 }
@@ -222,10 +222,10 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     const gated = {
       remoteAddr: raw.remoteAddr,
       send: (b) => { if (++wrote <= 1) raw.send(b); },
-      onMessage: (cb) => raw.onMessage(cb),
+      framing: raw.framing,
+      onData: (cb) => raw.onData(cb),
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),
-      allowLargeFrames: () => raw.allowLargeFrames?.(),
     };
     a.driver.openLink({ channel: gated, weDialed: true, expectPeerId: s.driver.peerId, contactSecret: CONTACT });
     d.ch.onClose(() => {});

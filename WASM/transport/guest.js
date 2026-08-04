@@ -134,6 +134,7 @@ function utf8Decode(b) {
 // Authorities only — a primitive has no op number, it has a name (see below).
 const OP_SIGN = 2;
 const OP_RANDOM = 4;
+const OP_MODULE_CALL = 13;
 const OP_CLOCK = 14;
 
 // The raw net capability: bytes over an opaque link id, opened and closed. This is
@@ -142,7 +143,6 @@ const OP_CLOCK = 14;
 const OP_LINK_OPEN = 15;
 const OP_LINK_SEND = 16;
 const OP_LINK_CLOSE = 17;
-const OP_LINK_CAP = 18;
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
 const OP_LINK_STAT = 27;
@@ -251,8 +251,13 @@ let signPrefix = null;
 let connsPerPeer = 1;
 // The HOST's flood cap, learned at INIT — this module never declares the number
 // that bounds it (net-limits.ts stays core); it only sizes its own send budget
-// against it.
-let maxFrameBytes = 16 * 1024 * 1024;
+// against it. The literal is the value INIT overwrites, never a second declaration.
+let maxFrameBytes = 2 * 1024 * 1024;
+// The pre-auth cap, learned at init from the same place. Enforced HERE rather than by
+// the host, because on an unframed link the host has no frames to measure — it holds a
+// byte duplex and we are the ones imposing boundaries on it. The number is still the
+// host's: whoever owns the resource declares the bound, whoever parses applies it.
+let maxHandshakeFrameBytes = 8 * 1024;
 let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256;
 
 // The one router and the one request/response layer per host instance.
@@ -334,10 +339,9 @@ function clockNow() {
 
 // ── calling out: the ops, each one argument-encoded and issued immediately ────
 //
-// There is no action buffer and no batch. An earlier revision accumulated orders
-// into a `[count u8][action …]` response the host decoded after the entrypoint
-// returned; that was a second host↔module ABI, and every one of these calls is now
-// an ordinary `host.call` through the one seam (§12.2).
+// There is no action buffer and no batch. Accumulating orders into a response the host
+// decodes after the entrypoint returns would be a second host↔module ABI; every one of
+// these calls is an ordinary `host.call` through the one seam (§12.2).
 //
 // The one rule the arrangement rests on is the host's: NO OP RE-ENTERS THIS REALM.
 // A socket write does not deliver during the write, a fired timer arrives on its own
@@ -360,10 +364,17 @@ function args(u32s, u8s, tail) {
 }
 
 /** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
-function netLinkOpen(destBytes) { return readU32BE(host.call(OP_LINK_OPEN, destBytes), 0); }
+function netLinkOpen(destBytes) {
+  const r = host.call(OP_LINK_OPEN, destBytes);
+  const authLen = readU32BE(r, 5);
+  return {
+    linkId: readU32BE(r, 0),
+    framing: r[4],
+    authority: authLen > 0 ? utf8Decode(r.subarray(9, 9 + authLen)) : "",
+  };
+}
 function netLinkSend(linkId, bytes) { host.call(OP_LINK_SEND, args([linkId], [], bytes)); }
 function netLinkClose(linkId, graceful) { host.call(OP_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
-function netLinkCap(linkId) { host.call(OP_LINK_CAP, args([linkId], [])); }
 /** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
  *  or a channel that cannot say — both read as "nothing queued", which leaves the
  *  stall clock to the deadline alone. */
@@ -414,9 +425,293 @@ function clearAllTimers() {
 // A link is bound to one host-managed channel, addressed by the HOST-SUPPLIED
 // link id — the table holds one instance per name (§3.1), so all session state
 // lives here, keyed by that id.
+// ── wire framing, for links the platform did not frame ────────────────────────
+//
+// A browser WebSocket and an RTCDataChannel arrive with message boundaries already
+// on them; a TCP socket does not. Where the platform supplies none, imposing them is
+// OURS — framing is content by the end-to-end argument (it is a state machine over
+// whole messages, and an endpoint can do it), so a host that framed on our behalf
+// would be holding a piece of the protocol that a replacement bundle could not
+// replace. The host hands over bytes; what a message *is* is decided here.
+//
+//   [len u32 BE][bytes]   one link message per record.
+//
+// The cap is two-stage and both numbers come from the host at init. Pre-auth it is
+// the small handshake bound: a stranger who knows only host:port must not be able to
+// reserve megabytes by declaring a frame and then dribbling the body. It rises to the
+// full frame cap at exactly the moment the peer becomes a known, admitted identity.
+class LengthFramer {
+  constructor(put) {
+    this.put = put;
+    this.buf = new Uint8Array(0);
+    this.cap = maxHandshakeFrameBytes;
+  }
+
+  /** A length-prefixed link is writable from birth — there is no negotiation. */
+  send(msg) {
+    const out = new Uint8Array(4 + msg.length);
+    writeU32BE(out, 0, msg.length);
+    out.set(msg, 4);
+    this.put(out);
+  }
+
+  raiseCap() { this.cap = maxFrameBytes; }
+
+  /** Feed inbound bytes, delivering each whole message. Returns false when the peer
+   *  declared an over-cap frame — a protocol violation the caller answers by tearing
+   *  the link down, never by growing the buffer. */
+  push(chunk, deliver) {
+    this.buf = this.buf.length === 0 ? chunk : concatBytes([this.buf, chunk]);
+    for (;;) {
+      if (this.buf.length < 4) return true;
+      const len = readU32BE(this.buf, 0);
+      if (len > this.cap) return false;
+      if (this.buf.length < 4 + len) return true;
+      const msg = this.buf.slice(4, 4 + len);
+      this.buf = this.buf.subarray(4 + len);
+      deliver(msg);
+    }
+  }
+}
+
+// ── RFC 6455, for the browser edge ────────────────────────────────────────────
+//
+// WebSocket exists here only because browsers cannot open raw TCP, so it is a wire
+// codec over a raw socket and nothing more: an HTTP upgrade, then length-delimited
+// frames with a masking rule that depends on which end you are. Both ends run this
+// one class; they differ in who speaks first and in whether frames are masked
+// (client→server must be, server→client must not).
+//
+// Every byte transform runs in `ws.wasm`, a module of THIS bundle reached by logical
+// name — the encode, the single-frame decode, the SHA-1 + base64 of the accept value.
+// Holding it as a module rather than as host code is what makes the framing content:
+// it arrives through the one install path, signed by the same author as this program,
+// and a fix to either half is one bundle rollout.
+const WS_OP_ENCODE = 1, WS_OP_DECODE_ONE = 2, WS_OP_ACCEPT = 3, WS_OP_BASE64 = 4;
+const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
+/** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
+const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
+/** An HTTP upgrade head is tiny; anything larger is not one. */
+const MAX_WS_HANDSHAKE = 16 * 1024;
+
+/** Call one of THIS bundle's modules by its logical name (the bridge resolves it to a
+ *  kernel name, which a guest never sees). */
+function moduleCall(name, req) {
+  const n = utf8Encode(name);
+  const out = new Uint8Array(1 + n.length + req.length);
+  out[0] = n.length;
+  out.set(n, 1);
+  out.set(req, 1 + n.length);
+  return host.call(OP_MODULE_CALL, out);
+}
+
+function wsCall(req) {
+  const out = moduleCall("ws", req);
+  if (out.length === 0) throw new Error("ws: module error");
+  return out;
+}
+
+class WsFramer {
+  /** `authority` is the `host:port` this link was dialed at, for the client's Host
+   *  header — empty on the accepting side, which never sends one. */
+  constructor(put, weDialed, authority) {
+    this.put = put;
+    this.client = weDialed;
+    this.cap = maxHandshakeFrameBytes;
+    this.buf = new Uint8Array(0);      // inbound: handshake head, then frames
+    this.queue = [];                   // outbound, until the upgrade completes
+    this.open = false;
+    this.fragOpcode = -1;
+    this.frags = [];
+    this.fragBytes = 0;
+    if (this.client) {
+      const r = wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
+      this.key = utf8Decode(r);
+      this.expectAccept = utf8Decode(wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
+      this.put(utf8Encode(
+        "GET / HTTP/1.1\r\nHost: " + authority + "\r\n" +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        "Sec-WebSocket-Key: " + this.key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+    }
+  }
+
+  raiseCap() { this.cap = maxFrameBytes; }
+
+  mask() { return this.client ? randomBytes(4) : null; }
+
+  frame(opcode, payload) {
+    const m = this.mask();
+    const req = new Uint8Array(3 + (m ? 4 : 0) + payload.length);
+    req[0] = WS_OP_ENCODE;
+    req[1] = opcode & 0x0f;
+    req[2] = m ? 1 : 0;
+    if (m) req.set(m, 3);
+    req.set(payload, 3 + (m ? 4 : 0));
+    return wsCall(req);
+  }
+
+  send(msg) {
+    // The transport emits its HELLO the moment the link exists — before the upgrade
+    // has finished — so frames queue until the channel opens.
+    if (!this.open) { this.queue.push(msg); return; }
+    this.put(this.frame(WS_OP_BINARY, msg));
+  }
+
+  /** The close frame rides the same byte stream as the end-of-stream record just
+   *  written, so it cannot overtake it — which is the ordering that record depends on. */
+  goodbye() {
+    if (this.open) { try { this.put(this.frame(WS_OP_CLOSE, WS_CLOSE_NORMAL)); } catch { /* gone */ } }
+  }
+
+  push(chunk, deliver) {
+    this.buf = this.buf.length === 0 ? chunk : concatBytes([this.buf, chunk]);
+    if (!this.open) {
+      let consumed;
+      try { consumed = this.upgrade(); } catch { return false; }
+      if (consumed < 0) return this.buf.length <= MAX_WS_HANDSHAKE;
+      this.buf = this.buf.subarray(consumed);
+      this.open = true;
+      for (const m of this.queue) this.put(this.frame(WS_OP_BINARY, m));
+      this.queue = [];
+    }
+    try { return this.frames(deliver); } catch { return false; }
+  }
+
+  /** Read (client) or answer (server) the opening handshake. Returns the bytes
+   *  consumed, or -1 when the head is not complete yet. Throws on a refusal. */
+  upgrade() {
+    const sep = indexOfCRLFCRLF(this.buf);
+    if (sep < 0) return -1;
+    const head = utf8Decode(this.buf.subarray(0, sep));
+    if (this.client) {
+      // Sec-WebSocket-Accept is base64 and case-significant, so compare the exact
+      // header value byte for byte rather than lowercasing both sides.
+      if (!/HTTP\/1\.1 101/.test(head) || headerValue(head, "sec-websocket-accept") !== this.expectAccept) {
+        throw new Error("ws: upgrade refused");
+      }
+      return sep + 4;
+    }
+    const key = headerValue(head, "sec-websocket-key");
+    if (!key) throw new Error("ws: missing Sec-WebSocket-Key");
+    const accept = utf8Decode(wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), utf8Encode(key)])));
+    this.put(utf8Encode(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+      "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"));
+    return sep + 4;
+  }
+
+  /** Parse whatever frames are complete. Delivery is per frame rather than per chunk:
+   *  delivering msg4 raises the cap, and an application frame riding the same TCP
+   *  segment must be measured against the raised cap, not the pre-auth one. */
+  frames(deliver) {
+    for (;;) {
+      const total = this.frameLength();
+      if (total < 0) return true;
+      if (total > this.cap) return false;
+      if (this.buf.length < total) return true;
+      const whole = this.buf.slice(0, total);
+      this.buf = this.buf.subarray(total);
+      const req = new Uint8Array(2 + whole.length);
+      req[0] = WS_OP_DECODE_ONE;
+      req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
+      req.set(whole, 2);
+      const r = wsCall(req);
+      // The module saw exactly one whole frame; anything but "frame" (1) is a protocol
+      // violation — bad mask direction, a fragmented control frame, a bad length.
+      if (r[0] !== 1) return false;
+      const fin = (r[1] & 0x80) !== 0;
+      const opcode = r[1] & 0x0f;
+      const payload = r.slice(10, 10 + readU32BE(r, 6));
+      if (opcode === WS_OP_CONT) {
+        if (this.fragOpcode < 0) return false;
+        this.fragBytes += payload.length;
+        if (this.fragBytes > this.cap) return false;
+        this.frags.push(payload);
+        if (fin) {
+          const msg = concatBytes(this.frags);
+          const first = this.fragOpcode;
+          this.fragOpcode = -1; this.frags = []; this.fragBytes = 0;
+          if (!this.dispatch(first, msg, deliver)) return false;
+        }
+      } else if (!fin) {
+        // The first fragment of a data message (the module refuses fragmented control).
+        if (this.fragOpcode >= 0) return false;
+        this.fragOpcode = opcode;
+        this.frags = [payload];
+        this.fragBytes = payload.length;
+      } else {
+        // A data frame may not preempt an in-flight fragmented message; control frames
+        // interleave freely (RFC 6455 §5.4).
+        if (opcode < 0x8 && this.fragOpcode >= 0) return false;
+        if (!this.dispatch(opcode, payload, deliver)) return false;
+      }
+    }
+  }
+
+  dispatch(opcode, payload, deliver) {
+    if (opcode === WS_OP_BINARY) deliver(payload);
+    else if (opcode === WS_OP_PING) this.put(this.frame(WS_OP_PONG, payload));
+    else if (opcode === WS_OP_CLOSE) return false;
+    return true;
+  }
+
+  /** Total byte length of the next frame, from the (unvalidated) header — or -1 when
+   *  too few bytes are buffered to know yet. All real validation is the module's; this
+   *  only sizes the wait. */
+  frameLength() {
+    const b = this.buf;
+    if (b.length < 2) return -1;
+    const masked = (b[1] & 0x80) !== 0;
+    const len7 = b[1] & 0x7f;
+    let headerLen = 2, payloadLen = len7;
+    if (len7 === 126) {
+      if (b.length < 4) return -1;
+      headerLen = 4;
+      payloadLen = (b[2] << 8) | b[3];
+    } else if (len7 === 127) {
+      if (b.length < 10) return -1;
+      if (readU32BE(b, 2) !== 0) return 0x7fffffff; // > 4 GiB: over any cap
+      headerLen = 10;
+      payloadLen = readU32BE(b, 6);
+    }
+    return headerLen + (masked ? 4 : 0) + payloadLen;
+  }
+}
+
+function indexOfCRLFCRLF(b) {
+  for (let i = 0; i + 3 < b.length; i++) {
+    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
+  }
+  return -1;
+}
+
+/** Case-insensitively pull a header value out of an HTTP head. */
+function headerValue(head, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp("^" + escaped + ":[ \\t]*(.+?)[ \\t]*$", "im").exec(head);
+  return m ? m[1] : null;
+}
+
+/** How a link is framed, as the host declares it at open. The host knows only because
+ *  it dialed the address; what to DO about it is entirely here. */
+const FRAMING_PLATFORM = 0, FRAMING_LENGTH = 1, FRAMING_WS_CLIENT = 2, FRAMING_WS_SERVER = 3;
+
+function makeFramer(framing, linkId, weDialed, authority) {
+  const put = (bytes) => netLinkSend(linkId, bytes);
+  if (framing === FRAMING_LENGTH) return new LengthFramer(put);
+  if (framing === FRAMING_WS_CLIENT) return new WsFramer(put, true, authority || "");
+  if (framing === FRAMING_WS_SERVER) return new WsFramer(put, false, "");
+  return null; // FRAMING_PLATFORM: the transport under us already has boundaries
+}
+
 class Link {
   constructor(spec) {
     this.linkId = spec.linkId;
+    // How this link is framed. PLATFORM means the transport under us already has
+    // message boundaries (a browser WebSocket, an RTCDataChannel) and the host still
+    // owns its cap; anything else is a byte duplex we frame ourselves.
+    this.framer = makeFramer(spec.framing, spec.linkId, spec.weDialed, spec.authority);
     this.weDialed = spec.weDialed;
     this.expectPeerId = spec.expectPeerId;   // 32B or null
     this.source = spec.source;               // remoteAddr for the limiter, if any
@@ -513,7 +808,7 @@ class Link {
     if (frame.length === 0) return;
     if (this.authed) {
       if (this.sendEpoch >= REJECT_AFTER_EPOCHS) { this.close(); return; }
-      netLinkSend(this.linkId, this.tag(MSG_FRAME, this.seal(frame)));
+      this.wire(this.tag(MSG_FRAME, this.seal(frame)));
       return;
     }
     this.queue.push(frame);
@@ -530,7 +825,10 @@ class Link {
     let saidGoodbye = false;
     if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS) {
       try {
-        netLinkSend(this.linkId, this.tag(MSG_FRAME, this.seal(new Uint8Array(0))));
+        this.wire(this.tag(MSG_FRAME, this.seal(new Uint8Array(0))));
+        // A codec with its own end-of-stream signal says it too, on the same byte
+        // stream and after our record, so the peer reads one clean shutdown.
+        if (this.framer && this.framer.goodbye) this.framer.goodbye();
         saidGoodbye = true;
       } catch { /* the channel is already gone */ }
     }
@@ -572,6 +870,21 @@ class Link {
     return out;
   }
 
+  /** Put one link message on the wire, framing it first where the platform gave us
+   *  no boundaries of its own. */
+  wire(msg) {
+    if (this.framer) this.framer.send(msg);
+    else netLinkSend(this.linkId, msg);
+  }
+
+  /** Inbound bytes from the host: a whole message on a framed link, an arbitrary
+   *  slice on an unframed one. An over-cap declaration is a protocol violation, so it
+   *  is a defensive abort — no goodbye record, nothing said. */
+  onWire(bytes) {
+    if (!this.framer) { this.onMessage(bytes); return; }
+    if (!this.framer.push(bytes, (m) => this.onMessage(m))) this.abort(true);
+  }
+
   onMessage(m) {
     if (this.closed || m.length < 1) return;
     const type = m[0];
@@ -595,10 +908,12 @@ class Link {
     this.authed = true;
     this.releaseSlot();
     this.clearDeadline();
-    try { netLinkCap(this.linkId); } catch { /* no cap to raise */ }
+    // A known, admitted identity may send full-size frames; a stranger may not. On a
+    // platform-framed link there is no reassembly buffer of ours to bound.
+    if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
-    for (const f of this.queue) netLinkSend(this.linkId, this.tag(MSG_FRAME, this.seal(f)));
+    for (const f of this.queue) this.wire(this.tag(MSG_FRAME, this.seal(f)));
     this.queue.length = 0;
     this.queuedBytes = 0;
   }
@@ -656,7 +971,7 @@ class Link {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
     const w1 = concatBytes([SUITE_BYTE, eph, this.sealZero(this.probeKey(SUITE_BYTE, eph), this.myNonce)]);
     this.th = this.h(this.root, w1);
-    netLinkSend(this.linkId, this.tag(MSG_HELLO, w1));
+    this.wire(this.tag(MSG_HELLO, w1));
   }
 
   onMsg1(w1) {
@@ -680,7 +995,7 @@ class Link {
       this.sealZero(this.kdf([this.ee], h1, LABEL_M2), this.myNonce),
     ]);
     this.th = this.h(h1, w2);
-    netLinkSend(this.linkId, this.tag(MSG_AUTH, w2));
+    this.wire(this.tag(MSG_AUTH, w2));
   }
 
   onMsg2(w2) {
@@ -697,7 +1012,7 @@ class Link {
     if (!si) return;
     const w3 = this.sealZero(this.kdf([this.ee], h2, LABEL_M3), concatBytes([si.id, si.sig]));
     this.th = this.h(h2, w3);
-    netLinkSend(this.linkId, this.tag(MSG_AUTH, w3));
+    this.wire(this.tag(MSG_AUTH, w3));
   }
 
   onMsg3(w3) {
@@ -721,7 +1036,7 @@ class Link {
     const w4 = this.sealZero(this.kdf([this.ee], h3, LABEL_M4), concatBytes([si.id, si.sig]));
     this.th = this.h(h3, w4);
     try { this.deriveConcealedSession(); } catch { this.stall(); return; }
-    netLinkSend(this.linkId, this.tag(MSG_AUTH, w4));
+    this.wire(this.tag(MSG_AUTH, w4));
     this.becomeAuthed();
   }
 
@@ -999,11 +1314,11 @@ class Router {
 //
 // The deadline arrives WITH each request rather than being inferred here, and that is
 // the whole of the timing policy. This layer cannot tell a 200-byte control message
-// from a 4 MB block, so anything it computed would be a guess: what it used to do was
-// re-arm a silence window whenever ANY frame arrived from the peer, under an absolute
-// backstop, which made a request's lifetime depend on unrelated traffic to the same
-// peer — a chatty request kept a stalled one alive, and a quiet-but-progressing
-// transfer died. The caller knows what it sent; it says so (`request` entrypoint).
+// from a 4 MB block, so anything it computed would be a guess. Re-arming a silence
+// window whenever ANY frame arrived from the peer, under an absolute backstop, makes a
+// request's lifetime depend on unrelated traffic to the same peer — a chatty request
+// keeps a stalled one alive, and a quiet-but-progressing transfer dies. The caller
+// knows what it sent; it says so (`request` entrypoint).
 //
 // The deadline is a STALL clock, not a budget for the whole exchange. Arming it at
 // enqueue and letting it expire measured our OWN upload: a request whose bytes are
@@ -1185,17 +1500,19 @@ class Core {
   }
 
   // Top a dialed peer up to connsPerPeer outbound links. `NET_LINK_OPEN` is the raw
-  // capability and it answers immediately with the link id (or 0 for no route), so
-  // the link lands in `connecting` before this returns — there is no in-flight dial
-  // window any more, and with it went the queue of frames that used to wait one out.
+  // capability and it answers immediately with the link id (or 0 for no route), so the
+  // link lands in `connecting` before this returns — there is no in-flight dial window,
+  // and so no queue of frames waiting one out.
   dial(peerId) {
     if (!this.addrs.has(peerId)) return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const linkId = netLinkOpen(fromHex(peerId));
+      const { linkId, framing, authority } = netLinkOpen(fromHex(peerId));
       if (linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
       this.openLink({
         linkId,
+        framing,
+        authority,
         weDialed: true,
         expectPeerId: fromHex(peerId),
         dialSecret: this.addrs.get(peerId),
@@ -1209,6 +1526,8 @@ class Core {
   openLink(spec) {
     const link = new Link({
       linkId: spec.linkId,
+      framing: spec.framing,
+      authority: spec.authority,
       weDialed: spec.weDialed,
       expectPeerId: spec.expectPeerId,
       dialSecret: spec.dialSecret,
@@ -1298,6 +1617,7 @@ function init(cfg) {
   contactSecret = cfg.contactSecret;
   connsPerPeer = Math.max(1, Math.floor(cfg.connsPerPeer || 1));
   maxFrameBytes = cfg.maxFrameBytes;
+  maxHandshakeFrameBytes = cfg.maxHandshakeFrameBytes;
   maxUnverified = cfg.maxUnverified;
   maxPerSource = cfg.maxPerSource;
   maxVerified = cfg.maxVerified;
@@ -1389,6 +1709,7 @@ entry("init", (r) => {
     connsPerPeer: r.u32(),
     maxUnverified: r.u32(), maxPerSource: r.u32(), maxVerified: r.u32(),
     maxFrameBytes: r.u32(),
+    maxHandshakeFrameBytes: r.u32(),
   });
 });
 
@@ -1399,13 +1720,16 @@ entry("linkOpen", (r) => {
   const linkId = r.u32();
   const weDialed = r.u8() === 1;
   const kind = r.u8();
+  const framing = r.u8();
+  const authority = r.blob();
   const handshakeTimeoutMs = r.u32();
   const rekeyAfterFrames = r.u32();
   const expectPeerId = r.blob();
   const dialSecret = r.blob();
   const source = r.blob();
   const spec = {
-    linkId, weDialed,
+    linkId, weDialed, framing,
+    authority: authority.length > 0 ? utf8Decode(authority) : "",
     expectPeerId: expectPeerId.length > 0 ? expectPeerId.slice() : null,
     dialSecret: dialSecret.length > 0 ? dialSecret.slice() : null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
@@ -1440,7 +1764,7 @@ entry("linkOpen", (r) => {
 
 entry("linkBytes", (r) => {
   const link = findLink(r.u32());
-  if (link) link.onMessage(r.blob());
+  if (link) link.onWire(r.blob());
 });
 
 entry("linkClosed", (r) => {

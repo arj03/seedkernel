@@ -7,7 +7,7 @@
 //
 // Each module keeps its own scope on purpose. A flat concat would put every
 // module's *private* top-level name in one namespace, where `const enc` in net.ts,
-// cap-bridge.ts and ws-codec.ts collide — so the set of modules a bundle may
+// cap-bridge.ts and shell-core.ts collide — so the set of modules a bundle may
 // contain would be limited by accidental name choices rather than by dependency.
 // Here the only names that cross a module boundary are the ones it `export`s:
 //

@@ -63,7 +63,7 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  of the seam still finds the number next to the ops. */
 export const GUEST_ABI_VERSION = 1;
 /** The crypto primitives this host serves through the one `CAP.CRYPTO` op — the catalog
- *  a manifest's `guest.primitives` is checked against at load (phase 3a, task 8).
+ *  a manifest's `guest.primitives` is checked against at load (§12.4).
  *
  *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: the
  *  loader checks a manifest field before anything is trusted, and it should not have to
@@ -96,7 +96,7 @@ export const PRIMITIVE_NAMES = [
 ] as const;
 
 export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
-/** The capability domains only a SLOT occupant may declare (phase 3a, task 11).
+/** The capability domains only a SLOT occupant may declare (§12.5).
  *
  *  `rawnet` is what the transport slot consumes — sockets behind opaque link ids, the
  *  whole of what the platform contributes to the network — and `transport` is what it
@@ -156,7 +156,7 @@ export const SUITE_CHANNEL_GENESIS = 0x01;
  *
  *  A node that accepts BOTH suites has the concealment of neither: a scanner offers
  *  0x01 and reads the cleartext HELLO. 0x01 acceptance is therefore a deployment
- *  setting to be turned off, not a permanent compatibility mode (§12.6.2 phase 5). */
+ *  setting to be turned off, not a permanent compatibility mode (§12.6.2). */
 export const SUITE_CHANNEL_CONCEALED = 0x02;
 /** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
 export const SUITE_MANIFEST_GENESIS = 0x01;

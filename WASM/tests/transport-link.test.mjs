@@ -1,22 +1,20 @@
 // transport-link.test.mjs — regression tests for the §12.6.1 link hardening and the
 // §12.6.2 concealed handshake.
 //
-// These properties used to be pinned against `host/net-link.ts` by driving a `PeerLink`
-// object directly. That module is gone: the AKE, the record layer, the half-open
-// limiter and the link router all moved into the signed transport bundle
-// (`transport/guest.js`), where no test can reach in and hold one. So each property is
-// now pinned where it actually ships — through the real host stack, shell → driver
-// (TransportHost) → guest realm — with an instrumented in-process channel standing in
-// for the socket.
+// The AKE, the record layer, the half-open limiter and the link router are the signed
+// transport bundle's (`transport/guest.js`), where no test can reach in and hold an
+// object. So each property is pinned where it ships — through the real host stack,
+// shell → driver (TransportHost) → guest realm — with an instrumented in-process
+// channel standing in for the socket.
 //
 // That is a strictly better place to pin them: what these tests observe is the wire and
 // the host-visible edges of the shipped artifact, not a parallel reimplementation. It is
-// also the only place left where they *can* be observed, which is the point.
+// also the only place they *can* be observed, which is the point.
 //
-// `TransportHost.openLink()` is the seam that makes it possible — it is the same shape
-// the old PeerLink constructor had (weDialed, expectPeerId, contactSecret, source,
-// handshakeTimeoutMs, rekeyAfterFrames, onAuth, onClose), because it is the host half of
-// the same link. The half-open budgets are the exception: a host-managed link spends no
+// `TransportHost.openLink()` is the seam that makes it possible: it is the host half of
+// one link, taking exactly what a link needs to be stood up (weDialed, expectPeerId,
+// contactSecret, source, handshakeTimeoutMs, rekeyAfterFrames, onAuth, onClose) and
+// handing back a handle. The half-open budgets are the exception: a host-managed link spends no
 // budget by design, so those tests use real listeners and raw dials instead, and live in
 // transport-load.test.mjs.
 //
@@ -27,18 +25,20 @@ import {
 } from "./transport-harness.mjs";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
-// The RawChannel shape (core/socket-seam.ts), with the hooks these tests need:
+// The RawLink shape (core/socket-seam.ts), with the hooks these tests need:
 // every byte written is recorded, `tamper` may corrupt or drop a message in flight,
 // `destructive` models a transport that discards unflushed writes on a hard close,
-// and `capRaised`/`closeArgs` record what the guest asked the transport to do.
+// and `closeArgs` records what the guest asked the transport to do. `framing` picks the
+// codec the guest runs over the pair: 0 leaves it alone, 1 makes it length-prefix its
+// own messages, which is what a real TCP link gets.
 // Delivery is deferred a microtask so nothing re-enters a live guest frame, which is
 // the same discipline a real socket imposes.
-function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive } = {}) {
+function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, framing = 0 } = {}) {
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
-    sent: [], closeArgs: [], capRaised: false, dead: false, inFlight: 0,
+    sent: [], closeArgs: [], dead: false, inFlight: 0,
     msg: null, cls: null, peer: null,
-    // The stall clock's progress signal (core/socket-seam.ts `RawChannel.buffered`):
+    // The stall clock's progress signal (core/socket-seam.ts `RawLink.buffered`):
     // bytes written but not yet on the wire. A test drives it directly to model a
     // backpressured socket — draining, or stuck.
     backlog: 0,
@@ -55,9 +55,9 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive 
         if (!this.peer.dead) this.peer.msg?.(out);
       });
     },
-    onMessage(cb) { this.msg = cb; },
+    framing,
+    onData(cb) { this.msg = cb; },
     onClose(cb) { this.cls = cb; },
-    allowLargeFrames() { this.capRaised = true; },
     close(graceful = false) {
       this.closeArgs.push(graceful);
       if (this.dead) return;
@@ -308,32 +308,31 @@ await test("CONTACT SECRET: the address book alone does not grant a probe", asyn
   assert(!st.a.authed && !st.b.authed, "a wrong contact secret must not authenticate");
 });
 
-await test("FRAME CAP: raised on authentication, and not before", async (keep) => {
-  // Transports reassemble under MAX_HANDSHAKE_FRAME_BYTES until a link authenticates, so
-  // a stranger cannot reserve megabytes by declaring a frame and dribbling it. If the
-  // raise never fires, every application frame over 512 bytes dies on a real transport
-  // and nothing in the handshake tests would notice.
-  const chans = wirePair();
+await test("FRAME CAP: an unauthenticated peer cannot declare a large frame", async (keep) => {
+  // A stranger who knows only host:port must not be able to reserve memory by declaring
+  // a big frame and dribbling the body. On a length-framed link the declaration is the
+  // 4-byte prefix, and one over the pre-auth cap is fatal on sight — the body never
+  // arrives and nothing is allocated for it.
+  const chans = wirePair({ framing: 1 });
   const st = keep(await linked(chans));
-  assert(!chans[0].capRaised && !chans[1].capRaised, "the cap must start low on both ends");
-  await until(() => st.a.authed && st.b.authed, 4000, "handshake");
-  await until(() => chans[0].capRaised && chans[1].capRaised, 2000, "cap raise");
+  chans[1].msg(new Uint8Array([0x00, 0x01, 0x00, 0x00])); // declares 64 KiB, cap is 8 KiB
+  await settle();
+  assert(st.b.closed, "an over-cap pre-auth declaration must tear the link down");
+  assert(!st.b.authed, "and it must never have authenticated");
 });
 
-await test("FRAME CAP: the caller raises before it flushes its queue", async (keep) => {
-  // Ordering, not just occurrence. Queued pre-auth frames are flushed inside the same
-  // becomeAuthed() that raises the cap; if the raise came second, the first application
-  // frame of every connection would be measured against the handshake cap.
-  const chans = wirePair();
-  const order = [];
-  const rawSend = chans[0].send.bind(chans[0]);
-  chans[0].allowLargeFrames = function () { order.push("raise"); this.capRaised = true; };
-  chans[0].send = (b) => { if (b[0] === 3) order.push("frame"); rawSend(b); };
+await test("FRAME CAP: authentication raises it, before anything can arrive under it", async (keep) => {
+  // The raise happens inside becomeAuthed(), ahead of the queued-frame flush, because a
+  // responder authenticates at msg3 and may put application data on the wire alongside
+  // msg4 — which arrives in the same delivery. A link that raised its cap afterwards
+  // would measure that first frame against the handshake bound and kill every
+  // connection on its first sizeable exchange.
+  const chans = wirePair({ framing: 1 });
   const st = keep(await linked(chans));
-  st.aLink.send(new Uint8Array(2000).fill(7)); // queued: bigger than the handshake cap
+  st.aLink.send(new Uint8Array(64 * 1024).fill(7)); // queued pre-auth, far over the cap
   await until(() => st.a.authed && st.b.authed, 4000, "handshake");
-  await until(() => order.includes("frame"), 2000, "the queued frame to flush");
-  assert(order[0] === "raise", `expected the cap raise first, got ${JSON.stringify(order)}`);
+  await settle();
+  assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
 });
 
 await test("SUBKEYS: one master seed, purpose-bound keys, deterministic", async () => {
@@ -498,10 +497,10 @@ await test("goodbye is not delivered to the application as a frame", async (keep
 });
 
 await test("goodbye: the CLOSER reports a local shutdown, not a truncation", async (keep) => {
-  // The regression this pins: wasTruncated() used to be `authed && !peerSaidGoodbye`,
-  // which is true on our own side of every deliberate close — we send the farewell and
-  // do not get one back. The double-connect tie-break closes a link on any parallel
-  // dial, so that flagged a routine event as a cut stream.
+  // The trap this pins: defining wasTruncated() as `authed && !peerSaidGoodbye` is true
+  // on our own side of every deliberate close — we send the farewell and do not get one
+  // back. The double-connect tie-break closes a link on any parallel dial, so that
+  // definition flags a routine event as a cut stream.
   const st = keep(await upPair());
   st.aLink.close();
   await until(() => st.a.closed && st.b.closed, 3000, "both ends to close");

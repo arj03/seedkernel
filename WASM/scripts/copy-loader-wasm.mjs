@@ -15,7 +15,6 @@ const dst = resolve(root, "../native/wasm");
 mkdirSync(dst, { recursive: true });
 
 const copies = [
-  ["build/ws.wasm", "ws.wasm"],
   ["browser/libsodium.wasm", "libsodium.wasm"],
   // ML-DSA-65 for manifest suite 0x02 (§12.4). The Go loader instantiates the very
   // same artifact the browser fetches, which is the point: one verifier, one

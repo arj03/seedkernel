@@ -83,11 +83,10 @@ export interface KernelBackend extends BundleHost, KernelTable {
  *  NET_PEERS cap — the transport owns connectivity, the shell just passes the
  *  closure through to the cap-bridge.
  *
- *  The transport itself is now a signed bundle (phase 3): the platform supplies the
- *  SOCKET seam (`channels`, `listen`/`wsListen`, the network key and contact
- *  secret) and the shell stands the driver up when a bundle claiming the transport
- *  role is admitted. There is no `network` member to hand in any more — the driver
- *  IS the network. */
+ *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
+ *  seam (`channels`, `listen`/`wsListen`, the network key and contact secret) and the
+ *  shell stands the driver up when a bundle claiming the transport role is admitted.
+ *  There is no `network` member to hand in — the driver IS the network. */
 export interface ShellPlatform {
     sodium: ShellSodium;
     /** The CHANNEL keypair — its public half is this node's peer id. */
@@ -117,7 +116,7 @@ export interface ShellPlatform {
      *  with our address; the gate a caller must produce before msg1 opens. Absent ⇒
      *  an open node. Per node, never per deployment (§12.6.3). */
     contactSecret?: Uint8Array;
-    /** The socket seam: TCP/WS dialing and listening behind the RawChannel shape
+    /** The socket seam: TCP/WS dialing and listening behind the RawLink shape
      *  (net-node's factory, the native loader's over Go sockets). Absent for a
      *  host-managed-transport-only node (a browser edge), which opens links through
      *  the driver's openLink() and lets DIAL actions go unanswered. */
@@ -354,7 +353,7 @@ export function createShell(opts: CreateShellOptions & {
             now: platform.now ?? (() => Date.now()),
             allowedOps: opsForCaps(caps),
             // What SIGN signs under is chosen HERE, by the slot the bundle occupies — the one
-            // place that knows it (phase 3a, task 10). The transport slot signs handshake
+            // place that knows it (§12.2). The transport slot signs handshake
             // transcripts under DOMAIN_channel with the node's channel key; every ordinary app
             // signs under DOMAIN_guest with the guest subkey, in its own bundle's scope. The
             // bridge prefixes and never parses, so neither can produce the other's signature

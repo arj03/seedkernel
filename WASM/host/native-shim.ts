@@ -24,14 +24,12 @@ import {
 } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
-import type { ChannelFactory, Identity, RawChannel, RawByteStream, TransportCrypto } from "../core/socket-seam.js";
+import { FRAMING, type ChannelFactory, type Framing, type Identity, type RawLink, type TransportCrypto } from "../core/socket-seam.js";
 import type { Fs } from "../core/fs.js";
 import { parsePeerSpec } from "../core/socket-seam.js";
-import { WsClientChannel, WsServerChannel } from "./net-frame.js";
-import { setWsHandle } from "./ws/ws-codec.js";
 import { toHex, fromHex } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
-// the signed program that IS the node's network (phase 3).
+// the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 
 /** The guest→host seam Go calls into. A null return means the op parked: Go holds
@@ -99,24 +97,18 @@ export const fs: Fs = {
   async stat() { return __fs.stat(); },
 };
 
-/** ws.wasm over wazero (native/wsframe.go): the same RFC 6455 byte transform the
- *  browser/Node targets drive, reached through the codec's one backend seam. */
-declare const __ws: { handle(req: Uint8Array): ArrayBuffer };
-
-/** Go's TCP socket primitive as RawChannels / raw byte duplexes (native/sock.go).
- *  `listen` returns the bound port. This is the whole networking seam: the channel
- *  handshake, the routing table and the request/response layer above it are the
- *  shared TS, unchanged. */
-declare function netConnect(host: string, port: number): RawChannel;
-declare function netConnectRaw(host: string, port: number): RawByteStream;
-declare function netListen(host: string, port: number, onAccept: (ch: RawChannel) => void): number;
-declare function netListenRaw(host: string, port: number, onAccept: (s: RawByteStream) => void): number;
+/** Go's TCP socket primitive (native/sock.go): a raw byte duplex and nothing else.
+ *  `listen` returns the bound port. This is the whole networking seam — the wire codec,
+ *  the channel handshake, the routing table and the request/response layer above it are
+ *  all the transport bundle's, over the same primitive every other target hands it.
+ *
+ *  A link arrives WITHOUT a `framing`: which codec applies follows from the address,
+ *  which is this file's to read and never Go's. */
+type GoLink = Omit<RawLink, "framing">;
+declare function netConnectRaw(host: string, port: number): GoLink;
+declare function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void): number;
 declare function netCloseListeners(): void;
 
-// The codec's backend, installed once for the realm. Node/browser install a
-// WebAssembly backend; here it is the identical ws.wasm driven over wazero, so
-// framing is byte-identical across targets.
-setWsHandle((req) => new Uint8Array(__ws.handle(req)));
 // ── The platform ─────────────────────────────────────────────────────────────
 /** The §3 handler table, which on this target lives in Go (wazero instances cannot
  *  be JS values). Shape only — every rule about what may land is the shared loader's. */
@@ -139,26 +131,22 @@ class NativeFreshnessStore extends FreshnessMarks {
     }
     persist(json: string) { bridge.writeFreshness(json); }
 }
-/** WebSocket RawChannels over Go's raw byte streams: the node-dialing-a-WS-endpoint
- *  and node-accepting-a-browser sides, framed by the shared net-frame classes. The
- *  browser uses its platform WebSocket instead; this is the same codec either way. */
-function netConnectWS(host: string, port: number): RawChannel {
-    return new WsClientChannel(netConnectRaw(host, port), host, port, sodium);
-}
-function netListenWS(host: string, port: number, onAccept: (ch: RawChannel) => void): number {
-    return netListenRaw(host, port, (stream) => onAccept(new WsServerChannel(stream)));
+/** Say which codec a Go socket carries. The bytes are Go's; the boundaries are the
+ *  transport bundle's, and this is the one place that decides which rule it applies. */
+function framed(link: GoLink, framing: Framing, authority?: string): RawLink {
+    return { ...link, framing, authority };
 }
 /** This target's socket seam, backed by Go's sockets: the transport driver's
- *  ChannelFactory. connect/listen produce RawChannels identically to the node:net
+ *  ChannelFactory. connect/listen produce RawLinks identically to the node:net
  *  factory, so the transport bundle's link state machine — driven by TransportHost
  *  — runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
     connect: (addr) => addr.transport === "ws"
-        ? netConnectWS(addr.host, addr.port)
-        : netConnect(addr.host, addr.port),
+        ? framed(netConnectRaw(addr.host, addr.port), FRAMING.WS_CLIENT, `${addr.host}:${addr.port}`)
+        : framed(netConnectRaw(addr.host, addr.port), FRAMING.LENGTH),
     listen: (tcp, ws, onAccept) => Promise.resolve({
-        port: tcp ? netListen(tcp.host, tcp.port, onAccept) : 0,
-        wsPort: ws ? netListenWS(ws.host, ws.port, onAccept) : 0,
+        port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(framed(s, FRAMING.LENGTH))) : 0,
+        wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(framed(s, FRAMING.WS_SERVER))) : 0,
     }),
     // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
     close: () => { netCloseListeners(); },
@@ -395,4 +383,4 @@ function revoke(authorHex: string): Uint8Array {
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, netConnectWS, netListenWS, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

@@ -90,7 +90,7 @@ export interface RtcNetworkOptions {
     onTrack?: (peerId: PeerId, track: MediaStreamTrack) => void;
 }
 
-// ── RawChannel over one RTCDataChannel ────────────────────────────────────────
+// ── RawLink over one RTCDataChannel ────────────────────────────────────────
 // An RTCDataChannel is already an ordered, whole-message binary pipe (WebRTC does
 // framing + ordering), so this is a thin adapter over BufferedChannel (net-channel.ts) —
 // with the same pre-open send buffer the transport needs because it emits its HELLO

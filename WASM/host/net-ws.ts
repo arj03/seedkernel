@@ -26,7 +26,7 @@ export interface WsLike {
   binaryType: string;
   readyState: number;
   /** Bytes queued but not yet on the wire — the stall clock's progress signal
-   *  (socket-seam.ts `RawChannel.buffered`). Optional: not every WebSocket-shaped
+   *  (socket-seam.ts `RawLink.buffered`). Optional: not every WebSocket-shaped
    *  object in a test double reports it. */
   bufferedAmount?: number;
   send(data: Uint8Array): void;
@@ -35,7 +35,7 @@ export interface WsLike {
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
 }
 
-// ── RawChannel over one WebSocket ─────────────────────────────────────────────
+// ── RawLink over one WebSocket ─────────────────────────────────────────────
 // A WebSocket delivers whole binary messages in order, so this is a thin adapter.
 // BufferedChannel (net-channel.ts) carries the shared machinery, including the
 // pre-open send buffer the transport needs because it emits its HELLO the instant

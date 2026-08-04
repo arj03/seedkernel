@@ -15,7 +15,7 @@ Signing survives where it must — over the **bundle** that installs code (§12.
 | Component | Role |
 | --- | --- |
 | **Kernel** | Routes names to handlers: a flat `handlers[name]` table (§3). It is a *contract*, not an artifact — the table, the handler ABI and the bind/unbind semantics — implemented as one map inside each host. Handlers are pure transforms; there is no dispatch loop, no signature logic, no I/O. |
-| **Raw I/O** | Two capabilities of the same shape: `net` is `send(link, bytes)` / `onBytes` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
+| **Raw I/O** | Two capabilities of the same shape: `net` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
 | **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — reaches a handler by name (`callHandler`), and provides `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no kernel seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. |
 | **Guests** | Confined JS programs (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(op, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here. |
@@ -50,7 +50,7 @@ What survives all of this is a socket seam with its flood limits, an entropy sou
 
 ## The transport is a bundle
 
-The channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle claiming the `transport` role. It is a **guest**, not a WASM handler, and the reason is structural: a §4 handler is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it.
+The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle claiming the `transport` role. It is a **guest**, not a WASM handler, and the reason is structural: a §4 handler is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
 
 What this buys is that the **protocol** is replaceable without a fork: the handshake's messages, its transcript, the record framing and the dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime.
 
@@ -126,12 +126,12 @@ The reference composition stacks the layers so each depends only on the layers b
 │   one map, held by the host         │
 ├─────────────────────────────────────┤
 │   Transport — a signed bundle       │
-│   AKE, record layer, link routing   │
-│   beneath the kernel, but content:  │
-│   replaceable without a rebuild     │
+│   wire codec, AKE, record layer,    │
+│   link routing. beneath the kernel, │
+│   but content: replaceable          │
 ├─────────────────────────────────────┤
 │   Raw I/O                           │
-│   net: send(link,bytes)/onBytes     │
+│   net: send(link,bytes)/onData      │
 │   fs:  get/put over a flat key      │
 │   limits, entropy, node key         │
 │   CORE — no endpoint substitute     │
@@ -142,6 +142,7 @@ The reference composition stacks the layers so each depends only on the layers b
 
 - **The core is what the endpoints cannot do for themselves.** Authenticity, confidentiality, framing and routing all have endpoint substitutes and are therefore content. Transmission does not, and is therefore core.
 - **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the kernel and is still an ordinary bundle. Keeping these separate is what stops "it's foundational" from becoming a licence to grow.
+- **Not-core is not the same as replaceable.** The bundle verifier, the cap-bridge and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
 - The kernel does exactly one thing: name resolution and byte dispatch. No built-in policies, I/O, or dispatch loop. Lower layers gate higher layers; each layer sees only downward.
 - Untrusted code is **bounded** as well as confined. A WASM handler declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **handler** CPU, and it is a missing mechanism rather than a decision: WebAssembly engines on the JS platform expose no fuel or timeout to call (§4.3, §14).
 - Modules, as untrusted code, run confined. WASM handlers are synchronous pure transforms — a buffer in, a buffer out, and that is the full extent of their interaction. JavaScript is reserved for code that must await multiple host interactions or maintain state across asynchronous turns, with zero ambient authority and only the single `host.call` seam.
@@ -155,31 +156,39 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded.
 
-**Shared — compiled once, run by all three targets (2,560 LOC)**
+**Shared — compiled once, run by all three targets (2,279 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 574 |
-| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 495 |
-| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 474 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 536 |
+| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 506 |
+| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 471 |
 | Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 386 |
-| Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, suite ids, the primitive catalog | `core/*.ts` (8 files) | 369 |
-| WebSocket codec and framing | `host/ws/*`, `host/net-frame.ts` | 261 |
+| Core seam and vocabulary — the socket/`fs` contracts, the flood bounds, domain prefixes, suite ids, the primitive catalog | `core/*.ts` (8 files) | 380 |
+
+**Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
+
+- **Trust root.** The bundle format and admission policy, the cap-bridge, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
+- **Vocabulary.** The domain prefixes, suite ids, primitive names and flood bounds in `core/`. A bundle is replaceable and the vocabulary it draws on is not (§14.1); a bundle defining the vocabulary its own signature is verified under is circular.
+- **A stable adapter.** The transport driver holds the link ids, the flood caps and the whitelist gate, and it is what keeps the app-facing `send` unchanged *across* a transport swap. Folding it into the thing being swapped is backwards.
+- **Reuse.** The protocol-id bindings carry no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to avoid writing the same three rules three times — not because agreement is load-bearing.
+
+**Wire framing is in none of them, and so it is not here.** Length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test — state machines over whole messages, which an endpoint can run — so they are the transport bundle's, over `ws.wasm` as one of *its* modules. What the host says about a link is which of those codecs applies (`FRAMING`, §12.1); what to do about it is entirely the bundle's. The browser needs none of it: a platform `WebSocket` and an `RTCDataChannel` arrive framed already and go to the driver as they are.
 
 **Per-target platform — the seam, written once per target**
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,545 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (235), the Go binding, which is TypeScript and rides in the shared bundle | 3,341 Go + 235 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,445 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (223), the Go binding, which is TypeScript and rides in the shared bundle | 2,600 Go + 223 TS |
 
 **Signed content — not host code at all**
 
 | | Where | LOC |
 | --- | --- | --- |
-| Transport bundle — the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` | 1,006 |
+| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,236 + 5 KB |
 
-Each target therefore runs 2,560 shared lines over roughly 1,500–3,500 of its own plumbing, and the protocol on the wire is none of it — that lives in the signed bundle.
+Each target therefore runs 2,279 shared lines over roughly 1,400–2,600 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Shared binaries, byte-identical on every target:
 
@@ -188,7 +197,6 @@ Shared binaries, byte-identical on every target:
 | `libsodium.wasm` | Ed25519, BLAKE2b, ChaCha20/XChaCha20 (sumo build) | 278 KB |
 | `mldsa65.wasm` | ML-DSA-65, the `0x02` hybrid manifest suite verifier | 17 KB |
 | `mlkem768.wasm` | ML-KEM-768, the primitive catalog's KEM | 11 KB |
-| `ws.wasm` | RFC 6455 framing — a no-capability module | 5 KB |
 
 The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go. The `core/` and `host/` split inside `WASM/` is the *other* axis: `core/` is what has no endpoint substitute, `host/` is the runtime around it, and both contribute to the shared set and to the JS platform.
 

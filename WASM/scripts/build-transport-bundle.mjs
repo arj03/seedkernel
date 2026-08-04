@@ -98,11 +98,16 @@ async function main() {
 
   const kp = sodium.crypto_sign_seed_keypair(seed);
   const guest = readFileSync(join(root, "transport", "guest.js"));
+  // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through
+  // the one install path signed by this program's own author and is reached by logical
+  // name through MODULE_CALL. It is an ordinary §4 pure transform — three exports, no
+  // imports but the AS shims — so the loader admits it like any other module.
+  const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
   const manifest = {
     app: "transport",
     version: 1,
     role: "transport",
-    modules: [],
+    modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
       abi: 1,
@@ -113,7 +118,7 @@ async function main() {
       // two of those are slot-only and the loader refuses them to a bundle claiming no
       // role. No `net` — that domain IS this program's output, and its own NET_SEND
       // would loop back into itself.
-      caps: ["crypto", "clock", "timer", "rawnet", "transport"],
+      caps: ["crypto", "clock", "timer", "rawnet", "transport", "module"],
       // The primitives it calls by name. NOT a grant — a pure transform reaches nothing
       // — but a compatibility claim, so a host lacking one refuses this bundle by name
       // instead of failing mid-handshake.
@@ -124,7 +129,7 @@ async function main() {
     },
   };
   const env = signManifest(sodium, kp.privateKey, kp.publicKey, manifest);
-  const blob = packBundle({ [MANIFEST_FILE]: env, [GUEST_FILE]: guest });
+  const blob = packBundle({ [MANIFEST_FILE]: env, [GUEST_FILE]: guest, "ws.wasm": wsWasm });
 
   writeFileSync(join(root, "build", "transport.skb"), blob);
   const b64 = Buffer.from(blob).toString("base64");

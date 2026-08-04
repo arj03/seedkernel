@@ -33,6 +33,7 @@
 import {
   newQuickJSWASMModule,
   type QuickJSWASMModule,
+  type QuickJSRuntime,
   type QuickJSContext,
   type QuickJSHandle,
 } from "quickjs-emscripten";
@@ -199,9 +200,43 @@ function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
 
 const invokeSrc = (entry: string): string => `__invoke(${JSON.stringify(entry)}, __arg)`;
 
+/** A realm's QuickJS **runtime** is created separately from its context and deliberately
+ *  never freed: `dispose()` frees the context, and `JS_FreeRuntime` is never called.
+ *
+ *  Not tidiness — the alternative is a process abort. Under many concurrent live realms, a
+ *  realm reaches teardown with its JSContext refcount still above one, so `JS_FreeContext`
+ *  returns early, the context stays on the GC object list, and `JS_FreeRuntime` fails its
+ *  `list_empty(&rt->gc_obj_list)` assertion. That assertion aborts the whole wasm module —
+ *  every other realm in the process with it — and it is reached from ordinary teardown of
+ *  a realm that did nothing wrong.
+ *
+ *  Nothing observable across the host seam is outstanding when it happens: no pending job,
+ *  no invocation in flight, no parked caller, no rejected or dropped bridge call, no
+ *  undisposed handle beyond the scope-managed global, no FFI pointer reuse. Every
+ *  "abnormal state at teardown" shape — an unsettled guest promise, a suspended async
+ *  function, a queued job, an unhandled rejection, a budget interrupt inside a
+ *  continuation, OOM — tears down cleanly in isolation. The extra reference is held inside
+ *  the engine, outside the GC graph, by something that never crosses this seam.
+ *
+ *  Deferring the free does not help, and that is worth recording so nobody tries it again:
+ *  the failure is a race, not a settling time. Swept against a suite that reproduces it,
+ *  50 ms aborts, 100 ms is clean, 150 / 200 / 250 ms abort, 300 ms and up are clean —
+ *  non-monotone, so there is no threshold and no margin to buy. Freeing the runtime one
+ *  turn after the context is the same lottery.
+ *
+ *  Leaving the runtime alive cannot hit the assertion, because the assertion is only in
+ *  `JS_FreeRuntime`. What it costs is roughly 1.2 MB RSS per realm ever created, held for
+ *  the life of the process. A host that stands up realms in bulk — a test suite, a CLI
+ *  run — pays it once and exits; a long-lived node pays per app install and upgrade, which
+ *  is the case to watch. Bounding it properly means finding the reference: a quickjs-ng
+ *  build whose leak dump names ref holders, or an instrumented `JS_DupContext`. */
+const newLeakedRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
+
 export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
   const mod = await getModule();
-  const ctx: QuickJSContext = mod.newContext();
+  // NOT `mod.newContext()`: that makes the context own the runtime and free it in the same
+  // breath, which is the abort described at newLeakedRuntime.
+  const ctx: QuickJSContext = newLeakedRuntime(mod).newContext();
   const clock = configureRealm(ctx, opts);
   let disposed = false;
 
@@ -367,13 +402,18 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // rejection continuation — the `finally` above, which releases its evalResult
       // handle — runs as a microtask after failPending, and the quickjs-ng build
       // asserts an empty gc object list at JS_FreeRuntime, so a handle released after
-      // the context died would abort the whole wasm module. Deferring the teardown to
-      // the NEXT MACROTASK (setTimeout 0) runs it after every microtask of the parked
-      // continuations, by which point nothing can re-enter (the queue fails on
-      // `disposed`): the context is quiescent when it dies.
-      setTimeout(() => {
+      // the context died would abort the whole wasm module. Deferring the teardown to a
+      // later macrotask runs it after every microtask of the parked continuations, by
+      // which point nothing can re-enter (the queue fails on `disposed`): the context is
+      // quiescent when it dies. Only the context goes: its runtime is left alive on
+      // purpose, for the reason at newLeakedRuntime.
+      const timer = setTimeout(() => {
         if (disposed && ctx.alive) ctx.dispose();
-      }, 0);
+      }, 0) as unknown as { unref?: () => void };
+      // Freeing a realm is housekeeping, so it must not be a reason for a process to stay
+      // up: a host that disposes its last realm and exits should not wait a turn to
+      // release memory the exit reclaims anyway. No-op off Node.
+      timer.unref?.();
     },
   };
 }

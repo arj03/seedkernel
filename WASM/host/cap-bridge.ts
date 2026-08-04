@@ -23,7 +23,7 @@ import { type SafeRealmBridge } from "./safe-js.js";
 export type CapDomain = keyof typeof CAP_DOMAINS;
 
 /** What `SIGN` signs under — derived by the host from the asking bundle's slot, never
- *  from anything the guest says (phase 3a, task 10).
+ *  from anything the guest says (§12.2).
  *
  *  **The host prefixes; it does not parse.** It signs `domain ‖ scope ‖ msg` where `msg`
  *  is opaque bytes the guest chose and the host never reads. The guarantee — this key
@@ -105,20 +105,18 @@ export interface RawNet {
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats exactly as a fabric dropping a
      *  frame. The host resolves the name in the address book it was configured with; the
-     *  caller never learns a host, a port or a transport. */
-    open(dest: Uint8Array): number;
+     *  caller learns no route it could dial for itself — only which wire codec applies
+     *  to the link the host has ALREADY opened (`framing`) and, for a dialed WebSocket,
+     *  the authority to put in its `Host` header (socket-seam.ts `RawLink`). */
+    open(dest: Uint8Array): { linkId: number; framing: number; authority: string };
     /** Write whole bytes to a link. Silently dropped if the link is already gone —
      *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
     send(linkId: number, bytes: Uint8Array): void;
     /** Tear a link down. `graceful` asks the channel to flush already-written bytes
-     *  first (transport-seam.ts `RawChannel.close`). */
+     *  first (socket-seam.ts `RawLink.close`). */
     close(linkId: number, graceful: boolean): void;
-    /** Raise this link's inbound frame cap from `MAX_HANDSHAKE_FRAME_BYTES` to
-     *  `MAX_FRAME_BYTES`. Both numbers are the host's (net-limits.ts) — this asks for
-     *  the one transition, it does not name a bound. */
-    raiseCap(linkId: number): void;
     /** Bytes written to this link that are not yet on the wire (socket-seam.ts
-     *  `RawChannel.buffered`). Optional: a host whose channels cannot say omits it,
+     *  `RawLink.buffered`). Optional: a host whose channels cannot say omits it,
      *  and the occupant's stall clock degrades to a plain deadline. */
     buffered?(linkId: number): number;
 }
@@ -138,7 +136,7 @@ export interface HostTimers {
 }
 
 /** What the transport slot's occupant hands back — the structured face the platform does
- *  not have and every app consumes (phase 3a, task 11).
+ *  not have and every app consumes (§12.6).
  *
  *  This is the provision half of the split: the slot occupant reads raw bytes off links
  *  and reports *attributed* traffic here, where the host binds it to the promises apps
@@ -237,8 +235,8 @@ export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../cor
  *  and host can never drift. The numbers are a shared guest↔host identifier regenerated
  *  with the preamble — never a wire value between nodes.
  *
- *  **There are two kinds of entry here and only one of them is a capability** (phase 3a,
- *  the shape test). `CRYPTO` is the *primitive* seam: a flat map over opaque names,
+ *  **There are two kinds of entry here and only one of them is a capability.**
+ *  `CRYPTO` is the *primitive* seam: a flat map over opaque names,
  *  resolved in the host's catalog, reaching nothing a guest does not already hold —
  *  a function of its arguments is computation the guest could have done itself, so
  *  there is nothing to grant. Every other op is an *authority*: it touches the node
@@ -250,7 +248,7 @@ export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../cor
  *  which is the whole difference between a core that serves opaque names and one that
  *  understands what a cipher suite is.
  *
- *  **There are two nets here and they are different capabilities** (phase 3a, task 11).
+ *  **There are two nets here and they are different capabilities** (§12.1).
  *  `NET_SEND`/`NET_PEERS` are the *structured* face — an attributed peer, a protocol id,
  *  a correlation — which is the transport bundle's OUTPUT, and an ordinary app reaches it
  *  through this seam like anything else. `NET_LINK_*` is the *raw* capability — bytes over
@@ -285,13 +283,13 @@ export const CAP = {
     CLOCK: 14, // -> now ms (u64 BE)
     // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` ──────
     //
-    // This is the WHOLE of what the platform contributes to the network (phase 3a,
-    // task 11): a link id the host mints and the guest never interprets, bytes in and
-    // bytes out, opened and closed. There is no peer here, no protocol id and no
+    // This is the WHOLE of what the platform contributes to the network (§12.1): a link
+    // id the host mints and the guest never interprets, bytes in and bytes out, opened
+    // and closed. There is no peer here, no protocol id and no
     // correlation — a peer id is an *attributed* identity, which is the transport's
     // output rather than the platform's contribution. Inbound bytes arrive the other
     // way, as ordinary entrypoint invocations on the slot occupant's guest.
-    NET_LINK_OPEN: 15, // [dest ..] -> [linkId u32 BE]  (0 ⇒ no route; `dest` is an
+    NET_LINK_OPEN: 15, // [dest ..] -> [linkId u32][framing u8][authLen u32][authority utf8]  (0 ⇒ no route; `dest` is an
     //   opaque destination name the host resolves in the address
     //   book it was configured with, exactly as `fs` resolves a key)
     NET_LINK_SEND: 16, // [linkId u32][bytes ..] -> []
@@ -301,9 +299,6 @@ export const CAP = {
     //   tells the slot occupant whether an exchange is progressing
     //   or stalled, which is the difference between a slow peer and
     //   a dead one. 0 for a link that is gone or cannot say.
-    NET_LINK_CAP: 18, // [linkId u32] -> []  raise this link's inbound frame cap from
-    //   MAX_HANDSHAKE_FRAME_BYTES to MAX_FRAME_BYTES (net-limits.ts).
-    //   Both numbers stay the host's; this asks for the transition.
     // ── timers: the platform's event loop ───────────────────────────────────────
     TIMER_ARM: 19, // [id u32][ms u32] -> []  (fires the `timer` entrypoint)
     TIMER_CLEAR: 20, // [id u32] -> []
@@ -518,7 +513,7 @@ globalThis.__invoke = (name, argBuf) => {
  *  is the coarse, human-auditable capability vocabulary: "this app reaches net + fs",
  *  not a list of 17 op numbers. `caps` is the grant; the preamble is the ABI.
  *
- *  **Only authorities appear here, because only authorities are grants** (phase 3a).
+ *  **Only authorities appear here, because only authorities are grants.**
  *  `SIGN` is a signing oracle under the node identity, `IDENTITY` hands out the node's
  *  public key, `RANDOM` reaches the OS entropy source — each a grant over something the
  *  host owns. `CAP.CRYPTO` is deliberately absent: its primitives are functions of their
@@ -536,8 +531,7 @@ export const CAP_DOMAINS = {
     module: [CAP.MODULE_CALL],
     clock: [CAP.CLOCK],
     timer: [CAP.TIMER_ARM, CAP.TIMER_CLEAR],
-    rawnet: [CAP.NET_LINK_OPEN, CAP.NET_LINK_SEND, CAP.NET_LINK_CLOSE, CAP.NET_LINK_CAP,
-        CAP.NET_LINK_STAT],
+    rawnet: [CAP.NET_LINK_OPEN, CAP.NET_LINK_SEND, CAP.NET_LINK_CLOSE, CAP.NET_LINK_STAT],
     transport: [CAP.NET_DELIVER, CAP.NET_SETTLE, CAP.NET_LINK_AUTH, CAP.NET_PEER_EDGE,
         CAP.NET_READY, CAP.NET_LINK_DOWN],
 };
@@ -750,7 +744,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             }
             // ── authorities ──────────────────────────────────────────────────────
             case CAP.SIGN: {
-                // The host prefixes and does not parse (phase 3a, task 10): it signs
+                // The host prefixes and does not parse: it signs
                 // `domain ‖ scope ‖ msg` with the key the asking bundle's slot selected, so a
                 // signature can never verify outside the domain it was made in — an app's can
                 // never pass as a channel transcript, nor in another app's scope, and the
@@ -847,9 +841,13 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
                 return u64be(now());
             // ── raw net: bytes over an opaque link id (the socket-side twin of fs) ──
             case CAP.NET_LINK_OPEN: {
-                const id = rawNet().open(payload);
-                const out = new Uint8Array(4);
-                writeU32BE(out, 0, id);
+                const link = rawNet().open(payload);
+                const authority = enc.encode(link.authority);
+                const out = new Uint8Array(9 + authority.length);
+                writeU32BE(out, 0, link.linkId);
+                out[4] = link.framing;
+                writeU32BE(out, 5, authority.length);
+                out.set(authority, 9);
                 return out;
             }
             case CAP.NET_LINK_SEND:
@@ -857,9 +855,6 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
                 return NONE;
             case CAP.NET_LINK_CLOSE:
                 rawNet().close(readU32BE(payload, 0), payload[4] === 1);
-                return NONE;
-            case CAP.NET_LINK_CAP:
-                rawNet().raiseCap(readU32BE(payload, 0));
                 return NONE;
             case CAP.NET_LINK_STAT: {
                 const out = new Uint8Array(4);

@@ -161,7 +161,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     // ── Node platform seam ─────────────────────────────────────────────────────
     const fs = new NodeFs(opts.dir);
     const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
-    const channels = opts.channels ?? new NodeChannelFactory(sodium as never);
+    const channels = opts.channels ?? new NodeChannelFactory();
     // ── Assemble the shared shell ───────────────────────────────────────────────
     const core = createShell({
         platform: {
@@ -178,7 +178,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         realmMemoryBytes: opts.realmMemoryBytes,
         config: opts.config,
     });
-    // ── Load the transport bundle: the node's network (phase 3) ─────────────────
+    // ── Load the transport bundle: the node's network (§12.6) ───────────────────
     // The ONE install path, like any other bundle: verify, govern under policy
     // (roles.transport), install, and — because it claims the transport role —
     // stand the driver up. A policy that does not admit the transport author

@@ -1,12 +1,11 @@
 // ws — RFC 6455 framing + opening-handshake bytes as a no-capability module.
 //
-// WebSocket exists only because browsers cannot speak raw TCP, so its wire codec
-// is pure byte transformation — exactly the shape of a no-cap WASM handler like
-// `codec`. It imports nothing but the AS runtime: no
-// kernel.call, no fs, no net. The host owns the socket and the RNG and pumps
-// bytes through this module; this module only frames/deframes and computes the
-// handshake accept (sha1 + base64), holding no per-connection state — the host
-// keeps the residual buffer, exactly as a stateless transform should.
+// WebSocket exists only because browsers cannot speak raw TCP, so its wire codec is
+// pure byte transformation — exactly the shape of a no-cap WASM handler. It imports
+// nothing but the AS runtime: no kernel.call, no fs, no net. It ships as a module of
+// the transport bundle, whose guest holds the socket, the RNG and the residual receive
+// buffer and calls in by logical name; this module only frames and deframes and
+// computes the handshake accept (sha1 + base64), holding no per-connection state.
 //
 // ABI (same as codec): the host stages a request at the exported `scratch`
 // offset, calls handle(input_len), and reads the response from `scratch`.
@@ -25,14 +24,13 @@
 //   OP_ACCEPT     (3) args [key bytes]   → base64(sha1(key ‖ GUID)) bytes (28)
 //   OP_BASE64     (4) args [bytes]       → base64(bytes)
 
-// The ABI ops, handshake GUID, and scratch caps are shared verbatim with the
-// host driver via host/ws/ws-abi.ts (asc compiles it into this module; tsc reads
-// the same file from ws-codec.ts) so the two units can't drift. SCRATCH_SIZE is
-// sized so the largest TCP transport message (MAX_FRAME_BYTES, 16 MiB, net-link.ts)
-// also fits in a single WS frame plus header/mask overhead — the two transports
-// must cap identically, or a message that succeeds over TCP would tear down a WS
-// link. This module heap.allocs SCRATCH_SIZE below as the actual scratch heap.
-import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "../../host/ws/ws-abi";
+// The ABI ops, handshake GUID and scratch caps live beside this module in
+// assembly/ws/abi.ts. SCRATCH_SIZE is sized so the largest transport message
+// (MAX_FRAME_BYTES, 2 MiB, net-limits.ts) fits in a single WS frame plus header and
+// mask overhead — the two codecs must cap identically, or a message that crosses a
+// length-framed link would tear down a WS one. This module heap.allocs SCRATCH_SIZE
+// below as the actual scratch heap.
+import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "./abi";
 
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
 
@@ -44,6 +42,11 @@ const PRIV_DIGEST_OFF: i32 = 4096;  // 20-byte sha1
 const PRIV_WORK_OFF: i32 = 8192;    // sha1 padded message + W[80]
 
 export let scratch: i32 = 0;
+/** How much I/O space the host may stage at `scratch` (§4.1). Declared because the
+ *  default the kernel assumes is 128 KB, and one WS frame here may be the whole
+ *  MAX_FRAME_BYTES message — so a host that took the default would refuse to stage
+ *  any frame larger than that, which the transport reaches on its first bulk response. */
+export const scratchSize: i32 = SCRATCH_SIZE;
 let priv: i32 = 0;
 scratch = heap.alloc(SCRATCH_SIZE) as i32;
 priv = heap.alloc(PRIV_SIZE) as i32;

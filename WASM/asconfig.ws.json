@@ -19,6 +19,8 @@
     }
   },
   "options": {
-    "bindings": "raw"
+    "bindings": "raw",
+    "//": "ws.wasm rides in the transport bundle, so it is admitted by the ordinary loader and must satisfy the §4 handler contract like any other module — including a declared memory MAXIMUM, which an embedder cannot impose after instantiation. 33 pages hold the 2 MiB + 4 KiB scratch region (assembly/ws/abi.ts SCRATCH_SIZE) and one more holds priv; the rest is slack for AS statics and its allocator. This module is instantiated in EVERY shell, so the maximum is also the per-shell cost — it tracks SCRATCH_SIZE, which tracks MAX_FRAME_BYTES.",
+    "maximumMemory": 48
   }
 }

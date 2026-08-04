@@ -682,13 +682,13 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     }
     // The declared primitives, checked the same way and for the same reason: "this bundle
     // wants a host I am not". Not a grant — a primitive reaches nothing — so it is refused
-    // here as an incompatibility rather than gated later as an authority (phase 3a).
+    // here as an incompatibility rather than gated later as an authority.
     for (const p of parsed.guest?.primitives ?? []) {
         if (!(PRIMITIVE_NAMES as readonly string[]).includes(p)) {
             throw new Error(`bundle: this host has no crypto primitive "${p}" (manifest guest.primitives; this host serves: ${PRIMITIVE_NAMES.join(", ")})`);
         }
     }
-    // The slot-only domains (phase 3a, task 11). `rawnet` is the platform's socket seam
+    // The slot-only domains (§12.5). `rawnet` is the platform's socket seam
     // and `transport` is the slot's provision seam; an ordinary app declaring either is a
     // refused manifest, not a cap that quietly resolves to nothing at first use. This is
     // an AUTHORITY check rather than a compatibility one — unlike the two above — so it

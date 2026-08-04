@@ -1,19 +1,15 @@
-// net.go — the Go target's TCP socket primitive: a length-framed, whole-message
-// duplex channel (rawChannel) over a raw socket.
+// net.go — the Go target's TCP socket primitive: a raw byte duplex (rawChannel) over a
+// socket, with no message boundaries of its own.
 //
-//	[len u32 BE][bytes]   one PeerLink message per record.
-//
-// This is the only networking that stays in Go. The
-// protocol that used to live here — the PeerLink handshake, the NodeNetwork routing
-// table, and the request/response + bulk Transport — now runs as the shared host JS
-// (transport/guest.js, driven by host/transport-host.ts) inside QuickJS, over this via
-// __net (sock.go). ws.go is the WebSocket twin of this channel. Wire framing is
-// byte-identical to the TypeScript so a Go node and a Bun node interop.
+// This is the only networking in Go. Everything structural — the wire codec that
+// imposes those boundaries, the PeerLink handshake, the routing table, the
+// request/response layer — is the transport bundle's guest program
+// (transport/guest.js, driven by host/transport-host.ts) running in QuickJS over this
+// via __net (sock.go).
 package main
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"runtime"
 	"sync"
@@ -24,15 +20,16 @@ import (
 // descriptors, so it declares and enforces its own copy — the same rule that puts the
 // declaration in core/net-limits.ts rather than in the transport it bounds. Keep the two
 // in step; a socket seam must never read this number out of the module it is bounding.
-const maxFrameBytes = 16 << 20
+const maxFrameBytes = 2 << 20
 
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
 // protocol is a single request/response plane — even a block upload awaits an ack per
 // chunk — so a healthy link's queue stays a few messages deep; hitting the cap means
 // the peer has stopped draining (or JS is pushing unpaced), and the channel fails
 // rather than buffering without bound. Must exceed maxFrameBytes or a single
-// max-size frame could never be queued.
-const sendQueueLimit = 32 << 20
+// max-size frame could never be queued; it stays at 2x the frame cap, so "how deep may a
+// stalled peer's queue get" does not drift when the cap moves.
+const sendQueueLimit = 4 << 20
 
 // closeGrace bounds how long a deliberate close() lets the writer flush queued
 // sends (a PeerLink rejection, a WS close frame) before the socket is torn down
@@ -56,32 +53,27 @@ func dialTCP(addr string) (net.Conn, error) {
 	return d.DialContext(context.Background(), "tcp", addr)
 }
 
-// ───────────────────────── RawChannel: a whole-message duplex ─────────────────
+// ───────────────────────── RawLink: a byte duplex ──────────────────────────────
 
-// rawChannel delivers whole messages atomically (core/socket-seam.ts RawChannel). TCP gets
-// message boundaries from a length prefix; WS already has them. A channel owns one
-// socket, one read goroutine, and one writer goroutine; send only queues (it is safe
-// from any goroutine and never blocks on the socket) and takes ownership of its
-// slice — the caller must not reuse it.
+// rawChannel delivers bytes as they arrive (core/socket-seam.ts RawLink at
+// FRAMING.LENGTH or FRAMING.WS_*): one delivery is an arbitrary slice of the stream and
+// implies no boundary, which the transport bundle's framer imposes at the far side of
+// __net. A channel owns one socket, one read goroutine, and one writer goroutine; send
+// only queues (it is safe from any goroutine and never blocks on the socket) and takes
+// ownership of its slice — the caller must not reuse it.
 //
-// onMsg ownership: the read loop hands its onMsg callback a freshly-allocated slice
-// that the callee owns — it is never reused by the reader, so the callee may retain it
-// without copying. Both strategies honor this (framedProto allocates per reassembled
-// frame, rawProto per read), so the delivery boundary needs no defensive copy.
+// onMsg ownership: the read loop hands its onMsg callback a freshly-allocated slice per
+// read that the callee owns — the reader never reuses it, so the callee may retain it
+// and the delivery boundary needs no defensive copy.
 type rawChannel interface {
 	send(bytes []byte)
 	close()
 }
 
-// ── sockChannel: the shared connection core (framed or raw) ────────────────────
+// ── sockChannel: the connection core ───────────────────────────────────────────
 //
-// Both wire shapes are the same connection with a swappable strategy: length-framed
-// whole messages (RawChannel over TCP) and a raw byte duplex (the
-// transport under the JS WebSocket codec, which does its own RFC 6455 framing). The
-// subtle parts live here exactly once — the writer goroutine with its bounded queue,
-// the dead lifecycle, and the close vs fail split. Only how a single send reaches
-// the wire (proto.writeMsg) and how received bytes become onMsg deliveries
-// (proto.readLoop) differ between the two.
+// One socket, with the subtle parts in one place: the writer goroutine and its bounded
+// queue, the dead lifecycle, and the close vs fail split.
 //
 // Writes never run on the caller's goroutine: send() only queues, and the channel's
 // writer goroutine (writeLoop) owns every socket write. The caller is the event-loop
@@ -97,7 +89,6 @@ type rawChannel interface {
 // earlier one (PeerLink needs its HELLO to land first; a WS client its upgrade
 // request), because one writer drains one FIFO.
 type sockChannel struct {
-	proto   proto
 	onMsg   func([]byte)
 	onClose func()
 
@@ -110,28 +101,10 @@ type sockChannel struct {
 	wake chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
 }
 
-// proto is the framed-vs-raw wire strategy. framedProto length-prefixes each message
-// and reassembles whole frames on read; rawProto writes bytes verbatim and delivers
-// each socket read as-is (a chunk, not a whole message). Both are zero-size, so the
-// interface values framingFor hands out box without allocating.
-type proto interface {
-	writeMsg(c *sockChannel, bytes []byte) // frame-and-write one send
-	readLoop(c *sockChannel)               // the read loop: socket bytes → onMsg
-}
-
-// framingFor maps sock.go's raw flag to the wire strategy: raw ⇒ bytes verbatim,
-// otherwise length-framed. The returned zero-size value costs no allocation.
-func framingFor(raw bool) proto {
-	if raw {
-		return rawProto{}
-	}
-	return framedProto{}
-}
-
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
-func newDialChannel(addr string, p proto, onMsg func([]byte), onClose func()) *sockChannel {
-	c := &sockChannel{proto: p, onMsg: onMsg, onClose: onClose, wake: make(chan struct{}, 1)}
+func newDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, wake: make(chan struct{}, 1)}
 	go func() {
 		conn, err := dialTCP(addr)
 		if err != nil {
@@ -147,7 +120,7 @@ func newDialChannel(addr string, p proto, onMsg func([]byte), onClose func()) *s
 		c.conn = conn
 		c.mu.Unlock()
 		go c.writeLoop() // started only after conn is set; drains pre-connect sends in order
-		c.proto.readLoop(c)
+		c.readLoop()
 	}()
 	return c
 }
@@ -155,8 +128,8 @@ func newDialChannel(addr string, p proto, onMsg func([]byte), onClose func()) *s
 // newInboundChannel wraps an already-open accepted socket: its writer starts
 // immediately. The caller starts proto.readLoop once the JS channel is registered —
 // see netHost.wrapInbound.
-func newInboundChannel(p proto, conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	c := &sockChannel{proto: p, onMsg: onMsg, onClose: onClose, conn: conn, wake: make(chan struct{}, 1)}
+func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, wake: make(chan struct{}, 1)}
 	go c.writeLoop()
 	return c
 }
@@ -232,7 +205,7 @@ func (c *sockChannel) writeLoop() {
 		// After a close()-initiated flush hits a write error, writeMsg's fail() is a
 		// no-op (dead is already set) and the remaining writes error instantly on the
 		// closed/deadlined conn — the loop still terminates, it just drains fast.
-		c.proto.writeMsg(c, b)
+		c.writeMsg(b)
 	}
 }
 
@@ -283,101 +256,18 @@ func (c *sockChannel) fail() {
 	c.onClose()
 }
 
-// ── framedProto: length-prefixed frames — [len u32 BE][bytes] per message ──────
-type framedProto struct{}
-
-func (framedProto) writeMsg(c *sockChannel, bytes []byte) {
-	// Reject an over-cap frame here rather than letting uint32(len(bytes)) silently wrap
-	// (a >4 GiB message would write a truncated length and desync the peer) or shipping a
-	// 16 MiB–4 GiB frame the receiver is hardcoded to reject. The read side treats an
-	// over-cap length as fatal (readLoop), so mirror it: fail the channel locally instead
-	// of provoking the peer to drop the link.
-	if len(bytes) > maxFrameBytes {
-		c.fail()
-		return
-	}
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(bytes)))
-	// net.Buffers ships the length prefix and the payload with one writev (a single
-	// syscall on a TCPConn), so we neither allocate a 4+len(bytes) frame nor copy the
-	// whole payload to prepend the header — the biggest saving on the 1 MiB upload path.
-	// Only the writer goroutine calls this (conn is always set by then), so frames on
-	// the same socket can't interleave. WriteTo consumes the slice header it's given
-	// (advancing/niling entries), so hand it a fresh local; bytes is untouched.
-	iov := net.Buffers{hdr[:], bytes}
-	if _, err := iov.WriteTo(c.conn); err != nil {
-		c.fail()
-	}
-}
-
-func (framedProto) readLoop(c *sockChannel) {
-	buf := make([]byte, 0, 4096)
-	chunk := make([]byte, 64<<10)
-	idle := 0 // consecutive compactions that left most of cap(buf) unused
-	conn := c.conn // set strictly before the read loop starts
-	for {
-		n, err := conn.Read(chunk)
-		if n > 0 {
-			buf = append(buf, chunk[:n]...)
-			// Consume whole frames by advancing an offset, then shift the unread tail
-			// back to the front of the SAME backing array. Reslicing buf forward
-			// (buf = buf[4+ln:]) instead walks the slice toward the end of its array, so
-			// each Read's append keeps reallocating a fresh 64 KiB-class buffer and
-			// copying the sliver across — needless churn on a high-throughput link.
-			off := 0
-			for {
-				if len(buf)-off < 4 {
-					break
-				}
-				ln := binary.BigEndian.Uint32(buf[off:])
-				if ln > maxFrameBytes {
-					c.fail()
-					return
-				}
-				if uint32(len(buf)-off) < 4+ln {
-					break
-				}
-				msg := append([]byte(nil), buf[off+4:off+4+int(ln)]...)
-				off += int(4 + ln)
-				c.onMsg(msg)
-			}
-			if off > 0 {
-				buf = append(buf[:0], buf[off:]...) // overlap-safe compaction (memmove)
-				// The compaction keeps the backing array, so one 16 MiB frame would pin
-				// 16 MiB per connection for its life — a real high-water cost on a node
-				// holding many peers after a bulk sync. Snap the capacity back to the
-				// tail once 16 consecutive compactions used under a quarter of it.
-				// Rate-limiting the shrink matters: doing it per-frame made a sustained
-				// stream of large frames realloc-thrash (BenchmarkNetUpload1M: 2.1 →
-				// 5.3 MB/op); every 16th frame amortizes that to noise, while a link
-				// whose burst has passed still frees its buffer within 16 messages.
-				if cap(buf) > 64<<10 && len(buf) < cap(buf)/4 {
-					if idle++; idle >= 16 {
-						idle = 0
-						buf = append(make([]byte, 0, max(len(buf), 4096)), buf...)
-					}
-				} else {
-					idle = 0
-				}
-			}
-		}
-		if err != nil {
-			c.fail()
-			return
-		}
-	}
-}
-
-// ── rawProto: a raw byte duplex — bytes pass through verbatim, no framing ───────
-type rawProto struct{}
-
-func (rawProto) writeMsg(c *sockChannel, bytes []byte) {
+// ── the wire: a raw byte duplex — bytes pass through verbatim, no framing ──────
+//
+// Go imposes no message boundaries at all. Whether a link is length-prefixed or
+// RFC 6455 framed is the transport bundle's decision and its code (transport/guest.js),
+// so this file moves bytes and nothing else.
+func (c *sockChannel) writeMsg(bytes []byte) {
 	if _, err := c.conn.Write(bytes); err != nil {
 		c.fail()
 	}
 }
 
-func (rawProto) readLoop(c *sockChannel) {
+func (c *sockChannel) readLoop() {
 	chunk := make([]byte, 64<<10)
 	conn := c.conn // set strictly before the read loop starts
 	for {

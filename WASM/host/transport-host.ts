@@ -1,17 +1,14 @@
 // transport-host.ts — the host side of the transport bundle
-// (§12.6). The channel handshake, the authenticated
+// (§12.6). The wire codec, the channel handshake, the authenticated
 // link router, the routing-core bookkeeping and the request/response layer run as
 // the transport bundle's zero-authority guest program; this file is the driver
 // that stands between that guest and the platform.
 //
-// **There is no second seam here** . An earlier revision of this
-// file marshalled 14 events and 14 actions across a bespoke byte ABI with a
-// hand-maintained twin in the guest — a host↔module contract alongside `host.call`,
-// in a design whose stated rule is that there is exactly one of everything. Both
-// halves are gone, and each went to the mechanism that already existed:
+// **There is no second seam here.** Both directions use the mechanism that already
+// exists, rather than a bespoke byte ABI with a hand-maintained twin in the guest:
 //
 //   guest → host ordinary `host.call` ops (cap-bridge.ts). The RAW net capability
-//                  — `NET_LINK_OPEN/SEND/CLOSE/CAP` over an opaque link id — plus
+//                  — `NET_LINK_OPEN/SEND/CLOSE/STAT` over an opaque link id — plus
 //                  `TIMER_*` for deadlines and the `transport` domain the slot
 //                  reports its structured output through. Adding one is an op, not
 //                  an action id with a decoder on both sides.
@@ -26,27 +23,26 @@
 // would re-enter a live guest frame. None does — a socket write does not deliver
 // during the write, an armed timer fires on a later turn, and `NET_DELIVER` answers
 // through the `respond` entrypoint rather than inline. That last one is not a
-// concession: it is also what keeps an asynchronous app handler possible, which is
-// what phase 4 needs.
+// concession: it is also what keeps an asynchronous app handler possible.
 //
-// The crypto surface the guest reaches is the cap-bridge's, and after phase 3a it
-// names no algorithm the host understands: the record layer and the ephemeral DH go
+// The crypto surface the guest reaches is the cap-bridge's, and it names no algorithm
+// the host understands: the record layer and the ephemeral DH go
 // through `host.crypto(name, bytes)` over the opaque primitive catalog, and the
 // transcript signature is the ordinary SIGN op, which the bridge scopes to
 // `DOMAIN_channel ‖ networkKey` because THIS bundle claims the transport slot. The
 // host prefixes and does not read the suffix, so no handshake shape is pinned into
 // the core and the node's key never enters the guest.
 //
-// What stays here, on the host: the channels (by the link id this file mints), the
-// timers, the promises of outbound requests (keyed by the corr the host assigns),
-// the address book for dialing, the flood caps (net-limits.ts — the module never
-// declares the number that bounds it, it only learns it at init to size its own send
-// budget), and the WHITELIST GATE, which is applied to the attribution the guest
-// reports rather than handed to the guest to apply to itself (see `admits`).
+// What the host holds: the channels (by the link id this file mints), the timers, the
+// promises of outbound requests (keyed by the corr the host assigns), the address book
+// for dialing, the flood caps (net-limits.ts — the module never declares the number
+// that bounds it, it only learns it at init), and the WHITELIST GATE, which is applied
+// to the attribution the guest reports rather than handed to the guest to apply to
+// itself (see `admits`).
 
 import { toHex, fromHex, writeU32BE } from "../core/util.js";
-import { MAX_FRAME_BYTES } from "../core/net-limits.js";
-import type { ChannelFactory, PeerAddr, RawChannel } from "../core/socket-seam.js";
+import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
+import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
 import type { RawNet, HostTimers, TransportSink } from "./cap-bridge.js";
 import type { SafeRealm } from "./safe-js.js";
 import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
@@ -68,6 +64,10 @@ const REASON_NAMES: readonly string[] = ["open", "handshake", "clean", "aborted"
 export function closeReasonName(code: number): string { return REASON_NAMES[code] ?? "unknown"; }
 
 const EMPTY = new Uint8Array(0);
+
+/** No address book entry, or no channel factory at all. Link id 0 is never live, so
+ *  the framing is moot — the guest reads the id first and stops. */
+const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -178,7 +178,7 @@ export interface LinkHandle {
 }
 
 export interface OpenLinkOptions {
-  channel: RawChannel;
+  channel: RawLink;
   /** true if we opened the connection (outbound dial), false if we accepted it. */
   weDialed: boolean;
   /** For an outbound dial, the peerId we expect to reach (hex) — the handshake
@@ -269,7 +269,7 @@ export class TransportHost implements Network, HostTransport {
 
   private realm: SafeRealm | null = null;
   private readonly opts: TransportHostOptions;
-  private readonly channels = new Map<number, RawChannel>;
+  private readonly channels = new Map<number, RawLink>;
   private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: CloseReasonCode) => void }>;
   private readonly timers = new Map<number, ReturnType<typeof setTimeout>>;
   private readonly pending = new Map<number, { resolve: (b: Uint8Array) => void; reject: (e: Error) => void }>;
@@ -302,6 +302,7 @@ export class TransportHost implements Network, HostTransport {
       .u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE)
       .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
       .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
+      .u32(MAX_HANDSHAKE_FRAME_BYTES)
       .build());
   }
 
@@ -383,18 +384,17 @@ export class TransportHost implements Network, HostTransport {
         // it in the address book it was configured with. No address book entry, or
         // no channel factory at all (a browser edge), is "no route" — which the
         // caller treats exactly as a fabric dropping a frame.
-        if (!this.opts.channels) return 0;
+        if (!this.opts.channels) return NO_ROUTE;
         const addr = this.addrs.get(toHex(dest));
-        if (!addr) return 0;
+        if (!addr) return NO_ROUTE;
         const channel = this.opts.channels.connect(addr);
-        return this.register(channel);
+        return {
+          linkId: this.register(channel), framing: channel.framing, authority: channel.authority ?? "",
+        };
       },
       send: (linkId, bytes) => { this.channels.get(linkId)?.send(bytes); },
       close: (linkId, graceful) => {
         try { this.channels.get(linkId)?.close(graceful); } catch { /* already gone */ }
-      },
-      raiseCap: (linkId) => {
-        try { this.channels.get(linkId)?.allowLargeFrames?.(); } catch { /* no cap */ }
       },
       // A link that is gone, or a channel that cannot say, both read 0 — indistinguishable
       // from "nothing queued", which is the safe answer: the occupant's stall clock then
@@ -497,10 +497,10 @@ export class TransportHost implements Network, HostTransport {
   /** Mint a link id for a channel and wire its events back into the guest. The
  *  callbacks fire on later turns (a socket does not deliver during the write that
  *  provoked it), which is what lets a channel be registered from inside an op. */
-  private register(channel: RawChannel): number {
+  private register(channel: RawLink): number {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
-    channel.onMessage((bytes) => {
+    channel.onData((bytes) => {
       this.enter("linkBytes", new Args().u32(linkId).blob(bytes).build());
     });
     channel.onClose(() => {
@@ -512,19 +512,21 @@ export class TransportHost implements Network, HostTransport {
 
   /** Tell the guest about a link the HOST opened: an accepted socket, or one a
  *  host-managed transport handed over. A dialed core link is not here — the guest
- *  opens those itself through `NET_LINK_OPEN` and already knows everything about
- *  them, which is one whole event that stopped existing. */
+ *  opens those itself through `NET_LINK_OPEN` and already knows everything about them. */
   private announce(
     linkId: number,
     spec: {
-      weDialed: boolean; kind: number; expectPeerId?: Uint8Array; dialSecret?: Uint8Array;
-      source?: string; handshakeTimeoutMs?: number; rekeyAfterFrames?: number;
+      weDialed: boolean; kind: number; framing: Framing; authority?: string; expectPeerId?: Uint8Array;
+      dialSecret?: Uint8Array; source?: string; handshakeTimeoutMs?: number;
+      rekeyAfterFrames?: number;
     },
   ): void {
     this.enter("linkOpen", new Args()
       .u32(linkId)
       .u8(spec.weDialed ? 1 : 0)
       .u8(spec.kind)
+      .u8(spec.framing)
+      .blob(enc.encode(spec.authority ?? ""))
       .u32(spec.handshakeTimeoutMs ?? 0)
       .u32(spec.rekeyAfterFrames ?? 0)
       .blob(spec.expectPeerId ?? EMPTY)
@@ -542,6 +544,8 @@ export class TransportHost implements Network, HostTransport {
     this.announce(linkId, {
       weDialed: opts.weDialed,
       kind: LINK_OPEN,
+      framing: opts.channel.framing,
+      authority: opts.channel.authority,
       expectPeerId: opts.expectPeerId ? fromHex(opts.expectPeerId) : undefined,
       // A dial gates on THE PEER's secret (from the address); an open peer is the
       // zero secret, said explicitly. An accept gates on ours (guest init).
@@ -578,7 +582,9 @@ export class TransportHost implements Network, HostTransport {
       this.opts.listen, this.opts.wsListen,
       (channel) => {
         const linkId = this.register(channel);
-        this.announce(linkId, { weDialed: false, kind: LINK_CORE, source: channel.remoteAddr });
+        this.announce(linkId, {
+          weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,
+        });
       },
     );
     this.port = port;
@@ -658,8 +664,8 @@ export class TransportHost implements Network, HostTransport {
  *  The answer goes back through the `respond` entrypoint on a LATER turn, never as
  *  the op's return value, and that is deliberate twice over: it keeps the
  *  no-re-entrancy invariant (this runs inside the guest's own frame), and it is
- *  what lets `RequestHandler` return a Promise — the shape phase 4's async fs
- *  needs from the app side. */
+ *  what lets `RequestHandler` return a Promise, which is the shape an app handler
+ *  awaiting `fs` needs. */
   private onDeliver(corr: number, noReply: boolean, from: Uint8Array, proto: Uint8Array, payload: Uint8Array): void {
     this.framesDelivered++;
     const handler = this.reqHandler;
@@ -692,7 +698,7 @@ export class TransportHost implements Network, HostTransport {
   /** A single-identity fabric: it vends exactly one endpoint, its own. The send
  *  path routes through the guest's router; inbound content arrives through the
  *  transport sink (NET_DELIVER / NET_SETTLE), never as raw frames — which is why
- *  `Endpoint` no longer carries an `onFrame` sink for nothing to deliver to. */
+ *  `Endpoint` carries no `onFrame` sink. */
   endpoint(id: PeerId): Endpoint {
     if (id !== this.peerId) throw new Error("TransportHost is bound to one identity");
     return {
@@ -736,7 +742,9 @@ export class TransportHost implements Network, HostTransport {
  *  mirroring a real socket; closing one end fires the other's onClose — the
  *  close semantics of BufferedChannel's fail() path, which is how a real channel
  *  reports the far side going away. */
-class LoopbackChannel implements RawChannel {
+class LoopbackChannel implements RawLink {
+  /** A socket pair with `send` as the boundary: one send is one delivery. */
+  readonly framing = FRAMING.PLATFORM;
   private peer: LoopbackChannel | null = null;
   private msg: ((bytes: Uint8Array) => void) | null = null;
   private cls: (() => void) | null = null;
@@ -760,7 +768,7 @@ class LoopbackChannel implements RawChannel {
     const p = this.peer;
     queueMicrotask(() => { if (p && !p.dead) p.msg?.(bytes); });
   }
-  onMessage(cb: (bytes: Uint8Array) => void): void { this.msg = cb; }
+  onData(cb: (bytes: Uint8Array) => void): void { this.msg = cb; }
   onClose(cb: () => void): void { this.cls = cb; }
   close(): void {
     if (this.dead) return;
@@ -775,7 +783,6 @@ class LoopbackChannel implements RawChannel {
     this.dead = true;
     this.cls?.();
   }
-  allowLargeFrames(): void { /* nothing to reassemble, nothing to bound */ }
 }
 
 /** In-process socket fabric for the transport driver — the successor of the old
@@ -788,7 +795,7 @@ class LoopbackChannel implements RawChannel {
  *  closing one driver only clears the listeners — it does not poison the fabric
  *  for the others. */
 export class LoopbackChannels implements ChannelFactory {
-  private listeners = new Map<number, (channel: RawChannel) => void>;
+  private listeners = new Map<number, (channel: RawLink) => void>;
   private nextPort = 10000;
 
   /** The bound ports (set by a driver's start()). */
@@ -798,7 +805,7 @@ export class LoopbackChannels implements ChannelFactory {
   async listen(
     tcp: { host: string; port: number } | undefined,
     ws: { host: string; port: number } | undefined,
-    onAccept: (channel: RawChannel) => void,
+    onAccept: (channel: RawLink) => void,
   ): Promise<{ port: number; wsPort: number }> {
     let port = 0, wsPort = 0;
     if (tcp) { port = this.bind(tcp.port, onAccept); }
@@ -808,14 +815,14 @@ export class LoopbackChannels implements ChannelFactory {
     return { port, wsPort };
   }
 
-  private bind(requested: number, onAccept: (channel: RawChannel) => void): number {
+  private bind(requested: number, onAccept: (channel: RawLink) => void): number {
     const port = requested > 0 ? requested : this.nextPort++;
     if (this.listeners.has(port)) throw new Error("LoopbackChannels: port already bound");
     this.listeners.set(port, onAccept);
     return port;
   }
 
-  connect(addr: PeerAddr): RawChannel {
+  connect(addr: PeerAddr): RawLink {
     const onAccept = this.listeners.get(addr.port);
     if (!onAccept) {
       // A dial to a dead port: the channel fails immediately on the DIAL side
