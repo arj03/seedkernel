@@ -31,7 +31,12 @@ const { ok, summary } = testkit();
 const assert = ok;
 // Read out of the artifact rather than restated: a hard-coded author is drift waiting
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
-const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
+const transportVerified = verifyBundle(sodium, transportBlob);
+const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
+// The artifact is PQ-signed by default (§14.1): the id policy pins under `0x02` is a
+// key-set hash, so a regression to the genesis suite would change every pin silently.
+assert(transportVerified.suite === 0x02, "the shipped transport bundle is hybrid-signed (suite 0x02)");
+assert(transportVerified.authorKeys.mlDsa !== undefined, "…and carries the ML-DSA-65 public key");
 
 // A SECOND transport, version 2, signed by a different author — the realistic upgrade
 // shape, and the one that exercises both admission gates at once: `roles.transport`
