@@ -19,7 +19,7 @@ const sodium = _sodium;
 const { KernelHost } = await imp("build/host/kernel-host.js");
 const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { entryModuleOf, appScopeFor, genesisHash, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
+const { appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
@@ -90,13 +90,12 @@ console.log("\n§12.2 — fs is scoped per app key");
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
 }
 
-console.log("\n§12.10 — the dispatch module is declared, not positional");
+console.log("\n§12.4 — a handler-only bundle is one module");
 {
-  const mods = [{ name: "a", hash: "" }, { name: "b", hash: "" }];
-  ok(entryModuleOf({ app: "x", version: 1, modules: [mods[0]] }) === "a", "one module needs no entry");
-  ok(entryModuleOf({ app: "x", version: 1, modules: mods, entry: "b" }) === "b", "entry selects the module");
-  throws(() => entryModuleOf({ app: "x", version: 1, modules: mods }), "two modules and no entry is an error, not modules[0]");
-  ok(entryModuleOf({ app: "x", version: 1, modules: mods, guest: {} }) === null, "a guest bundle dispatches itself");
+  const kp = sodium.crypto_sign_keypair();
+  const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp.privateKey, kp.publicKey, m));
+  throws(() => verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }] }),
+    "two handler modules and no guest are refused — the module count IS the dispatch rule");
 }
 
 console.log("\n§12.2 — the capability gates cannot be reached by omission");

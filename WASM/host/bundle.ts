@@ -133,19 +133,6 @@ export interface BundleManifest {
      *  bundle, so each author keeps their own version lineage (§12.4). */
     role?: BundleRole;
     modules: BundleModule[];
-    /** Which module receives inbound dispatch for a handler-only bundle — the `name` of
-     *  one of `modules` (README §12.10).
-     *
-     *  Declared, not positional. The shell used to take `modules[0]`, which made the
-     *  order of a JSON array load-bearing: reordering a manifest silently redirected every
-     *  inbound message to a different module, with nothing in the format saying that the
-     *  order meant anything. Since the field is inside the signed JSON, what receives
-     *  traffic is now something the author states and signs.
-     *
-     *  Optional only where it is unambiguous — a bundle with exactly one module, or one
-     *  whose guest does its own dispatch. Two or more modules and no guest requires it;
-     *  see `entryModuleOf`. */
-    entry?: string;
     /** The guest program, or absent for a handler-only bundle (app modules bound as
      *  handlers, no zero-authority realm — e.g. the chat demo). Present ⇒ the loader
      *  integrity-checks `guest.js` and hands the source back for the shell to run in a
@@ -383,24 +370,6 @@ export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: strin
     const key = enc.encode(appKeyFor(author, app));
     return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
 }
-/** The module name inbound dispatch goes to for a handler-only bundle, or null when the
- *  bundle has a guest (which dispatches itself, §12.2) or no modules at all.
- *
- *  Ambiguity is an error rather than a default: a manifest with several modules and no
- *  `entry` throws here instead of quietly picking one. That is the whole point of the
- *  field — the previous positional rule could not distinguish "the author meant the first
- *  one" from "the author never thought about it", and only one of those should load. */
-export function entryModuleOf(manifest: BundleManifest): string | null {
-    if (manifest.guest)
-        return null;
-    if (manifest.modules.length === 0)
-        return null;
-    if (manifest.entry !== undefined)
-        return manifest.entry;
-    if (manifest.modules.length === 1)
-        return manifest.modules[0].name;
-    throw new Error(`bundle: ${manifest.modules.length} modules and no "entry" — declare which one receives inbound messages`);
-}
 const SUITE_LEN = 1;
 const PK_LEN = 32;
 const SIG_LEN = 64;
@@ -571,13 +540,13 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         seen.add(mm.name);
     }
-    // `entry` must name a module this same manifest declares. Checked here, with the rest
-    // of the shape, so a mistyped entry is caught at load rather than at the first inbound
-    // message — an app whose traffic silently goes nowhere is the worst way to learn this.
-    if (o.entry !== undefined) {
-        if (typeof o.entry !== "string" || !seen.has(o.entry))
-            return false;
-    }
+    // A handler-only bundle is ONE pure transform (§4): nothing else can reach its
+    // modules — a handler cannot call another handler (§4.2) and with no guest there is
+    // no MODULE_CALL to drive them — so there is no second module to dispatch and no
+    // `entry` field to pick one. The single module IS the app's inbound entry, and
+    // anything multi-module ships a guest, which dispatches itself (§12.10).
+    if (o.guest === undefined && o.modules.length !== 1)
+        return false;
     if (o.guest !== undefined) {
         const g = o.guest as Record<string, unknown>;
         if (typeof g !== "object" || g === null || Array.isArray(g))

@@ -105,22 +105,26 @@ func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, 
 }
 
 // writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a handler-only
-// manifest carrying `role`. A slot occupant is an authority grant with its own admission
-// class (§12.5), so the native tests need a bundle the ordinary author allowlist must
-// refuse — and `role` is inside the signed JSON, which is why this signs its own body
-// rather than post-editing one.
+// manifest carrying `role` — the shape of the real transport bundle, whose one module
+// (ws.wasm) rides alongside its guest program. A slot occupant is an authority grant
+// with its own admission class (§12.5), so the native tests need a bundle the ordinary
+// author allowlist must refuse — and `role` is inside the signed JSON, which is why this
+// signs its own body rather than post-editing one.
 func writeSlotBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, role string) string {
 	t.Helper()
 	type mod struct {
 		Name string `json:"name"`
 		Hash string `json:"hash"`
 	}
+	// One module: a handler-only bundle is one module by construction (§12.4).
 	mjson, err := json.Marshal(struct {
 		App     string `json:"app"`
 		Version int    `json:"version"`
 		Role    string `json:"role"`
 		Modules []mod  `json:"modules"`
-	}{App: app, Version: version, Role: role, Modules: []mod{}})
+	}{App: app, Version: version, Role: role, Modules: []mod{{
+		Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}

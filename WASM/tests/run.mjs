@@ -48,7 +48,7 @@ import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
-         signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE }
+         signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
@@ -230,18 +230,23 @@ async function testBundleRefusesNonHandler() {
 
   // A well-formed manifest committing to two modules the author genuinely signed. One is
   // the real forwarder (a valid §4 handler); the other is arbitrary bytes that hash-match
-  // their manifest entry but won't instantiate as a handler. With a two-phase install, a
-  // module that fails phase 1 (instantiate) should fail the entire load — nothing lands.
+  // their manifest module entry but won't instantiate as a handler. A guest is declared
+  // because a handler-only bundle is one module by construction (§12.4) — the multi-module
+  // shape that tests atomicity is a guest bundle. With a two-phase install, a module that
+  // fails phase 1 (instantiate) should fail the entire load — nothing lands.
   const notAHandler = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
+  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestBytes = new TextEncoder().encode(guestText);
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
     { name: "broken", hash: toHex(gHash(notAHandler)) },
-  ] };
+  ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, caps: [] } };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: manifestEnv,
     [moduleFile("fwd")]: forwarderBytes,
     [moduleFile("broken")]: notAHandler,
+    [GUEST_FILE]: guestBytes,
   });
 
   const admit = authorAllowlist([toHex(author.publicKey)]);
@@ -728,9 +733,10 @@ async function testGuestAbi() {
   assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
 
   // A handler-only bundle declares no guest and therefore no ABI — the seam it never
-  // touches is not a field it has to fill in.
+  // touches is not a field it has to fill in. (A handler-only bundle is one module by
+  // construction §12.4, hence the single module here.)
   assert(verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
-    { app: "abi", version: 1, modules: [] })) !== null,
+    { app: "abi", version: 1, modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] })) !== null,
     "a handler-only bundle needs no ABI declaration");
 
   console.log("  OK\n");
@@ -1371,7 +1377,9 @@ async function testManifestSuiteByte() {
   const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
 
   const author = generateKeyPair();
-  const manifest = { app: "suite-probe", version: 1, modules: [] };
+  // One module: a handler-only bundle is one module by construction (§12.4), and this
+  // test is about the suite byte, not the module count.
+  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }] };
   const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
 
   // Layout: the suite byte leads, and the author key follows it (not at offset 0).
@@ -1580,7 +1588,9 @@ async function testHybridManifestSuite() {
   const ed = generateKeyPair();
   const pq = generatePqKeyPair();
   const keys = { ed, mlDsa: pq };
-  const manifest = { app: "pq-probe", version: 1, modules: [] };
+  // One module: a handler-only bundle is one module by construction (§12.4), and this
+  // test is about the hybrid envelope, not the module count.
+  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }] };
   const env = signManifestHybrid(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys

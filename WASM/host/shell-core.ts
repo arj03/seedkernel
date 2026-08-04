@@ -18,7 +18,7 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
-import { kernelNameFor, appKeyFor, appScopeFor, handlesOf, entryModuleOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { kernelNameFor, appKeyFor, appScopeFor, handlesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
@@ -478,15 +478,15 @@ export function createShell(opts: CreateShellOptions & {
     /** Resolve an app's one inbound entrypoint, ONCE, at install (§12.10).
      *
      *  An app has exactly one way in. Which mechanism serves it — a confined realm's
-     *  `handle` (§12.2) or the WASM module the manifest names as `entry` (§12.4) — is a
+     *  `handle` (§12.2) or the single WASM module of a handler-only bundle (§12.4) — is a
      *  property of the bundle, so it is decided here rather than re-decided per message:
      *  `dispatch` neither branches on how an app is implemented nor re-derives a kernel
-     *  name for every inbound frame. A multi-module handler bundle's other modules are
-     *  library code its `entry` calls, never a second inbound seam.
+     *  name for every inbound frame.
      *
-     *  `entryModuleOf` throws on a manifest that declares several modules and no `entry`,
-     *  and this runs on the load path, so an ambiguous bundle fails to install rather
-     *  than binding traffic to whichever module happened to be first.
+     *  A handler-only bundle is one module by construction (§12.4): the manifest is
+     *  refused at load with any other count, so `modules[0]` here is not a positional
+     *  default — it is the only shape the format admits, and it is why the format needs
+     *  no `entry` field at all.
      *
      *  It closes over the SLOT, not over `slot.realm`: the entrypoint is fixed at
      *  install, but the realm behind it is created lazily (`ensureRealm`, on serve() or
@@ -497,10 +497,8 @@ export function createShell(opts: CreateShellOptions & {
             // realm before it routes a single frame, so this is the pre-serve() case.
             return (input) => slot.realm ? slot.realm.call("handle", input) : null;
         }
-        const mod = entryModuleOf(slot.loaded.manifest);
-        if (!mod)
-            return () => null;
-        const name = kernelNameFor(slot.loaded.author, slot.loaded.manifest.app, mod);
+        const mod = slot.loaded.manifest.modules[0];
+        const name = kernelNameFor(slot.loaded.author, slot.loaded.manifest.app, mod.name);
         return (input) => host.callHandler(name, input);
     };
     /** Stand a transport driver up over an admitted transport bundle's realm.
