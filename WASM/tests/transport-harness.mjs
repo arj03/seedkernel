@@ -20,7 +20,13 @@ export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { KernelHost } = await imp("build/host/kernel-host.js");
-export const { CLOSE_REASON, TransportHost, LoopbackChannels } = await imp("build/host/transport-host.js");
+export const { TransportHost } = await imp("build/host/transport-host.js");
+export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
+/** The link close-reason codes the transport guest reports through NET_LINK_DOWN
+ *  (transport/guest.js, `REASON_*`). The host only relays the number to whoever
+ *  handed the channel in, so the vocabulary lives with the occupant and here,
+ *  where the tests assert it. */
+export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 export const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));

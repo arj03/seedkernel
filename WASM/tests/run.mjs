@@ -434,14 +434,16 @@ async function testFs() {
 // Which keys a node admits decides which blocks it stores and advertises, so it is a
 // consensus predicate: a Go node and a Bun node that disagree about it disagree about
 // their contents. The rule therefore lives in shared JS (core/fs.ts `isSafeFsKey`) and
-// is applied over whatever backend a target supplies (`validatedFs`), rather than being
+// is applied over whatever backend a target supplies (`validatedFs`, shell-core.ts),
+// rather than being
 // written once in host/fs-node.ts and again in native/fs.go — which is where it was,
 // under a comment on each copy saying the two had to match.
 
 async function testFsKeyRule() {
   console.log("Test: fs key space is one rule — isSafeFsKey over any backend (validatedFs)");
 
-  const { isSafeFsKey, validatedFs, scopedFs } = await imp("build/core/fs.js");
+  const { isSafeFsKey } = await imp("build/core/fs.js");
+  const { validatedFs, scopedFs } = await imp("build/host/shell-core.js");
 
   const legal = ["a", "a.blk", "A_b-c.9", "0".repeat(64) + ".blk", "_", "-", "..a", "a.."];
   for (const k of legal) assert(isSafeFsKey(k), `isSafeFsKey(${JSON.stringify(k)}) should hold`);

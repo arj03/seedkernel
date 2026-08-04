@@ -2,10 +2,12 @@
 // shape a browser backend (OPFS/IndexedDB) will mirror.
 //
 // A backend, so it sits with the other backends (`fs-node.ts`, and Go's `native/fs.go`)
-// rather than in core. What is core is the seam it satisfies and the scoping derivation
-// applied over it (`Fs`, `scopedFs` — core/fs.ts): those decide what an app can reach,
-// and every host must agree on them. Which medium the bytes land in decides nothing, so
-// a target picks a backend the way it picks a socket implementation.
+// rather than in core. What is core is the seam it satisfies and the key rule
+// (`Fs`, `isSafeFsKey` — core/fs.ts); the wrappers that apply the rule and the app
+// scoping (`validatedFs`, `scopedFs`) live in shell-core.ts with the shell that wires
+// them. Those decide what an app can reach, and every host must agree on them. Which
+// medium the bytes land in decides nothing, so a target picks a backend the way it
+// picks a socket implementation.
 
 import type { Fs, FsStat } from "../core/fs.js";
 

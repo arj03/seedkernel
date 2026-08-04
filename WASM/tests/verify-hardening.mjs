@@ -17,11 +17,10 @@ const sodium = _sodium;
 
 const { KernelHost } = await imp("build/host/kernel-host.js");
 const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
-const { scopedFs } = await imp("build/core/fs.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { entryModuleOf, appScopeFor, genesisHash, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
-const { createShell } = await imp("build/host/shell-core.js");
+const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");

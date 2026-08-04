@@ -16,7 +16,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadSodium, generateKeyPair } = await imp("build/host/node.js");
 const sodium = await loadSodium();
 const { createShell } = await imp("build/host/shell-core.js");
-const { LoopbackChannels } = await imp("build/host/transport-host.js");
+const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");

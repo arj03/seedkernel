@@ -114,14 +114,11 @@ export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: 
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
-/** Link close-reason codes, mirroring the transport guest's `linkClosed` report
- *  (transport/guest.js). */
-export const CLOSE_REASON = {
-  OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5,
-} as const;
-export type CloseReasonCode = (typeof CLOSE_REASON)[keyof typeof CLOSE_REASON];
-const REASON_NAMES: readonly string[] = ["open", "handshake", "clean", "aborted", "local", "truncated"];
-export function closeReasonName(code: number): string { return REASON_NAMES[code] ?? "unknown"; }
+// The link close-reason codes are the transport occupant's vocabulary — the host
+// only relays the number it reports through NET_LINK_DOWN (cap-bridge.ts) to
+// whoever handed the channel in, never interpreting it. The codes live with the
+// occupant (transport/guest.js, `REASON_*`) and with the tests that assert them
+// (tests/transport-harness.mjs).
 
 const EMPTY = new Uint8Array(0);
 
@@ -259,7 +256,7 @@ export interface OpenLinkOptions {
   /** Fired once this link's identity verified AND the whitelist admitted it. */
   onAuth?: (peerId: PeerId) => void;
   /** Fired when the link tears down (any reason). */
-  onClose?: (linkId: number, reason: CloseReasonCode) => void;
+  onClose?: (linkId: number, reason: number) => void;
 }
 
 /** The request/response face of the transport bundle — the shape shell-core's
@@ -330,7 +327,7 @@ export class TransportHost implements Network, HostTransport {
   private realm: SafeRealm | null = null;
   private readonly opts: TransportHostOptions;
   private readonly channels = new Map<number, RawLink>;
-  private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: CloseReasonCode) => void }>;
+  private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: number) => void }>;
   private readonly timers = new Map<number, ReturnType<typeof setTimeout>>;
   private readonly pending = new Map<number, { resolve: (b: Uint8Array) => void; reject: (e: Error) => void }>;
   private readonly addrs = new Map<PeerId, PeerAddr>;
@@ -542,7 +539,7 @@ export class TransportHost implements Network, HostTransport {
       ready: (ok) => this.onReady(ok),
       linkDown: (linkId, reason) => {
         const o = this.openLinks.get(linkId);
-        if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason as CloseReasonCode); }
+        if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason); }
       },
     };
   }
@@ -793,146 +790,5 @@ export class TransportHost implements Network, HostTransport {
     }
     this.channels.clear();
     this.opts.channels?.close();
-  }
-}
-
-// ── the in-process fabric (tests and single-process multi-node demos) ─────────
-
-/** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
- *  mirroring a real socket; closing one end fires the other's onClose — the
- *  close semantics of BufferedChannel's fail() path, which is how a real channel
- *  reports the far side going away. */
-class LoopbackChannel implements RawLink {
-  /** A socket pair with `send` as the boundary: one send is one delivery. */
-  readonly framing = FRAMING.PLATFORM;
-  private peer: LoopbackChannel | null = null;
-  private msg: ((bytes: Uint8Array) => void) | null = null;
-  private cls: (() => void) | null = null;
-  private dead = false;
-  readonly remoteAddr: string;
-
-  constructor(remoteAddr: string) {
-    this.remoteAddr = remoteAddr;
-  }
-
-  static pair(remoteAddr: string): [LoopbackChannel, LoopbackChannel] {
-    const a = new LoopbackChannel(remoteAddr);
-    const b = new LoopbackChannel(remoteAddr);
-    a.peer = b;
-    b.peer = a;
-    return [a, b];
-  }
-
-  send(bytes: Uint8Array): void {
-    if (this.dead) return;
-    const p = this.peer;
-    queueMicrotask(() => { if (p && !p.dead) p.msg?.(bytes); });
-  }
-  onData(cb: (bytes: Uint8Array) => void): void { this.msg = cb; }
-  onClose(cb: () => void): void { this.cls = cb; }
-  close(): void {
-    if (this.dead) return;
-    this.dead = true;
-    const p = this.peer;
-    queueMicrotask(() => { if (p && !p.dead) p.cls?.(); });
-  }
-  /** The far end went away / this end failed: notify our own onClose (the
- *  BufferedChannel.fail() path — how a socket reports being cut). */
-  kill(): void {
-    if (this.dead) return;
-    this.dead = true;
-    this.cls?.();
-  }
-}
-
-/** In-process socket fabric for the transport driver — the successor of the old
- *  LoopbackNetwork, which sat under a hand-rolled Transport. The fabric now sits
- *  under the driver's ChannelFactory seam, so the full AKE and record layer run
- *  in-process between two drivers: `listen` registers a listener per port and
- *  `connect` opens a microtask-delivered pipe pair into it.
- *
- *  The fabric is SHARED by every driver in a process (like a real network), so
- *  closing one driver only clears the listeners — it does not poison the fabric
- *  for the others. */
-export class LoopbackChannels implements ChannelFactory {
-  private listeners = new Map<number, (channel: RawLink) => void>;
-  private nextPort = 10000;
-
-  /** The bound ports (set by a driver's start()). */
-  port = 0;
-  wsPort = 0;
-
-  async listen(
-    tcp: { host: string; port: number } | undefined,
-    ws: { host: string; port: number } | undefined,
-    onAccept: (channel: RawLink) => void,
-  ): Promise<{ port: number; wsPort: number }> {
-    let port = 0, wsPort = 0;
-    if (tcp) { port = this.bind(tcp.port, onAccept); }
-    if (ws) { wsPort = this.bind(ws.port, onAccept); }
-    this.port = port;
-    this.wsPort = wsPort;
-    return { port, wsPort };
-  }
-
-  private bind(requested: number, onAccept: (channel: RawLink) => void): number {
-    const port = requested > 0 ? requested : this.nextPort++;
-    if (this.listeners.has(port)) throw new Error("LoopbackChannels: port already bound");
-    this.listeners.set(port, onAccept);
-    return port;
-  }
-
-  connect(addr: PeerAddr): RawLink {
-    const onAccept = this.listeners.get(addr.port);
-    if (!onAccept) {
-      // A dial to a dead port: the channel fails immediately on the DIAL side
-      // (mirroring ECONNREFUSED → the socket's error/close events), so the
-      // transport forgets the link instead of holding it until the deadline.
-      const [dial] = LoopbackChannel.pair(addr.host);
-      queueMicrotask(() => dial.kill());
-      return dial;
-    }
-    // The address's host is the "far end" both sides see — it is what the
-    // half-open limiter buckets accepts by (the per-source cap; §12.6.1).
-    const [dial, accepted] = LoopbackChannel.pair(addr.host);
-    queueMicrotask(() => onAccept(accepted));
-    return dial;
-  }
-
-  close(): void {
-    this.listeners.clear();
-  }
-
-  /** A per-node view of this fabric: it dials and listens through the same registry,
- *  but its `close` unbinds only the ports *it* bound.
- *
- *  Sharing one `LoopbackChannels` between nodes is a test convenience — in
- *  production each shell holds its own `NodeChannelFactory` — and the whole-fabric
- *  `close` above is right for teardown and wrong for anything else. An in-place
- *  transport upgrade closes the outgoing driver and re-binds its port, so on the
- *  shared object that would unbind every other node in the test. This is the shape
- *  the file header already claimed: closing one driver clears its listeners without
- *  poisoning the fabric for the others. */
-  view(): ChannelFactory {
-    const fabric = this;
-    const mine: number[] = [];
-    return {
-      connect: (addr) => fabric.connect(addr),
-      async listen(tcp, ws, onAccept) {
-        const r = await fabric.listen(tcp, ws, onAccept);
-        if (r.port) mine.push(r.port);
-        if (r.wsPort) mine.push(r.wsPort);
-        return r;
-      },
-      close() {
-        for (const p of mine.splice(0)) fabric.unbind(p);
-      },
-    };
-  }
-
-  /** Release one bound port. The per-node `view()` is the only caller — the fabric's
- *  own `close` drops everything. */
-  private unbind(port: number): void {
-    this.listeners.delete(port);
   }
 }

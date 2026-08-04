@@ -25,8 +25,9 @@ export interface FsStat {
  *  synchronous only inside a Worker — so a sync seam would have made the browser the one
  *  target that could not carry `fs`, which is core (README §1). A backend that genuinely
  *  is synchronous (`MemoryFs`, host/fs-memory.ts) returns an already-resolved promise and
- *  costs a microtask. The backends themselves are host code — this file is the seam they
- *  satisfy plus the scoping every host must apply over it, and nothing else.
+ *  costs a microtask. The backends themselves are host code, as are the wrappers that
+ *  apply the key rule over them (`validatedFs`/`scopedFs`, shell-core.ts) — this file is
+ *  the seam they satisfy plus the consensus key rule, and nothing else.
  *
  *  It is ABI-visible: `FS_*` are round-tripping ops (§12.2), so a guest reads them with
  *  `await`. Which side of that line an op sits on is exactly what `guest.abi` versions, so
@@ -58,8 +59,8 @@ export interface Fs {
 // ML-DSA verifier for all three targets (`pq.ts`). It was previously written twice, in
 // `host/fs-node.ts` and again in `native/fs.go`, with a comment on each saying the two
 // had to match. Now the rule is applied once, in shared JS, over whichever backend a
-// target supplies (`validatedFs`), and a backend's own path check is defence in depth
-// rather than the thing being relied on.
+// target supplies (`validatedFs`, shell-core.ts), and a backend's own path check is
+// defence in depth rather than the thing being relied on.
 
 /** The key charset. Also the scope charset: a scope is a prefix of a key, so anything
  *  it could not be part of is not a scope either. */
@@ -88,72 +89,10 @@ export function isSafeFsKey(key: string): boolean {
   return key !== "." && key !== ".." && SAFE_CHARS.test(key) && !isReservedDeviceName(key);
 }
 
-/** Apply the key rule over a backend, once, for every target.
- *
- *  A rejected key **throws** rather than reading as absent. An unrepresentable key is a
- *  caller bug, and answering `null`/`-1`/`false` would hide it on a read while `put`
- *  failed anyway — so the one behaviour is the loud one, on every op that names a key.
- *  `list` is not one of them: its argument is a prefix, and the empty prefix ("every key
- *  I can see") is exactly the call a key rule would wrongly refuse. `stat` names nothing.
- *
- *  Wrapping happens where a backend enters the shell (`createShell`), so it sits UNDER
- *  `scopedFs` and therefore validates the composite `scope + key` a guest actually
- *  reaches — which is the string the medium sees. */
-export function validatedFs(inner: Fs): Fs {
-  const check = (key: string): string => {
-    if (!isSafeFsKey(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
-    return key;
-  };
-  // `async` so a refusal is a REJECTION, like every other failure on this seam. A
-  // synchronous throw would reach a caller that only attached `.catch` as an exception.
-  return {
-    async get(key) { return inner.get(check(key)); },
-    async put(key, bytes) { return inner.put(check(key), bytes); },
-    async size(key) { return inner.size(check(key)); },
-    list: (prefix) => inner.list(prefix),
-    async delete(key) { return inner.delete(check(key)); },
-    stat: () => inner.stat(),
-  };
-}
-
-/** Scope a backend to one app's private keyspace (README §12.2).
- *
- *  Without this, every app granted the `fs` domain shares one flat keyspace: `FS_LIST`
- *  with an empty prefix enumerates every key on the node, `FS_GET` reads any of them and
- *  `FS_DELETE` removes any of them. That is the one place the runtime's "ownership is
- *  structural" property (§5.1) did not hold — kernel *names* carry their author, so one
- *  app's modules are unreachable to another by construction, but fs *keys* carried
- *  nothing and were reachable to everyone. This closes that asymmetry the same way the
- *  names do: by derivation, not by a rule something has to enforce.
- *
- *  `scope` is an opaque prefix derived from the app key by `appScopeFor` (bundle.ts) —
- *  derived there rather than here because it needs a hash, and this module stays
- *  dependency-free. Two properties matter and both come from that derivation: it lies
- *  inside the backend's key charset, and it is fixed-length, so distinct scopes cannot
- *  overlap however an author names the app. (An app name may itself contain `:`, so a
- *  plain `appKey + separator` prefix would let app `x` key `y:z` collide with app `x:y`
- *  key `z` — and would be rejected by both backends anyway.)
- *
- *  `stat()` is deliberately NOT scoped — `used`/`available` describe the physical
- *  backend, and reporting a per-app figure for `available` would be a fiction. An app
- *  that wants its own footprint sums `size()` over its own `list()`, which is now
- *  exactly its own keys. */
-export function scopedFs(inner: Fs, scope: string): Fs {
-  // A scope prefix must survive the key rule above — it is the head of every key this
-  // app will ever reach — so it is checked here, at construction, rather than on the
-  // first `put`. The charset only: a scope is not a whole key, so the bare-dot and
-  // device-name cases (which are about a complete name) do not apply to it.
-  if (!SAFE_CHARS.test(scope)) throw new Error(`fs: unsafe scope ${JSON.stringify(scope)}`);
-  const outward = (key: string): string => scope + key;
-  return {
-    get: (key) => inner.get(outward(key)),
-    put: (key, bytes) => inner.put(outward(key), bytes),
-    size: (key) => inner.size(outward(key)),
-    // An absent prefix means "everything I can see", which is now everything in this
-    // scope and nothing else. Keys come back stripped, so the guest only ever handles
-    // the names it chose and the scope stays a host-side fact.
-    list: async (prefix) => (await inner.list(outward(prefix ?? ""))).map((k) => k.slice(scope.length)),
-    delete: (key) => inner.delete(outward(key)),
-    stat: () => inner.stat(),
-  };
+/** Whether `scope` — the host-derived prefix an app's keys live under (shell-core
+ *  `scopedFs`) — is representable as the head of every key it will ever reach. The
+ *  charset only: a scope is not a whole key, so the bare-dot and device-name cases
+ *  (which are about a complete name) do not apply to it. */
+export function isSafeFsScope(scope: string): boolean {
+  return SAFE_CHARS.test(scope);
 }
