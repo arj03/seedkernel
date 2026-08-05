@@ -32,9 +32,10 @@
  *  able to stage a whole frame in its scratch region, which it allocates at module init —
  *  and, riding in the transport bundle, it is instantiated in every shell, so the cap was
  *  costing ~17 MB of linear memory per node whether or not that node ever spoke
- *  WebSocket. Raising this again means rebuilding ws.wasm (assembly/ws/abi.ts); lowering
- *  a single host's cap does not, and `TransportHostOptions.maxFrameBytes` already
- *  allows it. */
+ *  WebSocket. Raising this again means rebuilding ws.wasm (assembly/ws/abi.ts) — forget
+ *  and `tests/transport.test.mjs` says so by name, rather than a WS link tearing down on
+ *  the first big frame while TCP carries it. Lowering a single host's cap needs no
+ *  rebuild, and `TransportHostOptions.maxFrameBytes` already allows it. */
 export const MAX_FRAME_BYTES = 2 * 1024 * 1024; // 2 MiB
 /** The frame cap that applies BEFORE a link authenticates.
  *

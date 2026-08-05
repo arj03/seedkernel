@@ -7,7 +7,8 @@
 // frame in, one decoded frame out, and the refusals it owes its callers — far easier to
 // provoke here than over a socket.
 
-import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP } from "./ws-module.mjs";
+import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
+import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
 import { parseWsPeer } from "../build/host/net-ws.js";
 import { parsePeerSpec } from "../build/host/transport-host.js";
 import { testkit } from "./testkit.mjs";
@@ -62,6 +63,24 @@ test("a fragmented control frame is refused (RFC 6455 §5.5)", () => {
 test("a truncated frame decodes to nothing rather than reading past its end", () => {
   const f = encodeFrame(WS_OP.BINARY, body(200), null);
   assert(decodeOne(f.subarray(0, f.length - 10), false) === null, "short frame");
+});
+
+// The one cross-artifact coupling in the frame path, checked instead of documented.
+// `MAX_FRAME_BYTES` is the host's number (core/net-limits.ts) and every framer takes it
+// from there — but this module must be able to STAGE a whole frame in the scratch it
+// allocates at instantiation, so the compiled-in capacity is a floor under the cap.
+// Raise the cap past it and nothing fails at build time: TCP keeps carrying the frame
+// while WS tears the link down on the first big one, which reads as a WS bug. This turns
+// that into a red test naming the rebuild (`npm run build:ws`).
+test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () => {
+  // The encoder's own ceiling: header (10) + mask (4) ≤ the 16 bytes abi.ts holds back.
+  assert(MAX_FRAME_BYTES + 16 <= SCRATCH_SIZE,
+    `MAX_FRAME_BYTES ${MAX_FRAME_BYTES} needs ${MAX_FRAME_BYTES + 16} B of scratch, `
+    + `ws.wasm allocates ${SCRATCH_SIZE} — raise SCRATCH_SIZE in assembly/ws/abi.ts and `
+    + `rebuild (npm run build:ws)`);
+  // Not vacuous: the largest frame really does encode and decode through the module.
+  const got = decodeOne(encodeFrame(WS_OP.BINARY, body(MAX_FRAME_BYTES), MASK), true);
+  assert(got !== null && got.payload.length === MAX_FRAME_BYTES, "a full-size frame round-trips");
 });
 
 // ── peer specs ───────────────────────────────────────────────────────────────
