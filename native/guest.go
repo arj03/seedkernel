@@ -200,14 +200,15 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		if err != nil {
 			return nil, err
 		}
-		name := t.Args()[0].String()
-		// pv is the only refcounted arg (callID is an immediate); Invoke borrows it,
-		// so free it once the call returns. Without this every guest host.call leaked a
-		// host-realm ArrayBuffer.
+		// nv and pv are the refcounted args (callID is an immediate); Invoke borrows
+		// them, so free both once the call returns. Without this every guest host.call
+		// leaked a host-realm string and ArrayBuffer.
+		nv := hostQc.NewString(t.Args()[0].String())
 		pv := hostQc.NewArrayBuffer(payload)
 		res, err := hostQc.Invoke(g.capCall, hostQc.NewUndefined(),
-			hostQc.NewString(name), pv, hostQc.NewInt64(t.Args()[1].Int64()))
+			nv, pv, hostQc.NewInt64(t.Args()[1].Int64()))
 		pv.Free()
+		nv.Free()
 		if err != nil {
 			return nil, err
 		}

@@ -502,10 +502,10 @@ export function bundlePreamble(f: BundleFacts): string {
  */
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// Two of the deps below govern how far a guest reaches: `allowedCaps` (which prefixes
+// Two of `CapBridgeDeps` govern how far a guest reaches: `allowedCaps` (which prefixes
 // resolve at all) and `modules` (which kernel names `module/call` can address). Both
 // once had a permissive meaning for the *absent* value — omit them and the guest got
-// every op and every name. That is the wrong default in the one file where a mistake
+// every name in the catalog and every name on the table. That is the wrong default in the one file where a mistake
 // is a capability escalation: it makes full authority the thing a new call site gets
 // by forgetting a field, in a runtime whose admission policy is otherwise deny-all
 // (policy.ts).
@@ -591,12 +591,18 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             throw new Error("cap-bridge: the transport names are the slot occupant's, and this bridge serves no slot");
         return deps.transportSink;
     };
-    const handlers: Record<string, CapHandler> = {
+    // Null-prototype, so the table holds exactly what is written here: a plain object
+    // literal would answer `handlers["toString"]` (and "constructor", "valueOf", …) with
+    // an inherited function, which the dispatch below would then CALL. The prefix gate
+    // happens to refuse those — a bare name has no domain — but a lookup that can resolve
+    // to something nobody put in the table is the wrong shape for this file, and the
+    // construction check below walks own keys, so it could never see them.
+    const handlers: Record<string, CapHandler> = Object.assign(Object.create(null), {
         // ── the primitive seam (§12.2): the catalog's `crypto/*` half ────────────
         ...cryptoCatalog(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
         // node/sign is scoped, never raw: it signs `domain ‖ scope ‖ msg` with the
-        // key the asking bundle's slot selected (see SignScope below).
+        // key the asking bundle's slot selected (see `SignScope` above).
         "node/sign": (payload) => {
             const s = deps.signScope;
             if (!s)
@@ -607,7 +613,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         "node/random": (payload) => {
             const n = readU32BE(payload, 0);
             if (n > MAX_RANDOM_BYTES)
-                throw new Error("cap-bridge: RANDOM size over cap");
+                throw new Error("cap-bridge: node/random size over cap");
             return sodium.randombytes_buf(n);
         },
         // ── net: net/send is the only async name — a real round trip → a Promise ──
@@ -747,7 +753,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             sink().linkDown(readU32BE(payload, 0), payload[4]);
             return NONE;
         },
-    };
+    } as Record<string, CapHandler>);
     // The one-file rule, checked at construction: every name's prefix must be
     // `crypto` (ungated) or a declared `CAP_DOMAINS` member, so the catalog a guest
     // is dispatched through and the vocabulary a manifest is checked against cannot
