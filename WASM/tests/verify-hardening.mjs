@@ -24,7 +24,7 @@ const { appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANI
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createCapBridge, CAP, UNRESTRICTED_OPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
+const { createCapBridge, UNRESTRICTED_CAPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
 const { ok, throws, summary } = testkit();
 
@@ -106,9 +106,9 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     transport: { request: async () => new Uint8Array() },
     peers: () => [], fs: new MemoryFs(),
   };
-  throws(() => createCapBridge({ ...base, modules: UNSCOPED_MODULES }), "omitting allowedOps throws at construction");
-  throws(() => createCapBridge({ ...base, allowedOps: UNRESTRICTED_OPS }), "omitting modules throws at construction");
-  ok(typeof createCapBridge({ ...base, allowedOps: UNRESTRICTED_OPS, modules: UNSCOPED_MODULES }) === "function",
+  throws(() => createCapBridge({ ...base, modules: UNSCOPED_MODULES }), "omitting allowedCaps throws at construction");
+  throws(() => createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS }), "omitting modules throws at construction");
+  ok(typeof createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS, modules: UNSCOPED_MODULES }) === "function",
     "naming both sentinels is accepted");
 
   // A guest may only reach modules its own manifest declared.
@@ -116,12 +116,12 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   const scoped = createCapBridge({
     ...base,
     callHandler: (n) => { reached = n; return new Uint8Array([7]); },
-    allowedOps: [CAP.MODULE_CALL],
+    allowedCaps: ["module"],
     modules: { codec: "aa:chat:codec" },
   });
   const call = (name) => {
     const n = new TextEncoder().encode(name);
-    return scoped(CAP.MODULE_CALL, new Uint8Array([n.length, ...n]));
+    return scoped("module/call", new Uint8Array([n.length, ...n]));
   };
   ok(call("codec").length === 1 && reached === "aa:chat:codec", "a declared module resolves to its kernel name");
   reached = null;
@@ -150,11 +150,11 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // The budget is guest RUN time: parking on a slow bridge does not spend it, so an
   // initiator legitimately awaiting the network outlives a budget far shorter than
   // the wait. This is the case a wall-clock deadline would have killed.
-  const slowBridge = (op) => op === 7
+  const slowBridge = (name) => name === "slow"
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
   const waiter = await createSafeRealm({
-    source: 'register("go", async () => { await host.call(7, new Uint8Array()); return new Uint8Array([9]); });',
+    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); });',
     bridge: slowBridge, deadlineMs: 200,
   });
   const out = await waiter.call("go", new Uint8Array());
@@ -167,7 +167,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // callSync got from the host's call stack, now that every role can yield (§12.3).
   const order = [];
   const both = await createSafeRealm({
-    source: 'register("go", async () => { await host.call(7, new Uint8Array()); return new Uint8Array([1]); });'
+    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });'
           + 'register("handle", () => new Uint8Array([2]));',
     bridge: slowBridge, deadlineMs: 200,
   });
@@ -182,7 +182,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // The queue does not strand callers on dispose: one still in it fails rather than
   // entering a torn-down realm, which is what aborts the whole wasm module.
   const closing = await createSafeRealm({
-    source: 'register("go", async () => { await host.call(7, new Uint8Array()); return new Uint8Array([1]); });',
+    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });',
     bridge: slowBridge, deadlineMs: 5000,
   });
   const first = closing.call("go", new Uint8Array()).catch(() => "failed");

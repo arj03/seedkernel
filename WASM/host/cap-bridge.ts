@@ -1,9 +1,9 @@
 // cap-bridge — the capability counterpart to `safe-js` (exported as
 // `seedkernel-wasm/cap-bridge`). Given a safe-js realm, it services the guest's
-// single `host.call(op, bytes)` seam from the kernel's *primitive* capabilities
+// single `host.call(name, bytes)` seam from the kernel's *primitive* capabilities
 // and nothing else: crypto primitives (sumo), raw net (bytes over an opaque link id)
 // and the structured net the transport slot builds on it, fs (raw bytes under an
-// opaque key), an installed-handler call, timers, clock, and identity. Every op is
+// opaque key), an installed-handler call, timers, clock, and identity. Every name is
 // application-neutral — the bridge has no idea it is
 // hosting storage (or chat, or anything). All structure — content addressing,
 // descriptor envelopes, the HAVE/OFFER/STORE wire format, Reed–Solomon, the
@@ -15,14 +15,12 @@
 // identical bridge, so output orchestrated through the confined guest is
 // byte-compatible with a host-side reference path.
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_CHANNEL, PRIMITIVE_NAMES, type PrimitiveName } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_CHANNEL, CAP_DOMAINS, type PrimitiveName } from "../core/domains.js";
 import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
 import { type SafeRealmBridge } from "./safe-js.js";
 
-export type CapDomain = keyof typeof CAP_DOMAINS;
-
-/** What `SIGN` signs under — derived by the host from the asking bundle's slot, never
+/** What `node/sign` signs under — derived by the host from the asking bundle's slot, never
  *  from anything the guest says (§12.2).
  *
  *  **The host prefixes; it does not parse.** It signs `domain ‖ scope ‖ msg` where `msg`
@@ -50,7 +48,7 @@ export interface SignScope {
 
 /** The facts a guest learns about the bundle it is running as, all of them derived by
  *  the runtime at admission from the signed manifest. Kernel names never appear here —
- *  the guest reaches its modules by logical name through MODULE_CALL, and the bridge
+ *  the guest reaches its modules by logical name through module/call, and the bridge
  *  resolves to the kernel name. */
 export interface BundleFacts {
     /** The manifest `app`. */
@@ -59,7 +57,7 @@ export interface BundleFacts {
     author: Uint8Array;
 }
 
-/** The libsodium surface the crypto ops use — structural so any sumo build
+/** The libsodium surface the crypto names use — structural so any sumo build
  *  (the kernel's bundled `libsodium-wrappers-sumo`) satisfies it. */
 export interface CapSodium {
     crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
@@ -81,9 +79,9 @@ export interface CapSodium {
     ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): Uint8Array | null;
 }
 
-/** The request/response transport the net op drives. The transport slot's driver
+/** The request/response transport the net/send name drives. The transport slot's driver
  *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
- *  over `NET_SEND`, so the bridge needs only single-peer request/response — no
+ *  over `net/send`, so the bridge needs only single-peer request/response — no
  *  host-side scatter-gather. */
 export interface CapTransport {
     request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
@@ -186,19 +184,19 @@ export interface CapBridgeDeps {
     signScope?: SignScope;
     /** Reach an installed WASM handler by name (KernelHost.callHandler). */
     callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
-    /** Logical name → kernel name for MODULE_CALL resolution. The guest calls modules
+    /** Logical name → kernel name for module/call resolution. The guest calls modules
      *  by the logical name from its manifest; the bridge maps to the kernel name here
      *  so kernel names never leave the host. Required: pass `UNSCOPED_MODULES` to opt
      *  out deliberately, since a missing map means a guest could name any handler on
      *  the table, including another author's. */
     modules: Record<string, string> | typeof UNSCOPED_MODULES;
-    /** The request/response transport the net op drives. `TransportHost` satisfies
-     *  it. A confined guest fans out itself with `Promise.all` over `NET_SEND`, so the
+    /** The request/response transport the net/send name drives. `TransportHost` satisfies
+     *  it. A confined guest fans out itself with `Promise.all` over `net/send`, so the
      *  bridge needs only single-peer request/response — no host-side scatter-gather.
      *
      *  Optional ONLY for a bundle that never declares the `net` domain — the transport
-     *  bundle itself (whose NET_SEND would loop back into itself) is that caller.
-     *  NET_SEND without a transport throws rather than resolving to nothing. */
+     *  bundle itself (whose net/send would loop back into itself) is that caller.
+     *  net/send without a transport throws rather than resolving to nothing. */
     transport?: CapTransport;
     /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for the bundle
      *  claiming the transport slot: a confined module holds no ambient authority by
@@ -216,135 +214,37 @@ export interface CapBridgeDeps {
     fs?: Fs;
     /** Wall clock (ms). Defaults to Date.now. */
     now?: () => number;
-    /** The allowed op set, expanded from the manifest's declared cap domains
-     *  (README §12.2, `opsForCaps`). Any op outside the set is refused, so a guest
-     *  reaches exactly what its bundle declared. Required: pass `UNRESTRICTED_OPS` to
-     *  opt out deliberately (a host-side caller that holds the primitives anyway). */
-    allowedOps: Iterable<number> | typeof UNRESTRICTED_OPS;
+    /** The allowed cap set, expanded from the manifest's declared cap domains
+     *  (README §12.2). The bridge refuses any `host.call` whose first path component is
+     *  outside it — so a guest reaches exactly what its bundle declared. Required: pass
+     *  `UNRESTRICTED_CAPS` to opt out deliberately (a host-side caller that holds the
+     *  primitives anyway). */
+    allowedCaps: Iterable<string> | typeof UNRESTRICTED_CAPS;
 }
 
-/** The version of the seam defined below — re-exported so a reader of the ops finds it
+/** The version of the seam defined below — re-exported so a reader of the seam finds it
  *  beside them, and so `seedkernel-wasm/cap-bridge` is the import a bundle builder
  *  reaches for (it is stamping "which host contract is this guest written against",
  *  which is this file's subject). It is DECLARED in domains.ts, with the suite ids, so
  *  the loader can check a manifest's `guest.abi` without importing the guest bridge —
- *  see the note there. Anything that changes what an existing op returns bumps it. */
+ *  see the note there. Anything that changes what an existing name returns bumps it. */
 export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../core/domains.js";
-/** The op catalog — the seam ABI (README §12.2). `capPreamble()` injects these as
- *  `const CAP_X = n;` into the guest, and the bridge switch reads them here, so guest
- *  and host can never drift. The numbers are a shared guest↔host identifier regenerated
- *  with the preamble — never a wire value between nodes.
- *
- *  **There are two kinds of entry here and only one of them is a capability.**
- *  `CRYPTO` is the *primitive* seam: a flat map over opaque names,
- *  resolved in the host's catalog, reaching nothing a guest does not already hold —
- *  a function of its arguments is computation the guest could have done itself, so
- *  there is nothing to grant. Every other op is an *authority*: it touches the node
- *  key, the OS entropy source, the clock, a socket or the disk, and is gated through
- *  `CAP_DOMAINS` below.
- *
- *  That split is why a new algorithm never appears here. Adding one is a catalog entry
- *  (`CRYPTO_CATALOG`), not an op number, not an ABI rev, and not a capability domain —
- *  which is the whole difference between a core that serves opaque names and one that
- *  understands what a cipher suite is.
- *
- *  **There are two nets here and they are different capabilities** (§12.1).
- *  `NET_SEND`/`NET_PEERS` are the *structured* face — an attributed peer, a protocol id,
- *  a correlation — which is the transport bundle's OUTPUT, and an ordinary app reaches it
- *  through this seam like anything else. `NET_LINK_*` is the *raw* capability — bytes over
- *  an opaque link id — which is the platform's contribution and the only part of the
- *  network with no endpoint substitute. The transport slot consumes the second and
- *  provides the first; nothing else holds both.
- *
- *  Net fan-out is not an op: with real promises the guest fans out itself with
- *  `Promise.all` over `NET_SEND`. */
-export const CAP = {
-    /** The primitive seam: `[nameLen u8][name utf8][args …] -> result`, dispatched by
-     *  name through `CRYPTO_CATALOG`. Ungated by construction — see above. */
-    CRYPTO: 1,
-    // ── authorities: each reaches something no confined guest can hold ──────────
-    SIGN: 2, // msg -> 64B detached ed25519 signature over
-    //   `domain ‖ scope ‖ msg`, both host-supplied from the asking
-    //   bundle's slot (scoped, never raw — see SignScope below)
-    IDENTITY: 3, // -> this node's 32B public key
-    RANDOM: 4, // [n u32] -> n random bytes
-    NET_SEND: 5, // [peer 32][pidLen u8][protocolId utf8][payload ..] -> [ok u8][resp]
-    NET_PEERS: 6, // -> [count u32][pk 32 …]
-    FS_GET: 7, // key(utf8) -> [0] | [1][bytes]
-    FS_PUT: 8, // [klen u32][key(utf8)][bytes] -> []
-    FS_LIST: 9, // prefix(utf8, may be empty) -> [count u32]{[klen u32][key]}
-    FS_DELETE: 10, // key(utf8) -> []
-    FS_STAT: 11, // -> [used u64 BE][available u64 BE]
-    FS_SIZE: 12, // key(utf8) -> [size i32 BE] (-1 as 0xFFFFFFFF if absent) —
-    //   lets a policy layer rebuild a byte budget (quota) without
-    //   reading every value back. Existence is size ≥ 0, so there is
-    //   no separate FS_HAS.
-    MODULE_CALL: 13, // [nameLen u8][name utf8][req] -> installed handler response bytes
-    CLOCK: 14, // -> now ms (u64 BE)
-    // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` ──────
-    //
-    // This is the WHOLE of what the platform contributes to the network (§12.1): a link
-    // id the host mints and the guest never interprets, bytes in and bytes out, opened
-    // and closed. There is no peer here, no protocol id and no
-    // correlation — a peer id is an *attributed* identity, which is the transport's
-    // output rather than the platform's contribution. Inbound bytes arrive the other
-    // way, as ordinary entrypoint invocations on the slot occupant's guest.
-    NET_LINK_OPEN: 15, // [dest ..] -> [linkId u32][framing u8][authLen u32][authority utf8]  (0 ⇒ no route; `dest` is an
-    //   opaque destination name the host resolves in the address
-    //   book it was configured with, exactly as `fs` resolves a key)
-    NET_LINK_SEND: 16, // [linkId u32][bytes ..] -> []
-    NET_LINK_CLOSE: 17, // [linkId u32][graceful u8] -> []
-    NET_LINK_STAT: 27, // [linkId u32] -> [buffered u32 BE]  bytes written to this link
-    //   that are not yet on the wire. A READ, not an authority: it
-    //   tells the slot occupant whether an exchange is progressing
-    //   or stalled, which is the difference between a slow peer and
-    //   a dead one. 0 for a link that is gone or cannot say.
-    // ── timers: the platform's event loop ───────────────────────────────────────
-    TIMER_ARM: 19, // [id u32][ms u32] -> []  (fires the `timer` entrypoint)
-    TIMER_CLEAR: 20, // [id u32] -> []
-    // ── what the transport slot PROVIDES back ────────────────────────────────────
-    //
-    // The structured face — attributed peer, protocol id, correlation — is the slot
-    // occupant's output, so it comes back through the same seam as everything else
-    // rather than through a second host↔module ABI.
-    NET_DELIVER: 21, // [corr u32][noReply u8][from 32][pidLen u8][proto][payload] -> []
-    //   an inbound request, attributed. Answered later through the
-    //   `respond` entrypoint — never inline, because the app handler
-    //   may itself be async and because no op may re-enter the realm.
-    NET_SETTLE: 22, // [corr u32][ok u8][payload | utf8 message] -> []  settle an app's
-    //   outbound request under the corr the host assigned
-    NET_LINK_AUTH: 23, // [linkId u32][conceal u8][pk 32] -> [admitted u8]  this link
-    //   authenticated as `pk`. The WHITELIST GATE answers. Asked at the
-    //   first point the peer is known and before we have revealed
-    //   ourselves — msg3 accepting, msg4 dialing — so the verdict can
-    //   still suppress our identity. `conceal` marks the accepting
-    //   case, where a refusal must be silence rather than a close.
-    NET_PEER_EDGE: 24, // [up u8][pk 32] -> []  a peer's first link came up / last went down
-    NET_READY: 25, // [ok u8] -> []  answer to the `ready` entrypoint
-    NET_LINK_DOWN: 26, // [linkId u32][reason u8] -> []  a link the host handed over
-    //   (openLink) tore down, with why — the reason is the occupant's
-    //   vocabulary and the host only relays it to whoever passed the
-    //   channel in
-};
-/** The primitive catalog — the flat name→transform map `CAP.CRYPTO` dispatches through,
- *  and the reason the core can serve a transport whose cipher suite it knows nothing
- *  about. Every entry is a pure function of its argument bytes: no key of the host's, no
- *  entropy, no state. Entropy is deliberately absent — an ephemeral keypair is
- *  `RANDOM(32)` (an authority) followed by `x25519/dh` against the base point, so the
- *  catalog stays functional and the grant stays where it belongs.
- *
- *  Names are the seam, not the numbers: a host that lacks one refuses the load by name
- *  (verifyManifest, bundle.ts), and a bundle that wants a new algorithm needs a host
- *  carrying it — which is why a core vocabulary is provisioned ahead of need
- *  (README §14.1). */
-/** Build the catalog. The return type is keyed by `PRIMITIVE_NAMES` (declared in
- *  domains.ts, with the ABI version and the suite ids), so the list a manifest is checked
- *  against and the map the bridge dispatches through cannot drift — adding one without
- *  the other is a type error. */
-export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint8Array) => Uint8Array> {
+/** The `crypto/` members of the catalog — the template literal over `PRIMITIVE_NAMES`,
+ *  so the vocabulary a manifest is checked against and the table the bridge dispatches
+ *  through cannot drift: adding a primitive to one without the matching key in the
+ *  other is a type error. */
+type CryptoCapName = `crypto/${PrimitiveName}`;
+/** One catalog entry's implementation: argument bytes in, response bytes out (or a
+ *  Promise of them, for the round-tripping `net/send` and `fs/*` names). */
+type CapHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+/** The primitive half of the catalog (§12.1): a flat name→transform map. Every entry
+ *  is a pure function of its argument bytes — no host key, no entropy, no state — so
+ *  nothing gates it, and a new algorithm is a catalog entry rather than an op number
+ *  or an ABI rev (a host that lacks one refuses the load by name, bundle.ts). */
+function cryptoCatalog(sodium: CapSodium): Record<CryptoCapName, CapHandler> {
     return {
-        "blake2b-256": (a) => sodium.crypto_generichash(32, a),
-        "ed25519/verify": (a) => {
+        "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
+        "crypto/ed25519/verify": (a) => {
             const pk = a.slice(0, 32), sig = a.slice(32, 96), msg = a.slice(96);
             try {
                 return sodium.crypto_sign_verify_detached(sig, msg, pk) ? ONE : ZERO;
@@ -353,9 +253,9 @@ export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint
                 return ZERO;
             }
         },
-        "xchacha20/xor": (a) => sodium.crypto_stream_xchacha20_xor(a.slice(56), a.slice(0, 24), a.slice(24, 56)),
-        "chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.slice(44), null, null, a.slice(0, 12), a.slice(12, 44)),
-        "chacha20poly1305-ietf/open": (a) => {
+        "crypto/xchacha20/xor": (a) => sodium.crypto_stream_xchacha20_xor(a.slice(56), a.slice(0, 24), a.slice(24, 56)),
+        "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.slice(44), null, null, a.slice(0, 12), a.slice(12, 44)),
+        "crypto/chacha20poly1305-ietf/open": (a) => {
             try {
                 const pt = sodium.crypto_aead_chacha20poly1305_ietf_decrypt(null, a.slice(44), null, a.slice(0, 12), a.slice(12, 44));
                 return concatBytes([ONE, pt]);
@@ -366,8 +266,8 @@ export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint
         },
         // [sk 32][pk 32] -> [ok u8][shared 32]. ok=0 is a low-order point, which libsodium
         // refuses rather than returning an all-zero shared secret. Against the X25519 base
-        // point (9 ‖ 0×31) this is also the public-key derivation, so no separate op.
-        "x25519/dh": (a) => {
+        // point (9 ‖ 0×31) this is also the public-key derivation, so no separate name.
+        "crypto/x25519/dh": (a) => {
             try {
                 return concatBytes([ONE, sodium.crypto_scalarmult(a.slice(0, 32), a.slice(32, 64))]);
             }
@@ -377,11 +277,11 @@ export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint
         },
         // ── ML-KEM-768 (FIPS 203), from mlkem768.wasm on every target (kem.ts,
         // native/mlkem.go). Derandomized, so the entries stay pure functions of their
-        // arguments and the entropy grant stays in `RANDOM` where it belongs.
+        // arguments and the entropy grant stays in `node/random` where it belongs.
         //
         // [seed 64] -> [pk 1184][sk 2400]. The seed is FIPS 203's `d ‖ z`; a caller
-        // supplies 64 bytes of RANDOM.
-        "ml-kem-768/keypair": (a) => {
+        // supplies 64 bytes of node/random.
+        "crypto/ml-kem-768/keypair": (a) => {
             const kp = sodium.ml_kem768_keypair_from_seed(a.slice(0, 64));
             return concatBytes([kp.publicKey, kp.privateKey]);
         },
@@ -389,7 +289,7 @@ export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint
         // fails the modulus check of §7.2 — the same shape x25519/dh uses for a
         // low-order point, and for the same reason: a peer's key is not the caller's to
         // trust, so "unusable" has to be answerable without an exception.
-        "ml-kem-768/encaps": (a) => {
+        "crypto/ml-kem-768/encaps": (a) => {
             const r = sodium.ml_kem768_encaps(a.slice(0, 1184), a.slice(1184, 1216));
             return r ? concatBytes([ONE, r.ciphertext, r.sharedSecret]) : ZERO;
         },
@@ -397,17 +297,13 @@ export function cryptoCatalog(sodium: CapSodium): Record<PrimitiveName, (a: Uint
         // check of §7.3, never a bad ciphertext: ML-KEM answers those with a shared
         // secret derived from the key's own z, in constant time, and distinguishing that
         // from success is the oracle implicit rejection exists to deny.
-        "ml-kem-768/decaps": (a) => {
+        "crypto/ml-kem-768/decaps": (a) => {
             const ss = sodium.ml_kem768_decaps(a.slice(0, 2400), a.slice(2400, 3488));
             return ss ? concatBytes([ONE, ss]) : ZERO;
         },
     };
 }
-/** The generated `const CAP_NAME = n;` block the guest is written against. */
-export function capPreamble(): string {
-    return Object.entries(CAP).map(([k, v]) => `const CAP_${k} = ${v};`).join("\n") + "\n";
-}
-/** The guest-side ABI preamble: `host.call(op, bytes)` over the single seam, plus
+/** The guest-side ABI preamble: `host.call(name, bytes)` over the single seam, plus
  *  `register`/`__invoke` for entrypoint dispatch. Pure JS — it names no authority, so
  *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
  *  shape to call through.
@@ -420,13 +316,13 @@ export function capPreamble(): string {
  *
  *  HOST CONTRACT — a host embedding this must inject one function:
  *
- *    __host_call(op, callId, payload: ArrayBuffer) -> ArrayBuffer | null
+ *    __host_call(name: string, callId, payload: ArrayBuffer) -> ArrayBuffer | null
  *
- *  Returning bytes completes a **sync** op (the primitive catalog, clock, module, the
- *  raw-link and transport ops) inline. Returning `null` means the host started an
- *  **async** op under `callId` — `NET_SEND` and every `FS_*` — and the guest parks a
+ *  Returning bytes completes a **sync** name (the primitive catalog, clock, module, the
+ *  raw-link and transport names) inline. Returning `null` means the host started an
+ *  **async** name under `callId` — `net/send` and every `fs/*` — and the guest parks a
  *  Promise here, which the host later settles with `__netResolve(callId, bytes)` or
- *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync op that ever returned
+ *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync name that ever returned
  *  null/undefined would be read as async and leave a Promise pending forever.
  *
  *  The async half is deliberately plain ECMAScript rather than a host-created deferred:
@@ -454,38 +350,26 @@ globalThis.__netReject = (callId, msg) => {
   p.reject(new Error(msg));
 };
 globalThis.host = {
-  // A sync op resolves to its bytes directly; a net or fs op returns a real Promise, so
-  // a guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op) and
-  // a fan-out is just 'await Promise.all(peers.map(p => host.call(CAP_NET_SEND, ...)))'.
+  // A sync name resolves to its bytes directly; a net or fs name returns a real Promise,
+  // so a guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op)
+  // and a fan-out is just 'await Promise.all(peers.map(p => host.call("net/send", ...)))'.
+  // The name is the seam: a guest asks for a capability by NAME — "fs/get",
+  // "net/send", "crypto/blake2b-256" — never by a number.
   //
   // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
   // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
   // but quickjs-emscripten's getArrayBuffer accepts only a true ArrayBuffer. A subarray is
   // copied to its own buffer so the host never sees more bytes than the caller passed.
-  call(op, bytes) {
+  call(name, bytes) {
     const callId = ++__callSeq;
     const ab = bytes instanceof ArrayBuffer
       ? bytes
       : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
         ? bytes.buffer
         : bytes.slice().buffer;
-    const r = __host_call(op, callId, ab);
-    if (r !== null) return new Uint8Array(r);          // sync op — bytes directly
+    const r = __host_call(name, callId, ab);
+    if (r !== null) return new Uint8Array(r);          // sync name — bytes directly
     return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net / fs
-  },
-  // The primitive seam, by name: host.crypto("x25519/dh", sk_pk). Framing the
-  // [nameLen][name][args] envelope here rather than in every guest is the point of a
-  // named catalog — a guest asks for an algorithm, never for an op number. Always
-  // synchronous: a primitive is a function of its arguments.
-  crypto(name, args) {
-    const n = new Uint8Array(name.length);
-    for (let i = 0; i < name.length; i++) n[i] = name.charCodeAt(i);   // catalog names are ASCII
-    const a = args || new Uint8Array(0);
-    const buf = new Uint8Array(1 + n.length + a.length);
-    buf[0] = n.length;
-    buf.set(n, 1);
-    buf.set(a, 1 + n.length);
-    return this.call(CAP_CRYPTO, buf);
   },
 };
 globalThis.__entries = Object.create(null);
@@ -507,40 +391,38 @@ globalThis.__invoke = (name, argBuf) => {
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
-/** Capability *domains* — named groups of ops. A bundle's signed manifest declares
- *  the domains its guest needs (its `caps`), and the shell expands them to the
- *  concrete op set it enforces (`allowedOps`) and to which backends it wires. This
+/** Capability *domains* — the granted prefixes of the name-addressed seam. A bundle's
+ *  signed manifest declares the domains its guest needs (its `caps`), and the shell
+ *  passes them to the bridge as the prefix set it enforces (`allowedCaps`) and as the
+ *  list of which backends it wires. This
  *  is the coarse, human-auditable capability vocabulary: "this app reaches net + fs",
- *  not a list of 17 op numbers. `caps` is the grant; the preamble is the ABI.
+ *  not a list of op numbers. `caps` is the grant; the names are the ABI.
  *
  *  **Only authorities appear here, because only authorities are grants.**
- *  `SIGN` is a signing oracle under the node identity, `IDENTITY` hands out the node's
- *  public key, `RANDOM` reaches the OS entropy source — each a grant over something the
- *  host owns. `CAP.CRYPTO` is deliberately absent: its primitives are functions of their
- *  arguments, so a guest holding them computes only what it could have computed with code
- *  of its own, and a vocabulary that made an app ask for a domain in order to hash a byte
- *  string would be describing an authority that does not exist.
+ *  `node/sign` is a signing oracle under the node identity, `node/identity` hands out
+ *  the node's public key, `node/random` reaches the OS entropy source — each a grant
+ *  over something the host owns. The `crypto/` prefix is deliberately absent: its
+ *  primitives are functions of their arguments, so a guest holding them computes only
+ *  what it could have computed with code of its own, and a vocabulary that made an app
+ *  ask for a domain in order to hash a byte string would be describing an authority
+ *  that does not exist.
  *
  *  That absence is what retires the earlier `crypto`/`transform` split. The split was
  *  right that authority and pure transform are not one word; it was wrong that both
- *  words name grants. One does. */
-export const CAP_DOMAINS = {
-    crypto: [CAP.SIGN, CAP.IDENTITY, CAP.RANDOM],
-    net: [CAP.NET_SEND, CAP.NET_PEERS],
-    fs: [CAP.FS_GET, CAP.FS_PUT, CAP.FS_LIST, CAP.FS_DELETE, CAP.FS_STAT, CAP.FS_SIZE],
-    module: [CAP.MODULE_CALL],
-    clock: [CAP.CLOCK],
-    timer: [CAP.TIMER_ARM, CAP.TIMER_CLEAR],
-    rawnet: [CAP.NET_LINK_OPEN, CAP.NET_LINK_SEND, CAP.NET_LINK_CLOSE, CAP.NET_LINK_STAT],
-    transport: [CAP.NET_DELIVER, CAP.NET_SETTLE, CAP.NET_LINK_AUTH, CAP.NET_PEER_EDGE,
-        CAP.NET_READY, CAP.NET_LINK_DOWN],
-};
+ *  words name grants. One does.
+ *
+ *  The list itself is declared in core/domains.ts, with the ABI version and the suite
+ *  ids — the loader checks a manifest's `caps` against it before anything is trusted,
+ *  without importing this catalog. Re-exported so a reader of the seam finds the
+ *  vocabulary beside the names, and so the bridge's own prefix check cannot drift from
+ *  the list a manifest is checked against. */
+export { CAP_DOMAINS } from "../core/domains.js";
 /** Which domains only a slot occupant may declare — see the note in domains.ts, where it
  *  is declared for the same reason `GUEST_ABI_VERSION` is: the loader checks a manifest
- *  field without importing this op catalog. Re-exported so a reader of `CAP_DOMAINS`
+ *  field without importing this name catalog. Re-exported so a reader of the seam
  *  finds the restriction beside the domains it restricts. */
 export { SLOT_ONLY_DOMAINS } from "../core/domains.js";
-/** The host-derived scope the SIGN op binds every guest signature to (README §12.2):
+/** The host-derived scope the node/sign name binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
  *  and two bundles derive disjoint scopes. Every node running the same bundle derives
@@ -555,7 +437,7 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
     out.set(appBytes, author.length + 1);
     return out;
 }
-/** The full scoped-signature *prefix* the SIGN op prepends to a guest message before
+/** The full scoped-signature *prefix* the node/sign name prepends to a guest message before
  *  signing: `DOMAIN_guest ‖ scope`. Exported so a host-side signer/verifier in another
  *  package (e.g. seedstore's out-of-band descriptor signing, README §12.2) reconstructs the
  *  byte-identical preimage `guestSignPrefix(scope) ‖ msg` WITHOUT mirroring the domain
@@ -584,16 +466,16 @@ export function transportSignScope(key: {
 }, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_CHANNEL, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
 }
-/** The generated `const BUNDLE = {…};` block injected alongside `capPreamble()`, holding
- *  what the runtime knows about the admitted bundle (README §12.4).
+/** The generated `const BUNDLE = {…};` block injected ahead of a bundle's guest source,
+ *  holding what the runtime knows about the admitted bundle (README §12.4).
  *
  *  Every field here is a fact the runtime DERIVES, so no author ever restates one by
  *  hand: the signing prefix in particular is `DOMAIN_guest ‖ guestSignScope(author, app)`
- *  — precisely what the SIGN op prepends — and a hand-baked copy that disagrees with the
+ *  — precisely what `node/sign` prepends — and a hand-baked copy that disagrees with the
  *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
  *  cause. This is the same one-file rule the DOMAIN_* family follows.
  *
- *  MODULE_CALL takes the logical name — the guest never sees a kernel name — so the
+ *  `module/call` takes the logical name — the guest never sees a kernel name — so the
  *  module map lives in the bridge, not here. BUNDLE carries no modules field.
  *
  *  Kept deliberately separate from the app's `const APP`: APP is author config that a
@@ -603,54 +485,42 @@ export function bundlePreamble(f: BundleFacts): string {
     const bundle = {
         app: f.app,
         author: toHex(f.author),
-        // The prefix a guest prepends before the "ed25519/verify" primitive to rebuild
-        // what CAP_SIGN signed.
+        // The prefix a guest prepends before the "crypto/ed25519/verify" primitive to
+        // rebuild what node/sign signed.
         signPrefix: toHex(guestSignPrefix(guestSignScope(f.author, f.app))),
     };
     return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
 }
-/** Expand declared capability domains to the concrete op numbers a bridge allows.
- *  Throws on an unknown domain so a typo in a manifest fails loudly rather than
- *  silently granting nothing (or, worse, everything). */
-export function opsForCaps(domains: Iterable<string>): number[] {
-    const out = [];
-    for (const d of domains) {
-        const ops = (CAP_DOMAINS as Record<string, number[] | undefined>)[d];
-        if (!ops)
-            throw new Error(`cap-bridge: unknown capability domain "${d}"`);
-        out.push(...ops);
-    }
-    return out;
-}
 /**
  * The manifest's declared `guest.primitives` are checked against this catalog in
  * bundle.ts `verifyManifest`, which refuses the load by the missing name — a
- * compatibility check, not an authorization one: it grants nothing (after
- * `CAP_DOMAINS` dropped the pure transforms there is nothing to grant), it exists so a
+ * compatibility check, not an authorization one: it grants nothing (`crypto/` is not
+ * a grant, so there is nothing to grant), it exists so a
  * host that cannot serve a name refuses the load *by name* rather than failing at the
  * guest's first call. That is why the field sits beside `abi` in the manifest and not
  * inside `caps`.
  */
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// Two of the deps below govern how far a guest reaches: `allowedOps` (which ops resolve
-// at all) and `modules` (which kernel names MODULE_CALL can address). Both once had a
-// permissive meaning for the *absent* value — omit them and the guest got every op and
-// every name. That is the wrong default in the one file where a mistake is a capability
-// escalation: it makes full authority the thing a new call site gets by forgetting a
-// field, in a runtime whose admission policy is otherwise deny-all (policy.ts).
+// Two of the deps below govern how far a guest reaches: `allowedCaps` (which prefixes
+// resolve at all) and `modules` (which kernel names `module/call` can address). Both
+// once had a permissive meaning for the *absent* value — omit them and the guest got
+// every op and every name. That is the wrong default in the one file where a mistake
+// is a capability escalation: it makes full authority the thing a new call site gets
+// by forgetting a field, in a runtime whose admission policy is otherwise deny-all
+// (policy.ts).
 //
 // They are now required, and the permissive case is a value a caller has to name. There
 // IS a legitimate permissive caller — a host-side orchestrator that already holds every
 // primitive the bridge wraps, so gating it protects nothing — and these sentinels are for
 // it. Symbols rather than strings or `null`: a symbol cannot arrive from parsed config or
-// be produced by `opsForCaps`, so the only way to reach the permissive branch is to
+// be produced by a manifest, so the only way to reach the permissive branch is to
 // import the constant and mean it.
-/** Run without op gating: every op in `CAP` resolves. For a host-side caller that
- *  already holds the primitives; never for a bundle's guest, whose reach is its
- *  manifest `caps` and nothing else (§12.2). */
-export const UNRESTRICTED_OPS = Symbol("seedkernel.cap.unrestricted-ops");
-/** Run without module-name scoping: MODULE_CALL passes logical names straight through
+/** Run without cap gating: every prefix in `CAP_DOMAINS` resolves. For a host-side
+ *  caller that already holds the primitives; never for a bundle's guest, whose reach is
+ *  its manifest `caps` and nothing else (§12.2). */
+export const UNRESTRICTED_CAPS = Symbol("seedkernel.cap.unrestricted-caps");
+/** Run without module-name scoping: `module/call` passes logical names straight through
  *  as kernel names. For tests and host-side callers that address the table directly;
  *  never for a guest, which must not be able to name another author's modules. */
 export const UNSCOPED_MODULES = Symbol("seedkernel.cap.unscoped-modules");
@@ -658,7 +528,7 @@ export const UNSCOPED_MODULES = Symbol("seedkernel.cap.unscoped-modules");
 // 64 MiB memory limit does not cover host allocations the guest requests, so
 // the bridge caps them itself (a confined guest must not be able to size a
 // host buffer past these).
-const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per CAP_RANDOM call
+const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);
@@ -668,9 +538,10 @@ function u64be(value: number): Uint8Array {
     writeU32BE(out, 4, value >>> 0);
     return out;
 }
-/** Build the single capability funnel for one node. Most ops resolve *synchronously*
- *  (returns bytes); the ones that genuinely round-trip — `NET_SEND` and every `FS_*` —
- *  return a Promise the guest `await`s.
+/** Build the single capability funnel for one node. Most names resolve *synchronously*
+ *  (returns bytes); the ones that genuinely round-trip — `net/send` and every `fs/*` —
+ *  return a Promise the guest `await`s. Which side of that line a name sits on is the
+ *  ABI (§12.2), which is what `guest.abi` versions.
  *
  *  One bridge serves both roles. The **holder** path awaits like the initiator does — it
  *  answers from local fs, and fs is not answerable in the same turn on a target whose
@@ -684,19 +555,22 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
     // to enforce anything. A gate that only holds on one of two targets is not a gate, so
     // an absent value throws here rather than resolving to the permissive branch.
-    if (deps.allowedOps === undefined) {
-        throw new Error("cap-bridge: allowedOps is required — pass opsForCaps(manifest caps), or UNRESTRICTED_OPS to opt out");
+    if (deps.allowedCaps === undefined) {
+        throw new Error("cap-bridge: allowedCaps is required — pass the manifest's declared caps, or UNRESTRICTED_CAPS to opt out");
     }
     if (deps.modules === undefined) {
         throw new Error("cap-bridge: modules is required — pass the manifest's logical→kernel name map, or UNSCOPED_MODULES to opt out");
     }
     // null in both cases means "the caller named the sentinel" — never "the caller forgot".
-    const allowed = deps.allowedOps === UNRESTRICTED_OPS ? null : new Set(deps.allowedOps);
+    const allowed = deps.allowedCaps === UNRESTRICTED_CAPS ? null : new Set(deps.allowedCaps);
     const modules = deps.modules === UNSCOPED_MODULES ? null : deps.modules;
-    // Built once per bridge: the name→transform map CAP.CRYPTO dispatches through. It is
-    // not gated, and does not appear in CAP_DOMAINS, because none of its entries reach
-    // anything — see the note on CAP above.
-    const catalog = cryptoCatalog(sodium);
+    // ── the catalog — the seam ABI (§12.2), ONE table: the names a guest can call
+    // are the keys of this object — no second list, no numbers, never a wire value.
+    // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
+    // reach nothing a guest does not already hold, so the prefix is ungated by a rule;
+    // every other name is an authority, gated by the prefix its manifest domain grants.
+    // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
+    // the platform's raw contribution; the slot holds both, an app holds only `net`.
     const fs = () => {
         if (!deps.fs)
             throw new Error("cap-bridge: fs.* used but no fs backend wired");
@@ -704,7 +578,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     };
     const rawNet = () => {
         if (!deps.rawNet)
-            throw new Error("cap-bridge: net.link.* used but no raw net is wired (only the transport slot holds sockets)");
+            throw new Error("cap-bridge: link.* used but no raw net is wired (only the transport slot holds sockets)");
         return deps.rawNet;
     };
     const timers = () => {
@@ -714,190 +588,195 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     };
     const sink = () => {
         if (!deps.transportSink)
-            throw new Error("cap-bridge: the transport ops are the slot occupant's, and this bridge serves no slot");
+            throw new Error("cap-bridge: the transport names are the slot occupant's, and this bridge serves no slot");
         return deps.transportSink;
     };
-    return (op, payload) => {
-        // The gate covers authorities. `CAP.CRYPTO` is exempt by construction, not by
-        // oversight: it appears in no domain because it grants nothing, so gating it would
-        // make a guest ask permission to compute a function of bytes it already holds —
-        // the coarse-vocabulary lie the primitive/authority split exists to remove. Its
-        // catalog is fixed host-side, so the only thing an ungated CRYPTO reaches is a pure
-        // transform over the guest's own arguments.
-        if (allowed && op !== CAP.CRYPTO && !allowed.has(op)) {
-            throw new Error("cap-bridge: op " + op + " not declared by the bundle manifest");
-        }
-        switch (op) {
-            // ── the primitive seam: one op, a flat map over opaque names ─────────
-            case CAP.CRYPTO: {
-                const nameLen = payload[0];
-                const name = dec.decode(payload.slice(1, 1 + nameLen));
-                const prim = (catalog as Record<string, ((a: Uint8Array) => Uint8Array) | undefined>)[name];
-                // By name, so a host that cannot serve one says which — the same legibility
-                // an unsupported `guest.abi` gets. A manifest declaring its primitives is
-                // refused at load, so reaching here means an undeclared name.
-                if (!prim)
-                    throw new Error(`cap-bridge: no such primitive "${name}"`);
-                return prim(payload.slice(1 + nameLen));
-            }
-            // ── authorities ──────────────────────────────────────────────────────
-            case CAP.SIGN: {
-                // The host prefixes and does not parse: it signs
-                // `domain ‖ scope ‖ msg` with the key the asking bundle's slot selected, so a
-                // signature can never verify outside the domain it was made in — an app's can
-                // never pass as a channel transcript, nor in another app's scope, and the
-                // transport's can never pass as app data.
-                const s = deps.signScope;
-                if (!s)
-                    throw new Error("cap-bridge: SIGN needs a slot-derived scope (signing is never raw)");
-                return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
-            }
-            case CAP.IDENTITY:
-                return identity.publicKey.slice();
-            case CAP.RANDOM: {
-                const n = readU32BE(payload, 0);
-                if (n > MAX_RANDOM_BYTES)
-                    throw new Error("cap-bridge: RANDOM size over cap");
-                return sodium.randombytes_buf(n);
-            }
-            // ── net (NET_SEND is the only async op — a real round trip → a Promise) ──
-            case CAP.NET_SEND: {
-                if (!transport)
-                    throw new Error("cap-bridge: NET_SEND used but no transport is wired (the transport bundle itself must not declare net)");
-                const peer = toHex(payload.slice(0, 32));
-                const pidLen = payload[32];
-                const proto = payload.slice(33, 33 + pidLen);
-                const off = 33 + pidLen;
-                return transport.request(peer, proto, payload.slice(off)).then((resp) => concatBytes([ONE, resp]), () => ZERO);
-            }
-            case CAP.NET_PEERS: {
-                const peers = deps.peers();
+    const handlers: Record<string, CapHandler> = {
+        // ── the primitive seam (§12.2): the catalog's `crypto/*` half ────────────
+        ...cryptoCatalog(sodium),
+        // ── authorities: each reaches something no confined guest can hold ──────────
+        // node/sign is scoped, never raw: it signs `domain ‖ scope ‖ msg` with the
+        // key the asking bundle's slot selected (see SignScope below).
+        "node/sign": (payload) => {
+            const s = deps.signScope;
+            if (!s)
+                throw new Error("cap-bridge: node/sign needs a slot-derived scope (signing is never raw)");
+            return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
+        },
+        "node/identity": () => identity.publicKey.slice(),
+        "node/random": (payload) => {
+            const n = readU32BE(payload, 0);
+            if (n > MAX_RANDOM_BYTES)
+                throw new Error("cap-bridge: RANDOM size over cap");
+            return sodium.randombytes_buf(n);
+        },
+        // ── net: net/send is the only async name — a real round trip → a Promise ──
+        "net/send": (payload) => {
+            if (!transport)
+                throw new Error("cap-bridge: net/send used but no transport is wired (the transport bundle itself must not declare net)");
+            const peer = toHex(payload.slice(0, 32));
+            const pidLen = payload[32];
+            const proto = payload.slice(33, 33 + pidLen);
+            const off = 33 + pidLen;
+            return transport.request(peer, proto, payload.slice(off)).then((resp) => concatBytes([ONE, resp]), () => ZERO);
+        },
+        // net/peers — -> [count u32][pk 32 …]
+        "net/peers": () => {
+            const peers = deps.peers();
+            const head = new Uint8Array(4);
+            writeU32BE(head, 0, peers.length);
+            return concatBytes([head, ...peers.map(fromHex)]);
+        },
+        // ── fs: raw bytes under an opaque key. Every one of these round-trips, so
+        // each returns a Promise and the guest reads it with `await` — the seam is
+        // what is async, not the backend (§12.1). ──────────────────────────────────
+        "fs/get": (payload) => fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO)),
+        "fs/put": (payload) => {
+            const klen = readU32BE(payload, 0);
+            const key = dec.decode(payload.slice(4, 4 + klen));
+            return fs().put(key, payload.slice(4 + klen)).then(() => NONE);
+        },
+        "fs/list": (payload) => {
+            const prefix = payload.length ? dec.decode(payload) : undefined;
+            return fs().list(prefix).then((keys) => {
                 const head = new Uint8Array(4);
-                writeU32BE(head, 0, peers.length);
-                return concatBytes([head, ...peers.map(fromHex)]);
-            }
-            // ── fs (raw bytes under an opaque key) ───────────────────────────────
-            //
-            // Every one of these round-trips, so each returns a Promise and the guest
-            // reads it with `await`. The seam is what is async, not the backend: a
-            // synchronous `get` is a shape no browser backend can implement — IndexedDB
-            // cannot, and OPFS only inside a Worker — so a sync fs would make the browser
-            // the one target unable to carry a core capability. `MemoryFs` and Go's
-            // primitive both answer in the call, and still resolve in a microtask.
-            case CAP.FS_GET:
-                return fs().get(dec.decode(payload)).then((v) => (v ? concatBytes([ONE, v]) : ZERO));
-            case CAP.FS_PUT: {
-                const klen = readU32BE(payload, 0);
-                const key = dec.decode(payload.slice(4, 4 + klen));
-                return fs().put(key, payload.slice(4 + klen)).then(() => NONE);
-            }
-            case CAP.FS_LIST: {
-                const prefix = payload.length ? dec.decode(payload) : undefined;
-                return fs().list(prefix).then((keys) => {
-                    const head = new Uint8Array(4);
-                    writeU32BE(head, 0, keys.length);
-                    const parts = [head];
-                    for (const k of keys) {
-                        const kb = enc.encode(k);
-                        const kh = new Uint8Array(4);
-                        writeU32BE(kh, 0, kb.length);
-                        parts.push(kh, kb);
-                    }
-                    return concatBytes(parts);
-                });
-            }
-            case CAP.FS_DELETE:
-                return fs().delete(dec.decode(payload)).then(() => NONE);
-            case CAP.FS_SIZE:
-                return fs().size(dec.decode(payload)).then((sz) => {
-                    const out = new Uint8Array(4);
-                    writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
-                    return out;
-                });
-            case CAP.FS_STAT:
-                return fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)]));
-            // ── installed-handler call + clock ───────────────────────────────────
-            case CAP.MODULE_CALL: {
-                // The guest calls its own modules by the logical name from its manifest
-                // (README §5.1); the bridge resolves to the kernel name here so kernel
-                // names never leave the host. The guest is held to what its manifest
-                // declared — an undeclared name resolves to nothing, rather than being
-                // passed through as a kernel name it could have chosen freely.
-                if (payload.length < 1)
-                    return NONE;
-                const nameLen = payload[0];
-                if (payload.length < 1 + nameLen)
-                    return NONE;
-                const logicalName = dec.decode(payload.slice(1, 1 + nameLen));
-                const kernelName = modules ? modules[logicalName] : logicalName;
-                if (kernelName === undefined)
-                    return NONE;
-                const r = callHandler(kernelName, payload.slice(1 + nameLen));
-                return r ?? NONE;
-            }
-            case CAP.CLOCK:
-                return u64be(now());
-            // ── raw net: bytes over an opaque link id (the socket-side twin of fs) ──
-            case CAP.NET_LINK_OPEN: {
-                const link = rawNet().open(payload);
-                const authority = enc.encode(link.authority);
-                const out = new Uint8Array(9 + authority.length);
-                writeU32BE(out, 0, link.linkId);
-                out[4] = link.framing;
-                writeU32BE(out, 5, authority.length);
-                out.set(authority, 9);
-                return out;
-            }
-            case CAP.NET_LINK_SEND:
-                rawNet().send(readU32BE(payload, 0), payload.slice(4));
+                writeU32BE(head, 0, keys.length);
+                const parts = [head];
+                for (const k of keys) {
+                    const kb = enc.encode(k);
+                    const kh = new Uint8Array(4);
+                    writeU32BE(kh, 0, kb.length);
+                    parts.push(kh, kb);
+                }
+                return concatBytes(parts);
+            });
+        },
+        "fs/delete": (payload) => fs().delete(dec.decode(payload)).then(() => NONE),
+        "fs/size": (payload) => fs().size(dec.decode(payload)).then((sz) => {
+            const out = new Uint8Array(4);
+            writeU32BE(out, 0, sz < 0 ? 0xffffffff : sz);
+            return out;
+        }),
+        "fs/stat": () => fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
+        // ── installed-handler call + clock ───────────────────────────────────────
+        "module/call": (payload) => {
+            // The guest calls its own modules by the logical name from its manifest
+            // (README §5.1); the bridge resolves to the kernel name here so kernel
+            // names never leave the host — an undeclared name resolves to nothing.
+            if (payload.length < 1)
                 return NONE;
-            case CAP.NET_LINK_CLOSE:
-                rawNet().close(readU32BE(payload, 0), payload[4] === 1);
+            const nameLen = payload[0];
+            if (payload.length < 1 + nameLen)
                 return NONE;
-            case CAP.NET_LINK_STAT: {
-                const out = new Uint8Array(4);
-                writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
-                return out;
-            }
-            // ── timers ───────────────────────────────────────────────────────────
-            case CAP.TIMER_ARM:
-                // How many deadlines one guest may hold at once is bounded by the BACKEND,
-                // not here: the table of live timers is the backend's memory to spend, and a
-                // limit protecting a resource belongs to whoever owns the resource — the same
-                // rule that put MAX_FRAME_BYTES in the core and MAX_QUEUE_BYTES in the module.
-                // Counting here would also be wrong rather than merely misplaced, since this
-                // seam never learns that a timer fired.
-                timers().arm(readU32BE(payload, 0), readU32BE(payload, 4));
+            const logicalName = dec.decode(payload.slice(1, 1 + nameLen));
+            const kernelName = modules ? modules[logicalName] : logicalName;
+            if (kernelName === undefined)
                 return NONE;
-            case CAP.TIMER_CLEAR:
-                timers().clear(readU32BE(payload, 0));
-                return NONE;
-            // ── the transport slot's structured output ───────────────────────────
-            case CAP.NET_DELIVER: {
-                const corr = readU32BE(payload, 0);
-                const noReply = payload[4] === 1;
-                const from = payload.slice(5, 37);
-                const pidLen = payload[37];
-                const proto = payload.slice(38, 38 + pidLen);
-                sink().deliver(corr, noReply, from, proto, payload.slice(38 + pidLen));
-                return NONE;
-            }
-            case CAP.NET_SETTLE:
-                sink().settle(readU32BE(payload, 0), payload[4] === 1, payload.slice(5));
-                return NONE;
-            case CAP.NET_LINK_AUTH:
-                return sink().linkAuth(readU32BE(payload, 0), payload.slice(5, 37), payload[4] === 1) ? ONE : ZERO;
-            case CAP.NET_PEER_EDGE:
-                sink().peerEdge(payload[0] === 1, payload.slice(1, 33));
-                return NONE;
-            case CAP.NET_READY:
-                sink().ready(payload[0] === 1);
-                return NONE;
-            case CAP.NET_LINK_DOWN:
-                sink().linkDown(readU32BE(payload, 0), payload[4]);
-                return NONE;
-            default:
-                throw new Error("cap-bridge: unknown op " + op);
+            const r = callHandler(kernelName, payload.slice(1 + nameLen));
+            return r ?? NONE;
+        },
+        "clock/now": () => u64be(now()),
+        // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` ──
+        //
+        // The WHOLE of what the platform contributes to the network (§12.1): a link
+        // id the host mints and the guest never interprets, bytes in and bytes out.
+        // No peer, no protocol id, no correlation — those are the transport slot's
+        // OUTPUT (transport/* below), which an app reaches through the ordinary `net`
+        // domain. Inbound bytes arrive the other way, as ordinary entrypoint
+        // invocations on the slot occupant's guest.
+        "link/open": (payload) => {
+            const link = rawNet().open(payload);
+            const authority = enc.encode(link.authority);
+            const out = new Uint8Array(9 + authority.length);
+            writeU32BE(out, 0, link.linkId);
+            out[4] = link.framing;
+            writeU32BE(out, 5, authority.length);
+            out.set(authority, 9);
+            return out;
+        },
+        "link/send": (payload) => {
+            rawNet().send(readU32BE(payload, 0), payload.slice(4));
+            return NONE;
+        },
+        "link/close": (payload) => {
+            rawNet().close(readU32BE(payload, 0), payload[4] === 1);
+            return NONE;
+        },
+        "link/stat": (payload) => {
+            const out = new Uint8Array(4);
+            writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
+            return out;
+        },
+        // ── timers: the platform's event loop ─────────────────────────────────────
+        "timer/arm": (payload) => {
+            // How many deadlines one guest may hold at once is bounded by the BACKEND,
+            // not here: the table of live timers is the backend's memory to spend, and a
+            // limit protecting a resource belongs to whoever owns the resource.
+            timers().arm(readU32BE(payload, 0), readU32BE(payload, 4));
+            return NONE;
+        },
+        "timer/clear": (payload) => {
+            timers().clear(readU32BE(payload, 0));
+            return NONE;
+        },
+        // ── what the transport slot PROVIDES back: the structured face (attributed
+        // peer, protocol id, correlation) an app reaches through the `net` domain ──
+        "transport/deliver": (payload) => {
+            const corr = readU32BE(payload, 0);
+            const noReply = payload[4] === 1;
+            const from = payload.slice(5, 37);
+            const pidLen = payload[37];
+            const proto = payload.slice(38, 38 + pidLen);
+            sink().deliver(corr, noReply, from, proto, payload.slice(38 + pidLen));
+            return NONE;
+        },
+        "transport/settle": (payload) => {
+            sink().settle(readU32BE(payload, 0), payload[4] === 1, payload.slice(5));
+            return NONE;
+        },
+        "transport/link-auth": (payload) => sink().linkAuth(readU32BE(payload, 0), payload.slice(5, 37), payload[4] === 1) ? ONE : ZERO,
+        "transport/peer-edge": (payload) => {
+            sink().peerEdge(payload[0] === 1, payload.slice(1, 33));
+            return NONE;
+        },
+        "transport/ready": (payload) => {
+            sink().ready(payload[0] === 1);
+            return NONE;
+        },
+        "transport/link-down": (payload) => {
+            sink().linkDown(readU32BE(payload, 0), payload[4]);
+            return NONE;
+        },
+    };
+    // The one-file rule, checked at construction: every name's prefix must be
+    // `crypto` (ungated) or a declared `CAP_DOMAINS` member, so the catalog a guest
+    // is dispatched through and the vocabulary a manifest is checked against cannot
+    // drift — a typo'd prefix would otherwise be a name nothing could ever grant.
+    for (const name of Object.keys(handlers)) {
+        const prefix = name.slice(0, name.indexOf("/"));
+        if (prefix !== "crypto" && !(CAP_DOMAINS as readonly string[]).includes(prefix)) {
+            throw new Error(`cap-bridge: ${name} has no capability domain — CAP_DOMAINS is missing "${prefix}"`);
         }
+    }
+    return (name, payload) => {
+        // The gate covers authorities, and a granted domain is a PREFIX check: the first
+        // path component of the name must be one of the manifest's declared domains.
+        // `crypto` is exempt by a rule, not by omission: its catalog is fixed host-side
+        // and reaches nothing a guest does not already hold, so gating it would make a
+        // guest ask permission to compute a function of bytes it already has — the
+        // coarse-vocabulary lie the primitive/authority split exists to remove.
+        if (allowed) {
+            const slash = name.indexOf("/");
+            const prefix = slash < 0 ? name : name.slice(0, slash);
+            if (prefix !== "crypto" && !allowed.has(prefix)) {
+                throw new Error("cap-bridge: " + name + " not declared by the bundle manifest caps");
+            }
+        }
+        // The table lookup IS the dispatch: an unknown name (or a primitive this host
+        // does not carry) reads `undefined` and is refused by name.
+        const fn = handlers[name];
+        if (!fn)
+            throw new Error("cap-bridge: no such name " + name);
+        return fn(payload);
     };
 }

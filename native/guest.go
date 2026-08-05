@@ -5,18 +5,18 @@
 //
 // A realm is a second, zero-authority QuickJS runtime: a fresh context holds only the
 // ECMAScript intrinsics, so the guest cannot even *name* sodium / fs / net. Its single
-// seam is host.call(op, bytes), which Go funnels into the cap-bridge the shell built
+// seam is host.call(name, bytes), which Go funnels into the cap-bridge the shell built
 // for that app — a JS function in the host realm, retained here. Nothing in this file
-// knows what an op means or which ops an app may reach; that is the cap-bridge's, and
-// the manifest's, business.
+// knows what a name means or which domains an app may reach; that is the cap-bridge's,
+// and the manifest's, business.
 //
-// The async seam: a sync op (the primitive catalog, clock, module, the raw-link and
-// transport ops) returns its bytes immediately. A round-tripping op — NET_SEND and every
-// FS_* — returns null from the cap call, and the guest preamble hands the guest a real
-// Promise it `await`s; when the shim's promise settles it calls bridge.realmSettle and
-// this file resolves the parked guest Promise. The shared loop (loop.go) then pumps the
-// guest realm so the awaiting entrypoint resumes. There is no blocking and no Asyncify —
-// a suspended async guest is just heap state.
+// The async seam: a sync name (the primitive catalog, clock, module, the raw-link and
+// transport names) returns its bytes immediately. A round-tripping name — net/send and
+// every fs/* — returns null from the cap call, and the guest preamble hands the guest a
+// real Promise it `await`s; when the shim's promise settles it calls bridge.realmSettle
+// and this file resolves the parked guest Promise. The shared loop (loop.go) then pumps
+// the guest realm so the awaiting entrypoint resumes. There is no blocking and no
+// Asyncify — a suspended async guest is just heap state.
 //
 // There is one way in, `realmCall`, and it is asynchronous — for the initiator and the
 // holder alike. A synchronous second entry is not on offer: a holder answers from local
@@ -155,7 +155,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 }
 
 // newGuestRealm builds a confined realm running `source` — which the shell has already
-// fronted with the cap preamble, the bundle facts and the app config, so what arrives
+// fronted with the guest preamble, the bundle facts and the app config, so what arrives
 // here is exactly what a safe-js realm would be handed — with host.call funnelled into
 // `capCall`, a host-realm function the shell built for this app.
 func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
@@ -191,35 +191,36 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	// queue pumped — no Go timers of its own.
 	loop.addContext(g.qc, g.pump)
 
-	// The single seam. Read (op, callId, payload) from the guest and shuttle the call to
-	// the cap-bridge in the host realm. A sync op returns its bytes here; an async op
-	// returns null (its promise isn't settled yet) and we return null too — the guest
-	// preamble then parks a Promise under callId, which settleNet resolves later.
+	// The single seam. Read (name, callId, payload) from the guest and shuttle the call
+	// to the cap-bridge in the host realm. A sync name returns its bytes here; an async
+	// name returns null (its promise isn't settled yet) and we return null too — the
+	// guest preamble then parks a Promise under callId, which settleNet resolves later.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
 			return nil, err
 		}
-		// pv is the only refcounted arg (op/callID are immediates); Invoke borrows it,
+		name := t.Args()[0].String()
+		// pv is the only refcounted arg (callID is an immediate); Invoke borrows it,
 		// so free it once the call returns. Without this every guest host.call leaked a
 		// host-realm ArrayBuffer.
 		pv := hostQc.NewArrayBuffer(payload)
 		res, err := hostQc.Invoke(g.capCall, hostQc.NewUndefined(),
-			hostQc.NewInt32(t.Args()[0].Int32()), pv, hostQc.NewInt64(t.Args()[1].Int64()))
+			hostQc.NewString(name), pv, hostQc.NewInt64(t.Args()[1].Int64()))
 		pv.Free()
 		if err != nil {
 			return nil, err
 		}
 		defer res.Free() // the cap call's own-ref result (sync bytes, or the JS_NULL immediate)
-		// CONTRACT: null is RESERVED for an async op whose promise hasn't settled — NET_SEND
-		// and every FS_* (core/fs.ts is async on every target, so the native shim's
-		// synchronous __fs primitives are still wrapped into a resolved Promise). The
-		// remaining sync ops (crypto/clock/module) return their bytes here. A sync op
-		// returning null/undefined would be mistaken for an async one and leave a guest
-		// Promise pending forever — which is why cap-bridge.ts maps an empty MODULE_CALL
-		// reply to NONE rather than null.
+		// CONTRACT: null is RESERVED for an async name whose promise hasn't settled —
+		// net/send and every fs/* (core/fs.ts is async on every target, so the native
+		// shim's synchronous __fs primitives are still wrapped into a resolved Promise).
+		// The remaining sync names (crypto/clock/module) return their bytes here. A sync
+		// name returning null/undefined would be mistaken for an async one and leave a
+		// guest Promise pending forever — which is why cap-bridge.ts maps an empty
+		// module/call reply to NONE rather than null.
 		if res.IsNull() {
-			// The op parked, and its settlement will arrive as a HOST-realm microtask
+			// The call parked, and its settlement will arrive as a HOST-realm microtask
 			// (native-shim.ts capCall attaches `.then` → bridge.realmSettle). We are running
 			// inside the guest pump of some round, i.e. AFTER pumpAll already drained el.c
 			// this round — so without a nudge that microtask sits unqueued-for until
@@ -230,7 +231,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 			// rule reportCall and markDead follow — anything that settles or parks a promise
 			// outside a task/timer path has to wake the loop (see eventLoop.wake).
 			//
-			// Cheap and self-limiting: only an op that actually parked wakes the loop, and
+			// Cheap and self-limiting: only a call that actually parked wakes the loop, and
 			// wake() is a non-blocking send onto a buffered channel.
 			g.loop.wake()
 			return t.Context().NewNull(), nil
@@ -286,10 +287,10 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 
 // hostGuestPreamble asks the host realm for guestPreamble() — the guest-side ABI
 // (host.call over the single seam, register/__invoke for dispatch). Fetched rather than
-// restated for the same reason the cap preamble is: a bundle ships one guest.js that runs
-// byte-identical here and on the node/browser host (safe-js.ts), so the preamble is a
-// contract with signed content, not a per-target detail. Go's side of that contract is
-// the __host_call installed above (null ⇒ async under callId) plus settleNet.
+// restated for the same reason the other preambles are: a bundle ships one guest.js that
+// runs byte-identical here and on the node/browser host (safe-js.ts), so the preamble is
+// a contract with signed content, not a per-target detail. Go's side of that contract is
+// the __host_call installed above (null ⇒ the call parked under callId) plus settleNet.
 func hostGuestPreamble(hostQc *qjs.Context) string {
 	return hostFnString(hostQc, "guestPreamble")
 }

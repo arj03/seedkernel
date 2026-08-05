@@ -37,11 +37,11 @@ const (
 	suiteManifestGenesis = 0x01
 	suiteManifestHybrid  = 0x02
 	// The guest seam version these test bundles are written against, mirroring
-	// GUEST_ABI_VERSION in cap-bridge.ts. A manifest declaring anything else is refused
+	// GUEST_ABI_VERSION in core/domains.ts. A manifest declaring anything else is refused
 	// by the shared loader, which is the point of the field (§12.2) — so a bump lands
 	// here too, and a stale native test fails loudly rather than running a guest against
 	// a seam that moved.
-	guestABIVersion = 1
+	guestABIVersion = 2
 )
 
 // testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).

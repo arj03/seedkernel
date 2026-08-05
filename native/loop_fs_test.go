@@ -12,11 +12,11 @@ import (
 // This is the holder's shape, and it is the one case the loop's pump ordering cannot
 // carry on its own. pumpAll drains the host realm and THEN the guest realms, so a host
 // job that schedules a guest job lands in the same round. The reverse does not: a guest
-// continuation that issues `await host.call(CAP_FS_*)` parks, and its settlement is a
+// continuation that issues `await host.call("fs/*")` parks, and its settlement is a
 // HOST-realm microtask (native-shim.ts capCall attaches `.then` → bridge.realmSettle)
 // queued after el.c was already drained this round. Nothing schedules the next round —
 // step() blocks with no timer and no task — so without the wake in __host_call the chain
-// advances exactly one fs op per externally-provoked round and then stops dead.
+// advances exactly one fs call per externally-provoked round and then stops dead.
 //
 // A holder serving from local disk generates no I/O of its own, which is why it is the
 // case that strands: while a peer keeps sending frames the socket reader posts tasks and
@@ -41,22 +41,22 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 			for (let j = 0; j < s.length; j++) b[j] = s.charCodeAt(j);
 			return b;
 		}
-		register("chain", async (arg) => {
-			const n = arg[0];
-			let seen = 0;
-			for (let i = 0; i < n; i++) {
-				const k = keyBytes(i);
-				const body = new Uint8Array(4 + k.length + 16);
-				// [klen u32 BE][key][bytes]
-				body[0] = 0; body[1] = 0; body[2] = (k.length >>> 8) & 255; body[3] = k.length & 255;
-				body.set(k, 4);
-				await host.call(CAP_FS_PUT, body);
-				const got = await host.call(CAP_FS_GET, k);
-				if (got[0] === 1) seen++;
-				await host.call(CAP_FS_SIZE, k);
-			}
-			return new Uint8Array([seen]);
-		});
+			register("chain", async (arg) => {
+				const n = arg[0];
+				let seen = 0;
+				for (let i = 0; i < n; i++) {
+					const k = keyBytes(i);
+					const body = new Uint8Array(4 + k.length + 16);
+					// [klen u32 BE][key][bytes]
+					body[0] = 0; body[1] = 0; body[2] = (k.length >>> 8) & 255; body[3] = k.length & 255;
+					body.set(k, 4);
+					await host.call("fs/put", body);
+					const got = await host.call("fs/get", k);
+					if (got[0] === 1) seen++;
+					await host.call("fs/size", k);
+				}
+				return new Uint8Array([seen]);
+			});
 	`)
 
 	const blocks = 24

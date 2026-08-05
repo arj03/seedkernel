@@ -117,7 +117,7 @@ func removePrefix(prefix string) int {
 
 // callHandler invokes an installed handler by name (README §4), returning its response or
 // nil if the name is unbound or the handler produced nothing. The one way into an installed
-// module: the shell uses it directly and the cap-bridge routes MODULE_CALL (§12.2) through
+// module: the shell uses it directly and the cap-bridge routes module/call (§12.2) through
 // it. Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
 func callHandler(n string, payload []byte) []byte {
 	w := handlers[n]

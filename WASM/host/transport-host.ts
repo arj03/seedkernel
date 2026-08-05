@@ -8,7 +8,7 @@
 // exists, rather than a bespoke byte ABI with a hand-maintained twin in the guest:
 //
 //   guest → host ordinary `host.call` ops (cap-bridge.ts). The RAW net capability
-//                  — `NET_LINK_OPEN/SEND/CLOSE/STAT` over an opaque link id — plus
+//                  — `link/open, send, close, stat` over an opaque link id — plus
 //                  `TIMER_*` for deadlines and the `transport` domain the slot
 //                  reports its structured output through. Adding one is an op, not
 //                  an action id with a decoder on both sides.
@@ -18,17 +18,17 @@
 //                  unknown-tag case to desync on: an entrypoint this guest does not
 //                  register fails loud by name.
 //
-// **One invariant makes that safe: no op re-enters the realm.** The occupant calls
-// out from inside a synchronous entrypoint, so an op that called straight back in
+// **One invariant makes that safe: no name re-enters the realm.** The occupant calls
+// out from inside a synchronous entrypoint, so a name that called straight back in
 // would re-enter a live guest frame. None does — a socket write does not deliver
-// during the write, an armed timer fires on a later turn, and `NET_DELIVER` answers
-// through the `respond` entrypoint rather than inline. That last one is not a
+// during the write, an armed timer fires on a later turn, and `transport/deliver`
+// answers through the `respond` entrypoint rather than inline. That last one is not a
 // concession: it is also what keeps an asynchronous app handler possible.
 //
 // The crypto surface the guest reaches is the cap-bridge's, and it names no algorithm
 // the host understands: the record layer and the ephemeral DH go
-// through `host.crypto(name, bytes)` over the opaque primitive catalog, and the
-// transcript signature is the ordinary SIGN op, which the bridge scopes to
+// through `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and
+// the transcript signature is the ordinary node/sign name, which the bridge scopes to
 // `DOMAIN_channel ‖ networkKey` because THIS bundle claims the transport slot. The
 // host prefixes and does not read the suffix, so no handshake shape is pinned into
 // the core and the node's key never enters the guest.
@@ -124,7 +124,7 @@ const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
 // The link close-reason codes are the transport occupant's vocabulary — the host
-// only relays the number it reports through NET_LINK_DOWN (cap-bridge.ts) to
+// only relays the number it reports through transport/link-down (cap-bridge.ts) to
 // whoever handed the channel in, never interpreting it. The codes live with the
 // occupant (transport/guest.js, `REASON_*`) and with the tests that assert them
 // (tests/transport-harness.mjs).
@@ -145,7 +145,7 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
 
 /** How long one request may take when its caller names no deadline (§12.6). Generous
  *  on purpose: it is the number that has to be right for a caller who did not think
- *  about it, which includes every app guest, since NET_SEND carries no deadline of its
+ *  about it, which includes every app guest, since net/send carries no deadline of its
  *  own. A caller moving something large, or one that wants to fail fast, passes its own
  *  to `request` rather than moving this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
@@ -223,7 +223,7 @@ export interface TransportHostOptions {
   onPeerDown?: (peerId: PeerId) => void;
   /** The socket seam: dialing, listening, and the address book live here. Absent
  *  for a host-managed-transport-only node (browser edge), which opens links via
- *  openLink and whose NET_LINK_OPEN calls answer "no route". */
+ *  openLink and whose link/open calls answer "no route". */
   channels?: ChannelFactory;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
@@ -576,7 +576,7 @@ export class TransportHost implements Network, HostTransport {
 
   /** Tell the guest about a link the HOST opened: an accepted socket, or one a
  *  host-managed transport handed over. A dialed core link is not here — the guest
- *  opens those itself through `NET_LINK_OPEN` and already knows everything about them. */
+ *  opens those itself through `link/open` and already knows everything about them. */
   private announce(
     linkId: number,
     spec: {
@@ -631,7 +631,7 @@ export class TransportHost implements Network, HostTransport {
     this.addrs.set(peerId, addr);
     // The guest's dial needs the peer's contact secret (or the zero secret for
     // an open peer) to build msg1; the host keeps the full address, which is what
-    // NET_LINK_OPEN resolves the peer key against.
+    // link/open resolves the peer key against.
     this.enter("addr", new Args()
       .blob(fromHex(peerId))
       .blob(addr.contactSecret ?? ZERO32)
@@ -683,7 +683,7 @@ export class TransportHost implements Network, HostTransport {
 
   /** Send a typed request and await the typed response. The deadline clock runs in the
  *  guest (host-armed timers); this side holds the promise the guest settles with
- *  NET_SETTLE.
+ *  transport/settle.
  *
  *  `deadlineMs` is how long THIS exchange may take, and the caller supplies it because
  *  the caller is the only party that knows what it sent: a 200-byte control message and
@@ -722,11 +722,11 @@ export class TransportHost implements Network, HostTransport {
 
   onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
 
-  /** An inbound request the guest attributed (NET_DELIVER): run the app-facing
+  /** An inbound request the guest attributed (transport/deliver): run the app-facing
  *  handler and hand its response back for framing.
  *
  *  The answer goes back through the `respond` entrypoint on a LATER turn, never as
- *  the op's return value, and that is deliberate twice over: it keeps the
+ *  the call's return value, and that is deliberate twice over: it keeps the
  *  no-re-entrancy invariant (this runs inside the guest's own frame), and it is
  *  what lets `RequestHandler` return a Promise, which is the shape an app handler
  *  awaiting `fs` needs. */
@@ -761,7 +761,7 @@ export class TransportHost implements Network, HostTransport {
 
   /** A single-identity fabric: it vends exactly one endpoint, its own. The send
  *  path routes through the guest's router; inbound content arrives through the
- *  transport sink (NET_DELIVER / NET_SETTLE), never as raw frames — which is why
+ *  transport sink (transport/deliver / transport/settle), never as raw frames — which is why
  *  `Endpoint` carries no `onFrame` sink. */
   endpoint(id: PeerId): Endpoint {
     if (id !== this.peerId) throw new Error("TransportHost is bound to one identity");

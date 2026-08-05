@@ -10,8 +10,8 @@ import (
 )
 
 // asyncnet: a confined guest *initiates* a real network round-trip. The
-// guest's only net surface is `await host.call(CAP_NET_SEND, …)`; the engine has no
-// Asyncify, so that op returns a callId-backed Promise instead of blocking. This
+// guest's only net surface is `await host.call("net/send", …)`; the engine has no
+// Asyncify, so that call returns a callId-backed Promise instead of blocking. This
 // proves the cross-realm async seam end to end: the guest's await suspends, the host
 // realm's transport bundle dials a responder over a loopback socket, and when its promise
 // settles the shared loop (loop.go) resolves the guest's promise and resumes the
@@ -58,7 +58,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		t.Fatal("addPeerAddr:", err)
 	}
 
-	// The initiator guest: build a CAP_NET_SEND frame to A (from APP config) and await
+	// The initiator guest: build a net/send frame to A (from APP config) and await
 	// the response. The await is the whole point — it suspends until the host realm's
 	// socket round-trip settles and the loop resolves the guest's promise.
 	const askGuestSource = `
@@ -75,7 +75,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  req[32] = proto.length;
 		  req.set(proto, 33);
 		  req.set(msg, 33 + proto.length);
-		  const r = await host.call(CAP_NET_SEND, req); // [ok u8][resp]
+		  const r = await host.call("net/send", req); // [ok u8][resp]
 		  if (r[0] !== 1) throw new Error("net send failed");
 		  return r.slice(1);
 		});

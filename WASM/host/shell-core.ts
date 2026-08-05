@@ -19,7 +19,7 @@
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
 import { kernelNameFor, appKeyFor, appScopeFor, handlesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createCapBridge, capPreamble, bundlePreamble, opsForCaps, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
+import { createCapBridge, bundlePreamble, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
@@ -97,7 +97,7 @@ export interface KernelBackend extends BundleHost, KernelTable {
  *  filesystem backend. `createRealm` is optional for the same reason — absent, the
  *  shell still verifies, admits and installs a bundle's modules, but running or
  *  serving a guest throws rather than silently doing nothing. `livePeers` feeds the
- *  NET_PEERS cap — the transport owns connectivity, the shell just passes the
+ *  net/peers name — the transport owns connectivity, the shell just passes the
  *  closure through to the cap-bridge.
  *
  *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
@@ -329,9 +329,9 @@ export function validatedFs(inner: Fs): Fs {
 
 /** Scope a backend to one app's private keyspace (README §12.2).
  *
- *  Without this, every app granted the `fs` domain shares one flat keyspace: `FS_LIST`
- *  with an empty prefix enumerates every key on the node, `FS_GET` reads any of them and
- *  `FS_DELETE` removes any of them. That is the one place the runtime's "ownership is
+ *  Without this, every app granted the `fs` domain shares one flat keyspace: `fs/list`
+ *  with an empty prefix enumerates every key on the node, `fs/get` reads any of them and
+ *  `fs/delete` removes any of them. That is the one place the runtime's "ownership is
  *  structural" property (§5.1) did not hold — kernel *names* carry their author, so one
  *  app's modules are unreachable to another by construction, but fs *keys* carried
  *  nothing and were reachable to everyone. This closes that asymmetry the same way the
@@ -454,7 +454,10 @@ export function createShell(opts: CreateShellOptions & {
                 ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
                 : undefined,
             now: platform.now ?? (() => Date.now()),
-            allowedOps: opsForCaps(caps),
+            // The granted domain prefixes are the bridge's gate — a `host.call`
+            // resolves iff its first path component is one of these (`crypto` exempt:
+            // never a grant). The vocabulary was checked at load (verifyManifest).
+            allowedCaps: caps,
             // What SIGN signs under is chosen HERE, by the slot the bundle occupies — the one
             // place that knows it (§12.2). The transport slot signs handshake
             // transcripts under DOMAIN_channel with the node's channel key; every ordinary app
@@ -467,8 +470,7 @@ export function createShell(opts: CreateShellOptions & {
             modules: modMap,
         });
     };
-    const guestFullSource = (b: LoadedBundle) => capPreamble()
-        + bundlePreamble({
+    const guestFullSource = (b: LoadedBundle) => bundlePreamble({
             app: b.manifest.app,
             author: b.author,
         })
@@ -504,7 +506,7 @@ export function createShell(opts: CreateShellOptions & {
     /** Stand a transport driver up over an admitted transport bundle's realm.
      *  The driver is the shell's Network: it answers the guest's DIAL actions
      *  through the platform's socket seam, and its request/response face is what
-     *  every app's NET_SEND reaches.
+     *  every app's net/send reaches.
      *
      *  It does NOT publish itself as `netHost` — the caller does, once it has decided
      *  what to do with whatever was there before. That separation is what makes

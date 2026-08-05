@@ -18,7 +18,7 @@
 // `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
 // response back from `scratch`. Handlers import nothing — no kernel seam, no I/O, no
 // callback — so the host is the sole orchestrator: it reaches a handler by name with
-// `callHandler` (the counterpart a guest reaches through the cap-bridge's MODULE_CALL,
+// `callHandler` (the counterpart a guest reaches through the cap-bridge's module/call,
 // README §12.2), and does all I/O and authorization itself. Every entry is an installed
 // WASM handler: a bundle is the one way code arrives (§12.4), so the table holds one kind
 // of thing and `callHandler` has one path through it.
@@ -167,7 +167,7 @@ export class KernelHost {
    *  contract (README §4): write input at the handler's scratch offset, call
    *  handle(input_len), read the response back from the same offset. The generic "run a
    *  transform" primitive: the host uses it directly, and a guest reaches it through the
-   *  cap-bridge's MODULE_CALL (README §12.2). Handlers cannot call back, so there is no
+   *  cap-bridge's module/call (README §12.2). Handlers cannot call back, so there is no
    *  re-entrancy. */
   callHandler(name: string, payload: Uint8Array): Uint8Array | null {
     const w = this.handlers.get(name);

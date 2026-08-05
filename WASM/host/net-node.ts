@@ -73,7 +73,8 @@ export class NodeChannelFactory {
     private tcpServer: TcpServer | null = null;
     private wsServer: TcpServer | null = null;
     /** Takes no crypto. The WebSocket client key and the frame masks are the transport
-     *  bundle's, which reaches entropy through the `RANDOM` op like any other authority.
+     *  bundle's, which reaches entropy through the `node/random` name like any other
+     *  authority.
      *  This factory opens sockets and says which codec applies, and that is all of it. */
     constructor() {}
     connect(addr: PeerAddr): RawLink {

@@ -36,10 +36,11 @@ import { isAdmissionRejected } from "./shell-core.js";
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 
-/** The guest→host seam Go calls into. A null return means the op parked: Go holds
+/** The guest→host seam Go calls into. A null return means the call parked: Go holds
  *  the guest's Promise under `callId` and settles it later through
- *  `bridge.realmSettle`, the same null-means-async contract safe-js.ts implements. */
-type CapCall = (op: number, payload: ArrayBuffer, callId: number) => Uint8Array | null;
+ *  `bridge.realmSettle` — the same null-means-async contract safe-js.ts implements.
+ *  A sync name returns its bytes here instead. */
+type CapCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
 /** The handler table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
@@ -372,10 +373,10 @@ const embeddedTransportAuthor = (() => {
 // realm rather than a catchable JS error — see qjs.Runtime.Budget.
 const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes, deadlineMs }) => {
     // Assigned before any guest code can call back: bridge.createRealm evaluates the
-    // guest, whose top-level can only reach sync ops (a Promise it could not await).
+    // guest, whose top-level can only reach sync names (a Promise it could not await).
     let realm: number;
-    const capCall: CapCall = (op, payload, callId) => {
-        const r = capBridge(op, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
+    const capCall: CapCall = (name, payload, callId) => {
+        const r = capBridge(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
             return r as Uint8Array;
         (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)));

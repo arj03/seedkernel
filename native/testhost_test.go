@@ -128,9 +128,11 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
     transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
     peers: () => peers || [],
     now: () => Date.now(),
-    allowedOps: opsForCaps(new Set(caps)),
+    // The granted domain prefixes, straight through: a call resolves iff its first
+    // path component is one of these (or crypto, which is never a grant).
+    allowedCaps: caps,
     // No signed manifest behind this harness, so there is no logical->kernel map to
-    // scope MODULE_CALL against. The sentinel says so explicitly; omitting the field
+    // scope module/call against. The sentinel says so explicitly; omitting the field
     // is refused (§12.2), which is the point — production reaches this call through
     // createShell, which always has a manifest.
     modules: UNSCOPED_MODULES,
@@ -138,11 +140,11 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
   });
   return __capBridge;
 };
-globalThis.__callBridge = (op, ab) => __capBridge(op, new Uint8Array(ab));
-// The round-tripping ops — NET_SEND and every FS_* — hand back a Promise (§12.2), so a
-// caller that wants their bytes has to settle it. Driven through callRealm,
+globalThis.__callBridge = (name, ab) => __capBridge(name, new Uint8Array(ab));
+// The round-tripping names — net/send and every fs/* — hand back a Promise (§12.2),
+// so a caller that wants their bytes has to settle it. Driven through callRealm,
 // which already knows how to pump the loop until a realm promise settles.
-globalThis.__callBridgeAwait = async (op, ab) => __capBridge(op, new Uint8Array(ab));
+globalThis.__callBridgeAwait = async (name, ab) => __capBridge(name, new Uint8Array(ab));
 `
 
 // capBridgeRealm boots a realm and adds the test-only cap-bridge builder above.
@@ -173,7 +175,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {
-			globalThis.__realm = await createRealm({ source: capPreamble() + __src, bridge: __capBridge,
+			globalThis.__realm = await createRealm({ source: __src, bridge: __capBridge,
 				deadlineMs: __deadlineMs || undefined });
 			globalThis.__realmCall = (entry, arg) => __realm.call(entry, new Uint8Array(arg));
 			return new Uint8Array(0);

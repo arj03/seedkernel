@@ -176,7 +176,7 @@ async function main() {
   const guest = readFileSync(join(root, "transport", "guest.js"));
   // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through
   // the one install path signed by this program's own author and is reached by logical
-  // name through MODULE_CALL. It is an ordinary §4 pure transform — three exports, no
+  // name through module/call. It is an ordinary §4 pure transform — three exports, no
   // imports but the AS shims — so the loader admits it like any other module.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
   const manifest = {
@@ -186,15 +186,16 @@ async function main() {
     modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
-      abi: 1,
-      // The AUTHORITIES this program is granted, and the whole of them: SIGN (scoped by
-      // the transport slot to DOMAIN_channel), RANDOM and CLOCK; `rawnet`, the sockets
+      abi: 2,
+      // The AUTHORITIES this program is granted, and the whole of them: `node` (the
+      // slot-scoped signer and the entropy source), `clock`; `link`, the sockets
       // behind opaque link ids; `timer`, because a zero-authority realm has no
-      // setTimeout; and `transport`, where it reports its structured output. The last
-      // two of those are slot-only and the loader refuses them to a bundle claiming no
-      // role. No `net` — that domain IS this program's output, and its own NET_SEND
-      // would loop back into itself.
-      caps: ["crypto", "clock", "timer", "rawnet", "transport", "module"],
+      // setTimeout; `transport`, where it reports its structured output; and
+      // `module`, for this bundle's own ws.wasm. The last two of those are slot-only
+      // and the loader refuses them to a bundle claiming no role. No `net` — that
+      // domain IS this program's output, and its own net/send would loop back into
+      // itself.
+      caps: ["node", "clock", "timer", "link", "transport", "module"],
       // The primitives it calls by name. NOT a grant — a pure transform reaches nothing
       // — but a compatibility claim, so a host lacking one refuses this bundle by name
       // instead of failing mid-handshake.

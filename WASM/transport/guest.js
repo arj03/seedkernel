@@ -15,39 +15,40 @@
 //
 // What the host supplies (the seam):
 //
-//   - `host.crypto(name, bytes)` — the PRIMITIVE seam: one op over a flat catalog of
-//     opaque names, none of which is a capability, because a function of its arguments
-//     grants nothing. What this program uses, declared in its manifest's
-//     `guest.primitives` so a host that lacks one refuses the bundle at load:
-//       "blake2b-256"                  bytes -> 32B         (transcript, KDF, root)
-//       "ed25519/verify"               [pk 32][sig 64][msg] -> [ok u8]   (peer AUTH)
-//       "chacha20poly1305-ietf/seal"   [npub 12][key 32][msg] -> ct      (record layer)
-//       "chacha20poly1305-ietf/open"   [npub 12][key 32][ct] -> [ok u8][pt]
-//       "x25519/dh"                    [sk 32][pk 32] -> [ok u8][x 32]   (ephemeral DH,
+//   - `host.call(name, bytes)` — ONE seam, addressed by name (§12.2). The primitives
+//     this program uses are `crypto/<name>` calls into a flat catalog of opaque names,
+//     none of which is a capability, because a function of its arguments grants
+//     nothing. What this program uses, declared in its manifest's `guest.primitives`
+//     so a host that lacks one refuses the bundle at load:
+//       "crypto/blake2b-256"               bytes -> 32B      (transcript, KDF, root)
+//       "crypto/ed25519/verify"            [pk 32][sig 64][msg] -> [ok u8]   (peer AUTH)
+//       "crypto/chacha20poly1305-ietf/seal" [npub 12][key 32][msg] -> ct      (record layer)
+//       "crypto/chacha20poly1305-ietf/open" [npub 12][key 32][ct] -> [ok u8][pt]
+//       "crypto/x25519/dh"                 [sk 32][pk 32] -> [ok u8][x 32]   (ephemeral DH,
 //                                        and against the base point, the pubkey too)
 //
 //     Changing suite is changing these names. It costs this file and a host that
 //     already carries the primitive — no op number, no ABI rev, no new grant.
 //
-//   - `host.call(op, bytes)` — the AUTHORITIES the manifest declares in `caps`, which
-//     is the whole of what this program is granted:
-//       SIGN   (2)  msg -> 64B sig. The host prefixes `DOMAIN_channel ‖ networkKey`
-//                   from THIS bundle's slot and signs the opaque suffix with the node's
-//                   channel key, which never enters this module. It does not read the
-//                   suffix — the domain separation is the guarantee, so no transcript
-//                   shape is pinned into the host and no op signs raw bytes.
-//       RANDOM (4)  [n u32 BE] -> n random bytes            (nonces, ephemeral secrets)
-//       CLOCK  (14) -> now ms (u64 BE)                      (stall clocks)
+//     The AUTHORITIES the manifest declares in `caps` — which is the whole of what this
+//     program is granted, by domain PREFIX (README §12.2):
+//       "node/sign"   msg -> 64B sig. The host prefixes `DOMAIN_channel ‖ networkKey`
+//                     from THIS bundle's slot and signs the opaque suffix with the node's
+//                     channel key, which never enters this module. It does not read the
+//                     suffix — the domain separation is the guarantee, so no transcript
+//                     shape is pinned into the host and no call signs raw bytes.
+//       "node/random" [n u32 BE] -> n random bytes            (nonces, ephemeral secrets)
+//       "clock/now"   -> now ms (u64 BE)                      (stall clocks)
 //
-//     `rawnet` — the platform's whole contribution to the network: bytes over an
-//     opaque link id, opened and closed. `timer` — deadlines, because a
-//     zero-authority realm has no setTimeout. `transport` — where this program
-//     reports its structured OUTPUT (an attributed peer, a protocol id, a
-//     correlation), which every app then reaches through the ordinary `net` domain.
+//     `link` — the platform's whole contribution to the network: bytes over an opaque
+//     link id, opened and closed. `timer` — deadlines, because a zero-authority realm
+//     has no setTimeout. `transport` — where this program reports its structured
+//     OUTPUT (an attributed peer, a protocol id, a correlation), which every app then
+//     reaches through the ordinary `net` domain. `module` — this bundle's own ws.wasm.
 //
 //     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
-//     attribution this program reports (NET_LINK_AUTH answers with the verdict, and
-//     the host has already closed the channel on a refusal); a gate this program
+//     attribution this program reports (transport/link-auth answers with the verdict,
+//     and the host has already closed the channel on a refusal); a gate this program
 //     applied to itself would be one a hostile occupant of the slot would simply skip.
 //
 //   - entrypoints, invoked synchronously by name — `linkBytes`, `timer`, `request`
@@ -56,8 +57,8 @@
 //     an entrypoint this program does not register fails loud by name rather than
 //     desyncing a decoder.
 //
-// The node key stays out of this module in the strongest sense: there is no op
-// that signs arbitrary bytes — SIGN is scoped by the slot the host admitted this
+// The node key stays out of this module in the strongest sense: there is no call
+// that signs arbitrary bytes — node/sign is scoped by the slot the host admitted this
 // bundle into, so a compromised transport can neither forge app signatures nor
 // sign for another network.
 //
@@ -129,47 +130,49 @@ function utf8Decode(b) {
   return s;
 }
 
-// ── capability op ids (must match cap-bridge's CAP) ───────────────────────────
+// ── capability names (must match the cap-bridge's dispatch table) ─────────────
 
-// Authorities only — a primitive has no op number, it has a name (see below).
-const OP_SIGN = 2;
-const OP_RANDOM = 4;
-const OP_MODULE_CALL = 13;
+// Authorities only — a primitive has no name of its own beyond `crypto/<name>` (see
+// below).
+const N_SIGN = "node/sign";
+const N_RANDOM = "node/random";
+const N_MODULE_CALL = "module/call";
 
 // The raw net capability: bytes over an opaque link id, opened and closed. This is
 // the whole of what the platform contributes — there is no peer here, no framing and
 // no attribution, because those are state machines and state machines are ours.
-const OP_LINK_OPEN = 15;
-const OP_LINK_SEND = 16;
-const OP_LINK_CLOSE = 17;
+const N_LINK_OPEN = "link/open";
+const N_LINK_SEND = "link/send";
+const N_LINK_CLOSE = "link/close";
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
-const OP_LINK_STAT = 27;
+const N_LINK_STAT = "link/stat";
 
 // The platform's event loop.
-const OP_TIMER_ARM = 19;
-const OP_TIMER_CLEAR = 20;
+const N_TIMER_ARM = "timer/arm";
+const N_TIMER_CLEAR = "timer/clear";
 
 // What this program PROVIDES back — the structured face the platform does not have.
-const OP_DELIVER = 21;
-const OP_SETTLE = 22;
-const OP_LINK_AUTH = 23;
-const OP_PEER_EDGE = 24;
-const OP_READY = 25;
-const OP_LINK_DOWN = 26;
+const N_DELIVER = "transport/deliver";
+const N_SETTLE = "transport/settle";
+const N_LINK_AUTH = "transport/link-auth";
+const N_PEER_EDGE = "transport/peer-edge";
+const N_READY = "transport/ready";
+const N_LINK_DOWN = "transport/link-down";
 
-// The primitives this program asks for by name, through the one CAP_CRYPTO op. These
-// are the strings the manifest's `guest.primitives` declares, so a host that cannot
-// serve one refuses the bundle at load rather than failing here.
-const P_HASH = "blake2b-256";
-const P_VERIFY = "ed25519/verify";
-const P_SEAL = "chacha20poly1305-ietf/seal";
-const P_OPEN = "chacha20poly1305-ietf/open";
-const P_DH = "x25519/dh";
+// The primitives this program asks for by name, through the `crypto/` prefix. These
+// are the strings the manifest's `guest.primitives` declares (minus the prefix), so a
+// host that cannot serve one refuses the bundle at load rather than failing here.
+const P_HASH = "crypto/blake2b-256";
+const P_VERIFY = "crypto/ed25519/verify";
+const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
+const P_OPEN = "crypto/chacha20poly1305-ietf/open";
+const P_DH = "crypto/x25519/dh";
 
-// The X25519 base point. `x25519/dh(sk, BASEPOINT)` is the public-key derivation, so
-// the catalog needs no keygen entry and the ephemeral secret comes from RANDOM — which
-// keeps the entropy grant where it belongs and the catalog purely functional.
+// The X25519 base point. `crypto/x25519/dh(sk, BASEPOINT)` is the public-key
+// derivation, so the catalog needs no keygen entry and the ephemeral secret comes from
+// node/random — which keeps the entropy grant where it belongs and the catalog purely
+// functional.
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
@@ -177,11 +180,11 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 // (an accepted socket; dial/accept bookkeeping and the half-open limiter apply);
 // 1 = a host-managed transport (WebRTC / browser WS) that opened the socket itself
 // and handed it over (openLink). A CORE link we DIALED never arrives this way — we
-// open those ourselves through OP_LINK_OPEN and already know everything about them.
+// open those ourselves through link/open and already know everything about them.
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
-// Link close-reason codes (OP_LINK_DOWN's u8) — mirror Link.closeReason.
+// Link close-reason codes (transport/link-down's u8) — mirror Link.closeReason.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
       REASON_LOCAL = 4, REASON_TRUNCATED = 5;
 
@@ -289,34 +292,34 @@ function hash() {
   const out = new Uint8Array(len);
   let off = 0;
   for (const p of parts) { out.set(p, off); off += p.length; }
-  return host.crypto(P_HASH, out);
+  return host.call(P_HASH, out);
 }
 function verify(pk, sig, msg) {
   let len = pk.length + sig.length + msg.length;
   const out = new Uint8Array(len);
   out.set(pk, 0); out.set(sig, pk.length); out.set(msg, pk.length + sig.length);
-  return host.crypto(P_VERIFY, out)[0] === 1;
+  return host.call(P_VERIFY, out)[0] === 1;
 }
 function randomBytes(n) {
   const req = new Uint8Array(4);
   writeU32BE(req, 0, n);
-  return host.call(OP_RANDOM, req);
+  return host.call(N_RANDOM, req);
 }
 function aeadEnc(key, npub, msg) {
   const out = new Uint8Array(npub.length + key.length + msg.length);
   out.set(npub, 0); out.set(key, npub.length); out.set(msg, npub.length + key.length);
-  return host.crypto(P_SEAL, out);
+  return host.call(P_SEAL, out);
 }
 function aeadDec(key, npub, ct) {
   const out = new Uint8Array(npub.length + key.length + ct.length);
   out.set(npub, 0); out.set(key, npub.length); out.set(ct, npub.length + key.length);
-  const r = host.crypto(P_OPEN, out);
+  const r = host.call(P_OPEN, out);
   return r[0] === 1 ? { ok: true, pt: r.subarray(1) } : { ok: false, pt: null };
 }
 function scalarmult(sk, pk) {
   const out = new Uint8Array(64);
   out.set(sk, 0); out.set(pk, 32);
-  const r = host.crypto(P_DH, out);
+  const r = host.call(P_DH, out);
   return r[0] === 1 ? { ok: true, x: r.subarray(1) } : { ok: false, x: null };
 }
 /** An ephemeral X25519 pair: entropy from the host (an authority), the public half
@@ -330,12 +333,12 @@ function boxKeypair() {
 /** Ask the host to sign a handshake transcript. The host prefixes
  *  `DOMAIN_channel ‖ networkKey` — chosen from THIS bundle's slot, not from anything
  *  said here — and signs the opaque suffix with the node's channel key, which never
- *  enters this program. There is no op that signs raw bytes, and the prefix is what
+ *  enters this program. There is no call that signs raw bytes, and the prefix is what
  *  makes a transcript signature unusable as app data (and vice versa). */
 function channelSign(root, th, id) {
   const out = new Uint8Array(96);
   out.set(root, 0); out.set(th, 32); out.set(id, 64);
-  return { ok: true, sig: host.call(OP_SIGN, out) };
+  return { ok: true, sig: host.call(N_SIGN, out) };
 }
 
 // ── calling out: the ops, each one argument-encoded and issued immediately ────
@@ -347,7 +350,7 @@ function channelSign(root, th, id) {
 // The one rule the arrangement rests on is the host's: NO OP RE-ENTERS THIS REALM.
 // A socket write does not deliver during the write, a fired timer arrives on its own
 // turn, and an inbound request is answered through the `respond` entrypoint rather
-// than as OP_DELIVER's return value — so nothing below can call back into a frame
+// than as transport/deliver's return value — so nothing below can call back into a frame
 // that is still on the stack.
 
 function argU32(v) {
@@ -366,7 +369,7 @@ function args(u32s, u8s, tail) {
 
 /** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
 function netLinkOpen(destBytes) {
-  const r = host.call(OP_LINK_OPEN, destBytes);
+  const r = host.call(N_LINK_OPEN, destBytes);
   const authLen = readU32BE(r, 5);
   return {
     linkId: readU32BE(r, 0),
@@ -374,20 +377,20 @@ function netLinkOpen(destBytes) {
     authority: authLen > 0 ? utf8Decode(r.subarray(9, 9 + authLen)) : "",
   };
 }
-function netLinkSend(linkId, bytes) { host.call(OP_LINK_SEND, args([linkId], [], bytes)); }
-function netLinkClose(linkId, graceful) { host.call(OP_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
+function netLinkSend(linkId, bytes) { host.call(N_LINK_SEND, args([linkId], [], bytes)); }
+function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
 /** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
  *  or a channel that cannot say — both read as "nothing queued", which leaves the
  *  stall clock to the deadline alone. */
-function netLinkBuffered(linkId) { return readU32BE(host.call(OP_LINK_STAT, args([linkId], [])), 0); }
+function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
 function netDeliver(corr, noReply, fromBytes, proto, payload) {
   const head = new Uint8Array(1 + proto.length);
   head[0] = proto.length;
   head.set(proto, 1);
-  host.call(OP_DELIVER, args([corr], [noReply ? 1 : 0], concatBytes([fromBytes, head, payload])));
+  host.call(N_DELIVER, args([corr], [noReply ? 1 : 0], concatBytes([fromBytes, head, payload])));
 }
-function netSettle(corr, ok, payload) { host.call(OP_SETTLE, args([corr], [ok ? 1 : 0], payload)); }
+function netSettle(corr, ok, payload) { host.call(N_SETTLE, args([corr], [ok ? 1 : 0], payload)); }
 /** Ask the host's WHITELIST whether this peer may link. Asked at the FIRST point the
  *  peer is known and — critically — before this end has revealed anything about
  *  itself: msg3 when accepting, msg4 when dialing. `conceal` tells the host a refusal
@@ -395,22 +398,22 @@ function netSettle(corr, ok, payload) { host.call(OP_SETTLE, args([corr], [ok ? 
  *  The gate is the host's because a predicate we applied to ourselves would gate
  *  nothing; the ORDER is ours, and it is what keeps a refusal from being an oracle. */
 function netLinkAuth(linkId, peerBytes, conceal) {
-  return host.call(OP_LINK_AUTH, args([linkId], [conceal ? 1 : 0], peerBytes))[0] === 1;
+  return host.call(N_LINK_AUTH, args([linkId], [conceal ? 1 : 0], peerBytes))[0] === 1;
 }
-function netPeerEdge(up, peerBytes) { host.call(OP_PEER_EDGE, args([], [up ? 1 : 0], peerBytes)); }
-function netReady(ok) { host.call(OP_READY, args([], [ok ? 1 : 0])); }
-function netLinkDown(linkId, reason) { host.call(OP_LINK_DOWN, args([linkId], [reason])); }
+function netPeerEdge(up, peerBytes) { host.call(N_PEER_EDGE, args([], [up ? 1 : 0], peerBytes)); }
+function netReady(ok) { host.call(N_READY, args([], [ok ? 1 : 0])); }
+function netLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
 // ── timers ────────────────────────────────────────────────────────────────────
 
 function armTimer(ms, fn) {
   const id = nextTimerId++;
   timers.set(id, fn);
-  host.call(OP_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], []));
+  host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], []));
   return id;
 }
 function clearTimer(id) {
-  if (timers.delete(id)) host.call(OP_TIMER_CLEAR, args([id], []));
+  if (timers.delete(id)) host.call(N_TIMER_CLEAR, args([id], []));
 }
 function fireTimer(id) {
   const fn = timers.get(id);
@@ -499,7 +502,7 @@ function moduleCall(name, req) {
   out[0] = n.length;
   out.set(n, 1);
   out.set(req, 1 + n.length);
-  return host.call(OP_MODULE_CALL, out);
+  return host.call(N_MODULE_CALL, out);
 }
 
 function wsCall(req) {
@@ -1488,7 +1491,7 @@ class Core {
     this.addrs.set(toHex(peerBytes), secret.length > 0 ? secret : null);
   }
 
-  // Top a dialed peer up to connsPerPeer outbound links. `NET_LINK_OPEN` is the raw
+  // Top a dialed peer up to connsPerPeer outbound links. `link/open` is the raw
   // capability and it answers immediately with the link id (or 0 for no route), so the
   // link lands in `connecting` before this returns — there is no in-flight dial window,
   // and so no queue of frames waiting one out.
@@ -1784,8 +1787,8 @@ entry("sendFrame", (r) => {
   core.sendFrame(toHex(to), r.blob().slice());
 });
 
-/** The answer to a NET_DELIVER, on a later turn than the delivery itself — which is
- *  what lets the app-side handler be asynchronous, and what keeps an op from
+/** The answer to a transport/deliver, on a later turn than the delivery itself — which is
+ *  what lets the app-side handler be asynchronous, and what keeps a call from
  *  re-entering a guest frame that is still on the stack. */
 entry("respond", (r) => {
   const corr = r.u32();

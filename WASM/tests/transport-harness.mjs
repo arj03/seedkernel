@@ -22,7 +22,7 @@ export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js"
 export const { KernelHost } = await imp("build/host/kernel-host.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
-/** The link close-reason codes the transport guest reports through NET_LINK_DOWN
+/** The link close-reason codes the transport guest reports through transport/link-down
  *  (transport/guest.js, `REASON_*`). The host only relays the number to whoever
  *  handed the channel in, so the vocabulary lives with the occupant and here,
  *  where the tests assert it. */

@@ -136,7 +136,7 @@ func TestMlKemAcvpVectors(t *testing.T) {
 }
 
 // TestMlKemThroughCatalog drives the KEM the way a guest does — by name, through the
-// one CAP_CRYPTO op — rather than through the Go wrapper. That is the path that has
+// `crypto/` prefix — rather than through the Go wrapper. That is the path that has
 // to work end to end on this target: `PRIMITIVE_NAMES` is what a manifest's
 // `guest.primitives` is checked against in `verifyManifest` (bundle.ts), so a host
 // whose `__sodium` lacked these methods would admit a bundle by name and then fail it
@@ -144,8 +144,8 @@ func TestMlKemAcvpVectors(t *testing.T) {
 //
 // It also pins the thing the Go wrapper alone cannot: that the shared cap-bridge, the
 // sodium shim's ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract
-// line up. A bundle declaring NO crypto domain runs it, because a pure transform is
-// not a capability .
+// line up. A bundle declaring NO caps runs it, because a pure transform is
+// not a capability.
 func TestMlKemThroughCatalog(t *testing.T) {
 	capBridgeRealm(t)
 
@@ -157,9 +157,8 @@ func TestMlKemThroughCatalog(t *testing.T) {
 	}
 	prim := func(name string, args []byte) []byte {
 		t.Helper()
-		payload := append([]byte{byte(len(name))}, name...)
 		fn := qc.Global().GetPropertyStr("__callBridge")
-		v, err := qc.Invoke(fn, qc.NewUndefined(), qc.NewInt32(capCrypto), qc.NewArrayBuffer(append(payload, args...)))
+		v, err := qc.Invoke(fn, qc.NewUndefined(), qc.NewString("crypto/"+name), qc.NewArrayBuffer(args))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}

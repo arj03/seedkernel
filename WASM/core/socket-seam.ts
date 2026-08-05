@@ -10,7 +10,7 @@
 // It carries no crypto shape. The `TransportCrypto` interface that used to sit here
 // described "the narrow libsodium surface the channel handshake needs", and the channel
 // handshake is now the transport bundle's program, which reaches crypto through the
-// cap-bridge's one `CRYPTO` op (`CapSodium`, cap-bridge.ts) like any other guest. A
+// cap-bridge's `crypto/` prefix (`CapSodium`, cap-bridge.ts) like any other guest. A
 // second, parallel declaration of the host's crypto surface had stopped describing
 // anything: the native shim already refuses the keyed `crypto_generichash` that
 // interface promised, and nothing noticed, because nothing called it.
@@ -40,7 +40,7 @@ export interface RawLink {
  *  The one thing that distinguishes a slow exchange from a stalled one: a request whose
  *  bytes are still draining is progressing, however long it is taking, while one whose
  *  backlog has not moved is waiting on the far end. The transport bundle's stall clock
- *  polls it (NET_LINK_STAT) rather than timing an exchange from the moment it was
+ *  polls it (link/stat) rather than timing an exchange from the moment it was
  *  *queued*, which would measure our own upload and cancel healthy requests under
  *  backpressure. Optional: a transport that cannot say returns nothing and the clock
  *  falls back to a plain deadline. */

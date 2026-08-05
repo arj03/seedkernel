@@ -212,14 +212,14 @@ from being wrong, and being wrong is silent: signatures still verify, just for m
 than intended. A single omitted or mismatched prefix on a signing path turns that signer
 into an oracle for every other purpose sharing the key.
 
-Key separation is a property of the **keys**. The cap-bridge `SIGN` op cannot emit a channel
-handshake signature because it does not hold the channel key, whatever happens to the
-prefixes.
+Key separation is a property of the **keys**. The cap-bridge `node/sign` name cannot emit a
+channel handshake signature because it does not hold the channel key, whatever happens to
+the prefixes.
 
-That distinction matters most where a signing oracle is deliberate, and `SIGN` is exactly
-that: it signs guest-supplied bytes on request, exposed to guest code. Domain separation is
-what makes it safe today; key separation is what keeps it safe after someone edits the
-signing path.
+That distinction matters most where a signing oracle is deliberate, and `node/sign` is
+exactly that: it signs guest-supplied bytes on request, exposed to guest code. Domain
+separation is what makes it safe today; key separation is what keeps it safe after someone
+edits the signing path.
 
 This is the practice Noise asks for when it says a static key pair should not be used
 outside the protocol it was generated for, and the reasoning behind libsodium's
@@ -310,12 +310,12 @@ goal and belongs in its own suite.
 **Impersonation after key compromise.** Seizing a node's master seed lets an attacker be
 that node. Only §3's deferral limits the *retroactive* damage.
 
-**Guest signature verification across nodes is unfinished.** §7 moves `SIGN` onto the guest
-subkey, so `CAP.IDENTITY` now returns that subkey's public half while `senderPk` carries the
-channel key. Nothing in the tree verifies a peer's guest signature today, but anything that
-wants to will need the guest subkey published authentically. The natural home is the
-handshake — msg3 and msg4 already carry a signed identity — but that is a §12.2 decision
-about what guests are told, not a §12.6 one, and it is deliberately left open.
+**Guest signature verification across nodes is unfinished.** §7 moves `node/sign` onto the
+guest subkey, so `node/identity` now returns that subkey's public half while `senderPk`
+carries the channel key. Nothing in the tree verifies a peer's guest signature today, but
+anything that wants to will need the guest subkey published authentically. The natural home
+is the handshake — msg3 and msg4 already carry a signed identity — but that is a §12.2
+decision about what guests are told, not a §12.6 one, and it is deliberately left open.
 
 ---
 
@@ -348,7 +348,7 @@ at the first point the peer is known and before this end has revealed anything a
 would be one message too late on the accepting side, because that is reached only after
 msg4 — the receiver's identity and signature — is already on the wire. A concealed refusal
 is also silence rather than a close: closing at msg3 would answer the same question the
-ordering exists to leave unanswered. `NET_LINK_AUTH` carries a `conceal` flag for exactly
+ordering exists to leave unanswered. `transport/link-auth` carries a `conceal` flag for exactly
 that distinction.
 
 ---

@@ -130,7 +130,7 @@ func (el *eventLoop) removeContext(c *qjs.Context) {
 // guest job that schedules a host job — which every parked `host.call` does, since the
 // settlement is a host-realm `.then` — queues it after el.c has already been drained
 // here. That job waits for the NEXT round, so something has to schedule one. __host_call
-// wakes the loop whenever an op parks, which is exactly the case that would otherwise
+// wakes the loop whenever a call parks, which is exactly the case that would otherwise
 // have nothing else coming (see guest.go). Ordering the pumps the other way would only
 // move the problem, and looping to a fixpoint would need a "did any queue advance"
 // signal that qjs.Context.Pump does not report.

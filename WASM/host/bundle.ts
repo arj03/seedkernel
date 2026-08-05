@@ -28,12 +28,12 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
 import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
     /** Logical name, e.g. "codec". Three jobs, one value: the module's file in the
-     *  container (`<name>.wasm`), the key the guest addresses it by through MODULE_CALL
+     *  container (`<name>.wasm`), the key the guest addresses it by through module/call
      *  (the bridge resolves it to the kernel name), and — with the manifest `app` — the
      *  kernel name derived from it (`kernelNameFor`). Unique within a manifest, and
      *  restricted to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
@@ -73,18 +73,18 @@ export interface BundleGuest {
      *  guest author who never thought about the seam version is indistinguishable from one
      *  who meant the old one. There is nothing to infer here, so the format asks. */
     abi: number;
-    /** Capability *domains* (cap-bridge `CAP_DOMAINS` keys: "crypto" | "net" | "fs" |
-     *  "module" | "clock") granted to the guest. The shell expands these to the concrete
-     *  allowed op set and wires only the matching backends — so this is the enforced
-     *  capability declaration, not just documentation. Required whenever a guest exists;
-     *  an empty array is a guest with no authority at all.
+    /** Capability *domains* (`CAP_DOMAINS`, core/domains.ts) granted to the guest —
+     *  the prefixes the bridge enforces on its `host.call` names (§12.2), and the only
+     *  backends the shell wires. Required whenever a guest exists; an empty array is a
+     *  guest with no authority at all.
      *
      *  Only *authorities* appear here. Crypto primitives do not — they reach nothing, so
-     *  there is nothing to grant; see `primitives` below and the note on `CAP` in
-     *  cap-bridge.ts. */
+     *  there is nothing to grant; see `primitives` below and the note on the `crypto/`
+     *  prefix in cap-bridge.ts. */
     caps: string[];
-    /** The host crypto primitives this guest calls by name (cap-bridge `cryptoCatalog`
-     *  keys: "blake2b-256", "x25519/dh", "chacha20poly1305-ietf/seal", …).
+    /** The host crypto primitives this guest calls by name (`PRIMITIVE_NAMES`, the
+     *  bare names under the `crypto/` prefix: "blake2b-256", "x25519/dh",
+     *  "chacha20poly1305-ietf/seal", …).
      *
      *  **A compatibility declaration, not a capability one.** It grants nothing; it lets a
      *  host that cannot serve a name refuse the load *by name* instead of failing at the
@@ -319,7 +319,7 @@ export function appKeyFor(author: Uint8Array, app: string): string {
  *  Kernel names never leave the host. Nothing on the wire names another node's
  *  handler: a peer sends a protocol id or an opcode and the receiving host resolves it
  *  through its own bindings (§12.10) to whichever app it holds. A guest reaches its own
- *  modules by logical name through MODULE_CALL, and the bridge resolves the logical name
+ *  modules by logical name through module/call, and the bridge resolves the logical name
  *  to the kernel name — so the guest never sees a kernel name at all. This needs to be
  *  collision-free within one node, not agreed across a deployment. */
 export function kernelNameFor(author: Uint8Array, app: string, moduleName: string): string {
@@ -542,7 +542,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
     }
     // A handler-only bundle is ONE pure transform (§4): nothing else can reach its
     // modules — a handler cannot call another handler (§4.2) and with no guest there is
-    // no MODULE_CALL to drive them — so there is no second module to dispatch and no
+    // no module/call to drive them — so there is no second module to dispatch and no
     // `entry` field to pick one. The single module IS the app's inbound entry, and
     // anything multi-module ships a guest, which dispatches itself (§12.10).
     if (o.guest === undefined && o.modules.length !== 1)
@@ -657,17 +657,21 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
             throw new Error(`bundle: this host has no crypto primitive "${p}" (manifest guest.primitives; this host serves: ${PRIMITIVE_NAMES.join(", ")})`);
         }
     }
-    // The slot-only domains (§12.5). `rawnet` is the platform's socket seam
-    // and `transport` is the slot's provision seam; an ordinary app declaring either is a
-    // refused manifest, not a cap that quietly resolves to nothing at first use. This is
-    // an AUTHORITY check rather than a compatibility one — unlike the two above — so it
-    // belongs at the point the manifest becomes trusted, before any policy predicate is
-    // shown a bundle it must never admit as an app.
+    // The capability vocabulary (§12.2) is CLOSED — an unknown domain is a refused
+    // manifest, not a cap that quietly grants nothing at first use — and `link` and
+    // `transport` (§12.5) are the slot occupant's; an app declaring either is refused
+    // too. Both are AUTHORITY checks, so they belong at the point the manifest becomes
+    // trusted, before any policy predicate is shown a bundle it must never admit.
     if (parsed.role === undefined) {
         for (const c of parsed.guest?.caps ?? []) {
             if (SLOT_ONLY_DOMAINS.includes(c)) {
                 throw new Error(`bundle: capability domain "${c}" belongs to a slot occupant, and ${parsed.app} claims no role (§12.4)`);
             }
+        }
+    }
+    for (const c of parsed.guest?.caps ?? []) {
+        if (!(CAP_DOMAINS as readonly string[]).includes(c)) {
+            throw new Error(`bundle: unknown capability domain "${c}" (this host grants: ${CAP_DOMAINS.join(", ")})`);
         }
     }
     return { author, authorKeys, suite, manifest: parsed };

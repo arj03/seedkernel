@@ -44,32 +44,35 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  (§12.2). A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
  *  refuses a guest written for an ABI this host does not implement.
  *
- *  Bumped when an existing op changes what it RETURNS — an op moving across the
- *  sync/async line, a payload framing change. Adding an op does not: a guest written
- *  against ABI n that never calls the new op behaves identically, and one that does call
- *  it declares the domain and gets it.
+ *  Bumped when the seam's shape changes — the naming scheme of `host.call`'s first
+ *  argument, a payload framing change, a name moving across the sync/async line.
+ *  Adding a name to the catalog does not: a guest written against ABI n that never
+ *  calls the new name behaves identically, and one that does call it declares the
+ *  domain and gets it.
  *
- *  The field exists because the failure it guards is silent. A guest that writes
- *  `host.call(FS_GET, k)` without awaiting gets a Promise where bytes were expected and
- *  reads `undefined` — a wrong answer, not an error, and one no amount of care at the
- *  call site turns into a loud one. Declaring the seam version makes it a refused load.
+ *  The field exists because the failure it guards is silent. A guest written against
+ *  a different seam shape — a numbered op where this host reads a name, a synchronous
+ *  return where this host settles a promise — reads `undefined` where bytes were
+ *  expected, a wrong answer rather than an error, and one no amount of care at the call
+ *  site turns into a loud one. Declaring the seam version makes it a refused load.
  *
  *  **It lives HERE, with the suite ids, rather than in cap-bridge.ts where the seam it
  *  versions is defined.** It is the same kind of thing they are — a number naming which
  *  version of a contract a signed document was written for, read by the loader before
  *  anything is trusted — and putting it here is what keeps the loader from importing the
- *  guest bridge to check a manifest field. That edge would drag the whole op catalog and
- *  preamble into every page that verifies a bundle, including handler-only shells
+ *  guest bridge to check a manifest field. That edge would drag the whole name catalog
+ *  and preamble into every page that verifies a bundle, including handler-only shells
  *  (seedchat) that never build a bridge at all. cap-bridge.ts re-exports it, so a reader
- *  of the seam still finds the number next to the ops. */
-export const GUEST_ABI_VERSION = 1;
-/** The crypto primitives this host serves through the one `CAP.CRYPTO` op — the catalog
+ *  of the seam still finds the number next to the names. */
+export const GUEST_ABI_VERSION = 2;
+/** The crypto primitives this host serves through the `crypto/` prefix — the catalog
  *  a manifest's `guest.primitives` is checked against at load (§12.4).
  *
  *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: the
  *  loader checks a manifest field before anything is trusted, and it should not have to
- *  import the op catalog and preamble to do it. cap-bridge.ts builds the dispatch map
- *  from this list and re-exports it, so the names and the transforms cannot drift.
+ *  import the op catalog and preamble to do it. cap-bridge.ts dispatches through the
+ *  `crypto/` prefix — its table keys are the template literal over this list, so the
+ *  names and the transforms cannot drift.
  *
  *  **Adding a name here is the whole cost of a new algorithm** — no op number, no ABI
  *  rev, no capability domain. That is the point of a named catalog, and it is why a core
@@ -90,36 +93,35 @@ export const PRIMITIVE_NAMES = [
     // a credible break, so they land now.
     //
     // Derandomized, like every other entry: the coins are an argument, drawn by the
-    // guest from `RANDOM` — an authority — so the catalog stays purely functional.
+    // guest from `node/random` — an authority — so the catalog stays purely functional.
     "ml-kem-768/keypair",
     "ml-kem-768/encaps",
     "ml-kem-768/decaps",
 ] as const;
 
 export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
-/** The capability domains only a SLOT occupant may declare (§12.5).
- *
- *  `rawnet` is what the transport slot consumes — sockets behind opaque link ids, the
- *  whole of what the platform contributes to the network — and `transport` is what it
- *  provides back: the attributed peer, protocol id and correlation every other app's
- *  `net` domain reaches. Neither is an app capability. Splitting the two nets is what
- *  makes that statable at all: before it, `net` meant the structured thing and an app
- *  declaring it was implicitly being handed the transport's output and the platform's
- *  socket seam under one word.
- *
- *  Enforced at load, not at first use, and on the same argument that keeps
- *  `authorAllowlist` from admitting a slot claim: an authority class this large needs a
- *  deliberate per-slot policy decision, never a cap string an ordinary app can add to
- *  its own manifest and have quietly honoured.
- *
- *  `timer` is deliberately NOT here. It is an ordinary authority — small, host-bounded,
- *  and useful to any guest that needs a deadline — and the transport happening to want
- *  one is not a reason to make it a privilege.
+/** The capability *domains* a bundle's manifest may declare in `guest.caps` (§12.4) —
+ *  the granted prefixes of the name-addressed seam (§12.2). A domain IS its prefix: the
+ *  bridge refuses any `host.call(name, …)` whose first path component is not one of
+ *  these — or `crypto`, which is not here because it is never a grant (§12.1). The
+ *  vocabulary is closed, checked at load, so a manifest naming a domain this host has
+ *  never heard of is a refused bundle rather than a cap that quietly grants nothing at
+ *  first use. Adding a name to a domain here is the whole cost of a new op.
  *
  *  Here rather than in cap-bridge.ts for the reason `GUEST_ABI_VERSION` is: the loader
- *  checks this against a manifest before anything is trusted, and should not have to
- *  import the op catalog to do it. */
-export const SLOT_ONLY_DOMAINS: readonly string[] = ["rawnet", "transport"];
+ *  checks a manifest's caps against this list before anything is trusted, and should not
+ *  have to import the guest bridge to do it. cap-bridge.ts dispatches through a table
+ *  whose every name must carry one of these prefixes (checked at construction), so the
+ *  two cannot drift. */
+export const CAP_DOMAINS: readonly string[] = ["node", "net", "fs", "module", "clock", "timer", "link", "transport"];
+/** The capability domains only a SLOT occupant may declare (§12.5). `link` is what the
+ *  transport slot consumes — sockets behind opaque link ids, the whole of what the
+ *  platform contributes to the network — and `transport` is what it provides back: the
+ *  attributed peer, protocol id and correlation every other app's `net` domain reaches.
+ *  Neither is an app capability, and the loader refuses either to a manifest claiming no
+ *  role. `timer` is deliberately NOT here: it is an ordinary authority, and the transport
+ *  happening to want one is not a reason to make it a privilege. */
+export const SLOT_ONLY_DOMAINS: readonly string[] = ["link", "transport"];
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

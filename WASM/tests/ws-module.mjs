@@ -1,7 +1,7 @@
 // A test-only driver for ws.wasm's 4-op ABI (assembly/ws/index.ts).
 //
 // RFC 6455 framing is content, so the codec runs in the transport bundle's guest over
-// this module, reached by MODULE_CALL. What is reachable from the host side is the
+// this module, reached by module/call. What is reachable from the host side is the
 // module itself, and its conformance is worth testing directly rather than only through
 // a live link — a bad mask direction or a fragmented control frame is far easier to
 // provoke here than over a socket.

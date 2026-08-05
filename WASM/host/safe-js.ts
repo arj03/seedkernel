@@ -9,12 +9,13 @@
 // bridges.
 //
 // Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
-// `host.call` resolves a **sync op** (the primitive catalog, clock, module, the raw-link
-// and transport ops) to its bytes immediately, and a **round-tripping op** — `NET_SEND`
-// and every `FS_*` — to a real Promise the guest `await`s. The guest builds that Promise
-// itself (the shared preamble parks it under a `callId`); this host returns `null` to say
-// "started async", then settles it with `__netResolve`/`__netReject` and pumps
-// `executePendingJobs()` so the awaiting continuation runs. Deliberately NOT
+// `host.call(name, bytes)` resolves a **sync name** (the primitive catalog, clock,
+// module, the raw-link and transport names) to its bytes immediately, and a
+// **round-tripping name** — `net/send` and every `fs/*` — to a real Promise the guest
+// `await`s. The guest builds that Promise itself (the shared preamble parks it under a
+// `callId`); this host returns `null` to say "started async", then settles it with
+// `__netResolve`/`__netReject` and pumps `executePendingJobs()` so the awaiting
+// continuation runs. Deliberately NOT
 // quickjs-emscripten's `newPromise()` deferred: keeping the async half in plain
 // ECMAScript is what lets this host and the native loader (guest.go, quickjs-ng over
 // wazero, which has no promise primitive) share ONE preamble — see `guestPreamble` in
@@ -59,11 +60,12 @@ const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
 import { guestPreamble } from "./cap-bridge.js";
 import { serializeCalls } from "./realm-queue.js";
 
-/** The one capability seam. `op` selects a host capability (net / fs / crypto / clock /
- *  rand, mapped by the host); `payload`/return are opaque bytes, exactly like
- *  `kernel.call(name, payload) -> bytes`. A sync op returns bytes directly; a
- *  round-tripping one — `NET_SEND` and every `FS_*` — returns a Promise the guest awaits. */
-export type SafeRealmBridge = (op: number, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+/** The one capability seam. `name` addresses a host capability by its opaque name
+ *  (net / fs / crypto / clock / rand, mapped by the host); `payload`/return are opaque
+ *  bytes, exactly like `kernel.call(name, payload) -> bytes`. A sync name returns bytes
+ *  directly; a round-tripping one — `net/send` and every `fs/*` — returns a Promise the
+ *  guest awaits. */
+export type SafeRealmBridge = (name: string, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
 
 export interface SafeRealmOptions {
   /** Guest source. Runs in the sandbox; registers entrypoints via the injected
@@ -285,7 +287,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // Settle a parked net op by calling the guest's own __netResolve/__netReject (the
+  // Settle a parked host.call by calling the guest's own __netResolve/__netReject (the
   // preamble's half of the contract), then pump so the awaiting continuation runs.
   const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle): void => {
     const settler = ctx.getProp(ctx.global, fn);
@@ -316,20 +318,20 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // The single seam. QuickJS calls it synchronously: a sync op resolves to its bytes and
-  // we hand the ArrayBuffer straight back; a net op genuinely round-trips, so we return
-  // null — the preamble parks a Promise under callId — and settle it when the bridge
-  // promise resolves. Returning null (rather than a host-created deferred) is what keeps
-  // this seam identical to the native loader's; see guestPreamble.
-  const hostCall = ctx.newFunction("__host_call", (opHandle, callIdHandle, payloadHandle) => {
-    const op = ctx.getNumber(opHandle);
+  // The single seam. QuickJS calls it synchronously: a sync name resolves to its bytes
+  // and we hand the ArrayBuffer straight back; a net/fs name genuinely round-trips, so
+  // we return null — the preamble parks a Promise under callId — and settle it when the
+  // bridge promise resolves. Returning null (rather than a host-created deferred) is
+  // what keeps this seam identical to the native loader's; see guestPreamble.
+  const hostCall = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
+    const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    const result = opts.bridge(op, copyPayload(ctx, payloadHandle));
+    const result = opts.bridge(name, copyPayload(ctx, payloadHandle));
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
-      // Sync op — return the bytes directly (no promise, no job queue).
+      // Sync name — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
     }
-    // Net op — a genuine round trip. The guest holds the Promise; we settle it by callId.
+    // Net/fs name — a genuine round trip. The guest holds the Promise; we settle it by callId.
     (result as Promise<Uint8Array>).then(
       (bytes) => {
         if (disposed || !ctx.alive) return;

@@ -15,8 +15,8 @@ import (
 // the realm is zero-authority — the host capabilities are not reachable by name.
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
-// put hashes the data (CAP_CRYPTO, by name) and stores it under that id (CAP_FS_PUT); get
-// fetches by id (CAP_FS_GET). `probe` reports any leaked host globals.
+// put hashes the data (crypto/blake2b-256, by name) and stores it under that id
+// (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals.
 const storeGuestSource = `
 function hex(u8) { let s = ""; for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0"); return s; }
 function fsPutArg(key, bytes) {
@@ -28,17 +28,14 @@ function fsPutArg(key, bytes) {
   return out;
 }
 register("put", async (data) => {
-  // A primitive is reached BY NAME through the one CAP_CRYPTO op:
-  // [nameLen u8][name utf8][args].
-  const nm = new TextEncoder().encode("blake2b-256");
-  const call = new Uint8Array(1 + nm.length + data.length);
-  call[0] = nm.length; call.set(nm, 1); call.set(data, 1 + nm.length);
-  const id = host.call(CAP_CRYPTO, call);
-  await host.call(CAP_FS_PUT, fsPutArg(hex(id), data));
+  // A primitive is reached BY NAME through the crypto/ prefix — the name is the
+  // seam, not an op number — and it resolves synchronously like every primitive.
+  const id = host.call("crypto/blake2b-256", data);
+  await host.call("fs/put", fsPutArg(hex(id), data));
   return id;
 });
 register("get", async (id) => {
-  const r = await host.call(CAP_FS_GET, new TextEncoder().encode(hex(id)));
+  const r = await host.call("fs/get", new TextEncoder().encode(hex(id)));
   if (r.length < 1 || r[0] !== 1) throw new Error("not found");
   return r.slice(1);
 });
@@ -186,7 +183,7 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	capBridgeRealm(t)
 
-	// A stub transport is enough: NET_SEND only needs a promise that settles on the
+	// A stub transport is enough: net/send only needs a promise that settles on the
 	// loop, and using one keeps the kill (not a socket) as the only variable.
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
@@ -210,7 +207,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 		  req.set(peer, 0);
 		  req[32] = proto.length;
 		  req.set(proto, 33);
-		  await host.call(CAP_NET_SEND, req);
+		  await host.call("net/send", req);
 		  for (;;) {}                 // burn the budget in the CONTINUATION
 		});
 	`, 300)
@@ -291,7 +288,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		  req.set(peer, 0);
 		  req[32] = proto.length;
 		  req.set(proto, 33);
-		  await host.call(CAP_NET_SEND, req);
+		  await host.call("net/send", req);
 		  return new Uint8Array([1]);
 		});
 	`, 0)

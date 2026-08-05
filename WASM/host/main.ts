@@ -73,7 +73,7 @@ export interface ShellOptions {
      *  for the transport role. A shell without an admitted transport bundle has no
      *  network. */
     transportBundle?: Uint8Array;
-    /** Live connected peers for the NET_PEERS cap. The transport owns
+    /** Live connected peers for the net/peers name. The transport owns
      *  connectivity; this closure feeds it into the cap-bridge. */
     livePeers?: () => PeerId[];
     /** Default per-request deadline in ms — how long one net request may take before

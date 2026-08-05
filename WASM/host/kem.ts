@@ -26,8 +26,8 @@
 //
 // **Nothing here draws entropy.** Every operation takes its coins as an argument,
 // because a catalog entry is a pure function of its argument bytes (cap-bridge.ts):
-// a guest gets randomness from `RANDOM`, an authority it was granted, and hands it
-// in — the same shape as an ephemeral X25519 pair being `RANDOM(32)` plus
+// a guest gets randomness from `node/random`, an authority it was granted, and hands it
+// in — the same shape as an ephemeral X25519 pair being `node/random(32)` plus
 // `x25519/dh`. Keeping the grant out of the primitive is what makes the primitive
 // free to call.
 //
@@ -75,7 +75,7 @@ interface MlKemExports {
 /** Instantiate mlkem768.wasm. Async because browsers refuse synchronous
  *  compilation of anything over 4 KB on the main thread — but only the *load* is
  *  async: every operation below is synchronous, which is what lets the cap-bridge's
- *  `CRYPTO` op stay a synchronous byte transform. */
+ *  `crypto/` prefix stay a synchronous byte transform. */
 export async function loadMlKem768(wasm: BufferSource): Promise<MlKem768> {
   const { instance } = await WebAssembly.instantiate(wasm, {});
   return createMlKem768(instance);
