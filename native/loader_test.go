@@ -7,10 +7,10 @@ import (
 	"testing"
 )
 
-// boundToWasm reports whether `n` resolves — through the handler table, the way every call
-// path resolves it — to an installed wasm handler.
-func boundToWasm(n string) bool {
-	return handlers[n] != nil
+// boundToWasm reports whether an app's module resolves — through the handler table, the way
+// every call path resolves it — to an installed wasm handler.
+func boundToWasm(appKey, module string) bool {
+	return apps[appKey][module] != nil
 }
 
 // TestScratchRegion covers the §4.1 reservation on this target: a handler that declares no
@@ -25,11 +25,11 @@ func boundToWasm(n string) bool {
 // since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
-	n := kernelNameFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp", "fwd")
-	if err := installWasm(n, forwarderWasm, 0x20000); err != nil {
-		t.Fatalf("installWasm(forwarder) refused: %v", err)
+	key := appKeyFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp")
+	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		t.Fatalf("bindAll(forwarder) refused: %v", err)
 	}
-	w := handlers[n]
+	w := apps[key]["fwd"]
 	if w.size != 0x20000 {
 		t.Fatalf("a handler exporting no scratchSize should get the 128 KB default, got %d",
 			w.size)
@@ -38,11 +38,11 @@ func TestScratchRegion(t *testing.T) {
 	// proving the host stages input at `scratch`, calls handle, and reads the response
 	// from the same region (README §4).
 	msg := []byte("hello handler")
-	if r := callHandler(n, msg); !bytes.Equal(r, msg) {
+	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
 		t.Fatalf("echo handler returned %q, want %q", r, msg)
 	}
 	// A payload past the reserved region is refused by the clamp, not by memory bounds.
-	if r := callHandler(n, make([]byte, w.size+1)); r != nil {
+	if r := callModule(key, "fwd", make([]byte, w.size+1)); r != nil {
 		t.Fatalf("a payload past the reserved region must be refused, got %d B", len(r))
 	}
 }
@@ -58,12 +58,12 @@ func TestBundleModuleRuns(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, kernelName := writeTestBundle(t, author, authorPub, "runapp", 1)
+	bundlePath, appKey := writeTestBundle(t, author, authorPub, "runapp", 1)
 	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  handles=[runapp]") {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")
-	if r := callHandler(kernelName, msg); !bytes.Equal(r, msg) {
+	if r := callModule(appKey, "fwd", msg); !bytes.Equal(r, msg) {
 		t.Fatalf("bundle module echo = %q, want %q (module ran + host read its response)", r, msg)
 	}
 }

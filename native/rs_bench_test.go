@@ -40,7 +40,7 @@ const (
 
 var (
 	rsOnce      sync.Once
-	rsCodecName string
+	rsAppKey string
 	rsEncodeReq []byte // [OP_ENCODE][k][m][bs BE][640 KB data]
 	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks] — block 0 lost
 	rsReady     bool
@@ -134,10 +134,10 @@ func setupRS(tb testing.TB) {
 		rsSetupErr = fmt.Errorf("loadBundle(%s): %s", path, status)
 		return
 	}
-	// Where the loader bound the bundle's `codec` module: derived from the manifest's
-	// signed (author, app, name) triple (§5.1), not declared anywhere. `author` is the
-	// key we just authorized, so this is the name that bundle's module landed at.
-	rsCodecName = kernelNameFor(author, "seedstore", "codec")
+	// Which app the loader bound the bundle's modules under: derived from the manifest's
+	// signed (author, app) pair (§5.1), not declared anywhere. `author` is the key we just
+	// authorized, so this is the entry that bundle's `codec` module landed in.
+	rsAppKey = appKeyFor(author, "seedstore")
 
 	// 640 KB of deterministic data (content is irrelevant to RS timing; this is the
 	// same cheap fill bench.mjs uses).
@@ -151,9 +151,9 @@ func setupRS(tb testing.TB) {
 	binary.BigEndian.PutUint32(rsEncodeReq[3:7], rsBS)
 	copy(rsEncodeReq[7:], data)
 
-	parity := callHandler(rsCodecName, rsEncodeReq)
+	parity := callModule(rsAppKey, "codec", rsEncodeReq)
 	if len(parity) != rsM*rsBS {
-		rsSetupErr = fmt.Errorf("encode via %s returned %d B, want %d", rsCodecName, len(parity), rsM*rsBS)
+		rsSetupErr = fmt.Errorf("encode via %s returned %d B, want %d", rsAppKey, len(parity), rsM*rsBS)
 		return
 	}
 
@@ -173,10 +173,10 @@ func setupRS(tb testing.TB) {
 	rows[rsK-1] = byte(rsK) // first parity row (index k)
 	copy(blocks[(rsK-1)*rsBS:], parity[:rsBS])
 
-	out := callHandler(rsCodecName, rsDecodeReq)
+	out := callModule(rsAppKey, "codec", rsDecodeReq)
 	if len(out) != rsK*rsBS || !bytes.Equal(out[:rsBS], data[:rsBS]) {
 		// Don't report a bogus rate for a codec that didn't rebuild the lost block.
-		rsSetupErr = fmt.Errorf("decode via %s did not reconstruct block 0 (%d B out)", rsCodecName, len(out))
+		rsSetupErr = fmt.Errorf("decode via %s did not reconstruct block 0 (%d B out)", rsAppKey, len(out))
 		return
 	}
 	rsReady = true
@@ -193,7 +193,7 @@ func BenchmarkRSEncode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		callHandler(rsCodecName, rsEncodeReq)
+		callModule(rsAppKey, "codec", rsEncodeReq)
 	}
 }
 
@@ -208,6 +208,6 @@ func BenchmarkRSDecode(b *testing.B) {
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		callHandler(rsCodecName, rsDecodeReq)
+		callModule(rsAppKey, "codec", rsDecodeReq)
 	}
 }

@@ -34,7 +34,7 @@ const sodium = await loadSodium();
 // hands it out with its address; a single value here just means every test node is
 // reachable by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createCapBridge, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_CAPS, UNSCOPED_MODULES, GUEST_ABI_VERSION }
+const { createCapBridge, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_CAPS, GUEST_ABI_VERSION }
   = await imp("build/host/cap-bridge.js");
 // ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
 // itself is the bundle's now, so what is reachable from here is the module.
@@ -47,7 +47,7 @@ const { toHex, fromHex, concatBytes } = await imp("build/core/util.js");
 import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
-const { appKeyFor, genesisHash: bundleGenesisHash, kernelNameFor: bundleKernelNameFor,
+const { appKeyFor, genesisHash: bundleGenesisHash,
          signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
@@ -105,18 +105,18 @@ withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.w
 // object every target hands the cap-bridge.
 withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm"))));
 
-// Install a verified module directly under `targetName`. Bundles are the only way code
-// arrives (§12.4); there is no wire install envelope. Throws on structural failure.
-function installMod(host, targetName, wasm) {
-  host.bindAll([{ name: targetName, wasm }]);
+// Install one verified module as the whole of `appKey`'s module set. Bundles are the only
+// way code arrives (§12.4); there is no wire install envelope. Throws on structural failure.
+function installMod(host, appKey, module, wasm) {
+  host.bindAll(appKey, [{ name: module, wasm }]);
 }
 
-// The §5.1 bind name a bundle module lands at, `"<author hex>:<app>:<module>"` — the real
-// derivation, not a mirror of it, so a test can name a slot without packing a whole
+// The §5.1 app key a bundle's modules land under, `"<author hex>:<app>"` — the real
+// derivation, not a mirror of it, so a test can name a table entry without packing a whole
 // bundle and still land exactly where the loader would put it. Note the author: two
-// authors using the same `app` get different names, which is what makes ownership
+// authors using the same `app` get different keys, which is what makes ownership
 // structural rather than a rule anything has to enforce.
-const modName = (authorPk, app, mod) => bundleKernelNameFor(authorPk, app, mod);
+const appKey = (authorPk, app) => appKeyFor(authorPk, app);
 
 // ─── Test: install a module, reach it by name ───────────────────────────
 
@@ -126,22 +126,24 @@ async function testFullLifecycle() {
   const { host } = await makeHost();
 
   const { publicKey: pk } = generateKeyPair();
-  const chatName = modName(pk, "chat", "chat");
+  const chatKey = appKey(pk, "chat");
 
-  // Install the chat handler under its derived kernel name, through the same path the
-  // bundle loader uses. It is a pure transform (the forwarder fixture echoes its input).
-  installMod(host, chatName, forwarderBytes);
-  assert(host.isBound(chatName), "chat handler installed");
+  // Install the chat handler under its app's key, through the same path the bundle
+  // loader uses. It is a pure transform (the forwarder fixture echoes its input).
+  installMod(host, chatKey, "chat", forwarderBytes);
+  assert(host.isBound(chatKey, "chat"), "chat handler installed");
 
-  // There is no install record to consult: the author is IN the name (§5.1), so the
-  // table itself says who authored what it holds.
-  assert(chatName.startsWith(toHex(pk) + ":"), "kernel name leads with the author");
+  // There is no install record to consult: the author is IN the app key (§5.1), so the
+  // table itself says who authored what it holds — without parsing a module name out of
+  // anything, because the module is a key one level down.
+  assert(chatKey.startsWith(toHex(pk) + ":"), "the app key leads with the author");
 
   // Reach it by name: the host stages input at the handler's scratch, calls handle, and
   // reads the response back (README §4). A guest reaches the same handler through the
-  // cap-bridge's module/call (§12.2); here the host calls it directly.
+  // cap-bridge's module/call (§12.2), against the app key its bridge holds; here the host
+  // calls it directly.
   const text = new TextEncoder().encode("hello from author");
-  const resp = host.callHandler(chatName, text);
+  const resp = host.callModule(chatKey, "chat", text);
   assert(resp !== null && bytesEqual(resp, text), "handler echoed its input");
 
   console.log("  OK\n");
@@ -254,8 +256,8 @@ async function testBundleRefusesNonHandler() {
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
-  assert(!host.isBound(modName(author.publicKey, "demo", "fwd")), "the valid handler is NOT bound (the load failed atomically)");
-  assert(!host.isBound(modName(author.publicKey, "demo", "broken")), "the non-handler is not bound");
+  assert(!host.isBound(appKey(author.publicKey, "demo"), "fwd"), "the valid handler is NOT bound (the load failed atomically)");
+  assert(!host.isBound(appKey(author.publicKey, "demo"), "broken"), "the non-handler is not bound");
 
   console.log("  OK\n");
 }
@@ -263,37 +265,35 @@ async function testBundleRefusesNonHandler() {
 // ─── Test: ownership is structural (§5.1, §12.5) ────────────────────────
 
 async function testDerivedNamesKeepAuthorsApart() {
-  console.log("Test: derived names keep two authors' same-named apps apart (§5.1)");
+  console.log("Test: derived app keys keep two authors' same-named apps apart (§5.1)");
 
-  // policy cannot let one author land on another's name, because there is no shared name
-  // to land on. Squat-resistance is a property of the namespace, not of any policy rule.
+  // policy cannot let one author land on another's app, because there is no shared entry
+  // to land on. Squat-resistance is a property of the shape, not of any policy rule — and
+  // a module name is not part of it at all: `fwd` under A and `fwd` under B are two keys
+  // in two different maps rather than two strings that had to be made distinct.
   const { host } = await makeHost();
 
   const { publicKey: aPk } = generateKeyPair();
   const { publicKey: bPk } = generateKeyPair();
 
   // Both authors ship an app called "shared" with a module called "fwd".
-  const aName = modName(aPk, "shared", "fwd");
-  const bName = modName(bPk, "shared", "fwd");
-  assert(aName !== bName, "same (app, module) under different authors derives distinct names");
-  assert(aName.startsWith(toHex(aPk) + ":"), "A's name leads with A's key");
-  assert(bName.startsWith(toHex(bPk) + ":"), "B's name leads with B's key");
+  const aKey = appKey(aPk, "shared");
+  const bKey = appKey(bPk, "shared");
+  assert(aKey !== bKey, "the same app name under different authors derives distinct keys");
+  assert(aKey.startsWith(toHex(aPk) + ":"), "A's key leads with A's key");
+  assert(bKey.startsWith(toHex(bPk) + ":"), "B's key leads with B's key");
 
   // Both install. Neither displaces the other — they coexist.
-  installMod(host, aName, forwarderBytes);
-  installMod(host, bName, forwarderBytes);
-  assert(host.isBound(aName), "A's app is bound");
-  assert(host.isBound(bName), "B's app is bound — it did not have to contend for a name");
+  installMod(host, aKey, "fwd", forwarderBytes);
+  installMod(host, bKey, "fwd", forwarderBytes);
+  assert(host.isBound(aKey, "fwd"), "A's app is bound");
+  assert(host.isBound(bKey, "fwd"), "B's app is bound — it did not have to contend for a name");
 
-  // A re-install by the SAME author lands on the SAME name: an update, in place, with no
+  // A re-install by the SAME author lands on the SAME entry: an update, in place, with no
   // ownership rule consulted anywhere.
-  installMod(host, aName, forwarderBytes);
-  assert(host.isBound(aName), "A's re-install still occupies the slot");
-  assertEqual(modName(aPk, "shared", "fwd"), aName, "the same key derives the same name");
-
-  // The app key is the first two components of the kernel name (§12.4) — one identity
-  // the freshness marks, the bindings and the names all share.
-  assert(aName.startsWith(appKeyFor(aPk, "shared") + ":"), "kernel name extends the app key");
+  installMod(host, aKey, "fwd", forwarderBytes);
+  assert(host.isBound(aKey, "fwd"), "A's re-install still occupies the entry");
+  assertEqual(appKey(aPk, "shared"), aKey, "the same key derives the same app key");
 
   console.log("  OK\n");
 }
@@ -321,40 +321,41 @@ async function testHandlesIsADeclarationNotAClaim() {
   console.log("  OK\n");
 }
 
-// ─── Test: removePrefix, the per-app unbind ─────────────────────────────
+// ─── Test: removeApp, the per-app unbind ────────────────────────────────
 
 async function testInstallerRemove() {
-  console.log("Test: removePrefix unbinds exactly one app's names (§3.1, §12.5)");
+  console.log("Test: removeApp drops exactly one app (§3.1, §12.5)");
 
   const { host } = await makeHost();
 
   // Two apps of one author, plus a SECOND author's app sharing the app name — the
-  // case the app-key prefix exists to separate (§5.1).
+  // case the app key exists to separate (§5.1).
   const { publicKey: pk } = generateKeyPair();
   const { publicKey: other } = generateKeyPair();
-  const text = modName(pk, "chat", "text");
-  const media = modName(pk, "chat", "media");
-  const notes = modName(pk, "notes", "text");
-  const theirs = modName(other, "chat", "text");
+  const chat = appKey(pk, "chat");
+  const notes = appKey(pk, "notes");
+  const theirs = appKey(other, "chat");
 
-  for (const n of [text, media, notes, theirs]) installMod(host, n, forwarderBytes);
-  for (const n of [text, media, notes, theirs]) assert(host.isBound(n), "install ok: " + n);
+  host.bindAll(chat, [{ name: "text", wasm: forwarderBytes }, { name: "media", wasm: forwarderBytes }]);
+  installMod(host, notes, "text", forwarderBytes);
+  installMod(host, theirs, "text", forwarderBytes);
+  assert(host.isBound(chat, "text") && host.isBound(chat, "media"), "the app's two modules installed");
+  assert(host.isBound(notes, "text") && host.isBound(theirs, "text"), "the other two apps installed");
 
-  // The unbind is per APP, not per name: one pass takes every module the app landed
-  // and nothing else, because the app key prefixes all of them and leads with the
-  // author. A second author's identically-named app is untouched.
-  const prefix = appKeyFor(pk, "chat") + ":";
-  assertEqual(host.removePrefix(prefix), 2, "both modules of the app went in one pass");
-  assert(!host.isBound(text) && !host.isBound(media), "the app's names are free");
-  assert(host.isBound(notes), "the same author's other app is untouched");
-  assert(host.isBound(theirs), "another author's same-named app is untouched");
+  // The unbind is per APP, and the app is the key: one delete takes every module the app
+  // landed and nothing else. A second author's identically-named app is untouched, as is
+  // the same author's other app.
+  assertEqual(host.removeApp(chat), 2, "both modules of the app went in one call");
+  assert(!host.isBound(chat, "text") && !host.isBound(chat, "media"), "the app is gone");
+  assert(host.isBound(notes, "text"), "the same author's other app is untouched");
+  assert(host.isBound(theirs, "text"), "another author's same-named app is untouched");
 
-  // Nothing else to clear: a freed name can only be re-occupied by the author whose key
-  // derives it (§5.1), so there is no stale ownership to misattribute onto new bytes —
-  // and no tombstone, so the same name accepts bytes again immediately.
-  assertEqual(host.removePrefix(prefix), 0, "a second pass removes nothing");
-  installMod(host, text, forwarderBytes);
-  assert(host.isBound(text), "reinstall after remove succeeds");
+  // Nothing else to clear. There is no shared namespace for a freed entry to be contended
+  // for — the key can only be derived by the author whose public key is half of it — so
+  // there is no stale ownership to misattribute onto new bytes and no tombstone.
+  assertEqual(host.removeApp(chat), 0, "a second call removes nothing");
+  installMod(host, chat, "text", forwarderBytes);
+  assert(host.isBound(chat, "text"), "reinstall after remove succeeds");
 
   console.log("  OK\n");
 }
@@ -511,8 +512,8 @@ async function testCapBridge() {
   // A handler reachable by name, to exercise module/call. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
-  const echoName = modName("testapp", "echo");
-  installMod(host, echoName, forwarderBytes);
+  const testKey = appKey(id.publicKey, "testapp");
+  installMod(host, testKey, "echo", forwarderBytes);
 
   // A host-derived signing scope binds the guest's node/sign name to a bundle
   // namespace (README §12.2); a real node derives it from the manifest's (author, app).
@@ -520,9 +521,11 @@ async function testCapBridge() {
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const bridge = createCapBridge({
     sodium, identity: id,
-    callHandler: (name, p) => host.callHandler(name, p),
+    // Scoped to one app, exactly as the shell scopes it: module/call names a module
+    // inside this app's map and cannot reach out of it.
+    callModule: (name, p) => host.callModule(testKey, name, p),
     transport, peers: () => [toHex(id.publicKey)], fs, signScope,
-    allowedCaps: UNRESTRICTED_CAPS, modules: UNSCOPED_MODULES,
+    allowedCaps: UNRESTRICTED_CAPS,
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -611,9 +614,10 @@ async function testCapBridge() {
     const peers = await bridge("net/peers", U());
     assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "net/peers counts the cohort");
 
-    // module/call reaches an installed handler by name — the name crosses the seam as
-    // its UTF-8 bytes (§12.2 module/call: [nameLen u8][name utf8][req]).
-    const echoNameBytes = new TextEncoder().encode(echoName);
+    // module/call reaches this app's module by its LOGICAL name — the name crosses the
+    // seam as its UTF-8 bytes (§12.2 module/call: [nameLen u8][name utf8][req]), and the
+    // app key is the one the bridge was built with, never something the caller supplies.
+    const echoNameBytes = new TextEncoder().encode("echo");
     const mc = new Uint8Array(1 + echoNameBytes.length + 2);
     mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
     assertEqual([...await bridge("module/call", mc)], [8, 9], "module/call invokes the named handler");
@@ -829,7 +833,7 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { signManifest, verifyManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
+  const { signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -844,12 +848,12 @@ async function testBundle() {
   try {
     // Build a minimal one-module bundle (forwarder.wasm) + a guest stub, using a
     // throwaway host to hash content. Modules install directly from the manifest
-    // (§12.4) — no per-module .install envelope — under a kernel name the loader
-    // DERIVES from the signed `(app, name)` pair, so the manifest declares none.
-    // Neither the module nor the guest names a file: they are `<name>.wasm` and
-    // `guest.js`.
+    // (§12.4) — no per-module .install envelope — under the app key the loader DERIVES
+    // from the signed `(author, app)` pair, each at its own logical name, so the manifest
+    // declares no bind name at all. Neither the module nor the guest names a file: they
+    // are `<name>.wasm` and `guest.js`.
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor(author.publicKey, "test", "codec");
+    const testKey = appKey(author.publicKey, "test");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
@@ -892,7 +896,7 @@ async function testBundle() {
     });
     const loaded = await shell.loadBundle(bundlePath);
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
-    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
+    assert(shell.host.isBound(testKey, "codec"), "module registered under its app key");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app).
     // The first load (v1 above) set the mark to 1; re-signing the manifest at a new
@@ -934,7 +938,7 @@ async function testBundle() {
 async function testGuestlessBundleAndArchive() {
   console.log("Test: handler-only bundle (no guest) loads + verify/install split");
   const { signManifest, verifyManifest, verifyBundle,
-          packBundle, unpackBundle, kernelNameFor, MANIFEST_FILE, moduleFile }
+          packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -948,7 +952,7 @@ async function testGuestlessBundleAndArchive() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor(author.publicKey, "demo", "demo");
+    const demoKey = appKey(author.publicKey, "demo");
     // A manifest with NO `guest` field — the handler-only shape, and so no caps.
     const manifest = {
       app: "demo", version: 1,
@@ -993,7 +997,7 @@ async function testGuestlessBundleAndArchive() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(kernelName), "module registered under its kernel name");
+    assert(shell.host.isBound(demoKey, "demo"), "module registered under its app key");
     assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
   } finally {
     if (shell) shell.close();
@@ -1242,7 +1246,7 @@ async function testRealmSerialization() {
   console.log("  OK\n");
 }
 
-// ─── Test: PR-review hardening — cap enforcement, guarded callHandler, ───
+// ─── Test: PR-review hardening — cap enforcement, guarded callModule, ───
 // ─── sender-bound responses, WS fragmentation, redial after failure ──────
 
 async function testCapBridgeEnforcement() {
@@ -1251,9 +1255,9 @@ async function testCapBridgeEnforcement() {
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (allowedCaps) => createCapBridge({
-    sodium, identity: id, callHandler: () => null,
+    sodium, identity: id, callModule: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedCaps, modules: UNSCOPED_MODULES,
+    allowedCaps,
   });
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
@@ -1294,9 +1298,9 @@ async function testCapBridgeEnforcement() {
   // caps → prefixes: a bundle declares capability DOMAINS and the bridge enforces them
   // as first-component prefix checks.
   const nodeOnly = createCapBridge({
-    sodium, identity: id, callHandler: () => null,
+    sodium, identity: id, callModule: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedCaps: ["node"], modules: UNSCOPED_MODULES,
+    allowedCaps: ["node"],
     signScope: appSignScope(id, new Uint8Array(32), "probe"),
   });
   assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node grants the node-key names");
@@ -1317,27 +1321,30 @@ async function testCapBridgeEnforcement() {
 }
 
 async function testCallHandlerGuards() {
-  console.log("Test: KernelHost.callHandler resolves by name, or null when unbound (§4)");
+  console.log("Test: KernelHost.callModule resolves by name, or null when unbound (§4)");
 
   const { host } = await makeHost();
   const { publicKey: pk } = generateKeyPair();
+  const guards = appKey(pk, "guards");
 
-  // An unbound name resolves to nothing — null, distinct from an empty response.
-  const missing = modName("nope", "missing");
-  assert(host.callHandler(missing, new Uint8Array([1])) === null,
-    "callHandler returns null for an unbound name");
+  // An unbound module resolves to nothing — null, distinct from an empty response. So
+  // does a module under an app that was never installed at all: the outer miss and the
+  // inner miss are the same answer, because neither is a thing that exists.
+  assert(host.callModule(guards, "missing", new Uint8Array([1])) === null,
+    "callModule returns null for an unbound module");
+  assert(host.callModule(appKey(pk, "nope"), "echo", new Uint8Array([1])) === null,
+    "callModule returns null for an app that installed nothing");
 
   // An installed handler is reached by name. A confined guest reaches the same handler
   // through the cap-bridge's module/call (§12.2).
-  const echoName = modName("guards", "echo");
-  installMod(host, echoName, forwarderBytes);
-  const r = host.callHandler(echoName, new Uint8Array([5]));
-  assertEqual([...r], [5], "callHandler reaches an installed handler");
+  installMod(host, guards, "echo", forwarderBytes);
+  const r = host.callModule(guards, "echo", new Uint8Array([5]));
+  assertEqual([...r], [5], "callModule reaches an installed handler");
 
   // A 0-length response is a valid EMPTY answer, NOT the null of an unbound name — the
   // two are distinct at this seam, so a caller can tell "handler ran, said nothing" from
   // "nothing there". The forwarder echoes, so an empty input produces an empty response.
-  const empty = host.callHandler(echoName, EMPTY);
+  const empty = host.callModule(guards, "echo", EMPTY);
   assert(empty !== null && empty.length === 0,
     "an empty response is an empty array, distinct from null");
 
@@ -1585,7 +1592,7 @@ async function testMlKemAcvpVectors() {
 async function testHybridManifestSuite() {
   console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
   const { signManifest, signManifestHybrid, verifyManifest, hybridAuthorId,
-          verifyBundle, packBundle, kernelNameFor, MANIFEST_FILE }
+          verifyBundle, packBundle, MANIFEST_FILE }
     = await imp("build/host/bundle.js");
   const { generatePqKeyPair } = await imp("build/host/node.js");
 
@@ -1683,8 +1690,8 @@ async function testHybridManifestSuite() {
     assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
     const host = await createKernelHost();
     installBundle(host, v);
-    const derived = kernelNameFor(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app", "codec");
-    assert(host.isBound(derived), "the module binds under the derived hybrid author id");
+    const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
+    assert(host.isBound(derived, "codec"), "the module binds under the derived hybrid author id");
 
     const edOnly = packBundle({
       [MANIFEST_FILE]: signManifest(sodium, ed.privateKey, ed.publicKey, m),
@@ -1749,7 +1756,7 @@ async function testPolicyManifestSuite() {
 // bricking rollback (README §12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { signManifest, packBundle, kernelNameFor, MANIFEST_FILE, GUEST_FILE, moduleFile }
+  const { signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
   const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
@@ -1763,7 +1770,6 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const kernelName = kernelNameFor(author.publicKey, "rollback", "codec");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = (version) => ({
       app: "rollback", version,
@@ -1845,24 +1851,23 @@ async function testAuthorRevocation() {
     }));
 
     shell = await boot({ policyJson, dir: dataDir, identity });
-    const appKey = appKeyFor(author.publicKey, "victim");
-    const kernelName = bundleKernelNameFor(author.publicKey, "victim", "codec");
+    const victimKey = appKeyFor(author.publicKey, "victim");
 
     // 1. The author is trusted: v1 loads and binds.
     writeBundle(1);
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(kernelName), "the app binds while the author is trusted");
+    assert(shell.host.isBound(victimKey, "codec"), "the app binds while the author is trusted");
 
     // 2. The key is stolen. Freshness does NOT stop it — v2 is strictly newer, so it
     //    loads over the same name. This is the gap, asserted rather than assumed.
     writeBundle(2);
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(kernelName), "freshness does not stop a newer bundle from a stolen key");
+    assert(shell.host.isBound(victimKey, "codec"), "freshness does not stop a newer bundle from a stolen key");
 
     // 3. Write the key off. Both halves must happen in the one call.
     const gone = shell.revoke(authorHex);
-    assert(gone.includes(appKey), "revoke reports the app it tore down");
-    assert(!shell.host.isBound(kernelName), "revoke uninstalls what the key already landed");
+    assert(gone.includes(victimKey), "revoke reports the app it tore down");
+    assert(!shell.host.isBound(victimKey, "codec"), "revoke uninstalls what the key already landed");
 
     // 4. The thief's next bundle is refused even though the version keeps climbing
     //    and the author is still in the policy allowlist.
@@ -1870,7 +1875,7 @@ async function testAuthorRevocation() {
     let refused = false;
     try { await shell.loadBundle(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a revoked key is refused despite a higher version");
-    assert(!shell.host.isBound(kernelName), "nothing landed on the refused load");
+    assert(!shell.host.isBound(victimKey, "codec"), "nothing landed on the refused load");
 
     // 4b. The refusal must come BEFORE the admission predicate, not after it. An
     //     interactive shell puts its consent dialog there (§12.4), and prompting a
@@ -1915,7 +1920,7 @@ async function testAuthorRevocation() {
       dir: dataDir, identity,
     });
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(bundleKernelNameFor(heir.publicKey, "victim", "codec")),
+    assert(shell.host.isBound(appKeyFor(heir.publicKey, "victim"), "codec"),
       "a replacement author key installs normally after the old one is written off");
   } finally {
     if (shell) shell.close();

@@ -19,12 +19,12 @@ const sodium = _sodium;
 const { KernelHost } = await imp("build/host/kernel-host.js");
 const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
+const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createCapBridge, UNRESTRICTED_CAPS, UNSCOPED_MODULES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
+const { createCapBridge, UNRESTRICTED_CAPS, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
 const { ok, throws, summary } = testkit();
 
@@ -43,23 +43,23 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkHandlerMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
   const host = new KernelHost();
-  host.bindAll([{ name: "aa:app:ok", wasm: withMax }]);
-  ok(host.isBound("aa:app:ok"), "KernelHost binds a bounded handler");
-  throws(() => host.bindAll([{ name: "aa:app:bad", wasm: noMax }]),
+  host.bindAll("aa:app", [{ name: "ok", wasm: withMax }]);
+  ok(host.isBound("aa:app", "ok"), "KernelHost binds a bounded handler");
+  throws(() => host.bindAll("aa:app", [{ name: "bad", wasm: noMax }]),
     "KernelHost refuses an unbounded handler at install");
   const tiny = new KernelHost({ maxHandlerMemoryBytes: 1024 * 1024 });
-  throws(() => tiny.bindAll([{ name: "aa:app:ok", wasm: withMax }]), "the budget is configurable per host");
+  throws(() => tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was, rather than with its first module landed. Atomicity is the
   // host's guarantee, so it holds without the caller doing anything to earn it.
   const atomic = new KernelHost();
-  throws(() => atomic.bindAll([
-    { name: "aa:app:first", wasm: withMax },
-    { name: "aa:app:second", wasm: noMax },
+  throws(() => atomic.bindAll("aa:app", [
+    { name: "first", wasm: withMax },
+    { name: "second", wasm: noMax },
   ]), "a bundle with one bad module is refused whole");
-  ok(!atomic.isBound("aa:app:first"), "the good module of a refused bundle did not land");
-  ok(!atomic.isBound("aa:app:second"), "neither did the bad one");
+  ok(!atomic.isBound("aa:app", "first"), "the good module of a refused bundle did not land");
+  ok(!atomic.isBound("aa:app", "second"), "neither did the bad one");
 }
 
 console.log("\n§12.2 — fs is scoped per app key");
@@ -109,30 +109,33 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
 {
   const identity = sodium.crypto_sign_keypair();
   const base = {
-    sodium, identity, callHandler: () => null,
+    sodium, identity, callModule: () => null,
     transport: { request: async () => new Uint8Array() },
     peers: () => [], fs: new MemoryFs(),
   };
-  throws(() => createCapBridge({ ...base, modules: UNSCOPED_MODULES }), "omitting allowedCaps throws at construction");
-  throws(() => createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS }), "omitting modules throws at construction");
-  ok(typeof createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS, modules: UNSCOPED_MODULES }) === "function",
-    "naming both sentinels is accepted");
+  throws(() => createCapBridge({ ...base }), "omitting allowedCaps throws at construction");
+  ok(typeof createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS }) === "function",
+    "naming the sentinel is accepted");
 
-  // A guest may only reach modules its own manifest declared.
-  let reached = null;
+  // A guest reaches its own app's modules and has no way to name anything else: the
+  // bridge is built against ONE app's module map (the shell binds the app key), so
+  // scoping is the shape rather than a lookup table that could be omitted.
+  const chat = new KernelHost();
+  chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
+  chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
   const scoped = createCapBridge({
     ...base,
-    callHandler: (n) => { reached = n; return new Uint8Array([7]); },
+    callModule: (n, p) => chat.callModule("aa:chat", n, p),
     allowedCaps: ["module"],
-    modules: { codec: "aa:chat:codec" },
   });
+  // The forwarder echoes its input, so a resolved module answers with the body and an
+  // unresolved one answers empty — which is what tells the two apart.
   const call = (name) => {
     const n = new TextEncoder().encode(name);
-    return scoped("module/call", new Uint8Array([n.length, ...n]));
+    return scoped("module/call", new Uint8Array([n.length, ...n, 7, 7, 7]));
   };
-  ok(call("codec").length === 1 && reached === "aa:chat:codec", "a declared module resolves to its kernel name");
-  reached = null;
-  ok(call("bb:other:evil").length === 0 && reached === null, "an undeclared name reaches nothing");
+  ok(call("codec").length === 3, "a module of this app resolves and runs");
+  ok(call("evil").length === 0, "another app's module name reaches nothing through this bridge");
 }
 
 console.log("\n§4.3 — the guest realm has an execution budget");
@@ -245,6 +248,14 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen !== null, "the shell created a realm for the loaded guest");
   ok(seen && seen.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen && seen.deadlineMs})`);
   ok(seen && seen.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
+
+  // §12.5 — uninstalling a GUEST-ONLY app reports success. An app is its modules and
+  // its realm, and this bundle legitimately declares no modules at all, so a count of
+  // dropped modules is the wrong answer to "was there anything here".
+  ok(shell.uninstall(appKeyFor(kp.publicKey, "probe")) === true,
+    "uninstalling a guest-only app reports success, not 'nothing there'");
+  ok(shell.uninstall(appKeyFor(kp.publicKey, "probe")) === false,
+    "uninstalling it twice reports nothing the second time");
   shell.close();
 
   // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts) — not

@@ -7,25 +7,37 @@
 // (native/main.go), and neither is more canonical than the other. It sits with the
 // other backends — `fs-node.ts`, `safe-js.ts` — for the same reason they do.
 //
-// The kernel is a **contract, not an artifact**: the table (`handlers[name] → handler`),
+// The kernel is a **contract, not an artifact**: the table (`apps[appKey].get(module)`),
 // the pure-transform handler ABI (§4), and the bind/unbind semantics (§3.1). Its whole
-// implementation is the one `Map` below. §1's vision sentence — "installing a handler is
-// nothing more than `handlers[name] = wasm_bytes`" — is literally this map, so there is no
-// kernel module to instantiate, no handler-id indirection, and no second table to keep in
-// sync with a first.
+// implementation is the two `Map`s below. §1's vision sentence — "installing a handler is
+// nothing more than `handlers[name] = wasm_bytes`" — is literally this, one level down:
+// `apps[appKey].modules[name] = wasm_bytes`. It is the same sentence with the string codec
+// taken out of the keys, so there is still no kernel module to instantiate, no handler-id
+// indirection, and no second table to keep in sync with a first.
+//
+// **Two levels, because there are two things.** An app is what installs, what a binding
+// points at and what `revoke` removes; a module is what a call resolves. Encoding both
+// into one string key — `"<author hex>:<app>:<module>"` — bought a flat map at the cost of
+// a codec: a charset rule so the module half could not contain the separator, a
+// fixed-width author half so the app half could, a prefix scan for the unbind, and an
+// argument about why the author hex must not be truncated lest one author grind their way
+// onto another's names. Every one of those defends a shared namespace, and there is no
+// shared namespace: a guest reaches only its own app's modules, bindings point at app
+// keys, and a kernel name never leaves the host (§5.1). The outer key IS the ownership,
+// visible without parsing anything.
 //
 // A handler is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
 // `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
 // response back from `scratch`. Handlers import nothing — no kernel seam, no I/O, no
 // callback — so the host is the sole orchestrator: it reaches a handler by name with
-// `callHandler` (the counterpart a guest reaches through the cap-bridge's module/call,
+// `callModule` (the counterpart a guest reaches through the cap-bridge's module/call,
 // README §12.2), and does all I/O and authorization itself. Every entry is an installed
 // WASM handler: a bundle is the one way code arrives (§12.4), so the table holds one kind
-// of thing and `callHandler` has one path through it.
+// of thing and `callModule` has one path through it.
 //
 // The table is the host's ONLY install state. There is no ownership register beside it,
-// because a kernel name derives from its author's key (§5.1) — so who may bind a name is
-// answered by the name, and nothing can fall out of step with the table. That is also why
+// because ownership is the outer key (§5.1) — so who may bind a module is answered by
+// where it sits, and nothing can fall out of step with the table. That is also why
 // nothing here touches crypto: hashing belongs to the loader (`genesisHash`, bundle.ts),
 // and this component is the `Map` §3 says it is.
 //
@@ -46,7 +58,7 @@ export interface KernelHostOptions {
 }
 
 /** What the table holds at one name: an instantiated WASM handler, reached by name
- *  through `callHandler`. */
+ *  through `callModule`. */
 interface WasmHandlerRef {
   memory: WebAssembly.Memory;
   scratch: number;
@@ -55,10 +67,11 @@ interface WasmHandlerRef {
 }
 
 export class KernelHost {
-  /** The handler table (README §3). A name is bound exactly when it is a key here, so
-   *  the §3.1 bind / unbind / resolve operations are `set` / `delete` / `get` and
-   *  nothing else can disagree about what a name resolves to. */
-  private readonly handlers = new Map<string, WasmHandlerRef>();
+  /** The handler table (README §3): app key → that app's modules by logical name. A
+   *  module is bound exactly when it is a key in its app's map, so the §3.1 bind /
+   *  unbind / resolve operations are `set` / `delete` / `get` and nothing else can
+   *  disagree about what resolves. */
+  private readonly apps = new Map<string, Map<string, WasmHandlerRef>>();
 
   /** The §4.3 memory ceiling this host holds installs to. */
   private readonly maxHandlerMemoryBytes: number;
@@ -69,25 +82,33 @@ export class KernelHost {
 
   // ─── installing WASM handlers ─────────────────────────────────────────
 
-  /** Land a bundle's modules on the table, all or none (§3.1) — the one way code
-   *  arrives, and the only mutating entry point besides `removePrefix`.
+  /** Land an app's modules on the table, all or none (§3.1) — the one way code arrives,
+   *  and the only mutating entry point besides `removeApp`.
    *
-   *  Every module is instantiated and validated BEFORE any name is written, so a bundle
+   *  Every module is instantiated and validated BEFORE anything is written, so a bundle
    *  whose third module is malformed leaves the table exactly as it was rather than
-   *  half-replaced. That the caller cannot observe the intermediate state is the point:
-   *  atomicity belongs to whoever holds the half-built instances, which is this class.
+   *  half-replaced. Atomicity is now visible rather than argued: the app's whole module
+   *  map is built first and then assigned under its key, so the commit is ONE assignment
+   *  and there is no window in which some of an app's modules are the new version and
+   *  the rest are the old.
+   *
+   *  A re-install REPLACES the app's map rather than merging into it, which is what a
+   *  version of an app is: a bundle dropping a module from its manifest leaves nothing
+   *  of the old one behind.
    *
    *  Instances abandoned by a failure need no explicit release here — JS reclaims an
    *  unreferenced `WebAssembly.Instance` on its own. A host whose instances are not
    *  garbage-collected frees them on this same path (native/main.go), which is exactly
    *  why the release is the host's business and not a step in the loader. */
-  bindAll(mods: { name: string; wasm: Uint8Array }[]): void {
-    const refs = mods.map((m) => {
-      if (m.name.length === 0) throw new Error("kernel: empty handler name");
-      return { name: m.name, ref: this.instantiate(m.wasm) };
-    });
-    // Nothing above can have written to the table, and nothing below can fail.
-    for (const { name, ref } of refs) this.handlers.set(name, ref);
+  bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void {
+    if (appKey.length === 0) throw new Error("kernel: empty app key");
+    const built = new Map<string, WasmHandlerRef>();
+    for (const m of mods) {
+      if (m.name.length === 0) throw new Error("kernel: empty module name");
+      built.set(m.name, this.instantiate(m.wasm));
+    }
+    // Nothing above touched the table, and this cannot fail.
+    this.apps.set(appKey, built);
   }
 
   /** Instantiate handler `wasmBytes` — compile, validate, check §4 exports — without
@@ -162,15 +183,17 @@ export class KernelHost {
 
   // ─── public API ──────────────────────────────────────────────────────
 
-  /** Invoke a handler by name with `payload`, returning its response bytes, or null if
-   *  the name is unbound or the handler produced no response. This is the scratch-region
-   *  contract (README §4): write input at the handler's scratch offset, call
-   *  handle(input_len), read the response back from the same offset. The generic "run a
-   *  transform" primitive: the host uses it directly, and a guest reaches it through the
-   *  cap-bridge's module/call (README §12.2). Handlers cannot call back, so there is no
-   *  re-entrancy. */
-  callHandler(name: string, payload: Uint8Array): Uint8Array | null {
-    const w = this.handlers.get(name);
+  /** Invoke one app's module with `payload`, returning its response bytes, or null if
+   *  nothing is bound there or the handler produced no response. This is the
+   *  scratch-region contract (README §4): write input at the handler's scratch offset,
+   *  call handle(input_len), read the response back from the same offset. The generic
+   *  "run a transform" primitive: the host uses it directly, and a guest reaches it
+   *  through the cap-bridge's module/call (README §12.2) — with the app key bound at
+   *  bridge construction, so `module` is the LOGICAL name from the guest's own manifest
+   *  and a guest cannot address another app's modules by naming one. Handlers cannot
+   *  call back, so there is no re-entrancy. */
+  callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null {
+    const w = this.apps.get(appKey)?.get(module);
     if (!w) return null;
     if (payload.length > w.scratchSize) return null;
     new Uint8Array(w.memory.buffer, w.scratch, payload.length).set(payload);
@@ -184,26 +207,26 @@ export class KernelHost {
     return new Uint8Array(w.memory.buffer, w.scratch, responseLen).slice();
   }
 
-  /** Remove every handler whose name starts with `prefix`, returning how many went —
-   *  the §3.1 unbind, and the whole of it. The unit is an APP, not a name: the shell's
-   *  `uninstall` and `revoke` (§12.5) are the only callers, and every kernel name an app
-   *  landed shares its app key as a prefix (§5.1), so one pass frees exactly that app.
+  /** Drop an app and everything it landed, returning how many modules went — the §3.1
+   *  unbind, and the whole of it. The unit is an APP, which is now simply the key: the
+   *  shell's `uninstall` and `revoke` (§12.5) are the only callers, and both mean exactly
+   *  this. Install and removal are visibly the same unit, so there is no asymmetry left
+   *  to explain.
    *
-   *  There is no single-name remove. Nothing wants one — a name is not a unit anything
-   *  installs or revokes — and it frees the name and nothing else anyway: a freed name
-   *  can only ever be re-occupied by the author whose key derives it, so there is no
-   *  stale ownership to keep in step and no tombstone to leave behind. */
-  removePrefix(prefix: string): number {
-    let removed = 0;
-    for (const name of this.handlers.keys()) {
-      if (name.startsWith(prefix)) { this.handlers.delete(name); removed++; }
-    }
-    return removed;
+   *  There is no single-module remove. Nothing wants one — a module is not a unit anything
+   *  installs or revokes — and with modules living inside their app there is no shared
+   *  namespace for a freed one to be contended for, so there is nothing to keep in step
+   *  and no tombstone to leave behind. */
+  removeApp(appKey: string): number {
+    const mods = this.apps.get(appKey);
+    if (!mods) return 0;
+    this.apps.delete(appKey);
+    return mods.size;
   }
 
-  /** True if a handler occupies `name` — the §3.1 resolve, as a predicate. A shell uses
-   *  it to check that the modules it expects a bundle to have landed are bound. */
-  isBound(name: string): boolean {
-    return this.handlers.has(name);
+  /** True if `module` is bound for `appKey` — the §3.1 resolve, as a predicate. A shell
+   *  uses it to check that the modules it expects a bundle to have landed are bound. */
+  isBound(appKey: string, module: string): boolean {
+    return this.apps.get(appKey)?.has(module) ?? false;
   }
 }

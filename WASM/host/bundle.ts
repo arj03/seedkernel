@@ -1,7 +1,7 @@
 // The app bundle format (README §12.4). A bundle is *signed content* the generic
 // shell loads from a single file: a set of WASM handler modules, an optional
-// zero-authority guest program, and a signed manifest declaring the modules, the
-// kernel names they bind at, and — when there is a guest — the capabilities it holds.
+// zero-authority guest program, and a signed manifest declaring the modules by logical
+// name and — when there is a guest — the capabilities it holds.
 // The shell verifies the manifest signature, governs it against its policy (author +
 // module hashes), and installs the modules; the guest's `caps` describe the seam it is
 // wired over, honored by the generic cap bridge (README §12.2).
@@ -23,7 +23,7 @@
 // validate). The file a module lives in is `<name>.wasm`, by construction.
 //
 // The manifest commits to every module's genesisHash and the loader verifies the bytes
-// against it, so a verified module is admitted directly under its declared kernel name
+// against it, so a verified module is admitted directly under its declared logical name
 // (§12.4) — there is no separate per-module install envelope. A live update is not a
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
@@ -32,11 +32,11 @@ import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_
 import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
-    /** Logical name, e.g. "codec". Three jobs, one value: the module's file in the
-     *  container (`<name>.wasm`), the key the guest addresses it by through module/call
-     *  (the bridge resolves it to the kernel name), and — with the manifest `app` — the
-     *  kernel name derived from it (`kernelNameFor`). Unique within a manifest, and
-     *  restricted to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
+    /** Logical name, e.g. "codec". Two jobs, one value: the module's file in the
+     *  container (`<name>.wasm`), and the key it binds at inside its app's module map —
+     *  which is the same key the guest addresses it by through module/call, so there is
+     *  no second name to resolve between them. Unique within a manifest, and restricted
+     *  to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
     name: string;
     /** genesisHash(wasm) hex — content integrity for the module bytes (§5.1, §12.4). */
     hash: string;
@@ -97,8 +97,8 @@ export interface BundleGuest {
      *  guest preamble as `const APP = …`.
      *
      *  NB what does NOT belong here: anything the runtime already derives from the
-     *  admitted manifest. The author's key, the app name, the guest signing prefix and
-     *  the modules' kernel names all arrive as `const BUNDLE` (cap-bridge
+     *  admitted manifest. The author's key, the app name and the guest signing prefix
+     *  all arrive as `const BUNDLE` (cap-bridge
      *  `bundlePreamble`). Restating one of those here would be a build-time copy of a
      *  load-time fact — and a copy that silently disagrees is a verify mismatch with
      *  nothing pointing at the cause. */
@@ -246,14 +246,16 @@ export interface FreshnessStore {
  *  Hashing is deliberately NOT here — it is `genesisHash(sodium, …)`, so the component
  *  that owns the handler table needs no crypto at all (§3). */
 export interface BundleHost {
-    /** Compile, instantiate and validate every module against the §4 ABI, then bind each
-     *  at its `name`. Binding displaces whatever was at a name — the caller already ran
-     *  the admission policy (§12.4, §12.5).
+    /** Compile, instantiate and validate every module against the §4 ABI, then bind them
+     *  as `appKey`'s module set, each under its LOGICAL name from the manifest. It
+     *  replaces whatever that app held — the caller already ran the admission policy
+     *  (§12.4, §12.5), and an app key is only ever reachable by the author whose key is
+     *  half of it.
      *
      *  Throws on any structural failure (not valid wasm, missing exports, scratch out of
      *  bounds, invalid scratchSize) **with the table untouched**: nothing is bound unless
      *  everything validated, and whatever was built before the failure is released. */
-    bindAll(mods: { name: string; wasm: Uint8Array }[]): void;
+    bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void;
 }
 
 export interface VerifiedBundle {
@@ -288,42 +290,33 @@ export const GUEST_FILE = "guest.js";
 /** A module's name inside the container, derived from its logical name. */
 export function moduleFile(name: string): string { return name + ".wasm"; }
 /** An app's identity: `"<author hex>:<app>"` (§12.4). One value, three jobs — the
- *  freshness high-water key (FreshnessMarks below), the prefix of every one of the app's
- *  kernel names (`kernelNameFor`), and what a shell's protocol bindings point at (§12.10).
+ *  freshness high-water key (FreshnessMarks below), the key an app's modules live under
+ *  on the handler table (§5.1), and what a shell's protocol bindings point at (§12.10).
  *  Both halves are signed, so an app key is derived from the manifest and never declared.
  *
- *  The author hex is fixed-length, so the key parses unambiguously even though `app` is
- *  free to contain `:` itself. */
+ *  **Ownership is structural.** The author's key is half of the identity, so one author's
+ *  apps are unreachable to another: a second author shipping an app called `chat` gets a
+ *  different key and installs alongside, never over. Squat-resistance is a property of the
+ *  shape rather than a rule the admission policy has to enforce, which is why the loader
+ *  keeps no ownership register and the policy has no "who holds this name" clause (§12.5).
+ *  The author is the FULL hex, never truncated — a short prefix would be grindable, and an
+ *  admitted author could generate a key matching another's first bytes and land on their
+ *  app.
+ *
+ *  Nothing derives a per-module name from this. An app's modules live in a map UNDER this
+ *  key, by the logical name their manifest declares (`KernelHost.callModule`), so the two
+ *  levels stay two levels and the app key needs no parsing to be read back out of a
+ *  module's — there is no module name to parse. The author hex is fixed-length regardless,
+ *  so a reader that wants the two halves gets them even though `app` may contain `:`.
+ *
+ *  App keys never leave the host. Nothing on the wire names another node's app: a peer
+ *  sends a protocol id or an opcode and the receiving host resolves it through its own
+ *  bindings (§12.10) to whichever app it holds. A guest reaches its own modules by logical
+ *  name through module/call, against the app key its bridge was built with — so the guest
+ *  never sees an app key at all. This needs to be unambiguous within one node, not agreed
+ *  across a deployment. */
 export function appKeyFor(author: Uint8Array, app: string): string {
     return toHex(author) + ":" + app;
-}
-/** The kernel name a bundle module binds at: `"<author hex>:<app>:<module name>"` — the
- *  app key plus the module (§5.1). Derived, never declared: the manifest carries no
- *  bind-name field, so there is nothing in it to forge, and all three components are
- *  already covered by the author's signature.
- *
- *  **Ownership is structural.** Because the author's key leads the name, one author's
- *  names are unreachable to another: a second author shipping an app called `chat` derives
- *  entirely different names and binds alongside, never over. Squat-resistance is a property
- *  of the namespace rather than a rule the admission policy has to enforce, which is why
- *  the loader keeps no ownership register and the policy has no "who holds this name"
- *  clause (§12.5). The author is the FULL hex, never truncated — a short prefix would be
- *  grindable, and an admitted author could generate a key matching another's first bytes
- *  and land on their names, which is exactly the collision this derivation exists to make
- *  unrepresentable.
- *
- *  The name parses from both ends: the author is fixed-length hex and a module name cannot
- *  contain `:` (NAME_RE), so the last colon always separates the module and everything
- *  between the two is the `app`.
- *
- *  Kernel names never leave the host. Nothing on the wire names another node's
- *  handler: a peer sends a protocol id or an opcode and the receiving host resolves it
- *  through its own bindings (§12.10) to whichever app it holds. A guest reaches its own
- *  modules by logical name through module/call, and the bridge resolves the logical name
- *  to the kernel name — so the guest never sees a kernel name at all. This needs to be
- *  collision-free within one node, not agreed across a deployment. */
-export function kernelNameFor(author: Uint8Array, app: string, moduleName: string): string {
-    return appKeyFor(author, app) + ":" + moduleName;
 }
 /** The genesis hash (BLAKE2b-256, §5.1) — the one system hash. A module's `bytesHash`,
  *  a manifest's `modules[].hash` — the definitive declaration of which bytes are authorized.
@@ -433,8 +426,8 @@ function hybridPreimage(suite: number, edPk: Uint8Array, mlDsaPk: Uint8Array, js
  *  edPk ‖ mlDsaPk)`.
  *
  *  **Why the id is not simply the Ed25519 key.** The author id is what policy admits
- *  (§12.5), what freshness is keyed by, and what leads every kernel name (§5.1) — so it
- *  is the thing an attacker must reproduce to land on an author's names. If it were the
+ *  (§12.5), what freshness is keyed by, and what leads every app key (§5.1) — so it
+ *  is the thing an attacker must reproduce to land on an author's apps. If it were the
  *  Ed25519 key alone, then an attacker who eventually breaks Ed25519 forges that half
  *  and supplies a *freshly generated* ML-DSA key for the other: both signatures verify,
  *  the id is unchanged, and hybrid signing has bought nothing at exactly the moment it
@@ -446,7 +439,7 @@ function hybridPreimage(suite: number, edPk: Uint8Array, mlDsaPk: Uint8Array, js
  *  bindings and freshness marks are keyed by it. A suite that widened the id would
  *  change all of that; hashing keeps every one of them untouched while the key material
  *  under it changes shape. The one cost is that an author migrating from `0x01` to
- *  `0x02` gets a *new* identity — new kernel names, a fresh freshness lineage, a new
+ *  `0x02` gets a *new* identity — new app keys, a fresh freshness lineage, a new
  *  policy entry. That is a real cost and it is the honest one: the new identity is a
  *  different (stronger) statement about who signed, so pretending it is the old one
  *  would be the bug. Operators run both entries during an overlap.
@@ -501,8 +494,8 @@ function isValidManifest(m: unknown): m is BundleManifest {
         return false;
     const o = m as Record<string, unknown>;
     // `app` is load-bearing beyond reporting: it scopes the guest's signing namespace
-    // (guestSignScope), keys the freshness high-water mark, and is half of every module's
-    // kernel name (kernelNameFor). An empty one would yield the bind name ":codec".
+    // (guestSignScope), keys the freshness high-water mark, and is half of the app key
+    // every one of its modules binds under (appKeyFor).
     if (typeof o.app !== "string" || o.app.length === 0)
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
@@ -651,7 +644,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // A DISPATCH rule, not a reachability claim. Inbound traffic reaches one module
     // (§12.10), and nothing inside the runtime can fan out to a second — a handler cannot
     // call another handler (§4.2), and with no guest there is no `module/call` to drive
-    // one. A host-side embedder holding `shell.host.callHandler` CAN reach any of them by
+    // one. A host-side embedder holding `shell.host.callModule` CAN reach any of them by
     // kernel name, so a second module is not unreachable; it is undispatchable, and a
     // manifest that leaves inbound traffic pointing at one of several is the ambiguity
     // this refuses. Anything multi-module ships a guest, which dispatches itself.
@@ -955,16 +948,14 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
         checkHandlerMemory(wasm, DEFAULT_MAX_HANDLER_MEMORY_BYTES);
     }
     // One transactional call: every module lands or none does, and the host owns that
-    // guarantee (BundleHost). Each lands under the kernel name DERIVED from the signed
-    // `(author, app, name)` triple (§5.1). No per-module `.install` envelope means no
-    // 64 KB envelope cap and no boot-time seq — an equal-version reload just re-installs,
-    // and a higher-version bundle from the same author lands on the same names because the
-    // same key derives them.
+    // guarantee (BundleHost). They land as the module set of the app key DERIVED from the
+    // signed `(author, app)` pair (§5.1), each under the logical name its manifest gave it.
+    // No per-module `.install` envelope means no 64 KB envelope cap and no boot-time seq —
+    // an equal-version reload just re-installs, and a higher-version bundle from the same
+    // author replaces the same app's map because the same key derives it.
     try {
-        host.bindAll(v.modules.map(({ mod, wasm }) => ({
-            name: kernelNameFor(v.author, v.manifest.app, mod.name),
-            wasm,
-        })));
+        host.bindAll(appKeyFor(v.author, v.manifest.app),
+            v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
     }
     catch (e) {
         throw new Error(`bundle: module ${(e as Error).message}`);

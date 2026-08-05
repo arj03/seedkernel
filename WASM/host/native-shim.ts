@@ -44,10 +44,10 @@ type CapCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Arra
 
 /** The handler table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
-  bindAll(mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
-  callHandler(name: string, payload: Uint8Array): ArrayBuffer | null;
-  isBound(name: string): boolean;
-  removePrefix(prefix: string): number;
+  bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
+  callModule(appKey: string, module: string, payload: Uint8Array): ArrayBuffer | null;
+  isBound(appKey: string, module: string): boolean;
+  removeApp(appKey: string): number;
   readFreshness(): string | null;
   writeFreshness(json: string): void;
   createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;
@@ -294,13 +294,13 @@ const kernel: KernelBackend = {
     // its compiled code is reclaimed on its own (main.go `bindAll`). The §4.1 scratch
     // default crosses with it: it is the shared host's number (core/wasm-limits.ts),
     // so Go's table never owns a copy of the default the JS table enforces.
-    bindAll(mods) { bridge.bindAll(mods, DEFAULT_SCRATCH_SIZE); },
-    callHandler(name, payload) {
-        const r = bridge.callHandler(name, payload);
+    bindAll(appKey, mods) { bridge.bindAll(appKey, mods, DEFAULT_SCRATCH_SIZE); },
+    callModule(appKey, module, payload) {
+        const r = bridge.callModule(appKey, module, payload);
         return r === null ? null : new Uint8Array(r);
     },
-    isBound(name) { return bridge.isBound(name); },
-    removePrefix(prefix) { return bridge.removePrefix(prefix); },
+    isBound(appKey, module) { return bridge.isBound(appKey, module); },
+    removeApp(appKey) { return bridge.removeApp(appKey); },
 };
 /** The freshness store over the Go atomic-write seam (README §12.4). */
 class NativeFreshnessStore extends FreshnessMarks {
@@ -399,7 +399,7 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
     };
 };
 /** Everything that crosses back to Go crosses as BYTES — that is the currency of this
- *  seam (host.call, callHandler, a realm result), and the one shape Go's await harness
+ *  seam (host.call, callModule, a realm result), and the one shape Go's await harness
  *  carries out of a settled promise. A JSON report is no exception. */
 const utf8 = new TextEncoder();
 let shell: Shell | null = null;

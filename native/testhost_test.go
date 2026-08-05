@@ -124,18 +124,16 @@ const testCapBridgeJS = `
 globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope) {
   globalThis.__capBridge = createCapBridge({
     sodium, identity, fs,
-    callHandler: () => null,
+    // No app behind this harness, so module/call reaches nothing. Nothing to scope
+    // either: the bridge is built against ONE app's module map, so "a guest reaches
+    // only its own modules" needs no argument here to stay true.
+    callModule: () => null,
     transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
     peers: () => peers || [],
     now: () => Date.now(),
     // The granted domain prefixes, straight through: a call resolves iff its first
     // path component is one of these (or crypto, which is never a grant).
     allowedCaps: caps,
-    // No signed manifest behind this harness, so there is no logical->kernel map to
-    // scope module/call against. The sentinel says so explicitly; omitting the field
-    // is refused (§12.2), which is the point — production reaches this call through
-    // createShell, which always has a manifest.
-    modules: UNSCOPED_MODULES,
     signScope: scope || undefined,
   });
   return __capBridge;

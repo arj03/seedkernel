@@ -18,7 +18,7 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
-import { kernelNameFor, appKeyFor, appScopeFor, handlesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, handlesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, bundlePreamble, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
@@ -74,8 +74,8 @@ export type RealmFactory = (opts: {
  *  is the shell's uninstall method (§12.5). Neither install nor remove is a
  *  public host method. */
 export interface KernelTable {
-    callHandler(name: string, payload: Uint8Array): Uint8Array | null;
-    isBound(name: string): boolean;
+    callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null;
+    isBound(appKey: string, module: string): boolean;
 }
 
 /** The §3 handler table as the shell uses it: the one transactional install a bundle
@@ -86,10 +86,10 @@ export interface KernelTable {
  *  differs — which is precisely why both the all-or-none bind and the release live
  *  behind it rather than in the loader. */
 export interface KernelBackend extends BundleHost, KernelTable {
-    /** Remove every handler whose name starts with `prefix`, returning how many went.
-     *  One pass is all `uninstall` needs: every kernel name of an app shares its app
-     *  key as a prefix (§5.1). */
-    removePrefix(prefix: string): number;
+    /** Drop an app and every module it landed, returning how many went. One lookup is
+     *  all `uninstall` needs: an app's modules are the value under its key (§5.1), so
+     *  the unit of removal is the unit of install. */
+    removeApp(appKey: string): number;
 }
 
 /** The platform seam — everything the shell needs that varies by target.
@@ -199,7 +199,7 @@ export interface CreateShellOptions {
 }
 
 export interface Shell {
-    /** The handler table: callHandler to reach installed handlers, isBound to
+    /** The handler table: callModule to reach an app's installed modules, isBound to
      *  check occupancy. installWasmHandler is NOT on this interface — code lands
      *  only via loadBundleBlob (§12.4). */
     host: KernelTable;
@@ -436,14 +436,16 @@ export function createShell(opts: CreateShellOptions & {
      *  (README §1, capability-by-non-wiring). */
     const buildBridge = (b: LoadedBundle, driver: TransportHost | null) => {
         const caps = new Set(b.manifest.guest?.caps ?? []);
-        const modMap = Object.fromEntries(b.manifest.modules.map((m) => [m.name, kernelNameFor(b.author, b.manifest.app, m.name)]));
+        const appKey = appKeyFor(b.author, b.manifest.app);
         return createCapBridge({
             rawNet: driver?.rawNet(),
             timers: driver?.timerBackend(),
             transportSink: driver?.sink(),
             sodium: platform.sodium,
             identity: platform.guestIdentity ?? platform.identity,
-            callHandler: (name, p) => host.callHandler(name, p),
+            // Bound to THIS app's key, so the guest's `module/call` addresses its own
+            // module map by logical name and has no way to name another app's (§12.2).
+            callModule: (name, p) => host.callModule(appKey, name, p),
             transport: netHost ?? undefined,
             peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
             // Scoped to this app key, so `fs` grants reach over this app's own keyspace and
@@ -467,7 +469,6 @@ export function createShell(opts: CreateShellOptions & {
             signScope: b.manifest.role === "transport"
                 ? transportSignScope(platform.identity, platform.networkKey)
                 : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
-            modules: modMap,
         });
     };
     const guestFullSource = (b: LoadedBundle) => bundlePreamble({
@@ -499,9 +500,9 @@ export function createShell(opts: CreateShellOptions & {
             // realm before it routes a single frame, so this is the pre-serve() case.
             return (input) => slot.realm ? slot.realm.call("handle", input) : null;
         }
-        const mod = slot.loaded.manifest.modules[0];
-        const name = kernelNameFor(slot.loaded.author, slot.loaded.manifest.app, mod.name);
-        return (input) => host.callHandler(name, input);
+        const appKey = appKeyFor(slot.loaded.author, slot.loaded.manifest.app);
+        const mod = slot.loaded.manifest.modules[0].name;
+        return (input) => host.callModule(appKey, mod, input);
     };
     /** Stand a transport driver up over an admitted transport bundle's realm.
      *  The driver is the shell's Network: it answers the guest's DIAL actions
@@ -585,14 +586,17 @@ export function createShell(opts: CreateShellOptions & {
             roleKeys.delete("transport");
             return true;
         }
-        const removed = host.removePrefix(appKey + ":");
-        bindings.removeApp(appKey);
         const slot = apps.get(appKey);
+        const removed = host.removeApp(appKey);
+        bindings.removeApp(appKey);
         if (slot) {
             slot.realm?.dispose();
             apps.delete(appKey);
         }
-        return removed > 0;
+        // "Was there anything here": an app is its modules AND its realm, and a
+        // guest-only bundle legitimately has no modules at all (§12.4), so counting
+        // modules alone would report a successful uninstall as a failure.
+        return removed > 0 || slot !== undefined;
     };
     /** Route an inbound request to its app (§12.10): resolve the protocol to an app key,
      *  prepend the authenticated sender, hand it to that app's one entrypoint.

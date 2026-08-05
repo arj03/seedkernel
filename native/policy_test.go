@@ -117,28 +117,28 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorAPub) + `","` + hex.EncodeToString(authorBPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	nameA := kernelNameFor(authorAPub, "ownedapp", "fwd")
-	nameB := kernelNameFor(authorBPub, "ownedapp", "fwd")
-	if nameA == nameB {
-		t.Fatal("the same app name under two authors must derive distinct kernel names")
+	keyA := appKeyFor(authorAPub, "ownedapp")
+	keyB := appKeyFor(authorBPub, "ownedapp")
+	if keyA == keyB {
+		t.Fatal("the same app name under two authors must derive distinct app keys")
 	}
 	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
 	if status := loadBundle(bundleA); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
 	}
-	if !boundToWasm(nameA) {
-		t.Fatalf("author A's module is not bound at `%s`", nameA)
+	if !boundToWasm(keyA, "fwd") {
+		t.Fatalf("author A's module is not bound under `%s`", keyA)
 	}
 	// B's bundle declares the same app name and installs too — beside A, never over it.
 	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
 	if status := loadBundle(bundleB); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}
-	if !boundToWasm(nameB) {
-		t.Fatalf("author B's module is not bound at `%s`", nameB)
+	if !boundToWasm(keyB, "fwd") {
+		t.Fatalf("author B's module is not bound under `%s`", keyB)
 	}
 	// The decisive assertion: A's slot is untouched by B's install.
-	if !boundToWasm(nameA) {
-		t.Fatalf("author B's install displaced author A at `%s`", nameA)
+	if !boundToWasm(keyA, "fwd") {
+		t.Fatalf("author B's install displaced author A under `%s`", keyA)
 	}
 }

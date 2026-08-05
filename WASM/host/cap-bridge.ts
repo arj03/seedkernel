@@ -47,9 +47,9 @@ export interface SignScope {
 }
 
 /** The facts a guest learns about the bundle it is running as, all of them derived by
- *  the runtime at admission from the signed manifest. Kernel names never appear here —
- *  the guest reaches its modules by logical name through module/call, and the bridge
- *  resolves to the kernel name. */
+ *  the runtime at admission from the signed manifest. The app key never appears here —
+ *  the guest reaches its modules by logical name through module/call, against the key its
+ *  bridge already holds. */
 export interface BundleFacts {
     /** The manifest `app`. */
     app: string;
@@ -182,14 +182,14 @@ export interface CapBridgeDeps {
      *  unavailable, because guest signing is never raw. A host-side caller that never
      *  exposes SIGN may omit it. */
     signScope?: SignScope;
-    /** Reach an installed WASM handler by name (KernelHost.callHandler). */
-    callHandler: (name: string, payload: Uint8Array) => Uint8Array | null;
-    /** Logical name → kernel name for module/call resolution. The guest calls modules
-     *  by the logical name from its manifest; the bridge maps to the kernel name here
-     *  so kernel names never leave the host. Required: pass `UNSCOPED_MODULES` to opt
-     *  out deliberately, since a missing map means a guest could name any handler on
-     *  the table, including another author's. */
-    modules: Record<string, string> | typeof UNSCOPED_MODULES;
+    /** Reach one of THIS app's WASM modules by its logical name — the shell binds the app
+     *  key when it builds the bridge (`KernelHost.callModule`), so what arrives here is
+     *  already scoped and a guest naming a module it does not have resolves to nothing.
+     *
+     *  There is no logical→kernel map to pass and no opt-out sentinel guarding it. The
+     *  guest's namespace and the app's module map are the same map, so "a guest reaches
+     *  only its own modules" is the shape rather than a lookup that could be omitted. */
+    callModule: (name: string, payload: Uint8Array) => Uint8Array | null;
     /** The request/response transport the net/send name drives. `TransportHost` satisfies
      *  it. A confined guest fans out itself with `Promise.all` over `net/send`, so the
      *  bridge needs only single-peer request/response — no host-side scatter-gather.
@@ -475,8 +475,8 @@ export function transportSignScope(key: {
  *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
  *  cause. This is the same one-file rule the DOMAIN_* family follows.
  *
- *  `module/call` takes the logical name — the guest never sees a kernel name — so the
- *  module map lives in the bridge, not here. BUNDLE carries no modules field.
+ *  `module/call` takes the logical name, which is also the name the module is bound
+ *  under, so there is no map for BUNDLE to carry and no modules field.
  *
  *  Kept deliberately separate from the app's `const APP`: APP is author config that a
  *  deployment's operator config merges over, so anything living there is operator-
@@ -502,28 +502,26 @@ export function bundlePreamble(f: BundleFacts): string {
  */
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// Two of `CapBridgeDeps` govern how far a guest reaches: `allowedCaps` (which prefixes
-// resolve at all) and `modules` (which kernel names `module/call` can address). Both
-// once had a permissive meaning for the *absent* value — omit them and the guest got
-// every name in the catalog and every name on the table. That is the wrong default in the one file where a mistake
-// is a capability escalation: it makes full authority the thing a new call site gets
-// by forgetting a field, in a runtime whose admission policy is otherwise deny-all
-// (policy.ts).
+// `allowedCaps` governs how far a guest reaches, and it once had a permissive meaning for
+// the *absent* value — omit it and the guest got every name in the catalog. That is the
+// wrong default in the one file where a mistake is a capability escalation: it makes full
+// authority the thing a new call site gets by forgetting a field, in a runtime whose
+// admission policy is otherwise deny-all (policy.ts).
 //
-// They are now required, and the permissive case is a value a caller has to name. There
-// IS a legitimate permissive caller — a host-side orchestrator that already holds every
-// primitive the bridge wraps, so gating it protects nothing — and these sentinels are for
-// it. Symbols rather than strings or `null`: a symbol cannot arrive from parsed config or
-// be produced by a manifest, so the only way to reach the permissive branch is to
-// import the constant and mean it.
+// It is now required, and the permissive case is a value a caller has to name. There IS a
+// legitimate permissive caller — a host-side orchestrator that already holds every
+// primitive the bridge wraps, so gating it protects nothing — and this sentinel is for it.
+// A symbol rather than a string or `null`: a symbol cannot arrive from parsed config or be
+// produced by a manifest, so the only way to reach the permissive branch is to import the
+// constant and mean it.
+//
+// Module scoping used to need the same treatment, and no longer does: `callModule` is
+// bound to one app's module map (KernelHost), so there is no wider namespace an omitted
+// argument could open onto and nothing to opt out of.
 /** Run without cap gating: every prefix in `CAP_DOMAINS` resolves. For a host-side
  *  caller that already holds the primitives; never for a bundle's guest, whose reach is
  *  its manifest `caps` and nothing else (§12.2). */
 export const UNRESTRICTED_CAPS = Symbol("seedkernel.cap.unrestricted-caps");
-/** Run without module-name scoping: `module/call` passes logical names straight through
- *  as kernel names. For tests and host-side callers that address the table directly;
- *  never for a guest, which must not be able to name another author's modules. */
-export const UNSCOPED_MODULES = Symbol("seedkernel.cap.unscoped-modules");
 // Host-side allocation bounds for guest-controlled sizes. The realm's own
 // 64 MiB memory limit does not cover host allocations the guest requests, so
 // the bridge caps them itself (a confined guest must not be able to size a
@@ -549,7 +547,7 @@ function u64be(value: number): Uint8Array {
  *  entrypoint invocation from interleaving with the next is the realm's serialization
  *  queue (realm-queue.ts) rather than anything here. */
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
-    const { sodium, identity, callHandler, transport } = deps;
+    const { sodium, identity, callModule, transport } = deps;
     const now = deps.now ?? (() => Date.now());
     // Checked at runtime, not only in the types: the native target evaluates the COMPILED
     // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
@@ -558,12 +556,8 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     if (deps.allowedCaps === undefined) {
         throw new Error("cap-bridge: allowedCaps is required — pass the manifest's declared caps, or UNRESTRICTED_CAPS to opt out");
     }
-    if (deps.modules === undefined) {
-        throw new Error("cap-bridge: modules is required — pass the manifest's logical→kernel name map, or UNSCOPED_MODULES to opt out");
-    }
-    // null in both cases means "the caller named the sentinel" — never "the caller forgot".
+    // null means "the caller named the sentinel" — never "the caller forgot".
     const allowed = deps.allowedCaps === UNRESTRICTED_CAPS ? null : new Set(deps.allowedCaps);
-    const modules = deps.modules === UNSCOPED_MODULES ? null : deps.modules;
     // ── the catalog — the seam ABI (§12.2), ONE table: the names a guest can call
     // are the keys of this object — no second list, no numbers, never a wire value.
     // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
@@ -667,18 +661,16 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // ── installed-handler call + clock ───────────────────────────────────────
         "module/call": (payload) => {
             // The guest calls its own modules by the logical name from its manifest
-            // (README §5.1); the bridge resolves to the kernel name here so kernel
-            // names never leave the host — an undeclared name resolves to nothing.
+            // (README §5.1), and that is the name they are bound under inside this app's
+            // module map — so there is nothing to resolve and no scoping to apply. The
+            // app key was fixed when the shell built this bridge; a name the app does not
+            // have resolves to nothing, and no name reaches another app at all.
             if (payload.length < 1)
                 return NONE;
             const nameLen = payload[0];
             if (payload.length < 1 + nameLen)
                 return NONE;
-            const logicalName = dec.decode(payload.slice(1, 1 + nameLen));
-            const kernelName = modules ? modules[logicalName] : logicalName;
-            if (kernelName === undefined)
-                return NONE;
-            const r = callHandler(kernelName, payload.slice(1 + nameLen));
+            const r = callModule(dec.decode(payload.slice(1, 1 + nameLen)), payload.slice(1 + nameLen));
             return r ?? NONE;
         },
         "clock/now": () => u64be(now()),

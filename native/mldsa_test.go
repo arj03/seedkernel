@@ -273,7 +273,7 @@ func hybridAuthor(t *testing.T, s *mldsaSigner, seed byte) hybridKeys {
 func writeHybridBundle(t *testing.T, s *mldsaSigner, a hybridKeys, app string, version int) (string, string) {
 	t.Helper()
 	menv := hybridEnvelope(t, s, a, manifestJSON(t, app, version, "", nil))
-	return writeBundleFile(t, app, menv, ""), kernelNameFor(a.id(), app, "fwd")
+	return writeBundleFile(t, app, menv, ""), appKeyFor(a.id(), app)
 }
 
 // The whole point of the suite on this target: a hybrid-signed bundle loads, and its
@@ -284,15 +284,15 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	s := newMlDsaSigner(t)
 	a := hybridAuthor(t, s, 1)
 
-	path, name := writeHybridBundle(t, s, a, "pqapp", 1)
+	path, key := writeHybridBundle(t, s, a, "pqapp", 1)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	if status := loadBundle(path); !strings.HasPrefix(status, "pqapp v1") {
 		t.Fatalf("hybrid bundle should load: %s", status)
 	}
-	if !boundToWasm(name) {
-		t.Fatalf("hybrid bundle's module is not bound at `%s`", name)
+	if !boundToWasm(key, "fwd") {
+		t.Fatalf("hybrid bundle's module is not bound under `%s`", key)
 	}
 	// The id is the key-set hash, not the Ed25519 key — the property hybrid signing
 	// actually rests on (§12.4), since otherwise an attacker who breaks Ed25519 brings
@@ -300,7 +300,7 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	if hex.EncodeToString(a.id()) == hex.EncodeToString(a.edPub) {
 		t.Fatal("the hybrid author id must not be the Ed25519 public key")
 	}
-	if boundToWasm(kernelNameFor(a.edPub, "pqapp", "fwd")) {
+	if boundToWasm(appKeyFor(a.edPub, "pqapp"), "fwd") {
 		t.Fatal("a hybrid bundle bound under its Ed25519 key rather than its derived id")
 	}
 }

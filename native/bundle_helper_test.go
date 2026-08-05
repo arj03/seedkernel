@@ -75,13 +75,15 @@ func packBundle(files [][2]any) []byte {
 	return out
 }
 
-// kernelNameFor is the §5.1 bind-name derivation, mirroring bundle.ts, so a test can
-// predict where a bundle's module lands. Test-side only: the native host derives no name
-// in production — the shared JS loader hands it a module's finished kernel name.
-// The author leads the name, which is what makes ownership structural: two authors
+// appKeyFor is the §5.1 app-key derivation, mirroring bundle.ts, so a test can predict
+// which table entry a bundle's modules land under. Test-side only: the native host
+// derives no key in production — the shared JS loader hands it the finished one.
+// The author leads the key, which is what makes ownership structural: two authors
 // shipping the same app name never collide, so nothing has to arbitrate between them.
-func kernelNameFor(author []byte, app, moduleName string) string {
-	return hex.EncodeToString(author) + ":" + app + ":" + moduleName
+// A module is then addressed by the LOGICAL name from its manifest, inside that app's
+// map — there is no third component encoded into anything.
+func appKeyFor(author []byte, app string) string {
+	return hex.EncodeToString(author) + ":" + app
 }
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
@@ -96,8 +98,8 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 // under an author-signed manifest. An empty guestSrc makes it HANDLER-ONLY — the manifest
 // declares no `guest` at all, which is the shape a chat-style app ships (§12.4) and the
 // only way to exercise the shell's handler dispatch arm. Returns the bundle's path and
-// the kernel name the module will bind at, derived from `(app, "fwd")` since the manifest
-// declares no bind name. Requires a booted realm (it hashes content with the booted
+// the app key its modules will bind under; the module itself is "fwd", the logical name
+// from the manifest. Requires a booted realm (it hashes content with the booted
 // sodium). Mirrors the TS run.mjs testBundle.
 func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
 	t.Helper()
@@ -144,7 +146,7 @@ func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app strin
 	sig := ed25519.Sign(priv, preimage)
 	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
 
-	return writeBundleFile(t, app, menv, guestSrc), kernelNameFor(pub, app, "fwd")
+	return writeBundleFile(t, app, menv, guestSrc), appKeyFor(pub, app)
 }
 
 // manifestJSON builds the manifest body both suites sign: one forwarder module plus the

@@ -63,12 +63,12 @@ var (
 	// el is the Go-owned JS event loop driving the host realm and every confined
 	// realm attached to it (loop.go). One per boot.
 	el *eventLoop
-	// handlers is the handler table (README §3): the whole kernel, which is a contract
-	// rather than an artifact. A name is bound exactly when it is a key here, so the §3.1
+	// apps is the handler table (README §3): the whole kernel, which is a contract rather
+	// than an artifact. App key → that app's modules by logical name, so the §3.1
 	// bind / unbind / resolve operations are map assignment, delete and lookup — there is
-	// no id indirection and no second table to drift from this one. Every value is an
-	// installed module: bundles are the one way code arrives (§12.4).
-	handlers = map[string]*wasmHandler{}
+	// no id indirection, no name codec, and no second table to drift from this one. Every
+	// value is an installed module: bundles are the one way code arrives (§12.4).
+	apps = map[string]map[string]*wasmHandler{}
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
@@ -81,13 +81,16 @@ var (
 // exports a `scratchSize` global — seedstore's codec reserves 2 MB for whole-chunk
 // shards — which instantiateWasm reads once and clamps its cross-module copies to.
 
-// bind binds `n` to `w`, releasing whatever the name held before — the §3.1
-// replace-in-place. The one place a displaced wasm instance is closed: Go frees
-// neither the instance nor its compiled code on its own, so dropping the map value alone
-// would leak one linear memory + its JITed code per replace for the process's life.
-func bind(n string, w *wasmHandler) {
-	closeHandler(handlers[n])
-	handlers[n] = w
+// bindApp replaces `appKey`'s whole module set, releasing every instance the app held
+// before — the §3.1 install, which is one assignment because an app is one value. The one
+// place a displaced wasm instance is closed: Go frees neither the instance nor its
+// compiled code on its own, so dropping the map value alone would leak one linear memory
+// + its JITed code per re-install for the process's life.
+func bindApp(appKey string, mods map[string]*wasmHandler) {
+	for _, w := range apps[appKey] {
+		closeHandler(w)
+	}
+	apps[appKey] = mods
 }
 
 // closeHandler releases a handler's wasm instance and compiled code. nil-safe, so callers
@@ -100,27 +103,27 @@ func closeHandler(w *wasmHandler) {
 	_ = w.cmod.Close(ctx)
 }
 
-// removePrefix unbinds every name starting with `prefix` and releases what each held —
-// the shell's uninstall (§12.5). Every kernel name of an app shares its app key as a
-// prefix (§5.1), so one pass frees exactly that app.
-func removePrefix(prefix string) int {
-	removed := 0
-	for n, w := range handlers {
-		if strings.HasPrefix(n, prefix) {
-			closeHandler(w)
-			delete(handlers, n)
-			removed++
-		}
+// removeApp drops an app and releases every instance it held — the shell's uninstall
+// (§12.5). An app's modules are the value under its key (§5.1), so this is one lookup.
+func removeApp(appKey string) int {
+	mods, ok := apps[appKey]
+	if !ok {
+		return 0
 	}
-	return removed
+	for _, w := range mods {
+		closeHandler(w)
+	}
+	delete(apps, appKey)
+	return len(mods)
 }
 
-// callHandler invokes an installed handler by name (README §4), returning its response or
-// nil if the name is unbound or the handler produced nothing. The one way into an installed
-// module: the shell uses it directly and the cap-bridge routes module/call (§12.2) through
-// it. Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
-func callHandler(n string, payload []byte) []byte {
-	w := handlers[n]
+// callModule invokes one app's module by its logical name (README §4), returning its
+// response or nil if nothing is bound there or the handler produced nothing. The one way
+// into an installed module: the shell uses it directly and the cap-bridge routes
+// module/call (§12.2) through it, with the app key bound when the bridge was built.
+// Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
+func callModule(appKey, module string, payload []byte) []byte {
+	w := apps[appKey][module]
 	if w == nil {
 		return nil
 	}
@@ -163,8 +166,8 @@ func callHandler(n string, payload []byte) []byte {
 // a bundle rejected at its third module has to close the first two, and a loader that
 // forgot would leak a linear memory plus its JITed code per rejected bundle. Making it a
 // two-phase seam across the bridge is what would put that duty on the caller.
-func bindAll(names []string, wasms [][]byte, scratchDefault uint32) error {
-	built := make([]*wasmHandler, 0, len(wasms))
+func bindAll(appKey string, names []string, wasms [][]byte, scratchDefault uint32) error {
+	built := make(map[string]*wasmHandler, len(wasms))
 	for i, wasm := range wasms {
 		w, err := instantiateWasm(wasm, scratchDefault)
 		if err != nil {
@@ -173,12 +176,10 @@ func bindAll(names []string, wasms [][]byte, scratchDefault uint32) error {
 			}
 			return fmt.Errorf("%s: %w", names[i], err)
 		}
-		built = append(built, w)
+		built[names[i]] = w
 	}
 	// Nothing above touched the table and nothing below can fail.
-	for i, w := range built {
-		bind(names[i], w)
-	}
+	bindApp(appKey, built)
 	return nil
 }
 
@@ -229,19 +230,6 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*wasmHandler, error) {
 	}
 	ok = true
 	return &wasmHandler{m, cm, fn, s, size}, nil
-}
-
-// installWasm compiles, instantiates, validates, and binds in one call. Kept as a
-// convenience for the direct tests; the production path is bindAll, which needs the
-// instantiate and the bind as separate phases to stay all-or-none. `scratchDefault`
-// is the §4.1 default, passed by the tests (production gets it from the shim).
-func installWasm(n string, wasm []byte, scratchDefault uint32) error {
-	w, err := instantiateWasm(wasm, scratchDefault)
-	if err != nil {
-		return err
-	}
-	bind(n, w)
-	return nil
 }
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
@@ -334,7 +322,7 @@ func shutdown() {
 		_ = rt.Close(ctx)
 		rt = nil
 	}
-	handlers = map[string]*wasmHandler{}
+	apps = map[string]map[string]*wasmHandler{}
 }
 
 // exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
@@ -344,13 +332,15 @@ func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
 	// ── the handler table (§3) ──
-	// One transactional install (§3.1). The argument is the loader's `{name, wasm}[]`,
-	// read out here rather than flattened on the JS side so the bridge shape and the
-	// BundleHost interface are the same shape — plus the §4.1 scratch default, which
-	// the shim passes from the shared host (core/wasm-limits.ts) rather than Go owning
-	// a copy of the number the JS table enforces.
+	// One transactional install (§3.1) of one app's whole module set. The arguments are
+	// the app key and the loader's `{name, wasm}[]`, read out here rather than flattened
+	// on the JS side so the bridge shape and the BundleHost interface are the same shape
+	// — plus the §4.1 scratch default, which the shim passes from the shared host
+	// (core/wasm-limits.ts) rather than Go owning a copy of the number the JS table
+	// enforces.
 	b.SetPropertyStr("bindAll", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		mods := t.Args()[0]
+		appKey := t.Args()[0].String()
+		mods := t.Args()[1]
 		lenv := mods.GetPropertyStr("length")
 		n := int(lenv.Int64())
 		lenv.Free()
@@ -370,27 +360,27 @@ func exposeBridge(qc *qjs.Context) {
 			}
 			wasms[i] = wb
 		}
-		if err := bindAll(names, wasms, uint32(t.Args()[1].Int64())); err != nil {
+		if err := bindAll(appKey, names, wasms, uint32(t.Args()[2].Int64())); err != nil {
 			return nil, err
 		}
 		return t.Context().NewNull(), nil
 	}))
-	b.SetPropertyStr("callHandler", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		pl, err := qjs.JsTypedArrayToGo(t.Args()[1])
+	b.SetPropertyStr("callModule", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		pl, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
 			return t.Context().NewNull(), nil
 		}
-		resp := callHandler(t.Args()[0].String(), pl)
+		resp := callModule(t.Args()[0].String(), t.Args()[1].String(), pl)
 		if resp == nil {
 			return t.Context().NewNull(), nil
 		}
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
 	b.SetPropertyStr("isBound", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(handlers[t.Args()[0].String()] != nil), nil
+		return t.Context().NewBool(apps[t.Args()[0].String()][t.Args()[1].String()] != nil), nil
 	}))
-	b.SetPropertyStr("removePrefix", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewInt64(int64(removePrefix(t.Args()[0].String()))), nil
+	b.SetPropertyStr("removeApp", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewInt64(int64(removeApp(t.Args()[0].String()))), nil
 	}))
 
 	// ── bundle-freshness persistence (§12.4) ──
