@@ -105,11 +105,11 @@ func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, 
 }
 
 // writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a handler-only
-// manifest carrying `role` — the shape of the real transport bundle, whose one module
-// (ws.wasm) rides alongside its guest program. A slot occupant is an authority grant
-// with its own admission class (§12.5), so the native tests need a bundle the ordinary
-// author allowlist must refuse — and `role` is inside the signed JSON, which is why this
-// signs its own body rather than post-editing one.
+// manifest carrying `role`. Deliberately NOT the shape of the real transport bundle,
+// which ships a guest — nothing here is ever run, because the point is admission: a slot
+// occupant is an authority grant with its own class (§12.5), so the native tests need a
+// bundle the ordinary author allowlist must refuse. `role` is inside the signed JSON,
+// which is why this signs its own body rather than post-editing one.
 func writeSlotBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, role string) string {
 	t.Helper()
 	type mod struct {

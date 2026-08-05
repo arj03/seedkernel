@@ -540,13 +540,9 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         seen.add(mm.name);
     }
-    // A handler-only bundle is ONE pure transform (§4): nothing else can reach its
-    // modules — a handler cannot call another handler (§4.2) and with no guest there is
-    // no module/call to drive them — so there is no second module to dispatch and no
-    // `entry` field to pick one. The single module IS the app's inbound entry, and
-    // anything multi-module ships a guest, which dispatches itself (§12.10).
-    if (o.guest === undefined && o.modules.length !== 1)
-        return false;
+    // The module COUNT rule for a handler-only bundle is not here: it is a dispatch rule,
+    // not a shape one, so it is refused by name in verifyManifest with the rest of the
+    // "this bundle wants a runtime I am not" family.
     if (o.guest !== undefined) {
         const g = o.guest as Record<string, unknown>;
         if (typeof g !== "object" || g === null || Array.isArray(g))
@@ -648,6 +644,22 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // it could never run.
     if (parsed.guest && !SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
         throw new Error(`bundle: guest ABI ${parsed.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
+    }
+    // A handler-only bundle is exactly one module, refused here by name rather than as a
+    // shape error so an author learns the rule instead of "malformed manifest".
+    //
+    // A DISPATCH rule, not a reachability claim. Inbound traffic reaches one module
+    // (§12.10), and nothing inside the runtime can fan out to a second — a handler cannot
+    // call another handler (§4.2), and with no guest there is no `module/call` to drive
+    // one. A host-side embedder holding `shell.host.callHandler` CAN reach any of them by
+    // kernel name, so a second module is not unreachable; it is undispatchable, and a
+    // manifest that leaves inbound traffic pointing at one of several is the ambiguity
+    // this refuses. Anything multi-module ships a guest, which dispatches itself.
+    //
+    // Zero is refused by the same sentence: a bundle with no guest and no module carries
+    // nothing that can run.
+    if (!parsed.guest && parsed.modules.length !== 1) {
+        throw new Error(`bundle: a handler-only bundle is exactly one module, and this declares ${parsed.modules.length} — inbound dispatch reaches one module (§12.10), so ship the guest that dispatches them`);
     }
     // The declared primitives, checked the same way and for the same reason: "this bundle
     // wants a host I am not". Not a grant — a primitive reaches nothing — so it is refused

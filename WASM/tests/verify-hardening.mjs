@@ -94,8 +94,15 @@ console.log("\n§12.4 — a handler-only bundle is one module");
 {
   const kp = sodium.crypto_sign_keypair();
   const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp.privateKey, kp.publicKey, m));
-  throws(() => verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }] }),
-    "two handler modules and no guest are refused — the module count IS the dispatch rule");
+  // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: an author who
+  // ships two handler modules has to learn the rule, not "malformed manifest".
+  const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
+  const two = refusal({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }] });
+  ok(two.includes("exactly one module"), `two handler modules and no guest are refused by name (got: ${two})`);
+  const none = refusal({ app: "x", version: 1, modules: [] });
+  ok(none.includes("exactly one module"), `no guest and no module is refused by the same rule (got: ${none})`);
+  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } }) !== null,
+    "a guest bundle may declare no modules at all — it is the guest that dispatches");
 }
 
 console.log("\n§12.2 — the capability gates cannot be reached by omission");
