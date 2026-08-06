@@ -660,8 +660,8 @@ func main() {
 	}
 
 	// One-shot client ops through the loaded guest — "the shell runs the app" as the
-	// initiator (README §12.8). Arguments/results cross as raw bytes; a handler-only
-	// bundle has no guest, and the shell says so rather than silently doing nothing.
+	// initiator (README §12.8). Arguments/results cross as raw bytes, and every bundle
+	// has a guest to run them (§12.4), so there is no second shape to fall back to.
 	if a.put != "" {
 		data, err := os.ReadFile(a.put)
 		if err != nil {

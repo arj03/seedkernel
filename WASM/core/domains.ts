@@ -61,9 +61,9 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  version of a contract a signed document was written for, read by the loader before
  *  anything is trusted — and putting it here is what keeps the loader from importing the
  *  guest bridge to check a manifest field. That edge would drag the whole name catalog
- *  and preamble into every page that verifies a bundle, including handler-only shells
- *  (seedchat) that never build a bridge at all. cap-bridge.ts re-exports it, so a reader
- *  of the seam still finds the number next to the names. */
+ *  and preamble into every page that verifies a bundle, including pages that only
+ *  inspect one and never build a bridge at all. cap-bridge.ts re-exports it, so a
+ *  reader of the seam still finds the number next to the names. */
 export const GUEST_ABI_VERSION = 2;
 /** The crypto primitives this host serves through the `crypto/` prefix — the catalog
  *  a manifest's `guest.primitives` is checked against at load (§12.4).

@@ -1,7 +1,7 @@
 // The app bundle format (README §12.4). A bundle is *signed content* the generic
-// shell loads from a single file: a set of WASM handler modules, an optional
-// zero-authority guest program, and a signed manifest declaring the modules by logical
-// name and — when there is a guest — the capabilities it holds.
+// shell loads from a single file: a set of WASM modules, the app's zero-authority guest
+// program, and a signed manifest declaring the modules by logical name and the
+// capabilities the guest holds.
 // The shell verifies the manifest signature, governs it against its policy (author +
 // module hashes), and installs the modules; the guest's `caps` describe the seam it is
 // wired over, honored by the generic cap bridge (README §12.2).
@@ -57,9 +57,9 @@ export interface BundleCrypto extends ManifestVerifier {
 /** The zero-authority guest program and everything about it. `caps` and `config` live
  *  HERE rather than at the top level because both are the guest's alone: the manifest's
  *  caps are the guest's entire authority (§12.2) and config only ever becomes its
- *  injected `APP`. WASM handlers carry no authority and read no config, so a
- *  handler-only bundle (the chat demo) simply omits this object — and "no guest ⇒ zero
- *  authority" is then the schema's shape rather than a rule prose has to state. */
+ *  injected `APP`. WASM modules carry no authority and read no config, so the two fields
+ *  have no meaning at the top level — and "no authority ⇒ empty `caps`" is the schema's
+ *  shape rather than a rule prose has to state. */
 export interface BundleGuest {
     /** genesisHash(utf8(source)) hex of `guest.js`. */
     hash: string;
@@ -133,11 +133,11 @@ export interface BundleManifest {
      *  bundle, so each author keeps their own version lineage (§12.4). */
     role?: BundleRole;
     modules: BundleModule[];
-    /** The guest program, or absent for a handler-only bundle (app modules bound as
-     *  handlers, no zero-authority realm — e.g. the chat demo). Present ⇒ the loader
+    /** The guest program — required, because every app is a guest: the loader
      *  integrity-checks `guest.js` and hands the source back for the shell to run in a
-     *  confined realm (§12.2). */
-    guest?: BundleGuest;
+     *  confined realm (§12.2). The modules are the pure transforms the guest drives by
+     *  name, freely zero-to-many. */
+    guest: BundleGuest;
 }
 
 /** The surface *verifying* a manifest needs (a subset of libsodium). Deliberately
@@ -274,13 +274,12 @@ export interface VerifiedBundle {
         mod: BundleModule;
         wasm: Uint8Array;
     }[];
-    /** The verified guest source, or `""` for a handler-only bundle that declared none. */
+    /** The verified guest source. */
     guestSource: string;
 }
 
 /** What the shell returns from `loadBundleBlob`: everything the manifest proved,
- *  minus the raw module bytes already bound into the handler table. The guest source
- *  is `""` for a handler-only bundle that declared none. */
+ *  minus the raw module bytes already bound into the handler table. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
 /** The manifest envelope's name inside the container. */
@@ -533,10 +532,12 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         seen.add(mm.name);
     }
-    // The module COUNT rule for a handler-only bundle is not here: it is a dispatch rule,
-    // not a shape one, so it is refused by name in verifyManifest with the rest of the
-    // "this bundle wants a runtime I am not" family.
-    if (o.guest !== undefined) {
+    // `guest` is required: every app is a guest (§12.4), so the type guard insists on
+    // one. A manifest that OMITS it entirely is caught earlier, by name, in
+    // verifyManifest — this is the shape check for one that declared a broken one.
+    if (o.guest === undefined)
+        return false;
+    {
         const g = o.guest as Record<string, unknown>;
         if (typeof g !== "object" || g === null || Array.isArray(g))
             return false;
@@ -627,6 +628,16 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     catch {
         throw new Error("bundle: malformed manifest (not JSON)");
     }
+    // A manifest with no `guest` at all, refused BY NAME rather than as a shape error —
+    // the same courtesy an unimplemented ABI or an unknown cap domain gets below, and for
+    // the same reason: "this bundle is not shaped like an app this runtime runs" is a
+    // rule an author should learn, not something to report as "malformed manifest". It is
+    // also the one manifest a bundle written against the older, handler-only format
+    // produces, so it is exactly the error worth spelling out.
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+        && (parsed as Record<string, unknown>).guest === undefined) {
+        throw new Error("bundle: this manifest declares no guest, and every app is a guest (§12.4) — the modules are the library it drives, so ship the guest that drives them");
+    }
     if (!isValidManifest(parsed))
         throw new Error("bundle: malformed manifest");
     // Guest ABI support (§12.2), the same KIND of check as the suite above and refused the
@@ -635,29 +646,13 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // It sits here, at the one place a manifest becomes a value the rest of the runtime
     // trusts, so no target can forget it and no inspecting shell shows an operator a guest
     // it could never run.
-    if (parsed.guest && !SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
+    if (!SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
         throw new Error(`bundle: guest ABI ${parsed.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
-    }
-    // A handler-only bundle is exactly one module, refused here by name rather than as a
-    // shape error so an author learns the rule instead of "malformed manifest".
-    //
-    // A DISPATCH rule, not a reachability claim. Inbound traffic reaches one module
-    // (§12.10), and nothing inside the runtime can fan out to a second — a handler cannot
-    // call another handler (§4.2), and with no guest there is no `module/call` to drive
-    // one. A host-side embedder holding `shell.host.callModule` CAN reach any of them by
-    // kernel name, so a second module is not unreachable; it is undispatchable, and a
-    // manifest that leaves inbound traffic pointing at one of several is the ambiguity
-    // this refuses. Anything multi-module ships a guest, which dispatches itself.
-    //
-    // Zero is refused by the same sentence: a bundle with no guest and no module carries
-    // nothing that can run.
-    if (!parsed.guest && parsed.modules.length !== 1) {
-        throw new Error(`bundle: a handler-only bundle is exactly one module, and this declares ${parsed.modules.length} — inbound dispatch reaches one module (§12.10), so ship the guest that dispatches them`);
     }
     // The declared primitives, checked the same way and for the same reason: "this bundle
     // wants a host I am not". Not a grant — a primitive reaches nothing — so it is refused
     // here as an incompatibility rather than gated later as an authority.
-    for (const p of parsed.guest?.primitives ?? []) {
+    for (const p of parsed.guest.primitives ?? []) {
         if (!(PRIMITIVE_NAMES as readonly string[]).includes(p)) {
             throw new Error(`bundle: this host has no crypto primitive "${p}" (manifest guest.primitives; this host serves: ${PRIMITIVE_NAMES.join(", ")})`);
         }
@@ -668,13 +663,13 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // too. Both are AUTHORITY checks, so they belong at the point the manifest becomes
     // trusted, before any policy predicate is shown a bundle it must never admit.
     if (parsed.role === undefined) {
-        for (const c of parsed.guest?.caps ?? []) {
+        for (const c of parsed.guest.caps) {
             if (SLOT_ONLY_DOMAINS.includes(c)) {
                 throw new Error(`bundle: capability domain "${c}" belongs to a slot occupant, and ${parsed.app} claims no role (§12.4)`);
             }
         }
     }
-    for (const c of parsed.guest?.caps ?? []) {
+    for (const c of parsed.guest.caps) {
         if (!(CAP_DOMAINS as readonly string[]).includes(c)) {
             throw new Error(`bundle: unknown capability domain "${c}" (this host grants: ${CAP_DOMAINS.join(", ")})`);
         }
@@ -864,7 +859,7 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
         suite: v.suite,
         manifest: v.manifest,
         modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
-        guestSource: v.manifest.guest ? dec.decode(read(GUEST_FILE)) : "",
+        guestSource: dec.decode(read(GUEST_FILE)),
     };
     // Integrity: hash every module and the guest against the manifest's signed hashes.
     // This is inside verifyBundle (not a separate step) because the manifest hashes are
@@ -875,10 +870,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
             throw new Error(`bundle: ${mod.name} content hash mismatch`);
         }
     }
-    if (v.manifest.guest) {
-        if (!contentMatches(enc.encode(result.guestSource), v.manifest.guest.hash, (b) => genesisHash(sodium, b))) {
-            throw new Error("bundle: guest content hash mismatch");
-        }
+    if (!contentMatches(enc.encode(result.guestSource), v.manifest.guest.hash, (b) => genesisHash(sodium, b))) {
+        throw new Error("bundle: guest content hash mismatch");
     }
     return result;
 }

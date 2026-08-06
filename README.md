@@ -1,29 +1,28 @@
-# Seed kernel: a tiny handler-table kernel that bootstraps into a sandboxed app runtime
+# Seed kernel: a sandboxed app runtime that grows from signed bundles
 
-*A simple kernel grows from a signed message handler bundle into arbitrary behaviour — untrusted code runs sandboxed (WASM handlers or confined JS), anywhere from a browser tab to a single native binary.*
+*Every app is a confined JS guest over a library of pure-transform WASM modules; code arrives only as a signed bundle, and untrusted code runs sandboxed anywhere from a browser tab to a single native binary.*
 
 ## 1. Vision
 
-A minimal runtime built around a kernel that does one thing: look up an **app** and one of its **modules** in `apps` and run the handler bound there as a **pure transform** — bytes in and bytes out. Authorization, capability gating, confinement and application logic are the **host** and its **modules** — layers that compose around the table without the kernel knowing what any of them mean. Installing a handler is nothing more than `apps[appKey].modules[name] = wasm_bytes`; code arrives as a signed **bundle** and the host binds its modules into the table under a policy. The system bootstraps from one trusted policy (the authors it will install, or none) into arbitrarily complex behaviour.
+A minimal runtime: a **host** admits signed **bundles**, and every bundle is an app with exactly one shape — a confined JS **guest** (the app's logic) plus, optionally, any number of pure-transform WASM **modules** that serve as the app's library. The guest is the only thing an inbound frame reaches: the host resolves the protocol to an app, invokes the guest's one `handle` entrypoint, and the guest drives its own modules by name when it needs a transform. Authorization, capability gating, confinement and application logic are the **host** and its **guests** — layers that compose around the seam without the host knowing what any of them mean. Installing an app is one signed record: the author-derived app key, the guest source, and the module map. Code arrives as a signed **bundle** and the host binds it under a policy. The system bootstraps from one trusted policy (the authors it will install, or none) into arbitrarily complex behaviour.
 
-**The kernel is small because attribution happens below it.** By the time a frame reaches the table it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. The kernel gets to be two operations *because* a layer beneath it did that work. But being beneath the kernel is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle.
+**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be a bindings lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle.
 
 Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
 
-**The whole runtime is six components.** Everything after this table is detail:
+**The whole runtime is five components.** Everything after this table is detail:
 
 | Component | Role |
 | --- | --- |
-| **Kernel** | Routes an app's module names to handlers: an `apps[appKey][module]` table (§3). It is a *contract*, not an artifact — the table, the handler ABI and the bind/unbind semantics — implemented as two nested maps inside each host, so ownership is the outer key rather than something parsed out of one. Handlers are pure transforms; there is no dispatch loop, no signature logic, no I/O. |
+| **Host** | The runtime: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — the install records and the module table (§3), the inbound dispatch (§12.10), and `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Raw I/O** | Two capabilities of the same shape: `net` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
-| **Host** | The runtime around the table: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — reaches a handler by name (`callModule`), and provides `loadBundle`, the single admin path that admits new code (§12.4). |
-| **Handlers** | Pure-transform WASM modules (§4): the host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no kernel seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. |
-| **Guests** | Confined JS programs (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(name, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here. |
-| **Bundles** | The only way code arrives (§12.4): a manifest, WASM modules, a guest JS program, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits the modules into the flat table — a policy decision, then one all-or-none bind. **The transport is one of these.** |
+| **Handlers** | An app's *library*: pure-transform WASM modules (§4), reached by the guest by name through `module/call` (§12.2). The host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no host seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. A handler runs only when its app's guest calls it. |
+| **Guests** | Every app's logic (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(name, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Inbound delivery is an entrypoint invocation on the app's guest; everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here, and the modules are the library it drives by name. |
+| **Bundles** | The only way code arrives (§12.4): a manifest, a guest JS program, any number of WASM modules, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits the app — a policy decision, then one all-or-none bind. **The transport is one of these.** |
 
-There are no special cases and exactly one way to do everything: one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names and is driven through named entrypoints, exactly as an app is.
+There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names and is driven through named entrypoints, exactly as an app is.
 
-Every binding is three orthogonal pieces: the **name** is the kernel's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The loader binds names to bytes under a deployer-supplied **policy** that decides who may install what (§12.5).
+Every binding is three orthogonal pieces: the **name** is the host's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The loader binds names to bytes under a deployer-supplied **policy** that decides who may install what (§12.5).
 
 ## What belongs in the core
 
@@ -96,13 +95,16 @@ socket delivers bytes                    host: raw net + flood limits
 transport bundle: record open, attribute to peer      §12.6
         │
         ▼
-host resolves the app, stages input bytes
+host resolves the app through its bindings,
+prepends the authenticated sender key        §12.10
         │
         ▼
-apps[appKey][module] → handler (two lookups)         §3
+app's guest `handle` entrypoint — under the
+guest execution budget (§12.3)               §12.2
         │
         ▼
-pure transform at scratch offset → output bytes      §4
+the guest drives its modules:
+module/call → pure transform at scratch      §3, §4
         │
         ▼
 host frames response through the transport bundle
@@ -114,20 +116,19 @@ The reference composition stacks the layers so each depends only on the layers b
 ┌─────────────────────────────────────┐
 │   App                               │
 │   guest (confined JS) +             │
-│   pure-transform WASM handlers      │
+│   pure-transform WASM modules       │
 ├─────────────────────────────────────┤
-│   Cap-bridge (required if guest     │
-│   JS is present; otherwise omitted) │
+│   Cap-bridge                        │
 │   the guest's host.call seam —      │
 │   its only reach to real I/O        │
 ├─────────────────────────────────────┤
-│   Kernel                            │
-│   apps[appKey][module] → handler    │
-│   two maps, held by the host        │
+│   Host                              │
+│   install records + module table,   │
+│   dispatch, the platform seam       │
 ├─────────────────────────────────────┤
 │   Transport — a signed bundle       │
 │   wire codec, AKE, record layer,    │
-│   link routing. beneath the kernel, │
+│   link routing. beneath the host,   │
 │   but content: replaceable          │
 ├─────────────────────────────────────┤
 │   Raw I/O                           │
@@ -141,29 +142,29 @@ The reference composition stacks the layers so each depends only on the layers b
 **Design principles:**
 
 - **The core is what the endpoints cannot do for themselves.** Authenticity, confidentiality, framing and routing all have endpoint substitutes and are therefore content. Transmission does not, and is therefore core.
-- **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the kernel and is still an ordinary bundle. Keeping these separate is what stops "it's foundational" from becoming a licence to grow.
+- **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the host and is still an ordinary bundle. Keeping these separate is what stops "it's foundational" from becoming a licence to grow.
 - **Not-core is not the same as replaceable.** The bundle verifier, the cap-bridge and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
-- The kernel does exactly one thing: name resolution and byte dispatch. No built-in policies, I/O, or dispatch loop. Lower layers gate higher layers; each layer sees only downward.
-- Untrusted code is **bounded** as well as confined. A WASM handler declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **handler** CPU, and it is a missing mechanism rather than a decision: WebAssembly engines on the JS platform expose no fuel or timeout to call (§4.3, §14).
-- Modules, as untrusted code, run confined. WASM handlers are synchronous pure transforms — a buffer in, a buffer out, and that is the full extent of their interaction. JavaScript is reserved for code that must await multiple host interactions or maintain state across asynchronous turns, with zero ambient authority and only the single `host.call` seam.
+- The host's dispatch does exactly one thing: resolve the protocol to an app and invoke its guest. No built-in policies, I/O, or dispatch loop beyond the seam it is handed. Lower layers gate higher layers; each layer sees only downward.
+- Untrusted code is **bounded** as well as confined. A WASM handler declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **handler** CPU, and it is a missing mechanism rather than a decision: WebAssembly engines on the JS platform expose no fuel or timeout to call (§4.3, §14). It is also now one step away from the wire: every inbound frame enters under the guest's execution budget, so a handler can only be reached through a guest's own `module/call`.
+- Modules, as untrusted code, run confined. WASM handlers are synchronous pure transforms — a buffer in, a buffer out, and that is the full extent of their interaction. **Every app's logic is its guest** — a confined JS program with zero ambient authority and only the single `host.call` seam, because session state and async interaction have no other home. A module is what the guest delegates a pure transform to, by name through `module/call`.
 - Node-to-node links are confidential by default — the transport bundle opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket and WebRTC and needing no external TLS or Noise tunnel.
 - The channel authenticates one hop, not the whole path. An app that **relays** messages through intermediaries cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top. Bundles already work this way, which is why they need no channel at all.
-- The kernel is a specification, not a binary. Each host implements the table as a plain map; what must not drift is the bundle load order and the admission rules, and those are shared as one compiled implementation on every target (§12.9).
+- The handler table is a specification, not a binary. Each host implements it as a plain map; what must not drift is the bundle load order and the admission rules, and those are shared as one compiled implementation on every target (§12.9).
 
 ## One implementation, three targets
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which: `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content.
 
-The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded.
+The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
 
-**Shared — compiled once, run by all three targets (2,036 LOC)**
+**Shared — compiled once, run by all three targets (2,026 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 521 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 522 |
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 442 |
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 404 |
-| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 409 |
+| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 398 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 260 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
@@ -181,7 +182,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the kernel table, the PQ module drivers, entry points, key derivation | 1,466 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the handler table, the PQ module drivers, entry points, key derivation | 1,439 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the handler table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,373 Go + 335 TS |
 
 **Signed content — not host code at all**
@@ -190,7 +191,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,220 + 5 KB |
 
-Each target therefore runs 2,036 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,026 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 
@@ -225,7 +226,7 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 
 | Doc | Sections | Contents |
 | --- | --- | --- |
-| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The kernel and its handler table, host-level handler management, standing a host up, the pure-transform WASM handler ABI, layering, the protocol constants. |
+| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The handler table, host-level handler management, standing a host up, the pure-transform WASM handler ABI, layering, the protocol constants. |
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 | [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the four messages do, the three secrets and their different jobs, purpose-bound key derivation, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |

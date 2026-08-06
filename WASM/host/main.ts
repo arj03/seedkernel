@@ -207,6 +207,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         bindings: core.bindings,
         net: core.net,
         transport: core.transport,
+        // boot() always supplies an fs (Node always has a filesystem), so the optional
+        // seam member is non-null here.
         fs: core.fs!,
         sodium: core.sodium,
         loadBundleBlob: core.loadBundleBlob,

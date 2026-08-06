@@ -56,6 +56,12 @@ const { withMlKem768, loadMlKem768 } = await imp("build/host/kem.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Every app is a guest (§12.4), so every bundle a test builds declares one. The stub
+// used by tests that do not exercise the guest is the same minimal program throughout.
+const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
+const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
+const GUEST = () => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, caps: [] });
+
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own KernelHost without a shell. */
 // The two halves of a load with the admission seam between them (§12.4). `admit` may
@@ -159,9 +165,10 @@ async function testInstallRejectsUntrustedAuthor() {
 
   // A valid manifest signed by an untrusted author — the author is not in the policy.
   const manifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
+    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+    guest: GUEST() };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
-  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
+  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   // The predicate only trusts a DIFFERENT key.
   const stranger = generateKeyPair();
@@ -179,9 +186,10 @@ async function testManifestHashIsEnforced() {
   const author = generateKeyPair();
   // A manifest that declares the CORRECT hash — loadBundle should accept it.
   const manifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
+    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+    guest: GUEST() };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
-  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
+  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   // verifyBundle (now the single verify step) must accept a hash-matched module.
   const v = verifyBundle(sodium, blob);
@@ -189,9 +197,10 @@ async function testManifestHashIsEnforced() {
 
   // A manifest that declares a WRONG hash — verifyBundle must throw.
   const badManifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(new Uint8Array([1, 2, 3]))) }] };
+    modules: [{ name: "fwd", hash: toHex(gHash(new Uint8Array([1, 2, 3]))) }],
+    guest: GUEST() };
   const badEnv = signManifest(sodium, author.privateKey, author.publicKey, badManifest);
-  const badBlob = packBundle({ [MANIFEST_FILE]: badEnv, [moduleFile("fwd")]: forwarderBytes });
+  const badBlob = packBundle({ [MANIFEST_FILE]: badEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
   let threw = false;
   try { verifyBundle(sodium, badBlob); } catch { threw = true; }
   assert(threw, "verifyBundle throws when a module hash does not match the bytes");
@@ -211,9 +220,10 @@ async function testDenyAllPolicyRejects() {
   const { host } = await makeHost();
   const author = generateKeyPair();
   const manifest = { app: "demo", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
+    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+    guest: GUEST() };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
-  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
+  const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   let threw = false;
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
@@ -232,10 +242,10 @@ async function testBundleRefusesNonHandler() {
 
   // A well-formed manifest committing to two modules the author genuinely signed. One is
   // the real forwarder (a valid §4 handler); the other is arbitrary bytes that hash-match
-  // their manifest module entry but won't instantiate as a handler. A guest is declared
-  // because a handler-only bundle is one module by construction (§12.4) — the multi-module
-  // shape that tests atomicity is a guest bundle. With a two-phase install, a module that
-  // fails phase 1 (instantiate) should fail the entire load — nothing lands.
+  // their manifest module entry but won't instantiate as a handler. A guest is declared —
+  // every app is a guest (§12.4) — and the multi-module shape is exactly what tests
+  // atomicity. With a two-phase install, a module that fails phase 1 (instantiate)
+  // should fail the entire load — nothing lands.
   const notAHandler = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
   const guestText = "register('ping', () => new Uint8Array([1]));";
   const guestBytes = new TextEncoder().encode(guestText);
@@ -642,9 +652,10 @@ async function testPolicy() {
   const tryLoad = async (policyJson, author, extra = {}) => {
     const host = new KernelHost();
     const manifest = { app: "mod", version: 1, ...extra,
-      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] };
+      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST() };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
-    const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes });
+    const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
     let landed = false;
     try { await loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
@@ -699,7 +710,7 @@ async function testPolicy() {
   threw = false;
   try {
     verifyManifest(sodium, signManifest(sodium, good.privateKey, good.publicKey,
-      { app: "mod", version: 1, role: "quantum-relay", modules: [] }));
+      { app: "mod", version: 1, role: "quantum-relay", modules: [], guest: GUEST() }));
   } catch { threw = true; }
   assert(threw, "a manifest claiming an unknown slot is refused as malformed");
 
@@ -735,12 +746,14 @@ async function testGuestAbi() {
   catch (e) { msg = e.message; }
   assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
 
-  // A handler-only bundle declares no guest and therefore no ABI — the seam it never
-  // touches is not a field it has to fill in. (A handler-only bundle is one module by
-  // construction §12.4, hence the single module here.)
-  assert(verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
-    { app: "abi", version: 1, modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] })) !== null,
-    "a handler-only bundle needs no ABI declaration");
+  // A manifest without a guest is not an app at all: every bundle declares a guest
+  // (§12.4). Refused BY NAME, like the ABI above — it is the manifest a bundle written
+  // against the retired handler-only format produces, so the message has to say what
+  // the rule is rather than "malformed manifest".
+  let noGuest = "";
+  try { verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+    { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
+  assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
   console.log("  OK\n");
 }
@@ -757,8 +770,9 @@ async function testSlotFreshness() {
   const b = generateKeyPair();
   const blobFrom = (author, version, role) => packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey,
-      { app: "link", version, ...(role ? { role } : {}), modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }] }),
+      { app: "link", version, ...(role ? { role } : {}), modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }], guest: GUEST() }),
     [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
   });
   const land = (host, freshness, author, version, role) => {
     installBundle(host, verifyBundle(sodium, blobFrom(author, version, role)), freshness);
@@ -927,16 +941,17 @@ async function testBundle() {
   console.log("  OK\n");
 }
 
-// ─── Test: handler-only bundle (no guest) + the verify/install split ────
+// ─── Test: every app is a guest (§12.4) + the verify/install split ────
 //
-// A chat-style app is a one-module bundle with NO guest realm — and because caps
-// live inside `guest` (§12.4), omitting it IS declaring zero authority; there is no
-// empty caps list to write. Proves the shared §12.4 loader accepts that shape
-// (guestSource === ""), that a bundle blob round-trips as one value, and that
-// `verifyBundle` authenticates + integrity-checks WITHOUT a host or a policy — the
-// seam the browser shell peeks a received Offer through before asking for consent.
-async function testGuestlessBundleAndArchive() {
-  console.log("Test: handler-only bundle (no guest) loads + verify/install split");
+// A chat-style app is a guest plus its module — and because caps live inside `guest`,
+// an empty list IS declaring zero authority; there is no second shape without one. A
+// manifest without a guest is refused by name. Proves the shared §12.4 loader
+// accepts the one app shape (guestSource round-trips), that a bundle blob round-trips
+// as one value, and that `verifyBundle` authenticates + integrity-checks WITHOUT a
+// host or a policy — the seam the browser shell peeks a received Offer through before
+// asking for consent.
+async function testGuestBundleAndArchive() {
+  console.log("Test: every app is a guest — bundle blob + verify/install split");
   const { signManifest, verifyManifest, verifyBundle,
           packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
@@ -947,25 +962,34 @@ async function testGuestlessBundleAndArchive() {
 
   const author = generateKeyPair();
   const identity = generateKeyPair();
-  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guestless-"));
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guest-"));
   const bundlePath = pjoin(dir, "demo.skb");
   let shell;
   try {
     const { host: h } = await makeHost();
     const demoKey = appKey(author.publicKey, "demo");
-    // A manifest with NO `guest` field — the handler-only shape, and so no caps.
+    // A manifest with NO `guest` field is refused: every app is a guest (§12.4).
+    let noGuest = "";
+    try {
+      verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+        { app: "demo", version: 1, modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }] }));
+    } catch (e) { noGuest = e.message; }
+    assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
+
     const manifest = {
       app: "demo", version: 1,
       modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST(),
     };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
-    assert(verifyManifest(sodium, manifestEnv) !== null, "a guest-less manifest verifies");
+    assert(verifyManifest(sodium, manifestEnv) !== null, "a manifest with a guest verifies");
 
     // Blob round-trip: a bundle IS one blob, and this is what an Offer carries over a
     // data channel and what the loader reads from disk — one format, one path.
     const packed = packBundle({
       [MANIFEST_FILE]: manifestEnv,
       [moduleFile("demo")]: forwarderBytes,
+      [GUEST_FILE]: GUEST_BYTES,
     });
     const files = unpackBundle(packed);
     assert(bytesEqual(files[MANIFEST_FILE], manifestEnv), "packed manifest round-trips");
@@ -979,18 +1003,29 @@ async function testGuestlessBundleAndArchive() {
     const v = verifyBundle(sodium, packed);
     assert(bytesEqual(v.author, author.publicKey), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
-    assertEqual(v.guestSource, "", "a guest-less bundle verifies with an empty guest source");
+    assertEqual(v.guestSource, GUEST_TEXT, "verifyBundle yields the verified guest source");
     // Corrupting a module must fail integrity even though the manifest still verifies.
     const corrupt = packBundle({
       [MANIFEST_FILE]: manifestEnv,
       [moduleFile("demo")]: forwarderBytes.slice(0, forwarderBytes.length - 1),
+      [GUEST_FILE]: GUEST_BYTES,
     });
     let integrityFailed = false;
     try { verifyBundle(sodium, corrupt); }
     catch { integrityFailed = true; }
     assert(integrityFailed, "a module that does not match its declared hash fails integrity");
+    // Corrupting the guest fails the same way — the guest is signed content too.
+    const corruptGuest = packBundle({
+      [MANIFEST_FILE]: manifestEnv,
+      [moduleFile("demo")]: forwarderBytes,
+      [GUEST_FILE]: GUEST_BYTES.slice(0, GUEST_BYTES.length - 1),
+    });
+    let guestIntegrityFailed = false;
+    try { verifyBundle(sodium, corruptGuest); }
+    catch { guestIntegrityFailed = true; }
+    assert(guestIntegrityFailed, "a guest that does not match its declared hash fails integrity");
 
-    // Load the guest-less bundle through the shared §12.4 loader.
+    // Load the bundle through the shared §12.4 loader.
     wf(bundlePath, packed);
     shell = await boot({
       policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
@@ -998,7 +1033,7 @@ async function testGuestlessBundleAndArchive() {
     });
     const loaded = await shell.loadBundle(bundlePath);
     assert(shell.host.isBound(demoKey, "demo"), "module registered under its app key");
-    assertEqual(loaded.guestSource, "", "a guest-less bundle yields an empty guest source");
+    assertEqual(loaded.guestSource, GUEST_TEXT, "the shell yields the verified guest source");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -1388,9 +1423,8 @@ async function testManifestSuiteByte() {
   const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
 
   const author = generateKeyPair();
-  // One module: a handler-only bundle is one module by construction (§12.4), and this
-  // test is about the suite byte, not the module count.
-  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }] };
+  // One module: this test is about the suite byte, not the module count.
+  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } };
   const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
 
   // Layout: the suite byte leads, and the author key follows it (not at offset 0).
@@ -1599,9 +1633,8 @@ async function testHybridManifestSuite() {
   const ed = generateKeyPair();
   const pq = generatePqKeyPair();
   const keys = { ed, mlDsa: pq };
-  // One module: a handler-only bundle is one module by construction (§12.4), and this
-  // test is about the hybrid envelope, not the module count.
-  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }] };
+  // One module: this test is about the hybrid envelope, not the module count.
+  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } };
   const env = signManifestHybrid(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
@@ -1681,10 +1714,11 @@ async function testHybridManifestSuite() {
   //    different authors, which is the honest reading of a stronger statement.
   {
     const wasm = forwarderBytes;
-    const m = { app: "pq-app", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
+    const m = { app: "pq-app", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }], guest: GUEST() };
     const blob = packBundle({
       [MANIFEST_FILE]: signManifestHybrid(sodium, keys, m),
       [moduleFile("codec")]: wasm,
+      [GUEST_FILE]: GUEST_BYTES,
     });
     const v = verifyBundle(sodium, blob);
     assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
@@ -1696,6 +1730,7 @@ async function testHybridManifestSuite() {
     const edOnly = packBundle({
       [MANIFEST_FILE]: signManifest(sodium, ed.privateKey, ed.publicKey, m),
       [moduleFile("codec")]: wasm,
+      [GUEST_FILE]: GUEST_BYTES,
     });
     assert(toHex(verifyBundle(sodium, edOnly).author) !== toHex(v.author),
       "the same author's 0x01 and 0x02 identities are distinct");
@@ -1719,8 +1754,8 @@ async function testPolicyManifestSuite() {
   const ed = generateKeyPair();
   const pq = generatePqKeyPair();
   const wasm = forwarderBytes;
-  const m = { app: "suite-policy", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }] };
-  const pack = (envelope) => packBundle({ [MANIFEST_FILE]: envelope, [moduleFile("codec")]: wasm });
+  const m = { app: "suite-policy", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }], guest: GUEST() };
+  const pack = (envelope) => packBundle({ [MANIFEST_FILE]: envelope, [moduleFile("codec")]: wasm, [GUEST_FILE]: GUEST_BYTES });
 
   const classical = verifyBundle(sodium, pack(signManifest(sodium, ed.privateKey, ed.publicKey, m)));
   const hybrid = verifyBundle(sodium, pack(signManifestHybrid(sodium, { ed, mlDsa: pq }, m)));
@@ -1844,10 +1879,12 @@ async function testAuthorRevocation() {
     const manifest = (version) => ({
       app: "victim", version,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST(),
     });
     const writeBundle = (version) => wf(bundlePath, packBundle({
       [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
       [moduleFile("codec")]: forwarderBytes,
+      [GUEST_FILE]: GUEST_BYTES,
     }));
 
     shell = await boot({ policyJson, dir: dataDir, identity });
@@ -1889,6 +1926,7 @@ async function testAuthorRevocation() {
       const probe = mkShell({
         platform: {
           sodium, identity, kernel: new KH(), freshnessStore: store,
+          createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
         },
         admit: () => { admitCalls++; return true; },
       });
@@ -1913,6 +1951,7 @@ async function testAuthorRevocation() {
     wf(bundlePath, packBundle({
       [MANIFEST_FILE]: signManifest(sodium, heir.privateKey, heir.publicKey, manifest(1)),
       [moduleFile("codec")]: forwarderBytes,
+      [GUEST_FILE]: GUEST_BYTES,
     }));
     shell.close();
     shell = await boot({
@@ -1980,7 +2019,7 @@ await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();
 await testBundle();
-await testGuestlessBundleAndArchive();
+await testGuestBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testSafeJs();
 await testRealmSerialization();

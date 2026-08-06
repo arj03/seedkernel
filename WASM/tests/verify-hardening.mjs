@@ -90,19 +90,20 @@ console.log("\n§12.2 — fs is scoped per app key");
   throws(() => scopedFs(disk, "aa:bb"), "an unsafe scope prefix is refused up front");
 }
 
-console.log("\n§12.4 — a handler-only bundle is one module");
+console.log("\n§12.4 — every app is a guest, modules are its library");
 {
   const kp = sodium.crypto_sign_keypair();
   const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp.privateKey, kp.publicKey, m));
-  // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: an author who
-  // ships two handler modules has to learn the rule, not "malformed manifest".
+  // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: this is the
+  // manifest a bundle written against the retired handler-only format produces, so its
+  // author has to learn the rule, not read "malformed manifest".
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
-  const two = refusal({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }] });
-  ok(two.includes("exactly one module"), `two handler modules and no guest are refused by name (got: ${two})`);
   const none = refusal({ app: "x", version: 1, modules: [] });
-  ok(none.includes("exactly one module"), `no guest and no module is refused by the same rule (got: ${none})`);
+  ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
   ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } }) !== null,
-    "a guest bundle may declare no modules at all — it is the guest that dispatches");
+    "a guest may declare no modules at all — zero-to-many, no count rule");
+  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } }) !== null,
+    "a guest may declare many modules — the guest dispatches them");
 }
 
 console.log("\n§12.2 — the capability gates cannot be reached by omission");

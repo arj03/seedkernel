@@ -272,8 +272,8 @@ func hybridAuthor(t *testing.T, s *mldsaSigner, seed byte) hybridKeys {
 // writeHybridBundle is writeBundle under manifest suite 0x02.
 func writeHybridBundle(t *testing.T, s *mldsaSigner, a hybridKeys, app string, version int) (string, string) {
 	t.Helper()
-	menv := hybridEnvelope(t, s, a, manifestJSON(t, app, version, "", nil))
-	return writeBundleFile(t, app, menv, ""), appKeyFor(a.id(), app)
+	menv := hybridEnvelope(t, s, a, manifestJSON(t, app, version, stubGuestSrc, nil))
+	return writeBundleFile(t, app, menv, stubGuestSrc), appKeyFor(a.id(), app)
 }
 
 // The whole point of the suite on this target: a hybrid-signed bundle loads, and its
@@ -315,7 +315,7 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	mjson := manifestJSON(t, "pqtamper", 1, "", nil)
+	mjson := manifestJSON(t, "pqtamper", 1, stubGuestSrc, nil)
 
 	for _, tc := range []struct {
 		what string
@@ -330,7 +330,7 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	} {
 		menv := hybridEnvelope(t, s, a, mjson)
 		menv[tc.at] ^= 0x01
-		path := writeBundleFile(t, "pqtamper", menv, "")
+		path := writeBundleFile(t, "pqtamper", menv, stubGuestSrc)
 		if status := loadBundle(path); !strings.Contains(status, "manifest signature invalid") {
 			t.Fatalf("tampering with %s must fail the manifest, got: %s", tc.what, status)
 		}

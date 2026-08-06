@@ -86,51 +86,70 @@ func appKeyFor(author []byte, app string) string {
 	return hex.EncodeToString(author) + ":" + app
 }
 
+// The stub guest every test bundle that does not exercise the guest declares: every
+// app is a guest (§12.4), so the one app shape ships a guest program even when the
+// test's point is elsewhere (policy, freshness, suite admission…).
+const stubGuestSrc = "register('ping', () => new Uint8Array([1]));"
+
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest with no caps, under an author-signed manifest
 // at the given (app, version). See writeBundle for the general form.
 func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
 	t.Helper()
-	return writeBundle(t, priv, pub, app, version, "register('ping', () => new Uint8Array([1]));", nil)
+	return writeBundle(t, priv, pub, app, version, "", nil)
 }
 
 // writeBundle assembles a signed bundle FILE: one forwarder module plus the given guest,
-// under an author-signed manifest. An empty guestSrc makes it HANDLER-ONLY — the manifest
-// declares no `guest` at all, which is the shape a chat-style app ships (§12.4) and the
-// only way to exercise the shell's handler dispatch arm. Returns the bundle's path and
-// the app key its modules will bind under; the module itself is "fwd", the logical name
-// from the manifest. Requires a booted realm (it hashes content with the booted
+// under an author-signed manifest. A zero guestSrc falls back to the stub — every app is
+// a guest (§12.4), so there is no guest-less shape to write. Returns the bundle's path
+// and the app key its modules will bind under; the module itself is "fwd", the logical
+// name from the manifest. Requires a booted realm (it hashes content with the booted
 // sodium). Mirrors the TS run.mjs testBundle.
 func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
 	t.Helper()
+	if guestSrc == "" {
+		guestSrc = stubGuestSrc
+	}
 	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, caps), guestSrc)
 }
 
-// writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a handler-only
+// writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a stub-guest
 // manifest carrying `role`. Deliberately NOT the shape of the real transport bundle,
-// which ships a guest — nothing here is ever run, because the point is admission: a slot
-// occupant is an authority grant with its own class (§12.5), so the native tests need a
-// bundle the ordinary author allowlist must refuse. `role` is inside the signed JSON,
-// which is why this signs its own body rather than post-editing one.
+// which ships a real guest — nothing here is ever run, because the point is admission: a
+// slot occupant is an authority grant with its own class (§12.5), so the native tests
+// need a bundle the ordinary author allowlist must refuse. `role` is inside the signed
+// JSON, which is why this signs its own body rather than post-editing one.
 func writeSlotBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, role string) string {
 	t.Helper()
 	type mod struct {
 		Name string `json:"name"`
 		Hash string `json:"hash"`
 	}
-	// One module: a handler-only bundle is one module by construction (§12.4).
+	type guest struct {
+		Hash string   `json:"hash"`
+		Abi  int      `json:"abi"`
+		Caps []string `json:"caps"`
+	}
 	mjson, err := json.Marshal(struct {
 		App     string `json:"app"`
 		Version int    `json:"version"`
 		Role    string `json:"role"`
 		Modules []mod  `json:"modules"`
-	}{App: app, Version: version, Role: role, Modules: []mod{{
-		Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
-	}}})
+		Guest   guest  `json:"guest"`
+	}{
+		App: app, Version: version, Role: role,
+		Modules: []mod{{
+			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
+		}},
+		Guest: guest{
+			Hash: hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
+			Abi:  guestABIVersion, Caps: []string{},
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	path, _ := signBundleJSON(t, priv, pub, app, mjson, "")
+	path, _ := signBundleJSON(t, priv, pub, app, mjson, stubGuestSrc)
 	return path
 }
 
@@ -150,9 +169,10 @@ func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app strin
 }
 
 // manifestJSON builds the manifest body both suites sign: one forwarder module plus the
-// given guest. An empty guestSrc makes it HANDLER-ONLY — the manifest declares no `guest`
-// at all. The bytes are the signed bytes; there is no canonicalisation step, so the
-// verifier parses exactly what it checked (§12.4).
+// given guest. Every app is a guest (§12.4), so the manifest always declares one — the
+// guest's authority is the `caps` list, which may be empty. The bytes are the signed
+// bytes; there is no canonicalisation step, so the verifier parses exactly what it
+// checked (§12.4).
 func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps []string) []byte {
 	t.Helper()
 
@@ -161,9 +181,9 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 		Hash string `json:"hash"`
 	}
 	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's,
-	// so a bundle with no guest has no authority to declare and omits the object.
-	// `abi` names the host seam the guest was written against (§12.2) and is required
-	// wherever a guest is — the loader refuses one it does not implement.
+	// so "no authority" is an empty `caps` list, not an absent object. `abi` names the
+	// host seam the guest was written against (§12.2) and is required — the loader
+	// refuses one it does not implement.
 	type guest struct {
 		Hash string   `json:"hash"`
 		Abi  int      `json:"abi"`
@@ -173,23 +193,21 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 		App     string `json:"app"`
 		Version int    `json:"version"`
 		Modules []mod  `json:"modules"`
-		Guest   *guest `json:"guest,omitempty"`
+		Guest   guest  `json:"guest"`
 	}{
 		App:     app,
 		Version: version,
 		Modules: []mod{{
 			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
 		}},
-	}
-	if caps == nil {
-		caps = []string{}
-	}
-	if guestSrc != "" {
-		manifest.Guest = &guest{
+		Guest: guest{
 			Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
 			Abi:  guestABIVersion,
 			Caps: caps,
-		}
+		},
+	}
+	if manifest.Guest.Caps == nil {
+		manifest.Guest.Caps = []string{}
 	}
 	mjson, err := json.Marshal(manifest)
 	if err != nil {
@@ -199,18 +217,16 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 }
 
 // writeBundleFile packs a finished manifest envelope, the forwarder module and the guest
-// (if any) into the container and writes it to a fresh temp dir. Suite-agnostic on
-// purpose: the envelope is opaque bytes to the container, which is the property that lets
-// a new signature suite land without the packing format moving (§12.4).
+// into the container and writes it to a fresh temp dir. Suite-agnostic on purpose: the
+// envelope is opaque bytes to the container, which is the property that lets a new
+// signature suite land without the packing format moving (§12.4).
 func writeBundleFile(t *testing.T, app string, menv []byte, guestSrc string) string {
 	t.Helper()
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
 	files := [][2]any{
 		{"manifest.bundle", menv},
 		{"fwd.wasm", forwarderWasm},
-	}
-	if guestSrc != "" {
-		files = append(files, [2]any{"guest.js", []byte(guestSrc)})
+		{"guest.js", []byte(guestSrc)},
 	}
 	path := filepath.Join(t.TempDir(), app+".skb")
 	if err := os.WriteFile(path, packBundle(files), 0o644); err != nil {

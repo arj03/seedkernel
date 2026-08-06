@@ -1,19 +1,19 @@
 // The handler table (README §3, §4), as the JS targets implement it.
 //
-// **Host code, not core.** What is core about the kernel is the CONTRACT — the table,
+// **Host code, not core.** What is core about the table is the CONTRACT — the table,
 // the §4 handler ABI, the bind/unbind semantics, and the §4.3 memory ceiling
 // (core/wasm-limits.ts). This file is one platform's implementation of it, over
 // `WebAssembly`; the native target's is a wazero map in Go behind its byte bridge
 // (native/main.go), and neither is more canonical than the other. It sits with the
 // other backends — `fs-node.ts`, `safe-js.ts` — for the same reason they do.
 //
-// The kernel is a **contract, not an artifact**: the table (`apps[appKey].get(module)`),
+// The table is a **contract, not an artifact**: the table (`apps[appKey].get(module)`),
 // the pure-transform handler ABI (§4), and the bind/unbind semantics (§3.1). Its whole
-// implementation is the two `Map`s below. §1's vision sentence — "installing a handler is
-// nothing more than `handlers[name] = wasm_bytes`" — is literally this, one level down:
-// `apps[appKey].modules[name] = wasm_bytes`. It is the same sentence with the string codec
-// taken out of the keys, so there is still no kernel module to instantiate, no handler-id
-// indirection, and no second table to keep in sync with a first.
+// implementation is the two `Map`s below. The outer level is an INSTALL RECORD — what
+// a bundle load created — and the inner level is the app's module map, which is what a
+// call resolves: `apps[appKey].modules[name] = wasm_bytes`. There is no kernel module
+// to instantiate, no handler-id indirection, and no second table to keep in sync with
+// a first.
 //
 // **Two levels, because there are two things.** An app is what installs, what a binding
 // points at and what `revoke` removes; a module is what a call resolves. Encoding both
@@ -28,12 +28,13 @@
 //
 // A handler is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
 // `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
-// response back from `scratch`. Handlers import nothing — no kernel seam, no I/O, no
-// callback — so the host is the sole orchestrator: it reaches a handler by name with
-// `callModule` (the counterpart a guest reaches through the cap-bridge's module/call,
-// README §12.2), and does all I/O and authorization itself. Every entry is an installed
-// WASM handler: a bundle is the one way code arrives (§12.4), so the table holds one kind
-// of thing and `callModule` has one path through it.
+// response back from `scratch`. Handlers import nothing — no host seam, no I/O, no
+// callback. Inbound delivery reaches an app's GUEST (§12.10), and the guest drives its
+// modules by name through the cap-bridge's module/call (README §12.2); a host-side
+// embedder reaches the same path directly with `callModule`, and does all I/O and
+// authorization itself. Every entry is an installed WASM module: a bundle is the one
+// way code arrives (§12.4), so the table holds one kind of thing and `callModule` has
+// one path through it.
 //
 // The table is the host's ONLY install state. There is no ownership register beside it,
 // because ownership is the outer key (§5.1) — so who may bind a module is answered by

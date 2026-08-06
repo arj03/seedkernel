@@ -32,6 +32,16 @@ const holderGuestSource = `
 	});
 `
 
+// The echo guest: forwards its input to the bundle's own "fwd" module by name through
+// module/call — the shape every app has now that handler-only apps are retired (§12.4):
+// inbound delivery reaches the guest, and the guest drives its module library.
+const echoGuestSource = `
+	register("handle", (arg) => {
+	  const name = new TextEncoder().encode("fwd");
+	  return host.call("module/call", new Uint8Array([name.length, ...name, ...arg]));
+	});
+`
+
 // requesterJS stands a second, bundle-less node up in the same realm — just a network
 // and a Transport — so a test can put a real request on a real socket. The node under
 // test is the one bootNode built; this is only the peer knocking on its door.
@@ -133,40 +143,40 @@ func TestServeGuestApp(t *testing.T) {
 // the native target could not hold while it assembled its own dispatch: that one asked
 // whether a protocol was bound and then called the single guest whatever the answer
 // named, had no arm at all for a handler-only app, and dropped the sender. All three
-// are checked here at once, since only a node hosting two different KINDS of app can
-// tell the difference.
+// are checked here at once, since only a node hosting two apps with different code
+// shapes can tell the difference.
 func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	author, authorPub := testAuthor(t)
 	st := serveNode(t, authorPub)
 
-	// A guest app and a HANDLER-ONLY app (no guest at all), from one author under two
-	// app names — so they derive disjoint kernel names (§5.1) and bind their own
-	// protocols. The forwarder module echoes its input, so the echo app's response IS
-	// whatever the shell handed it.
+	// Two guest apps from one author under two app names — so they derive disjoint
+	// kernel names (§5.1) and bind their own protocols. The holder guest reads fs; the
+	// echo guest forwards to its own "fwd" module, which echoes its input — so the echo
+	// app's response IS whatever the shell handed the guest.
 	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
 	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("guest bundle load: %s", status)
 	}
-	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, "", nil)
+	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, echoGuestSource, []string{"module"})
 	if status := loadBundle(echoBundle); status != "echoapp v1  handles=[echoapp]" {
-		t.Fatalf("handler-only bundle load: %s", status)
+		t.Fatalf("echo bundle load: %s", status)
 	}
 	if _, err := callRealm("serve", 10*time.Second); err != nil {
 		t.Fatal("serve:", err)
 	}
 	peerID := startRequester(t, st.PeerID, st.Port)
 
-	// The handler-only arm: the app is reached by NAME through the handler table, with
-	// the authenticated sender prepended to the payload (§12.8). The echo makes both
-	// halves of that directly checkable.
+	// The module arm: the guest `handle` receives the input, forwards it through
+	// module/call, and the forwarder's echo makes both halves directly checkable — the
+	// authenticated sender arrives prepended (§12.8), inside the module's input.
 	payload := []byte("who is asking?")
 	got := ask(t, st.PeerID, "echoapp", payload)
 	if want := append(mustHex(t, peerID), payload...); !bytes.Equal(got, want) {
-		t.Fatalf("echoapp handler input = %x, want senderPk ‖ payload = %x", got, want)
+		t.Fatalf("echoapp module input = %x, want senderPk ‖ payload = %x", got, want)
 	}
 
 	// The guest arm, on the same node, in the same breath: a FETCH of a key nobody
-	// stored answers [0] — a MISS from the guest, which is proof the guest ran. The old
+	// stored answers [0] — a MISS from the holder guest, which is proof it ran. The old
 	// dispatch would have sent this to whichever single guest it held regardless of the
 	// protocol, and would have had nothing at all to answer the echo request above with.
 	if miss := ask(t, st.PeerID, "holderapp", append([]byte{2}, "absent"...)); len(miss) != 1 || miss[0] != 0 {

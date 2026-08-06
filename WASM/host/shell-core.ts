@@ -3,7 +3,7 @@
 // here: the handler table's owner, the cap-bridge wiring, the preamble assembly, the
 // realm's lifecycle, the bundle load order, the transport slot, and the inbound
 // dispatch. A target supplies the platform seam — { sodium, identity, kernel, fs?,
-// freshnessStore, channels?, listen?, wsListen?, createRealm? } — exactly like the
+// freshnessStore, channels?, listen?, wsListen?, createRealm } — exactly like the
 // transport driver takes a ChannelFactory, and gets back a fully wired Shell.
 //
 // This is the ONE assemble path, and the assembly ORDER is the point: it is the last
@@ -93,12 +93,12 @@ export interface KernelBackend extends BundleHost, KernelTable {
 }
 
 /** The platform seam — everything the shell needs that varies by target.
- *  `fs` is optional: handler-only shells (the browser chat-shell) need no
- *  filesystem backend. `createRealm` is optional for the same reason — absent, the
- *  shell still verifies, admits and installs a bundle's modules, but running or
- *  serving a guest throws rather than silently doing nothing. `livePeers` feeds the
- *  net/peers name — the transport owns connectivity, the shell just passes the
- *  closure through to the cap-bridge.
+ *  `fs` is optional, and the reason is simply "a node with no disk": a bundle declaring
+ *  the `fs` cap on such a shell gets no backend wired at all, so its first `fs/*` call
+ *  throws by name rather than resolving to a pretend store (§12.2). `createRealm` is
+ *  REQUIRED: every app is a guest (§12.4), so a shell that cannot run a guest cannot
+ *  host an app. `livePeers` feeds the net/peers name — the transport owns connectivity,
+ *  the shell just passes the closure through to the cap-bridge.
  *
  *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
  *  seam (`channels`, `listen`/`wsListen`, the network key and contact secret) and the
@@ -116,7 +116,7 @@ export interface ShellPlatform {
     kernel: KernelBackend;
     fs?: Fs;
     freshnessStore: FreshnessStore;
-    createRealm?: RealmFactory;
+    createRealm: RealmFactory;
     now?: () => number;
     livePeers?: () => PeerId[];
     /** OPTIONAL network key — which network this node belongs to. An isolation
@@ -210,7 +210,8 @@ export interface Shell {
     net: Network;
     /** The request/response face of the same driver (the old Transport shape). */
     transport: HostTransport;
-    /** Filesystem backend. Absent for handler-only shells. */
+    /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
+     *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
     fs?: Fs;
     sodium: ShellSodium;
     /** Load a signed bundle blob: verify the manifest, run the admission predicate,
@@ -239,17 +240,16 @@ export interface Shell {
     /** Run one of a loaded bundle's guest entrypoints through a generic
      *  cap-bridge over the kernel's primitives. `appKey` defaults to the
      *  only loaded app; throws when more than one is loaded and no key is
-     *  given. Throws for handler-only bundles (no guest source). */
+     *  given. */
     runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app via protocol bindings (§12.10):
-     *  resolve the protocol to an app and call that app's one entrypoint with
-     *  `senderPk ‖ payload`. Null when no bound app handles the protocol.
+     *  resolve the protocol to an app and invoke that app's guest `handle` entrypoint
+     *  with `senderPk ‖ payload`. Null when no bound app handles the protocol.
      *
-     *  A guest app answers with a Promise and a handler-only app with bytes — the
-     *  same union `RequestHandler` (core/net.ts) accepts, because the transport driver
-     *  is the consumer either way and awaits what it is handed. Callers must not assume
-     *  the synchronous arm. */
-    dispatch(from: PeerId, proto: string, payload: Uint8Array): Uint8Array | Promise<Uint8Array> | null;
+     *  Every app is a guest, so the answer is always the realm's — a Promise the
+     *  transport driver awaits — never raw bytes; there is no second, synchronous
+     *  delivery shape. */
+    dispatch(from: PeerId, proto: string, payload: Uint8Array): Promise<Uint8Array> | null;
     /** Wire transport.onRequest to the shell's dispatch. After this, every
      *  inbound frame resolves through the bindings table to its app (§12.10). */
     serve(): Promise<void>;
@@ -268,23 +268,32 @@ export { KernelHost } from "./kernel-host.js";
  *  re-implementing the kernel host, cap-bridge wiring, preamble assembly, realm
  *  creation, and transport routing. */
 /** An app's ONE inbound entrypoint (§12.10): the authenticated `senderPk ‖ payload`
- *  in, the response bytes out, or null for "this app answers nothing". A guest app's
- *  resolves to its realm's `handle` and therefore returns a Promise; a handler-only
- *  app's resolves to a WASM handler and returns bytes. Dispatch consumes the union
- *  without distinguishing them, exactly as `RequestHandler` (core/net.ts) already
- *  does — the driver awaits whatever it is handed. */
-type AppEntry = (input: Uint8Array) => Uint8Array | Promise<Uint8Array> | null;
+ *  in, the response bytes out, or null for "this app answers nothing". Every app is a
+ *  guest, so every entry resolves to its realm's `handle` and therefore returns a
+ *  Promise — there is no second, synchronous shape. */
+type AppEntry = (input: Uint8Array) => Promise<Uint8Array> | null;
 
-interface AppSlot {
+/** A slot's realm, in the two shapes the code needs it in. `realm` is the SETTLED
+ *  handle, and it is what teardown reads — disposing has to be synchronous, because
+ *  the callers that do it (uninstall, close, a transport handover) are deciding
+ *  right then what the node holds. `realmP` is the in-flight construction, and it
+ *  is the memo: `ensureRealm` is now reached concurrently — two inbound frames for
+ *  an app whose realm does not exist yet both arrive before either factory call
+ *  resolves — so without a promise to share, each caller would build its own realm
+ *  and every one but the last would be orphaned: never disposed, still holding its
+ *  heap and its interpreter. Memoizing the RESULT is not enough; the window this
+ *  closes is entirely before there is one. */
+interface RealmHolder {
   loaded: LoadedBundle;
   realm: SafeRealm | null;
+  realmP: Promise<SafeRealm> | null;
+}
+
+interface AppSlot extends RealmHolder {
   entry: AppEntry;
 }
 
-interface RoleSlot {
-  loaded: LoadedBundle;
-  realm: SafeRealm | null;
-}
+type RoleSlot = RealmHolder;
 
 // ── the fs key rule, applied once (core/fs.ts `isSafeFsKey`) ─────────────────
 //
@@ -413,20 +422,24 @@ export function createShell(opts: CreateShellOptions & {
      *  initiator (`runGuest`) and the holder (`dispatch`) each `realm.call`, and the
      *  realm serializes them, so one runs to completion before the next begins. Lazy
      *  because the JS factory pulls in a heavy engine, and because a node may serve for
-     *  a long time before its first guest call. */
-    const ensureRealm = async (slot: AppSlot | RoleSlot) => {
-        if (slot.realm)
-            return slot.realm;
-        if (!platform.createRealm) {
-            throw new Error("shell: this platform supplies no createRealm — it can install handler modules but not run a guest");
+     *  a long time before its first guest call.
+     *
+     *  Concurrency-safe by memoizing the PROMISE (`RealmHolder`): every caller past the
+     *  first joins the construction already running rather than starting a second one.
+     *  A failed construction clears the memo instead of caching the rejection, so a
+     *  factory that failed on a transient (a heap the page could not spare yet) is
+     *  retried on the next frame rather than making the app permanently dead. */
+    const ensureRealm = (slot: AppSlot | RoleSlot): Promise<SafeRealm> => {
+        if (!slot.realmP) {
+            slot.realmP = platform.createRealm({
+                source: guestFullSource(slot.loaded),
+                bridge: buildBridge(slot.loaded, null),
+                memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+                deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
+            }).then((r) => { slot.realm = r; return r; },
+                    (e) => { slot.realmP = null; throw e; });
         }
-        slot.realm = await platform.createRealm({
-            source: guestFullSource(slot.loaded),
-            bridge: buildBridge(slot.loaded, null),
-            memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-            deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
-        });
-        return slot.realm;
+        return slot.realmP;
     };
     /** The bridge for one admitted bundle. `driver` is passed ONLY for the bundle
      *  claiming the transport slot, and is what wires the three seams no app holds: the
@@ -435,7 +448,7 @@ export function createShell(opts: CreateShellOptions & {
      *  any point in the process's life, because nothing else is ever handed one
      *  (README §1, capability-by-non-wiring). */
     const buildBridge = (b: LoadedBundle, driver: TransportHost | null) => {
-        const caps = new Set(b.manifest.guest?.caps ?? []);
+        const caps = new Set(b.manifest.guest.caps);
         const appKey = appKeyFor(b.author, b.manifest.app);
         return createCapBridge({
             rawNet: driver?.rawNet(),
@@ -475,34 +488,27 @@ export function createShell(opts: CreateShellOptions & {
             app: b.manifest.app,
             author: b.author,
         })
-        + `const APP = ${JSON.stringify({ ...(b.manifest.guest?.config ?? {}), ...(opts.config ?? {}) })};\n`
+        + `const APP = ${JSON.stringify({ ...(b.manifest.guest.config ?? {}), ...(opts.config ?? {}) })};\n`
         + b.guestSource;
-    const hasGuest = (b: LoadedBundle) => b.guestSource.length > 0;
     /** Resolve an app's one inbound entrypoint, ONCE, at install (§12.10).
      *
-     *  An app has exactly one way in. Which mechanism serves it — a confined realm's
-     *  `handle` (§12.2) or the single WASM module of a handler-only bundle (§12.4) — is a
-     *  property of the bundle, so it is decided here rather than re-decided per message:
-     *  `dispatch` neither branches on how an app is implemented nor re-derives a kernel
-     *  name for every inbound frame.
-     *
-     *  A handler-only bundle is one module by construction (§12.4): the manifest is
-     *  refused at load with any other count, so `modules[0]` here is not a positional
-     *  default — it is the only shape the format admits, and it is why the format needs
-     *  no `entry` field at all.
+     *  An app has exactly one way in: the confined realm's `handle` entrypoint (§12.2).
+     *  Every bundle declares a guest (§12.4), so there is no second mechanism to branch
+     *  on — `dispatch` neither branches on how an app is implemented nor re-derives a
+     *  kernel name for every inbound frame.
      *
      *  It closes over the SLOT, not over `slot.realm`: the entrypoint is fixed at
-     *  install, but the realm behind it is created lazily (`ensureRealm`, on serve() or
-     *  first use), so a guest entry that captured today's `null` would never see it. */
+     *  install, but the realm behind it is created lazily, so the entry ensures it on
+     *  first use (`ensureRealm`) rather than capturing today's `null`. `serve()`
+     *  pre-creates every app's realm so the first routed frame does not pay realm
+     *  construction, and an embedder that never calls `serve()` still gets a working
+     *  dispatch instead of a silent empty answer. Concurrent frames arriving into that
+     *  gap share one construction rather than racing (`ensureRealm`); the settled arm
+     *  below is only the steady state, saving a microtask once there is a realm. */
     const entryFor = (slot: AppSlot): AppEntry => {
-        if (hasGuest(slot.loaded)) {
-            // No realm yet ⇒ nothing to dispatch to. serve() creates every guest app's
-            // realm before it routes a single frame, so this is the pre-serve() case.
-            return (input) => slot.realm ? slot.realm.call("handle", input) : null;
-        }
-        const appKey = appKeyFor(slot.loaded.author, slot.loaded.manifest.app);
-        const mod = slot.loaded.manifest.modules[0].name;
-        return (input) => host.callModule(appKey, mod, input);
+        return (input) => slot.realm
+            ? slot.realm.call("handle", input)
+            : ensureRealm(slot).then((r) => r.call("handle", input));
     };
     /** Stand a transport driver up over an admitted transport bundle's realm.
      *  The driver is the shell's Network: it answers the guest's DIAL actions
@@ -514,9 +520,6 @@ export function createShell(opts: CreateShellOptions & {
      *  replacing a standing occupant safe: this function can fail without the node
      *  losing the transport it already had. */
     const standTransport = async (slot: AppSlot | RoleSlot) => {
-        if (!platform.createRealm) {
-            throw new Error("shell: this platform supplies no createRealm — cannot run the transport bundle");
-        }
         // The driver is built BEFORE the realm and attached after, because the realm's
         // bridge resolves the slot's ops here: the guest reaches sockets, timers and the
         // sink through the ordinary seam, so the object serving them has to exist first.
@@ -535,12 +538,17 @@ export function createShell(opts: CreateShellOptions & {
             maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
             maxHalfOpenVerified: opts.transportHalfOpen?.verified,
         });
+        // Not `ensureRealm`: this realm's bridge is the only one wired to a driver, so it
+        // cannot be the one a lazy caller would have built. Both fields are set for the
+        // same reason they exist — `realm` so a handover can dispose it synchronously,
+        // `realmP` so nothing later mistakes an occupied slot for an empty one.
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
             bridge: buildBridge(slot.loaded, driver),
             memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
+        slot.realmP = Promise.resolve(slot.realm);
         driver.attach(slot.realm);
         return driver;
     };
@@ -603,10 +611,10 @@ export function createShell(opts: CreateShellOptions & {
      *
      *  There is no branch on how the app is implemented — every app presents the same
      *  `senderPk ‖ payload` shape and the same single entry, resolved at install
-     *  (`entryFor`). A guest app's answer is a Promise, which the driver already expects
-     *  from `RequestHandler` and answers through the `respond` entrypoint on a later turn
-     *  rather than inline (transport-host.ts) — the seam an asynchronous holder needs,
-     *  since `fs` is async (core/fs.ts). */
+     *  (`entryFor`). The answer is the realm's — a Promise, which the driver already
+     *  expects from `RequestHandler` and answers through the `respond` entrypoint on a
+     *  later turn rather than inline (transport-host.ts) — the seam an asynchronous
+     *  holder needs, since `fs` is async (core/fs.ts). */
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
         const key = bindings.boundApp(proto);
         const slot = key ? apps.get(key) : undefined;
@@ -666,7 +674,7 @@ export function createShell(opts: CreateShellOptions & {
             // driver the rest of the shell consumes.
             if (v.manifest.role !== undefined) {
                 const role = v.manifest.role;
-                const slot = { loaded, realm: null };
+                const slot: RoleSlot = { loaded, realm: null, realmP: null };
                 // The slot maps are written AFTER the driver is standing, not before: on a
                 // failed upgrade the node keeps both the transport it had and the author key
                 // that `revoke` needs in order to find what that key landed.
@@ -682,7 +690,7 @@ export function createShell(opts: CreateShellOptions & {
             // `entryFor` closes over the slot, so the slot is built first and its entry
             // attached immediately — nothing can observe the placeholder between the two
             // statements, since neither yields.
-            const slot: AppSlot = { loaded, realm: null, entry: () => null };
+            const slot: AppSlot = { loaded, realm: null, realmP: null, entry: () => null };
             slot.entry = entryFor(slot);
             apps.set(key, slot);
             // An app's marks were already advanced inside installBundle — nothing can fail
@@ -729,8 +737,6 @@ export function createShell(opts: CreateShellOptions & {
             const slot = appKey ? apps.get(appKey) : onlyApp();
             if (!slot)
                 throw new Error(`shell: no app '${appKey}' loaded`);
-            if (!hasGuest(slot.loaded))
-                throw new Error("shell: no guest source — this is a handler-only bundle");
             const r = await ensureRealm(slot);
             const call = r.call(entry, payload);
             inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
@@ -739,8 +745,7 @@ export function createShell(opts: CreateShellOptions & {
         dispatch: doDispatch,
         async serve() {
             for (const slot of apps.values()) {
-                if (hasGuest(slot.loaded))
-                    await ensureRealm(slot);
+                await ensureRealm(slot);
             }
             if (!netHost)
                 throw new Error("shell: the transport bundle is not loaded — serve() needs it (admit a bundle with role \"transport\")");
