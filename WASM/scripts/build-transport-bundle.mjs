@@ -190,12 +190,12 @@ async function main() {
       // The AUTHORITIES this program is granted, and the whole of them: `node` (the
       // slot-scoped signer and the entropy source), `clock`; `link`, the sockets
       // behind opaque link ids; `timer`, because a zero-authority realm has no
-      // setTimeout; `transport`, where it reports its structured output; and
-      // `module`, for this bundle's own ws.wasm. The last two of those are slot-only
-      // and the loader refuses them to a bundle claiming no role. No `net` — that
-      // domain IS this program's output, and its own net/send would loop back into
-      // itself.
-      caps: ["node", "clock", "timer", "link", "transport", "module"],
+      // setTimeout; `transport`, where it reports its structured output. The last two
+      // of those are slot-only and the loader refuses them to a bundle claiming no
+      // role. Its own ws.wasm needs no grant — `module/call` is a primitive, ungated
+      // like `crypto` (§12.1). No `net` — that domain IS this program's output, and
+      // its own net/send would loop back into itself.
+      caps: ["node", "clock", "timer", "link", "transport"],
       // The primitives it calls by name. NOT a grant — a pure transform reaches nothing
       // — but a compatibility claim, so a host lacking one refuses this bundle by name
       // instead of failing mid-handshake.

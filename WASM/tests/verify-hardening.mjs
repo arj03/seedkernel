@@ -118,16 +118,17 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   ok(typeof createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS }) === "function",
     "naming the sentinel is accepted");
 
-  // A guest reaches its own app's modules and has no way to name anything else: the
-  // bridge is built against ONE app's module map (the shell binds the app key), so
-  // scoping is the shape rather than a lookup table that could be omitted.
+  // A guest reaches its own app's modules with NO grant at all: module/call is a
+  // primitive — the asking bundle's own code, scoped structurally by the app key the
+  // bridge was built with — so it resolves under an empty cap set, exactly like
+  // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
   const chat = new KernelHost();
   chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
   chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
   const scoped = createCapBridge({
     ...base,
     callModule: (n, p) => chat.callModule("aa:chat", n, p),
-    allowedCaps: ["module"],
+    allowedCaps: [],
   });
   // The forwarder echoes its input, so a resolved module answers with the body and an
   // unresolved one answers empty — which is what tells the two apart.

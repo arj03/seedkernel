@@ -63,7 +63,7 @@ function transportBundleAt(version, keys, guestSource) {
       // Read, never restated: a hardcoded number here would pass a test that the
       // production loader would refuse the moment the seam revved (§12.4).
       abi: GUEST_ABI_VERSION,
-      caps: ["node", "clock", "timer", "link", "transport", "module"],
+      caps: ["node", "clock", "timer", "link", "transport"],
       primitives: ["blake2b-256", "ed25519/verify", "chacha20poly1305-ietf/seal",
                    "chacha20poly1305-ietf/open", "x25519/dh"],
     },

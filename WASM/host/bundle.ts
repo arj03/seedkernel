@@ -80,7 +80,9 @@ export interface BundleGuest {
      *
      *  Only *authorities* appear here. Crypto primitives do not — they reach nothing, so
      *  there is nothing to grant; see `primitives` below and the note on the `crypto/`
-     *  prefix in cap-bridge.ts. */
+     *  prefix in cap-bridge.ts. Neither does `module`: a bundle's own module map is the
+     *  app-supplied half of the primitive catalog, so `module/call` is ungated like
+     *  `crypto` (§12.1). */
     caps: string[];
     /** The host crypto primitives this guest calls by name (`PRIMITIVE_NAMES`, the
      *  bare names under the `crypto/` prefix: "blake2b-256", "x25519/dh",

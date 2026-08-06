@@ -405,7 +405,11 @@ globalThis.__invoke = (name, argBuf) => {
  *  primitives are functions of their arguments, so a guest holding them computes only
  *  what it could have computed with code of its own, and a vocabulary that made an app
  *  ask for a domain in order to hash a byte string would be describing an authority
- *  that does not exist.
+ *  that does not exist. `module/call` is absent for the same reason: the modules it
+ *  reaches are the asking bundle's own, installed and verified with it, so calling one
+ *  reaches nothing the guest does not already hold — its scope (one app's map) is the
+ *  shape, not a grant, and a vocabulary that gated it would be describing an authority
+ *  that does not exist either.
  *
  *  That absence is what retires the earlier `crypto`/`transform` split. The split was
  *  right that authority and pure transform are not one word; it was wrong that both
@@ -561,8 +565,9 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // ── the catalog — the seam ABI (§12.2), ONE table: the names a guest can call
     // are the keys of this object — no second list, no numbers, never a wire value.
     // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
-    // reach nothing a guest does not already hold, so the prefix is ungated by a rule;
-    // every other name is an authority, gated by the prefix its manifest domain grants.
+    // and `module/call` (the asking bundle's own module map) reach nothing a guest does
+    // not already hold, so their prefixes are ungated by a rule; every other name is an
+    // authority, gated by the prefix its manifest domain grants.
     // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
     // the platform's raw contribution; the slot holds both, an app holds only `net`.
     const fs = () => {
@@ -592,8 +597,29 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // to something nobody put in the table is the wrong shape for this file, and the
     // construction check below walks own keys, so it could never see them.
     const handlers: Record<string, CapHandler> = Object.assign(Object.create(null), {
-        // ── the primitive seam (§12.2): the catalog's `crypto/*` half ────────────
+        // ── the primitive seam (§12.2): two ungated halves ─────────────────────────
+        // The catalog's `crypto/*` half reaches nothing a guest does not already hold,
+        // and the app-supplied half below reaches the asking bundle's own module map —
+        // both are computation the guest could have done itself, so neither prefix is
+        // a grant (§12.1).
         ...cryptoCatalog(sodium),
+        // ── the app-supplied half: the asking bundle's own modules ────────────────
+        "module/call": (payload) => {
+            // The guest calls its own modules by the logical name from its manifest
+            // (README §5.1), and that is the name they are bound under inside this app's
+            // module map — so there is nothing to resolve and no scoping to apply. The
+            // app key was fixed when the shell built this bridge; a name the app does not
+            // have resolves to nothing, and no name reaches another app at all. Its own
+            // bundle's code is a pure transform the guest already holds, so this is
+            // ungated like `crypto` — a primitive, never a grant.
+            if (payload.length < 1)
+                return NONE;
+            const nameLen = payload[0];
+            if (payload.length < 1 + nameLen)
+                return NONE;
+            const r = callModule(dec.decode(payload.slice(1, 1 + nameLen)), payload.slice(1 + nameLen));
+            return r ?? NONE;
+        },
         // ── authorities: each reaches something no confined guest can hold ──────────
         // node/sign is scoped, never raw: it signs `domain ‖ scope ‖ msg` with the
         // key the asking bundle's slot selected (see `SignScope` above).
@@ -658,21 +684,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             return out;
         }),
         "fs/stat": () => fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
-        // ── installed-handler call + clock ───────────────────────────────────────
-        "module/call": (payload) => {
-            // The guest calls its own modules by the logical name from its manifest
-            // (README §5.1), and that is the name they are bound under inside this app's
-            // module map — so there is nothing to resolve and no scoping to apply. The
-            // app key was fixed when the shell built this bridge; a name the app does not
-            // have resolves to nothing, and no name reaches another app at all.
-            if (payload.length < 1)
-                return NONE;
-            const nameLen = payload[0];
-            if (payload.length < 1 + nameLen)
-                return NONE;
-            const r = callModule(dec.decode(payload.slice(1, 1 + nameLen)), payload.slice(1 + nameLen));
-            return r ?? NONE;
-        },
+        // ── clock ─────────────────────────────────────────────────────────────────
         "clock/now": () => u64be(now()),
         // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` ──
         //
@@ -747,26 +759,29 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         },
     } as Record<string, CapHandler>);
     // The one-file rule, checked at construction: every name's prefix must be
-    // `crypto` (ungated) or a declared `CAP_DOMAINS` member, so the catalog a guest
-    // is dispatched through and the vocabulary a manifest is checked against cannot
-    // drift — a typo'd prefix would otherwise be a name nothing could ever grant.
+    // `crypto` or `module` (the ungated primitives) or a declared `CAP_DOMAINS`
+    // member, so the catalog a guest is dispatched through and the vocabulary a
+    // manifest is checked against cannot drift — a typo'd prefix would otherwise be a
+    // name nothing could ever grant.
     for (const name of Object.keys(handlers)) {
         const prefix = name.slice(0, name.indexOf("/"));
-        if (prefix !== "crypto" && !(CAP_DOMAINS as readonly string[]).includes(prefix)) {
+        if (prefix !== "crypto" && prefix !== "module" && !(CAP_DOMAINS as readonly string[]).includes(prefix)) {
             throw new Error(`cap-bridge: ${name} has no capability domain — CAP_DOMAINS is missing "${prefix}"`);
         }
     }
     return (name, payload) => {
         // The gate covers authorities, and a granted domain is a PREFIX check: the first
         // path component of the name must be one of the manifest's declared domains.
-        // `crypto` is exempt by a rule, not by omission: its catalog is fixed host-side
-        // and reaches nothing a guest does not already hold, so gating it would make a
-        // guest ask permission to compute a function of bytes it already has — the
-        // coarse-vocabulary lie the primitive/authority split exists to remove.
+        // `crypto` and `module` are exempt by a rule, not by omission: the first is a
+        // fixed host-side catalog of functions of bytes the guest already holds, and the
+        // second reaches the asking bundle's own module map — its scope is the shape (one
+        // app's modules), not a grant. Gating either would make a guest ask permission to
+        // compute a function of bytes it already has — the coarse-vocabulary lie the
+        // primitive/authority split exists to remove.
         if (allowed) {
             const slash = name.indexOf("/");
             const prefix = slash < 0 ? name : name.slice(0, slash);
-            if (prefix !== "crypto" && !allowed.has(prefix)) {
+            if (prefix !== "crypto" && prefix !== "module" && !allowed.has(prefix)) {
                 throw new Error("cap-bridge: " + name + " not declared by the bundle manifest caps");
             }
         }

@@ -755,6 +755,14 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
+  // `module` is not a domain: a bundle's own modules are a primitive (§12.1), like the
+  // `crypto/` prefix, so a manifest still granting it is refused as an unknown domain —
+  // the same loud failure a typo gets, never a cap that quietly grants nothing.
+  let moduleCaps = "";
+  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, caps: ["module"] })); }
+  catch (e) { moduleCaps = e.message; }
+  assert(moduleCaps.includes("unknown capability domain"), `a manifest declaring "module" in caps is refused at load (got: ${moduleCaps})`);
+
   console.log("  OK\n");
 }
 
@@ -1306,6 +1314,12 @@ async function testCapBridgeEnforcement() {
   threw = false;
   try { await clockOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
+  // module/call is the same KIND of name: the asking bundle's own module map — code it
+  // already holds, scoped structurally by the app key the bridge was built with — so a
+  // bundle declaring no `module` domain still reaches it.
+  threw = false;
+  try { await clockOnly("module/call", U(1, 120)); } catch { threw = true; }
+  assert(!threw, "module/call resolves for a bundle declaring no module domain — the bundle's own modules are not a grant");
 
   // Authorities are gated by their domain PREFIX, and each one names something no
   // confined module can hold.

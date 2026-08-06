@@ -44,7 +44,9 @@
 //     link id, opened and closed. `timer` — deadlines, because a zero-authority realm
 //     has no setTimeout. `transport` — where this program reports its structured
 //     OUTPUT (an attributed peer, a protocol id, a correlation), which every app then
-//     reaches through the ordinary `net` domain. `module` — this bundle's own ws.wasm.
+//     reaches through the ordinary `net` domain. Its own ws.wasm is NOT here:
+//     `module/call` is a primitive — the bundle's own code, ungated like `crypto`
+//     (§12.1) — so no domain grants it.
 //
 //     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
 //     attribution this program reports (transport/link-auth answers with the verdict,

@@ -49,7 +49,7 @@ register("probe", () => {
 func TestGuestPutGetAndConfinement(t *testing.T) {
 	capBridgeRealm(t)
 
-	// Host realm: build the cap-bridge granting crypto + fs (no net/module).
+	// Host realm: build the cap-bridge granting crypto + fs (no net).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildCapBridge(["fs"], __id, null, []);

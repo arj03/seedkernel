@@ -157,7 +157,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
 		t.Fatalf("guest bundle load: %s", status)
 	}
-	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, echoGuestSource, []string{"module"})
+	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, echoGuestSource, nil)
 	if status := loadBundle(echoBundle); status != "echoapp v1  handles=[echoapp]" {
 		t.Fatalf("echo bundle load: %s", status)
 	}

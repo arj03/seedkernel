@@ -29,7 +29,7 @@ const (
 func TestCapBridgeOps(t *testing.T) {
 	capBridgeRealm(t)
 
-	// Grant node + fs + clock (not net/module) and an identity from sodium. The
+	// Grant node + fs + clock (not net) and an identity from sodium. The
 	// guest-signing scope binds node/sign to a bundle namespace (README §12.2); a real
 	// node derives it from the manifest's (author, app), here a throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`

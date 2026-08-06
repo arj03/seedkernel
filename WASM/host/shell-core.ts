@@ -470,8 +470,9 @@ export function createShell(opts: CreateShellOptions & {
                 : undefined,
             now: platform.now ?? (() => Date.now()),
             // The granted domain prefixes are the bridge's gate — a `host.call`
-            // resolves iff its first path component is one of these (`crypto` exempt:
-            // never a grant). The vocabulary was checked at load (verifyManifest).
+            // resolves iff its first path component is one of these (`crypto` and
+            // `module` exempt: never grants — a fixed catalog and the app's own module
+            // map). The vocabulary was checked at load (verifyManifest).
             allowedCaps: caps,
             // What SIGN signs under is chosen HERE, by the slot the bundle occupies — the one
             // place that knows it (§12.2). The transport slot signs handshake

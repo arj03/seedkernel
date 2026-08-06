@@ -103,17 +103,18 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
 /** The capability *domains* a bundle's manifest may declare in `guest.caps` (§12.4) —
  *  the granted prefixes of the name-addressed seam (§12.2). A domain IS its prefix: the
  *  bridge refuses any `host.call(name, …)` whose first path component is not one of
- *  these — or `crypto`, which is not here because it is never a grant (§12.1). The
- *  vocabulary is closed, checked at load, so a manifest naming a domain this host has
- *  never heard of is a refused bundle rather than a cap that quietly grants nothing at
- *  first use. Adding a name to a domain here is the whole cost of a new op.
+ *  these — or `crypto` and `module`, which are not here because they are never grants
+ *  (§12.1). The vocabulary is closed, checked at load, so a manifest naming a domain
+ *  this host has never heard of is a refused bundle rather than a cap that quietly
+ *  grants nothing at first use. Adding a name to a domain here is the whole cost of a
+ *  new op.
  *
  *  Here rather than in cap-bridge.ts for the reason `GUEST_ABI_VERSION` is: the loader
  *  checks a manifest's caps against this list before anything is trusted, and should not
  *  have to import the guest bridge to do it. cap-bridge.ts dispatches through a table
  *  whose every name must carry one of these prefixes (checked at construction), so the
  *  two cannot drift. */
-export const CAP_DOMAINS: readonly string[] = ["node", "net", "fs", "module", "clock", "timer", "link", "transport"];
+export const CAP_DOMAINS: readonly string[] = ["node", "net", "fs", "clock", "timer", "link", "transport"];
 /** The capability domains only a SLOT occupant may declare (§12.5). `link` is what the
  *  transport slot consumes — sockets behind opaque link ids, the whole of what the
  *  platform contributes to the network — and `transport` is what it provides back: the
