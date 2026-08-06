@@ -61,7 +61,7 @@ type libsodium struct {
 	fns map[string]api.Function
 	// One shared scratch heap + allocator means an op is a malloc/call/read/free
 	// sequence that must not interleave with another. The net stack (net.go) now
-	// drives sign/verify from per-connection goroutines and the kernel's
+	// drives sign/verify from per-connection goroutines and the host's
 	// env.ed25519_verify from the main thread, so every op takes this lock. Held
 	// only for the duration of one op — never across a callback into JS or Go.
 	mu sync.Mutex

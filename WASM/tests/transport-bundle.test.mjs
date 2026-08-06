@@ -21,7 +21,7 @@ const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
-const { KernelHost } = await imp("build/host/kernel-host.js");
+const { ModuleTable } = await imp("build/host/module-table.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
@@ -77,7 +77,7 @@ async function makeNode(channels, listen) {
   const shell = createShell({
     platform: {
       sodium, identity,
-      kernel: new KernelHost(),
+      table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       channels, listen,
       createRealm: async (o) => createSafeRealm(o),

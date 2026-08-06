@@ -12,7 +12,7 @@
 // parked runs *interleaved* with it — the two frames resuming into each other at every
 // `await`, in an order neither the guest author nor the host chose. That is not a
 // performance question but a correctness one: a guest keeping state across an await
-// (which is the whole reason a guest exists rather than a pure-transform handler) has no
+// (which is the whole reason a guest exists rather than a pure-transform module) has no
 // way to reason about it.
 //
 // **The cost, stated plainly.** Head-of-line blocking: a parked initiator delays an

@@ -1,4 +1,4 @@
-// End-to-end test: bootstrap -> signed message -> handler dispatch.
+// End-to-end test: bootstrap -> signed message -> module dispatch.
 //
 // Run: node tests/run.mjs
 
@@ -13,7 +13,7 @@ import { makeTransportHost } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
 const {
-  createKernelHost,
+  createModuleTable,
   generateKeyPair,
   loadSodium,
 } = await imp("build/host/node.js");
@@ -63,7 +63,7 @@ const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = () => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, caps: [] });
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
- *  policy + integrity tests that own their own KernelHost without a shell. */
+ *  policy + integrity tests that own their own ModuleTable without a shell. */
 // The two halves of a load with the admission seam between them (§12.4). `admit` may
 // answer with a Promise — a composed policy does — so this awaits it: reading an
 // unawaited Promise as a verdict is fail-OPEN, which is the one way this seam must never
@@ -74,7 +74,7 @@ async function loadBundle(host, blob, admit) {
   return installBundle(host, v);
 }
 
-// The empty payload — a handler whose `handle` takes no meaningful input.
+// The empty payload — a module whose `handle` takes no meaningful input.
 const EMPTY = new Uint8Array(0);
 
 const { ok, summary } = testkit({ verbose: false });
@@ -91,11 +91,11 @@ const assertEqual = (actual, expected, msg) => {
   assert(a === e, `${msg}: expected ${e}, got ${a}`);
 };
 
-// Standard bootstrap (README §3): a fresh handler table. The host holds no policy — it
-// is the §3 map and nothing else. Handlers are pure transforms with no
+// Standard bootstrap (README §3): a fresh module table. The host holds no policy — it
+// is the §3 map and nothing else. Modules are pure transforms with no
 // signature/dispatch seam, so there is nothing else to wire.
 async function makeHost() {
-  const host = await createKernelHost();
+  const host = await createModuleTable();
   return { host };
 }
 
@@ -134,23 +134,23 @@ async function testFullLifecycle() {
   const { publicKey: pk } = generateKeyPair();
   const chatKey = appKey(pk, "chat");
 
-  // Install the chat handler under its app's key, through the same path the bundle
+  // Install the chat module under its app's key, through the same path the bundle
   // loader uses. It is a pure transform (the forwarder fixture echoes its input).
   installMod(host, chatKey, "chat", forwarderBytes);
-  assert(host.isBound(chatKey, "chat"), "chat handler installed");
+  assert(host.isBound(chatKey, "chat"), "chat module installed");
 
   // There is no install record to consult: the author is IN the app key (§5.1), so the
   // table itself says who authored what it holds — without parsing a module name out of
   // anything, because the module is a key one level down.
   assert(chatKey.startsWith(toHex(pk) + ":"), "the app key leads with the author");
 
-  // Reach it by name: the host stages input at the handler's scratch, calls handle, and
-  // reads the response back (README §4). A guest reaches the same handler through the
+  // Reach it by name: the host stages input at the module's scratch, calls handle, and
+  // reads the response back (README §4). A guest reaches the same module through the
   // cap-bridge's module/call (§12.2), against the app key its bridge holds; here the host
   // calls it directly.
   const text = new TextEncoder().encode("hello from author");
   const resp = host.callModule(chatKey, "chat", text);
-  assert(resp !== null && bytesEqual(resp, text), "handler echoed its input");
+  assert(resp !== null && bytesEqual(resp, text), "module echoed its input");
 
   console.log("  OK\n");
 }
@@ -234,30 +234,30 @@ async function testDenyAllPolicyRejects() {
 
 // ─── Test: a non-instantiable module fails the whole load (§12.4) ───
 
-async function testBundleRefusesNonHandler() {
-  console.log("Test: a hash-correct module that isn't a valid handler fails the whole bundle");
+async function testBundleRefusesNonModule() {
+  console.log("Test: a hash-correct file that isn't a valid module fails the whole bundle");
 
   const author = generateKeyPair();
   const { host } = await makeHost();
 
   // A well-formed manifest committing to two modules the author genuinely signed. One is
-  // the real forwarder (a valid §4 handler); the other is arbitrary bytes that hash-match
-  // their manifest module entry but won't instantiate as a handler. A guest is declared —
+  // the real forwarder (a valid §4 module); the other is arbitrary bytes that hash-match
+  // their manifest module entry but won't instantiate as a module. A guest is declared —
   // every app is a guest (§12.4) — and the multi-module shape is exactly what tests
   // atomicity. With a two-phase install, a module that fails phase 1 (instantiate)
   // should fail the entire load — nothing lands.
-  const notAHandler = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
+  const notAModule = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
   const guestText = "register('ping', () => new Uint8Array([1]));";
   const guestBytes = new TextEncoder().encode(guestText);
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
-    { name: "broken", hash: toHex(gHash(notAHandler)) },
+    { name: "broken", hash: toHex(gHash(notAModule)) },
   ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, caps: [] } };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: manifestEnv,
     [moduleFile("fwd")]: forwarderBytes,
-    [moduleFile("broken")]: notAHandler,
+    [moduleFile("broken")]: notAModule,
     [GUEST_FILE]: guestBytes,
   });
 
@@ -266,8 +266,8 @@ async function testBundleRefusesNonHandler() {
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
-  assert(!host.isBound(appKey(author.publicKey, "demo"), "fwd"), "the valid handler is NOT bound (the load failed atomically)");
-  assert(!host.isBound(appKey(author.publicKey, "demo"), "broken"), "the non-handler is not bound");
+  assert(!host.isBound(appKey(author.publicKey, "demo"), "fwd"), "the valid module is NOT bound (the load failed atomically)");
+  assert(!host.isBound(appKey(author.publicKey, "demo"), "broken"), "the non-module is not bound");
 
   console.log("  OK\n");
 }
@@ -519,7 +519,7 @@ async function testCapBridge() {
   // to itself drops at the guest's own-frame guard, so net/send drains.
   const { driver: transport } = await makeTransportHost({ identity: id, requestDeadlineMs: 200 });
 
-  // A handler reachable by name, to exercise module/call. The forwarder fixture
+  // A module reachable by name, to exercise module/call. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
   const testKey = appKey(id.publicKey, "testapp");
@@ -630,7 +630,7 @@ async function testCapBridge() {
     const echoNameBytes = new TextEncoder().encode("echo");
     const mc = new Uint8Array(1 + echoNameBytes.length + 2);
     mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
-    assertEqual([...await bridge("module/call", mc)], [8, 9], "module/call invokes the named handler");
+    assertEqual([...await bridge("module/call", mc)], [8, 9], "module/call invokes the named module");
   } finally {
     transport.close();
   }
@@ -648,9 +648,9 @@ async function testPolicy() {
   const bad = generateKeyPair();
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
-  const { KernelHost } = await imp("build/host/kernel-host.js");
+  const { ModuleTable } = await imp("build/host/module-table.js");
   const tryLoad = async (policyJson, author, extra = {}) => {
-    const host = new KernelHost();
+    const host = new ModuleTable();
     const manifest = { app: "mod", version: 1, ...extra,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST() };
@@ -748,7 +748,7 @@ async function testGuestAbi() {
 
   // A manifest without a guest is not an app at all: every bundle declares a guest
   // (§12.4). Refused BY NAME, like the ABI above — it is the manifest a bundle written
-  // against the retired handler-only format produces, so the message has to say what
+  // against the retired module-only format produces, so the message has to say what
   // the rule is rather than "malformed manifest".
   let noGuest = "";
   try { verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
@@ -772,7 +772,7 @@ async function testSlotFreshness() {
   console.log("Test: a slot occupant carries the ordinary (author, app) freshness mark");
 
   const { FreshnessMarks } = await imp("build/host/bundle.js");
-  const { KernelHost } = await imp("build/host/kernel-host.js");
+  const { ModuleTable } = await imp("build/host/module-table.js");
 
   const a = generateKeyPair();
   const b = generateKeyPair();
@@ -792,7 +792,7 @@ async function testSlotFreshness() {
   // which signed bundle arrives — which nothing delivering a bundle allows (§12.4).
   {
     const freshness = new FreshnessMarks();
-    const host = new KernelHost();
+    const host = new ModuleTable();
     land(host, freshness, a, 5, "transport");
     assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a slot occupant advances its (author, app) mark");
     land(host, freshness, b, 1, "transport");
@@ -803,7 +803,7 @@ async function testSlotFreshness() {
   // nothing about the downgrade that has always been in scope.
   {
     const freshness = new FreshnessMarks();
-    const host = new KernelHost();
+    const host = new ModuleTable();
     land(host, freshness, a, 5, "transport");
     let refused = false;
     try { land(host, freshness, a, 4, "transport"); } catch { refused = true; }
@@ -1369,8 +1369,8 @@ async function testCapBridgeEnforcement() {
   console.log("  OK\n");
 }
 
-async function testCallHandlerGuards() {
-  console.log("Test: KernelHost.callModule resolves by name, or null when unbound (§4)");
+async function testCallModuleGuards() {
+  console.log("Test: ModuleTable.callModule resolves by name, or null when unbound (§4)");
 
   const { host } = await makeHost();
   const { publicKey: pk } = generateKeyPair();
@@ -1384,14 +1384,14 @@ async function testCallHandlerGuards() {
   assert(host.callModule(appKey(pk, "nope"), "echo", new Uint8Array([1])) === null,
     "callModule returns null for an app that installed nothing");
 
-  // An installed handler is reached by name. A confined guest reaches the same handler
+  // An installed module is reached by name. A confined guest reaches the same module
   // through the cap-bridge's module/call (§12.2).
   installMod(host, guards, "echo", forwarderBytes);
   const r = host.callModule(guards, "echo", new Uint8Array([5]));
-  assertEqual([...r], [5], "callModule reaches an installed handler");
+  assertEqual([...r], [5], "callModule reaches an installed module");
 
   // A 0-length response is a valid EMPTY answer, NOT the null of an unbound name — the
-  // two are distinct at this seam, so a caller can tell "handler ran, said nothing" from
+  // two are distinct at this seam, so a caller can tell "module ran, said nothing" from
   // "nothing there". The forwarder echoes, so an empty input produces an empty response.
   const empty = host.callModule(guards, "echo", EMPTY);
   assert(empty !== null && empty.length === 0,
@@ -1736,7 +1736,7 @@ async function testHybridManifestSuite() {
     });
     const v = verifyBundle(sodium, blob);
     assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
-    const host = await createKernelHost();
+    const host = await createModuleTable();
     installBundle(host, v);
     const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
     assert(host.isBound(derived, "codec"), "the module binds under the derived hybrid author id");
@@ -1933,13 +1933,13 @@ async function testAuthorRevocation() {
     //     user to approve a bundle this host has already decided to refuse — then
     //     failing once they say yes — is the wrong order to ask in.
     {
-      const { createShell: mkShell, KernelHost: KH } = await imp("build/host/shell-core.js");
+      const { createShell: mkShell, ModuleTable: KH } = await imp("build/host/shell-core.js");
       const { FreshnessMarks } = await imp("build/host/bundle.js");
       const store = new FreshnessMarks();
       let admitCalls = 0;
       const probe = mkShell({
         platform: {
-          sodium, identity, kernel: new KH(), freshnessStore: store,
+          sodium, identity, table: new KH(), freshnessStore: store,
           createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
         },
         admit: () => { admitCalls++; return true; },
@@ -2021,7 +2021,7 @@ await testFullLifecycle();
 await testInstallRejectsUntrustedAuthor();
 await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
-await testBundleRefusesNonHandler();
+await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testHandlesIsADeclarationNotAClaim();
 await testInstallerRemove();
@@ -2038,7 +2038,7 @@ await testBundleCorruptNewerRollback();
 await testSafeJs();
 await testRealmSerialization();
 await testCapBridgeEnforcement();
-await testCallHandlerGuards();
+await testCallModuleGuards();
 await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();

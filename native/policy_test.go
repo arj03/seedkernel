@@ -103,7 +103,7 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 	}
 }
 
-// Two authors shipping an app under the SAME name coexist (README §5.1): a kernel name
+// Two authors shipping an app under the SAME name coexist (README §5.1): a table name
 // is derived from its author's key, so B never aims at A's slot in the first place. There
 // is no ownership register and no same-author clause — the collision the old register
 // existed to refuse is unrepresentable, and both modules land.

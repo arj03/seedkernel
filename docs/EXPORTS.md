@@ -21,7 +21,7 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 
 **Two things are reached that are not exports at all**, both by resolving a path straight off the filesystem under `node_modules` and bypassing `exports` entirely. Both work only because `package.json` has no `files` field, and **adding one without listing these would silently break the consumer's build**:
 
-- `seedkernel-wasm/assembly/seedkernel/handler` — the guest half of the handler ABI (§4), imported by seedchat's WASM modules and resolved by AssemblyScript. Nothing inside this repo imports that file either, so it looks like an orphan from in here and is not.
+- `seedkernel-wasm/assembly/seedkernel/handler` — the guest half of the module ABI (§4), imported by seedchat's WASM modules and resolved by AssemblyScript. Nothing inside this repo imports that file either, so it looks like an orphan from in here and is not.
 - `seedkernel-wasm/build/transport.skb` — the built transport bundle, read by `seedchat/scripts/smoke.mjs`. Sharper than the first: `build/` is gitignored, so this is a dependency on *output*, and a consumer that has never run `npm run build:transport-bundle` in this repo finds nothing there.
 
 Two traps this table exists to prevent:

@@ -7,17 +7,17 @@ import (
 	"testing"
 )
 
-// boundToWasm reports whether an app's module resolves — through the handler table, the way
-// every call path resolves it — to an installed wasm handler.
+// boundToWasm reports whether an app's module resolves — through the module table, the way
+// every call path resolves it — to an installed wasm module.
 func boundToWasm(appKey, module string) bool {
 	return apps[appKey][module] != nil
 }
 
-// TestScratchRegion covers the §4.1 reservation on this target: a handler that declares no
+// TestScratchRegion covers the §4.1 reservation on this target: a module that declares no
 // `scratchSize` gets the 128 KB default, and the host clamps its I/O to what it reserved
 // rather than to whatever its linear memory happens to allow. The forwarder reserves a
 // second buffer past `scratch`, so an over-default payload would physically fit its memory —
-// only the clamp refuses it. (The declared-scratchSize branch belongs to handlers like
+// only the clamp refuses it. (The declared-scratchSize branch belongs to modules like
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 //
 // The default itself is the shared host's number (core/wasm-limits.ts
@@ -31,15 +31,15 @@ func TestScratchRegion(t *testing.T) {
 	}
 	w := apps[key]["fwd"]
 	if w.size != 0x20000 {
-		t.Fatalf("a handler exporting no scratchSize should get the 128 KB default, got %d",
+		t.Fatalf("a module exporting no scratchSize should get the 128 KB default, got %d",
 			w.size)
 	}
 	// The installed module actually runs: an in-bounds payload echoes back unchanged,
 	// proving the host stages input at `scratch`, calls handle, and reads the response
 	// from the same region (README §4).
-	msg := []byte("hello handler")
+	msg := []byte("hello module")
 	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
-		t.Fatalf("echo handler returned %q, want %q", r, msg)
+		t.Fatalf("echo module returned %q, want %q", r, msg)
 	}
 	// A payload past the reserved region is refused by the clamp, not by memory bounds.
 	if r := callModule(key, "fwd", make([]byte, w.size+1)); r != nil {
@@ -50,7 +50,7 @@ func TestScratchRegion(t *testing.T) {
 // TestBundleModuleRuns is the end-to-end shape: build a minimal signed bundle right here
 // (no seedstore / sibling-repo dependency), load it, then reach its installed module by
 // name and confirm the pure-transform executes. The host reaches installed modules only by
-// name now (README §4, §12.4) — there is no kernel.call/dispatch seam to drive one through —
+// name now (README §4, §12.4) — there is no host-call/dispatch seam to drive one through —
 // so echoing a payload back is the whole "the bundle-installed wasm runs" proof.
 func TestBundleModuleRuns(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)

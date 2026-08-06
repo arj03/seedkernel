@@ -1,7 +1,7 @@
 package main
 
-// Networking round-trip perf for the Go loader — the net twin of BenchmarkKernelDispatch.
-// Where that bench times the kernel pipeline, this one times the transport bundle's
+// Networking round-trip perf for the Go loader. Where the crypto and RS benches time
+// individual primitives, this one times the transport bundle's
 // request/response over a real loopback socket: dial/accept, the AKE + record layer
 // (amortized — the warmup request establishes the link, steady-state requests reuse it),
 // routing, the [len][bytes] TCP framing (net.go), the Go↔JS frame-delivery boundary

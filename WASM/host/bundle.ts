@@ -13,7 +13,7 @@
 //                        0x01  [suite(1)][edPk(32)][edSig(64)][utf8 json]
 //                        0x02  [suite(1)][edPk(32)][mlDsaPk(1952)]
 //                              [edSig(64)][mlDsaSig(3309)][utf8 json]
-//   <name>.wasm        each handler module, named by its manifest `name`
+//   <name>.wasm        each WASM module, named by its manifest `name`
 //   guest.js           the safe-js guest program, if the manifest declares one
 //
 // There is no directory form: a bundle is a value, not a path. That is what lets the
@@ -29,7 +29,7 @@
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
-import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
     /** Logical name, e.g. "codec". Two jobs, one value: the module's file in the
@@ -233,7 +233,7 @@ export interface FreshnessStore {
 }
 
 /** The one host power a bundle load needs, as one call: land a bundle's modules on the
- *  handler table, all or none. `KernelHost` satisfies it; the native loader forwards it
+ *  module table, all or none. `ModuleTable` satisfies it; the native loader forwards it
  *  over its Go bridge (README §12.9).
  *
  *  **Atomicity is the host's, not the caller's.** A bundle is admitted as a unit (§12.4),
@@ -246,7 +246,7 @@ export interface FreshnessStore {
  *  that runs when something is already wrong.
  *
  *  Hashing is deliberately NOT here — it is `genesisHash(sodium, …)`, so the component
- *  that owns the handler table needs no crypto at all (§3). */
+ *  that owns the module table needs no crypto at all (§3). */
 export interface BundleHost {
     /** Compile, instantiate and validate every module against the §4 ABI, then bind them
      *  as `appKey`'s module set, each under its LOGICAL name from the manifest. It
@@ -281,7 +281,7 @@ export interface VerifiedBundle {
 }
 
 /** What the shell returns from `loadBundleBlob`: everything the manifest proved,
- *  minus the raw module bytes already bound into the handler table. */
+ *  minus the raw module bytes already bound into the module table. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
 /** The manifest envelope's name inside the container. */
@@ -292,7 +292,7 @@ export const GUEST_FILE = "guest.js";
 export function moduleFile(name: string): string { return name + ".wasm"; }
 /** An app's identity: `"<author hex>:<app>"` (§12.4). One value, three jobs — the
  *  freshness high-water key (FreshnessMarks below), the key an app's modules live under
- *  on the handler table (§5.1), and what a shell's protocol bindings point at (§12.10).
+ *  on the module table (§5.1), and what a shell's protocol bindings point at (§12.10).
  *  Both halves are signed, so an app key is derived from the manifest and never declared.
  *
  *  **Ownership is structural.** The author's key is half of the identity, so one author's
@@ -305,7 +305,7 @@ export function moduleFile(name: string): string { return name + ".wasm"; }
  *  app.
  *
  *  Nothing derives a per-module name from this. An app's modules live in a map UNDER this
- *  key, by the logical name their manifest declares (`KernelHost.callModule`), so the two
+ *  key, by the logical name their manifest declares (`ModuleTable.callModule`), so the two
  *  levels stay two levels and the app key needs no parsing to be read back out of a
  *  module's — there is no module name to parse. The author hex is fixed-length regardless,
  *  so a reader that wants the two halves gets them even though `app` may contain `:`.
@@ -324,7 +324,7 @@ export function appKeyFor(author: Uint8Array, app: string): string {
  *  value over the same bytes.
  *
  *  A free function taking the crypto, not a method on the host: hashing is the loader's
- *  business, and routing it through the handler table's owner would put a crypto
+ *  business, and routing it through the module table's owner would put a crypto
  *  dependency inside a component that is otherwise a `Map` (§3). */
 export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
@@ -634,7 +634,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // the same courtesy an unimplemented ABI or an unknown cap domain gets below, and for
     // the same reason: "this bundle is not shaped like an app this runtime runs" is a
     // rule an author should learn, not something to report as "malformed manifest". It is
-    // also the one manifest a bundle written against the older, handler-only format
+    // also the one manifest a bundle written against the older, module-only format
     // produces, so it is exactly the error worth spelling out.
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
         && (parsed as Record<string, unknown>).guest === undefined) {
@@ -940,7 +940,7 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // before ANY is handed down, so a bundle whose second module is over the ceiling never
     // reaches the host at all.
     for (const { wasm } of v.modules) {
-        checkHandlerMemory(wasm, DEFAULT_MAX_HANDLER_MEMORY_BYTES);
+        checkModuleMemory(wasm, DEFAULT_MAX_MODULE_MEMORY_BYTES);
     }
     // One transactional call: every module lands or none does, and the host owns that
     // guarantee (BundleHost). They land as the module set of the app key DERIVED from the

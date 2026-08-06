@@ -7,7 +7,7 @@
 // provoke here than over a socket.
 //
 // This is deliberately the whole driver: stage a request at `scratch`, call
-// handle(len), read the response back. It is the §4 handler ABI, so the kernel drives
+// handle(len), read the response back. It is the §4 module ABI, so the host drives
 // it identically in production.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,7 +26,7 @@ const exp = inst.exports;
 const scratch = exp.scratch.value;
 
 /** The module's declared scratch — read from the export rather than restated, since
- *  that export is exactly what tells the kernel how much it may stage. */
+ *  that export is exactly what tells the host how much it may stage. */
 export const SCRATCH_SIZE = exp.scratchSize.value;
 
 function call(req) {

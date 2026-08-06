@@ -1,19 +1,19 @@
-// Node entry point — bridges the portable KernelHost to libsodium-wrappers. Use
+// Node entry point — bridges the portable ModuleTable to libsodium-wrappers. Use
 // this when running on Node / Bun / Deno (with Node compat). A browser page reaches
 // the runtime through `./shell-core` and readies its own libsodium (docs/EXPORTS.md).
 
 import { readFileSync } from "node:fs";
-import { KernelHost } from "./kernel-host.js";
+import { ModuleTable } from "./module-table.js";
 import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "./pq.js";
 import { withMlKem768, loadMlKem768 } from "./kem.js";
 
 // The runtime bundles the sumo build so apps that need symbols beyond the
-// kernel's own Ed25519 + BLAKE2b (e.g. seedstore's crypto_stream_xchacha20_xor)
+// host's own Ed25519 + BLAKE2b (e.g. seedstore's crypto_stream_xchacha20_xor)
 // reuse one libsodium rather than shipping a second (README §12.1). A *static*
 // import (not createRequire) so `bun build --compile` bundles the package into
 // the standalone shell binary — a dynamic require resolves to nothing there. The
 // default export is the wrapper object; cast it to the module-namespace type the
-// rest of the host (and the KernelHost constructor) is written against.
+// rest of the host (and the ModuleTable constructor) is written against.
 import sodiumDefault from "libsodium-wrappers-sumo";
 const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sumo");
 
@@ -43,12 +43,12 @@ function ensurePq(): Promise<void> {
   return pqReady;
 }
 
-/** Await sodium readiness and stand up a KernelHost. The handler table is host
- *  state — there is no kernel blob to load — so booting is "ready libsodium, done"
+/** Await sodium readiness and stand up a ModuleTable. The module table is host
+ *  state — there is no blob to load — so booting is "ready libsodium, done"
  *  (§3); installing bundles stays the caller's job. */
-export async function createKernelHost(): Promise<KernelHost> {
+export async function createModuleTable(): Promise<ModuleTable> {
   await ensureSodium();
-  return new KernelHost();
+  return new ModuleTable();
 }
 
 // Every half of the crypto surface, always together. A caller that awaited only
@@ -68,7 +68,7 @@ export async function loadSodium(): Promise<typeof sodium> {
 
 /** A fresh ML-DSA-65 keypair — the PQ half of a hybrid author identity (§12.4).
  *  The Ed25519 half is `generateKeyPair` below; `hybridAuthorId` (bundle.ts) turns
- *  the two public keys into the 32-byte id policy and kernel names are written
+ *  the two public keys into the 32-byte id policy and table names are written
  *  against. Requires `ensureSodium()` first, like every other call here. */
 export function generatePqKeyPair(): {
   publicKey: Uint8Array;
@@ -87,4 +87,4 @@ export function generateKeyPair(): {
   return { publicKey: kp.publicKey, privateKey: kp.privateKey };
 }
 
-export { KernelHost } from "./kernel-host.js";
+export { ModuleTable } from "./module-table.js";

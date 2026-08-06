@@ -14,7 +14,7 @@
 // the worst a wrong binding does is deliver to the wrong app the user already
 // chose to install.
 //
-// This module owns ONLY the proto→appKey mapping. App records (handlerName, UI
+// This module owns ONLY the proto→appKey mapping. App records (moduleName, UI
 // metadata, etc.) live in the caller's own registry — the shell (chat-shell.js)
 // or the native host — and Bindings resolves appKeys that the caller then looks up.
 

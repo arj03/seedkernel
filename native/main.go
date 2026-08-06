@@ -4,7 +4,7 @@
 // (§12.2), the confined guest's lifecycle (§12.3), protocol dispatch (§12.10) — is
 // the shared host TS, compiled into the embedded host-shell.gen.js and run in
 // QuickJS (README §12.9). This Go layer is the bridge and only the bridge: it owns
-// the handler table (§3), supplies the crypto (Ed25519 via libsodium, BLAKE2b
+// the module table (§3), supplies the crypto (Ed25519 via libsodium, BLAKE2b
 // native), the fs directory, the sockets and the second QuickJS realm, and forwards
 // the CLI. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero
 // bridge) → one static binary.
@@ -45,9 +45,9 @@ import (
 //go:embed host-shell.gen.js
 var hostShellJS string
 
-// ───────────────────────── handler table (§3) ─────────────────────────
+// ───────────────────────── module table (§3) ─────────────────────────
 
-type wasmHandler struct {
+type boundModule struct {
 	mod     api.Module
 	cmod    wazero.CompiledModule // retained so an upgrade can release the old compiled code
 	fn      api.Function
@@ -63,21 +63,21 @@ var (
 	// el is the Go-owned JS event loop driving the host realm and every confined
 	// realm attached to it (loop.go). One per boot.
 	el *eventLoop
-	// apps is the handler table (README §3): the whole kernel, which is a contract rather
+	// apps is the module table (README §3), a contract rather
 	// than an artifact. App key → that app's modules by logical name, so the §3.1
 	// bind / unbind / resolve operations are map assignment, delete and lookup — there is
 	// no id indirection, no name codec, and no second table to drift from this one. Every
 	// value is an installed module: bundles are the one way code arrives (§12.4).
-	apps = map[string]map[string]*wasmHandler{}
+	apps = map[string]map[string]*boundModule{}
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
 )
 
-// The §4.1 scratch default (how much I/O space a handler reserves at `scratch` when it
+// The §4.1 scratch default (how much I/O space a module reserves at `scratch` when it
 // declares no `scratchSize`) is the shared host's number — core/wasm-limits.ts
 // DEFAULT_SCRATCH_SIZE — passed across by the shim with every bindAll, so Go's table
-// never owns a copy that could drift from the JS table's. A handler needing more
+// never owns a copy that could drift from the JS table's. A module needing more
 // exports a `scratchSize` global — seedstore's codec reserves 2 MB for whole-chunk
 // shards — which instantiateWasm reads once and clamps its cross-module copies to.
 
@@ -86,16 +86,16 @@ var (
 // place a displaced wasm instance is closed: Go frees neither the instance nor its
 // compiled code on its own, so dropping the map value alone would leak one linear memory
 // + its JITed code per re-install for the process's life.
-func bindApp(appKey string, mods map[string]*wasmHandler) {
+func bindApp(appKey string, mods map[string]*boundModule) {
 	for _, w := range apps[appKey] {
-		closeHandler(w)
+		closeModule(w)
 	}
 	apps[appKey] = mods
 }
 
-// closeHandler releases a handler's wasm instance and compiled code. nil-safe, so callers
+// closeModule releases a module's wasm instance and compiled code. nil-safe, so callers
 // can hand it whatever a lookup returned.
-func closeHandler(w *wasmHandler) {
+func closeModule(w *boundModule) {
 	if w == nil {
 		return
 	}
@@ -111,24 +111,24 @@ func removeApp(appKey string) int {
 		return 0
 	}
 	for _, w := range mods {
-		closeHandler(w)
+		closeModule(w)
 	}
 	delete(apps, appKey)
 	return len(mods)
 }
 
 // callModule invokes one app's module by its logical name (README §4), returning its
-// response or nil if nothing is bound there or the handler produced nothing. The one way
+// response or nil if nothing is bound there or the module produced nothing. The one way
 // into an installed module: the shell uses it directly and the cap-bridge routes
 // module/call (§12.2) through it, with the app key bound when the bridge was built.
-// Handlers are pure transforms and cannot call back, so there is no re-entrancy to guard.
+// Modules are pure transforms and cannot call back, so there is no re-entrancy to guard.
 func callModule(appKey, module string, payload []byte) []byte {
 	w := apps[appKey][module]
 	if w == nil {
 		return nil
 	}
 	// §4: write input at the scratch offset, call handle(input_len), read the response
-	// back from the same offset. Both copies are clamped to what the handler reserved
+	// back from the same offset. Both copies are clamped to what the module reserved
 	// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
 	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
 		return nil
@@ -137,7 +137,7 @@ func callModule(appKey, module string, payload []byte) []byte {
 	// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
 	// length is a failure. A 0-length result is a valid EMPTY response, not a
 	// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
-	// from "no handler / trap" (nil).
+	// from "no module / trap" (nil).
 	if err != nil || len(r) == 0 {
 		return nil
 	}
@@ -158,7 +158,7 @@ func callModule(appKey, module string, payload []byte) []byte {
 	return out
 }
 
-// bindAll lands a bundle's modules on the handler table, all or none (README §3.1) — the
+// bindAll lands a bundle's modules on the module table, all or none (README §3.1) — the
 // one way code arrives on this target, reached from JS as bridge.bindAll.
 //
 // The transaction is HERE rather than in the loader because this is the side holding the
@@ -167,12 +167,12 @@ func callModule(appKey, module string, payload []byte) []byte {
 // forgot would leak a linear memory plus its JITed code per rejected bundle. Making it a
 // two-phase seam across the bridge is what would put that duty on the caller.
 func bindAll(appKey string, names []string, wasms [][]byte, scratchDefault uint32) error {
-	built := make(map[string]*wasmHandler, len(wasms))
+	built := make(map[string]*boundModule, len(wasms))
 	for i, wasm := range wasms {
 		w, err := instantiateWasm(wasm, scratchDefault)
 		if err != nil {
 			for _, h := range built {
-				closeHandler(h)
+				closeModule(h)
 			}
 			return fmt.Errorf("%s: %w", names[i], err)
 		}
@@ -183,10 +183,10 @@ func bindAll(appKey string, names []string, wasms [][]byte, scratchDefault uint3
 	return nil
 }
 
-// instantiateWasm compiles, instantiates, and validates handler bytes against the §4
+// instantiateWasm compiles, instantiates, and validates module bytes against the §4
 // ABI. No table effect: the result is an intermediate of bindAll's transaction, never
 // something that crosses the bridge.
-func instantiateWasm(wasm []byte, scratchDefault uint32) (*wasmHandler, error) {
+func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
@@ -210,7 +210,7 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*wasmHandler, error) {
 	if g == nil || fn == nil || m.Memory() == nil {
 		return nil, fmt.Errorf("missing exports: memory=%v scratch=%v handle=%v", m.Memory() != nil, g != nil, fn != nil)
 	}
-	// §4.1: the handler reserves [scratch, scratch+size). It MAY export `scratchSize` to
+	// §4.1: the module reserves [scratch, scratch+size). It MAY export `scratchSize` to
 	// declare more than the default — honored only if it names real, in-bounds memory, and
 	// never below the default. A negative i32 arrives as a huge uint32 the bounds refuse.
 	mem, s := uint64(m.Memory().Size()), uint32(g.Get())
@@ -229,7 +229,7 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*wasmHandler, error) {
 		size = d
 	}
 	ok = true
-	return &wasmHandler{m, cm, fn, s, size}, nil
+	return &boundModule{m, cm, fn, s, size}, nil
 }
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
@@ -253,18 +253,18 @@ func boot(dataDir string) error {
 	// ML-KEM-768 for the primitive catalog (§14.1) — provisioned ahead of any caller,
 	// because a primitive is the one thing a bundle cannot deliver (mlkem.go).
 	mk = bootMlKem(rt)
-	// Every installed handler is a pure transform (README §4): the only host imports it
+	// Every installed module is a pure transform (README §4): the only host imports it
 	// takes are its language runtime's shims — for AssemblyScript the three below, which
-	// are exactly the set the JS host resolves (WASM/core/kernel-host.ts). Resolving a
+	// are exactly the set the JS host resolves (WASM/host/module-table.ts). Resolving a
 	// subset would make "does this module load" a property of which target it landed on:
-	// one `trace()` or `Math.random()` anywhere in a handler is the difference between
-	// loading and a missing-import failure. There is no kernel.call / kernel.caller seam
-	// and no env.invoke_handler dispatch callback.
+	// one `trace()` or `Math.random()` anywhere in a module is the difference between
+	// loading and a missing-import failure. There is no host-call / caller seam
+	// and no env.invoke_module dispatch callback.
 	//
 	// All three are inert, which is what keeps them shims rather than a seam. `seed` is a
 	// constant, not the clock: a pure transform is deterministic and reaches no clock
-	// (§4.2) — a handler that needs entropy takes it in its input. `trace` drops its
-	// arguments rather than writing them where anything could observe them, so a handler's
+	// (§4.2) — a module that needs entropy takes it in its input. `trace` drops its
+	// arguments rather than writing them where anything could observe them, so a module's
 	// only effect stays the bytes it returns (§4.3). `abort` need not trap here: AS emits
 	// `unreachable` immediately after the call, so the module traps either way.
 	env := rt.NewHostModuleBuilder("env")
@@ -272,7 +272,7 @@ func boot(dataDir string) error {
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, float64, float64, float64, float64, float64) {}).Export("trace")
 	if _, err := env.Instantiate(ctx); err != nil {
-		return fmt.Errorf("handler imports: %w", err)
+		return fmt.Errorf("module imports: %w", err)
 	}
 
 	var err error
@@ -307,7 +307,7 @@ func boot(dataDir string) error {
 }
 
 // shutdown releases a previous boot's engines: every confined realm, the host realm,
-// and the wazero runtime holding each handler's compiled code. Without it a test run
+// and the wazero runtime holding each module's compiled code. Without it a test run
 // that boots a dozen times strands a dozen of each for the process's life.
 func shutdown() {
 	for _, g := range realms {
@@ -322,7 +322,7 @@ func shutdown() {
 		_ = rt.Close(ctx)
 		rt = nil
 	}
-	apps = map[string]map[string]*wasmHandler{}
+	apps = map[string]map[string]*boundModule{}
 }
 
 // exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
@@ -331,7 +331,7 @@ func shutdown() {
 func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
-	// ── the handler table (§3) ──
+	// ── the module table (§3) ──
 	// One transactional install (§3.1) of one app's whole module set. The arguments are
 	// the app key and the loader's `{name, wasm}[]`, read out here rather than flattened
 	// on the JS side so the bridge shape and the BundleHost interface are the same shape

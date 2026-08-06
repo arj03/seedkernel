@@ -1,16 +1,17 @@
-// Shared scaffolding for pure-transform WASM handlers (README §3.2, §4).
+// Shared scaffolding for pure-transform WASM modules (README §3.2, §4).
 //
 // NOTE: nothing inside this repo imports this file. Its only consumer today is
 // seedchat, which reaches it as `seedkernel-wasm/assembly/seedkernel/handler`.
 // (seed store's modules predate it and declare their own layout.) It is not dead
-// code: it is the guest half of the handler ABI, published for the same reason
-// the bundle format is — an ABI that apps fork is an ABI that drifts. Moving or
-// renaming it is a breaking change to the public surface.
+// code: it is the guest half of the module ABI, published for the same reason
+// the bundle format is — an ABI that apps fork is an ABI that drifts. The path
+// keeps its `handler` filename because it is public surface: moving or renaming
+// it is a breaking change to consumers.
 //
-// A handler is a PURE TRANSFORM. It exports `memory`, a `scratch` global, and
+// A module is a PURE TRANSFORM. It exports `memory`, a `scratch` global, and
 // `handle(input_len)`. The host stages the input bytes at `scratch`, calls
-// `handle`, and reads the response back from `scratch[0..ret]`. Handlers import
-// nothing — no kernel.call, no signer query, no caller stack. The kernel is a
+// `handle`, and reads the response back from `scratch[0..ret]`. Modules import
+// nothing — no host seam, no signer query, no caller stack. The host holds a
 // named table of pure transforms; the orchestrator (the host shell, or a
 // zero-authority guest — README §12) does all I/O, routing, and authorization.
 //
@@ -22,7 +23,7 @@
  *  a message before handing it to the transform. */
 export const PK_LEN: i32 = 32;
 
-/** Offset in a handler's private memory that app bookkeeping may start at. The
+/** Offset in a module's private memory that app bookkeeping may start at. The
  *  helper reserves nothing anymore, so this is 0 — kept as a named constant so
  *  app modules read intent, not a bare literal. */
 export const PRIV_USER_OFF: i32 = 0;

@@ -1,8 +1,8 @@
 // ws — RFC 6455 framing + opening-handshake bytes as a no-capability module.
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so its wire codec is
-// pure byte transformation — exactly the shape of a no-cap WASM handler. It imports
-// nothing but the AS runtime: no kernel.call, no fs, no net. It ships as a module of
+// pure byte transformation — exactly the shape of a no-cap WASM module. It imports
+// nothing but the AS runtime: no host seam, no fs, no net. It ships as a module of
 // the transport bundle, whose guest holds the socket, the RNG and the residual receive
 // buffer and calls in by logical name; this module only frames and deframes and
 // computes the handshake accept (sha1 + base64), holding no per-connection state.
@@ -43,7 +43,7 @@ const PRIV_WORK_OFF: i32 = 8192;    // sha1 padded message + W[80]
 
 export let scratch: i32 = 0;
 /** How much I/O space the host may stage at `scratch` (§4.1). Declared because the
- *  default the kernel assumes is 128 KB, and one WS frame here may be the whole
+ *  default the host assumes is 128 KB, and one WS frame here may be the whole
  *  MAX_FRAME_BYTES message — so a host that took the default would refuse to stage
  *  any frame larger than that, which the transport reaches on its first bulk response. */
 export const scratchSize: i32 = SCRATCH_SIZE;

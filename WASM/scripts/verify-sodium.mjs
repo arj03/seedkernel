@@ -54,7 +54,7 @@ const sodium = (await import(base + "wrap.mjs")).default;
 await sodium.ready;
 
 const { publicKey, privateKey } = sodium.crypto_sign_keypair();
-const msg = new TextEncoder().encode("hello kernel.wasm");
+const msg = new TextEncoder().encode("hello seedkernel");
 const sig = sodium.crypto_sign_detached(msg, privateKey);
 const ok = sodium.crypto_sign_verify_detached(sig, msg, publicKey);
 const h = sodium.crypto_generichash(32, msg);

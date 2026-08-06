@@ -1,20 +1,20 @@
 // The platform-neutral shell core — the §12.9 "move one level up". Everything that
 // standing a node up involves EXCEPT the parts that genuinely vary by target lives
-// here: the handler table's owner, the cap-bridge wiring, the preamble assembly, the
+// here: the module table's owner, the cap-bridge wiring, the preamble assembly, the
 // realm's lifecycle, the bundle load order, the transport slot, and the inbound
-// dispatch. A target supplies the platform seam — { sodium, identity, kernel, fs?,
+// dispatch. A target supplies the platform seam — { sodium, identity, table, fs?,
 // freshnessStore, channels?, listen?, wsListen?, createRealm } — exactly like the
 // transport driver takes a ChannelFactory, and gets back a fully wired Shell.
 //
 // This is the ONE assemble path, and the assembly ORDER is the point: it is the last
 // thing two hosts could disagree about, so no target restates it.
 //
-//   main.ts       → boot()         → KernelHost + NodeFs + FileFreshnessStore + NodeChannelFactory + safe-js → createShell()
-//   browser       → chat-shell.js  → KernelHost + RtcNetwork-style openLink edges + sessionStorage freshness  → createShell()
-//   native        → native-shim.ts → Go handler table + Go Fs + Go channels + Go realm                → createShell()
+//   main.ts       → boot()         → ModuleTable + NodeFs + FileFreshnessStore + NodeChannelFactory + safe-js → createShell()
+//   browser       → chat-shell.js  → ModuleTable + RtcNetwork-style openLink edges + sessionStorage freshness  → createShell()
+//   native        → native-shim.ts → Go module table + Go Fs + Go channels + Go realm                → createShell()
 //   seedstore     → StorageNode    → { MemoryFs, FreshnessMarks }                  → createShell() + loadBundle(seedstore.skb)
 //
-// installWasmHandler is not public API on the Shell and there is no raw-bind path — the
+// installWasmModule is not public API on the Shell and there is no raw-bind path — the
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
@@ -68,24 +68,24 @@ export type RealmFactory = (opts: {
     deadlineMs?: number;
 }) => Promise<SafeRealm>;
 
-/** The handler table as exposed by the Shell — everything a caller needs to
- *  reach installed handlers, WITHOUT installWasmHandler AND WITHOUT
- *  removeHandler. The bind is the bundle loader's job (§12.4); the unbind
+/** The module table as exposed by the Shell — everything a caller needs to
+ *  reach installed modules, WITHOUT installWasmModule AND WITHOUT
+ *  removeApp. The bind is the bundle loader's job (§12.4); the unbind
  *  is the shell's uninstall method (§12.5). Neither install nor remove is a
  *  public host method. */
-export interface KernelTable {
+export interface ModuleLookup {
     callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null;
     isBound(appKey: string, module: string): boolean;
 }
 
-/** The §3 handler table as the shell uses it: the one transactional install a bundle
+/** The §3 module table as the shell uses it: the one transactional install a bundle
  *  load needs (`BundleHost.bindAll`), plus reaching and releasing what landed. A
- *  platform primitive, not shell logic — `KernelHost` is the JS implementation over
+ *  platform primitive, not shell logic — `ModuleTable` is the JS implementation over
  *  `WebAssembly`, and the native target's is Go's wazero map behind its byte bridge
  *  (§12.9). The table is the same contract either way; only who owns the instances
  *  differs — which is precisely why both the all-or-none bind and the release live
  *  behind it rather than in the loader. */
-export interface KernelBackend extends BundleHost, KernelTable {
+export interface ModuleTableBackend extends BundleHost, ModuleLookup {
     /** Drop an app and every module it landed, returning how many went. One lookup is
      *  all `uninstall` needs: an app's modules are the value under its key (§5.1), so
      *  the unit of removal is the unit of install. */
@@ -112,8 +112,8 @@ export interface ShellPlatform {
      *  this and nothing else, so a guest can never elicit a channel signature. Defaults to
      *  `identity` for hosts that supply a single keypair. */
     guestIdentity?: Keypair;
-    /** The handler table this shell binds bundle modules into (§3). */
-    kernel: KernelBackend;
+    /** The module table this shell binds bundle modules into (§3). */
+    table: ModuleTableBackend;
     fs?: Fs;
     freshnessStore: FreshnessStore;
     createRealm: RealmFactory;
@@ -173,7 +173,7 @@ export interface CreateShellOptions {
     config?: Record<string, string | number>;
     /** QuickJS heap limit for the guest realm, in bytes. Omitted ⇒ the shared default
      *  (`DEFAULT_REALM_MEMORY_BYTES`, core/wasm-limits.ts — 64 MiB, the same ceiling
-     *  as a handler's declared memory). A target that streams large windows through
+     *  as a module's declared memory). A target that streams large windows through
      *  the guest raises it to run without the realm OOMing (seedstore's
      *  `realmMemoryBytes`). */
     realmMemoryBytes?: number;
@@ -183,7 +183,7 @@ export interface CreateShellOptions {
      *  it spends parked on a host bridge, so it bounds a wedged guest without penalising
      *  one legitimately awaiting the network. `Infinity` disables it.
      *
-     *  This is the operator's number, not the author's: unlike the handler memory ceiling
+     *  This is the operator's number, not the author's: unlike the module memory ceiling
      *  (§4.3), which a bundle declares in its signed manifest, how long this node is
      *  willing to spend on one message is a property of the deployment. */
     guestDeadlineMs?: number;
@@ -199,10 +199,10 @@ export interface CreateShellOptions {
 }
 
 export interface Shell {
-    /** The handler table: callModule to reach an app's installed modules, isBound to
-     *  check occupancy. installWasmHandler is NOT on this interface — code lands
+    /** The module table: callModule to reach an app's installed modules, isBound to
+     *  check occupancy. installWasmModule is NOT on this interface — code lands
      *  only via loadBundleBlob (§12.4). */
-    host: KernelTable;
+    host: ModuleLookup;
     /** Protocol bindings (§12.10): which app handles which protocol. */
     bindings: Bindings;
     /** The transport bundle's driver — the node's Network. Absent until a bundle
@@ -219,9 +219,9 @@ export interface Shell {
      *  the §12.4 load order — the ONE install path. A bundle claiming the transport
      *  role additionally stands the transport driver up over its guest program. */
     loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
-    /** Uninstall an app: remove every kernel handler derived from `appKey`,
+    /** Uninstall an app: remove every module derived from `appKey`,
      *  drop every protocol binding for it, and dispose the confined realm if
-     *  this was its last app. Returns true if any handlers were removed.
+     *  this was its last app. Returns true if any modules were removed.
      *  The one uninstall path, symmetric with loadBundleBlob (§12.5). */
     uninstall(appKey: string): boolean;
     /** Write off an author key: refuse everything it signs from now on, and uninstall
@@ -238,7 +238,7 @@ export interface Shell {
      *  names and a fresh mark (§5.1) — not an un-revoke. */
     revoke(authorHex: string): string[];
     /** Run one of a loaded bundle's guest entrypoints through a generic
-     *  cap-bridge over the kernel's primitives. `appKey` defaults to the
+     *  cap-bridge over the host's primitives. `appKey` defaults to the
      *  only loaded app; throws when more than one is loaded and no key is
      *  given. */
     runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
@@ -258,14 +258,14 @@ export interface Shell {
 
 // Re-export the admission predicate constructors so a target that gates admission
 // on consent (the browser) or on which bundle it was handed (a StorageNode) can
-// reach them from the same module it gets createShell from. KernelHost rides along
-// for the same reason: the JS platforms all hand it in as their `kernel`, and a
+// reach them from the same module it gets createShell from. ModuleTable rides along
+// for the same reason: the JS platforms all hand it in as their `table`, and a
 // re-export keeps that a one-line seam rather than a second import.
 export { denyAll, admitAll, authorAllowlist, roleAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
 export { Bindings } from "./bindings.js";
-export { KernelHost } from "./kernel-host.js";
+export { ModuleTable } from "./module-table.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
- *  re-implementing the kernel host, cap-bridge wiring, preamble assembly, realm
+ *  re-implementing the module table, cap-bridge wiring, preamble assembly, realm
  *  creation, and transport routing. */
 /** An app's ONE inbound entrypoint (§12.10): the authenticated `senderPk ‖ payload`
  *  in, the response bytes out, or null for "this app answers nothing". Every app is a
@@ -341,7 +341,7 @@ export function validatedFs(inner: Fs): Fs {
  *  Without this, every app granted the `fs` domain shares one flat keyspace: `fs/list`
  *  with an empty prefix enumerates every key on the node, `fs/get` reads any of them and
  *  `fs/delete` removes any of them. That is the one place the runtime's "ownership is
- *  structural" property (§5.1) did not hold — kernel *names* carry their author, so one
+ *  structural" property (§5.1) did not hold — table *names* carry their author, so one
  *  app's modules are unreachable to another by construction, but fs *keys* carried
  *  nothing and were reachable to everyone. This closes that asymmetry the same way the
  *  names do: by derivation, not by a rule something has to enforce.
@@ -389,7 +389,7 @@ export function createShell(opts: CreateShellOptions & {
     // the contents a node stores and advertises. Under `scopedFs` below, so what gets
     // checked is the composite key the medium actually sees.
     const fs = platform.fs ? validatedFs(platform.fs) : undefined;
-    const host = platform.kernel;
+    const host = platform.table;
     const bindings = new Bindings();
     const admit = opts.admit ?? denyAll;
     const peerId = toHex(platform.identity.publicKey);
@@ -464,7 +464,7 @@ export function createShell(opts: CreateShellOptions & {
             // Scoped to this app key, so `fs` grants reach over this app's own keyspace and
             // not the node's (fs.ts). Two admitted apps can no longer read, enumerate or
             // delete each other's data, which brings `fs` into line with the structural
-            // ownership kernel names already have (§5.1).
+            // ownership module names already have (§5.1).
             fs: caps.has("fs") && fs
                 ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
                 : undefined,
@@ -496,7 +496,7 @@ export function createShell(opts: CreateShellOptions & {
      *  An app has exactly one way in: the confined realm's `handle` entrypoint (§12.2).
      *  Every bundle declares a guest (§12.4), so there is no second mechanism to branch
      *  on — `dispatch` neither branches on how an app is implemented nor re-derives a
-     *  kernel name for every inbound frame.
+     *  table name for every inbound frame.
      *
      *  It closes over the SLOT, not over `slot.realm`: the entrypoint is fixed at
      *  install, but the realm behind it is created lazily, so the entry ensures it on
@@ -724,7 +724,7 @@ export function createShell(opts: CreateShellOptions & {
                 }
             }
             for (const appKey of [...apps.keys()]) {
-                // Every kernel name of an app begins with its author (§5.1), so one prefix
+                // Every table name of an app begins with its author (§5.1), so one prefix
                 // test finds every app this key ever landed — including ones this shell
                 // loaded before the key went bad.
                 if (appKey.startsWith(hex + ":")) {

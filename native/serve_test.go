@@ -33,7 +33,7 @@ const holderGuestSource = `
 `
 
 // The echo guest: forwards its input to the bundle's own "fwd" module by name through
-// module/call — the shape every app has now that handler-only apps are retired (§12.4):
+// module/call — the shape every app has now that module-only apps are retired (§12.4):
 // inbound delivery reaches the guest, and the guest drives its module library.
 const echoGuestSource = `
 	register("handle", (arg) => {
@@ -142,7 +142,7 @@ func TestServeGuestApp(t *testing.T) {
 // Two apps on one node, and each protocol reaches ITS OWN app (§12.10) — the property
 // the native target could not hold while it assembled its own dispatch: that one asked
 // whether a protocol was bound and then called the single guest whatever the answer
-// named, had no arm at all for a handler-only app, and dropped the sender. All three
+// named, had no arm at all for a module-only app, and dropped the sender. All three
 // are checked here at once, since only a node hosting two apps with different code
 // shapes can tell the difference.
 func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
@@ -150,7 +150,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	st := serveNode(t, authorPub)
 
 	// Two guest apps from one author under two app names — so they derive disjoint
-	// kernel names (§5.1) and bind their own protocols. The holder guest reads fs; the
+	// table names (§5.1) and bind their own protocols. The holder guest reads fs; the
 	// echo guest forwards to its own "fwd" module, which echoes its input — so the echo
 	// app's response IS whatever the shell handed the guest.
 	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs"})
@@ -184,7 +184,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	}
 
 	// A protocol bound to nothing reaches nobody. The shared Transport still answers the
-	// frame (a null handler result is an EMPTY response, not a dropped one — that is
+	// frame (a null dispatch result is an EMPTY response, not a dropped one — that is
 	// dispatchRequest's contract on every target), so the check is that the answer is
 	// empty rather than either app's.
 	if resp := ask(t, st.PeerID, "nobody-serves-this", []byte{2}); len(resp) != 0 {

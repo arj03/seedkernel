@@ -11,7 +11,7 @@
 // bundle's, identical to the TCP path with only the bottom swapped.
 //
 // Identity: the transport runs its HELLO/AUTH challenge *inside* the channel,
-// proving each end holds the kernel private key for the pubkey it claims. That
+// proving each end holds the channel private key for the pubkey it claims. That
 // subsumes the SDP-fingerprint signing chat-shell.js does at the signaling layer —
 // and is stronger, because it is continuous channel binding rather than a one-shot
 // SDP assertion: a MITM relay can splice SDP and bring up DTLS to itself, but it

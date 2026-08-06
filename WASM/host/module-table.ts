@@ -1,19 +1,19 @@
-// The handler table (README §3, §4), as the JS targets implement it.
+// The module table (README §3, §4), as the JS targets implement it.
 //
 // **Host code, not core.** What is core about the table is the CONTRACT — the table,
-// the §4 handler ABI, the bind/unbind semantics, and the §4.3 memory ceiling
+// the §4 module ABI, the bind/unbind semantics, and the §4.3 memory ceiling
 // (core/wasm-limits.ts). This file is one platform's implementation of it, over
 // `WebAssembly`; the native target's is a wazero map in Go behind its byte bridge
 // (native/main.go), and neither is more canonical than the other. It sits with the
 // other backends — `fs-node.ts`, `safe-js.ts` — for the same reason they do.
 //
 // The table is a **contract, not an artifact**: the table (`apps[appKey].get(module)`),
-// the pure-transform handler ABI (§4), and the bind/unbind semantics (§3.1). Its whole
+// the pure-transform module ABI (§4), and the bind/unbind semantics (§3.1). Its whole
 // implementation is the two `Map`s below. The outer level is an INSTALL RECORD — what
 // a bundle load created — and the inner level is the app's module map, which is what a
-// call resolves: `apps[appKey].modules[name] = wasm_bytes`. There is no kernel module
-// to instantiate, no handler-id indirection, and no second table to keep in sync with
-// a first.
+// call resolves: `apps[appKey].modules[name] = wasm_bytes`. There is nothing to
+// instantiate beside it, no module-id indirection, and no second table to keep in sync
+// with a first.
 //
 // **Two levels, because there are two things.** An app is what installs, what a binding
 // points at and what `revoke` removes; a module is what a call resolves. Encoding both
@@ -23,12 +23,12 @@
 // argument about why the author hex must not be truncated lest one author grind their way
 // onto another's names. Every one of those defends a shared namespace, and there is no
 // shared namespace: a guest reaches only its own app's modules, bindings point at app
-// keys, and a kernel name never leaves the host (§5.1). The outer key IS the ownership,
+// keys, and a table name never leaves the host (§5.1). The outer key IS the ownership,
 // visible without parsing anything.
 //
-// A handler is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
+// A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
 // `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
-// response back from `scratch`. Handlers import nothing — no host seam, no I/O, no
+// response back from `scratch`. Modules import nothing — no host seam, no I/O, no
 // callback. Inbound delivery reaches an app's GUEST (§12.10), and the guest drives its
 // modules by name through the cap-bridge's module/call (README §12.2); a host-side
 // embedder reaches the same path directly with `callModule`, and does all I/O and
@@ -45,43 +45,43 @@
 // Authenticity is the transport's job (the AKE channel attributes every frame), not a
 // per-message signature — so there is no signature wrapper and no signer scoping here.
 
-import { checkHandlerMemory, DEFAULT_MAX_HANDLER_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
+import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 
-// ─── handler routing ─────────────────────────────────────────────────────
+// ─── module routing ─────────────────────────────────────────────────────
 
-export interface KernelHostOptions {
-  /** Ceiling on a handler's declared initial *and* maximum linear memory, in bytes.
+export interface ModuleTableOptions {
+  /** Ceiling on a module's declared initial *and* maximum linear memory, in bytes.
    *  A module above it — or one declaring no maximum at all — is refused at install
-   *  (§4.3). Defaults to the shared `DEFAULT_MAX_HANDLER_MEMORY_BYTES` that
+   *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES` that
    *  `installBundle` also applies; lower it to hold this host's direct installs to
    *  something tighter than the bundle path requires. */
-  maxHandlerMemoryBytes?: number;
+  maxModuleMemoryBytes?: number;
 }
 
-/** What the table holds at one name: an instantiated WASM handler, reached by name
+/** What the table holds at one name: an instantiated WASM module, reached by name
  *  through `callModule`. */
-interface WasmHandlerRef {
+interface WasmModuleRef {
   memory: WebAssembly.Memory;
   scratch: number;
   scratchSize: number;
   handle: (input_len: number) => number;
 }
 
-export class KernelHost {
-  /** The handler table (README §3): app key → that app's modules by logical name. A
+export class ModuleTable {
+  /** The module table (README §3): app key → that app's modules by logical name. A
    *  module is bound exactly when it is a key in its app's map, so the §3.1 bind /
    *  unbind / resolve operations are `set` / `delete` / `get` and nothing else can
    *  disagree about what resolves. */
-  private readonly apps = new Map<string, Map<string, WasmHandlerRef>>();
+  private readonly apps = new Map<string, Map<string, WasmModuleRef>>();
 
   /** The §4.3 memory ceiling this host holds installs to. */
-  private readonly maxHandlerMemoryBytes: number;
+  private readonly maxModuleMemoryBytes: number;
 
-  constructor(opts: KernelHostOptions = {}) {
-    this.maxHandlerMemoryBytes = opts.maxHandlerMemoryBytes ?? DEFAULT_MAX_HANDLER_MEMORY_BYTES;
+  constructor(opts: ModuleTableOptions = {}) {
+    this.maxModuleMemoryBytes = opts.maxModuleMemoryBytes ?? DEFAULT_MAX_MODULE_MEMORY_BYTES;
   }
 
-  // ─── installing WASM handlers ─────────────────────────────────────────
+  // ─── installing WASM modules ─────────────────────────────────────────
 
   /** Land an app's modules on the table, all or none (§3.1) — the one way code arrives,
    *  and the only mutating entry point besides `removeApp`.
@@ -102,31 +102,31 @@ export class KernelHost {
    *  garbage-collected frees them on this same path (native/main.go), which is exactly
    *  why the release is the host's business and not a step in the loader. */
   bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void {
-    if (appKey.length === 0) throw new Error("kernel: empty app key");
-    const built = new Map<string, WasmHandlerRef>();
+    if (appKey.length === 0) throw new Error("table: empty app key");
+    const built = new Map<string, WasmModuleRef>();
     for (const m of mods) {
-      if (m.name.length === 0) throw new Error("kernel: empty module name");
+      if (m.name.length === 0) throw new Error("table: empty module name");
       built.set(m.name, this.instantiate(m.wasm));
     }
     // Nothing above touched the table, and this cannot fail.
     this.apps.set(appKey, built);
   }
 
-  /** Instantiate handler `wasmBytes` — compile, validate, check §4 exports — without
-   *  binding to the handler table. Private: a ref that is not on the table is an
+  /** Instantiate module `wasmBytes` — compile, validate, check §4 exports — without
+   *  binding to the module table. Private: a ref that is not on the table is an
    *  intermediate of `bindAll`'s transaction and never something a caller holds.
    *
-   *  A handler is a pure transform: it imports nothing from the runtime — no `kernel.*`
-   *  seam, only its own language runtime's shims (`env.*`, §4.2) — and exports `memory`,
+   *  A module is a pure transform: it imports nothing from the runtime — no host seam
+   *  at all, only its own language runtime's shims (`env.*`, §4.2) — and exports `memory`,
    *  a `scratch` global, and `handle`. */
-  private instantiate(wasmBytes: Uint8Array): WasmHandlerRef {
-    if (wasmBytes.length === 0) throw new Error("kernel: empty wasm bytes");
+  private instantiate(wasmBytes: Uint8Array): WasmModuleRef {
+    if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
     // BEFORE instantiation, not after: `new WebAssembly.Instance` allocates the module's
     // declared initial memory, so a module asking for 4 GiB has already OOMed this host
     // by the time the export checks below could see it. Reading the limits off the bytes
     // is the only point at which the §4.3 memory residual can be refused (wasm-limits.ts,
     // which also refuses an imported or shared memory).
-    checkHandlerMemory(wasmBytes, this.maxHandlerMemoryBytes);
+    checkModuleMemory(wasmBytes, this.maxModuleMemoryBytes);
     let instance: WebAssembly.Instance;
     try {
       const mod = new WebAssembly.Module(wasmBytes as BufferSource);
@@ -134,13 +134,13 @@ export class KernelHost {
       // other target resolves (native/main.go), so "does this module load" is never a
       // property of which target it landed on. All three are inert: `seed` is a constant
       // rather than `Date.now()`, because a pure transform is deterministic and reaches
-      // no clock (§4.2) — a handler needing entropy takes it in its input — and `trace`
+      // no clock (§4.2) — a module needing entropy takes it in its input — and `trace`
       // drops its arguments rather than writing them where anything could observe them,
-      // so a handler's only effect stays the bytes it returns (§4.3).
+      // so a module's only effect stays the bytes it returns (§4.3).
       const imports: WebAssembly.Imports = {
         env: {
           abort: (_m: number, _f: number, l: number, c: number) => {
-            throw new Error(`dynamic handler abort at ${l}:${c}`);
+            throw new Error(`dynamic module abort at ${l}:${c}`);
           },
           seed: () => 0,
           trace: () => {},
@@ -148,7 +148,7 @@ export class KernelHost {
       };
       instance = new WebAssembly.Instance(mod, imports);
     } catch (e) {
-      throw new Error(`kernel: failed to instantiate wasm: ${(e as Error).message}`);
+      throw new Error(`table: failed to instantiate wasm: ${(e as Error).message}`);
     }
     const exps = instance.exports as {
       memory?: WebAssembly.Memory;
@@ -156,21 +156,21 @@ export class KernelHost {
       scratchSize?: WebAssembly.Global;
       handle?: (input_len: number) => number;
     };
-    if (!exps.memory) throw new Error("kernel: handler missing export: memory");
-    if (!(exps.scratch instanceof WebAssembly.Global)) throw new Error("kernel: handler missing export: scratch");
-    if (typeof exps.handle !== "function") throw new Error("kernel: handler missing export: handle");
+    if (!exps.memory) throw new Error("table: module missing export: memory");
+    if (!(exps.scratch instanceof WebAssembly.Global)) throw new Error("table: module missing export: scratch");
+    if (typeof exps.handle !== "function") throw new Error("table: module missing export: handle");
     const scratchOffset = exps.scratch.value as number;
     if (typeof scratchOffset !== "number" || scratchOffset <= 0 || scratchOffset + DEFAULT_SCRATCH_SIZE > exps.memory.buffer.byteLength) {
-      throw new Error(`kernel: scratch offset ${scratchOffset} out of bounds`);
+      throw new Error(`table: scratch offset ${scratchOffset} out of bounds`);
     }
     let scratchSize = DEFAULT_SCRATCH_SIZE;
     if (exps.scratchSize instanceof WebAssembly.Global) {
       const declared = exps.scratchSize.value as number;
       if (typeof declared !== "number" || declared < DEFAULT_SCRATCH_SIZE) {
-        throw new Error(`kernel: invalid scratchSize ${declared} (must be >= ${DEFAULT_SCRATCH_SIZE})`);
+        throw new Error(`table: invalid scratchSize ${declared} (must be >= ${DEFAULT_SCRATCH_SIZE})`);
       }
       if (scratchOffset + declared > exps.memory.buffer.byteLength) {
-        throw new Error(`kernel: scratchSize ${declared} overflows memory`);
+        throw new Error(`table: scratchSize ${declared} overflows memory`);
       }
       scratchSize = declared;
     }
@@ -185,13 +185,13 @@ export class KernelHost {
   // ─── public API ──────────────────────────────────────────────────────
 
   /** Invoke one app's module with `payload`, returning its response bytes, or null if
-   *  nothing is bound there or the handler produced no response. This is the
-   *  scratch-region contract (README §4): write input at the handler's scratch offset,
+   *  nothing is bound there or the module produced no response. This is the
+   *  scratch-region contract (README §4): write input at the module's scratch offset,
    *  call handle(input_len), read the response back from the same offset. The generic
    *  "run a transform" primitive: the host uses it directly, and a guest reaches it
    *  through the cap-bridge's module/call (README §12.2) — with the app key bound at
    *  bridge construction, so `module` is the LOGICAL name from the guest's own manifest
-   *  and a guest cannot address another app's modules by naming one. Handlers cannot
+   *  and a guest cannot address another app's modules by naming one. Modules cannot
    *  call back, so there is no re-entrancy. */
   callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null {
     const w = this.apps.get(appKey)?.get(module);
@@ -203,7 +203,7 @@ export class KernelHost {
     catch { return null; }
     // handle returns output_len ≥ 0 (§4): only a trap or a negative/oversized length is a
     // failure. Zero is a valid EMPTY response — return an empty array for it, distinct
-    // from null (no handler / trap).
+    // from null (no module / trap).
     if (responseLen < 0 || responseLen > w.scratchSize) return null;
     return new Uint8Array(w.memory.buffer, w.scratch, responseLen).slice();
   }

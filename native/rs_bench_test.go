@@ -2,7 +2,7 @@ package main
 
 // Reed–Solomon codec perf for the Go loader. RS isn't a libsodium primitive — it
 // lives in the seedstore repo's codec.wasm (AssemblyScript GF(2^8) erasure coding) —
-// but the loader runs that same wasm through the installed `seedstore:codec` handler,
+// but the loader runs that same wasm through the installed `seedstore:codec` module,
 // so its encode/decode throughput is comparable runtime-to-runtime against the node
 // numbers from seedstore/WASM/tests/bench.mjs. Same shape as that bench: RS(10,6),
 // 64 KB blocks, 640 KB of data per chunk; throughput is reported over data bytes

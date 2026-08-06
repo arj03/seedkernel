@@ -16,8 +16,8 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 await _sodium.ready;
 const sodium = _sodium;
 
-const { KernelHost } = await imp("build/host/kernel-host.js");
-const { readMemoryLimits, checkHandlerMemory } = await imp("build/core/wasm-limits.js");
+const { ModuleTable } = await imp("build/host/module-table.js");
+const { readMemoryLimits, checkModuleMemory } = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
@@ -35,25 +35,25 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
 {
   const a = readMemoryLimits(withMax);
   const b = readMemoryLimits(noMax);
-  ok(a.maxPages === 256, `built handler declares a 256-page maximum (got ${a.maxPages})`);
+  ok(a.maxPages === 256, `built module declares a 256-page maximum (got ${a.maxPages})`);
   ok(b.maxPages === null, "the no-maximum build declares none");
-  ok(checkHandlerMemory(withMax, 64 * 1024 * 1024) !== null, "a bounded handler passes the budget");
-  throws(() => checkHandlerMemory(noMax, 64 * 1024 * 1024), "a handler with no declared maximum is refused");
-  throws(() => checkHandlerMemory(withMax, 1024 * 1024), "a handler above the host budget is refused");
-  throws(() => checkHandlerMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
+  ok(checkModuleMemory(withMax, 64 * 1024 * 1024) !== null, "a bounded module passes the budget");
+  throws(() => checkModuleMemory(noMax, 64 * 1024 * 1024), "a module with no declared maximum is refused");
+  throws(() => checkModuleMemory(withMax, 1024 * 1024), "a module above the host budget is refused");
+  throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
-  const host = new KernelHost();
+  const host = new ModuleTable();
   host.bindAll("aa:app", [{ name: "ok", wasm: withMax }]);
-  ok(host.isBound("aa:app", "ok"), "KernelHost binds a bounded handler");
+  ok(host.isBound("aa:app", "ok"), "ModuleTable binds a bounded module");
   throws(() => host.bindAll("aa:app", [{ name: "bad", wasm: noMax }]),
-    "KernelHost refuses an unbounded handler at install");
-  const tiny = new KernelHost({ maxHandlerMemoryBytes: 1024 * 1024 });
+    "ModuleTable refuses an unbounded module at install");
+  const tiny = new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 });
   throws(() => tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was, rather than with its first module landed. Atomicity is the
   // host's guarantee, so it holds without the caller doing anything to earn it.
-  const atomic = new KernelHost();
+  const atomic = new ModuleTable();
   throws(() => atomic.bindAll("aa:app", [
     { name: "first", wasm: withMax },
     { name: "second", wasm: noMax },
@@ -95,7 +95,7 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
   const kp = sodium.crypto_sign_keypair();
   const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp.privateKey, kp.publicKey, m));
   // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: this is the
-  // manifest a bundle written against the retired handler-only format produces, so its
+  // manifest a bundle written against the retired module-only format produces, so its
   // author has to learn the rule, not read "malformed manifest".
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
@@ -122,7 +122,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   // primitive — the asking bundle's own code, scoped structurally by the app key the
   // bridge was built with — so it resolves under an empty cap set, exactly like
   // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
-  const chat = new KernelHost();
+  const chat = new ModuleTable();
   chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
   chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
   const scoped = createCapBridge({
@@ -234,7 +234,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   let seen = null;
   const shell = createShell({
     platform: {
-      sodium, identity: kp, kernel: new KernelHost(), fs: new MemoryFs(),
+      sodium, identity: kp, table: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen = o;
@@ -266,7 +266,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   let seen2 = null;
   const bare = createShell({
     platform: {
-      sodium, identity: kp, kernel: new KernelHost(), fs: new MemoryFs(),
+      sodium, identity: kp, table: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen2 = o;

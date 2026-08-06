@@ -19,7 +19,7 @@ export const { createShell } = await imp("build/host/shell-core.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
-export const { KernelHost } = await imp("build/host/kernel-host.js");
+export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest reports through transport/link-down
@@ -58,7 +58,7 @@ export async function makeTransportHost(opts = {}) {
     platform: {
       sodium: opts.sodium ?? sodium,
       identity,
-      kernel: new KernelHost(),
+      table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       channels: opts.channels,
       listen: opts.listen,

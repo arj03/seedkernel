@@ -64,7 +64,7 @@
 // bundle into, so a compromised transport can neither forge app signatures nor
 // sign for another network.
 //
-// Channels are host handles keyed by a link id the HOST minted — the kernel table
+// Channels are host handles keyed by a link id the HOST minted — the module table
 // holds one instance per name (§3.1), so all link state lives in this module's
 // heap, keyed by that id.
 //
@@ -496,7 +496,7 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
 /** Call one of THIS bundle's modules by its logical name (the bridge resolves it to a
- *  kernel name, which a guest never sees). */
+ *  table name, which a guest never sees). */
 function moduleCall(name, req) {
   const n = utf8Encode(name);
   const out = new Uint8Array(1 + n.length + req.length);

@@ -25,7 +25,7 @@ const { NodeChannelFactory } = await imp("build/host/net-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
-const { KernelHost } = await imp("build/host/kernel-host.js");
+const { ModuleTable } = await imp("build/host/module-table.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
@@ -38,7 +38,7 @@ async function makeNode(ws = false) {
   const shell = createShell({
     platform: {
       sodium, identity,
-      kernel: new KernelHost(),
+      table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       channels: new NodeChannelFactory(),
       listen: { host: HOST, port: 0 },

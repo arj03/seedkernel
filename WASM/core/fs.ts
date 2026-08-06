@@ -1,7 +1,7 @@
 // The `fs.*` capability (exported as `seedkernel-wasm/fs`): raw bytes under an
 // opaque, flat key. It is the storage-side twin of `net.*` (raw bytes to/from an
-// opaque peer id) — see the runtime split, "raw-byte caps in the kernel,
-// structure in modules". The kernel knows nothing about content-addressing,
+// opaque peer id) — see the runtime split, "raw-byte caps in the host,
+// structure in modules". The host knows nothing about content-addressing,
 // descriptors, or quota: those are app policy that an application layers on top
 // (seedstore's FsBlobStore does exactly that). Only real platform conditions
 // surface — a full disk makes `put` throw, and `stat` reports what the backend

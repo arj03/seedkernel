@@ -4,7 +4,7 @@
 // scripts/bundle-loader.mjs.
 //
 // This file is a SEAM, not an implementation. Go supplies platform *primitives* —
-// a handler table over wazero, libsodium, an `fs` directory, TCP sockets, a second
+// a module table over wazero, libsodium, an `fs` directory, TCP sockets, a second
 // QuickJS realm — and this file adapts them to the interfaces the shared shell
 // already consumes (`BundleHost`, `FreshnessStore`, `ChannelFactory`, `RealmFactory`,
 // `ShellPlatform`) and hands the result to `createShell`. Everything above the
@@ -20,7 +20,7 @@
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks } from "./bundle.js";
 import {
-  createShell, type KernelBackend, type RealmFactory, type Shell, type ShellSodium,
+  createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
@@ -42,7 +42,7 @@ import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
  *  A sync name returns its bytes here instead. */
 type CapCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
-/** The handler table and realm plumbing Go exposes (main.go). */
+/** The module table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
   bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
   callModule(appKey: string, module: string, payload: Uint8Array): ArrayBuffer | null;
@@ -286,9 +286,9 @@ globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed()
 globalThis.__netAccept = (port, id) => { const a = netAccepts.get(port); if (a) a(id); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
-/** The §3 handler table, which on this target lives in Go (wazero instances cannot
+/** The §3 module table, which on this target lives in Go (wazero instances cannot
  *  be JS values). Shape only — every rule about what may land is the shared loader's. */
-const kernel: KernelBackend = {
+const table: ModuleTableBackend = {
     // Straight through: the all-or-none guarantee is Go's, because Go holds the
     // half-built wazero instances — and has to close them, since neither an instance nor
     // its compiled code is reclaimed on its own (main.go `bindAll`). The §4.1 scratch
@@ -452,7 +452,7 @@ async function makeTransportNode(cfg: {
 }> {
     const s = createShell({
         platform: {
-            sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, kernel, fs,
+            sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, table, fs,
             freshnessStore: new NativeFreshnessStore(),
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
             contactSecret: cfg.contactSecret, createRealm,
@@ -520,7 +520,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
 /** Load a signed bundle (README §12.4). Go has read the one file — that is the whole
  *  fs seam — and passes its bytes; every check, its order, and the module binding are
  *  the shared shell's. Returns the little Go needs to report; the guest source, the
- *  caps, the signing scope and the kernel names never leave this realm. */
+ *  caps, the signing scope and the table names never leave this realm. */
 async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
     const b = await theShell().loadBundleBlob(new Uint8Array(blob));
     return utf8.encode(JSON.stringify({

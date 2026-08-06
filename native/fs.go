@@ -1,6 +1,6 @@
 // fs.go — the Go target's `fs.*` platform primitive: raw bytes under an opaque,
 // flat key, one file per key under a data directory (the storage twin of the net
-// cap). The kernel knows nothing about content-addressing or quota —
+// cap). The host knows nothing about content-addressing or quota —
 // those are the storage guest's business, layered on top of these primitives. This
 // mirrors host/fs-node.ts (NodeFs) so a Go node's on-disk store behaves like a
 // Bun node's. Exposed into QuickJS as an `fs` object with the core/fs.ts `Fs`

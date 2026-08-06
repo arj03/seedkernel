@@ -19,7 +19,7 @@
 // envelope (§12.4, §14.1): a PQ verifier could never have been delivered as a
 // bundle, and a PQ *identity* is equally immovable — the 0x02 author id is a
 // key-set hash, not the Ed25519 key, so an author who migrates later changes every
-// pin and every kernel name built on the old id. The artifact therefore ships
+// pin and every table name built on the old id. The artifact therefore ships
 // hybrid from the start; the ML-DSA half of the key set is derived from the same
 // `--key` seed as the Ed25519 half, so one key file still holds the whole identity.
 //
@@ -211,7 +211,7 @@ async function main() {
   const edSig = sodium.crypto_sign_detached(pre, kp.privateKey);
   const pqSig = mldsa.sign(pre, pq.privateKey);
   const env = concat([Uint8Array.of(suite), kp.publicKey, pq.publicKey, edSig, pqSig, json]);
-  // The 0x02 author id: the key-set hash policy pins, kernel names derive from, and
+  // The 0x02 author id: the key-set hash policy pins, table names derive from, and
   // freshness is keyed by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`).
   const authorId = sodium.crypto_generichash(32, concat([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(suite), kp.publicKey, pq.publicKey]));
   const blob = packBundle({ [MANIFEST_FILE]: env, [GUEST_FILE]: guest, "ws.wasm": wsWasm });

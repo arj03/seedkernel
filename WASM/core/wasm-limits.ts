@@ -1,44 +1,44 @@
-// Pre-instantiation bounds on a handler module's declared linear memory (README §4.3),
+// Pre-instantiation bounds on a module's declared linear memory (README §4.3),
 // plus the shared §12.3 guest-realm bounds that are deliberately the same number
-// (the realm heap cap and the handler memory ceiling — see DEFAULT_REALM_MEMORY_BYTES)
+// (the realm heap cap and the module memory ceiling — see DEFAULT_REALM_MEMORY_BYTES)
 // and the §4.1 scratch default every host's table must agree on.
 //
-// §4.3 names this as a residual: "an installed handler can still infinite-loop or declare
+// §4.3 names this as a residual: "an installed module can still infinite-loop or declare
 // a huge linear memory and OOM the single-threaded host." The memory half of that cannot
 // be closed *after* instantiation — `new WebAssembly.Instance` allocates the declared
 // initial memory before any export runs, so a module declaring 4 GiB has already taken
-// the host down by the time kernel-host.ts's scratch validation sees it. The bound has to
+// the host down by the time module-table.ts's scratch validation sees it. The bound has to
 // be read off the bytes first, which is what this file is for.
 //
 // The JS WebAssembly API exposes no memory limits on a compiled `Module`, so this walks
 // the binary's section headers and reads the limits directly. It is a *bounds read*, not
 // a validator: the engine still does real validation at compile time. Anything this
 // cannot parse is refused rather than waved through, because a module whose sections do
-// not parse is one whose memory footprint cannot be bounded either — and the §4 handler
-// contract is narrow enough (three exports, no imports but the AS shims) that a handler
-// with an unparseable prologue is not a handler.
+// not parse is one whose memory footprint cannot be bounded either — and the §4 module
+// contract is narrow enough (three exports, no imports but the AS shims) that a module
+// with an unparseable prologue is not a module.
 //
 // Two refusals here are structural rather than budgetary, and both defend claims §4.3
 // already makes in prose:
 //   - an *imported* memory would be host-supplied, which is the one way a pure transform
-//     could reach bytes it did not declare (§4.2: handlers import nothing);
+//     could reach bytes it did not declare (§4.2: modules import nothing);
 //   - a *shared* memory would be visible to another agent, breaking "a buggy or malicious
-//     handler ... cannot touch the host, the kernel, or another handler" (§4.3).
+//     module ... cannot touch the host or another module" (§4.3).
 
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
 
-/** The I/O region a handler reserves at its `scratch` export when it declares no
+/** The I/O region a module reserves at its `scratch` export when it declares no
  *  `scratchSize` (README §4.1). One number on every target: the JS table
- *  (kernel-host.ts) and the Go table (native/main.go) must not disagree about how
- *  much of a handler's memory is its staging area — a payload the JS host admits
- *  and Go refuses (or vice versa) is a handler that loads on one node and not
+ *  (module-table.ts) and the Go table (native/main.go) must not disagree about how
+ *  much of a module's memory is its staging area — a payload the JS host admits
+ *  and Go refuses (or vice versa) is a module that loads on one node and not
  *  another. The Go side receives it from the shared shim at every bindAll. */
 export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
 /** Default heap cap for a confined guest realm (README §12.3, §16.1) — applied by
  *  the shell when no target overrides it, and by the realm factories for a direct
- *  caller. It deliberately equals `DEFAULT_MAX_HANDLER_MEMORY_BYTES` below, so the
+ *  caller. It deliberately equals `DEFAULT_MAX_MODULE_MEMORY_BYTES` below, so the
  *  two kinds of untrusted code a bundle can ship are held to one number; the two
  *  factories used to each own their own 64 MiB copy that could drift from this. */
 export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
@@ -50,7 +50,7 @@ export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
  *  when no target overrides; the realm factories use it for a direct caller. */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
-/** Default ceiling on a handler's declared linear memory. Matches the guest realm's
+/** Default ceiling on a module's declared linear memory. Matches the guest realm's
  *  default heap cap (safe-js.ts), so the two kinds of untrusted code a bundle can ship
  *  are held to one number rather than to two that drift.
  *
@@ -59,7 +59,7 @@ export const DEFAULT_GUEST_DEADLINE_MS = 5000;
  *  Go one (§3: "what genuinely must not diverge between hosts is the bundle load order
  *  and the admission rules"). A host may hold its own direct installs to something
  *  tighter; no host may be looser about what a *bundle* may land. */
-export const DEFAULT_MAX_HANDLER_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
+export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 export interface MemoryLimits {
   /** Initial size in pages — allocated eagerly at instantiation, so this is the
@@ -67,7 +67,7 @@ export interface MemoryLimits {
   initialPages: number;
   /** Declared maximum in pages, or null when the module declares none. A module with
    *  no maximum may `memory.grow` up to whatever the engine allows, so the host cannot
-   *  bound it and refuses it (see `checkHandlerMemory`). */
+   *  bound it and refuses it (see `checkModuleMemory`). */
   maxPages: number | null;
 }
 
@@ -100,7 +100,7 @@ function skipName(c: Cursor): void {
 function readLimits(c: Cursor): MemoryLimits {
   if (c.i >= c.b.length) throw new Error("wasm: truncated limits");
   const flags = c.b[c.i++];
-  if (flags & 0x02) throw new Error("wasm: handler declares a shared memory — refused (§4.3: a handler's memory is private to it)");
+  if (flags & 0x02) throw new Error("wasm: module declares a shared memory — refused (§4.3: a module's memory is private to it)");
   if (flags & ~0x01) throw new Error(`wasm: unsupported memory limits flags 0x${flags.toString(16)}`);
   const initialPages = readVarU32(c);
   const maxPages = (flags & 0x01) ? readVarU32(c) : null;
@@ -110,7 +110,7 @@ function readLimits(c: Cursor): MemoryLimits {
 /** Read the declared limits of a module's own linear memory, or null when it declares
  *  none. Throws when the module imports a memory, declares more than one, or cannot be
  *  walked. A null return is not a pass — it means the module exports no memory of its
- *  own, which kernel-host's `memory` export check then refuses with its own message. */
+ *  own, which module-table's `memory` export check then refuses with its own message. */
 export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
   if (wasm.length < 8) throw new Error("wasm: too short to be a module");
   if (!(wasm[0] === 0x00 && wasm[1] === 0x61 && wasm[2] === 0x73 && wasm[3] === 0x6d)) {
@@ -124,7 +124,7 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
     const end = c.i + size;
     if (end > wasm.length) throw new Error("wasm: truncated section");
     if (id === 2) {
-      // Import section. A handler imports nothing from the runtime — only its own
+      // Import section. A module imports nothing from the runtime — only its own
       // language runtime's shims, which are functions (§4.2); an imported memory is the
       // one import that would hand a pure transform bytes it did not declare, so it is
       // refused rather than counted.
@@ -136,14 +136,14 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
         const kind = wasm[c.i++];
         if (kind === 0x00) readVarU32(c);                     // func: typeidx
         else if (kind === 0x01) { c.i++; readLimits(c); }     // table: reftype ‖ limits
-        else if (kind === 0x02) throw new Error("wasm: handler imports a memory — refused (§4.2: a handler imports nothing from the runtime)");
+        else if (kind === 0x02) throw new Error("wasm: module imports a memory — refused (§4.2: a module imports nothing from the runtime)");
         else if (kind === 0x03) c.i += 2;                     // global: valtype ‖ mut
         else throw new Error(`wasm: unknown import kind 0x${kind.toString(16)}`);
       }
     } else if (id === 5) {
       // Memory section.
       const count = readVarU32(c);
-      if (count !== 1) throw new Error(`wasm: ${count} memories declared — a handler declares exactly one (§4.1)`);
+      if (count !== 1) throw new Error(`wasm: ${count} memories declared — a module declares exactly one (§4.1)`);
       limits = readLimits(c);
     }
     // Sections this does not read are skipped wholesale; so is any tail left inside one
@@ -153,7 +153,7 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
   return limits;
 }
 
-/** Refuse a handler whose declared memory does not fit `maxBytes` (README §4.3).
+/** Refuse a module whose declared memory does not fit `maxBytes` (README §4.3).
  *
  *  Both halves of the budget matter and they fail for different reasons. `initialPages`
  *  is allocated at instantiation, so an oversized one is an attack that lands the moment
@@ -161,29 +161,29 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
  *  `maxPages` bounds `memory.grow` afterwards, and a module that declares **no** maximum
  *  is refused outright: WebAssembly gives the embedder no way to impose one after the
  *  fact, so an undeclared maximum is an unbounded one. That makes "declare your ceiling"
- *  part of the handler contract rather than a hope — the cost is one build flag
+ *  part of the module contract rather than a hope — the cost is one build flag
  *  (AssemblyScript's `--maximumMemory`, in pages), and the benefit is that the §4.3
  *  memory residual is closed by construction rather than by a deployment note.
  *
  *  Returns the limits it validated (null when the module declares no memory of its own,
  *  which the `memory` export check refuses separately). */
-export function checkHandlerMemory(wasm: Uint8Array, maxBytes: number): MemoryLimits | null {
+export function checkModuleMemory(wasm: Uint8Array, maxBytes: number): MemoryLimits | null {
   const limits = readMemoryLimits(wasm);
   if (!limits) return null;
   const budgetPages = Math.floor(maxBytes / WASM_PAGE_BYTES);
   if (limits.initialPages > budgetPages) {
     throw new Error(
-      `wasm: handler declares ${limits.initialPages} initial memory pages, above the host budget of ${budgetPages}`,
+      `wasm: module declares ${limits.initialPages} initial memory pages, above the host budget of ${budgetPages}`,
     );
   }
   if (limits.maxPages === null) {
     throw new Error(
-      "wasm: handler declares no memory maximum — refused, since an embedder cannot impose one after instantiation (build with AssemblyScript's --maximumMemory)",
+      "wasm: module declares no memory maximum — refused, since an embedder cannot impose one after instantiation (build with AssemblyScript's --maximumMemory)",
     );
   }
   if (limits.maxPages > budgetPages) {
     throw new Error(
-      `wasm: handler declares a maximum of ${limits.maxPages} memory pages, above the host budget of ${budgetPages}`,
+      `wasm: module declares a maximum of ${limits.maxPages} memory pages, above the host budget of ${budgetPages}`,
     );
   }
   return limits;

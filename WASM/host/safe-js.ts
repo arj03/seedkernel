@@ -5,8 +5,8 @@
 // `fetch` — confinement is the default, not something we lock down (ShadowRealm was
 // disqualified on exactly this; see the ShadowRealm probes). The single seam to the
 // outside is one injected host function, `__host_call`, which funnels every capability
-// access through a copy-model byte boundary, the same shape as the KernelHost handler
-// bridges.
+// access through a copy-model byte boundary, the same shape as the ModuleTable's own
+// module bridges.
 //
 // Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
 // `host.call(name, bytes)` resolves a **sync name** (the primitive catalog, clock,
@@ -62,7 +62,7 @@ import { serializeCalls } from "./realm-queue.js";
 
 /** The one capability seam. `name` addresses a host capability by its opaque name
  *  (net / fs / crypto / clock / rand, mapped by the host); `payload`/return are opaque
- *  bytes, exactly like `kernel.call(name, payload) -> bytes`. A sync name returns bytes
+ *  bytes, exactly like the table's `callModule(name, payload) -> bytes`. A sync name returns bytes
  *  directly; a round-tripping one — `net/send` and every `fs/*` — returns a Promise the
  *  guest awaits. */
 export type SafeRealmBridge = (name: string, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;

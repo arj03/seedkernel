@@ -1,16 +1,16 @@
 // cap-bridge — the capability counterpart to `safe-js` (exported as
 // `seedkernel-wasm/cap-bridge`). Given a safe-js realm, it services the guest's
-// single `host.call(name, bytes)` seam from the kernel's *primitive* capabilities
+// single `host.call(name, bytes)` seam from the host's *primitive* capabilities
 // and nothing else: crypto primitives (sumo), raw net (bytes over an opaque link id)
 // and the structured net the transport slot builds on it, fs (raw bytes under an
-// opaque key), an installed-handler call, timers, clock, and identity. Every name is
+// opaque key), an installed-module call, timers, clock, and identity. Every name is
 // application-neutral — the bridge has no idea it is
 // hosting storage (or chat, or anything). All structure — content addressing,
 // descriptor envelopes, the HAVE/OFFER/STORE wire format, Reed–Solomon, the
 // nonce convention — is the guest's business, built on top of these primitives.
 //
 // This is what lets the seedkernel shell run an arbitrary signed guest: it
-// constructs a cap-bridge from kernel primitives it already holds (README
+// constructs a cap-bridge from host primitives it already holds (README
 // §12.2). A host-side caller that holds the same primitives constructs the
 // identical bridge, so output orchestrated through the confined guest is
 // byte-compatible with a host-side reference path.
@@ -58,7 +58,7 @@ export interface BundleFacts {
 }
 
 /** The libsodium surface the crypto names use — structural so any sumo build
- *  (the kernel's bundled `libsodium-wrappers-sumo`) satisfies it. */
+ *  (the host's bundled `libsodium-wrappers-sumo`) satisfies it. */
 export interface CapSodium {
     crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
     crypto_stream_xchacha20_xor(message: Uint8Array, nonce: Uint8Array, key: Uint8Array): Uint8Array;
@@ -167,10 +167,10 @@ export interface TransportSink {
     linkDown(linkId: number, reason: number): void;
 }
 
-/** Everything a cap-bridge needs — all kernel primitives, zero app knowledge. */
+/** Everything a cap-bridge needs — all host primitives, zero app knowledge. */
 export interface CapBridgeDeps {
     sodium: CapSodium;
-    /** This node's kernel keypair (README §12.1): IDENTITY returns its pk. Which key
+    /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key
      *  SIGN uses is `signScope.key`, chosen by the slot — not this. */
     identity: {
         publicKey: Uint8Array;
@@ -183,10 +183,10 @@ export interface CapBridgeDeps {
      *  exposes SIGN may omit it. */
     signScope?: SignScope;
     /** Reach one of THIS app's WASM modules by its logical name — the shell binds the app
-     *  key when it builds the bridge (`KernelHost.callModule`), so what arrives here is
+     *  key when it builds the bridge (`ModuleTable.callModule`), so what arrives here is
      *  already scoped and a guest naming a module it does not have resolves to nothing.
      *
-     *  There is no logical→kernel map to pass and no opt-out sentinel guarding it. The
+     *  There is no logical→table map to pass and no opt-out sentinel guarding it. The
      *  guest's namespace and the app's module map are the same map, so "a guest reaches
      *  only its own modules" is the shape rather than a lookup that could be omitted. */
     callModule: (name: string, payload: Uint8Array) => Uint8Array | null;
@@ -520,7 +520,7 @@ export function bundlePreamble(f: BundleFacts): string {
 // constant and mean it.
 //
 // Module scoping used to need the same treatment, and no longer does: `callModule` is
-// bound to one app's module map (KernelHost), so there is no wider namespace an omitted
+// bound to one app's module map (ModuleTable), so there is no wider namespace an omitted
 // argument could open onto and nothing to opt out of.
 /** Run without cap gating: every prefix in `CAP_DOMAINS` resolves. For a host-side
  *  caller that already holds the primitives; never for a bundle's guest, whose reach is
