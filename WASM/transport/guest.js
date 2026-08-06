@@ -199,7 +199,6 @@ function reasonCode(link) {
 
 // ── channel handshake constants (ex net-link.ts §12.6) ───────────────────────
 
-const MSG_HELLO = 1, MSG_AUTH = 2, MSG_FRAME = 3;
 const SUITE_CHANNEL_CONCEALED = 0x02;
 const SUITE_LEN = 1, PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
@@ -804,13 +803,13 @@ class Link {
     // Refuse a frame that would seal to an over-cap wire record — the receiver
     // would reject it on its length prefix and tear the whole link down. The
     // cap itself is the host's (learned at INIT).
-    if (frame.length > maxFrameBytes - 1 - TAG_LEN) return;
+    if (frame.length > maxFrameBytes - TAG_LEN) return;
     // An empty record is the authenticated end-of-stream marker — never an
     // application frame.
     if (frame.length === 0) return;
     if (this.authed) {
       if (this.sendEpoch >= REJECT_AFTER_EPOCHS) { this.close(); return; }
-      this.wire(this.tag(MSG_FRAME, this.seal(frame)));
+      this.wire(this.seal(frame));
       return;
     }
     this.queue.push(frame);
@@ -827,7 +826,7 @@ class Link {
     let saidGoodbye = false;
     if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS) {
       try {
-        this.wire(this.tag(MSG_FRAME, this.seal(new Uint8Array(0))));
+        this.wire(this.seal(new Uint8Array(0)));
         // A codec with its own end-of-stream signal says it too, on the same byte
         // stream and after our record, so the peer reads one clean shutdown.
         if (this.framer && this.framer.goodbye) this.framer.goodbye();
@@ -863,13 +862,6 @@ class Link {
 
   // ── handshake ───────────────────────────────────────────────────────────────
 
-  tag(type, payload) {
-    const out = new Uint8Array(1 + payload.length);
-    out[0] = type;
-    out.set(payload, 1);
-    return out;
-  }
-
   /** Put one link message on the wire, framing it first where the platform gave us
    *  no boundaries of its own. */
   wire(msg) {
@@ -885,19 +877,18 @@ class Link {
     if (!this.framer.push(bytes, (m) => this.onMessage(m))) this.abort(true);
   }
 
+  /** Route one whole link message. A message is a bare body, and which one it is
+   *  follows from our role and how far the exchange has got: we dialed, so msg2 then
+   *  msg4; we accepted, so msg1 then msg3; authenticated, so a record. Our progress
+   *  is ours, so the sender chooses nothing here — every message has exactly one
+   *  destination, the handler checks its exact width, and a post-auth body goes to
+   *  the AEAD, which fails closed. Delivery is in order, as the record layer's
+   *  implicit counter requires of every seam beneath us. */
   onMessage(m) {
-    if (this.closed || m.length < 1) return;
-    const type = m[0];
-    const body = m.subarray(1);
-    if (type === MSG_HELLO) this.onMsg1(body);
-    else if (type === MSG_AUTH) {
-      // Which sealed message this is follows from our role and progress:
-      // the initiator reads msg2 then msg4, the responder msg3.
-      if (!this.weDialed) this.onMsg3(body);
-      else if (!this.peerEph) this.onMsg2(body);
-      else this.onMsg4(body);
-    } else if (type === MSG_FRAME) this.onRecord(body);
-    else this.stall();
+    if (this.closed) return;
+    if (this.authed) this.onRecord(m);
+    else if (this.weDialed) this.peerEph ? this.onMsg4(m) : this.onMsg2(m);
+    else this.peerEph ? this.onMsg3(m) : this.onMsg1(m);
   }
 
   // Refuse WITHOUT saying so — every suite-0x02 refusal funnels here so refusals
@@ -913,7 +904,7 @@ class Link {
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
-    for (const f of this.queue) this.wire(this.tag(MSG_FRAME, this.seal(f)));
+    for (const f of this.queue) this.wire(this.seal(f));
     this.queue.length = 0;
     this.queuedBytes = 0;
   }
@@ -971,7 +962,7 @@ class Link {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
     const w1 = concatBytes([SUITE_BYTE, eph, this.sealZero(this.probeKey(SUITE_BYTE, eph), this.myNonce)]);
     this.th = this.h(this.root, w1);
-    this.wire(this.tag(MSG_HELLO, w1));
+    this.wire(w1);
   }
 
   onMsg1(w1) {
@@ -995,7 +986,7 @@ class Link {
       this.sealZero(this.kdf([this.ee], h1, LABEL_M2), this.myNonce),
     ]);
     this.th = this.h(h1, w2);
-    this.wire(this.tag(MSG_AUTH, w2));
+    this.wire(w2);
   }
 
   onMsg2(w2) {
@@ -1012,7 +1003,7 @@ class Link {
     if (!si) return;
     const w3 = this.sealZero(this.kdf([this.ee], h2, LABEL_M3), concatBytes([si.id, si.sig]));
     this.th = this.h(h2, w3);
-    this.wire(this.tag(MSG_AUTH, w3));
+    this.wire(w3);
   }
 
   onMsg3(w3) {
@@ -1036,7 +1027,7 @@ class Link {
     const w4 = this.sealZero(this.kdf([this.ee], h3, LABEL_M4), concatBytes([si.id, si.sig]));
     this.th = this.h(h3, w4);
     try { this.deriveConcealedSession(); } catch { this.stall(); return; }
-    this.wire(this.tag(MSG_AUTH, w4));
+    this.wire(w4);
     this.becomeAuthed();
   }
 
@@ -1090,8 +1081,11 @@ class Link {
     return ct;
   }
 
+  // Reached only on an authenticated link, where a body that will not open is corruption
+  // or injection either way and the link goes down. This is the one receive path that
+  // speaks: concealment is owed to strangers, and this peer proved who it is.
   onRecord(body) {
-    if (!this.authed || !this.recvKey || body.length < TAG_LEN) { this.abort(this.authed); return; }
+    if (!this.recvKey || body.length < TAG_LEN) { this.abort(true); return; }
     if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
     const r = aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
     if (!r.ok) { this.abort(true); return; }

@@ -126,13 +126,12 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
   const dials = [];
   for (let i = 0; i < N; i++) {
     const d = silentDial(fabric, s.driver.port, `10.1.${(i >> 8) & 255}.${i & 255}`);
-    // A well-formed-looking msg1 — right message tag, right suite byte, right length,
-    // wrong everything else. The suite byte matters: get it wrong and the guest refuses
-    // on the byte alone, and this measures a cheaper path than a real attacker gets.
-    const junk = new Uint8Array(1 + 81);
-    junk[0] = 1;    // MSG_HELLO
-    junk[1] = 0x02; // SUITE_CHANNEL_CONCEALED
-    for (let j = 2; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
+    // A well-formed-looking msg1 — right suite byte, right length, wrong everything
+    // else. The suite byte matters: get it wrong and the guest refuses on the byte
+    // alone, and this measures a cheaper path than a real attacker gets.
+    const junk = new Uint8Array(81);
+    junk[0] = 0x02; // SUITE_CHANNEL_CONCEALED
+    for (let j = 1; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
     d.ch.send(junk);
     dials.push(d);
   }

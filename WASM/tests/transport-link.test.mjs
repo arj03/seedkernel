@@ -234,17 +234,18 @@ await test("a stalled link still settles on the deadline", async (keep) => {
 await test("handshake messages are exact-length: a trailing byte is refused", async (keep) => {
   // Trailing bytes would ride outside the transcript hash, and so outside what both
   // signatures cover. Exact, not minimum, for every message in the flight.
-  for (const tag of [1, 2]) {
+  // A's two handshake messages, by the width each is accepted at: msg1 and msg3.
+  for (const len of [81, 112]) {
     const chans = wirePair({
-      tamper: (b, from) => (from === "A" && b[0] === tag ? Buffer.concat([Buffer.from(b), Buffer.from([0])]) : b),
+      tamper: (b, from) => (from === "A" && b.length === len ? Buffer.concat([Buffer.from(b), Buffer.from([0])]) : b),
     });
     const st = keep(await linked(chans));
     await settle();
     // The responder is the end that reads a tampered message from A, so it is the end
-    // that must refuse. (For tag 2 the initiator has legitimately authenticated by then:
+    // that must refuse. (For msg3 the initiator has legitimately authenticated by then:
     // it verified msg2 at 1 RTT, a round trip before the responder authenticates it.)
-    assert(!st.b.authed, `responder must refuse an over-long message with tag ${tag}`);
-    if (tag === 1) assert(!st.a.authed, "a rejected msg1 must leave the initiator unauthenticated");
+    assert(!st.b.authed, `responder must refuse an over-long ${len}-byte message`);
+    if (len === 81) assert(!st.a.authed, "a rejected msg1 must leave the initiator unauthenticated");
     st.close();
   }
 });
@@ -283,7 +284,7 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
   const st = keep(await linked(chans));
   await until(() => chans[0].sent.length > 0, 4000, "msg1");
   const msg1 = Buffer.from(chans[0].sent[0], "hex");
-  assert(msg1.length === 1 + 81, `msg1 should be tag+81 bytes, got ${msg1.length}`);
+  assert(msg1.length === 81, `msg1 should be 81 bytes, got ${msg1.length}`);
   assert(!msg1.includes(Buffer.from(st.A.driver.peerId, "hex")), "msg1 must not carry the initiator identity");
 });
 
@@ -507,16 +508,19 @@ await test("goodbye: an injected junk record must NOT produce a farewell", async
   // emitted an end-of-stream record, B would hand A a genuine, correctly-keyed
   // farewell, and A would read an attacker-chosen moment as a clean shutdown. The
   // attacker never forges anything; they induce the victim to say goodbye.
-  let corrupted = false;
+  let corrupted = false, armed = false;
   const st = keep(await upPair({
     tamper: (bytes, from) => {
-      if (from !== "A" || corrupted || bytes[0] !== 3) return bytes; // FRAME only
+      // Records only: upPair returns with both ends authenticated, and after that
+      // every message A sends is one.
+      if (from !== "A" || !armed || corrupted) return bytes;
       corrupted = true;
       const out = Uint8Array.from(bytes);
       out[out.length - 1] ^= 0xff; // break the Poly1305 tag
       return out;
     },
   }));
+  armed = true;
   st.aLink.send(new TextEncoder().encode("payload"));
   await until(() => st.a.closed && st.b.closed, 3000, "both ends to tear down");
   assert(corrupted, "the test did not actually corrupt a record");
@@ -583,16 +587,18 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
 await test("a decrypt failure does not advance the receive counter", async (keep) => {
   // Flip a byte in the first post-auth record. The link must die rather than
   // desync — the flynn/noise bug this layer already avoided, pinned so it stays that way.
-  let flipped = false;
+  let flipped = false, armed = false;
   const st = keep(await upPair({
     tamper: (b, from) => {
-      if (from === "A" && b[0] === 3 && !flipped) {
+      // Post-auth, so every message from A is a record (upPair waits for both ends).
+      if (from === "A" && armed && !flipped) {
         flipped = true;
         const c = Buffer.from(b); c[c.length - 1] ^= 1; return c;
       }
       return b;
     },
   }));
+  armed = true;
   const seen = [];
   st.B.driver.onRequest((_f, _p, p) => { seen.push(p); return p; });
   st.aLink.send(new TextEncoder().encode("tampered"));

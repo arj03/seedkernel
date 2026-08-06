@@ -352,20 +352,24 @@ The *guest's* §12.2 cap domains are **not** gated by this file — they come fr
 
 A real socket carries no trustworthy "from" field, so before a connection delivers frames the bundle runs a mutual challenge/response proving each end holds the private key for the pubkey it claims — the same binding applied to each WebRTC data channel (§11, §12.7). The channel is transport-agnostic over anything that delivers whole messages, and where the platform delivers none the bundle imposes them itself (§12.1): a length prefix over raw TCP node↔node, RFC 6455 over the same socket browser↔node, or a WebRTC `RTCDataChannel` peer↔peer as it comes (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Each framer checks its cap against the declared length **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). Every codec caps identically.
 
-Four handshake messages, each tagged with a leading type byte, then records:
+Four handshake messages, then records. **A message is a bare body — there is no type
+byte.**
 
 ```
-                tag        body (the tag byte is not part of the length)
-msg1  i→r   HELLO 0x01   [suite: 1][eph_i: 32][seal(k1; nonce_i): 48]      81 B  contact proof, no identity
-msg2  r→i   AUTH  0x02   [eph_r: 32][seal(k2; nonce_r): 48]                80 B  contact proof, no identity
-msg3  i→r   AUTH  0x02   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]            112 B  the caller names itself
-msg4  r→i   AUTH  0x02   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]            112 B  the receiver answers, or not
-FRAME       FRAME 0x03   [AEAD record ..]                                        only after authentication
+msg1  i→r   [suite: 1][eph_i: 32][seal(k1; nonce_i): 48]      81 B  contact proof, no identity
+msg2  r→i   [eph_r: 32][seal(k2; nonce_r): 48]                80 B  contact proof, no identity
+msg3  i→r   [seal(k3; id_i: 32 ‖ sig_i: 64): 112]            112 B  the caller names itself
+msg4  r→i   [seal(k4; id_r: 32 ‖ sig_r: 64): 112]            112 B  the receiver answers, or not
+FRAME       [AEAD record ..]                                        only after authentication
 
-Three of the four share the AUTH tag: which message a body is follows from the reader's
-role and how far the exchange has got, not from a tag, so there is nothing for an attacker
-to reorder by relabelling. Note `suite` is a *body* field of msg1 and distinct from the
-tag byte, which happens also to be 0x01.
+Which message a body is follows from the reader's role and how far the exchange has got:
+the initiator reads msg2 then msg4, the responder msg1 then msg3, and every message after
+authentication is a record. That state is the reader's own — it must hold it to answer at
+all — so the sender has no say in which path a message takes, and each handshake message
+is accepted only at its exact width. A post-authentication message has exactly one
+destination, the AEAD open, which fails closed and tears the link down. The `suite` field
+of msg1 is the one self-describing byte on the wire, and it is a body field, covered by
+both signatures.
 ```
 
 `eph` is a fresh **ephemeral X25519 public key**, generated per connection. `seal` is
@@ -432,7 +436,8 @@ encrypts with `k_i2r` and decrypts with `k_r2i`, the responder mirrors. Every
 post-handshake FRAME is a **ChaCha20-Poly1305-IETF record** under the sending key, with an
 implicit monotonic per-direction `(epoch, counter)` nonce and strict enforcement on
 receive. There is exactly one post-handshake frame type — the AEAD record — so no plane
-split, no downgrade seam.
+split and no downgrade seam. That nonce and the dispatch above both rest on the pipe
+delivering whole messages in order, which every socket seam beneath supplies.
 
 **The handshake uses no long-term Diffie–Hellman key at all**: `ee` is ephemeral on both
 sides, and the contact secret and network key are KDF inputs. So the channel Ed25519 key

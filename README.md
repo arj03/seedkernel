@@ -189,7 +189,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | | Where | LOC |
 | --- | --- | --- |
-| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,220 + 5 KB |
+| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,207 + 5 KB |
 
 Each target therefore runs 2,026 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
