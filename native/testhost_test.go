@@ -191,3 +191,27 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 func realmCall(entry string, payload []byte) ([]byte, error) {
 	return callRealm("__realmCall", 30*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
 }
+
+// TestCallRealmReleasesStagedArgs covers the argument staging: callRealm lands each
+// argument on a __aN global for the duration of the call and must release it when the
+// call returns — otherwise a one-shot op (a --put of a large file, an uninstall after
+// which nothing else runs) leaves its payload rooted on the global object for the
+// process's life.
+func TestCallRealmReleasesStagedArgs(t *testing.T) {
+	bootRealm(t)
+	if _, err := qc.Eval("probe.js", qjs.Code(`
+		globalThis.__probe = function () { return new Uint8Array(0); };
+	`)); err != nil {
+		t.Fatal("probe:", err)
+	}
+	if _, err := callRealm("__probe", 5*time.Second, qc.NewString("a"), qc.NewString("b")); err != nil {
+		t.Fatal("callRealm:", err)
+	}
+	for _, slot := range []string{"__a0", "__a1"} {
+		v := qc.Global().GetPropertyStr(slot)
+		if !v.IsUndefined() {
+			t.Fatalf("%s must be released after the call, got %q", slot, v.String())
+		}
+		v.Free()
+	}
+}

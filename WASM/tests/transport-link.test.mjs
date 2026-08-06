@@ -329,6 +329,59 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
   assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
 });
 
+await test("REASSEMBLY: a frame dribbled one byte at a time is still one message", async (keep) => {
+  // The framer used to join every inbound slice onto one buffer, so a peer that
+  // dribbles a full-size frame one byte at a time forced a quadratic number of
+  // copies — a CPU-exhaustion budget no frame-size cap controls (the cap bounds
+  // the buffer, not the copying). The parser now keeps the slices it was handed
+  // and copies once per complete frame. This pins the behaviour the refactor has
+  // to preserve: arbitrary slice boundaries in, exactly one message out.
+  let armed = false;
+  const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
+  const st = keep(await linked(chans));
+  await until(() => st.a.authed && st.b.authed, 4000, "handshake");
+  const proto = new TextEncoder().encode("_t");
+  st.B.driver.onRequest((_f, _p, p) => p);
+  // Above the pre-auth cap, so the dribble must be measured against the RAISED
+  // cap (the FRAME CAP tests pin the raise itself).
+  const payload = new Uint8Array(48 * 1024).fill(0x5a);
+  armed = true; // from here on, drop A's real delivery — it is re-fed manually below
+  const before = chans[0].sent.length;
+  const respP = st.A.driver.request(st.B.driver.peerId, proto, payload, 8000);
+  await until(() => chans[0].sent.length > before, 3000, "A's wire message");
+  const wire = Uint8Array.from(Buffer.from(chans[0].sent[chans[0].sent.length - 1], "hex"));
+  // Re-feed the exact bytes one at a time, yielding between pushes so each slice
+  // is a separate visit to the framer.
+  for (const byte of wire) {
+    chans[1].msg(new Uint8Array([byte]));
+    await Promise.resolve();
+  }
+  const resp = await respP;
+  assert(resp.length === payload.length && resp[0] === 0x5a && resp[resp.length - 1] === 0x5a,
+    `a byte-dribbled frame must deliver intact (got ${resp.length} bytes)`);
+});
+
+await test("READY: a second ready() joins the first instead of stranding it", async (keep) => {
+  // ready() used to overwrite the waiter on a second call: the first caller's
+  // promise was resolved by the second caller's timer — or never, if the second
+  // call resolved first. Both callers must settle together, whatever the order.
+  const { TransportHost } = await import("../build/host/transport-host.js");
+  const { generateKeyPair: mkKey } = await import("./transport-harness.mjs");
+  const identity = mkKey();
+  const host = new TransportHost({ identity });
+  // A stub realm that answers the ready entrypoint immediately, so the test does
+  // not wait out the host's timeout backstop.
+  host.attach({
+    call: async (entry) => { if (entry === "ready") host.sink().ready(true); return new Uint8Array(); },
+    dispose() {},
+  });
+  const [r1, r2] = await Promise.all([
+    host.ready(50).then(() => "ok", () => "failed"),
+    host.ready(50).then(() => "ok", () => "failed"),
+  ]);
+  assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle together (got ${r1}/${r2})`);
+});
+
 await test("SUBKEYS: one master seed, purpose-bound keys, deterministic", async () => {
   const { deriveNodeKeys } = await import("../build/core/subkeys.js");
   const master = new Uint8Array(32).fill(5);

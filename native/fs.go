@@ -29,8 +29,11 @@ import (
 // refused whatever admitted it. Defence in depth, not the rule being relied on.
 // The empty key is refused first and explicitly: filepath.Join(dir, "") is the DATA
 // DIRECTORY itself, so an unchecked "" would make delete("") an os.Remove of the store.
+// '\n' is in the set for a serialization reason that is this layer's alone: list()
+// joins keys with '\n' and the shim splits on it, so a '\n' in a key would corrupt
+// this backend's own list() output even though the shared charset also forbids it.
 func fsKeySafe(k string) bool {
-	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, `/\`) && !strings.ContainsRune(k, 0)
+	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, "/\\\n") && !strings.ContainsRune(k, 0)
 }
 
 // fsTmpPrefix marks the scratch files put() writes before renaming onto a key. It

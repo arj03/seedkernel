@@ -27,7 +27,7 @@
 // (§12.4) — there is no separate per-module install envelope. A live update is not a
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
-import { concatBytes, toHex, enc, dec } from "../core/util.js";
+import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
@@ -230,6 +230,13 @@ export interface FreshnessStore {
      *  allowlist by a later edit stays refused. Undoing it is an out-of-band operator
      *  action on the store file, symmetric with rolling a freshness mark back. */
     revoke(author: Uint8Array): void;
+    /** Roll a (author, app) mark back to a captured previous value — the ONE legal
+     *  rewind, for the load that raised the mark and then failed to persist it: the
+     *  load reported failure, so the in-memory state must match the store the next
+     *  retry will persist against. `previous` is what `get` returned before the load
+     *  (−Infinity when the pair had no mark). Optional: a store with no in-memory
+     *  state may omit it, and the load still fails loudly either way. */
+    resetMark?(author: Uint8Array, app: string, previous: number): void;
 }
 
 /** The one host power a bundle load needs, as one call: land a bundle's modules on the
@@ -258,6 +265,12 @@ export interface BundleHost {
      *  bounds, invalid scratchSize) **with the table untouched**: nothing is bound unless
      *  everything validated, and whatever was built before the failure is released. */
     bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void;
+    /** Unbind an app's whole module set, returning how many modules went. Optional, and
+     *  wanted for ONE reason: the load that bound its modules and then could not persist
+     *  its freshness mark must not leave those modules reachable while it reports failure
+     *  (see `installBundle`). A host that omits it still fails that load loudly — it just
+     *  leaves the newly bound modules on the table until the retry replaces them. */
+    removeApp?(appKey: string): number;
 }
 
 export interface VerifiedBundle {
@@ -496,19 +509,30 @@ function isValidManifest(m: unknown): m is BundleManifest {
     const o = m as Record<string, unknown>;
     // `app` is load-bearing beyond reporting: it scopes the guest's signing namespace
     // (guestSignScope), keys the freshness high-water mark, and is half of the app key
-    // every one of its modules binds under (appKeyFor).
+    // every one of its modules binds under (appKeyFor). It is also the DEFAULT protocol
+    // id (handlesOf) — and protocol ids cross the seam in one byte (`net/send`,
+    // `transport/deliver`), while guestSignScope refuses an app over 255 bytes. A name
+    // above that limit would be a bundle this host can verify and install but can never
+    // actually serve — its first guest call would throw and no frame could address it —
+    // so the limit is enforced HERE, at load, where the refusal names the rule. Bytes,
+    // not characters: the scope and the wire both count UTF-8 bytes.
     if (typeof o.app !== "string" || o.app.length === 0)
+        return false;
+    if (enc.encode(o.app).length > 255)
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
         return false;
     // `handles` is optional (absent ⇒ [app], see handlesOf). Present, it must be a list of
     // non-empty strings — it is only ever compared against a protocol id off the wire, so
     // the shape is the whole check: an id confers nothing until a user binds it (§12.10).
+    // Each id is held to the same 255-byte limit as the app default it replaces — a
+    // protocol id crosses the seam in one length byte, so a longer declared id could
+    // never be the id of anything on the wire.
     if (o.handles !== undefined) {
         if (!Array.isArray(o.handles))
             return false;
         for (const h of o.handles)
-            if (typeof h !== "string" || h.length === 0)
+            if (typeof h !== "string" || h.length === 0 || enc.encode(h).length > 255)
                 return false;
     }
     // `role` is optional (absent ⇒ an ordinary app) and closed: an unrecognized slot name
@@ -783,17 +807,40 @@ export class FreshnessMarks {
                         'Reading it as-is would silently drop every downgrade guard. Migrate it to {"marks":{…},"revoked":[]} ' +
                         "or delete it to start from no marks.");
                 }
+                // The legacy guard above catches only the OLD shape. The same silent
+                // discard is reachable through a NEW-shaped store whose fields have the
+                // wrong types — `{"marks":"garbage"}` or `{"marks":{"aa:app":"x"}}`
+                // parse as "no marks, nothing revoked", which is every downgrade guard
+                // AND every revocation gone on the one boot after the file was edited.
+                // Guard data that exists but cannot be read is a corrupt store, not an
+                // empty one: it throws rather than booting with the guards missing.
                 const marks = raw.marks;
-                if (typeof marks === "object" && marks !== null && !Array.isArray(marks)) {
+                if (marks !== undefined) {
+                    if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
+                        throw new Error('freshness store: corrupt file — "marks" must be an object of {appKey: version} pairs');
+                    }
                     for (const [k, v] of Object.entries(marks)) {
-                        if (typeof v === "number")
-                            this.marks.set(k, v);
+                        // Versions are manifest-verified integers, so anything else in
+                        // the file is an edit error that would silently change what a
+                        // downgrade check means (a float 2.5 re-prices every version
+                        // below it).
+                        if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+                            throw new Error(`freshness store: corrupt file — mark "${k}" is not a non-negative integer version (got ${JSON.stringify(v)})`);
+                        }
+                        this.marks.set(k, v);
                     }
                 }
-                if (Array.isArray(raw.revoked)) {
-                    for (const a of raw.revoked)
-                        if (typeof a === "string")
-                            this.revoked.add(a.toLowerCase());
+                const revoked = raw.revoked;
+                if (revoked !== undefined) {
+                    if (!Array.isArray(revoked)) {
+                        throw new Error('freshness store: corrupt file — "revoked" must be an array of hex author ids');
+                    }
+                    for (const a of revoked) {
+                        if (typeof a !== "string") {
+                            throw new Error(`freshness store: corrupt file — a revoked entry is not a string (got ${JSON.stringify(a)})`);
+                        }
+                        this.revoked.add(a.toLowerCase());
+                    }
                 }
             }
         }
@@ -826,12 +873,31 @@ export class FreshnessMarks {
     isRevoked(author: Uint8Array): boolean {
         return this.revoked.has(toHex(author));
     }
+    resetMark(author: Uint8Array, app: string, previous: number): void {
+        const k = this.key(author, app);
+        if (previous === -Infinity) this.marks.delete(k);
+        else this.marks.set(k, previous);
+    }
     revoke(author: Uint8Array): void {
         const hex = toHex(author);
         if (this.revoked.has(hex))
             return;
         this.revoked.add(hex);
-        this.persist(this.serialize());
+        // Same rule as a mark that could not be persisted: in-memory state mirrors the
+        // store, so a failed write is a failed revocation and the caller is told. Keeping
+        // the key revoked in memory would look safer — it refuses the author for the rest
+        // of THIS boot — but it makes the retry a silent no-op (the early return above
+        // sees the key already revoked) while nothing ever reaches the disk, and the next
+        // boot admits the author anyway. Rolling back keeps `revoke` retryable, which is
+        // what actually gets the key written off.
+        try {
+            this.persist(this.serialize());
+        }
+        catch (e) {
+            this.revoked.delete(hex);
+            throw new Error(`freshness store: the revocation could not be persisted — ${hex} is NOT revoked: ${errMessage(e)}. ` +
+                "Fix the store and revoke again.", { cause: e });
+        }
     }
 }
 /** Authenticate and integrity-check a bundle blob (README §12.4 steps 1, 4a, 5a).
@@ -953,7 +1019,7 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
             v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
     }
     catch (e) {
-        throw new Error(`bundle: module ${(e as Error).message}`);
+        throw new Error(`bundle: module ${errMessage(e)}`, { cause: e });
     }
     // Advance the freshness mark only now — after a fully successful load (or, with
     // `deferMark`, leave it to the caller at its own completion point). Advancing it
@@ -966,7 +1032,34 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // this function was called, so the freshness advance is always behind a successful
     // verify — and, with `deferMark`, behind the driver standing as well.
     if (freshness && !deferMark) {
-        freshness.set(v.author, v.manifest.app, version);
+        // A persist that FAILS is a failed load, not a silent success: the modules have
+        // landed but the mark did not, so the downgrade gate is off for this pair on the
+        // next boot while the app looks installed. Two things follow. Roll the in-memory
+        // mark back to what it was, so a retry persists a fresh advance rather than
+        // no-op'ing against the stale in-memory value; and, where the host can, un-bind
+        // what just landed, so nothing from the failed load stays reachable.
+        //
+        // What that restores is "nothing of this load was kept", NOT "the table as it
+        // was". `bindAll` REPLACES an app's module map, so on an upgrade the previous
+        // version was already gone before this line ran — there is nothing left to roll
+        // back to, and the app ends up unbound rather than at its old version. That is
+        // the honest outcome of a store that cannot be written: the load failed, an
+        // idempotent retry re-lands the app once the store is fixed, and until then the
+        // app is absent rather than silently ungated.
+        const appKey = appKeyFor(v.author, v.manifest.app);
+        const prev = freshness.get(v.author, v.manifest.app);
+        try {
+            freshness.set(v.author, v.manifest.app, version);
+        }
+        catch (e) {
+            freshness.resetMark?.(v.author, v.manifest.app, prev);
+            host.removeApp?.(appKey);
+            throw new Error(
+                `bundle: the load succeeded but the freshness mark could not be persisted — nothing of it was kept: ${errMessage(e)}. ` +
+                "Fix the store and re-run the load.",
+                { cause: e },
+            );
+        }
     }
     return {
         manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, suite: v.suite,

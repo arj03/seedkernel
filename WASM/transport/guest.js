@@ -441,14 +441,77 @@ function fireTimer(id) {
 // the small handshake bound: a stranger who knows only host:port must not be able to
 // reserve megabytes by declaring a frame and then dribbling the body. It rises to the
 // full frame cap at exactly the moment the peer becomes a known, admitted identity.
+// ── inbound byte assembly ─────────────────────────────────────────────────────
+//
+// A link message may arrive in arbitrary slices, and the slices can be arbitrarily
+// small. The old arrangement joined every new slice onto one buffer, which made a
+// peer that dribbles a full-size frame one byte at a time cost a quadratic number of
+// copies — a CPU-exhaustion budget no frame-size cap controls. The parser instead
+// keeps the slices it was handed and copies only when a whole message is complete:
+// once per frame, bounded by the cap that already governs the frame.
+class ByteParts {
+  constructor() {
+    this.parts = [];   // inbound slices, not yet parsed
+    this.head = 0;     // index of the first live slice
+    this.length = 0;   // live bytes across all slices
+  }
+  push(chunk) {
+    if (chunk.length > 0) { this.parts.push(chunk); this.length += chunk.length; }
+  }
+  /** Copy up to `n` bytes from the front without consuming them. */
+  peek(n) {
+    const out = new Uint8Array(Math.min(n, this.length));
+    let off = 0;
+    for (let i = this.head; i < this.parts.length && off < out.length; i++) {
+      const p = this.parts[i];
+      const take = Math.min(p.length, out.length - off);
+      out.set(p.subarray(0, take), off);
+      off += take;
+    }
+    return out;
+  }
+  /** Consume exactly `n` bytes from the front, as one buffer. */
+  take(n) {
+    const out = new Uint8Array(n);
+    let off = 0;
+    while (off < n) {
+      const p = this.parts[this.head];
+      const need = n - off;
+      if (p.length <= need) { out.set(p, off); off += p.length; this.head++; }
+      else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = n; }
+    }
+    this.length -= n;
+    // Drop the consumed slices once they outnumber the live ones — a long dribble
+    // must not grow the array without bound.
+    if (this.head >= 8 && this.head * 2 >= this.parts.length) {
+      this.parts = this.parts.slice(this.head);
+      this.head = 0;
+    }
+    return out;
+  }
+  /** Byte offset of the first `\r\n\r\n`, or -1 when not present yet. */
+  findHeadEnd() {
+    let b0 = -1, b1 = -1, b2 = -1, b3 = -1, off = 0;
+    for (let i = this.head; i < this.parts.length; i++) {
+      const p = this.parts[i];
+      for (let j = 0; j < p.length; j++) {
+        b0 = b1; b1 = b2; b2 = b3; b3 = p[j];
+        if (b0 === 13 && b1 === 10 && b2 === 13 && b3 === 10) return off - 3;
+        off++;
+      }
+    }
+    return -1;
+  }
+}
+
+/** A length-prefixed link is writable from birth — there is no negotiation. */
 class LengthFramer {
   constructor(put) {
     this.put = put;
-    this.buf = new Uint8Array(0);
+    this.parts = new ByteParts();
     this.cap = maxHandshakeFrameBytes;
   }
 
-  /** A length-prefixed link is writable from birth — there is no negotiation. */
   send(msg) {
     const out = new Uint8Array(4 + msg.length);
     writeU32BE(out, 0, msg.length);
@@ -462,15 +525,13 @@ class LengthFramer {
    *  declared an over-cap frame — a protocol violation the caller answers by tearing
    *  the link down, never by growing the buffer. */
   push(chunk, deliver) {
-    this.buf = this.buf.length === 0 ? chunk : concatBytes([this.buf, chunk]);
+    this.parts.push(chunk);
     for (;;) {
-      if (this.buf.length < 4) return true;
-      const len = readU32BE(this.buf, 0);
+      if (this.parts.length < 4) return true;
+      const len = readU32BE(this.parts.peek(4), 0);
       if (len > this.cap) return false;
-      if (this.buf.length < 4 + len) return true;
-      const msg = this.buf.slice(4, 4 + len);
-      this.buf = this.buf.subarray(4 + len);
-      deliver(msg);
+      if (this.parts.length < 4 + len) return true;
+      deliver(this.parts.take(4 + len).subarray(4));
     }
   }
 }
@@ -519,7 +580,7 @@ class WsFramer {
     this.put = put;
     this.client = weDialed;
     this.cap = maxHandshakeFrameBytes;
-    this.buf = new Uint8Array(0);      // inbound: handshake head, then frames
+    this.parts = new ByteParts();      // inbound: handshake head, then frames
     this.queue = [];                   // outbound, until the upgrade completes
     this.open = false;
     this.fragOpcode = -1;
@@ -565,12 +626,12 @@ class WsFramer {
   }
 
   push(chunk, deliver) {
-    this.buf = this.buf.length === 0 ? chunk : concatBytes([this.buf, chunk]);
+    this.parts.push(chunk);
     if (!this.open) {
       let consumed;
       try { consumed = this.upgrade(); } catch { return false; }
-      if (consumed < 0) return this.buf.length <= MAX_WS_HANDSHAKE;
-      this.buf = this.buf.subarray(consumed);
+      if (consumed < 0) return this.parts.length <= MAX_WS_HANDSHAKE;
+      this.parts.take(consumed);
       this.open = true;
       for (const m of this.queue) this.put(this.frame(WS_OP_BINARY, m));
       this.queue = [];
@@ -581,9 +642,9 @@ class WsFramer {
   /** Read (client) or answer (server) the opening handshake. Returns the bytes
    *  consumed, or -1 when the head is not complete yet. Throws on a refusal. */
   upgrade() {
-    const sep = indexOfCRLFCRLF(this.buf);
+    const sep = this.parts.findHeadEnd();
     if (sep < 0) return -1;
-    const head = utf8Decode(this.buf.subarray(0, sep));
+    const head = utf8Decode(this.parts.peek(sep));
     if (this.client) {
       // Sec-WebSocket-Accept is base64 and case-significant, so compare the exact
       // header value byte for byte rather than lowercasing both sides.
@@ -610,9 +671,8 @@ class WsFramer {
       const total = this.frameLength();
       if (total < 0) return true;
       if (total > this.cap) return false;
-      if (this.buf.length < total) return true;
-      const whole = this.buf.slice(0, total);
-      this.buf = this.buf.subarray(total);
+      if (this.parts.length < total) return true;
+      const whole = this.parts.take(total);
       const req = new Uint8Array(2 + whole.length);
       req[0] = WS_OP_DECODE_ONE;
       req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
@@ -661,30 +721,23 @@ class WsFramer {
    *  too few bytes are buffered to know yet. All real validation is the module's; this
    *  only sizes the wait. */
   frameLength() {
-    const b = this.buf;
-    if (b.length < 2) return -1;
+    if (this.parts.length < 2) return -1;
+    const b = this.parts.peek(10);
     const masked = (b[1] & 0x80) !== 0;
     const len7 = b[1] & 0x7f;
     let headerLen = 2, payloadLen = len7;
     if (len7 === 126) {
-      if (b.length < 4) return -1;
+      if (this.parts.length < 4) return -1;
       headerLen = 4;
       payloadLen = (b[2] << 8) | b[3];
     } else if (len7 === 127) {
-      if (b.length < 10) return -1;
+      if (this.parts.length < 10) return -1;
       if (readU32BE(b, 2) !== 0) return 0x7fffffff; // > 4 GiB: over any cap
       headerLen = 10;
       payloadLen = readU32BE(b, 6);
     }
     return headerLen + (masked ? 4 : 0) + payloadLen;
   }
-}
-
-function indexOfCRLFCRLF(b) {
-  for (let i = 0; i + 3 < b.length; i++) {
-    if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
-  }
-  return -1;
 }
 
 /** Case-insensitively pull a header value out of an HTTP head. */

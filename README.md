@@ -157,12 +157,12 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
 
-**Shared — compiled once, run by all three targets (2,026 LOC)**
+**Shared — compiled once, run by all three targets (2,070 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 522 |
-| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 442 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 563 |
+| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 404 |
 | Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 398 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 260 |
@@ -182,16 +182,16 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,439 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,373 Go + 335 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,442 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,381 Go + 335 TS |
 
 **Signed content — not host code at all**
 
 | | Where | LOC |
 | --- | --- | --- |
-| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,207 + 5 KB |
+| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,247 + 5 KB |
 
-Each target therefore runs 2,026 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,070 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 

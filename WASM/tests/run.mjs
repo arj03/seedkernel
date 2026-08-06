@@ -2015,6 +2015,155 @@ async function testPreRevocationStoreIsRefused() {
   console.log("  OK\n");
 }
 
+// ─── Test: a WRONG-TYPED store is refused, not silently emptied ──────────────
+//
+// Finding guard: the legacy guard above catches only the OLD bare-map shape. The
+// same silent discard — every downgrade guard AND every revocation gone on the one
+// boot after an edit — was reachable through a NEW-shaped file whose fields have
+// the wrong types: `{"marks":"garbage"}` or `{"marks":{"aa:app":"x"}}` parsed as
+// "no marks, nothing revoked". Guard data that exists but cannot be read is a
+// corrupt store, and it throws (§12.5).
+async function testWrongTypedStoreIsRefused() {
+  console.log("Test: a wrong-typed freshness store fails the boot loudly, never silently empty");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+
+  for (const [what, json] of [
+    ['a string "marks"', JSON.stringify({ marks: "garbage", revoked: [] })],
+    ['a null "marks"', JSON.stringify({ marks: null, revoked: [] })],
+    ['a marks array', JSON.stringify({ marks: [], revoked: [] })],
+    ['a string mark value', JSON.stringify({ marks: { "aa:app": "2" }, revoked: [] })],
+    ['a fractional mark', JSON.stringify({ marks: { "aa:app": 2.5 }, revoked: [] })],
+    ['a negative mark', JSON.stringify({ marks: { "aa:app": -1 }, revoked: [] })],
+    ['a non-array "revoked"', JSON.stringify({ marks: {}, revoked: "nul" })],
+    ['a non-string revoked entry', JSON.stringify({ marks: {}, revoked: [1] })],
+  ]) {
+    let threw = false;
+    try { new FreshnessMarks(json); } catch { threw = true; }
+    assert(threw, `${what} must throw as a corrupt store`);
+  }
+
+  // The well-formed shapes still load — including a file carrying an unrecognized
+  // key (legacy slot floors), which is ignored rather than refused.
+  const good = new FreshnessMarks(JSON.stringify({
+    marks: { ["aa".repeat(32) + ":app"]: 2 }, revoked: ["bb".repeat(32)], roles: { transport: 4 },
+  }));
+  assert(good.get(new Uint8Array(32).fill(0xaa), "app") === 2, "a well-formed store still loads its marks");
+  assert(good.isRevoked(new Uint8Array(32).fill(0xbb)), "…and its revocations");
+  console.log("  OK\n");
+}
+
+// ─── Test: an app the runtime cannot serve is refused at load ────────────────
+//
+// Finding guard: `app` is the default protocol id and the guest's signing scope,
+// both of which cap at 255 UTF-8 bytes (the wire's one-byte protocol length, and
+// guestSignScope). A longer name passed verification, installed, and then failed
+// at first use — a bundle the host can verify and install but can never serve
+// (§12.2, §12.4).
+async function testAppNameLengthRefused() {
+  console.log("Test: an over-long app name (or declared handle) is refused at load, not at first use");
+  const { verifyManifest, signManifest } = await imp("build/host/bundle.js");
+  const author = generateKeyPair();
+  const mk = (app, extra = {}) => signManifest(sodium, author.privateKey, author.publicKey,
+    { app, version: 1, modules: [], guest: GUEST(), ...extra });
+
+  // At the limit, everything works — 255 bytes is exactly what the seam can carry.
+  assert(verifyManifest(sodium, mk("a".repeat(255), { handles: ["b".repeat(255)] })) !== null,
+    "a 255-byte app name and a 255-byte declared handle verify");
+
+  for (const [what, env] of [
+    ["a 256-byte app name", mk("a".repeat(256))],
+    ["a 256-byte declared handle", mk("app", { handles: ["b".repeat(256)] })],
+    // The limit counts UTF-8 BYTES, the unit both the scope and the wire use.
+    ["a 200-char (600-byte) UTF-8 app name", mk("\u{1f600}".repeat(200))],
+  ]) {
+    let threw = false;
+    try { verifyManifest(sodium, env); } catch { threw = true; }
+    assert(threw, `${what} is refused as malformed`);
+  }
+  console.log("  OK\n");
+}
+
+// ─── Test: a freshness persist failure fails the load and keeps nothing ──────
+//
+// Finding guard: the freshness mark was advanced AFTER the modules bound, so a
+// durable write that failed left the modules on the table while the load reported
+// failure — and the stale in-memory mark made a retry no-op against a store that
+// still lacked it. A failed persist must be a failed load with nothing kept, and
+// the mark rolled back so a retry persists a fresh advance (§12.4).
+async function testPersistFailureRollsBack() {
+  console.log("Test: a failed freshness persist fails the load — nothing is kept, the mark is rolled back");
+  const { FreshnessMarks, installBundle, verifyBundle, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+    = await imp("build/host/bundle.js");
+  const { ModuleTable } = await imp("build/host/module-table.js");
+
+  const author = generateKeyPair();
+  const manifest = { app: "persist", version: 1,
+    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+    guest: GUEST() };
+  const blob = packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest),
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  const v = verifyBundle(sodium, blob);
+  const key = appKey(author.publicKey, "persist");
+
+  // A store whose durable write always fails, as a full disk would.
+  class BrokenStore extends FreshnessMarks {
+    persist() { throw new Error("disk full"); }
+  }
+  const host = new ModuleTable();
+  const broken = new BrokenStore();
+  let msg = "";
+  try { installBundle(host, v, broken); } catch (e) { msg = e.message; }
+  assert(msg.includes("could not be persisted"), "a failed persist fails the load");
+  assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
+  assert(!host.isBound(key, "fwd"), "nothing was kept — the modules did not stay bound");
+  assertEqual(broken.get(author.publicKey, "persist"), -Infinity, "the in-memory mark was rolled back");
+
+  // A retry against a healthy store completes cleanly: the rollback is what makes
+  // it persist a FRESH advance rather than no-op'ing against the stale mark.
+  const healthy = new FreshnessMarks();
+  installBundle(host, v, healthy);
+  assert(host.isBound(key, "fwd"), "the retry lands");
+  assertEqual(healthy.get(author.publicKey, "persist"), 1, "…and persists its mark");
+  console.log("  OK\n");
+}
+
+// ─── Test: a failed revocation persist is a failed revocation ───────────────
+//
+// The same rule as the mark, one method over: `revoke` adds the key to the live
+// set and then writes. A write that throws must not leave the key revoked only in
+// memory — that reads as safe (the author is refused for the rest of this boot)
+// while making the retry a silent no-op against a store that never got it, and
+// the next boot admits the author regardless (§12.5).
+async function testFailedRevokePersistRollsBack() {
+  console.log("Test: a revocation that cannot be persisted is refused, not held in memory");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const author = new Uint8Array(32).fill(0xcd);
+
+  let broken = true;
+  const written = [];
+  class FlakyStore extends FreshnessMarks {
+    persist(json) { if (broken) throw new Error("disk full"); written.push(json); }
+  }
+  const store = new FlakyStore();
+  let msg = "";
+  try { store.revoke(author); } catch (e) { msg = e.message; }
+  assert(msg.includes("NOT revoked"), `a failed revoke says so plainly (got: ${msg})`);
+  assert(msg.includes("disk full"), "the original persist error survives the wrap");
+  assert(!store.isRevoked(author), "the key is not left revoked in memory only");
+
+  // The retry is the point of the rollback: without it the early return would see
+  // the key already revoked and never write.
+  broken = false;
+  store.revoke(author);
+  assert(store.isRevoked(author), "the retry revokes");
+  assert(written.length === 1 && written[0].includes("cd".repeat(32)),
+    "…and the retry is what actually reached the store");
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -2047,5 +2196,9 @@ await testPolicyManifestSuite();
 await testSafeRealmConcurrency();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();
+await testWrongTypedStoreIsRefused();
+await testAppNameLengthRefused();
+await testPersistFailureRollsBack();
+await testFailedRevokePersistRollsBack();
 
 summary("Results");

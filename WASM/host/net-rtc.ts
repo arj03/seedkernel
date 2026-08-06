@@ -195,6 +195,16 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.opts.signaling.close();
     }
     // ── per-peer connection (perfect negotiation, adapted from chat-shell.js) ─────
+    /** Whether a NEW (pre-auth) peer entry may be created. The relay can force
+     *  speculative entries by naming arbitrary peers in hellos AND in offers, so
+     *  every path that would CREATE an entry answers to the same cap; a peer with
+     *  an entry already (pre- or post-auth) is never counted against it, so a
+     *  genuine fleet is unconstrained. */
+    private admitNewPeer(): boolean {
+        let unauthed = 0;
+        for (const e of this.peers.values()) if (!e.authed) unauthed++;
+        return unauthed < MAX_UNAUTHED_PEERS;
+    }
     ensurePeer(peerId: PeerId) {
         const existing = this.peers.get(peerId);
         if (existing)
@@ -306,13 +316,11 @@ export class RtcNetwork extends SingleIdentityNetwork {
             const existing = this.peers.get(msg.from);
             if (existing && !existing.authed)
                 this.forget(msg.from);
-            let unauthed = 0;
-            for (const e of this.peers.values())
-                if (!e.authed)
-                    unauthed++;
-            if (!this.peers.has(msg.from) && unauthed >= MAX_UNAUTHED_PEERS)
-                return;
         }
+        // The cap is on CREATION, whatever shape the hello took: a directed hello
+        // names us too, so it can spam a slot just as well as a broadcast one.
+        if (!this.peers.has(msg.from) && !this.admitNewPeer())
+            return;
         const e = this.ensurePeer(msg.from);
         // Reply to a broadcast once (directed), so the peer learns we're here; never
         // reply to a directed hello, or the two bounce forever.
@@ -324,7 +332,12 @@ export class RtcNetwork extends SingleIdentityNetwork {
         if (!msg.sdp)
             return;
         // Only an offer may create a peer; a stray answer for an unknown peer is dropped.
-        const e = msg.sdp.type === "offer" ? this.ensurePeer(msg.from) : this.peers.get(msg.from);
+        // An offer must clear the same speculative-entry cap a hello does — the relay
+        // can name arbitrary `from` values in offers too, and each entry carries an
+        // RTCPeerConnection, so the hello path was never the only door.
+        const e = msg.sdp.type === "offer"
+            ? (this.peers.get(msg.from) ?? (this.admitNewPeer() ? this.ensurePeer(msg.from) : undefined))
+            : this.peers.get(msg.from);
         if (!e)
             return;
         // Glare: an offer arriving while we are also offering (or mid-renegotiation) is

@@ -1,6 +1,6 @@
-// Focused checks for the four hardening changes. Standalone rather than folded into
-// run.mjs only because run.mjs currently dies at its second test on a clean install
-// (its own sodium handle is used before `ready` resolves) — see the note in the review.
+// Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and
+// cap gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each
+// block is a tight loop over one seam; run.mjs covers the same ground end-to-end.
 //
 // Run: node tests/verify-hardening.mjs   (after `npm run build`)
 

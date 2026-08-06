@@ -425,14 +425,28 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 		return nil, errors.New("seedkernel: boot has not run")
 	}
 	expr := name + "("
+	slots := make([]string, len(args))
 	for i, a := range args {
 		slot := fmt.Sprintf("__a%d", i)
+		slots[i] = slot
 		qc.Global().SetPropertyStr(slot, a) // SetPropertyStr takes the reference
 		if i > 0 {
 			expr += ","
 		}
 		expr += slot
 	}
+	defer func() {
+		// Release the staged arguments: SetPropertyStr took their references, and a
+		// slot is only re-set by the NEXT callRealm — so a process that never calls
+		// again (every one-shot --put/--get, and any op after which no other op
+		// follows) would leave every payload rooted on the global object for its
+		// life. Overwriting the slot with undefined drops the property's value; a
+		// fresh call sets the slots again anyway.
+		undef := qc.NewUndefined()
+		for _, slot := range slots {
+			qc.Global().SetPropertyStr(slot, undef)
+		}
+	}()
 	kind, value, msg, err := el.awaitIn(qc, expr+")", timeout)
 	if err != nil {
 		return nil, err

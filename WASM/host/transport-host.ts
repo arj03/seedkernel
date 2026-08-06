@@ -342,7 +342,7 @@ export class TransportHost implements Network, HostTransport {
   private nextLinkId = 1;
   private nextCorr = 1;
   private reqHandler: RequestHandler | null = null;
-  private readyWaiter: { resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
+  private readyWaiter: { promise: Promise<void>; resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
   private closed = false;
   private listening = false;
 
@@ -656,16 +656,24 @@ export class TransportHost implements Network, HostTransport {
   }
 
   /** Dial every known peer address and resolve once each is authenticated (or
- *  the guest's deadline passes). The dialing itself is the guest's — it counts
- *  the shortfall to connsPerPeer and opens links through the raw capability. */
+   *  the guest's deadline passes). The dialing itself is the guest's — it counts
+   *  the shortfall to connsPerPeer and opens links through the raw capability.
+   *
+   *  Joining, not racing: a second `ready()` while one is in flight returns the
+   *  SAME pending promise rather than overwriting the waiter — the old behaviour
+   *  resolved the second caller's promise from the first caller's timer and left
+   *  the first caller hanging forever. Both callers settle together. */
   ready(timeoutMs = 5000): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.readyWaiter = {
-        resolve,
-        timer: setTimeout(() => { this.onReady(false); }, timeoutMs + 5000),
-      };
-      this.enter("ready", new Args().u32(timeoutMs).build());
-    });
+    if (this.readyWaiter) return this.readyWaiter.promise;
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => { resolve = r; });
+    this.readyWaiter = {
+      promise,
+      resolve,
+      timer: setTimeout(() => { this.onReady(false); }, timeoutMs + 5000),
+    };
+    this.enter("ready", new Args().u32(timeoutMs).build());
+    return promise;
   }
 
   private onReady(_ok: boolean): void {

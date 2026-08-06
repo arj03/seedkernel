@@ -61,7 +61,7 @@ func TestNodeFsRoundTrip(t *testing.T) {
 // the data directory itself, so an unchecked empty key makes delete("") remove the store.
 func TestNodeFsRejectsUnsafeKeys(t *testing.T) {
 	fs, _ := newNodeFs(t.TempDir())
-	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`, "a\x00b"}
+	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`, "a\x00b", "a\nb"}
 	for _, k := range unsafe {
 		if err := fs.put(k, []byte("x")); err == nil {
 			t.Fatalf("put(%q) accepted an unsafe key", k)
