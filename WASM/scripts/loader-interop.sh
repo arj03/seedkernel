@@ -36,9 +36,9 @@ BASEPORT=47100
 # suite byte landed. verifyBundle is the one definition of both layouts.
 AUTHOR=$(cd "$SK" && node --input-type=module -e "
 const { verifyBundle } = await import('./build/host/bundle.js');
-const { loadSodium } = await import('./build/host/node.js');
+const { loadCrypto } = await import('./build/host/crypto-node.js');
 const { readFileSync } = await import('node:fs');
-const sodium = await loadSodium();
+const sodium = await loadCrypto();
 process.stdout.write(Buffer.from(verifyBundle(sodium, new Uint8Array(readFileSync(process.argv[1]))).author).toString('hex'));
 " "$BUNDLE")
 

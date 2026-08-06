@@ -13,8 +13,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
-export const { loadSodium, generateKeyPair } = await imp("build/host/node.js");
-export const sodium = await loadSodium();
+export const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
+export const sodium = await loadCrypto();
 export const { createShell } = await imp("build/host/shell-core.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { policyFromJson } = await imp("build/host/policy.js");

@@ -5,8 +5,8 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./build/host/node.d.ts",
-      "default": "./build/host/node.js"
+      "types": "./build/host/crypto-node.d.ts",
+      "default": "./build/host/crypto-node.js"
     },
     "./net": {
       "types": "./build/core/net.d.ts",

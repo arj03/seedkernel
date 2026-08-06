@@ -15,8 +15,8 @@ import { testkit } from "./testkit.mjs";
 const {
   createModuleTable,
   generateKeyPair,
-  loadSodium,
-} = await imp("build/host/node.js");
+  loadCrypto,
+} = await imp("build/host/crypto-node.js");
 
 // Take the host's already-readied instance instead of importing our own copy.
 // libsodium-wrappers-sumo declares separate "import" and "require" conditions
@@ -24,7 +24,7 @@ const {
 // with its own wasm heap — one nothing ever awaits .ready on, which leaves every
 // crypto_* symbol undefined at call time. One shared instance is the documented
 // rule (README §12.1), and these tests have to follow it like any other consumer.
-const sodium = await loadSodium();
+const sodium = await loadCrypto();
 
 // `./net-node`'s own coverage is transport-tcp.test.mjs, which stands two nodes on
 // real sockets through `NodeChannelFactory` — the only path that exercises the
@@ -1642,7 +1642,7 @@ async function testHybridManifestSuite() {
   const { signManifest, signManifestHybrid, verifyManifest, hybridAuthorId,
           verifyBundle, packBundle, MANIFEST_FILE }
     = await imp("build/host/bundle.js");
-  const { generatePqKeyPair } = await imp("build/host/node.js");
+  const { generatePqKeyPair } = await imp("build/host/crypto-node.js");
 
   const ed = generateKeyPair();
   const pq = generatePqKeyPair();
@@ -1763,7 +1763,7 @@ async function testPolicyManifestSuite() {
   console.log("Test: policy manifestSuites — a deployment can insist on PQ-signed manifests");
   const { signManifest, signManifestHybrid, verifyBundle, packBundle, MANIFEST_FILE }
     = await imp("build/host/bundle.js");
-  const { generatePqKeyPair } = await imp("build/host/node.js");
+  const { generatePqKeyPair } = await imp("build/host/crypto-node.js");
 
   const ed = generateKeyPair();
   const pq = generatePqKeyPair();

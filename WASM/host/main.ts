@@ -17,14 +17,14 @@
 // README §12.9) embeds and runs this same shared host JS — no Node install needed.
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { loadSodium } from "./node.js";
+import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
 import { FreshnessMarks, type LoadedBundle } from "./bundle.js";
 import { NodeChannelFactory, parsePeerSpec } from "./net-node.js";
 import { NodeFs } from "./fs-node.js";
 import { toHex, fromHex, concatBytes, fromBase64 } from "../core/util.js";
 import { deriveNodeKeys, type SubkeyCrypto, type NodeKeys } from "../core/subkeys.js";
-type Sodium = Awaited<ReturnType<typeof loadSodium>>;
+type Sodium = Awaited<ReturnType<typeof loadCrypto>>;
 import { createShell, ModuleTable, isAdmissionRejected, type RealmFactory, type Shell as CoreShell, type ModuleLookup, type ShellSodium } from "./shell-core.js";
 import { TransportHost, parseHostPort } from "./transport-host.js";
 // The transport bundle the artifact ships (§12.6):
@@ -158,7 +158,7 @@ const createRealm: RealmFactory = async (o) => (await import("./safe-js.js")).cr
  *  shell is the platform-neutral core plus a file-backed `loadBundle` — that is the
  *  whole platform seam. */
 export async function boot(opts: ShellOptions): Promise<Shell> {
-    const sodium = await loadSodium();
+    const sodium = await loadCrypto();
     // ── Node platform seam ─────────────────────────────────────────────────────
     const fs = new NodeFs(opts.dir);
     const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
@@ -302,7 +302,7 @@ export async function main(): Promise<void> {
     const policyJson = policyPath ? readFileSync(policyPath, "utf8") : undefined;
     const dir = str(args, "dir", "./seedkernel-data");
     const keyPath = str(args, "key", "./seedkernel.key");
-    const sodium = await loadSodium();
+    const sodium = await loadCrypto();
     const keys = loadNodeKeys(sodium, keyPath!);
     const identity = keys.channel;
     const contactSecret = loadContactSecret(str(args, "contact-secret"));
