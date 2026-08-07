@@ -150,7 +150,7 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  to `request` rather than moving this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
-/** Concurrent deadlines the slot occupant may hold. One per half-open link plus one
+/** Concurrent deadlines the mounted transport may hold. One per half-open link plus one
  *  per in-flight request is the real demand, so this is headroom over both budgets
  *  rather than a tuning knob — it exists so a wedged occupant cannot grow the host's
  *  timer table without bound. */
@@ -492,7 +492,7 @@ export class TransportHost implements Network, HostTransport {
     };
   }
 
-  /** Where the slot occupant reports its structured output. Everything policy-shaped
+  /** Where the mounted transport reports its structured output. Everything policy-shaped
  *  is applied HERE, on what the guest reports, rather than handed to the guest. */
   sink(): TransportSink {
     return {

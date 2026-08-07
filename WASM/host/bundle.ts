@@ -28,7 +28,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, SLOT_ONLY_DOMAINS, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, MOUNT_ONLY_DOMAINS, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -107,8 +107,6 @@ export interface BundleGuest {
     config?: Record<string, string | number>;
 }
 
-export type BundleRole = typeof BUNDLE_ROLES[number];
-
 export interface BundleManifest {
     app: string;
     /** Monotonic version of the coherent set (README §12.4). Enforced at load against
@@ -124,16 +122,6 @@ export interface BundleManifest {
      *  anything. That separation — landing code is authorized by policy, receiving messages
      *  is chosen by the user — is what lets the loader hold no ownership state at all. */
     handles?: string[];
-    /** The slot this bundle claims, or absent for an ordinary app (README §12.4, §12.5).
-     *  Signed, so what a bundle claims to be is the author's statement and not the
-     *  deliverer's, and one of `BUNDLE_ROLES` or the load is refused.
-     *
-     *  Admission is what keys off it, and it is the way a slot differs from an app: a slot
-     *  occupant is an authority grant, not a preference, so the ordinary author allowlist
-     *  does NOT admit one — it needs a per-slot decision (`roleAllowlist`). Freshness is
-     *  not: a slot occupant carries the same `(author, app)` high-water mark as any other
-     *  bundle, so each author keeps their own version lineage (§12.4). */
-    role?: BundleRole;
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
      *  integrity-checks `guest.js` and hands the source back for the shell to run in a
@@ -347,20 +335,21 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
 export function handlesOf(manifest: BundleManifest): string[] {
     return manifest.handles && manifest.handles.length > 0 ? manifest.handles : [manifest.app];
 }
-/** The slots a bundle may claim (README §12.4). A slot is a *role* every other node
- *  must interoperate with, and there is exactly one occupant of it per host — where an
- *  ordinary app is a node-local choice that contends with nothing (§12.10).
+/** Which of the mount-only capability domains (§12.5) a manifest declares.
  *
- *  A closed vocabulary, checked at load, so an unknown slot is a refused bundle rather
- *  than an unenforced string. That is deliberate even though it means a new slot needs a
- *  host rev: a slot is an authority class with its own admission (`roleAllowlist`,
- *  §12.5) and its own freshness floor, and neither can be honoured for a name this host
- *  has never heard of. A bundle claiming an unknown slot would otherwise be admitted as
- *  an ordinary app — the exact confusion the field exists to prevent.
+ *  The ONE predicate both admission paths ask, and the reason there is no `role` field:
+ *  what a bundle may do is read off the caps it declares, never off a claim about what
+ *  it is. The app path refuses a manifest for which this is non-empty; the mount path
+ *  requires it to name every mount-only domain. Two different questions, one derivation
+ *  from `MOUNT_ONLY_DOMAINS`, so neither can drift from the other or from the domain
+ *  vocabulary — the same argument that keeps `CAP_DOMAINS` out of cap-bridge.ts.
  *
- *  `transport` is the only member today: the AKE, record layer and link routing (§12.6),
- *  which sees all plaintext and holds the session keys. */
-export const BUNDLE_ROLES = ["transport"];
+ *  Not folded into `verifyManifest`: this is not a well-formedness question. The same
+ *  manifest is legitimate at one admission point and refused at the other, so the
+ *  decision belongs where the caller has said which point it is (shell-core). */
+export function mountOnlyCaps(manifest: BundleManifest): string[] {
+    return MOUNT_ONLY_DOMAINS.filter((d) => manifest.guest.caps.includes(d));
+}
 /** The fs keyspace prefix for one app (README §12.2).
  *
  *  A hash of the app key rather than the app key itself, because the key must double as
@@ -535,12 +524,6 @@ function isValidManifest(m: unknown): m is BundleManifest {
             if (typeof h !== "string" || h.length === 0 || enc.encode(h).length > 255)
                 return false;
     }
-    // `role` is optional (absent ⇒ an ordinary app) and closed: an unrecognized slot name
-    // is a rejection, never an ignored field. See BUNDLE_ROLES.
-    if (o.role !== undefined) {
-        if (typeof o.role !== "string" || !BUNDLE_ROLES.includes(o.role))
-            return false;
-    }
     if (!Array.isArray(o.modules))
         return false;
     const seen = new Set();
@@ -684,17 +667,11 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
         }
     }
     // The capability vocabulary (§12.2) is CLOSED — an unknown domain is a refused
-    // manifest, not a cap that quietly grants nothing at first use — and `link` and
-    // `transport` (§12.5) are the slot occupant's; an app declaring either is refused
-    // too. Both are AUTHORITY checks, so they belong at the point the manifest becomes
-    // trusted, before any policy predicate is shown a bundle it must never admit.
-    if (parsed.role === undefined) {
-        for (const c of parsed.guest.caps) {
-            if (SLOT_ONLY_DOMAINS.includes(c)) {
-                throw new Error(`bundle: capability domain "${c}" belongs to a slot occupant, and ${parsed.app} claims no role (§12.4)`);
-            }
-        }
-    }
+    // manifest, not a cap that quietly grants nothing at first use. This is a
+    // WELL-FORMEDNESS check, and the only one the caps get here: `link` and `transport`
+    // are in the vocabulary and a manifest naming them is well-formed, but they are the
+    // transport mount's alone (§12.5). Which admission point will have it is not a
+    // property of the manifest, so that decision is the shell's, over `mountOnlyCaps`.
     for (const c of parsed.guest.caps) {
         if (!(CAP_DOMAINS as readonly string[]).includes(c)) {
             throw new Error(`bundle: unknown capability domain "${c}" (this host grants: ${CAP_DOMAINS.join(", ")})`);
@@ -764,8 +741,8 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     return files;
 }
 /** The freshness *arithmetic*: the `(author, app)` key derivation, the monotonic
- *  never-rewind rule, the per-slot role floors, the revocation set, and the
- *  `{ marks, roles, revoked }` serialization. All of it is target-independent, so
+ *  never-rewind rule, the revocation set, and the
+ *  `{ marks, revoked }` serialization. All of it is target-independent, so
  *  it lives here and every target subclasses this with its own persistence seam
  *  (`persist`) rather than restating the rules — the author hex is fixed-length, so
  *  the key is unambiguous. On its own this is an in-memory store: `persist` does
@@ -957,13 +934,13 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  Trusting the author means trusting everything the author signed.
  *
  *  `deferMark` is for the one load whose "actually loaded" boundary is NOT this
- *  function's: a slot occupant is only loaded once its driver STANDS, which happens
+ *  function's: the transport mount is only loaded once its driver STANDS, which happens
  *  after this returns (shell-core `loadBundleBlob` → `installTransport`). A realm
  *  built from the guest source can fail there, and the node then keeps the transport
  *  it had — so advancing the mark inside would raise the (author, app) mark before that
  *  was known, bricking a rollback to the last good version
  *  (the exact outcome the downgrade refusals above exist to prevent). The caller
- *  passes `deferMark` for a role bundle and advances at the point the load is
+ *  passes `deferMark` for the transport mount and advances at the point the load is
  *  complete (§12.4: "the mark must record the highest version that actually loaded"). */
 export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): LoadedBundle {
     // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
@@ -987,14 +964,14 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
         if (version < highWater) {
             throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
         }
-        // A slot occupant is checked no differently: versions are an author's own lineage,
-        // so a bundle claiming a slot carries the ordinary `(author, app)` mark and nothing
-        // second keyed to the role. A floor keyed to the slot would bind every author of it
-        // to one shared version line — B could not replace A's v5 without numbering above
-        // it, a sequence with no owner — and it would buy protection only where an attacker
-        // chooses which signed bundle arrives. Nothing delivers a bundle but the operator
-        // (§12.4), so the answer to "two trusted authors, one stale" is to trust one author
-        // per slot at a time (§12.5).
+        // The mounted transport is checked no differently: versions are an author's own
+        // lineage, so the transport carries the ordinary `(author, app)` mark and nothing
+        // second keyed to the mount. A floor keyed to it would bind every author of the
+        // mount to one shared version line — B could not replace A's v5 without numbering
+        // above it, a sequence with no owner — and it would buy protection only where an
+        // attacker chooses which signed bundle arrives. Nothing delivers a bundle but the
+        // operator (§12.4), so the answer to "two trusted authors, one stale" is to trust
+        // one author for the mount at a time (§12.5).
         // NB: the mark is advanced at the *end* of this function, only after every module
         // has instantiated and bound — not here. See below.
     }

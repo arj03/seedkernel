@@ -3,7 +3,7 @@
 // record layer, ex net-link.ts), the authenticated link router (ex link-router.ts),
 // the link bookkeeping (ex net-route.ts NodeNetworkCore) and the request/response
 // layer (ex net.ts) — as the zero-authority JS program of a signed bundle claiming
-// `role: "transport"`.
+// the shell's explicit transport mount.
 //
 // Why this exists as a bundle at all (§12.6): the wire
 // behaviour of a seedkernel node — what the AKE signs, which suite byte it speaks,
@@ -33,7 +33,7 @@
 //     The AUTHORITIES the manifest declares in `caps` — which is the whole of what this
 //     program is granted, by domain PREFIX (README §12.2):
 //       "node/sign"   msg -> 64B sig. The host prefixes `DOMAIN_channel ‖ networkKey`
-//                     from THIS bundle's slot and signs the opaque suffix with the node's
+//                     from THIS bundle's admission point and signs the opaque suffix with the node's
 //                     channel key, which never enters this module. It does not read the
 //                     suffix — the domain separation is the guarantee, so no transcript
 //                     shape is pinned into the host and no call signs raw bytes.
@@ -51,7 +51,7 @@
 //     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
 //     attribution this program reports (transport/link-auth answers with the verdict,
 //     and the host has already closed the channel on a refusal); a gate this program
-//     applied to itself would be one a hostile occupant of the slot would simply skip.
+//     applied to itself would be one a hostile transport would simply skip.
 //
 //   - entrypoints, invoked synchronously by name — `linkBytes`, `timer`, `request`
 //     and the rest below. This is the SAME mechanism an app's holder `handle` is
@@ -60,7 +60,7 @@
 //     desyncing a decoder.
 //
 // The node key stays out of this module in the strongest sense: there is no call
-// that signs arbitrary bytes — node/sign is scoped by the slot the host admitted this
+// that signs arbitrary bytes — node/sign is scoped by the point the host admitted this
 // bundle into, so a compromised transport can neither forge app signatures nor
 // sign for another network.
 //
@@ -249,8 +249,8 @@ let ownPk = null;          // 32B node channel public key
 let ownId = "";            // its hex — the peer id
 let networkKey = null;     // 32B
 let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
-// What the host PREPENDS to everything the SIGN op signs for this slot:
-// `DOMAIN_channel ‖ networkKey`, chosen from the slot this bundle was admitted into
+// What the host PREPENDS to everything the SIGN op signs for the mounted transport:
+// `DOMAIN_channel ‖ networkKey`, chosen from the point this bundle was admitted through
 // and never from anything said here (cap-bridge `transportSignScope`). The host
 // prefixes and does not parse, so reconstructing the prefix to VERIFY a peer's
 // transcript signature is this program's job — it is the one thing about signing the
@@ -332,7 +332,7 @@ function boxKeypair() {
   return { publicKey: r.x, privateKey: sk };
 }
 /** Ask the host to sign a handshake transcript. The host prefixes
- *  `DOMAIN_channel ‖ networkKey` — chosen from THIS bundle's slot, not from anything
+ *  `DOMAIN_channel ‖ networkKey` — chosen from THIS bundle's admission point, not from anything
  *  said here — and signs the opaque suffix with the node's channel key, which never
  *  enters this program. There is no call that signs raw bytes, and the prefix is what
  *  makes a transcript signature unusable as app data (and vice versa). */

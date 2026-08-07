@@ -18,12 +18,13 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
-import { appKeyFor, appScopeFor, handlesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, handlesOf, mountOnlyCaps, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, bundlePreamble, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { MOUNT_ONLY_DOMAINS } from "../core/domains.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
@@ -36,7 +37,7 @@ import type { Keypair } from "../core/subkeys.js";
 export type ShellSodium = BundleCrypto & CapSodium;
 
 /** The one reason a bundle load is refused without being an error worth reporting:
- *  the policy predicate said no (§12.4). The transport role's installers treat this
+ *  the policy predicate said no (§12.4). The transport mount's installers treat this
  *  as "a node without a network — a deliberate configuration", not a failure, so
  *  the message is a shared constant rather than a string the caller re-matches. */
 export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
@@ -102,8 +103,8 @@ export interface ModuleTableBackend extends BundleHost, ModuleLookup {
  *
  *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
  *  seam (`channels`, `listen`/`wsListen`, the network key and contact secret) and the
- *  shell stands the driver up when a bundle claiming the transport role is admitted.
- *  There is no `network` member to hand in — the driver IS the network. */
+ *  shell stands the driver up when the transport bundle is mounted. There is no
+ *  `network` member to hand in — the driver IS the network. */
 export interface ShellPlatform {
     sodium: ShellSodium;
     /** The CHANNEL keypair — its public half is this node's peer id. */
@@ -163,6 +164,10 @@ export interface CreateShellOptions {
      *  allowlist, a consent dialog, and "the bundle my operator handed me" are
      *  three constructors of the same predicate type (§12.5). */
     admit?: AdmitCallback;
+    /** Admission callback for the explicitly mounted transport. This is separate from
+     *  app admission because mounting a bundle grants raw links and channel identity
+     *  signing; the manifest itself makes no such claim. */
+    admitTransport?: AdmitCallback;
     /** How long one net request may take before it settles as unreachable, in ms, for
      *  a caller that names no deadline of its own (§12.6). Omitted ⇒ the transport's
      *  `DEFAULT_REQUEST_DEADLINE_MS`. A deployment-wide fallback, not a policy — the
@@ -205,8 +210,8 @@ export interface Shell {
     host: ModuleLookup;
     /** Protocol bindings (§12.10): which app handles which protocol. */
     bindings: Bindings;
-    /** The transport bundle's driver — the node's Network. Absent until a bundle
-     *  claiming the transport role is admitted; a shell without one has no net. */
+    /** The transport bundle's driver — the node's Network. Absent until the
+     *  transport bundle is mounted; a shell without one has no net. */
     net: Network;
     /** The request/response face of the same driver (the old Transport shape). */
     transport: HostTransport;
@@ -216,8 +221,12 @@ export interface Shell {
     sodium: ShellSodium;
     /** Load a signed bundle blob: verify the manifest, run the admission predicate,
      *  integrity-check + install the modules, and return the guest source. This is
-     *  the §12.4 load order — the ONE install path. A bundle claiming the transport
-     *  role additionally stands the transport driver up over its guest program. */
+     *  the §12.4 load order — the ONE install path, for apps and for the transport
+     *  alike. A bundle declaring the mount-only caps (§12.5) is governed by the
+     *  transport half of the policy and mounted as this shell's transport instead of
+     *  bound as an app; replacing a standing transport is a staged handover, where the
+     *  incoming guest stands before the outgoing driver is closed and links reconnect
+     *  under the new guest. */
     loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
     /** Uninstall an app: remove every module derived from `appKey`,
      *  drop every protocol binding for it, and dispose the confined realm if
@@ -261,7 +270,7 @@ export interface Shell {
 // reach them from the same module it gets createShell from. ModuleTable rides along
 // for the same reason: the JS platforms all hand it in as their `table`, and a
 // re-export keeps that a one-line seam rather than a second import.
-export { denyAll, admitAll, authorAllowlist, roleAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
 export { Bindings } from "./bindings.js";
 export { ModuleTable } from "./module-table.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
@@ -293,7 +302,7 @@ interface AppSlot extends RealmHolder {
   entry: AppEntry;
 }
 
-type RoleSlot = RealmHolder;
+type TransportSlot = RealmHolder;
 
 // ── the fs key rule, applied once (core/fs.ts `isSafeFsKey`) ─────────────────
 //
@@ -392,16 +401,17 @@ export function createShell(opts: CreateShellOptions & {
     const host = platform.table;
     const bindings = new Bindings();
     const admit = opts.admit ?? denyAll;
+    const admitTransport = opts.admitTransport ?? denyAll;
     const peerId = toHex(platform.identity.publicKey);
     const apps = new Map();
-    const roles = new Map();
-    const roleKeys = new Map();
-    /** The transport driver, standing once a bundle claiming the transport role is
-     *  admitted. The app bridges and the shell's net/transport fields read this
-     *  indirection, so the shell can be assembled before any bundle loads. */
+    let transportSlot: TransportSlot | null = null;
+    let transportKey: string | null = null;
+    /** The transport driver, standing once the transport bundle is mounted. The app
+     *  bridges and the shell's net/transport fields read this indirection, so the
+     *  shell can be assembled before any bundle loads. */
     let netHost: TransportHost | null = null;
     const noTransport = (what: string): never => {
-        throw new Error(`shell: ${what} — the transport bundle is not loaded (admit a signed bundle with role "transport" first)`);
+        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring ${MOUNT_ONLY_DOMAINS.join(" + ")} first)`);
     };
     // The tail of every initiator `runGuest` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
@@ -429,7 +439,7 @@ export function createShell(opts: CreateShellOptions & {
      *  A failed construction clears the memo instead of caching the rejection, so a
      *  factory that failed on a transient (a heap the page could not spare yet) is
      *  retried on the next frame rather than making the app permanently dead. */
-    const ensureRealm = (slot: AppSlot | RoleSlot): Promise<SafeRealm> => {
+    const ensureRealm = (slot: AppSlot | TransportSlot): Promise<SafeRealm> => {
         if (!slot.realmP) {
             slot.realmP = platform.createRealm({
                 source: guestFullSource(slot.loaded),
@@ -441,9 +451,9 @@ export function createShell(opts: CreateShellOptions & {
         }
         return slot.realmP;
     };
-    /** The bridge for one admitted bundle. `driver` is passed ONLY for the bundle
-     *  claiming the transport slot, and is what wires the three seams no app holds: the
-     *  raw net capability (sockets), the platform's timers, and the sink the slot
+    /** The bridge for one admitted bundle. `driver` is passed ONLY for the mounted
+     *  transport bundle, and is what wires the three seams no app holds: the
+     *  raw net capability (sockets), the platform's timers, and the sink the mount
      *  reports its structured output through. Nothing else can reach a descriptor, at
      *  any point in the process's life, because nothing else is ever handed one
      *  (README §1, capability-by-non-wiring). */
@@ -480,7 +490,7 @@ export function createShell(opts: CreateShellOptions & {
             // signs under DOMAIN_guest with the guest subkey, in its own bundle's scope. The
             // bridge prefixes and never parses, so neither can produce the other's signature
             // and no op signs raw bytes.
-            signScope: b.manifest.role === "transport"
+            signScope: driver
                 ? transportSignScope(platform.identity, platform.networkKey)
                 : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
         });
@@ -520,7 +530,7 @@ export function createShell(opts: CreateShellOptions & {
      *  what to do with whatever was there before. That separation is what makes
      *  replacing a standing occupant safe: this function can fail without the node
      *  losing the transport it already had. */
-    const standTransport = async (slot: AppSlot | RoleSlot) => {
+    const standTransport = async (slot: TransportSlot) => {
         // The driver is built BEFORE the realm and attached after, because the realm's
         // bridge resolves the slot's ops here: the guest reaches sockets, timers and the
         // sink through the ordinary seam, so the object serving them has to exist first.
@@ -570,13 +580,13 @@ export function createShell(opts: CreateShellOptions & {
      *
      *  Live links do not survive, and cannot: session state is in the outgoing guest's
      *  private memory (see `TransportHandover`). An upgrade is a reconnect. */
-    const installTransport = async (slot: AppSlot | RoleSlot) => {
+    const installTransport = async (slot: TransportSlot) => {
         const outgoing = netHost;
         const state = outgoing?.handover() ?? null;
         const incoming = await standTransport(slot);
         if (outgoing) {
             outgoing.close();
-            roles.get("transport")?.realm?.dispose();
+            transportSlot?.realm?.dispose();
         }
         netHost = incoming;
         if (state)
@@ -585,14 +595,12 @@ export function createShell(opts: CreateShellOptions & {
     const doUninstall = (appKey: string) => {
         // The transport slot is not an app, but it IS uninstallable: dropping it
         // stops the node's net.
-        const roleKey = roleKeys.get("transport");
-        if (roleKey === appKey) {
+        if (transportKey === appKey) {
             netHost?.close();
             netHost = null;
-            const slot = roles.get("transport");
-            slot?.realm?.dispose();
-            roles.delete("transport");
-            roleKeys.delete("transport");
+            transportSlot?.realm?.dispose();
+            transportSlot = null;
+            transportKey = null;
             return true;
         }
         const slot = apps.get(appKey);
@@ -646,6 +654,26 @@ export function createShell(opts: CreateShellOptions & {
         sodium,
         async loadBundleBlob(blob) {
             const v = verifyBundle(sodium, blob);
+            // WHICH BUNDLE THIS IS, read off the caps and nothing else. There is no `role`
+            // field and there is no second entrypoint: a transport is exactly the bundle
+            // declaring the mount-only domains (§12.5), which the manifest signature
+            // already covers and `verifyManifest` has already checked. Restating that as a
+            // self-description, or as a choice of method, would be a second place for the
+            // same fact to live — and the caps are the one that must be right anyway,
+            // because they are what the bridge actually wires.
+            //
+            // An author cannot climb into the mount by declaring them, which is the
+            // property the whole split exists for: adding `link` moves a bundle onto the
+            // STRICTER predicate (`admitTransport`), never the looser one. The dispatch is
+            // safe in the only direction it can be pushed.
+            const mountOnly = mountOnlyCaps(v.manifest);
+            const isMount = mountOnly.length > 0;
+            // All of them or none. A bundle missing `link` has no sockets and one missing
+            // `transport` has nowhere to report, so a partial claim could only stand as a
+            // transport that is not one — refused at the load rather than at the first dial.
+            if (isMount && mountOnly.length !== MOUNT_ONLY_DOMAINS.length) {
+                throw new Error(`shell: a transport declares every mount-only capability domain or none (${MOUNT_ONLY_DOMAINS.join(", ")}); ${v.manifest.app} declares only ${mountOnly.join(", ")} (§12.5)`);
+            }
             // Revocation before `admit`, not just inside installBundle. The predicate is
             // where an interactive shell puts its consent dialog (§12.4), so asking it
             // first would show a user the author and metadata of a bundle this host has
@@ -655,35 +683,31 @@ export function createShell(opts: CreateShellOptions & {
             if (platform.freshnessStore.isRevoked(v.author)) {
                 throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
             }
-            const ok = await admit(v);
-            if (!ok)
+            // The two admission CLASSES (§12.5). Admitting an app risks that app; admitting
+            // a transport risks the channel, which sees all plaintext and holds the session
+            // keys — so an author trusted for apps is not thereby trusted for the mount,
+            // and the policy answers the two separately.
+            if (!(await (isMount ? admitTransport : admit)(v)))
                 throw new Error(ADMISSION_REJECTED);
-            // A slot occupant's load is not "done" when its modules bind — the driver
-            // must STAND — so its mark is deferred (installBundle `deferMark`) and
-            // advanced only after installTransport below: a transport guest that fails
-            // to compile raises nothing, and the node — still running the transport it
-            // had — can still roll back to the previous version. The mark must record
-            // the highest version that actually loaded (README §12.4).
-            const loaded = installBundle(host, v, platform.freshnessStore, v.manifest.role !== undefined);
+            // A transport's load is not done when its modules bind — it is done when its
+            // DRIVER stands, below — so its mark is deferred (`deferMark`) and advanced
+            // only after. A guest that fails to compile then raises nothing, and the node,
+            // still running the transport it had, can roll back to the previous version
+            // (§12.4: the mark records the highest version that actually loaded).
+            const loaded = installBundle(host, v, platform.freshnessStore, isMount);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
-            const advanceMark = (): void => {
+            // A transport is not an app: it binds no protocol ids (its handles would claim
+            // a dispatch the runtime itself performs) and receives no inbound dispatch. It
+            // is stood up as the driver the rest of the shell consumes, and the slot is
+            // recorded only AFTER it stands — on a failed upgrade the node keeps both the
+            // transport it had and the author key `revoke` needs to find what that key
+            // landed.
+            if (isMount) {
+                const slot: TransportSlot = { loaded, realm: null, realmP: null };
+                await installTransport(slot);
+                transportSlot = slot;
+                transportKey = key;
                 platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
-            };
-            // A slot occupant is not an app: it binds no protocol ids (its handles
-            // would claim a dispatch the runtime itself performs), receives no inbound
-            // dispatch, and `transport` — the one slot today — is stood up as the
-            // driver the rest of the shell consumes.
-            if (v.manifest.role !== undefined) {
-                const role = v.manifest.role;
-                const slot: RoleSlot = { loaded, realm: null, realmP: null };
-                // The slot maps are written AFTER the driver is standing, not before: on a
-                // failed upgrade the node keeps both the transport it had and the author key
-                // that `revoke` needs in order to find what that key landed.
-                if (role === "transport")
-                    await installTransport(slot);
-                roles.set(role, slot);
-                roleKeys.set(role, key);
-                advanceMark();
                 return loaded;
             }
             bindings.autoBind(key, handlesOf(loaded.manifest));
@@ -695,7 +719,7 @@ export function createShell(opts: CreateShellOptions & {
             slot.entry = entryFor(slot);
             apps.set(key, slot);
             // An app's marks were already advanced inside installBundle — nothing can fail
-            // between that return and here — so the app path advances exactly as before.
+            // between that return and here.
             return loaded;
         },
         uninstall: doUninstall,
@@ -709,19 +733,10 @@ export function createShell(opts: CreateShellOptions & {
             // key that is actively publishing.
             platform.freshnessStore.revoke(fromHex(hex));
             const gone = [];
-            // Slot occupants too: a revoked transport author must lose the slot, not just
-            // the apps. The driver is the slot's face — close it and the node has no net.
-            for (const [role, appKey] of [...roleKeys]) {
-                if (appKey.startsWith(hex + ":")) {
-                    if (role === "transport") {
-                        netHost?.close();
-                        netHost = null;
-                        roles.get("transport")?.realm?.dispose();
-                        roles.delete("transport");
-                    }
-                    roleKeys.delete(role);
-                    gone.push(appKey);
-                }
+            if (transportKey?.startsWith(hex + ":")) {
+                const key = transportKey;
+                doUninstall(key);
+                gone.push(key);
             }
             for (const appKey of [...apps.keys()]) {
                 // Every table name of an app begins with its author (§5.1), so one prefix
@@ -749,7 +764,7 @@ export function createShell(opts: CreateShellOptions & {
                 await ensureRealm(slot);
             }
             if (!netHost)
-                throw new Error("shell: the transport bundle is not loaded — serve() needs it (admit a bundle with role \"transport\")");
+                throw new Error("shell: the transport bundle is not loaded — serve() needs it");
             netHost.onRequest((from, proto, payload) => {
                 return doDispatch(from, proto, payload);
             });
@@ -762,10 +777,9 @@ export function createShell(opts: CreateShellOptions & {
                     slot.realm?.dispose();
                 }
                 apps.clear();
-                for (const slot of roles.values()) {
-                    slot.realm?.dispose();
-                }
-                roles.clear();
+                transportSlot?.realm?.dispose();
+                transportSlot = null;
+                transportKey = null;
             };
             inFlight.then(dispose, dispose);
         },

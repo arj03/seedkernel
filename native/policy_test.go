@@ -32,41 +32,59 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
-// A slot occupant is a SECOND admission class (§12.5): the transport sees all plaintext
-// and holds the session keys, so "I trust this author's apps" must not answer "may this
-// author be my transport". The author allowlist refuses a `role` claim; only a `roles`
-// entry admits one. Driven through the native loader because the policy file is an
-// operator-facing surface on this target — `--policy` is parsed by the shared JS, and
-// this is what proves the loader reaches that decision and not a permissive default.
-func TestPolicySlotNeedsItsOwnGrant(t *testing.T) {
+// The mount-only caps are a SECOND admission class (§12.5): the transport sees all
+// plaintext and holds the session keys, so "I trust this author's apps" must not answer
+// "may this author be my transport". There is no self-description in the manifest — the
+// bundle format has no role field — so `guest.caps` alone decides which class a bundle
+// answers to, and the dispatch only ever runs the strict way: declaring `link` and
+// `transport` moves a bundle onto `transportAuthors`, never off it.
+//
+// Driven through the native loader because the policy file is an operator-facing surface
+// on this target — `--policy` is parsed by the shared JS, and this is what proves the
+// loader reaches that decision and not a permissive default.
+func TestPolicyTransportCapsAreASecondAdmissionClass(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author, authorPub := testAuthor(t)
 	authorHex := hex.EncodeToString(authorPub)
 
+	// On the app allowlist and nothing else. The same load that lands this author's apps
+	// refuses their transport, and the refusal is admission — not a parse error, not a
+	// missing entrypoint: the caps sent it to a predicate that says no.
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	slotBundle := writeSlotBundle(t, author, authorPub, "linkapp", 1, "transport")
-	if status := loadBundle(slotBundle); !strings.Contains(status, "rejected by admission") {
-		t.Fatalf("an app-allowlisted author must not thereby occupy a slot: %s", status)
+	linkBundle, _ := writeBundle(t, author, authorPub, "linkapp", 1, "", []string{"link", "transport"})
+	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
+		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
 	}
 
-	// The deliberate second entry admits it — and the app grant still works alongside.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"roles":{"transport":["` + authorHex + `"]}}`); err != nil {
+	// A partial claim is refused before either predicate — it cannot fall back to the app
+	// class, which is the hole a half-declared mount would otherwise open.
+	halfBundle, _ := writeBundle(t, author, authorPub, "halfapp", 1, "", []string{"link"})
+	if status := loadBundle(halfBundle); !strings.Contains(status, "every mount-only capability domain") {
+		t.Fatalf("a bundle declaring link without transport must be refused as malformed: %s", status)
+	}
+
+	// Adding the deliberate second entry gets the same blob PAST admission, where it then
+	// fails on its own merits — this fixture's stub guest is not a transport. A different
+	// failure, from a policy edit and nothing else. The node keeps the transport it had:
+	// installTransport builds the incoming driver before closing the outgoing one.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"transportAuthors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	if status := loadBundle(slotBundle); strings.Contains(status, "rejected") {
-		t.Fatalf("a roles entry must admit the slot it names: %s", status)
+	if status := loadBundle(linkBundle); strings.Contains(status, "rejected by admission") {
+		t.Fatalf("a transportAuthors entry must admit its author to the transport class: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, authorPub, "ordinary", 1)
 	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {
-		t.Fatalf("adding a slot entry must not disturb app admission: %s", status)
+		t.Fatalf("adding a transport entry must not disturb app admission: %s", status)
 	}
 
-	// A typo'd slot name fails the boot rather than parsing into a list that admits
-	// nothing and looks like it should.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"roles":{"transprot":["` + authorHex + `"]}}`); err == nil {
-		t.Fatal("an unknown slot name in the policy must fail loudly")
+	// The old policy vocabulary is gone and says so at the boot: a file carrying
+	// `roles` fails loudly rather than parsing into an app-only policy that silently
+	// leaves the node without a network.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"roles":{"transport":["` + authorHex + `"]}}`); err == nil {
+		t.Fatal("the legacy \"roles\" policy key must fail loudly")
 	}
 }
 

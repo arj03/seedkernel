@@ -35,7 +35,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		// policy has to name the artifact's own transport author before either node
 		// stands up. The id is read from the realm, never restated.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
-		                           roles: { transport: [embeddedTransportAuthor] } }));
+		                           transportAuthors: [embeddedTransportAuthor] }));
 		globalThis.__setup = (async () => {
 		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });

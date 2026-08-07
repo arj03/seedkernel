@@ -60,7 +60,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // used by tests that do not exercise the guest is the same minimal program throughout.
 const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
-const GUEST = () => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, caps: [] });
+const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, caps: [], ...extra });
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own ModuleTable without a shell. */
@@ -214,7 +214,7 @@ async function testDenyAllPolicyRejects() {
   // `policyFromJson(null)` is the boot default every target shares: a predicate
   // that returns false for every bundle. The absence of a decision is never permission.
   const admit = policyFromJson(null);
-  assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
+  assert(!admit.apps({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
     "deny-all predicate returns false for any VerifiedBundle");
 
   const { host } = await makeHost();
@@ -226,7 +226,7 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   let threw = false;
-  try { await loadBundle(host, blob, admit); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit.apps); } catch { threw = true; }
   assert(threw, "a deny-all admit predicate prevents install");
 
   console.log("  OK\n");
@@ -641,7 +641,7 @@ async function testCapBridge() {
 // ──── Test: channel identity pinning (transport §12.6) ────
 
 async function testPolicy() {
-  console.log("Test: shell install policy — closed author set gates bundle loads");
+  console.log("Test: shell install policy — closed author sets gate bundle loads");
   const { parsePolicy } = await imp("build/host/policy.js");
 
   const good = generateKeyPair();
@@ -649,16 +649,16 @@ async function testPolicy() {
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
-  const tryLoad = async (policyJson, author, extra = {}) => {
+  const tryLoad = async (policyJson, author, mount) => {
     const host = new ModuleTable();
-    const manifest = { app: "mod", version: 1, ...extra,
+    const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST() };
+      guest: GUEST({ caps: mount ? ["link", "transport"] : [] }) };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { await loadBundle(host, blob, admit); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, mount ? admit.transport : admit.apps); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -669,27 +669,28 @@ async function testPolicy() {
   const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
-  // ── the slot admission class (§12.5) ───────────────────────────────────
-  // A bundle claiming a slot is an authority grant — the transport sees all plaintext
-  // and holds the session keys — so the ordinary author allowlist must NOT admit one,
-  // even for an author it already trusts with apps. Only a `roles` entry does.
+  // ── the transport mount is a SECOND admission class (§12.5) ────────────
+  // Mounting a transport grants raw links and channel-identity signing — the bundle
+  // that carries the node's whole network — so the ordinary author allowlist must NOT
+  // admit one, even for an author it already trusts with apps. Only a `transportAuthors`
+  // entry does.
   const goodHex = toHex(good.publicKey);
   const appOnly = JSON.stringify({ authors: [goodHex] });
-  const withSlot = JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } });
+  const withTransport = JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] });
 
-  const slotLanded = await tryLoad(appOnly, good, { role: "transport" });
-  assert(!slotLanded, "an author trusted for apps does NOT thereby occupy the transport slot");
-  const slotAllowed = await tryLoad(withSlot, good, { role: "transport" });
-  assert(slotAllowed, "a roles entry admits that author into the slot it names");
-  const strangerSlot = await tryLoad(withSlot, bad, { role: "transport" });
-  assert(!strangerSlot, "an author outside the slot's list is refused the slot");
-  const appStillOk = await tryLoad(withSlot, good, {});
-  assert(appStillOk, "adding a slot entry does not disturb ordinary app admission");
+  const mountDenied = await tryLoad(appOnly, good, true);
+  assert(!mountDenied, "an author trusted for apps does NOT thereby mount the transport");
+  const mountAllowed = await tryLoad(withTransport, good, true);
+  assert(mountAllowed, "a transportAuthors entry admits that author to the transport mount");
+  const strangerMount = await tryLoad(withTransport, bad, true);
+  assert(!strangerMount, "an author outside the transport list is refused the mount");
+  const appStillOk = await tryLoad(withTransport, good, false);
+  assert(appStillOk, "adding a transport entry does not disturb ordinary app admission");
 
-  // The two classes partition the bundles: a slot list alone admits no apps.
-  const slotsOnly = JSON.stringify({ authors: [toHex(bad.publicKey)], roles: { transport: [goodHex] } });
-  const appUnderSlotList = await tryLoad(slotsOnly, good, {});
-  assert(!appUnderSlotList, "a slot entry is not an app grant — the app allowlist still decides apps");
+  // The two classes partition the bundles: a transport list alone admits no apps.
+  const transportOnly = JSON.stringify({ transportAuthors: [goodHex] });
+  const appUnderTransportList = await tryLoad(transportOnly, good, false);
+  assert(!appUnderTransportList, "a transport entry is not an app grant — the app allowlist still decides apps");
 
   // ── parse validation ───────────────────────────────────────────────────
   let threw = false;
@@ -699,21 +700,103 @@ async function testPolicy() {
   try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
   assert(threw, "an empty author set is rejected");
   threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transprot: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "a typo'd slot name fails the boot rather than silently admitting nothing");
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [] })); } catch { threw = true; }
+  assert(threw, "an empty transport list is rejected (omit the key to allow none)");
   threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [] } })); } catch { threw = true; }
-  assert(threw, "an empty slot list is rejected (omit the slot to allow none)");
-
-  // A manifest may only claim a slot this host knows (§12.4) — an unknown role is a
-  // malformed manifest, not an ignored field that lands as an ordinary app.
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "the legacy \"roles\" key fails the boot loudly rather than silently denying mounts");
   threw = false;
-  try {
-    verifyManifest(sodium, signManifest(sodium, good.privateKey, good.publicKey,
-      { app: "mod", version: 1, role: "quantum-relay", modules: [], guest: GUEST() }));
-  } catch { threw = true; }
-  assert(threw, "a manifest claiming an unknown slot is refused as malformed");
+  try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
+  assert(threw, "a policy listing neither authors nor transportAuthors is refused");
 
+  console.log("  OK\n");
+}
+
+// ─── Test: the caps pick the admission class (§12.5) ────────────────────
+//
+// There is one install path and no `role` field, so which of the two admission classes a
+// bundle answers to is read off `guest.caps` alone. The property that has to hold is that
+// the dispatch cannot be pushed the wrong way: declaring a mount-only domain moves a
+// bundle onto the STRICTER predicate, never the looser one — so the MOST permissive app
+// allowlist this codebase can express (`admitAll`) still buys an author no sockets. If
+// that fails, "an app author cannot acquire socket access" is a convention rather than a
+// property, and every policy test above is a lock on an open door.
+//
+// Driven through createShell, because the dispatch is the shell's: the four policy tests
+// above compose verifyBundle → admit → installBundle by hand and would not see it.
+async function testCapsPickTheAdmissionClass() {
+  console.log("Test: guest.caps decides which admission class a bundle answers to");
+  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { admitAll, denyAll } = await imp("build/host/policy.js");
+
+  const author = generateKeyPair();
+  const blobWithCaps = (caps) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
+      app: "mod", version: 1,
+      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST({ caps }),
+    }),
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  const mkTestShell = (admit, admitTransport) => mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
+    },
+    admit, admitTransport,
+  });
+  const load = async (shell, caps) => {
+    try { await shell.loadBundleBlob(blobWithCaps(caps)); return null; }
+    catch (e) { return String(e); }
+  };
+
+  // 1. Which predicate was ASKED, counted rather than inferred from the outcome — the
+  //    outcome of a mount also depends on whether the driver stands, which this fixture's
+  //    stub guest cannot do.
+  {
+    let appAsked = 0, transportAsked = 0;
+    const shell = mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
+    try {
+      await load(shell, ["fs", "clock"]);
+      assert(appAsked === 1 && transportAsked === 0, "an ordinary app is governed by the app predicate");
+      appAsked = transportAsked = 0;
+      await load(shell, ["link", "transport"]);
+      assert(transportAsked === 1 && appAsked === 0, "a bundle declaring the mount-only caps is governed by the transport predicate");
+    } finally { shell.close(); }
+  }
+
+  // 2. The direction that matters: admitAll for apps, denyAll for the transport. An
+  //    author trusted for every app there is still cannot land raw links.
+  {
+    const shell = mkTestShell(admitAll, denyAll);
+    try {
+      const err = await load(shell, ["link", "transport"]);
+      assert(err !== null && /rejected by admission/.test(err),
+        "a permissive app allowlist does not admit a bundle asking for the mount-only caps");
+      assert(await load(shell, ["fs", "clock"]) === null, "the same shell still lands an ordinary app");
+      assert(shell.host.isBound(appKeyFor(author.publicKey, "mod"), "fwd"),
+        "an app declaring no mount-only domain binds normally");
+    } finally { shell.close(); }
+  }
+
+  // 3. All of them or none, refused before either predicate: a bundle declaring `link`
+  //    without `transport` has sockets and nowhere to report, so it could only stand as a
+  //    transport that is not one. It must not fall back to the app class either — that is
+  //    the exact hole a partial claim would open.
+  {
+    let asked = 0;
+    const shell = mkTestShell(() => { asked++; return true; }, () => { asked++; return true; });
+    try {
+      for (const caps of [["link"], ["transport"], ["fs", "link"]]) {
+        const err = await load(shell, caps);
+        assert(err !== null && /every mount-only capability domain/.test(err),
+          `a partial mount claim ${JSON.stringify(caps)} is refused as malformed`);
+      }
+      assert(asked === 0, "a partial mount claim never reaches a predicate at all");
+    } finally { shell.close(); }
+  }
   console.log("  OK\n");
 }
 
@@ -766,48 +849,48 @@ async function testGuestAbi() {
   console.log("  OK\n");
 }
 
-// ─── Test: a slot occupant's freshness (§12.4) ──────────────────────────
+// ─── Test: the mounted transport's freshness (§12.4) ───────────────────
 
 async function testSlotFreshness() {
-  console.log("Test: a slot occupant carries the ordinary (author, app) freshness mark");
+  console.log("Test: the mounted transport carries the ordinary (author, app) freshness mark");
 
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { ModuleTable } = await imp("build/host/module-table.js");
 
   const a = generateKeyPair();
   const b = generateKeyPair();
-  const blobFrom = (author, version, role) => packBundle({
+  const blobFrom = (author, version) => packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey,
-      { app: "link", version, ...(role ? { role } : {}), modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }], guest: GUEST() }),
+      { app: "link", version, modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }], guest: GUEST() }),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
-  const land = (host, freshness, author, version, role) => {
-    installBundle(host, verifyBundle(sodium, blobFrom(author, version, role)), freshness);
+  const land = (host, freshness, author, version) => {
+    installBundle(host, verifyBundle(sodium, blobFrom(author, version)), freshness);
   };
 
-  // Versions are an author's own lineage, slot or no slot. A's v5 landing does NOT bind
-  // B to number above it: a floor keyed to the slot would put two independent authors on
+  // Versions are an author's own lineage, mount or no mount. A's v5 landing does NOT bind
+  // B to number above it: a floor keyed to the transport would put two independent authors on
   // one shared version line with no owner, and would only pay where an attacker chooses
   // which signed bundle arrives — which nothing delivering a bundle allows (§12.4).
   {
     const freshness = new FreshnessMarks();
     const host = new ModuleTable();
-    land(host, freshness, a, 5, "transport");
-    assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a slot occupant advances its (author, app) mark");
-    land(host, freshness, b, 1, "transport");
-    assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's slot bundle answers to its own lineage");
+    land(host, freshness, a, 5);
+    assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a transport advances its (author, app) mark");
+    land(host, freshness, b, 1);
+    assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's transport answers to its own lineage");
   }
 
-  // Each author is still held to their own mark — dropping the slot floor weakens
-  // nothing about the downgrade that has always been in scope.
+  // Each author is still held to their own mark — dropping any floor
+  // weakens nothing about the downgrade that has always been in scope.
   {
     const freshness = new FreshnessMarks();
     const host = new ModuleTable();
-    land(host, freshness, a, 5, "transport");
+    land(host, freshness, a, 5);
     let refused = false;
-    try { land(host, freshness, a, 4, "transport"); } catch { refused = true; }
-    assert(refused, "an author's own stale slot bundle is still refused as a downgrade");
+    try { land(host, freshness, a, 4); } catch { refused = true; }
+    assert(refused, "an author's own stale transport is still refused as a downgrade");
   }
 
   // The store holds marks and revocations only. A file written by a host that also kept
@@ -1778,12 +1861,12 @@ async function testPolicyManifestSuite() {
     authors: [toHex(classical.author), toHex(hybrid.author)],
     manifestSuites: [2],
   }));
-  assert(await pqOnly(hybrid) === true, "a hybrid-signed bundle is admitted");
-  assert(await pqOnly(classical) === false, "an Ed25519-only bundle from a trusted author is refused");
+  assert(await pqOnly.apps(hybrid) === true, "a hybrid-signed bundle is admitted");
+  assert(await pqOnly.apps(classical) === false, "an Ed25519-only bundle from a trusted author is refused");
 
   // Absent, the field constrains nothing — an existing policy file keeps its meaning.
   const anySuite = policyFromJson(JSON.stringify({ authors: [toHex(classical.author)] }));
-  assert(await anySuite(classical) === true, "a policy without manifestSuites admits any suite");
+  assert(await anySuite.apps(classical) === true, "a policy without manifestSuites admits any suite");
 
   // Strict parsing, like every other field: a typo fails the boot loudly.
   for (const bad of [{ manifestSuites: 2 }, { manifestSuites: [] }, { manifestSuites: ["2"] }]) {
@@ -2178,6 +2261,7 @@ await testFs();
 await testFsKeyRule();
 await testCapBridge();
 await testPolicy();
+await testCapsPickTheAdmissionClass();
 await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();

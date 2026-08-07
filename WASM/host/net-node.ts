@@ -4,7 +4,7 @@
 // else. The transport itself — the PeerLink handshake, link routing, the
 // request/response layer — now runs in the transport bundle's guest program,
 // driven by the shared TransportHost (transport-host.ts), which the shell stands
-// up when a bundle claiming the transport role is admitted. This file is what
+// up when the transport bundle is mounted. This file is what
 // remains of the old NodeNetworkCore wiring: the factory the driver's DIAL
 // actions and listeners go through, and the peer-spec parsing for the CLI.
 //

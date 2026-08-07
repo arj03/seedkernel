@@ -3,8 +3,9 @@
 // request/response through it. Everything after boot is the bundle's code.
 //
 // The second half is the claim the whole arrangement rests on: a node **replaces its
-// transport while running**, through the one install path, and comes back on the same
-// port. That is what "the protocol is replaceable without a fork" means in practice.
+// transport while running**, through the explicit transport mount, and comes back on
+// the same port. That is what "the protocol is replaceable without a fork" means in
+// practice.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -39,8 +40,8 @@ assert(transportVerified.suite === 0x02, "the shipped transport bundle is hybrid
 assert(transportVerified.authorKeys.mlDsa !== undefined, "…and carries the ML-DSA-65 public key");
 
 // A SECOND transport, version 2, signed by a different author — the realistic upgrade
-// shape, and the one that exercises both admission gates at once: `roles.transport`
-// must list the new author, and the slot's freshness floor (which v1 set to 1) must be
+// shape, and the one that exercises both admission gates at once: `transportAuthors`
+// must list the new author, and the freshness floor (which v1 set to 1) must be
 // cleared by the new version. Same guest program, because what is under test is the
 // swap and not a different protocol.
 const upgradeKeys = (() => {
@@ -56,7 +57,7 @@ function transportBundleAt(version, keys, guestSource) {
   const guest = guestSource ?? new Uint8Array(readFileSync(join(root, "transport/guest.js")));
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const manifest = {
-    app: "transport", version, role: "transport",
+    app: "transport", version,
     modules: [{ name: "ws", hash: Buffer.from(sodium.crypto_generichash(32, wsWasm)).toString("hex") }],
     guest: {
       hash: Buffer.from(sodium.crypto_generichash(32, guest)).toString("hex"),
@@ -74,6 +75,10 @@ function transportBundleAt(version, keys, guestSource) {
 
 async function makeNode(channels, listen) {
   const identity = generateKeyPair();
+  const policy = policyFromJson(JSON.stringify({
+    authors: [transportAuthor, upgradeAuthor],
+    transportAuthors: [transportAuthor, upgradeAuthor],
+  }));
   const shell = createShell({
     platform: {
       sodium, identity,
@@ -82,10 +87,8 @@ async function makeNode(channels, listen) {
       channels, listen,
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: policyFromJson(JSON.stringify({
-      authors: [transportAuthor, upgradeAuthor],
-      roles: { transport: [transportAuthor, upgradeAuthor] },
-    })),
+    admit: policy.apps,
+    admitTransport: policy.transport,
     requestDeadlineMs: 800,
   });
   await shell.loadBundleBlob(transportBlob);
@@ -129,7 +132,7 @@ const oldPort = aNet.port;
 await a.loadBundleBlob(transportBundleAt(2, upgradeKeys));
 const aNet2 = a.net;
 
-assert(aNet2 !== oldDriver, "the slot's occupant was replaced");
+assert(aNet2 !== oldDriver, "the standing transport was replaced");
 // The old driver is CLOSED, not merely dropped: its realm is gone, its links are torn
 // down and — the part that would fail loudly on a real socket — its listener is
 // released rather than left bound for the life of the process.
@@ -149,7 +152,7 @@ const resp3 = await bNet.request(aNet.peerId, proto, new Uint8Array([5, 6, 7]));
 assert(resp3.length === 3 && resp3[2] === 7, "B reaches A on the unchanged port, through the re-wired sink");
 
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
-// and a slot occupant answers to that mark like any other bundle (§12.4).
+// and the mounted transport answers to that mark like any other bundle (§12.4).
 let refused = false;
 try { await a.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
 catch { refused = true; }
@@ -157,7 +160,7 @@ assert(refused, "a lower version from the same author is refused after the upgra
 assert(a.net === aNet2, "…and the refused load left the standing transport in place");
 
 // ── A version that never ran must not consume the slot ───────────────────────────
-// A slot occupant's load is not done when its modules bind — it is done when its DRIVER
+// A transport mount's load is not done when its modules bind — it is done when its DRIVER
 // STANDS, one step later. A v3 whose guest cannot compile dies at that step. If the mark
 // had been advanced on the way in, the node would keep serving the transport it has and
 // yet never be able to reinstall it: every version it can reach now sits below a mark

@@ -339,7 +339,7 @@ const embeddedTransport = (() => {
     }
 })();
 /** Who signed the transport this artifact ships — hex, DERIVED from the blob rather
- *  than restated anywhere. This is the id an operator pins as `roles.transport` in a
+ *  than restated anywhere. This is the id an operator pins as `transportAuthors` in a
  *  policy file (§12.5), so a build with a different key needs a different entry and
  *  nothing has to be kept in step by hand. Empty if the artifact carries no transport. */
 const embeddedTransportAuthor = (() => {
@@ -408,11 +408,11 @@ let shell: Shell | null = null;
  *  — and `--policy` replaces it at boot. The shell closes over this indirection rather
  *  than over a fixed predicate, so an operator can narrow or widen trust without
  *  restarting the node; the rules themselves are entirely policy.ts's. */
-let admitPredicate = policyFromJson(null);
+let admissionPolicy = policyFromJson(null);
 /** Point the realm at a policy config (§12.5). `null` restores the deny-all default;
  *  malformed JSON throws, so a typo fails loudly rather than silently widening trust. */
 function setPolicy(json: string | null): void {
-    admitPredicate = policyFromJson(json);
+    admissionPolicy = policyFromJson(json);
 }
 /** The one shell, or a clear error if Go asked for something before booting one. */
 function theShell() {
@@ -457,12 +457,13 @@ async function makeTransportNode(cfg: {
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
             contactSecret: cfg.contactSecret, createRealm,
         },
-        admit: (v) => admitPredicate(v),
+        admit: (v) => admissionPolicy.apps(v),
+        admitTransport: (v) => admissionPolicy.transport(v),
         requestDeadlineMs: cfg.requestDeadlineMs,
         config: cfg.config,
     });
-    // The transport bundle IS the node's network: verify + govern under policy
-    // (roles.transport), install, and the shell stands the driver up. A policy that
+    // The transport bundle IS the node's network: verify + govern under the policy's
+    // `transportAuthors`, install, and the shell stands the driver up. A policy that
     // does not admit the transport author leaves the node without a network.
     if (embeddedTransport) {
         try {

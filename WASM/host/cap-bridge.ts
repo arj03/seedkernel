@@ -2,7 +2,7 @@
 // `seedkernel-wasm/cap-bridge`). Given a safe-js realm, it services the guest's
 // single `host.call(name, bytes)` seam from the host's *primitive* capabilities
 // and nothing else: crypto primitives (sumo), raw net (bytes over an opaque link id)
-// and the structured net the transport slot builds on it, fs (raw bytes under an
+// and the structured net the mounted transport builds on it, fs (raw bytes under an
 // opaque key), an installed-module call, timers, clock, and identity. Every name is
 // application-neutral — the bridge has no idea it is
 // hosting storage (or chat, or anything). All structure — content addressing,
@@ -20,24 +20,24 @@ import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
 import { type SafeRealmBridge } from "./safe-js.js";
 
-/** What `node/sign` signs under — derived by the host from the asking bundle's slot, never
- *  from anything the guest says (§12.2).
+/** What `node/sign` signs under — derived by the host from which admission point the
+ *  asking bundle came through, never from anything the guest says (§12.2).
  *
  *  **The host prefixes; it does not parse.** It signs `domain ‖ scope ‖ msg` where `msg`
  *  is opaque bytes the guest chose and the host never reads. The guarantee — this key
  *  signs channel transcripts and never app data, an app's data and never another app's —
  *  rides entirely on the prefix, which is what domain separation is for. A host that
  *  instead validated the *fields* of what it signs would have pinned one protocol's
- *  design into the core and bought nothing: a hostile occupant of a slot already holds
- *  everything that slot touches.
+ *  design into the core and bought nothing: a hostile transport already holds everything
+ *  the transport touches.
  *
- *  `key` is part of the scope because the slot picks it too: an app signs with the guest
- *  subkey, the transport slot with the node's channel key. */
+ *  `key` is part of the scope because the admission point picks it too: an app signs with
+ *  the guest subkey, the mounted transport with the node's channel key. */
 export interface SignScope {
-    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the transport slot. */
+    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the mounted transport. */
     domain: Uint8Array;
     /** Scope bytes under the domain: `author ‖ app` for an app, the network key for the
-     *  transport slot. */
+     *  mounted transport. */
     scope: Uint8Array;
     /** The keypair that signs. */
     key: {
@@ -79,7 +79,7 @@ export interface CapSodium {
     ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): Uint8Array | null;
 }
 
-/** The request/response transport the net/send name drives. The transport slot's driver
+/** The request/response transport the net/send name drives. The mounted transport's driver
  *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
  *  over `net/send`, so the bridge needs only single-peer request/response — no
  *  host-side scatter-gather. */
@@ -95,7 +95,7 @@ export interface CapTransport {
  *  machines over whole messages, which the endpoints can implement and therefore do
  *  (the transport bundle). What has no substitute is moving the bytes.
  *
- *  **Nothing here may re-enter the guest realm.** The slot occupant calls these from
+ *  **Nothing here may re-enter the guest realm.** The mounted transport calls these from
  *  inside an entrypoint, so anything that would call back into the realm has to reach it
  *  on a later turn — which every implementation does anyway, because a socket does not
  *  deliver during the write that provoked it. */
@@ -115,7 +115,7 @@ export interface RawNet {
     close(linkId: number, graceful: boolean): void;
     /** Bytes written to this link that are not yet on the wire (socket-seam.ts
      *  `RawLink.buffered`). Optional: a host whose channels cannot say omits it,
-     *  and the occupant's stall clock degrades to a plain deadline. */
+     *  and the transport's stall clock degrades to a plain deadline. */
     buffered?(linkId: number): number;
 }
 
@@ -136,14 +136,14 @@ export interface HostTimers {
 /** What the transport slot's occupant hands back — the structured face the platform does
  *  not have and every app consumes (§12.6).
  *
- *  This is the provision half of the split: the slot occupant reads raw bytes off links
+ *  This is the provision half of the split: the mounted transport reads raw bytes off links
  *  and reports *attributed* traffic here, where the host binds it to the promises apps
  *  are awaiting and to the protocol bindings that route inbound requests. Like `RawNet`,
  *  no method may re-enter the realm synchronously — `deliver` in particular answers
  *  through the `respond` entrypoint on a later turn, which is also what keeps an
  *  asynchronous app handler possible. */
 export interface TransportSink {
-    /** An inbound request from `from`, already attributed by the slot occupant. */
+    /** An inbound request from `from`, already attributed by the mounted transport. */
     deliver(corr: number, noReply: boolean, from: Uint8Array, proto: Uint8Array, payload: Uint8Array): void;
     /** Settle an app's outbound request: `ok` ⇒ `payload` is the response, otherwise it is
      *  a utf8 failure message. */
@@ -421,11 +421,11 @@ globalThis.__invoke = (name, argBuf) => {
  *  vocabulary beside the names, and so the bridge's own prefix check cannot drift from
  *  the list a manifest is checked against. */
 export { CAP_DOMAINS } from "../core/domains.js";
-/** Which domains only a slot occupant may declare — see the note in domains.ts, where it
- *  is declared for the same reason `GUEST_ABI_VERSION` is: the loader checks a manifest
- *  field without importing this name catalog. Re-exported so a reader of the seam
- *  finds the restriction beside the domains it restricts. */
-export { SLOT_ONLY_DOMAINS } from "../core/domains.js";
+/** Which domains only the transport mount may declare — see the note in domains.ts, where
+ *  it is declared for the same reason `GUEST_ABI_VERSION` is: the loader checks a
+ *  manifest's caps without importing this name catalog. Re-exported so a reader of the
+ *  seam finds the restriction beside the domains it restricts. */
+export { MOUNT_ONLY_DOMAINS } from "../core/domains.js";
 /** The host-derived scope the node/sign name binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
@@ -587,7 +587,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     };
     const sink = () => {
         if (!deps.transportSink)
-            throw new Error("cap-bridge: the transport names are the slot occupant's, and this bridge serves no slot");
+            throw new Error("cap-bridge: the transport names are the mounted transport's, and this bridge is not it");
         return deps.transportSink;
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
@@ -693,7 +693,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // No peer, no protocol id, no correlation — those are the transport slot's
         // OUTPUT (transport/* below), which an app reaches through the ordinary `net`
         // domain. Inbound bytes arrive the other way, as ordinary entrypoint
-        // invocations on the slot occupant's guest.
+        // invocations on the mounted transport's guest.
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);

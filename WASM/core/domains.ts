@@ -115,14 +115,22 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  whose every name must carry one of these prefixes (checked at construction), so the
  *  two cannot drift. */
 export const CAP_DOMAINS: readonly string[] = ["node", "net", "fs", "clock", "timer", "link", "transport"];
-/** The capability domains only a SLOT occupant may declare (§12.5). `link` is what the
- *  transport slot consumes — sockets behind opaque link ids, the whole of what the
+/** The capability domains only the shell's transport MOUNT may declare (§12.5). `link` is
+ *  what the mount consumes — sockets behind opaque link ids, the whole of what the
  *  platform contributes to the network — and `transport` is what it provides back: the
  *  attributed peer, protocol id and correlation every other app's `net` domain reaches.
- *  Neither is an app capability, and the loader refuses either to a manifest claiming no
- *  role. `timer` is deliberately NOT here: it is an ordinary authority, and the transport
- *  happening to want one is not a reason to make it a privilege. */
-export const SLOT_ONLY_DOMAINS: readonly string[] = ["link", "transport"];
+ *  Neither is an app capability: a manifest declaring them is governed by the policy's
+ *  transport half rather than its app half, and mounted as the node's transport rather
+ *  than bound as an app. This list IS what says which bundle that is — there is no role
+ *  field, because the caps already carry the fact and the signature already covers them.
+ *  `timer` is deliberately NOT here: it is an ordinary authority, and the transport
+ *  happening to want one is not a reason to make it a privilege.
+ *
+ *  A subset of `CAP_DOMAINS` — declared beside it, and derived from by the one predicate
+ *  both admission paths ask (`mountOnlyCaps`, bundle.ts), so the vocabulary the app path
+ *  refuses and the vocabulary the mount path requires cannot drift from each other or
+ *  from the domains they name. */
+export const MOUNT_ONLY_DOMAINS: readonly string[] = ["link", "transport"];
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

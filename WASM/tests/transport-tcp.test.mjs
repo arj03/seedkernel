@@ -35,6 +35,10 @@ const HOST = "127.0.0.1";
 
 async function makeNode(ws = false) {
   const identity = generateKeyPair();
+  const policy = policyFromJson(JSON.stringify({
+    authors: [transportAuthor],
+    transportAuthors: [transportAuthor],
+  }));
   const shell = createShell({
     platform: {
       sodium, identity,
@@ -45,10 +49,8 @@ async function makeNode(ws = false) {
       ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: policyFromJson(JSON.stringify({
-      authors: [transportAuthor],
-      roles: { transport: [transportAuthor] },
-    })),
+    admit: policy.apps,
+    admitTransport: policy.transport,
     requestDeadlineMs: 2000,
   });
   await shell.loadBundleBlob(transportBlob);

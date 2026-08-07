@@ -39,12 +39,13 @@ export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
 
-/** The policy every harness node runs under: the transport author is admitted
- *  for the transport role (the app-allowlist entry is parsePolicy's minimum). */
+/** The policy every harness node runs under: the transport author, trusted for both
+ *  admission classes, so a harness node can load an app bundle as well as its
+ *  transport without a second key. */
 export function transportPolicy(authorHex) {
   return policyFromJson(JSON.stringify({
     authors: [authorHex],
-    roles: { transport: [authorHex] },
+    transportAuthors: [authorHex],
   }));
 }
 
@@ -54,6 +55,7 @@ export function transportPolicy(authorHex) {
  *  and to the shell's createShell opts (requestDeadlineMs, transportHalfOpen). */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
+  const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor());
   const shell = createShell({
     platform: {
       sodium: opts.sodium ?? sodium,
@@ -68,7 +70,8 @@ export async function makeTransportHost(opts = {}) {
       connsPerPeer: opts.connsPerPeer,
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: transportPolicy(opts.transportAuthorHex ?? transportAuthor()),
+    admit: policy.apps,
+    admitTransport: policy.transport,
     requestDeadlineMs: opts.requestDeadlineMs,
     transportHalfOpen: opts.transportHalfOpen,
   });

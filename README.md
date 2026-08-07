@@ -40,7 +40,7 @@ Four things follow, and together they are most of what the core is:
 
 - **One seam, name-addressed.** A guest reaches a primitive by name through the same `host.call` it uses for everything else: `host.call("crypto/blake2b-256", …)`, and the host holds the catalog: `crypto/x25519/dh`, `crypto/chacha20poly1305-ietf/seal`, `crypto/ml-kem-768/encaps`. A new algorithm is a catalog entry — no op number, no ABI rev, no capability domain. A host missing a name refuses the load *by name*.
 - **A pure transform is not a capability.** A function of bytes the guest already holds is computation it could have done itself — correct and fast rather than permitted. So the seam holds **primitives**, which are free, and **authorities**, which reach something no confined module can hold: the node key, the entropy source, the clock, a socket, the disk.
-- **Signing is domain separation, not parsing.** The node's Ed25519 key never leaves the host, so a module that needs a signature asks for one — and the host signs `DOMAIN ‖ scope ‖ opaque`, choosing the domain from the asking bundle's slot, over a suffix it does not read.
+- **Signing is domain separation, not parsing.** The node's Ed25519 key never leaves the host, so a module that needs a signature asks for one — and the host signs `DOMAIN ‖ scope ‖ opaque`, choosing the domain from which admission point the asking bundle came through, over a suffix it does not read.
 - **Raw net is the capability; structured net is what the transport provides.** The raw capability is an opaque link id with bytes in and out — the socket-side twin of `fs`. The transport bundle consumes that and *provides* the attributed peer, protocol id and correlation every app reaches, unchanged on the app's side.
 
 **Capability-by-non-wiring makes raw I/O core permanently, not just at boot.** A confined module holds no ambient authority by construction (§12.2), so it can never hold a file descriptor, at any point in the process's life, no matter what has already been installed. The host owns the socket forever.
@@ -49,16 +49,16 @@ What survives all of this is a socket seam with its flood limits, an entropy sou
 
 ## The transport is a bundle
 
-The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle claiming the `transport` role. It is a **guest**, not a WASM module, and the reason is structural: a §4 module is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
+The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle mounted as the node's transport. It is a **guest**, not a WASM module, and the reason is structural: a §4 module is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
 
 What this buys is that the **protocol** is replaceable without a fork: the handshake's messages, its transcript, the record framing and the dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime.
 
 Two properties make that safe:
 
-- **A transport module is an authority grant, not a preference.** Admitting an ordinary app risks that app; admitting a transport risks the channel, which sees all plaintext and holds the session keys. `roleAllowlist` admits per slot, and an author trusted for apps cannot land a transport without a second deliberate `roles` entry (§12.5).
+- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; admitting a transport risks the channel, which sees all plaintext and holds the session keys — so the two answer to separate policy entries, `authors` and `transportAuthors`. There is no role field a bundle claims for itself: which entry governs it is read off `guest.caps`, and asking for `link` moves a bundle onto the stricter list rather than off it, so an author trusted for apps gains nothing by asking (§12.5).
 - **The suite byte makes a mixed period a rollout rather than a corruption.** One suite per link, unknown ids close the connection, and the byte is covered by both signatures and read before verification (§12.6). An in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies.
 
-**It can be swapped under a running node.** A second bundle claiming the slot goes through the ordinary `loadBundle` path: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the occupant confineable. An upgrade is a **reconnect**.
+**It can be swapped under a running node.** A second transport bundle loads the ordinary way: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
 
 The bundle ships inside the host artifact, which closes the metadata window a first fetch would open. Fetching one over raw net — a node bootstrapping its transport from a peer it does not yet trust — is a separate feature and is not implemented.
 
@@ -157,14 +157,14 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
 
-**Shared — compiled once, run by all three targets (2,070 LOC)**
+**Shared — compiled once, run by all three targets (2,045 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 563 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 546 |
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 404 |
-| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 398 |
+| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 390 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 260 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
@@ -182,8 +182,8 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,442 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,381 Go + 335 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,444 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,381 Go + 336 TS |
 
 **Signed content — not host code at all**
 
@@ -191,7 +191,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,247 + 5 KB |
 
-Each target therefore runs 2,070 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,045 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 
@@ -205,7 +205,7 @@ The two migrations are on independent clocks and are scheduled on opposite princ
 
 **The channel suite can wait for a credible break,** because when one arrives the fix is a bundle rollout. Its primitive is already provisioned: `ml-kem-768/{keypair,encaps,decaps}` are in the catalog on all three targets, pinned to NIST's ACVP vectors. A KEM is the PQ stand-in for the DH step of the channel's key agreement: `encaps(pk)` wraps a fresh shared secret in a public key and `decaps(sk, ct)` unwraps it, where the current suite computes the same secret with `x25519/dh` over the two ephemerals. A `0x03` suite is expected to run both — msg1 gains the initiator's ML-KEM encapsulation key, msg2 the responder's ciphertext, and the KEM secret joins the DH secret in the key schedule — so the classical half stays load-bearing while the PQ half is young, and only the handshake widths change, never the record layer. That was the only part of a PQ channel that could not have been shipped as content — a bundle is replaceable, the vocabulary it draws on is not, so a core vocabulary is provisioned ahead of need or not at all (§14.1).
 
-**What that leaves open.** The bundle clock is closed, and the symmetric half needs no clock at all: the ChaCha20-Poly1305 record layer, the catalog's seal/open and the BLAKE2b hashes are already PQ-safe, because a quantum computer threatens only discrete-log and signature keys, never 256-bit symmetric or hash work. The channel clock is the one still running — its session keys are ephemeral X25519, the harvest-now exposure: ciphertext recorded today decrypts when the DH problem breaks, and no retrofit can change that, which is why the `0x03` KEM rollout is the remaining deadline. Nothing else about that fix is missing: the primitive is provisioned, the handshake is a state machine in the transport bundle's guest program, and a replacement bundle claiming the transport slot goes through the ordinary `loadBundle` path — swapped under a running node, no rebuild. Its transcript signatures stay Ed25519 on purpose, because a forgery is only live (it cannot retroactively install a bundle) and so that half can genuinely wait for a credible break. One entry the two clocks missed is the guests' own Ed25519 signatures ([SECURITY §14.2](docs/SECURITY.md)), whose clock depends on the record's lifetime like the AUTH half.
+**What that leaves open.** The bundle clock is closed, and the symmetric half needs no clock at all: the ChaCha20-Poly1305 record layer, the catalog's seal/open and the BLAKE2b hashes are already PQ-safe, because a quantum computer threatens only discrete-log and signature keys, never 256-bit symmetric or hash work. The channel clock is the one still running — its session keys are ephemeral X25519, the harvest-now exposure: ciphertext recorded today decrypts when the DH problem breaks, and no retrofit can change that, which is why the `0x03` KEM rollout is the remaining deadline. Nothing else about that fix is missing: the primitive is provisioned, the handshake is a state machine in the transport bundle's guest program, and a replacement bundle loads like any other — swapped under a running node, no rebuild. Its transcript signatures stay Ed25519 on purpose, because a forgery is only live (it cannot retroactively install a bundle) and so that half can genuinely wait for a credible break. One entry the two clocks missed is the guests' own Ed25519 signatures ([SECURITY §14.2](docs/SECURITY.md)), whose clock depends on the record's lifetime like the AUTH half.
 
 ## Get started
 

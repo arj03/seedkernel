@@ -113,46 +113,6 @@ func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, 
 	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, caps), guestSrc)
 }
 
-// writeSlotBundle is writeBundle for a bundle that CLAIMS A SLOT (§12.4): a stub-guest
-// manifest carrying `role`. Deliberately NOT the shape of the real transport bundle,
-// which ships a real guest — nothing here is ever run, because the point is admission: a
-// slot occupant is an authority grant with its own class (§12.5), so the native tests
-// need a bundle the ordinary author allowlist must refuse. `role` is inside the signed
-// JSON, which is why this signs its own body rather than post-editing one.
-func writeSlotBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, role string) string {
-	t.Helper()
-	type mod struct {
-		Name string `json:"name"`
-		Hash string `json:"hash"`
-	}
-	type guest struct {
-		Hash string   `json:"hash"`
-		Abi  int      `json:"abi"`
-		Caps []string `json:"caps"`
-	}
-	mjson, err := json.Marshal(struct {
-		App     string `json:"app"`
-		Version int    `json:"version"`
-		Role    string `json:"role"`
-		Modules []mod  `json:"modules"`
-		Guest   guest  `json:"guest"`
-	}{
-		App: app, Version: version, Role: role,
-		Modules: []mod{{
-			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
-		}},
-		Guest: guest{
-			Hash: hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
-			Abi:  guestABIVersion, Caps: []string{},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	path, _ := signBundleJSON(t, priv, pub, app, mjson, stubGuestSrc)
-	return path
-}
-
 // signBundleJSON wraps a finished manifest body in the suite-0x01 envelope and packs it.
 func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, mjson []byte, guestSrc string) (string, string) {
 	t.Helper()

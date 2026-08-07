@@ -34,11 +34,11 @@ func bootRealmIn(tb testing.TB, dir string) {
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
-// withTransportRole adds the artifact's own transport author to a policy's
-// roles.transport. A node whose policy does not admit a transport bundle has no
+// withTransportAuthor adds the artifact's own transport author to a policy's
+// transportAuthors. A node whose policy does not admit a transport bundle has no
 // network at all — which is also what a deliberate deny-all looks like, so the two
 // must not be confused by accident in a test.
-func withTransportRole(tb testing.TB, policyJSON string) string {
+func withTransportAuthor(tb testing.TB, policyJSON string) string {
 	tb.Helper()
 	author := evalString(tb, "embeddedTransportAuthor")
 	if author == "" {
@@ -52,7 +52,7 @@ func withTransportRole(tb testing.TB, policyJSON string) string {
 	}
 	authors, _ := p["authors"].([]any)
 	p["authors"] = append(authors, author)
-	p["roles"] = map[string]any{"transport": []string{author}}
+	p["transportAuthors"] = []string{author}
 	out, err := json.Marshal(p)
 	if err != nil {
 		tb.Fatal("policy json:", err)
@@ -73,7 +73,7 @@ func evalString(tb testing.TB, expr string) string {
 func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStatus {
 	tb.Helper()
 	bootRealmIn(tb, dir)
-	policyJSON = withTransportRole(tb, policyJSON)
+	policyJSON = withTransportAuthor(tb, policyJSON)
 	cfg := nodeConfig{KeyHex: testKeyHex(tb), ContactSecretHex: testContactSecretHex, Listen: listen, RequestDeadline: 2000}
 	if policyJSON != "" {
 		cfg.PolicyJSON = &policyJSON

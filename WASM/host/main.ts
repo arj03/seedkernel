@@ -70,8 +70,8 @@ export interface ShellOptions {
     channels?: ChannelFactory;
     /** The signed transport bundle blob. Defaults to the one shipped in the
      *  artifact (transport-bundle.ts); the operator's policy must admit its author
-     *  for the transport role. A shell without an admitted transport bundle has no
-     *  network. */
+     *  under `transportAuthors` (never the app allowlist). A shell without an
+     *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
     /** Live connected peers for the net/peers name. The transport owns
      *  connectivity; this closure feeds it into the cap-bridge. */
@@ -164,6 +164,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
     const channels = opts.channels ?? new NodeChannelFactory();
     // ── Assemble the shared shell ───────────────────────────────────────────────
+    const policy = policyFromJson(opts.policyJson);
     const core = createShell({
         platform: {
             sodium: sodium as unknown as ShellSodium, identity: opts.identity,
@@ -173,25 +174,25 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
             contactSecret: opts.contactSecret, networkKey: opts.networkKey,
             createRealm, livePeers: opts.livePeers,
         },
-        admit: policyFromJson(opts.policyJson),
+        admit: policy.apps,
+        admitTransport: policy.transport,
         requestDeadlineMs: opts.requestDeadlineMs,
         guestDeadlineMs: opts.guestDeadlineMs,
         realmMemoryBytes: opts.realmMemoryBytes,
         config: opts.config,
     });
     // ── Load the transport bundle: the node's network (§12.6) ───────────────────
-    // The ONE install path, like any other bundle: verify, govern under policy
-    // (roles.transport), install, and — because it claims the transport role —
-    // stand the driver up. A policy that does not admit the transport author
-    // leaves the node without a network, which is a deliberate configuration
-    // ("this node does not speak to anyone"), not an error.
+    // The ONE install path, like any other bundle: verify, govern under policy, install,
+    // and — because it declares the mount-only caps — stand the driver up. A policy that
+    // does not admit the transport author leaves the node without a network, which is a
+    // deliberate configuration ("this node does not speak to anyone"), not an error.
     if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {
         try {
             await core.loadBundleBlob(opts.transportBundle ?? EMBEDDED_TRANSPORT!);
         }
         catch (err) {
             if (isAdmissionRejected(err)) {
-                console.warn("  no transport: the policy does not admit a bundle for the transport role");
+                console.warn("  no transport: the policy's transportAuthors does not admit this bundle");
             }
             else {
                 throw err;
