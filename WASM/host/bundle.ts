@@ -119,15 +119,6 @@ export interface BundleManifest {
      *  a persisted per-`(author, app)` high-water mark: a load whose `version` is below
      *  the mark is refused as a downgrade. An integer, not a label. */
     version: number;
-    /** Protocol ids this app can serve (README §12.10). Absent ⇒ `[app]`, so an app that
-     *  speaks only its own protocol declares nothing.
-     *
-     *  A DECLARATION, not a claim. It makes the app *eligible* for a binding and confers no
-     *  traffic on its own: delivery follows the shell's user-owned `protocol id → app key`
-     *  table, so any number of bundles may declare the same id without contending for
-     *  anything. That separation — landing code is authorized by policy, receiving messages
-     *  is chosen by the user — is what lets the loader hold no ownership state at all. */
-    handles?: string[];
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
      *  integrity-checks `guest.js` and hands the source back for the shell to run in a
@@ -336,11 +327,6 @@ export function appKeyFor(author: Uint8Array, app: string): string {
 export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
 }
-/** The protocol ids a manifest offers to serve (README §12.10), defaulting to `[app]`.
- *  One place applies the default so a shell never has to remember it. */
-export function handlesOf(manifest: BundleManifest): string[] {
-    return manifest.handles && manifest.handles.length > 0 ? manifest.handles : [manifest.app];
-}
 /** Which mount halves (§12.5) a manifest's `requires` covers — the `mount:…` groups of
  *  the authorities it names, read straight off the catalog (`AUTHORITY_CALLS`), never
  *  off a prefix parsed out of a name.
@@ -507,32 +493,17 @@ function isValidManifest(m: unknown): m is BundleManifest {
     const o = m as Record<string, unknown>;
     // `app` is load-bearing beyond reporting: it scopes the guest's signing namespace
     // (guestSignScope), keys the freshness high-water mark, and is half of the app key
-    // every one of its modules binds under (appKeyFor). It is also the DEFAULT protocol
-    // id (handlesOf) — and protocol ids cross the seam in one byte (`net/send`,
-    // `transport/deliver`), while guestSignScope refuses an app over 255 bytes. A name
-    // above that limit would be a bundle this host can verify and install but can never
-    // actually serve — its first guest call would throw and no frame could address it —
-    // so the limit is enforced HERE, at load, where the refusal names the rule. Bytes,
-    // not characters: the scope and the wire both count UTF-8 bytes.
+    // every one of its modules binds under (appKeyFor). guestSignScope encodes the app
+    // name in one length byte, so a name above 255 bytes would be a bundle this host can
+    // verify and install but can never actually serve — its first guest call would throw.
+    // The limit is enforced HERE, at load, where the refusal names the rule. Bytes, not
+    // characters: the scope counts UTF-8 bytes.
     if (typeof o.app !== "string" || o.app.length === 0)
         return false;
     if (enc.encode(o.app).length > 255)
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
         return false;
-    // `handles` is optional (absent ⇒ [app], see handlesOf). Present, it must be a list of
-    // non-empty strings — it is only ever compared against a protocol id off the wire, so
-    // the shape is the whole check: an id confers nothing until a user binds it (§12.10).
-    // Each id is held to the same 255-byte limit as the app default it replaces — a
-    // protocol id crosses the seam in one length byte, so a longer declared id could
-    // never be the id of anything on the wire.
-    if (o.handles !== undefined) {
-        if (!Array.isArray(o.handles))
-            return false;
-        for (const h of o.handles)
-            if (typeof h !== "string" || h.length === 0 || enc.encode(h).length > 255)
-                return false;
-    }
     if (!Array.isArray(o.modules))
         return false;
     const seen = new Set();

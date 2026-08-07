@@ -94,6 +94,16 @@ func ask(t *testing.T, holderID, proto string, payload []byte) []byte {
 	return out
 }
 
+// bindProto points a wire protocol at an installed app (§12.10) — the operator's one
+// action. Install is inert: nothing in loadBundle bound a protocol, so a test that
+// wants a protocol answered has to say which app answers it.
+func bindProto(t *testing.T, proto, appKey string) {
+	t.Helper()
+	if _, err := callRealm("bind", 5*time.Second, qc.NewString(proto), qc.NewString(appKey)); err != nil {
+		t.Fatal("bind:", err)
+	}
+}
+
 // serveNode boots a listening node under a policy admitting `authorPub`, and returns
 // its status once it is serving.
 func serveNode(t *testing.T, authorPub []byte) nodeStatus {
@@ -111,15 +121,17 @@ func TestServeGuestApp(t *testing.T) {
 	author, authorPub := testAuthor(t)
 	st := serveNode(t, authorPub)
 	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
-	if status := loadBundle(bundlePath); status != "holderapp v1  handles=[holderapp]" {
+	holderKey := appKeyFor(authorPub, "holderapp")
+	if status := loadBundle(bundlePath); status != "holderapp v1  key "+holderKey {
 		t.Fatalf("bundle load: %s", status)
 	}
+	// The operator's one action (§12.10): install bound nothing, so the protocol is
+	// pointed at the app explicitly.
+	bindProto(t, "holderapp", holderKey)
 	if _, err := callRealm("serve", 10*time.Second); err != nil {
 		t.Fatal("serve:", err)
 	}
 	startRequester(t, st.PeerID, st.Port)
-
-	// The app declares no `handles`, so it serves its own name (§12.10).
 	key := []byte("greeting")
 	val := []byte("held by the cohort")
 	fsFrame := make([]byte, 4+len(key)+len(val)) // [klen u32][key][bytes]
@@ -150,17 +162,24 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	st := serveNode(t, authorPub)
 
 	// Two guest apps from one author under two app names — so they derive disjoint
-	// table names (§5.1) and bind their own protocols. The holder guest reads fs; the
-	// echo guest forwards to its own "fwd" module, which echoes its input — so the echo
-	// app's response IS whatever the shell handed the guest.
+	// table names (§5.1). The holder guest reads fs; the echo guest forwards to its own
+	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
+	// shell handed the guest. Each protocol reaches its own app because the operator
+	// bound it there, not because the bundles claimed anything.
 	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
-	if status := loadBundle(guestBundle); status != "holderapp v1  handles=[holderapp]" {
+	holderKey := appKeyFor(authorPub, "holderapp")
+	if status := loadBundle(guestBundle); status != "holderapp v1  key "+holderKey {
 		t.Fatalf("guest bundle load: %s", status)
 	}
 	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, echoGuestSource, nil)
-	if status := loadBundle(echoBundle); status != "echoapp v1  handles=[echoapp]" {
+	echoKey := appKeyFor(authorPub, "echoapp")
+	if status := loadBundle(echoBundle); status != "echoapp v1  key "+echoKey {
 		t.Fatalf("echo bundle load: %s", status)
 	}
+	// Install is inert (§12.10): the two bundles landed unbound, and the operator's
+	// explicit binds are the only reason these protocols have destinations.
+	bindProto(t, "holderapp", holderKey)
+	bindProto(t, "echoapp", echoKey)
 	if _, err := callRealm("serve", 10*time.Second); err != nil {
 		t.Fatal("serve:", err)
 	}

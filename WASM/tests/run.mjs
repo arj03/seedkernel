@@ -308,26 +308,82 @@ async function testDerivedNamesKeepAuthorsApart() {
   console.log("  OK\n");
 }
 
-// ─── Test: the `handles` declaration is inert (§12.10) ──────────────────
+// ─── Test: installation is inert — a bundle lands serving no protocol (§12.10) ──
+//
+// Protocol choice is explicitly operator-owned. Landing a bundle writes nothing to the
+// bindings table: there is no declared list to honor, no default to the app's own name,
+// and no update rule to inherit a binding. A protocol gains a destination only through
+// the operator's one action — `shell.bind("seedstore/v1", appKey)` — and nothing else.
+async function testInstallIsInert() {
+  console.log("Test: installation is inert — a bundle lands serving no protocol (§12.10)");
+  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { admitAll, denyAll } = await imp("build/host/policy.js");
 
-async function testHandlesIsADeclarationNotAClaim() {
-  console.log("Test: `handles` is a declaration, not a claim (§12.10)");
+  const author = generateKeyPair();
+  const blob = (version) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
+      app: "store", version,
+      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST(),
+    }),
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  const shell = mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
+    },
+    admit: admitAll, admitTransport: denyAll,
+  });
+  try {
+    const key = appKey(author.publicKey, "store");
+    await shell.loadBundleBlob(blob(1));
+    assert(shell.host.isBound(key, "fwd"), "the bundle's modules are installed");
+    assert(shell.bindings.boundApp("store") === null,
+      "no protocol is bound — install wrote nothing to the bindings table");
+    assert(shell.bindings.boundApp("seedstore/v1") === null, "there is no default binding either");
 
-  const { handlesOf } = await imp("build/host/bundle.js");
+    // The operator's one action is the only way a protocol gains a destination.
+    shell.bind("seedstore/v1", key);
+    assert(shell.bindings.boundApp("seedstore/v1") === key,
+      "an explicit bind is the only way a protocol gains a destination");
+    assert(shell.bindings.boundApp("store") === null,
+      "…and it names exactly the protocol the operator chose, not the app's own name");
 
-  // Absent ⇒ [app]: an app that speaks only its own protocol declares nothing.
-  assertEqual(JSON.stringify(handlesOf({ app: "chat", version: 1, modules: [] })),
-    JSON.stringify(["chat"]), "absent handles defaults to [app]");
+    // The one thing an operator cannot do is name an app that is not here. With install
+    // inert, a mistyped key is otherwise a node that boots clean and answers an empty
+    // body on that protocol forever — so it is refused at the bind, naming the key.
+    let threw = false;
+    try { shell.bind("chat", appKey(generateKeyPair().publicKey, "store")); }
+    catch (e) { threw = /no app/.test(String(e)); }
+    assert(threw, "binding a protocol to an app key nothing is installed under is refused");
+    assert(shell.bindings.boundApp("chat") === null, "…and the refused bind wrote nothing");
 
-  // Any number of apps may declare the same protocol. Nothing in the loader arbitrates
-  // between them, because declaring confers no traffic — a binding does, and that is the
-  // shell's user-owned table (§12.10), not loader state.
-  const mine  = { app: "chat", version: 1, modules: [], handles: ["chat"] };
-  const yours = { app: "natter", version: 1, modules: [], handles: ["chat"] };
-  assertEqual(JSON.stringify(handlesOf(mine)), JSON.stringify(["chat"]), "explicit handles kept");
-  assertEqual(JSON.stringify(handlesOf(yours)), JSON.stringify(["chat"]),
-    "a second app may declare the same protocol");
+    // A legacy bundle carrying the removed `handles` field still loads — the field is a
+    // dead key now, ignored by the schema — but binds nothing, not even into a vacancy.
+    const legacy = packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
+        app: "legacy", version: 1, handles: ["chat", "natter"],
+        modules: [], guest: GUEST(),
+      }),
+      [GUEST_FILE]: GUEST_BYTES,
+    });
+    await shell.loadBundleBlob(legacy);
+    assert(shell.bindings.boundApp("chat") === null, "a legacy `handles` declaration binds nothing");
+    assert(shell.bindings.boundApp("natter") === null, "…not even into a vacancy");
 
+    // An update (same author, same app name, higher version) re-lands on the same app
+    // key and changes nothing about the table — there is no inheritance to apply.
+    await shell.loadBundleBlob(blob(2));
+    assert(shell.bindings.boundApp("seedstore/v1") === key,
+      "an update leaves the operator's binding untouched — nothing re-applies or inherits it");
+
+    // Uninstall takes the app's bindings with it; the app does not linger as a route.
+    shell.uninstall(key);
+    assert(shell.bindings.boundApp("seedstore/v1") === null, "uninstall drops the app's bindings");
+  } finally { shell.close(); }
   console.log("  OK\n");
 }
 
@@ -2168,26 +2224,24 @@ async function testWrongTypedStoreIsRefused() {
 
 // ─── Test: an app the runtime cannot serve is refused at load ────────────────
 //
-// Finding guard: `app` is the default protocol id and the guest's signing scope,
-// both of which cap at 255 UTF-8 bytes (the wire's one-byte protocol length, and
-// guestSignScope). A longer name passed verification, installed, and then failed
-// at first use — a bundle the host can verify and install but can never serve
-// (§12.2, §12.4).
+// Finding guard: `app` is the guest's signing scope, which caps at 255 UTF-8 bytes
+// (guestSignScope's one-byte length). A longer name passed verification, installed, and
+// then failed at first use — a bundle the host can verify and install but can never
+// serve (§12.2, §12.4).
 async function testAppNameLengthRefused() {
-  console.log("Test: an over-long app name (or declared handle) is refused at load, not at first use");
+  console.log("Test: an over-long app name is refused at load, not at first use");
   const { verifyManifest, signManifest } = await imp("build/host/bundle.js");
   const author = generateKeyPair();
   const mk = (app, extra = {}) => signManifest(sodium, author.privateKey, author.publicKey,
     { app, version: 1, modules: [], guest: GUEST(), ...extra });
 
-  // At the limit, everything works — 255 bytes is exactly what the seam can carry.
-  assert(verifyManifest(sodium, mk("a".repeat(255), { handles: ["b".repeat(255)] })) !== null,
-    "a 255-byte app name and a 255-byte declared handle verify");
+  // At the limit, everything works — 255 bytes is exactly what the scope can carry.
+  assert(verifyManifest(sodium, mk("a".repeat(255))) !== null,
+    "a 255-byte app name verifies");
 
   for (const [what, env] of [
     ["a 256-byte app name", mk("a".repeat(256))],
-    ["a 256-byte declared handle", mk("app", { handles: ["b".repeat(256)] })],
-    // The limit counts UTF-8 BYTES, the unit both the scope and the wire use.
+    // The limit counts UTF-8 BYTES, the unit the scope uses.
     ["a 200-char (600-byte) UTF-8 app name", mk("\u{1f600}".repeat(200))],
   ]) {
     let threw = false;
@@ -2286,7 +2340,7 @@ await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
-await testHandlesIsADeclarationNotAClaim();
+await testInstallIsInert();
 await testInstallerRemove();
 await testFs();
 await testFsKeyRule();

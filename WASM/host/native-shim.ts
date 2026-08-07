@@ -528,11 +528,16 @@ async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
         app: b.manifest.app,
         version: b.manifest.version,
         author: toHex(b.author),
-        // The protocols this app actually ended up serving (§12.10) — auto-bound inside
-        // loadBundleBlob, so this reports what happened rather than what was declared.
-        // For the operator's console line and nothing else.
-        handles: theShell().bindings.boundProtocols(appKeyFor(b.author, b.manifest.app)),
+        // The app key the operator's `bind` names — install is inert (§12.10), so the
+        // console line prints the key a protocol must be explicitly bound to.
+        appKey: appKeyFor(b.author, b.manifest.app),
     }));
+}
+/** Point a wire protocol at an installed app (§12.10) — the operator's one action,
+ *  with nothing inferred: no defaults, no install-time auto-binding. The bundle's
+ *  load above landed code and nothing else. */
+function bind(proto: string, appKey: string): void {
+    theShell().bind(proto, appKey);
 }
 /** Run a loaded bundle's guest entrypoint as the *initiator* (§12.8) — the
  *  `--put` / `--get` one-shots. Arguments and results cross as raw bytes. */
@@ -589,4 +594,4 @@ globalThis.__start = function (id, entry, arg) {
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { bootNode, setPolicy, loadBundleBlob, bind, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

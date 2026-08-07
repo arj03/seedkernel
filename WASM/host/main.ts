@@ -206,6 +206,8 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     return {
         host: core.host,
         bindings: core.bindings,
+        bind: core.bind,
+        unbind: core.unbind,
         net: core.net,
         transport: core.transport,
         // boot() always supplies an fs (Node always has a filesystem), so the optional
@@ -373,6 +375,16 @@ export async function main(): Promise<void> {
     if (args["bundle"]) {
         const b = await shell.loadBundle(str(args, "bundle")!);
         console.log(`  bundle ${b.manifest.app} v${b.manifest.version}`);
+    }
+    // The operator's routing table (§12.10), applied explicitly: install is inert —
+    // the bundle above landed code and nothing else, and these binds are the only way
+    // a protocol gains a destination.
+    for (const spec of list("bind")) {
+        const eq = spec.indexOf("=");
+        if (eq <= 0 || eq === spec.length - 1)
+            throw new Error(`--bind: want proto=appKey, got ${JSON.stringify(spec)}`);
+        shell.bind(spec.slice(0, eq), spec.slice(eq + 1));
+        console.log(`  bind ${spec.slice(0, eq)} → ${spec.slice(eq + 1)}`);
     }
     // One-shot client ops through the loaded guest — "the shell runs the app" as the
     // *initiator* (README §12.8). The request side is served below once we start

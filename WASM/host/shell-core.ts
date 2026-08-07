@@ -18,7 +18,7 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
-import { appKeyFor, appScopeFor, handlesOf, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
@@ -208,8 +208,21 @@ export interface Shell {
      *  check occupancy. installWasmModule is NOT on this interface — code lands
      *  only via loadBundleBlob (§12.4). */
     host: ModuleLookup;
-    /** Protocol bindings (§12.10): which app handles which protocol. */
+    /** Protocol bindings (§12.10): the operator-owned routing table. A protocol gains a
+     *  destination only through `bind` below — installation is inert and writes nothing
+     *  here. */
     bindings: Bindings;
+    /** The one way a protocol gains a destination (§12.10). Install is inert: a bundle
+     *  lands and serves nothing until the operator points a wire protocol at its app key,
+     *  `shell.bind("seedstore/v1", appKey)`. Rebinding is the operator's move too — a
+     *  protocol's destination changes by a second `bind`, never by an install or update.
+     *
+     *  Throws if no app is installed under `appKey`: the routing is the operator's, but a
+     *  destination that does not exist is a mistake rather than a choice, and the only
+     *  other way it surfaces is silence on the wire. */
+    bind(proto: string, appKey: string): void;
+    /** Drop a protocol's destination; the app stays installed. */
+    unbind(proto: string): void;
     /** The transport bundle's driver — the node's Network. Absent until the
      *  transport bundle is mounted; a shell without one has no net. */
     net: Network;
@@ -639,6 +652,19 @@ export function createShell(opts: CreateShellOptions & {
     return {
         host,
         bindings,
+        bind: (proto, appKey) => {
+            // A binding names an app that is here. Refusing an unknown key at bind time
+            // is the whole reason this wrapper exists: with install inert (§12.10), a
+            // mistyped key is no longer impossible the way it was when the load wrote the
+            // table, and its only other symptom is `dispatch` resolving to nothing — a
+            // node that boots clean and answers an empty body forever. The transport key
+            // is unknown here by the same rule that keeps it out of `apps`: it is not an
+            // app and receives no dispatch, so a protocol bound to it could never arrive.
+            if (!apps.has(appKey))
+                throw new Error(`shell: bind ${JSON.stringify(proto)}: no app ${JSON.stringify(appKey)} is installed`);
+            bindings.bind(proto, appKey);
+        },
+        unbind: (proto) => bindings.unbind(proto),
         // Both fields are the transport driver, reached through the indirection so
         // the shell can be assembled before any bundle loads.
         get net() { return netHost ?? { endpoint: () => noTransport("net is unavailable") }; },
@@ -699,12 +725,11 @@ export function createShell(opts: CreateShellOptions & {
             // (§12.4: the mark records the highest version that actually loaded).
             const loaded = installBundle(host, v, platform.freshnessStore, isMount);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
-            // A transport is not an app: it binds no protocol ids (its handles would claim
-            // a dispatch the runtime itself performs) and receives no inbound dispatch. It
-            // is stood up as the driver the rest of the shell consumes, and the slot is
-            // recorded only AFTER it stands — on a failed upgrade the node keeps both the
-            // transport it had and the author key `revoke` needs to find what that key
-            // landed.
+            // A transport is not an app: it binds no protocol ids and receives no inbound
+            // dispatch. It is stood up as the driver the rest of the shell consumes, and
+            // the slot is recorded only AFTER it stands — on a failed upgrade the node
+            // keeps both the transport it had and the author key `revoke` needs to find
+            // what that key landed.
             if (isMount) {
                 const slot: TransportSlot = { loaded, realm: null, realmP: null };
                 await installTransport(slot);
@@ -713,7 +738,12 @@ export function createShell(opts: CreateShellOptions & {
                 platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
                 return loaded;
             }
-            bindings.autoBind(key, handlesOf(loaded.manifest));
+            // Installation is inert (§12.10): nothing here touches the bindings table.
+            // A freshly installed app serves no protocol until the operator points one at
+            // its app key (`bind`) — the app's identity, the wire protocol, and the local
+            // routing are three separate things, and the last is the operator's alone. An
+            // update lands on the same app key, so an existing binding survives it without
+            // any rule re-applying it: the table was never written by the load.
             // The app's one inbound entrypoint, resolved here and not per message.
             // `entryFor` closes over the slot, so the slot is built first and its entry
             // attached immediately — nothing can observe the placeholder between the two

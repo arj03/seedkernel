@@ -503,8 +503,9 @@ func startNode(cfg nodeConfig) (nodeStatus, error) {
 
 // loadBundle loads a signed app bundle file (README §12.4). Reading the one file is all
 // this does: the whole load — manifest signature, policy governance, freshness, per-module
-// and guest integrity, binding the modules and auto-binding the app's protocols — is the
-// shared shell. Returns the operator's console line, or an `ERROR: …` string.
+// and guest integrity, binding the modules — is the shared shell. Installation is INERT
+// (§12.10): no protocol is bound by the load; the operator names the bindings after,
+// through --bind. Returns the operator's console line, or an `ERROR: …` string.
 func loadBundle(path string) string {
 	blob, err := os.ReadFile(path)
 	if err != nil {
@@ -517,12 +518,25 @@ func loadBundle(path string) string {
 	var m struct {
 		App     string
 		Version int
-		Handles []string
+		AppKey  string
 	}
 	if err := json.Unmarshal(out, &m); err != nil {
 		return "ERROR(json): " + err.Error()
 	}
-	return fmt.Sprintf("%s v%d  handles=%v", m.App, m.Version, m.Handles)
+	return fmt.Sprintf("%s v%d  key %s", m.App, m.Version, m.AppKey)
+}
+
+// bindProtocol points a wire protocol at an installed app (README §12.10) — the
+// operator's one action. Nothing else writes the table: the bundle load landed code
+// and nothing more, so an app serves nothing until an explicit bind names it. The
+// shell refuses a key no app is installed under, and that refusal is returned rather
+// than printed: a bind naming an app that is not here is a mistake in the invocation,
+// and a node that kept serving would answer nothing on that protocol forever.
+func bindProtocol(proto, appKey string) (string, error) {
+	if _, err := callRealm("bind", 30*time.Second, qc.NewString(proto), qc.NewString(appKey)); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s → %s", proto, appKey), nil
 }
 
 // runGuest runs one of the loaded bundle's guest entrypoints as the *initiator* —
@@ -584,6 +598,7 @@ type cliArgs struct {
 	contactSecret                           string
 	put, get, out, appConfig                string
 	revokeKeys, uninstallApps               string
+	binds                                   string
 	requestDeadlineMs                       int
 }
 
@@ -603,6 +618,7 @@ func parseCLI() cliArgs {
 	flag.StringVar(&a.appConfig, "app-config", "", "app config JSON")
 	flag.StringVar(&a.revokeKeys, "revoke", "", "write off compromised author keys (hex,…): refuse their bundles and uninstall what they landed")
 	flag.StringVar(&a.uninstallApps, "uninstall", "", "uninstall app keys (authorHex:app,…) without revoking the author")
+	flag.StringVar(&a.binds, "bind", "", "protocol bindings to apply after the bundle load: proto=appKey,… — the operator-owned routing table (§12.10); nothing else ever writes it")
 	flag.IntVar(&a.requestDeadlineMs, "request-deadline", 0, "default per-request deadline in ms (0 = the transport's own default)")
 	flag.Parse()
 	if flag.NArg() > 0 {
@@ -662,15 +678,34 @@ func main() {
 		fmt.Println("  uninstall " + uninstall(appKey))
 	}
 
-	// The signed bundle: verify + install its modules, stand up its guest, bind its
-	// protocols. Every invocation targets a bundle (there is always a --bundle / default
-	// dir), so a load error is fatal: the node has no app to run or serve. Exit non-zero
-	// rather than keep serving as a silent bundle-less relay, which would hide the
-	// failure from a driving script (§12.4).
+	// The signed bundle: verify + install its modules, stand up its guest. Install is
+	// INERT — no protocol is bound by it (§12.10), so the node serves nothing until the
+	// operator's --bind below points wire protocols at app keys. Every invocation
+	// targets a bundle (there is always a --bundle / default dir), so a load error is
+	// fatal: the node has no app to run or serve. Exit non-zero rather than keep serving
+	// as a silent bundle-less relay, which would hide the failure from a driving script
+	// (§12.4).
 	bundleResult := loadBundle(a.bundleDir)
 	fmt.Println("  bundle " + bundleResult)
 	if strings.HasPrefix(bundleResult, "ERROR") {
 		os.Exit(1)
+	}
+
+	// The operator's routing table (§12.10), applied explicitly: the bundle above landed
+	// code and nothing else, and these binds are the only way a protocol gains a
+	// destination. Each names the app key the load just printed.
+	for _, spec := range splitList(a.binds) {
+		proto, appKey, ok := strings.Cut(spec, "=")
+		if !ok || proto == "" || appKey == "" {
+			fatal("bind", fmt.Errorf("want proto=appKey, got %q", spec))
+			return
+		}
+		line, err := bindProtocol(proto, appKey)
+		if err != nil {
+			fatal("bind", err)
+			return
+		}
+		fmt.Println("  bind " + line)
 	}
 
 	// One-shot client ops through the loaded guest — "the shell runs the app" as the

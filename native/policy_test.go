@@ -13,8 +13,8 @@ func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  handles=[testapp]") {
+	bundlePath, appKey := writeTestBundle(t, author, authorPub, "testapp", 1)
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  key "+appKey) {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
 }

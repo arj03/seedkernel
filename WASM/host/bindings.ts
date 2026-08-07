@@ -2,13 +2,12 @@
 //
 // A frame names a protocol, not an app. The wire carries a protocol id (e.g.
 // "chat-v1"); the receiving host resolves it through its own bindings to whichever
-// app it holds. This module implements the three binding rules every target shares:
-//
-//   1. Auto-bind only into a vacancy — on install, each declared protocol with no
-//      binding binds to the new app.
-//   2. A contested protocol is a choice, never an error — the app installs but
-//      stays unbound for that protocol.
-//   3. An update inherits only what it already had — new protocols land unbound.
+// app it holds. `bind` is the ONLY way a protocol gains a destination, and it is
+// always an explicit operator act — nothing else touches this table. Installation
+// is inert (§12.10): a bundle lands and serves nothing until the operator points a
+// protocol at it, so there are no defaults to apply and no update-inheritance rules
+// for a binding to derive from. The worst an unbound protocol does is resolve to
+// nothing, which the transport answers with an empty body.
 //
 // Bindings are shell state, not loader state, and hold no security property —
 // the worst a wrong binding does is deliver to the wrong app the user already
@@ -38,13 +37,6 @@ export class Bindings {
   removeApp(appKey: string): void {
     for (const [proto, key] of this.table) {
       if (key === appKey) this.table.delete(proto);
-    }
-  }
-
-  /** Auto-bind on install, into VACANCIES only (§12.10 rule 1). */
-  autoBind(appKey: string, handles: string[]): void {
-    for (const proto of handles) {
-      if (!this.table.has(proto)) this.table.set(proto, appKey);
     }
   }
 
