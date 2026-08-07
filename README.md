@@ -197,6 +197,15 @@ Three wasm binaries are shared the same way and for the same reason: `libsodium.
 
 The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go. The `core/` and `host/` split inside `WASM/` is the *other* axis: `core/` is what has no endpoint substitute, `host/` is the runtime around it, and both contribute to the shared set and to the JS platform.
 
+## The overhead, measured
+
+The fair follow-up to all these seams is whether confinement costs throughput. The proof that it does not is [seed store](https://github.com/arj03/seedstore): a complete storage layer including client-side encryption, Reed–Solomon erasure coding, content addressing, repair shipped as two WASM modules and a confined guest. Its measured numbers are the answer:
+
+- **The full write path — encrypt, hash every block, RS-encode — runs at ~210 MB/s on one thread** (100 MB, RS(10,6), 64 KB blocks, Node 20), balanced across its three pieces: xchacha20 at ~545 MB/s, BLAKE2b block-ids at ~1.1 GB/s, SIMD RS encode at ~670 MB/s. Those are the codec's own computations and they dominate — the runtime's seam between guest and module is not where the time goes.
+- **A read with every block present is ~3 GB/s** — the code is systematic, so a full read is a concatenation with no GF(2⁸) work at all; only a missing block pays a decode, at ~625 MB/s.
+- **End to end, the link bounds throughput, not the runtime:** ~11 MB/s PUT and ~17 MB/s GET over a 10 ms-RTT, WebRTC-capped link with windowed round trips, and ~13 MB/s browser-to-browser — all through the same signed transport bundle every app gets.
+- **The whole layer ships as ~15 KB of WASM plus ~8 KB of gzipped guest JS**, reusing the libsodium the runtime already loads rather than bundling a second copy of a crypto library. The numbers reproduce with `node tests/bench.mjs` in the seedstore repo.
+
 ## Post-quantum posture
 
 The two migrations are on independent clocks and are scheduled on opposite principles.
