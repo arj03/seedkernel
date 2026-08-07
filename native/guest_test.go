@@ -10,7 +10,7 @@ import (
 )
 
 // A confined guest realm runs an app's entrypoints over the single
-// host.call seam, reaching only its declared cap domains. This exercises a
+// host.call seam, reaching only its declared requires. This exercises a
 // content-addressed put/get guest (local, synchronous ops) end-to-end, and asserts
 // the realm is zero-authority — the host capabilities are not reachable by name.
 
@@ -49,10 +49,10 @@ register("probe", () => {
 func TestGuestPutGetAndConfinement(t *testing.T) {
 	capBridgeRealm(t)
 
-	// Host realm: build the cap-bridge granting crypto + fs (no net).
+	// Host realm: build the cap-bridge granting fs/put + fs/get (no net).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["fs"], __id, null, []);
+		__buildCapBridge(["fs/put", "fs/get"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -103,7 +103,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["crypto"], __id, null, []);
+		__buildCapBridge([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -144,7 +144,7 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["crypto"], __id, null, []);
+		__buildCapBridge([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -188,7 +188,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildCapBridge(["crypto", "net"], __id,
+		__buildCapBridge(["net/send"], __id,
 			{ request: async () => new Uint8Array([9]) }, [__peer]);
 	`)); err != nil {
 		t.Fatal("setup:", err)
@@ -237,7 +237,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	capBridgeRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["crypto"], __id, null, []);
+		__buildCapBridge([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -268,7 +268,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildCapBridge(["crypto", "net"], __id,
+		__buildCapBridge(["net/send"], __id,
 			{ request: () => new Promise(() => {}) }, [__peer]);
 	`)); err != nil {
 		t.Fatal("setup:", err)

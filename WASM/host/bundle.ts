@@ -3,7 +3,7 @@
 // program, and a signed manifest declaring the modules by logical name and the
 // capabilities the guest holds.
 // The shell verifies the manifest signature, governs it against its policy (author +
-// module hashes), and installs the modules; the guest's `caps` describe the seam it is
+// module hashes), and installs the modules; the guest's `requires` describe the seam it is
 // wired over, honored by the generic cap bridge (README §12.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
@@ -28,7 +28,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES, CAP_DOMAINS, MOUNT_ONLY_DOMAINS, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, MOUNT_GROUPS, isGrant, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -54,12 +54,12 @@ export interface BundleModule {
 export interface BundleCrypto extends ManifestVerifier {
 }
 
-/** The zero-authority guest program and everything about it. `caps` and `config` live
- *  HERE rather than at the top level because both are the guest's alone: the manifest's
- *  caps are the guest's entire authority (§12.2) and config only ever becomes its
- *  injected `APP`. WASM modules carry no authority and read no config, so the two fields
- *  have no meaning at the top level — and "no authority ⇒ empty `caps`" is the schema's
- *  shape rather than a rule prose has to state. */
+/** The zero-authority guest program and everything about it. `requires` and `config`
+ *  live HERE rather than at the top level because both are the guest's alone: the
+ *  manifest's requires are the guest's entire authority (§12.2) and config only ever
+ *  becomes its injected `APP`. WASM modules carry no authority and read no config, so
+ *  the two fields have no meaning at the top level — and "no authority ⇒ empty
+ *  `requires`" is the schema's shape rather than a rule prose has to state. */
 export interface BundleGuest {
     /** genesisHash(utf8(source)) hex of `guest.js`. */
     hash: string;
@@ -68,32 +68,36 @@ export interface BundleGuest {
      *  implement is refused with its own error rather than run against a seam that no
      *  longer means what it meant.
      *
+     *  **The ONE compatibility gate, and the only one the format needs.** The version IS
+     *  the version of every name in the seam: within an ABI a name's meaning is fixed, and
+     *  an incompatible change bumps it. That covers what no per-name declaration could —
+     *  the seam's shape, the entrypoint protocol (`register`/`__invoke`), the preamble
+     *  globals, the payload framing, none of which is addressed by anything the guest
+     *  calls — and it is why `requires` below carries grants only: a list of names the
+     *  host cannot fail to serve would add nothing this number does not already say.
+     *
      *  Required and not optional-with-a-default because the default would have to be the
      *  oldest ABI, which is exactly the population a bump exists to catch — and because a
      *  guest author who never thought about the seam version is indistinguishable from one
      *  who meant the old one. There is nothing to infer here, so the format asks. */
     abi: number;
-    /** Capability *domains* (`CAP_DOMAINS`, core/domains.ts) granted to the guest —
-     *  the prefixes the bridge enforces on its `host.call` names (§12.2), and the only
-     *  backends the shell wires. Required whenever a guest exists; an empty array is a
-     *  guest with no authority at all.
+    /** EXACTLY the authorities this guest is granted (`AUTHORITY_CALLS`, core/domains.ts):
+     *  `node/sign`, `fs/get`, `net/send`, … — each name enforced at the bridge by exact
+     *  match, so a guest reaches what its bundle declared and nothing beside it. Required
+     *  whenever a guest exists; an empty array is a guest with no authority at all, which
+     *  is the common case and reads as one.
      *
-     *  Only *authorities* appear here. Crypto primitives do not — they reach nothing, so
-     *  there is nothing to grant; see `primitives` below and the note on the `crypto/`
-     *  prefix in cap-bridge.ts. Neither does `module`: a bundle's own module map is the
-     *  app-supplied half of the primitive catalog, so `module/call` is ungated like
-     *  `crypto` (§12.1). */
-    caps: string[];
-    /** The host crypto primitives this guest calls by name (`PRIMITIVE_NAMES`, the
-     *  bare names under the `crypto/` prefix: "blake2b-256", "x25519/dh",
-     *  "chacha20poly1305-ietf/seal", …).
+     *  **Only grants appear here, so the list an operator reads IS the bundle's reach.**
+     *  A guest also calls `crypto/*` and `module/call`, and those are deliberately not
+     *  declarable: neither can be absent from a host (the primitive catalog is total, and
+     *  a bundle's modules arrive inside it), so declaring them would be a requirement on
+     *  something that cannot fail — and a dozen such names would bury the two or three
+     *  that carry the authority. What the guest needs from that half of the seam is
+     *  covered by `abi` above, which versions every name it contains.
      *
-     *  **A compatibility declaration, not a capability one.** It grants nothing; it lets a
-     *  host that cannot serve a name refuse the load *by name* instead of failing at the
-     *  guest's first call — the same legibility `abi` buys for the seam version, which is
-     *  why it sits here beside `abi` rather than inside `caps`. Optional: a guest that
-     *  calls no primitive declares none. */
-    primitives?: string[];
+     *  The list is CLOSED: a name this host does not grant is a refused manifest, not a
+     *  requirement that quietly grants nothing at first use. */
+    requires: string[];
     /** App-structural constants the guest needs as injected globals (e.g. storage
      *  k/m/blockSize). Opaque to the runtime — the shell forwards it verbatim into the
      *  guest preamble as `const APP = …`.
@@ -335,20 +339,23 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
 export function handlesOf(manifest: BundleManifest): string[] {
     return manifest.handles && manifest.handles.length > 0 ? manifest.handles : [manifest.app];
 }
-/** Which of the mount-only capability domains (§12.5) a manifest declares.
+/** Which mount halves (§12.5) a manifest's `requires` covers — the `mount:…` groups of
+ *  the authorities it names, read straight off the catalog (`AUTHORITY_CALLS`), never
+ *  off a prefix parsed out of a name.
  *
  *  The ONE predicate both admission paths ask, and the reason there is no `role` field:
- *  what a bundle may do is read off the caps it declares, never off a claim about what
+ *  what a bundle may do is read off the names it requires, never off a claim about what
  *  it is. The app path refuses a manifest for which this is non-empty; the mount path
- *  requires it to name every mount-only domain. Two different questions, one derivation
- *  from `MOUNT_ONLY_DOMAINS`, so neither can drift from the other or from the domain
- *  vocabulary — the same argument that keeps `CAP_DOMAINS` out of cap-bridge.ts.
+ *  requires EVERY group in `MOUNT_GROUPS`. Two different questions, one derivation from
+ *  the catalog, so neither can drift from the other or from the vocabulary — the same
+ *  argument that keeps the catalog in domains.ts and out of cap-bridge.ts.
  *
  *  Not folded into `verifyManifest`: this is not a well-formedness question. The same
  *  manifest is legitimate at one admission point and refused at the other, so the
  *  decision belongs where the caller has said which point it is (shell-core). */
-export function mountOnlyCaps(manifest: BundleManifest): string[] {
-    return MOUNT_ONLY_DOMAINS.filter((d) => manifest.guest.caps.includes(d));
+export function mountGroups(manifest: BundleManifest): string[] {
+    const groups = manifest.guest.requires.filter(isGrant).map((n) => AUTHORITY_CALLS[n]);
+    return MOUNT_GROUPS.filter((g) => groups.includes(g));
 }
 /** The fs keyspace prefix for one app (README §12.2).
  *
@@ -487,11 +494,11 @@ export function signManifestHybrid(sodium: ManifestCrypto, keys: HybridAuthorKey
  *  signed but got wrong (a missing/mistyped field) into a clean, loud rejection
  *  instead of a raw TypeError surfacing deep in the loader, and lets the rest of
  *  the runtime treat every field as present and correctly typed (matching the
- *  fail-loud posture of parsePolicy). Note `caps` and `abi` are required *inside*
+ *  fail-loud posture of parsePolicy). Note `requires` and `abi` are required *inside*
  *  `guest`: the capability declaration and the seam the guest was written against are
  *  never optional where a guest exists, and never present where one doesn't. Whether
- *  this host *implements* the declared `abi` is a separate question, answered by
- *  verifyManifest — this is shape only. */
+ *  this host *implements* the declared `abi` — or serves a required name — is a
+ *  separate question, answered by verifyManifest — this is shape only. */
 function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof m !== "object" || m === null || Array.isArray(m))
         return false;
@@ -554,10 +561,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         if (typeof g.abi !== "number" || !Number.isInteger(g.abi))
             return false;
-        if (!Array.isArray(g.caps) || g.caps.some((c: unknown) => typeof c !== "string"))
-            return false;
-        if (g.primitives !== undefined
-            && (!Array.isArray(g.primitives) || g.primitives.some((p: unknown) => typeof p !== "string")))
+        if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string"))
             return false;
         if (g.config !== undefined) {
             if (typeof g.config !== "object" || g.config === null || Array.isArray(g.config))
@@ -638,7 +642,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
         throw new Error("bundle: malformed manifest (not JSON)");
     }
     // A manifest with no `guest` at all, refused BY NAME rather than as a shape error —
-    // the same courtesy an unimplemented ABI or an unknown cap domain gets below, and for
+    // the same courtesy an unimplemented ABI or an unknown required name gets below, and for
     // the same reason: "this bundle is not shaped like an app this runtime runs" is a
     // rule an author should learn, not something to report as "malformed manifest". It is
     // also the one manifest a bundle written against the older, module-only format
@@ -658,23 +662,29 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     if (!SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
         throw new Error(`bundle: guest ABI ${parsed.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
     }
-    // The declared primitives, checked the same way and for the same reason: "this bundle
-    // wants a host I am not". Not a grant — a primitive reaches nothing — so it is refused
-    // here as an incompatibility rather than gated later as an authority.
-    for (const p of parsed.guest.primitives ?? []) {
-        if (!(PRIMITIVE_NAMES as readonly string[]).includes(p)) {
-            throw new Error(`bundle: this host has no crypto primitive "${p}" (manifest guest.primitives; this host serves: ${PRIMITIVE_NAMES.join(", ")})`);
-        }
-    }
-    // The capability vocabulary (§12.2) is CLOSED — an unknown domain is a refused
-    // manifest, not a cap that quietly grants nothing at first use. This is a
-    // WELL-FORMEDNESS check, and the only one the caps get here: `link` and `transport`
-    // are in the vocabulary and a manifest naming them is well-formed, but they are the
-    // transport mount's alone (§12.5). Which admission point will have it is not a
-    // property of the manifest, so that decision is the shell's, over `mountOnlyCaps`.
-    for (const c of parsed.guest.caps) {
-        if (!(CAP_DOMAINS as readonly string[]).includes(c)) {
-            throw new Error(`bundle: unknown capability domain "${c}" (this host grants: ${CAP_DOMAINS.join(", ")})`);
+    // The declared requires, checked the same way and for the same reason: "this bundle
+    // wants a host I am not". The vocabulary (§12.2) is CLOSED and it is the authorities
+    // alone — an unknown name is a refused manifest, not a grant that quietly reaches
+    // nothing at first use, and `crypto/blake2b-256` is refused HERE rather than accepted
+    // as a no-op, because a manifest that asks for what was never a grant has misread the
+    // format and should be told so.
+    //
+    // This is a WELL-FORMEDNESS check, and the only one requires get here: `link/open`
+    // and `transport/deliver` are in the vocabulary and a manifest naming them is
+    // well-formed, but they are the transport mount's alone (§12.5). Which admission
+    // point will have it is not a property of the manifest, so that decision is the
+    // shell's, over `mountGroups`.
+    for (const r of parsed.guest.requires) {
+        if (!isGrant(r)) {
+            // The authorities sharing the rejected name's prefix, not the whole list: a
+            // misspelled `fs/exists` is answered by the six `fs/` names, and a bare `fs`
+            // — the shape the coarse-domain format used — by the same.
+            const prefix = r.includes("/") ? r.slice(0, r.indexOf("/") + 1) : r + "/";
+            const near = Object.keys(AUTHORITY_CALLS).filter((n) => n.startsWith(prefix));
+            const hint = near.length > 0
+                ? `this host grants: ${near.join(", ")}`
+                : `no authority under "${prefix}" exists — a pure name (crypto/*, module/call) is not a grant and is not declared`;
+            throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
         }
     }
     return { author, authorKeys, suite, manifest: parsed };

@@ -183,7 +183,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     });
     // ── Load the transport bundle: the node's network (§12.6) ───────────────────
     // The ONE install path, like any other bundle: verify, govern under policy, install,
-    // and — because it declares the mount-only caps — stand the driver up. A policy that
+    // and — because it requires the mount-only names — stand the driver up. A policy that
     // does not admit the transport author leaves the node without a network, which is a
     // deliberate configuration ("this node does not speak to anyone"), not an error.
     if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {

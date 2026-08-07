@@ -15,11 +15,9 @@
 //
 // What the host supplies (the seam):
 //
-//   - `host.call(name, bytes)` — ONE seam, addressed by name (§12.2). The primitives
-//     this program uses are `crypto/<name>` calls into a flat catalog of opaque names,
-//     none of which is a capability, because a function of its arguments grants
-//     nothing. What this program uses, declared in its manifest's `guest.primitives`
-//     so a host that lacks one refuses the bundle at load:
+//   - `host.call(name, bytes)` — ONE seam, addressed by name (§12.2). What this
+//     program uses, declared in its manifest's `guest.requires` — the names a host
+//     that cannot serve them refuses the bundle by, at load:
 //       "crypto/blake2b-256"               bytes -> 32B      (transcript, KDF, root)
 //       "crypto/ed25519/verify"            [pk 32][sig 64][msg] -> [ok u8]   (peer AUTH)
 //       "crypto/chacha20poly1305-ietf/seal" [npub 12][key 32][msg] -> ct      (record layer)
@@ -30,15 +28,14 @@
 //     Changing suite is changing these names. It costs this file and a host that
 //     already carries the primitive — no op number, no ABI rev, no new grant.
 //
-//     The AUTHORITIES the manifest declares in `caps` — which is the whole of what this
-//     program is granted, by domain PREFIX (README §12.2):
+//     The AUTHORITIES the manifest's `requires` grants — the whole of what this
+//     program holds, by EXACT name (README §12.2):
 //       "node/sign"   msg -> 64B sig. The host prefixes `DOMAIN_channel ‖ networkKey`
 //                     from THIS bundle's admission point and signs the opaque suffix with the node's
 //                     channel key, which never enters this module. It does not read the
 //                     suffix — the domain separation is the guarantee, so no transcript
 //                     shape is pinned into the host and no call signs raw bytes.
 //       "node/random" [n u32 BE] -> n random bytes            (nonces, ephemeral secrets)
-//       "clock/now"   -> now ms (u64 BE)                      (stall clocks)
 //
 //     `link` — the platform's whole contribution to the network: bytes over an opaque
 //     link id, opened and closed. `timer` — deadlines, because a zero-authority realm
@@ -46,7 +43,7 @@
 //     OUTPUT (an attributed peer, a protocol id, a correlation), which every app then
 //     reaches through the ordinary `net` domain. Its own ws.wasm is NOT here:
 //     `module/call` is a primitive — the bundle's own code, ungated like `crypto`
-//     (§12.1) — so no domain grants it.
+//     (§12.1) — so no grant is needed to name it.
 //
 //     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
 //     attribution this program reports (transport/link-auth answers with the verdict,
@@ -162,9 +159,9 @@ const N_PEER_EDGE = "transport/peer-edge";
 const N_READY = "transport/ready";
 const N_LINK_DOWN = "transport/link-down";
 
-// The primitives this program asks for by name, through the `crypto/` prefix. These
-// are the strings the manifest's `guest.primitives` declares (minus the prefix), so a
-// host that cannot serve one refuses the bundle at load rather than failing here.
+// The primitives this program asks for by name, through the `crypto/` prefix — the
+// full names as the manifest's `guest.requires` declares them, so a host that cannot
+// serve one refuses the bundle at load rather than failing here.
 const P_HASH = "crypto/blake2b-256";
 const P_VERIFY = "crypto/ed25519/verify";
 const P_SEAL = "crypto/chacha20poly1305-ietf/seal";

@@ -15,7 +15,7 @@
 // identical bridge, so output orchestrated through the confined guest is
 // byte-compatible with a host-side reference path.
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_CHANNEL, CAP_DOMAINS, type PrimitiveName } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, type PrimitiveName, type CapabilityName } from "../core/domains.js";
 import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
 import { type SafeRealmBridge } from "./safe-js.js";
@@ -214,12 +214,13 @@ export interface CapBridgeDeps {
     fs?: Fs;
     /** Wall clock (ms). Defaults to Date.now. */
     now?: () => number;
-    /** The allowed cap set, expanded from the manifest's declared cap domains
-     *  (README §12.2). The bridge refuses any `host.call` whose first path component is
-     *  outside it — so a guest reaches exactly what its bundle declared. Required: pass
-     *  `UNRESTRICTED_CAPS` to opt out deliberately (a host-side caller that holds the
-     *  primitives anyway). */
-    allowedCaps: Iterable<string> | typeof UNRESTRICTED_CAPS;
+    /** The allowed names, EXACTLY the manifest's declared `guest.requires` (README
+     *  §12.2). The bridge refuses any `host.call` naming an authority outside it — so
+     *  a guest reaches exactly what its bundle declared, name by name, and nothing
+     *  else. Names that are not authorities (`isGrant`) pass regardless: they are
+     *  never grants. Required: pass `UNRESTRICTED_NAMES` to opt out deliberately (a
+     *  host-side caller that holds the primitives anyway). */
+    allowedNames: Iterable<string> | typeof UNRESTRICTED_NAMES;
 }
 
 /** The version of the seam defined below — re-exported so a reader of the seam finds it
@@ -234,6 +235,21 @@ export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../cor
  *  through cannot drift: adding a primitive to one without the matching key in the
  *  other is a type error. */
 type CryptoCapName = `crypto/${PrimitiveName}`;
+/** The keys the dispatch table must cover — every authority (`CapabilityName`, the keys
+ *  of `AUTHORITY_CALLS` in domains.ts), the bundle's own module map, and every crypto
+ *  primitive. The table literal is typed against this union, so the names are written in
+ *  exactly ONE place: a name added to the vocabulary without a handler here is a compile
+ *  error, and so is a handler whose name the loader would refuse. */
+type HandlerKey = CapabilityName | CryptoCapName | "module/call";
+/** The same union as a runtime list, for the construction check below — the compiled-JS
+ *  half of the one-file rule, where `HandlerKey` is not present to enforce anything.
+ *  Derived here, next to the table it describes, because it is nobody else's business:
+ *  the loader's vocabulary is `AUTHORITY_CALLS` alone (a manifest never names the rest). */
+const HANDLER_KEYS: readonly string[] = [
+    ...Object.keys(AUTHORITY_CALLS),
+    "module/call",
+    ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
+];
 /** One catalog entry's implementation: argument bytes in, response bytes out (or a
  *  Promise of them, for the round-tripping `net/send` and `fs/*` names). */
 type CapHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
@@ -391,41 +407,28 @@ globalThis.__invoke = (name, argBuf) => {
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
-/** Capability *domains* — the granted prefixes of the name-addressed seam. A bundle's
- *  signed manifest declares the domains its guest needs (its `caps`), and the shell
- *  passes them to the bridge as the prefix set it enforces (`allowedCaps`) and as the
- *  list of which backends it wires. This
- *  is the coarse, human-auditable capability vocabulary: "this app reaches net + fs",
- *  not a list of op numbers. `caps` is the grant; the names are the ABI.
+/** The authority catalog — declared in core/domains.ts and re-exported so a reader of the
+ *  seam finds it beside the names it governs. A bundle's signed manifest declares the
+ *  authorities its guest holds (its `requires`), the loader checks them against this table
+ *  before anything is trusted, and the shell passes them to the bridge as the exact set it
+ *  enforces (`allowedNames`). Fine-grained and human-auditable: "this app reaches
+ *  `node/sign` + `fs/get`", not a prefix that grows every op ever added under it.
  *
- *  **Only authorities appear here, because only authorities are grants.**
+ *  **Only authorities are grants; `crypto/*` and `module/call` are not.**
  *  `node/sign` is a signing oracle under the node identity, `node/identity` hands out
  *  the node's public key, `node/random` reaches the OS entropy source — each a grant
- *  over something the host owns. The `crypto/` prefix is deliberately absent: its
- *  primitives are functions of their arguments, so a guest holding them computes only
- *  what it could have computed with code of its own, and a vocabulary that made an app
- *  ask for a domain in order to hash a byte string would be describing an authority
- *  that does not exist. `module/call` is absent for the same reason: the modules it
- *  reaches are the asking bundle's own, installed and verified with it, so calling one
- *  reaches nothing the guest does not already hold — its scope (one app's map) is the
- *  shape, not a grant, and a vocabulary that gated it would be describing an authority
- *  that does not exist either.
+ *  over something the host owns. The `crypto/` primitives are functions of their
+ *  arguments, so a guest holding them computes only what it could have computed with
+ *  code of its own, and a manifest that had to ask before hashing a byte string
+ *  would be describing an authority that does not exist. `module/call` is exempt for
+ *  the same reason: the modules it reaches are the asking bundle's own, installed
+ *  and verified with it, so calling one reaches nothing the guest does not already
+ *  hold — its scope (one app's map) is the shape, not a grant.
  *
- *  That absence is what retires the earlier `crypto`/`transform` split. The split was
- *  right that authority and pure transform are not one word; it was wrong that both
- *  words name grants. One does.
- *
- *  The list itself is declared in core/domains.ts, with the ABI version and the suite
- *  ids — the loader checks a manifest's `caps` against it before anything is trusted,
- *  without importing this catalog. Re-exported so a reader of the seam finds the
- *  vocabulary beside the names, and so the bridge's own prefix check cannot drift from
- *  the list a manifest is checked against. */
-export { CAP_DOMAINS } from "../core/domains.js";
-/** Which domains only the transport mount may declare — see the note in domains.ts, where
- *  it is declared for the same reason `GUEST_ABI_VERSION` is: the loader checks a
- *  manifest's caps without importing this name catalog. Re-exported so a reader of the
- *  seam finds the restriction beside the domains it restricts. */
-export { MOUNT_ONLY_DOMAINS } from "../core/domains.js";
+ *  Neither exemption is a parse of the name: the gate asks `isGrant`, which is
+ *  membership in this table, so a name is an authority exactly by being one the host owns
+ *  something for — and the manifest never mentions the rest of the seam at all. */
+export { AUTHORITY_CALLS, MOUNT_GROUPS } from "../core/domains.js";
 /** The host-derived scope the node/sign name binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
@@ -495,18 +498,9 @@ export function bundlePreamble(f: BundleFacts): string {
     };
     return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
 }
-/**
- * The manifest's declared `guest.primitives` are checked against this catalog in
- * bundle.ts `verifyManifest`, which refuses the load by the missing name — a
- * compatibility check, not an authorization one: it grants nothing (`crypto/` is not
- * a grant, so there is nothing to grant), it exists so a
- * host that cannot serve a name refuses the load *by name* rather than failing at the
- * guest's first call. That is why the field sits beside `abi` in the manifest and not
- * inside `caps`.
- */
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// `allowedCaps` governs how far a guest reaches, and it once had a permissive meaning for
+// `allowedNames` governs how far a guest reaches, and it once had a permissive meaning for
 // the *absent* value — omit it and the guest got every name in the catalog. That is the
 // wrong default in the one file where a mistake is a capability escalation: it makes full
 // authority the thing a new call site gets by forgetting a field, in a runtime whose
@@ -522,10 +516,10 @@ export function bundlePreamble(f: BundleFacts): string {
 // Module scoping used to need the same treatment, and no longer does: `callModule` is
 // bound to one app's module map (ModuleTable), so there is no wider namespace an omitted
 // argument could open onto and nothing to opt out of.
-/** Run without cap gating: every prefix in `CAP_DOMAINS` resolves. For a host-side
+/** Run without name gating: every authority resolves. For a host-side
  *  caller that already holds the primitives; never for a bundle's guest, whose reach is
- *  its manifest `caps` and nothing else (§12.2). */
-export const UNRESTRICTED_CAPS = Symbol("seedkernel.cap.unrestricted-caps");
+ *  its manifest `requires` and nothing else (§12.2). */
+export const UNRESTRICTED_NAMES = Symbol("seedkernel.cap.unrestricted-names");
 // Host-side allocation bounds for guest-controlled sizes. The realm's own
 // 64 MiB memory limit does not cover host allocations the guest requests, so
 // the bridge caps them itself (a confined guest must not be able to size a
@@ -557,17 +551,17 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
     // to enforce anything. A gate that only holds on one of two targets is not a gate, so
     // an absent value throws here rather than resolving to the permissive branch.
-    if (deps.allowedCaps === undefined) {
-        throw new Error("cap-bridge: allowedCaps is required — pass the manifest's declared caps, or UNRESTRICTED_CAPS to opt out");
+    if (deps.allowedNames === undefined) {
+        throw new Error("cap-bridge: allowedNames is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
     }
     // null means "the caller named the sentinel" — never "the caller forgot".
-    const allowed = deps.allowedCaps === UNRESTRICTED_CAPS ? null : new Set(deps.allowedCaps);
+    const allowed = deps.allowedNames === UNRESTRICTED_NAMES ? null : new Set(deps.allowedNames);
     // ── the catalog — the seam ABI (§12.2), ONE table: the names a guest can call
     // are the keys of this object — no second list, no numbers, never a wire value.
     // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
     // and `module/call` (the asking bundle's own module map) reach nothing a guest does
-    // not already hold, so their prefixes are ungated by a rule; every other name is an
-    // authority, gated by the prefix its manifest domain grants.
+    // not already hold, so they are ungated by a rule; every other name is an
+    // authority, gated by EXACT membership in the manifest's declared requires.
     // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
     // the platform's raw contribution; the slot holds both, an app holds only `net`.
     const fs = () => {
@@ -592,10 +586,11 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` (and "constructor", "valueOf", …) with
-    // an inherited function, which the dispatch below would then CALL. The prefix gate
-    // happens to refuse those — a bare name has no domain — but a lookup that can resolve
-    // to something nobody put in the table is the wrong shape for this file, and the
-    // construction check below walks own keys, so it could never see them.
+    // an inherited function, which the dispatch below would then CALL. The gate happens
+    // to refuse those — `isGrant("toString")` is false, so it falls straight through to
+    // a lookup — but a lookup that can resolve to something nobody put
+    // in the table is the wrong shape for this file, and the construction check below
+    // walks own keys, so it could never see them.
     const handlers: Record<string, CapHandler> = Object.assign(Object.create(null), {
         // ── the primitive seam (§12.2): two ungated halves ─────────────────────────
         // The catalog's `crypto/*` half reaches nothing a guest does not already hold,
@@ -757,33 +752,34 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             sink().linkDown(readU32BE(payload, 0), payload[4]);
             return NONE;
         },
-    } as Record<string, CapHandler>);
-    // The one-file rule, checked at construction: every name's prefix must be
-    // `crypto` or `module` (the ungated primitives) or a declared `CAP_DOMAINS`
-    // member, so the catalog a guest is dispatched through and the vocabulary a
-    // manifest is checked against cannot drift — a typo'd prefix would otherwise be a
-    // name nothing could ever grant.
+    } satisfies Record<HandlerKey, CapHandler>);
+    // The one-file rule, checked at construction: every name this table dispatches
+    // through is a `HandlerKey` — an authority the loader knows (`AUTHORITY_CALLS`), a
+    // primitive (`PRIMITIVE_NAMES`), or `module/call`. A key outside that set would be a
+    // name no manifest could ever reach, and an authority the loader knows but the table
+    // lacks would answer "no such name" at the guest's first call.
+    //
+    // The `satisfies` above is the compile-time half of the same rule (a missing
+    // authority is a type error); this walk is the runtime half, holding on the COMPILED
+    // JS the native target evaluates (§12.9) where the types are gone — and it is the one
+    // check a typo'd EXTRA key would trip.
     for (const name of Object.keys(handlers)) {
-        const prefix = name.slice(0, name.indexOf("/"));
-        if (prefix !== "crypto" && prefix !== "module" && !(CAP_DOMAINS as readonly string[]).includes(prefix)) {
-            throw new Error(`cap-bridge: ${name} has no capability domain — CAP_DOMAINS is missing "${prefix}"`);
+        if (!HANDLER_KEYS.includes(name)) {
+            throw new Error(`cap-bridge: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS), no primitive (PRIMITIVE_NAMES), and not module/call`);
         }
     }
     return (name, payload) => {
-        // The gate covers authorities, and a granted domain is a PREFIX check: the first
-        // path component of the name must be one of the manifest's declared domains.
-        // `crypto` and `module` are exempt by a rule, not by omission: the first is a
-        // fixed host-side catalog of functions of bytes the guest already holds, and the
-        // second reaches the asking bundle's own module map — its scope is the shape (one
-        // app's modules), not a grant. Gating either would make a guest ask permission to
-        // compute a function of bytes it already has — the coarse-vocabulary lie the
-        // primitive/authority split exists to remove.
-        if (allowed) {
-            const slash = name.indexOf("/");
-            const prefix = slash < 0 ? name : name.slice(0, slash);
-            if (prefix !== "crypto" && prefix !== "module" && !allowed.has(prefix)) {
-                throw new Error("cap-bridge: " + name + " not declared by the bundle manifest caps");
-            }
+        // The gate covers authorities, and a granted authority is an EXACT-name check:
+        // the name itself must be one of the manifest's declared requires — an
+        // undeclared `node/identity` is refused even beside a declared `node/sign`.
+        // What counts as an authority is `isGrant` — membership in the catalog's
+        // authority table (domains.ts) — never a prefix read off the name: `crypto/*`
+        // is a fixed host-side catalog of functions of bytes the guest already holds
+        // and `module/call` reaches the asking bundle's own module map, so neither is
+        // something to grant. Gating either would make a guest ask permission to
+        // compute a function of bytes it already has.
+        if (allowed && isGrant(name) && !allowed.has(name)) {
+            throw new Error("cap-bridge: " + name + " not declared by the bundle manifest requires");
         }
         // The table lookup IS the dispatch: an unknown name (or a primitive this host
         // does not carry) reads `undefined` and is refused by name.

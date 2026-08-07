@@ -32,12 +32,12 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
-// The mount-only caps are a SECOND admission class (§12.5): the transport sees all
+// The mount-only names are a SECOND admission class (§12.5): the transport sees all
 // plaintext and holds the session keys, so "I trust this author's apps" must not answer
 // "may this author be my transport". There is no self-description in the manifest — the
-// bundle format has no role field — so `guest.caps` alone decides which class a bundle
-// answers to, and the dispatch only ever runs the strict way: declaring `link` and
-// `transport` moves a bundle onto `transportAuthors`, never off it.
+// bundle format has no role field — so `guest.requires` alone decides which class a bundle
+// answers to, and the dispatch only ever runs the strict way: naming `link/open` and
+// `transport/deliver` moves a bundle onto `transportAuthors`, never off it.
 //
 // Driven through the native loader because the policy file is an operator-facing surface
 // on this target — `--policy` is parsed by the shared JS, and this is what proves the
@@ -49,20 +49,20 @@ func TestPolicyTransportCapsAreASecondAdmissionClass(t *testing.T) {
 
 	// On the app allowlist and nothing else. The same load that lands this author's apps
 	// refuses their transport, and the refusal is admission — not a parse error, not a
-	// missing entrypoint: the caps sent it to a predicate that says no.
+	// missing entrypoint: the requires sent it to a predicate that says no.
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	linkBundle, _ := writeBundle(t, author, authorPub, "linkapp", 1, "", []string{"link", "transport"})
+	linkBundle, _ := writeBundle(t, author, authorPub, "linkapp", 1, "", []string{"link/open", "transport/deliver"})
 	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
 	}
 
 	// A partial claim is refused before either predicate — it cannot fall back to the app
 	// class, which is the hole a half-declared mount would otherwise open.
-	halfBundle, _ := writeBundle(t, author, authorPub, "halfapp", 1, "", []string{"link"})
-	if status := loadBundle(halfBundle); !strings.Contains(status, "every mount-only capability domain") {
-		t.Fatalf("a bundle declaring link without transport must be refused as malformed: %s", status)
+	halfBundle, _ := writeBundle(t, author, authorPub, "halfapp", 1, "", []string{"link/open"})
+	if status := loadBundle(halfBundle); !strings.Contains(status, "every mount half or none") {
+		t.Fatalf("a bundle naming link without any transport name must be refused as malformed: %s", status)
 	}
 
 	// Adding the deliberate second entry gets the same blob PAST admission, where it then

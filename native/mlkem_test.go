@@ -137,14 +137,14 @@ func TestMlKemAcvpVectors(t *testing.T) {
 
 // TestMlKemThroughCatalog drives the KEM the way a guest does — by name, through the
 // `crypto/` prefix — rather than through the Go wrapper. That is the path that has
-// to work end to end on this target: `PRIMITIVE_NAMES` is what a manifest's
-// `guest.primitives` is checked against in `verifyManifest` (bundle.ts), so a host
-// whose `__sodium` lacked these methods would admit a bundle by name and then fail it
-// at first use — the legibility failure the check exists to prevent.
+// to work end to end on this target: the `crypto/*` entries of `HOST_CALL_NAMES` are
+// what a manifest's `guest.requires` is checked against in `verifyManifest` (bundle.ts),
+// so a host whose `__sodium` lacked these methods would admit a bundle by name and then
+// fail it at first use — the legibility failure the check exists to prevent.
 //
 // It also pins the thing the Go wrapper alone cannot: that the shared cap-bridge, the
 // sodium shim's ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract
-// line up. A bundle declaring NO caps runs it, because a pure transform is
+// line up. A bundle declaring NO requires runs it, because a pure transform is
 // not a capability.
 func TestMlKemThroughCatalog(t *testing.T) {
 	capBridgeRealm(t)

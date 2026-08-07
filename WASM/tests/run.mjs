@@ -34,7 +34,7 @@ const sodium = await loadCrypto();
 // hands it out with its address; a single value here just means every test node is
 // reachable by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createCapBridge, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_CAPS, GUEST_ABI_VERSION }
+const { createCapBridge, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION }
   = await imp("build/host/cap-bridge.js");
 // ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
 // itself is the bundle's now, so what is reachable from here is the module.
@@ -60,7 +60,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // used by tests that do not exercise the guest is the same minimal program throughout.
 const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
-const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, caps: [], ...extra });
+const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own ModuleTable without a shell. */
@@ -252,7 +252,7 @@ async function testBundleRefusesNonModule() {
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
     { name: "broken", hash: toHex(gHash(notAModule)) },
-  ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, caps: [] } };
+  ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, requires: [] } };
   const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: manifestEnv,
@@ -535,7 +535,7 @@ async function testCapBridge() {
     // inside this app's map and cannot reach out of it.
     callModule: (name, p) => host.callModule(testKey, name, p),
     transport, peers: () => [toHex(id.publicKey)], fs, signScope,
-    allowedCaps: UNRESTRICTED_CAPS,
+    allowedNames: UNRESTRICTED_NAMES,
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -653,7 +653,7 @@ async function testPolicy() {
     const host = new ModuleTable();
     const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST({ caps: mount ? ["link", "transport"] : [] }) };
+      guest: GUEST({ requires: mount ? ["link/open", "transport/deliver"] : [] }) };
     const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
@@ -712,11 +712,11 @@ async function testPolicy() {
   console.log("  OK\n");
 }
 
-// ─── Test: the caps pick the admission class (§12.5) ────────────────────
+// ─── Test: the requires pick the admission class (§12.5) ───────────────────
 //
 // There is one install path and no `role` field, so which of the two admission classes a
-// bundle answers to is read off `guest.caps` alone. The property that has to hold is that
-// the dispatch cannot be pushed the wrong way: declaring a mount-only domain moves a
+// bundle answers to is read off `guest.requires` alone. The property that has to hold is that
+// the dispatch cannot be pushed the wrong way: naming a mount-only name moves a
 // bundle onto the STRICTER predicate, never the looser one — so the MOST permissive app
 // allowlist this codebase can express (`admitAll`) still buys an author no sockets. If
 // that fails, "an app author cannot acquire socket access" is a convention rather than a
@@ -724,18 +724,18 @@ async function testPolicy() {
 //
 // Driven through createShell, because the dispatch is the shell's: the four policy tests
 // above compose verifyBundle → admit → installBundle by hand and would not see it.
-async function testCapsPickTheAdmissionClass() {
-  console.log("Test: guest.caps decides which admission class a bundle answers to");
+async function testRequiresPickTheAdmissionClass() {
+  console.log("Test: guest.requires decides which admission class a bundle answers to");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
-  const blobWithCaps = (caps) => packBundle({
+  const blobWithRequires = (requires) => packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
       app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST({ caps }),
+      guest: GUEST({ requires }),
     }),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
@@ -747,8 +747,8 @@ async function testCapsPickTheAdmissionClass() {
     },
     admit, admitTransport,
   });
-  const load = async (shell, caps) => {
-    try { await shell.loadBundleBlob(blobWithCaps(caps)); return null; }
+  const load = async (shell, requires) => {
+    try { await shell.loadBundleBlob(blobWithRequires(requires)); return null; }
     catch (e) { return String(e); }
   };
 
@@ -759,11 +759,11 @@ async function testCapsPickTheAdmissionClass() {
     let appAsked = 0, transportAsked = 0;
     const shell = mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
     try {
-      await load(shell, ["fs", "clock"]);
+      await load(shell, ["fs/get", "clock/now"]);
       assert(appAsked === 1 && transportAsked === 0, "an ordinary app is governed by the app predicate");
       appAsked = transportAsked = 0;
-      await load(shell, ["link", "transport"]);
-      assert(transportAsked === 1 && appAsked === 0, "a bundle declaring the mount-only caps is governed by the transport predicate");
+      await load(shell, ["link/open", "transport/deliver"]);
+      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the mount-only names is governed by the transport predicate");
     } finally { shell.close(); }
   }
 
@@ -772,27 +772,27 @@ async function testCapsPickTheAdmissionClass() {
   {
     const shell = mkTestShell(admitAll, denyAll);
     try {
-      const err = await load(shell, ["link", "transport"]);
+      const err = await load(shell, ["link/open", "transport/deliver"]);
       assert(err !== null && /rejected by admission/.test(err),
-        "a permissive app allowlist does not admit a bundle asking for the mount-only caps");
-      assert(await load(shell, ["fs", "clock"]) === null, "the same shell still lands an ordinary app");
+        "a permissive app allowlist does not admit a bundle naming the mount-only names");
+      assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
       assert(shell.host.isBound(appKeyFor(author.publicKey, "mod"), "fwd"),
-        "an app declaring no mount-only domain binds normally");
+        "an app naming no mount-only name binds normally");
     } finally { shell.close(); }
   }
 
-  // 3. All of them or none, refused before either predicate: a bundle declaring `link`
-  //    without `transport` has sockets and nowhere to report, so it could only stand as a
-  //    transport that is not one. It must not fall back to the app class either — that is
-  //    the exact hole a partial claim would open.
+  // 3. All of them or none, refused before either predicate: a bundle naming `link/open`
+  //    without any `transport/*` name has sockets and nowhere to report, so it could only
+  //    stand as a transport that is not one. It must not fall back to the app class
+  //    either — that is the exact hole a partial claim would open.
   {
     let asked = 0;
     const shell = mkTestShell(() => { asked++; return true; }, () => { asked++; return true; });
     try {
-      for (const caps of [["link"], ["transport"], ["fs", "link"]]) {
-        const err = await load(shell, caps);
-        assert(err !== null && /every mount-only capability domain/.test(err),
-          `a partial mount claim ${JSON.stringify(caps)} is refused as malformed`);
+      for (const requires of [["link/open"], ["transport/deliver"], ["fs/get", "link/open"]]) {
+        const err = await load(shell, requires);
+        assert(err !== null && /every mount half or none/.test(err),
+          `a partial mount claim ${JSON.stringify(requires)} is refused as malformed`);
       }
       assert(asked === 0, "a partial mount claim never reaches a predicate at all");
     } finally { shell.close(); }
@@ -812,20 +812,20 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [], guest });
   const hash = toHex(gHash(guestBytes));
 
-  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, caps: [] })) !== null,
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: [] })) !== null,
     "a guest declaring this host's ABI verifies");
 
   // Missing: the field is required, not defaulted. A guest author who never thought
   // about the seam version is indistinguishable from one who meant the old one, and
   // defaulting would silently pick the population a bump exists to catch.
   let threw = false;
-  try { verifyManifest(sodium, mk({ hash, caps: [] })); } catch { threw = true; }
+  try { verifyManifest(sodium, mk({ hash, requires: [] })); } catch { threw = true; }
   assert(threw, "a guest with no declared ABI is refused as malformed");
 
   // Present but unimplemented: a legibility failure ("this bundle wants a host I am
   // not"), so it throws with its own message rather than reading as a bad signature.
   let msg = "";
-  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION + 1, caps: [] })); }
+  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION + 1, requires: [] })); }
   catch (e) { msg = e.message; }
   assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
 
@@ -838,13 +838,21 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
-  // `module` is not a domain: a bundle's own modules are a primitive (§12.1), like the
-  // `crypto/` prefix, so a manifest still granting it is refused as an unknown domain —
-  // the same loud failure a typo gets, never a cap that quietly grants nothing.
-  let moduleCaps = "";
-  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, caps: ["module"] })); }
-  catch (e) { moduleCaps = e.message; }
-  assert(moduleCaps.includes("unknown capability domain"), `a manifest declaring "module" in caps is refused at load (got: ${moduleCaps})`);
+  // `requires` is grants ONLY. The pure half of the seam — a bundle's own modules and
+  // the primitive catalog (§12.1) — is not declarable: neither can be absent from a
+  // host, so requiring one is a requirement on something that cannot fail, and the
+  // format says so by refusing it rather than accepting a no-op. A bare `module`, the
+  // shape the coarse-domain format used, is refused the same way a typo is.
+  for (const name of ["module", "module/call", "crypto/blake2b-256", "fs"]) {
+    let refused = "";
+    try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: [name] })); }
+    catch (e) { refused = e.message; }
+    assert(refused.includes(`no authority "${name}"`),
+      `a manifest requiring the non-grant "${name}" is refused at load (got: ${refused})`);
+  }
+  // …and the guest still CALLS them — being undeclarable is not being unavailable.
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs/get"] })) !== null,
+    "an authority, by exact name, is what a manifest may require");
 
   console.log("  OK\n");
 }
@@ -963,11 +971,11 @@ async function testBundle() {
     const manifest = {
       app: "test", version: 1,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
-      // caps + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
+      // requires + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
         abi: GUEST_ABI_VERSION,
-        caps: [],
+        requires: [],
       },
     };
     const writeBundle = (m) => wf(bundlePath, packBundle({
@@ -1034,7 +1042,7 @@ async function testBundle() {
 
 // ─── Test: every app is a guest (§12.4) + the verify/install split ────
 //
-// A chat-style app is a guest plus its module — and because caps live inside `guest`,
+// A chat-style app is a guest plus its module — and because requires live inside `guest`,
 // an empty list IS declaring zero authority; there is no second shape without one. A
 // manifest without a guest is refused by name. Proves the shared §12.4 loader
 // accepts the one app shape (guestSource round-trips), that a bundle blob round-trips
@@ -1376,36 +1384,37 @@ async function testRealmSerialization() {
 // ─── sender-bound responses, WS fragmentation, redial after failure ──────
 
 async function testCapBridgeEnforcement() {
-  console.log("Test: cap-bridge enforces the manifest's declared cap set + allocation caps");
+  console.log("Test: cap-bridge enforces the manifest's declared requires + allocation caps");
 
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
-  const mk = (allowedCaps) => createCapBridge({
+  const mk = (allowedNames) => createCapBridge({
     sodium, identity: id, callModule: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedCaps,
+    allowedNames,
   });
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
 
   // A PRIMITIVE is exempt from the gate by a rule about one prefix: `crypto/` reaches
   // nothing, so there is nothing to grant. A bridge built for a bundle declaring NO
-  // domains still hashes.
-  const clockOnly = mk(["clock"]);
+  // names still hashes.
+  const clockOnly = mk(["clock/now"]);
   assertEqual((await clockOnly("crypto/blake2b-256", U(1, 2))).length, 32,
-    "crypto/blake2b-256 resolves for a bundle declaring no crypto domain — a pure transform is not a grant");
+    "crypto/blake2b-256 resolves for a bundle declaring no crypto name — a pure transform is not a grant");
   threw = false;
   try { await clockOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
   // module/call is the same KIND of name: the asking bundle's own module map — code it
   // already holds, scoped structurally by the app key the bridge was built with — so a
-  // bundle declaring no `module` domain still reaches it.
+  // bundle naming no module name still reaches it.
   threw = false;
   try { await clockOnly("module/call", U(1, 120)); } catch { threw = true; }
-  assert(!threw, "module/call resolves for a bundle declaring no module domain — the bundle's own modules are not a grant");
+  assert(!threw, "module/call resolves for a bundle naming no module name — the bundle's own modules are not a grant");
 
-  // Authorities are gated by their domain PREFIX, and each one names something no
-  // confined module can hold.
+  // Authorities are gated by EXACT name, and each one names something no
+  // confined module can hold: declaring `node` grants nothing, declaring `node/sign`
+  // grants only it.
   threw = false;
   try { await clockOnly("node/sign", U(1)); } catch { threw = true; }
   assert(threw, "an undeclared authority (node/sign) is refused by the bridge");
@@ -1414,35 +1423,43 @@ async function testCapBridgeEnforcement() {
   assert(threw, "an undeclared authority (fs/delete) is refused by the bridge");
   threw = false;
   try { await clockOnly("clock/now", U()); } catch { threw = true; }
-  assert(!threw, "clock/now resolves under the declared clock prefix");
+  assert(!threw, "clock/now resolves under the declared name");
+  // A declared `clock` (bare prefix) is not the same thing as a declared `clock/now`.
+  const prefixOnly = mk(["clock"]);
+  threw = false;
+  try { await prefixOnly("clock/now", U()); } catch { threw = true; }
+  assert(threw, "declaring a bare prefix grants no name — requires are exact");
 
-  // guest-controlled allocation caps. UNRESTRICTED_CAPS is the host-side caller that
-  // opts out of gating *by name* — omitting allowedCaps entirely now throws (§12.2).
-  const open = mk(UNRESTRICTED_CAPS);
+  // guest-controlled allocation caps. UNRESTRICTED_NAMES is the host-side caller that
+  // opts out of gating *by name* — omitting allowedNames entirely now throws (§12.2).
+  const open = mk(UNRESTRICTED_NAMES);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
-  assert(omitted, "omitting allowedCaps throws rather than granting every prefix");
+  assert(omitted, "omitting allowedNames throws rather than granting every name");
   assertEqual((await open("node/random", U(0, 0, 4, 0))).length, 1024, "node/random under the cap works");
   threw = false;
   try { await open("node/random", U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "node/random over the cap is refused");
 
-  // caps → prefixes: a bundle declares capability DOMAINS and the bridge enforces them
-  // as first-component prefix checks.
+  // requires → names: a bundle declares the EXACT names and the bridge enforces them
+  // as exact-membership checks.
   const nodeOnly = createCapBridge({
     sodium, identity: id, callModule: () => null,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedCaps: ["node"],
+    allowedNames: ["node/sign"],
     signScope: appSignScope(id, new Uint8Array(32), "probe"),
   });
-  assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node grants the node-key names");
+  assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign is granted by its declared name");
   assertEqual((await nodeOnly("crypto/blake2b-256", U(1, 2))).length, 32,
-    "…and hashing needs no domain at all");
+    "…and hashing needs no grant at all");
   threw = false;
   try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
-  assert(threw, "a name outside the declared domains (fs) is refused");
+  assert(threw, "a name outside the declared requires (fs/get) is refused");
+  threw = false;
+  try { await nodeOnly("node/identity", U()); } catch { threw = true; }
+  assert(threw, "a name beside the declared one (node/identity under node/sign) is refused");
 
-  // The vocabulary is closed at LOAD, not at first use: an unknown domain in a manifest
+  // The vocabulary is closed at LOAD, not at first use: an unknown name in a manifest
   // is a refused bundle (verifyManifest, bundle.ts) — the bridge itself answers "no
   // such name" for anything it was not built to serve.
   threw = false;
@@ -1521,7 +1538,7 @@ async function testManifestSuiteByte() {
 
   const author = generateKeyPair();
   // One module: this test is about the suite byte, not the module count.
-  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } };
+  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
   const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
 
   // Layout: the suite byte leads, and the author key follows it (not at offset 0).
@@ -1731,7 +1748,7 @@ async function testHybridManifestSuite() {
   const pq = generatePqKeyPair();
   const keys = { ed, mlDsa: pq };
   // One module: this test is about the hybrid envelope, not the module count.
-  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } };
+  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
   const env = signManifestHybrid(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
@@ -1909,7 +1926,7 @@ async function testBundleCorruptNewerRollback() {
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
         abi: GUEST_ABI_VERSION,
-        caps: [],
+        requires: [],
       },
     });
     // `wasm` is the module's actual bytes — passed corrupt below to model a
@@ -2261,7 +2278,7 @@ await testFs();
 await testFsKeyRule();
 await testCapBridge();
 await testPolicy();
-await testCapsPickTheAdmissionClass();
+await testRequiresPickTheAdmissionClass();
 await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();

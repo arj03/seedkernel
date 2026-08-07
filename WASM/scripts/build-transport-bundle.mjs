@@ -186,23 +186,27 @@ async function main() {
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
       abi: 2,
-      // The AUTHORITIES this program is granted, and the whole of them: `node` (the
-      // slot-scoped signer and the entropy source), `clock`; `link`, the sockets
-      // behind opaque link ids; `timer`, because a zero-authority realm has no
-      // setTimeout; `transport`, where it reports its structured output. The last two
-      // of those are MOUNT_ONLY_DOMAINS: the shell refuses a bundle naming either to the
-      // ordinary app path, and requires BOTH of a transport mount — which is what makes
-      // this cap list, and not a self-description, the thing that says what this bundle
-      // is. Its own ws.wasm needs no grant — `module/call` is a primitive, ungated
-      // like `crypto` (§12.1). No `net` — that domain IS this program's output, and
-      // its own net/send would loop back into itself.
-      caps: ["node", "clock", "timer", "link", "transport"],
-      // The primitives it calls by name. NOT a grant — a pure transform reaches nothing
-      // — but a compatibility claim, so a host lacking one refuses this bundle by name
-      // instead of failing mid-handshake.
-      primitives: [
-        "blake2b-256", "ed25519/verify",
-        "chacha20poly1305-ietf/seal", "chacha20poly1305-ietf/open", "x25519/dh",
+      // EXACTLY the authorities this program holds — and, since the list is grants only,
+      // exactly what an operator is agreeing to when they mount it. `node/sign`
+      // (slot-scoped signing) and `node/random` (entropy); `link/*`, the sockets behind
+      // opaque link ids; `timer/*`, because a zero-authority realm has no setTimeout;
+      // `transport/*`, where it reports its structured output. The last two are the
+      // catalog's mount halves (`mount:sockets` + `mount:report`): the shell refuses a
+      // bundle naming either to the ordinary app path and requires BOTH of a mount —
+      // which is what makes this list, and not a self-description, the thing that says
+      // what this bundle is. No `net`: that vocabulary IS this program's output, and its
+      // own net/send would loop back into itself.
+      //
+      // Its ws.wasm and its crypto are absent because neither is a grant and neither can
+      // be missing — `module/call` reaches modules that arrived in this same signed
+      // bundle, and the primitive catalog is total on any host that has a cap bridge at
+      // all. What this program needs of them is `abi: 2` above (§12.1).
+      requires: [
+        "node/sign", "node/random",
+        "link/open", "link/send", "link/close", "link/stat",
+        "timer/arm", "timer/clear",
+        "transport/deliver", "transport/settle", "transport/link-auth",
+        "transport/peer-edge", "transport/ready", "transport/link-down",
       ],
     },
   };

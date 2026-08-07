@@ -11,8 +11,9 @@
 // the first into the second.
 //
 // **What picks the class is not here.** There is no `role` field: the shell reads it off
-// `guest.caps` (`MOUNT_ONLY_DOMAINS`) before it asks anything of this file. That dispatch
-// runs only the strict way — declaring `link` moves a bundle onto `transport`, never onto
+// `guest.requires` (`mountGroups`, over the catalog's mount halves) before it asks
+// anything of this file. That dispatch
+// runs only the strict way — naming `link/open` moves a bundle onto `transport`, never onto
 // `apps` — so an author cannot reach the looser predicate by editing a manifest, and a
 // permissive `apps` predicate is a bad configuration rather than a path to sockets.
 //
@@ -39,12 +40,12 @@ export type AdmitPredicate = (v: VerifiedBundle) => boolean | Promise<boolean>;
 
 /** What a policy file resolves to: one predicate per admission class. A record rather
  *  than a single predicate branching internally, because the branch is the shell's
- *  (over the manifest's caps) and a predicate reached through the wrong field would be
+ *  (over the manifest's requires) and a predicate reached through the wrong field would be
  *  the one bug this whole split exists to prevent. */
 export interface AdmissionPolicy {
-  /** Governs a bundle declaring no mount-only domain — an ordinary app. */
+  /** Governs a bundle naming no mount-only name — an ordinary app. */
   apps: AdmitPredicate;
-  /** Governs a bundle declaring the mount-only domains — the node's transport. */
+  /** Governs a bundle naming the mount-only names — the node's transport. */
   transport: AdmitPredicate;
 }
 

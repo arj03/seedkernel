@@ -29,7 +29,8 @@ const (
 func TestCapBridgeOps(t *testing.T) {
 	capBridgeRealm(t)
 
-	// Grant node + fs + clock (not net) and an identity from sodium. The
+	// Grant node/sign, node/identity, fs/put, fs/get and clock/now (not net, not
+	// link) and an identity from sodium. The
 	// guest-signing scope binds node/sign to a bundle namespace (README §12.2); a real
 	// node derives it from the manifest's (author, app), here a throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`
@@ -39,7 +40,7 @@ func TestCapBridgeOps(t *testing.T) {
 		// test reconstructs the preimage from.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
-		__buildCapBridge(["node", "fs", "clock"], __id, null, [], __scope);
+		__buildCapBridge(["node/sign", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -131,12 +132,12 @@ func TestCapBridgeOps(t *testing.T) {
 		t.Fatalf("clock/now = %v, want nonzero u64", clk)
 	}
 
-	// Gate: a name under an undeclared prefix is refused. net/peers rather than
+	// Gate: a name outside the granted set is refused. net/peers rather than
 	// net/send because the gate has to be observed SYNCHRONOUSLY here — net/send is a
 	// real round trip, so a refusal comes back as a rejected promise rather than a
 	// thrown error.
 	if _, err := call(nameNetPeers, nil); err == nil {
-		t.Fatal("net/peers resolved despite not being a declared cap")
+		t.Fatal("net/peers resolved despite not being a declared name")
 	}
 	// And raw net is not merely undeclared here — it is the transport slot's, so no app
 	// bridge is ever wired one.

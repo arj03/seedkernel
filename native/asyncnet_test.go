@@ -24,7 +24,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	capBridgeRealm(t)
 
 	// A (responder, listens) and B (the guest's node). The guest's cap-bridge is built
-	// over B's identity + transport, granting crypto + net only. A's onRequest echoes
+	// over B's identity + transport, granting net/send only. A's onRequest echoes
 	// the payload so the round-trip result is checkable.
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.idA = sodium.crypto_sign_keypair();
@@ -42,7 +42,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.netA = a.net;
 		  globalThis.netB = b.net;
 		  netA.onRequest((from, proto, payload) => payload);
-		  __buildCapBridge(["crypto", "net"], idB, netB, [aId]);
+		  __buildCapBridge(["net/send"], idB, netB, [aId]);
 		})();
 	`)); err != nil {
 		t.Fatal("setup:", err)

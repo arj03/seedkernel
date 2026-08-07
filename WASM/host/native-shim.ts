@@ -521,7 +521,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
 /** Load a signed bundle (README §12.4). Go has read the one file — that is the whole
  *  fs seam — and passes its bytes; every check, its order, and the module binding are
  *  the shared shell's. Returns the little Go needs to report; the guest source, the
- *  caps, the signing scope and the table names never leave this realm. */
+ *  requires, the signing scope and the table names never leave this realm. */
 async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
     const b = await theShell().loadBundleBlob(new Uint8Array(blob));
     return utf8.encode(JSON.stringify({

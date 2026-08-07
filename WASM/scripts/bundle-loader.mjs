@@ -19,6 +19,11 @@
 // assigned from inside. Two modules exporting the same name is a real conflict and
 // fails the build loudly.
 //
+// One rule this imposes on the shared sources: **no aliased imports**. A name crosses
+// a module boundary as the name it was exported under, so `import { X as Y }` compiles
+// and typechecks fine and then throws `ReferenceError: Y is not defined` inside
+// QuickJS — a break only the native target sees. Import the plain name.
+//
 // Usage: node bundle-loader.mjs <out.js> <Export1,Export2,...> <file1.js> <file2.js> ...
 // Files must be given in dependency order (a module before the ones importing it).
 import { readFileSync, writeFileSync } from "node:fs";

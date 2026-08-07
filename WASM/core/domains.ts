@@ -65,17 +65,19 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  inspect one and never build a bridge at all. cap-bridge.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
 export const GUEST_ABI_VERSION = 2;
-/** The crypto primitives this host serves through the `crypto/` prefix — the catalog
- *  a manifest's `guest.primitives` is checked against at load (§12.4).
+/** The crypto primitives this host serves through the `crypto/` prefix — the pure half
+ *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (cap-bridge.ts)
+ *  is total over this list: a host that has that file has every name in it, so a partial
+ *  catalog is unrepresentable and there is nothing for a bundle to require. What a guest
+ *  needs from the pure half is covered by `abi` — the version of the seam it was written
+ *  against, which is the version of everything in it.
  *
- *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: the
- *  loader checks a manifest field before anything is trusted, and it should not have to
- *  import the op catalog and preamble to do it. cap-bridge.ts dispatches through the
- *  `crypto/` prefix — its table keys are the template literal over this list, so the
- *  names and the transforms cannot drift.
+ *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: it
+ *  belongs with the vocabulary, and cap-bridge.ts's table keys are the template literal
+ *  over this list, so the names and the transforms cannot drift.
  *
  *  **Adding a name here is the whole cost of a new algorithm** — no op number, no ABI
- *  rev, no capability domain. That is the point of a named catalog, and it is why a core
+ *  rev, no manifest field. That is the point of a named catalog, and it is why a core
  *  vocabulary is provisioned ahead of need (§14.1): a bundle is replaceable, the
  *  vocabulary it draws on is not. */
 export const PRIMITIVE_NAMES = [
@@ -100,37 +102,83 @@ export const PRIMITIVE_NAMES = [
 ] as const;
 
 export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
-/** The capability *domains* a bundle's manifest may declare in `guest.caps` (§12.4) —
- *  the granted prefixes of the name-addressed seam (§12.2). A domain IS its prefix: the
- *  bridge refuses any `host.call(name, …)` whose first path component is not one of
- *  these — or `crypto` and `module`, which are not here because they are never grants
- *  (§12.1). The vocabulary is closed, checked at load, so a manifest naming a domain
- *  this host has never heard of is a refused bundle rather than a cap that quietly
- *  grants nothing at first use. Adding a name to a domain here is the whole cost of a
- *  new op.
+/** The authorities: every name that reaches something no confined guest can hold — the
+ *  node key (`node/sign` is scoped, never raw), the entropy source, a socket, the disk,
+ *  the platform's clock and event loop. This IS the manifest vocabulary: `guest.requires`
+ *  names a subset of these keys and nothing else, so the list an operator reads is the
+ *  list of what the bundle can reach.
  *
- *  Here rather than in cap-bridge.ts for the reason `GUEST_ABI_VERSION` is: the loader
- *  checks a manifest's caps against this list before anything is trusted, and should not
- *  have to import the guest bridge to do it. cap-bridge.ts dispatches through a table
- *  whose every name must carry one of these prefixes (checked at construction), so the
- *  two cannot drift. */
-export const CAP_DOMAINS: readonly string[] = ["node", "net", "fs", "clock", "timer", "link", "transport"];
-/** The capability domains only the shell's transport MOUNT may declare (§12.5). `link` is
- *  what the mount consumes — sockets behind opaque link ids, the whole of what the
- *  platform contributes to the network — and `transport` is what it provides back: the
- *  attributed peer, protocol id and correlation every other app's `net` domain reaches.
- *  Neither is an app capability: a manifest declaring them is governed by the policy's
- *  transport half rather than its app half, and mounted as the node's transport rather
- *  than bound as an app. This list IS what says which bundle that is — there is no role
- *  field, because the caps already carry the fact and the signature already covers them.
- *  `timer` is deliberately NOT here: it is an ordinary authority, and the transport
- *  happening to want one is not a reason to make it a privilege.
+ *  `crypto/*` and `module/call` are not here, and that absence is the whole gate rule: a
+ *  name is a grant iff it is a key of this table (`isGrant`), so the dispatcher never
+ *  parses a name to decide (§12.1). They are also, for the same reason, not declarable —
+ *  a manifest naming one is refused. Neither can be absent from a host (`cryptoCatalog`
+ *  is total; a bundle's modules arrive with it), so requiring them would be a requirement
+ *  on something that cannot fail, and it would bury the three or four names that carry
+ *  the bundle's actual authority under a dozen that carry none.
  *
- *  A subset of `CAP_DOMAINS` — declared beside it, and derived from by the one predicate
- *  both admission paths ask (`mountOnlyCaps`, bundle.ts), so the vocabulary the app path
- *  refuses and the vocabulary the mount path requires cannot drift from each other or
- *  from the domains they name. */
-export const MOUNT_ONLY_DOMAINS: readonly string[] = ["link", "transport"];
+ *  Each name carries what it is granted *for*, which is the whole of the mount rule:
+ *  `"app"` is an ordinary authority any bundle may ask for, and a `"mount:…"` value
+ *  says the name is the transport mount's alone (§12.5) and which half of a transport
+ *  it supplies — `mount:sockets` is what the mount consumes (the platform's whole
+ *  contribution to the network, behind opaque link ids), `mount:report` is what it
+ *  provides back (the attributed peer, protocol id and correlation every app's `net`
+ *  names reach). A mount must name both halves or neither: a bundle with sockets and
+ *  nowhere to report could only stand as a transport that is not one, so a partial
+ *  claim is refused at the load rather than at the first dial. `timer/*` is
+ *  deliberately `"app"` — an ordinary authority, and the transport happening to want
+ *  one is not a reason to make it a privilege.
+ *
+ *  The table IS what says which bundle is the mount; there is no role field, because
+ *  the requires already carry the fact and the signature already covers them.
+ *
+ *  The one-file rule: the bridge's dispatch table is TYPED against `CapabilityName`
+ *  (a key here without a handler is a compile error) and walked against its own key
+ *  set at construction (the compiled-JS half the native target evaluates, and the
+ *  check a typo'd extra key trips). Adding a name here is the whole cost of a new op. */
+export const AUTHORITY_CALLS = {
+    "node/sign": "app",
+    "node/identity": "app",
+    "node/random": "app",
+    "net/send": "app",
+    "net/peers": "app",
+    "fs/get": "app",
+    "fs/put": "app",
+    "fs/list": "app",
+    "fs/delete": "app",
+    "fs/size": "app",
+    "fs/stat": "app",
+    "clock/now": "app",
+    "timer/arm": "app",
+    "timer/clear": "app",
+    "link/open": "mount:sockets",
+    "link/send": "mount:sockets",
+    "link/close": "mount:sockets",
+    "link/stat": "mount:sockets",
+    "transport/deliver": "mount:report",
+    "transport/settle": "mount:report",
+    "transport/link-auth": "mount:report",
+    "transport/peer-edge": "mount:report",
+    "transport/ready": "mount:report",
+    "transport/link-down": "mount:report",
+} as const;
+export type CapabilityName = keyof typeof AUTHORITY_CALLS;
+/** Whether a name is a *grant* — the one question the bridge's gate asks, and the one
+ *  the manifest does not answer. `crypto/*` and `module/call` are false here by being
+ *  absent from `AUTHORITY_CALLS` rather than by a parse of their prefix: a primitive is
+ *  a function of its arguments and a module is the asking bundle's own, so neither
+ *  reaches anything a guest does not already hold (§12.1). */
+export function isGrant(name: string): name is CapabilityName {
+    return Object.prototype.hasOwnProperty.call(AUTHORITY_CALLS, name);
+}
+/** The mount halves (§12.5), derived from the catalog so there is no second list to
+ *  keep in step with the names. A manifest naming any mount-only authority is the
+ *  transport mount, governed by the policy's transport half rather than its app half;
+ *  `mountGroups` (bundle.ts) is the ONE predicate both admission paths ask, and a mount
+ *  must cover every group here. */
+export type MountGroup = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
+export const MOUNT_GROUPS: readonly MountGroup[] = [
+    ...new Set(Object.values(AUTHORITY_CALLS).filter((g): g is MountGroup => g !== "app")),
+];
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

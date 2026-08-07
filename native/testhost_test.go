@@ -117,11 +117,11 @@ func applyPolicy(policyJSON string) error {
 // testCapBridgeJS installs __buildCapBridge / __callBridge: a TEST-ONLY convenience
 // over the shared createCapBridge, so a test can hand a realm a capability funnel with
 // no signed bundle behind it. Production never takes this path — createShell builds
-// the bridge from the admitted manifest's declared domains (§12.2) — which is why this
+// the bridge from the admitted manifest's declared requires (§12.2) — which is why this
 // lives in a _test file and not in the shipped glue.
 const testCapBridgeJS = `
 "use strict";
-globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope) {
+globalThis.__buildCapBridge = function (names, identity, transport, peers, scope) {
   globalThis.__capBridge = createCapBridge({
     sodium, identity, fs,
     // No app behind this harness, so module/call reaches nothing. Nothing to scope
@@ -131,9 +131,9 @@ globalThis.__buildCapBridge = function (caps, identity, transport, peers, scope)
     transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
     peers: () => peers || [],
     now: () => Date.now(),
-    // The granted domain prefixes, straight through: a call resolves iff its first
-    // path component is one of these (or crypto, which is never a grant).
-    allowedCaps: caps,
+    // The granted names, straight through: a call resolves iff the name itself is
+    // one of these (or crypto/module, which are never grants).
+    allowedNames: names,
     signScope: scope || undefined,
   });
   return __capBridge;

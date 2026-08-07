@@ -92,7 +92,7 @@ func appKeyFor(author []byte, app string) string {
 const stubGuestSrc = "register('ping', () => new Uint8Array([1]));"
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
-// dir: one forwarder module + a stub guest with no caps, under an author-signed manifest
+// dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
 // at the given (app, version). See writeBundle for the general form.
 func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
 	t.Helper()
@@ -105,12 +105,12 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 // and the app key its modules will bind under; the module itself is "fwd", the logical
 // name from the manifest. Requires a booted realm (it hashes content with the booted
 // sodium). Mirrors the TS run.mjs testBundle.
-func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, caps []string) (string, string) {
+func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
 		guestSrc = stubGuestSrc
 	}
-	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, caps), guestSrc)
+	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, requires), guestSrc)
 }
 
 // signBundleJSON wraps a finished manifest body in the suite-0x01 envelope and packs it.
@@ -130,24 +130,24 @@ func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app strin
 
 // manifestJSON builds the manifest body both suites sign: one forwarder module plus the
 // given guest. Every app is a guest (§12.4), so the manifest always declares one — the
-// guest's authority is the `caps` list, which may be empty. The bytes are the signed
+// guest's authority is the `requires` list, which may be empty. The bytes are the signed
 // bytes; there is no canonicalisation step, so the verifier parses exactly what it
 // checked (§12.4).
-func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps []string) []byte {
+func manifestJSON(t *testing.T, app string, version int, guestSrc string, requires []string) []byte {
 	t.Helper()
 
 	type mod struct {
 		Name string `json:"name"`
 		Hash string `json:"hash"`
 	}
-	// caps + config live inside `guest` (§12.4): a bundle's authority is its guest's,
-	// so "no authority" is an empty `caps` list, not an absent object. `abi` names the
+	// requires + config live inside `guest` (§12.4): a bundle's authority is its guest's,
+	// so "no authority" is an empty `requires` list, not an absent object. `abi` names the
 	// host seam the guest was written against (§12.2) and is required — the loader
 	// refuses one it does not implement.
 	type guest struct {
-		Hash string   `json:"hash"`
-		Abi  int      `json:"abi"`
-		Caps []string `json:"caps"`
+		Hash     string   `json:"hash"`
+		Abi      int      `json:"abi"`
+		Requires []string `json:"requires"`
 	}
 	manifest := struct {
 		App     string `json:"app"`
@@ -161,13 +161,13 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, caps [
 			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
 		}},
 		Guest: guest{
-			Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
-			Abi:  guestABIVersion,
-			Caps: caps,
+			Hash:     hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
+			Abi:      guestABIVersion,
+			Requires: requires,
 		},
 	}
-	if manifest.Guest.Caps == nil {
-		manifest.Guest.Caps = []string{}
+	if manifest.Guest.Requires == nil {
+		manifest.Guest.Requires = []string{}
 	}
 	mjson, err := json.Marshal(manifest)
 	if err != nil {

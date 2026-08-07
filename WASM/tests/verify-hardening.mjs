@@ -24,7 +24,7 @@ const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packB
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createCapBridge, UNRESTRICTED_CAPS, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
+const { createCapBridge, UNRESTRICTED_NAMES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
 
 const { ok, throws, summary } = testkit();
 
@@ -100,9 +100,9 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
-  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } }) !== null,
     "a guest may declare no modules at all — zero-to-many, no count rule");
-  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, caps: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } }) !== null,
     "a guest may declare many modules — the guest dispatches them");
 }
 
@@ -114,13 +114,13 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     transport: { request: async () => new Uint8Array() },
     peers: () => [], fs: new MemoryFs(),
   };
-  throws(() => createCapBridge({ ...base }), "omitting allowedCaps throws at construction");
-  ok(typeof createCapBridge({ ...base, allowedCaps: UNRESTRICTED_CAPS }) === "function",
+  throws(() => createCapBridge({ ...base }), "omitting allowedNames throws at construction");
+  ok(typeof createCapBridge({ ...base, allowedNames: UNRESTRICTED_NAMES }) === "function",
     "naming the sentinel is accepted");
 
   // A guest reaches its own app's modules with NO grant at all: module/call is a
   // primitive — the asking bundle's own code, scoped structurally by the app key the
-  // bridge was built with — so it resolves under an empty cap set, exactly like
+  // bridge was built with — so it resolves under an empty requires set, exactly like
   // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
   const chat = new ModuleTable();
   chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
@@ -128,7 +128,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   const scoped = createCapBridge({
     ...base,
     callModule: (n, p) => chat.callModule("aa:chat", n, p),
-    allowedCaps: [],
+    allowedNames: [],
   });
   // The forwarder echoes its input, so a resolved module answers with the body and an
   // unresolved one answers empty — which is what tells the two apart.
@@ -224,7 +224,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const guestBytes = new TextEncoder().encode(guestSrc);
   const manifest = {
     app: "probe", version: 1, modules: [],
-    guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, caps: [] },
+    guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires: [] },
   };
   const blob = packBundle({
     [MANIFEST_FILE]: signManifest(sodium, kp.privateKey, kp.publicKey, manifest),

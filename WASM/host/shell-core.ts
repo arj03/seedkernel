@@ -18,13 +18,13 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
-import { appKeyFor, appScopeFor, handlesOf, mountOnlyCaps, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, handlesOf, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, bundlePreamble, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { MOUNT_ONLY_DOMAINS } from "../core/domains.js";
+import { MOUNT_GROUPS } from "../core/domains.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
@@ -222,7 +222,7 @@ export interface Shell {
     /** Load a signed bundle blob: verify the manifest, run the admission predicate,
      *  integrity-check + install the modules, and return the guest source. This is
      *  the §12.4 load order — the ONE install path, for apps and for the transport
-     *  alike. A bundle declaring the mount-only caps (§12.5) is governed by the
+     *  alike. A bundle naming the mount-only names (§12.5) is governed by the
      *  transport half of the policy and mounted as this shell's transport instead of
      *  bound as an app; replacing a standing transport is a staged handover, where the
      *  incoming guest stands before the outgoing driver is closed and links reconnect
@@ -411,7 +411,7 @@ export function createShell(opts: CreateShellOptions & {
      *  shell can be assembled before any bundle loads. */
     let netHost: TransportHost | null = null;
     const noTransport = (what: string): never => {
-        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring ${MOUNT_ONLY_DOMAINS.join(" + ")} first)`);
+        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the mount-only names, ${MOUNT_GROUPS.join(" + ")}, first)`);
     };
     // The tail of every initiator `runGuest` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
@@ -458,7 +458,7 @@ export function createShell(opts: CreateShellOptions & {
      *  any point in the process's life, because nothing else is ever handed one
      *  (README §1, capability-by-non-wiring). */
     const buildBridge = (b: LoadedBundle, driver: TransportHost | null) => {
-        const caps = new Set(b.manifest.guest.caps);
+        const names = new Set(b.manifest.guest.requires);
         const appKey = appKeyFor(b.author, b.manifest.app);
         return createCapBridge({
             rawNet: driver?.rawNet(),
@@ -475,15 +475,19 @@ export function createShell(opts: CreateShellOptions & {
             // not the node's (fs.ts). Two admitted apps can no longer read, enumerate or
             // delete each other's data, which brings `fs` into line with the structural
             // ownership module names already have (§5.1).
-            fs: caps.has("fs") && fs
-                ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app))
-                : undefined,
+            //
+            // Wired whenever the node has an fs at all, without consulting the manifest:
+            // the gate below refuses every `fs/*` name the bundle did not declare, so a
+            // second test here would be the same grant decided in two places — and the
+            // one that reads a prefix off a name, which is exactly what the name catalog
+            // exists to stop.
+            fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
             now: platform.now ?? (() => Date.now()),
-            // The granted domain prefixes are the bridge's gate — a `host.call`
-            // resolves iff its first path component is one of these (`crypto` and
-            // `module` exempt: never grants — a fixed catalog and the app's own module
-            // map). The vocabulary was checked at load (verifyManifest).
-            allowedCaps: caps,
+            // The declared requires ARE the bridge's gate — a `host.call` resolves iff
+            // the name itself is one of these (`crypto/*` and `module/call` exempt:
+            // never grants — a fixed catalog and the app's own module map). The
+            // vocabulary was checked at load (verifyManifest).
+            allowedNames: names,
             // What SIGN signs under is chosen HERE, by the slot the bundle occupies — the one
             // place that knows it (§12.2). The transport slot signs handshake
             // transcripts under DOMAIN_channel with the node's channel key; every ordinary app
@@ -654,25 +658,27 @@ export function createShell(opts: CreateShellOptions & {
         sodium,
         async loadBundleBlob(blob) {
             const v = verifyBundle(sodium, blob);
-            // WHICH BUNDLE THIS IS, read off the caps and nothing else. There is no `role`
-            // field and there is no second entrypoint: a transport is exactly the bundle
-            // declaring the mount-only domains (§12.5), which the manifest signature
+            // WHICH BUNDLE THIS IS, read off the requires and nothing else. There is no
+            // `role` field and there is no second entrypoint: a transport is exactly the
+            // bundle naming mount-only names (§12.5), which the manifest signature
             // already covers and `verifyManifest` has already checked. Restating that as a
             // self-description, or as a choice of method, would be a second place for the
-            // same fact to live — and the caps are the one that must be right anyway,
+            // same fact to live — and the requires are the one that must be right anyway,
             // because they are what the bridge actually wires.
             //
             // An author cannot climb into the mount by declaring them, which is the
-            // property the whole split exists for: adding `link` moves a bundle onto the
-            // STRICTER predicate (`admitTransport`), never the looser one. The dispatch is
-            // safe in the only direction it can be pushed.
-            const mountOnly = mountOnlyCaps(v.manifest);
-            const isMount = mountOnly.length > 0;
-            // All of them or none. A bundle missing `link` has no sockets and one missing
-            // `transport` has nowhere to report, so a partial claim could only stand as a
-            // transport that is not one — refused at the load rather than at the first dial.
-            if (isMount && mountOnly.length !== MOUNT_ONLY_DOMAINS.length) {
-                throw new Error(`shell: a transport declares every mount-only capability domain or none (${MOUNT_ONLY_DOMAINS.join(", ")}); ${v.manifest.app} declares only ${mountOnly.join(", ")} (§12.5)`);
+            // property the whole split exists for: adding `link/open` moves a bundle onto
+            // the STRICTER predicate (`admitTransport`), never the looser one. The dispatch
+            // is safe in the only direction it can be pushed.
+            const groups = mountGroups(v.manifest);
+            const isMount = groups.length > 0;
+            // Every mount half, or none. A bundle with no `mount:sockets` name has no
+            // sockets and one with no `mount:report` name has nowhere to report, so a
+            // partial claim could only stand as a transport that is not one — refused at
+            // the load rather than at the first dial.
+            const missing = MOUNT_GROUPS.filter((g) => !groups.includes(g));
+            if (isMount && missing.length > 0) {
+                throw new Error(`shell: a transport declares names in every mount half or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
             }
             // Revocation before `admit`, not just inside installBundle. The predicate is
             // where an interactive shell puts its consent dialog (§12.4), so asking it

@@ -27,7 +27,7 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 	capBridgeRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["crypto", "fs"], __id, null, []);
+		__buildCapBridge(["fs/put", "fs/get", "fs/size"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
