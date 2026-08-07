@@ -187,8 +187,9 @@ async function main() {
       hash: toHex(sodium.crypto_generichash(32, guest)),
       abi: 2,
       // EXACTLY the authorities this program holds — and, since the list is grants only,
-      // exactly what an operator is agreeing to when they mount it. `node/sign`
-      // (slot-scoped signing) and `node/random` (entropy); `link/*`, the sockets behind
+      // exactly what an operator is agreeing to when they mount it. `node/sign` +
+      // `node/verify` (slot-scoped signing and its verification twin) and
+      // `node/random` (entropy); `link/*`, the sockets behind
       // opaque link ids; `timer/*`, because a zero-authority realm has no setTimeout;
       // `transport/*`, where it reports its structured output. The last two are the
       // catalog's mount halves (`mount:sockets` + `mount:report`): the shell refuses a
@@ -202,7 +203,7 @@ async function main() {
       // bundle, and the primitive catalog is total on any host that has a cap bridge at
       // all. What this program needs of them is `abi: 2` above (§12.1).
       requires: [
-        "node/sign", "node/random",
+        "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",
         "timer/arm", "timer/clear",
         "transport/deliver", "transport/settle", "transport/link-auth",

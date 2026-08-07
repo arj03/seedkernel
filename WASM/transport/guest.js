@@ -19,7 +19,6 @@
 //     program uses, declared in its manifest's `guest.requires` — the names a host
 //     that cannot serve them refuses the bundle by, at load:
 //       "crypto/blake2b-256"               bytes -> 32B      (transcript, KDF, root)
-//       "crypto/ed25519/verify"            [pk 32][sig 64][msg] -> [ok u8]   (peer AUTH)
 //       "crypto/chacha20poly1305-ietf/seal" [npub 12][key 32][msg] -> ct      (record layer)
 //       "crypto/chacha20poly1305-ietf/open" [npub 12][key 32][ct] -> [ok u8][pt]
 //       "crypto/x25519/dh"                 [sk 32][pk 32] -> [ok u8][x 32]   (ephemeral DH,
@@ -35,6 +34,11 @@
 //                     channel key, which never enters this module. It does not read the
 //                     suffix — the domain separation is the guarantee, so no transcript
 //                     shape is pinned into the host and no call signs raw bytes.
+//       "node/verify" [pk 32][sig 64][msg] -> [ok u8]. The SAME scope, host-applied:
+//                     verifies a peer's transcript signature under the caller-named key
+//                     without this module ever reconstructing the prefix it was made
+//                     under — the one side of signing the two ends have to agree on is
+//                     the host's, never this program's.
 //       "node/random" [n u32 BE] -> n random bytes            (nonces, ephemeral secrets)
 //
 //     `link` — the platform's whole contribution to the network: bytes over an opaque
@@ -59,7 +63,9 @@
 // The node key stays out of this module in the strongest sense: there is no call
 // that signs arbitrary bytes — node/sign is scoped by the point the host admitted this
 // bundle into, so a compromised transport can neither forge app signatures nor
-// sign for another network.
+// sign for another network. Its verification twin is equally scope-bound: node/verify
+// answers only under this mount's own scope, so this program checks a peer's
+// transcript signature without holding the domain tag it was made under.
 //
 // Channels are host handles keyed by a link id the HOST minted — the module table
 // holds one instance per name (§3.1), so all link state lives in this module's
@@ -134,6 +140,7 @@ function utf8Decode(b) {
 // Authorities only — a primitive has no name of its own beyond `crypto/<name>` (see
 // below).
 const N_SIGN = "node/sign";
+const N_VERIFY = "node/verify";
 const N_RANDOM = "node/random";
 const N_MODULE_CALL = "module/call";
 
@@ -163,7 +170,6 @@ const N_LINK_DOWN = "transport/link-down";
 // full names as the manifest's `guest.requires` declares them, so a host that cannot
 // serve one refuses the bundle at load rather than failing here.
 const P_HASH = "crypto/blake2b-256";
-const P_VERIFY = "crypto/ed25519/verify";
 const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
 const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
@@ -230,6 +236,11 @@ const LABEL_M4 = utf8Encode("seedkernel-c-msg4-v1\0");
 const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 
+// The channel-id domain tag, for the session ROOT derivation only (Link: root =
+// blake2b(DOMAIN_channel ‖ networkKey)) — the KDF's domain separator, this bundle's
+// own wire contract like the LABEL_* strings above. It is NOT the sign-prefix domain:
+// that half of signing is the host's (transportSignScope) and this program never
+// reconstructs it — node/verify applies it for us.
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
 // Per-suite wire lengths (ex SUITE_PARAMS). A later suite changes these and the
@@ -246,14 +257,6 @@ let ownPk = null;          // 32B node channel public key
 let ownId = "";            // its hex — the peer id
 let networkKey = null;     // 32B
 let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
-// What the host PREPENDS to everything the SIGN op signs for the mounted transport:
-// `DOMAIN_channel ‖ networkKey`, chosen from the point this bundle was admitted through
-// and never from anything said here (cap-bridge `transportSignScope`). The host
-// prefixes and does not parse, so reconstructing the prefix to VERIFY a peer's
-// transcript signature is this program's job — it is the one thing about signing the
-// two sides have to agree on, and getting it wrong is a handshake that never
-// completes rather than one that completes wrongly.
-let signPrefix = null;
 let connsPerPeer = 1;
 // The HOST's flood cap, learned at INIT — this module never declares the number
 // that bounds it (net-limits.ts stays core); it only sizes its own send budget
@@ -296,7 +299,7 @@ function verify(pk, sig, msg) {
   let len = pk.length + sig.length + msg.length;
   const out = new Uint8Array(len);
   out.set(pk, 0); out.set(sig, pk.length); out.set(msg, pk.length + sig.length);
-  return host.call(P_VERIFY, out)[0] === 1;
+  return host.call(N_VERIFY, out)[0] === 1;
 }
 function randomBytes(n) {
   const req = new Uint8Array(4);
@@ -332,7 +335,8 @@ function boxKeypair() {
  *  `DOMAIN_channel ‖ networkKey` — chosen from THIS bundle's admission point, not from anything
  *  said here — and signs the opaque suffix with the node's channel key, which never
  *  enters this program. There is no call that signs raw bytes, and the prefix is what
- *  makes a transcript signature unusable as app data (and vice versa). */
+ *  makes a transcript signature unusable as app data (and vice versa). The peer side
+ *  of the same transcript is checked with node/verify under the identical prefix. */
 function channelSign(root, th, id) {
   const out = new Uint8Array(96);
   out.set(root, 0); out.set(th, 32); out.set(id, 64);
@@ -1003,7 +1007,11 @@ class Link {
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
-    if (!verify(id, sig, concatBytes([signPrefix, this.root, th, id]))) return null;
+    // Scoped verify, host-applied: node/verify checks `DOMAIN_channel ‖ networkKey ‖
+    // root ‖ th ‖ id` under `id` — the same scope this node signs its own identity
+    // under — so the preimage the two ends must agree on is the host's, never
+    // reconstructed here.
+    if (!verify(id, sig, concatBytes([this.root, th, id]))) return null;
     if (bytesCompare(id, ownPk) === 0) return null; // our own traffic reflected
     return id;
   }
@@ -1650,7 +1658,6 @@ function init(cfg) {
   ownPk = cfg.ownPk;
   ownId = toHex(ownPk);
   networkKey = cfg.networkKey;
-  signPrefix = concatBytes([DOMAIN_CHANNEL, networkKey]);
   contactSecret = cfg.contactSecret;
   connsPerPeer = Math.max(1, Math.floor(cfg.connsPerPeer || 1));
   maxFrameBytes = cfg.maxFrameBytes;

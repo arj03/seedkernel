@@ -69,7 +69,7 @@ function transportBundleAt(version, keys, guestSource) {
       // calls are not grants and are not declared. `link/*` + `transport/*` are the two
       // mount halves the admission dispatch reads (§12.5).
       requires: [
-        "node/sign", "node/random",
+        "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",
         "timer/arm", "timer/clear",
         "transport/deliver", "transport/settle", "transport/link-auth",

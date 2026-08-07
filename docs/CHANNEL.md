@@ -313,7 +313,9 @@ that node. Only §3's deferral limits the *retroactive* damage.
 **Guest signature verification across nodes is unfinished.** §7 moves `node/sign` onto the
 guest subkey, so `node/identity` now returns that subkey's public half while `senderPk`
 carries the channel key. Nothing in the tree verifies a peer's guest signature today, but
-anything that wants to will need the guest subkey published authentically. The natural home
+anything that wants to will need the guest subkey published authentically — the scoped
+`node/verify` name (§12.2) is the verifier it would check through, applying the same
+host-derived scope `node/sign` bound the signature to. The natural home
 is the handshake — msg3 and msg4 already carry a signed identity — but that is a §12.2
 decision about what guests are told, not a §12.6 one, and it is deliberately left open.
 

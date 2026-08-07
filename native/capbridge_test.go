@@ -18,6 +18,7 @@ import (
 // one edit rather than as bare strings scattered through the assertions.
 const (
 	nameSign     = "node/sign"
+	nameVerify   = "node/verify"
 	nameIdentity = "node/identity"
 	nameNetPeers = "net/peers"
 	nameFsGet    = "fs/get"
@@ -29,18 +30,20 @@ const (
 func TestCapBridgeOps(t *testing.T) {
 	capBridgeRealm(t)
 
-	// Grant node/sign, node/identity, fs/put, fs/get and clock/now (not net, not
-	// link) and an identity from sodium. The
-	// guest-signing scope binds node/sign to a bundle namespace (README §12.2); a real
-	// node derives it from the manifest's (author, app), here a throwaway pair.
+	// Grant node/sign, node/verify, node/identity, fs/put, fs/get and clock/now (not
+	// net, not link) and an identity from sodium. The
+	// guest-signing scope binds node/sign + node/verify to a bundle namespace (README
+	// §12.2); a real node derives it from the manifest's (author, app), here a
+	// throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
+		globalThis.__other = sodium.crypto_sign_keypair();
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
 		// the key that signs, all three. __scopeBytes is the middle third, which this
-		// test reconstructs the preimage from.
+		// test rebuilds the raw preimage from to prove node/verify applies it.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
-		__buildCapBridge(["node/sign", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
+		__buildCapBridge(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -84,23 +87,51 @@ func TestCapBridgeOps(t *testing.T) {
 		t.Fatalf("node/identity = %x, want node pubkey %x", id, pk)
 	}
 
-	// node/sign is scoped, so it signs DOMAIN_guest ‖ scope ‖ msg, not raw msg. The
-	// verify primitive stays raw, so we reconstruct the prefixed preimage.
+	// node/sign and node/verify are scoped (README §12.2): the host applies
+	// DOMAIN_guest ‖ scope to the message on BOTH sides, so the guest checks a
+	// signature by naming the key, never by reconstructing host-owned prefix bytes.
 	msg := []byte("a message to sign")
 	sig := callBytes(nameSign, msg)
 	if len(sig) != 64 {
 		t.Fatalf("node/sign len = %d, want 64", len(sig))
 	}
-	scope := jsBytes(t, qc, `__scopeBytes`)
-	preimage := append(append(append([]byte{}, []byte("seedkernel-guest-sig-v1\x00")...), scope...), msg...)
-	verifyGood := append(append(append([]byte{}, pk...), sig...), preimage...) // [pk 32][sig 64][preimage]
-	if v := callBytes("crypto/ed25519/verify", verifyGood); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("crypto/ed25519/verify(scoped preimage) = %v, want [1]", v)
+	// node/verify — [pk 32][sig 64][msg] — the scope rides on the host side of the seam.
+	verifyScoped := append(append(append([]byte{}, pk...), sig...), msg...)
+	if v := callBytes(nameVerify, verifyScoped); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("node/verify(scoped msg) = %v, want [1]", v)
 	}
-	// The raw message must NOT verify — proof the signature is bound to the scope.
+	// The same signature must NOT verify under a different key: the key is caller-named,
+	// the scope is not — this is a check of this bundle's namespace, not of "some key".
+	otherPk := jsBytes(t, qc, `__other.publicKey`)
+	verifyOther := append(append(append([]byte{}, otherPk...), sig...), msg...)
+	if v := callBytes(nameVerify, verifyOther); len(v) != 1 || v[0] != 0 {
+		t.Fatalf("node/verify(another key) = %v, want [0]", v)
+	}
+	// A mis-framed call is not a failed verification: a payload too short to hold
+	// [pk 32][sig 64] errors, where [0] would have been a verdict about bytes nothing
+	// checked. The bound is exactly that prefix, so an empty message still answers.
+	if _, err := call(nameVerify, verifyScoped[:95]); err == nil {
+		t.Fatal("node/verify(short payload) returned a verdict, want an error (mis-framed is not invalid)")
+	}
+	emptySig := callBytes(nameSign, nil)
+	verifyEmpty := append(append([]byte{}, pk...), emptySig...)
+	if v := callBytes(nameVerify, verifyEmpty); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("node/verify(empty msg) = %v, want [1]", v)
+	}
+	// The raw message must NOT verify — proof the signature is bound to the scope, and
+	// that node/verify has no raw mode: the same [pk][sig][msg] fed to the raw
+	// primitive answers 0, where the scoped name answered 1.
 	verifyRaw := append(append(append([]byte{}, pk...), sig...), msg...)
 	if v := callBytes("crypto/ed25519/verify", verifyRaw); len(v) != 1 || v[0] != 0 {
-		t.Fatalf("crypto/ed25519/verify(raw msg) = %v, want [0] (node/sign is scoped, never raw)", v)
+		t.Fatalf("crypto/ed25519/verify(raw msg) = %v, want [0] (node/verify is the scoped wrapper)", v)
+	}
+	// node/verify is exactly the raw primitive over the scoped preimage: rebuild the
+	// preimage from the slot-derived scope and the raw primitive answers 1 too.
+	scope := jsBytes(t, qc, `__scopeBytes`)
+	preimage := append(append(append([]byte{}, []byte("seedkernel-guest-sig-v1\x00")...), scope...), msg...)
+	verifyPreimage := append(append(append([]byte{}, pk...), sig...), preimage...)
+	if v := callBytes("crypto/ed25519/verify", verifyPreimage); len(v) != 1 || v[0] != 1 {
+		t.Fatalf("crypto/ed25519/verify(scoped preimage) = %v, want [1]", v)
 	}
 
 	// fs/put then fs/get: content-addressed round trip. Both AWAIT — fs round-trips at

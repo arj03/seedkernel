@@ -137,6 +137,7 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  check a typo'd extra key trips). Adding a name here is the whole cost of a new op. */
 export const AUTHORITY_CALLS = {
     "node/sign": "app",
+    "node/verify": "app",
     "node/identity": "app",
     "node/random": "app",
     "net/send": "app",

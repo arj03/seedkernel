@@ -103,11 +103,13 @@ export interface BundleGuest {
      *  guest preamble as `const APP = …`.
      *
      *  NB what does NOT belong here: anything the runtime already derives from the
-     *  admitted manifest. The author's key, the app name and the guest signing prefix
-     *  all arrive as `const BUNDLE` (cap-bridge
-     *  `bundlePreamble`). Restating one of those here would be a build-time copy of a
+     *  admitted manifest. The author's key and app name are the guest's *identity*,
+     *  which it reads through the seam (`node/identity`), and its signing namespace is
+     *  not injectable at all — `node/sign`/`node/verify` apply the slot-derived scope
+     *  host-side. Restating one of those here would be a build-time copy of a
      *  load-time fact — and a copy that silently disagrees is a verify mismatch with
-     *  nothing pointing at the cause. */
+     *  nothing pointing at the cause. There is nowhere safe to put it either: APP is
+     *  operator-mergeable, so a hand-baked prefix there would be operator-writable. */
     config?: Record<string, string | number>;
 }
 

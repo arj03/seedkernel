@@ -20,19 +20,24 @@ import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
 import { type SafeRealmBridge } from "./safe-js.js";
 
-/** What `node/sign` signs under — derived by the host from which admission point the
- *  asking bundle came through, never from anything the guest says (§12.2).
+/** What `node/sign` signs under — and what `node/verify` checks against — derived by
+ *  the host from which admission point the asking bundle came through, never from
+ *  anything the guest says (§12.2).
  *
  *  **The host prefixes; it does not parse.** It signs `domain ‖ scope ‖ msg` where `msg`
- *  is opaque bytes the guest chose and the host never reads. The guarantee — this key
- *  signs channel transcripts and never app data, an app's data and never another app's —
- *  rides entirely on the prefix, which is what domain separation is for. A host that
- *  instead validated the *fields* of what it signs would have pinned one protocol's
- *  design into the core and bought nothing: a hostile transport already holds everything
- *  the transport touches.
+ *  is opaque bytes the guest chose and the host never reads, and it verifies the same
+ *  preimage for the key a caller names. The guarantee — this key signs channel
+ *  transcripts and never app data, an app's data and never another app's — rides
+ *  entirely on the prefix, which is what domain separation is for. A host that instead
+ *  validated the *fields* of what it signed would have pinned one protocol's design
+ *  into the core and bought nothing: a hostile transport already holds everything the
+ *  transport touches.
  *
  *  `key` is part of the scope because the admission point picks it too: an app signs with
- *  the guest subkey, the mounted transport with the node's channel key. */
+ *  the guest subkey, the mounted transport with the node's channel key. `node/verify`
+ *  takes the verifying key from its argument bytes, so only the `domain` and `scope`
+ *  halves bind a verification — a guest can check a signature under its own bundle's
+ *  namespace, never another's. */
 export interface SignScope {
     /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the mounted transport. */
     domain: Uint8Array;
@@ -44,17 +49,6 @@ export interface SignScope {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
-}
-
-/** The facts a guest learns about the bundle it is running as, all of them derived by
- *  the runtime at admission from the signed manifest. The app key never appears here —
- *  the guest reaches its modules by logical name through module/call, against the key its
- *  bridge already holds. */
-export interface BundleFacts {
-    /** The manifest `app`. */
-    app: string;
-    /** The manifest author's public key — the key the signature verified under. */
-    author: Uint8Array;
 }
 
 /** The libsodium surface the crypto names use — structural so any sumo build
@@ -176,11 +170,11 @@ export interface CapBridgeDeps {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
-    /** What SIGN signs under, derived by the host from the asking bundle's slot
-     *  (`appSignScope` / `transportSignScope`). SIGN binds every signature to
-     *  `domain ‖ scope ‖ msg` and reads none of `msg`; without a scope SIGN is
-     *  unavailable, because guest signing is never raw. A host-side caller that never
-     *  exposes SIGN may omit it. */
+    /** What SIGN signs and VERIFY checks under, derived by the host from the asking
+     *  bundle's slot (`appSignScope` / `transportSignScope`). Both bind every
+     *  signature to `domain ‖ scope ‖ msg` and read none of `msg`; without a scope
+     *  both are unavailable, because guest signing and scoped verification are never
+     *  raw. A host-side caller that never exposes them may omit it. */
     signScope?: SignScope;
     /** Reach one of THIS app's WASM modules by its logical name — the shell binds the app
      *  key when it builds the bridge (`ModuleTable.callModule`), so what arrives here is
@@ -324,7 +318,7 @@ function cryptoCatalog(sodium: CapSodium): Record<CryptoCapName, CapHandler> {
  *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
  *  shape to call through.
  *
- *  ONE definition for every target, for the same reason `bundlePreamble` is one: a bundle
+ *  ONE definition for every target: a bundle
  *  ships a single `guest.js` that runs byte-identical on the node/browser host (safe-js.ts)
  *  and inside the native loader's confined realm (guest.go). The preamble is therefore a
  *  contract between the runtime and signed content, not a host implementation detail — a
@@ -433,7 +427,9 @@ export { AUTHORITY_CALLS, MOUNT_GROUPS } from "../core/domains.js";
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
  *  and two bundles derive disjoint scopes. Every node running the same bundle derives
- *  the same bytes, which is what makes the scoped signatures portable across a cohort. */
+ *  the same bytes, which is what makes the scoped signatures portable across a cohort.
+ *  `node/verify` applies the same scope, so a guest checks signatures without ever
+ *  reconstructing host-owned bytes. */
 export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
     const appBytes = enc.encode(app);
     if (appBytes.length > 255)
@@ -443,15 +439,6 @@ export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
     out[author.length] = appBytes.length;
     out.set(appBytes, author.length + 1);
     return out;
-}
-/** The full scoped-signature *prefix* the node/sign name prepends to a guest message before
- *  signing: `DOMAIN_guest ‖ scope`. Exported so a host-side signer/verifier in another
- *  package (e.g. seedstore's out-of-band descriptor signing, README §12.2) reconstructs the
- *  byte-identical preimage `guestSignPrefix(scope) ‖ msg` WITHOUT mirroring the domain
- *  tag — if this string ever revs, every such verifier revs with it instead of silently
- *  diverging. `scope` comes from `guestSignScope(author, app)`. */
-export function guestSignPrefix(scope: Uint8Array): Uint8Array {
-    return concatBytes([DOMAIN_GUEST, scope]);
 }
 /** An ordinary app's signing scope: `DOMAIN_guest ‖ author ‖ app`, signed by the guest
  *  subkey. Two bundles derive disjoint scopes, and every node running the same bundle
@@ -472,31 +459,6 @@ export function transportSignScope(key: {
     privateKey: Uint8Array;
 }, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_CHANNEL, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
-}
-/** The generated `const BUNDLE = {…};` block injected ahead of a bundle's guest source,
- *  holding what the runtime knows about the admitted bundle (README §12.4).
- *
- *  Every field here is a fact the runtime DERIVES, so no author ever restates one by
- *  hand: the signing prefix in particular is `DOMAIN_guest ‖ guestSignScope(author, app)`
- *  — precisely what `node/sign` prepends — and a hand-baked copy that disagrees with the
- *  host's derivation fails as a signature that verifies nowhere, with nothing naming the
- *  cause. This is the same one-file rule the DOMAIN_* family follows.
- *
- *  `module/call` takes the logical name, which is also the name the module is bound
- *  under, so there is no map for BUNDLE to carry and no modules field.
- *
- *  Kept deliberately separate from the app's `const APP`: APP is author config that a
- *  deployment's operator config merges over, so anything living there is operator-
- *  writable. Nothing in BUNDLE is. */
-export function bundlePreamble(f: BundleFacts): string {
-    const bundle = {
-        app: f.app,
-        author: toHex(f.author),
-        // The prefix a guest prepends before the "crypto/ed25519/verify" primitive to
-        // rebuild what node/sign signed.
-        signPrefix: toHex(guestSignPrefix(guestSignScope(f.author, f.app))),
-    };
-    return `const BUNDLE = ${JSON.stringify(bundle)};\n`;
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
@@ -616,13 +578,39 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
             return r ?? NONE;
         },
         // ── authorities: each reaches something no confined guest can hold ──────────
-        // node/sign is scoped, never raw: it signs `domain ‖ scope ‖ msg` with the
-        // key the asking bundle's slot selected (see `SignScope` above).
+        // node/sign and node/verify are scoped, never raw: both apply `domain ‖ scope`
+        // to the message with the key the asking bundle's slot selected (see
+        // `SignScope` above), so a guest checks signatures without ever reconstructing
+        // host-owned bytes.
         "node/sign": (payload) => {
             const s = deps.signScope;
             if (!s)
                 throw new Error("cap-bridge: node/sign needs a slot-derived scope (signing is never raw)");
             return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
+        },
+        // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the
+        // host verifies `domain ‖ scope ‖ msg` under the caller-named key, so the
+        // caller supplies the key but never the scope. The key's own signature binds
+        // it to this bundle's namespace — a signature made under any other scope
+        // (or an app key, a channel transcript) answers [0] here.
+        //
+        // A payload too short to hold both throws rather than answering [0]: that is a
+        // guest that mis-framed the call, not a signature that failed, and the two
+        // must not arrive as the same answer — [0] is a verdict about bytes that were
+        // actually checked. Only the check itself is caught, and an empty `msg` is a
+        // legitimate question, so the bound is exactly the fixed prefix.
+        "node/verify": (payload) => {
+            const s = deps.signScope;
+            if (!s)
+                throw new Error("cap-bridge: node/verify needs a slot-derived scope (verification is never raw)");
+            if (payload.length < 96)
+                throw new Error("cap-bridge: node/verify takes [pk 32][sig 64][msg ..]");
+            try {
+                return sodium.crypto_sign_verify_detached(payload.slice(32, 96), concatBytes([s.domain, s.scope, payload.slice(96)]), payload.slice(0, 32)) ? ONE : ZERO;
+            }
+            catch {
+                return ZERO;
+            }
         },
         "node/identity": () => identity.publicKey.slice(),
         "node/random": (payload) => {

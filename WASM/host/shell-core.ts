@@ -19,7 +19,7 @@
 // true instead of true-by-convention.
 import { denyAll } from "./policy.js";
 import { appKeyFor, appScopeFor, handlesOf, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createCapBridge, bundlePreamble, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
+import { createCapBridge, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
 import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
@@ -488,22 +488,19 @@ export function createShell(opts: CreateShellOptions & {
             // never grants — a fixed catalog and the app's own module map). The
             // vocabulary was checked at load (verifyManifest).
             allowedNames: names,
-            // What SIGN signs under is chosen HERE, by the slot the bundle occupies — the one
-            // place that knows it (§12.2). The transport slot signs handshake
-            // transcripts under DOMAIN_channel with the node's channel key; every ordinary app
-            // signs under DOMAIN_guest with the guest subkey, in its own bundle's scope. The
-            // bridge prefixes and never parses, so neither can produce the other's signature
-            // and no op signs raw bytes.
+            // What SIGN signs under — and what VERIFY checks against — is chosen HERE, by
+            // the slot the bundle occupies, the one place that knows it (§12.2). The
+            // transport slot signs handshake transcripts under DOMAIN_channel with the
+            // node's channel key; every ordinary app signs under DOMAIN_guest with the
+            // guest subkey, in its own bundle's scope. The bridge prefixes and never
+            // parses, so neither can produce the other's signature and no op signs raw
+            // bytes.
             signScope: driver
                 ? transportSignScope(platform.identity, platform.networkKey)
                 : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
         });
     };
-    const guestFullSource = (b: LoadedBundle) => bundlePreamble({
-            app: b.manifest.app,
-            author: b.author,
-        })
-        + `const APP = ${JSON.stringify({ ...(b.manifest.guest.config ?? {}), ...(opts.config ?? {}) })};\n`
+    const guestFullSource = (b: LoadedBundle) => `const APP = ${JSON.stringify({ ...(b.manifest.guest.config ?? {}), ...(opts.config ?? {}) })};\n`
         + b.guestSource;
     /** Resolve an app's one inbound entrypoint, ONCE, at install (§12.10).
      *

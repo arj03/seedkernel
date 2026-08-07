@@ -514,6 +514,7 @@ async function testCapBridge() {
   console.log("Test: cap-bridge — generic primitive capabilities, no app vocabulary (step 7)");
 
   const id = generateKeyPair();
+  const otherKey = generateKeyPair();
   const fs = new MemoryFs();
   // A transport host for the net ops: its peer id is the identity's, and a request
   // to itself drops at the guest's own-frame guard, so net/send drains.
@@ -550,12 +551,25 @@ async function testCapBridge() {
     assert(bytesEqual(await prim("xchacha20/xor", concatBytes([nonce, key, msg])),
       sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "crypto/xchacha20/xor, by name");
     // node/sign is scoped, never raw (README §12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
+    // node/verify applies the SAME scope host-side, so a guest checks a signature by
+    // naming the key, never by reconstructing the prefix the host owns.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
     const sig = await bridge("node/sign", msg);
     const preimage = concatBytes([DOMAIN_GUEST, scopeBytes, msg]);
     assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "node/sign signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
     assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "node/sign never signs the raw message (scoped, not raw)");
-    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "crypto/ed25519/verify accepts the scoped preimage");
+    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "node/verify accepts what node/sign signed — the same scope, host-applied");
+    assertEqual((await bridge("node/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "node/verify rejects the signature under a different key");
+    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "node/verify rejects a forged message");
+    // A mis-framed call is not a failed verification: too few bytes to hold [pk][sig]
+    // throws, where 0 would have been a verdict about bytes nothing checked. The bound
+    // is exactly the fixed prefix — an empty message is a legitimate question.
+    const emptySig = await bridge("node/sign", new Uint8Array(0));
+    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "node/verify takes an empty message — 96 bytes is a whole call");
+    let verifyThrew = false;
+    try { await bridge("node/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
+    assert(verifyThrew, "node/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
+    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "crypto/ed25519/verify accepts the scoped preimage — the raw primitive node/verify wraps");
     assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "crypto/ed25519/verify rejects a forged message");
     // ML-KEM-768 is in the catalog ahead of any caller — a bundle is replaceable, the
     // vocabulary it draws on is not — so what is checked here is that it is REACHABLE
