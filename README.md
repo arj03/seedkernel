@@ -22,7 +22,7 @@ Signing survives where it must — over the **bundle** that installs code (§12.
 
 There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names and is driven through named entrypoints, exactly as an app is.
 
-Every binding is three orthogonal pieces: the **name** is the host's opaque dispatch key, the **bytes** are the WASM instance held at that key, and the **author** is the signer of the bundle. The loader binds names to bytes under a deployer-supplied **policy** that decides who may install what (§12.5).
+Every table entry is three orthogonal pieces: the **name** is the module's logical name inside its app, the **bytes** are the WASM instance held at that name, and the **author** is the signer of the bundle — half of the app key the entry sits under. The loader lands a whole bundle's modules at once under a deployer-supplied **policy** that decides who may install what (§12.5).
 
 ## What belongs in the core
 
