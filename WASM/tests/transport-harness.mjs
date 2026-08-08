@@ -39,13 +39,13 @@ export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
 
-/** The policy every harness node runs under: the transport author, trusted for both
- *  admission classes, so a harness node can load an app bundle as well as its
- *  transport without a second key. */
+/** The policy every harness node runs under: the transport author, trusted to load and
+ *  granted the mount, so a harness node can load an app bundle as well as its transport
+ *  without a second key. */
 export function transportPolicy(authorHex) {
   return policyFromJson(JSON.stringify({
     authors: [authorHex],
-    transportAuthors: [authorHex],
+    grants: { mount: [authorHex] },
   }));
 }
 

@@ -37,7 +37,7 @@ async function makeNode(ws = false) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor],
-    transportAuthors: [transportAuthor],
+    grants: { mount: [transportAuthor] },
   }));
   const shell = createShell({
     platform: {

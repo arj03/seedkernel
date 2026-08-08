@@ -28,7 +28,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, MOUNT_GROUPS, isGrant, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, type GrantGroup, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -352,23 +352,24 @@ export function appKeyFor(author: Uint8Array, app: string): string {
 export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
 }
-/** Which mount halves (§12.5) a manifest's `requires` covers — the `mount:…` groups of
- *  the authorities it names, read straight off the catalog (`AUTHORITY_CALLS`), never
- *  off a prefix parsed out of a name.
+/** Which grant groups (§12.5) a manifest's `requires` covers — the `"<privilege>:<half>"`
+ *  groups of the authorities it names, read straight off the catalog (`AUTHORITY_CALLS`),
+ *  never off a prefix parsed out of a name. Empty ⇒ the bundle reaches no privilege and
+ *  is an ordinary app.
  *
- *  The ONE predicate both admission paths ask, and the reason there is no `role` field:
- *  what a bundle may do is read off the names it requires, never off a claim about what
- *  it is. The app path refuses a manifest for which this is non-empty; the mount path
- *  requires EVERY group in `MOUNT_GROUPS`. Two different questions, one derivation from
- *  the catalog, so neither can drift from the other or from the vocabulary — the same
- *  argument that keeps the catalog in domains.ts and out of guest-seam.ts.
+ *  The ONE derivation admission asks, and the reason there is no `role` field: what a
+ *  bundle may do is read off the names it requires, never off a claim about what it is.
+ *  The shell turns these into the privileges the operator's policy is keyed on
+ *  (`privilegeOf`) and checks each is claimed in full — two questions, one derivation
+ *  from the catalog, so neither can drift from the other or from the vocabulary. The
+ *  same argument that keeps the catalog in domains.ts and out of guest-seam.ts.
  *
- *  Not folded into `verifyManifest`: this is not a well-formedness question. The same
- *  manifest is legitimate at one admission point and refused at the other, so the
- *  decision belongs where the caller has said which point it is (shell-core). */
-export function mountGroups(manifest: BundleManifest): string[] {
+ *  Not folded into `verifyManifest`: this is not a well-formedness question. A manifest
+ *  naming `link/open` is well-formed; whether this node's operator grants that is
+ *  policy, so the decision belongs where the policy is in hand (shell-core). */
+export function grantGroups(manifest: BundleManifest): GrantGroup[] {
     const groups = manifest.guest.requires.filter(isGrant).map((n) => AUTHORITY_CALLS[n]);
-    return MOUNT_GROUPS.filter((g) => groups.includes(g));
+    return GRANT_GROUPS.filter((g) => groups.includes(g));
 }
 /** The fs keyspace prefix for one app (README §12.2).
  *
@@ -700,7 +701,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // and `transport/deliver` are in the vocabulary and a manifest naming them is
     // well-formed, but they are the transport mount's alone (§12.5). Which admission
     // point will have it is not a property of the manifest, so that decision is the
-    // shell's, over `mountGroups`.
+    // shell's, over `grantGroups`.
     for (const r of parsed.guest.requires) {
         if (!isGrant(r)) {
             // The authorities sharing the rejected name's prefix, not the whole list: a

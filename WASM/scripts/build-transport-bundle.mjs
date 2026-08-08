@@ -12,7 +12,7 @@
 // `build` and `build:loader` sequence it ahead of tsc.
 //
 // It also prints the author id. THE AUTHOR ID IS WHAT POLICY PINS: the node admits
-// the transport only when the operator's `transportAuthors` lists it (§12.5), so
+// the transport only when the operator's `grants.mount` lists it (§12.5), so
 // a different build with a different key simply needs a different policy entry.
 //
 // The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65
@@ -230,7 +230,7 @@ async function main() {
 // bundle for the shell's explicit transport mount. Signed by the seed transport author
 //   ${toHex(authorId)}
 // under the hybrid suite 0x02 (Ed25519 + ML-DSA-65, §14.1) — pin that id in policy
-// as \`transportAuthors\` (\u00a712.5) or build your own with this script and pin that.
+// under \`grants.mount\` (\u00a712.5) or build your own with this script and pin that.
 // Rebuild with a different key: new author, new policy entry. The ML-DSA half of the
 // key set is derived from the same seed, so one key file holds the whole identity.
 // See scripts/build-transport-bundle.mjs.

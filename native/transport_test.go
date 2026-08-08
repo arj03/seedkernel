@@ -43,7 +43,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		// makeTransportNode — the factory bootNode uses — and the policy has to admit
 		// the artifact's own transport author before either has a network at all.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
-		                           transportAuthors: [embeddedTransportAuthor] }));
+		                           grants: { mount: [embeddedTransportAuthor] } }));
 		globalThis.startTest = async function () {
 		  const idA = sodium.crypto_sign_keypair();
 		  const idB = sodium.crypto_sign_keypair();

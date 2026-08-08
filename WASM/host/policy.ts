@@ -15,21 +15,24 @@
 // must not be a way to lose them, and an OFFER-delivered bundle (§11) is exactly the
 // path that would.
 //
-// **Two admission classes remain, as a combinator.** Admitting an ordinary app risks
-// that app; mounting a transport risks the channel, which sees all plaintext and holds
-// the session keys (§12.4). "I trust this author's chat app" is not "I trust this author
-// to be my transport", so `byRole` keeps the two answers separate — but it answers
-// through the same predicate the runtime already calls, so the runtime never picks
-// between two of them.
+// **Trust is per PRIVILEGE, and the privileges are the catalog's.** Admitting an
+// ordinary app risks that app; granting the mount risks the channel, which sees all
+// plaintext and holds the session keys (§12.4). "I trust this author's chat app" is not
+// "I trust this author to be my transport", so those are separate answers — but the
+// thing an operator says yes to is the CAPABILITY, not a name for the kind of bundle
+// that wants it. `byPrivilege` keeps the answers separate over `PRIVILEGES` (domains.ts),
+// so the next authority that is too dangerous to hand out freely gets its own operator
+// grant by appearing in the catalog under a new prefix, with no third class here and no
+// second vocabulary for an operator to learn.
 //
-// **What picks the class is not here.** There is no `role` field in a manifest: the
-// shell reads it off `guest.requires` (`mountGroups`, over the catalog's mount halves)
-// and hands it in as `ctx.role`. That dispatch runs only the strict way — naming
-// `link/open` moves a bundle onto `mount`, never onto `app` — so an author cannot reach
-// the looser branch by editing a manifest, and a permissive `app` predicate is a bad
-// configuration rather than a path to sockets.
+// **What a bundle reaches is not decided here.** There is no `role` field in a manifest
+// and no class the shell assigns: the shell reads the privileges off `guest.requires`
+// (`grantGroups`, over the catalog) and hands them in as `ctx.privileges`. That runs
+// only the strict way — naming `link/open` puts `mount` in the set, and nothing takes
+// one out — so an author cannot shed a grant by editing a manifest, and a permissive
+// `authors` list is a bad configuration rather than a path to sockets.
 //
-// Three constructors cover the three deployment postures, and compose into either class:
+// Three constructors cover the three deployment postures, and compose into any grant:
 //   authorAllowlist  — a file-backed closed set of author ids
 //   admitAll         — "the bundle my operator handed me" (StorageNode posture)
 //   interactive      — the caller writes their own, e.g. a per-bundle consent dialog
@@ -43,17 +46,16 @@
 // Deny-all stays the default: the absent predicate admits nothing.
 
 import { toHex } from "../core/util.js";
+import { PRIVILEGES, type Privilege } from "../core/domains.js";
 import type { VerifiedBundle } from "./bundle.js";
-
-/** Which admission class a bundle is landing as, decided by the shell from the
- *  manifest's `requires` and never by anything the bundle says about itself. */
-export type AdmissionRole = "app" | "mount";
 
 /** Everything a gate used to read for itself, read ONCE by the shell and handed to the
  *  predicate — which is what makes the predicate pure and its order irrelevant. */
 export interface AdmissionContext {
-  /** `"mount"` iff the manifest names the mount-only groups (§12.5). */
-  role: AdmissionRole;
+  /** The privileges this bundle's `requires` reach (§12.5), derived by the shell from
+   *  the catalog and never from anything the bundle says about itself. Empty ⇒ it
+   *  reaches none and is an ordinary app. */
+  privileges: readonly Privilege[];
   /** The persisted `(author, app)` freshness high-water mark, or −Infinity if this
    *  pair has never loaded on this host (README §12.4). */
   highWater: number;
@@ -126,10 +128,10 @@ export const hostGates: Admit = allOf(notRevoked, freshVersion);
  *  (`hybridAuthorId`, §12.4). One 32-byte id either way, so an operator pins an
  *  identity here without knowing which suite produced it.
  *
- *  It says nothing about which class it guards: the same constructor builds the app
- *  allowlist and the mount allowlist, and a policy file that wants one author trusted
- *  for both says so twice. That is the point — trusting an author is per-class, and there
- *  is no "trusted everywhere" author. */
+ *  It says nothing about what it guards: the same constructor builds the list of authors
+ *  who may load at all and the list of those who may hold a given privilege, and a policy
+ *  file that wants one author trusted for both says so twice. That is the point —
+ *  trusting an author is per-capability, and there is no "trusted everywhere" author. */
 export function authorAllowlist(authors: string[]): Admit {
   const set = new Set(authors.map((a) => a.toLowerCase()));
   return (v) => set.has(toHex(v.author));
@@ -147,16 +149,29 @@ export function manifestSuiteAllowlist(suites: number[]): Admit {
   return (v) => set.has(v.suite);
 }
 
-/** The two admission CLASSES as one predicate: `ctx.role` picks the branch (§12.5).
+/** Trust keyed on CAPABILITY: `base` decides a bundle that reaches no privilege, and a
+ *  bundle that reaches some must be admitted by the grant of **every one** of them
+ *  (§12.5).
  *
- *  A combinator rather than a record the runtime holds two of, because the branch is the
- *  shell's — over the manifest's `requires`, before it asks anything of this file — and a
- *  runtime that carried both predicates could reach the wrong one, which is the single
- *  bug this whole split exists to prevent. Here there is one predicate and the class is
- *  an argument to it. Both halves are required, so widening apps can never widen the
- *  mount by omission. */
-export function byRole(p: { app: Admit; mount: Admit }): Admit {
-  return (v, ctx) => (ctx.role === "mount" ? p.mount : p.app)(v, ctx);
+ *  A combinator rather than a record the runtime holds several of, because which
+ *  privileges are in play is the shell's answer — over the manifest's `requires`, before
+ *  it asks anything of this file — and a runtime that carried the predicates separately
+ *  could reach the wrong one, which is the single bug this split exists to prevent. Here
+ *  there is one predicate and the capability set is an argument to it.
+ *
+ *  A privilege with no entry in `grants` denies, so widening `base` can never widen a
+ *  grant by omission, and a privilege added to the catalog is refused everywhere until an
+ *  operator has said something about it — the safe direction for the one edit that
+ *  silently changes what a policy file means. */
+export function byPrivilege(p: { base: Admit; grants: Readonly<Partial<Record<Privilege, Admit>>> }): Admit {
+  return async (v, ctx) => {
+    if (ctx.privileges.length === 0) return p.base(v, ctx);
+    for (const priv of ctx.privileges) {
+      const granted = p.grants[priv];
+      if (!granted || !(await granted(v, ctx))) return false;
+    }
+    return true;
+  };
 }
 
 /** Every predicate must admit (logical AND, short-circuiting). Rejections stay
@@ -179,9 +194,9 @@ export function anyOf(...predicates: Admit[]): Admit {
   };
 }
 
-/** One author list, parsed strictly. Shared by both classes so `authors` and
- *  `transportAuthors` cannot diverge in what they accept — a typo or an empty list
- *  fails the boot on either, rather than quietly widening (or emptying) what lands. */
+/** One author list, parsed strictly. Shared by every list in the file so `authors` and
+ *  the grants cannot diverge in what they accept — a typo or an empty list fails the
+ *  boot on any of them, rather than quietly widening (or emptying) what lands. */
 function authorList(value: unknown, name: string): string[] {
   if (!Array.isArray(value) || value.some((x) => typeof x !== "string")) {
     throw new Error(`policy: "${name}" must be an array of hex author ids`);
@@ -196,12 +211,23 @@ function authorList(value: unknown, name: string): string[] {
  *  Throws on malformed input — a typo fails the boot loudly rather than
  *  silently widening trust.
  *
- *  `authors` governs ordinary app loads; `transportAuthors` governs the mount. Either
- *  may be omitted and the omission means the strongest thing it can mean: that class
- *  admits nothing. A node with only `authors` runs apps and has no network, which is a
- *  deliberate configuration ("this node does not speak to anyone", §14) and not an
- *  error — so the two lists sit adjacent here, where an operator can see both decisions
- *  at once, while neither is anywhere a bundle author can reach. */
+ *      { "authors": ["<hex>"], "grants": { "mount": ["<hex>"] }, "manifestSuites": [2] }
+ *
+ *  `authors` is who may load a bundle that reaches no privilege; each key of `grants` is
+ *  a privilege from the catalog (`PRIVILEGES`) and lists who may hold THAT. An operator
+ *  therefore reads the risk itself — "these authors may be the node's transport" — rather
+ *  than a name for the kind of bundle that carries it, and a privilege added to the
+ *  catalog is a new key here rather than a new class.
+ *
+ *  Anything omitted means the strongest thing it can mean: nobody. A node with only
+ *  `authors` runs apps and has no network, which is a deliberate configuration ("this
+ *  node does not speak to anyone", §14) and not an error — so every decision sits in one
+ *  object where an operator sees them at once, while none of it is anywhere a bundle
+ *  author can reach.
+ *
+ *  An unknown key under `grants` is refused rather than ignored, and that is the whole
+ *  value of naming privileges from the catalog: a misspelled grant is the failure mode
+ *  where a node comes up looking configured and silently holds nothing. */
 export function parsePolicy(json: string): Admit {
   let raw: unknown;
   try { raw = JSON.parse(json); }
@@ -210,26 +236,38 @@ export function parsePolicy(json: string): Admit {
     throw new Error("policy: expected a JSON object");
   }
   const o = raw as Record<string, unknown>;
-  // The pre-mount vocabulary, refused by name rather than ignored. A file written for
-  // the `role`-field design would otherwise parse into an app-only policy and leave the
-  // node silently without a network — the one failure mode a transport misconfiguration
-  // must never have, since "no transport" is also a legitimate configuration and would
-  // look identical.
+  // Superseded vocabularies, refused BY NAME rather than ignored. Either would otherwise
+  // parse into an app-only policy and leave the node silently without a network — the one
+  // failure mode a transport misconfiguration must never have, since "no transport" is
+  // also a legitimate configuration and would look identical.
   if (o.roles !== undefined) {
-    throw new Error('policy: "roles" is gone — the transport mounts only through an explicit load, so list its authors under "transportAuthors" instead');
+    throw new Error('policy: "roles" is gone — a bundle declares no role; grant the capability instead, as "grants": { "mount": [...] }');
+  }
+  if (o.transportAuthors !== undefined) {
+    throw new Error('policy: "transportAuthors" is gone — the transport is not a class, it is the "mount" privilege; write "grants": { "mount": [...] }');
   }
   const appAuthors = o.authors === undefined ? undefined : authorList(o.authors, "authors");
-  const transportAuthors = o.transportAuthors === undefined
-    ? undefined
-    : authorList(o.transportAuthors, "transportAuthors");
-  // A file naming neither is a mistake, not a deny-all: deny-all is what an ABSENT
-  // policy already means (`policyFromJson`), so an operator who wrote a file and got
-  // nothing from it wanted something.
-  if (!appAuthors && !transportAuthors) {
-    throw new Error('policy: provide "authors", "transportAuthors", or both');
+  const grants: Partial<Record<Privilege, Admit>> = {};
+  const granted: string[] = [];
+  if (o.grants !== undefined) {
+    if (typeof o.grants !== "object" || o.grants === null || Array.isArray(o.grants)) {
+      throw new Error('policy: "grants" must be an object mapping a privilege to its author list');
+    }
+    for (const [name, value] of Object.entries(o.grants as Record<string, unknown>)) {
+      if (!(PRIVILEGES as readonly string[]).includes(name)) {
+        throw new Error(`policy: "${name}" is not a privilege this host grants (grants: ${PRIVILEGES.join(", ")})`);
+      }
+      grants[name as Privilege] = authorAllowlist(authorList(value, `grants.${name}`));
+      granted.push(name);
+    }
   }
-  let app = appAuthors ? authorAllowlist(appAuthors) : denyAll;
-  let mount = transportAuthors ? authorAllowlist(transportAuthors) : denyAll;
+  // A file granting nothing to nobody is a mistake, not a deny-all: deny-all is what an
+  // ABSENT policy already means (`policyFromJson`), so an operator who wrote a file and
+  // got nothing from it wanted something.
+  if (!appAuthors && granted.length === 0) {
+    throw new Error('policy: provide "authors", "grants", or both');
+  }
+  let base = appAuthors ? authorAllowlist(appAuthors) : denyAll;
   // `manifestSuites` is optional and, like everything else here, strict.
   // Absent ⇒ any suite the host can verify.
   if (o.manifestSuites !== undefined) {
@@ -239,13 +277,13 @@ export function parsePolicy(json: string): Admit {
     }
     const suites = o.manifestSuites as number[];
     if (suites.length === 0) throw new Error('policy: "manifestSuites" must list at least one suite id');
-    // The suite axis applies to both classes — it is about how a bundle was signed, not
-    // about what it is landing as — so it ANDs into each.
+    // The suite axis cuts across every grant — it is about how a bundle was signed, not
+    // about what it reaches — so it ANDs into each.
     const suiteOk = manifestSuiteAllowlist(suites);
-    app = allOf(app, suiteOk);
-    mount = allOf(mount, suiteOk);
+    base = allOf(base, suiteOk);
+    for (const name of granted) grants[name as Privilege] = allOf(grants[name as Privilege]!, suiteOk);
   }
-  return byRole({ app, mount });
+  return byPrivilege({ base, grants });
 }
 
 /** The policy a shell runs under given its (optional) config file.

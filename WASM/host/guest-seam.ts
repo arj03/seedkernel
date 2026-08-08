@@ -487,7 +487,7 @@ globalThis.__invoke = (name, argBuf) => {
  *  Neither exemption is a parse of the name: the gate asks `isGrant`, which is
  *  membership in this table, so a name is an authority exactly by being one the host owns
  *  something for — and the manifest never mentions the rest of the seam at all. */
-export { AUTHORITY_CALLS, MOUNT_GROUPS } from "../core/domains.js";
+export { AUTHORITY_CALLS, GRANT_GROUPS, PRIVILEGES } from "../core/domains.js";
 /** The host-derived scope the node/sign name binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,

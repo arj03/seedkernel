@@ -392,7 +392,7 @@ const embeddedTransport = (() => {
     }
 })();
 /** Who signed the transport this artifact ships — hex, DERIVED from the blob rather
- *  than restated anywhere. This is the id an operator pins as `transportAuthors` in a
+ *  than restated anywhere. This is the id an operator pins under `grants.mount` in a
  *  policy file (§12.5), so a build with a different key needs a different entry and
  *  nothing has to be kept in step by hand. Empty if the artifact carries no transport. */
 const embeddedTransportAuthor = (() => {
@@ -528,8 +528,8 @@ async function makeTransportNode(cfg: {
         config: cfg.config,
     });
     // The transport bundle IS the node's network: verify + govern under the policy's
-    // `transportAuthors`, install, and the shell stands the driver up. A policy that
-    // does not admit the transport author leaves the node without a network.
+    // `mount` grant, install, and the shell stands the driver up. A policy that does not
+    // grant the transport author that privilege leaves the node without a network.
     const transport = cfg.transportBundle ?? embeddedTransport;
     if (transport) {
         try {
@@ -541,7 +541,7 @@ async function makeTransportNode(cfg: {
             }
             // A deliberate configuration — "this node does not speak to anyone" — but
             // one that is indistinguishable from a broken network unless it says so.
-            bridge.log("  no transport: the policy's transportAuthors does not admit this bundle");
+            bridge.log('  no transport: the policy grants "mount" to no author of this bundle');
         }
     }
     const net = s.net as unknown as TransportHost;

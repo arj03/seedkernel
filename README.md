@@ -55,7 +55,7 @@ What this buys is that the **protocol** is replaceable without a fork: the hands
 
 Two properties make that safe:
 
-- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; admitting a transport risks the channel, which sees all plaintext and holds the session keys — so the two answer to separate policy entries, `authors` and `transportAuthors`. There is no role field a bundle claims for itself: which entry governs it is read off `guest.requires`, and requiring `link/open` moves a bundle onto the stricter list rather than off it, so an author trusted for apps gains nothing by asking (§12.5).
+- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; granting the transport risks the channel, which sees all plaintext and holds the session keys — so policy is keyed on the *capability*: `authors` says who may load at all, `grants` names a privilege from the catalog and who may hold it (`grants: { "mount": [...] }`). There is no role field a bundle claims for itself, and no class the shell assigns: which privileges are in play is read off `guest.requires`, and requiring `link/open` puts `mount` in that set rather than taking it out, so an author trusted for apps gains nothing by asking (§12.5).
 - **The suite byte makes a mixed period a rollout rather than a corruption.** One suite per link, unknown ids close the connection, and the byte is covered by both signatures and read before verification (§12.6). An in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies.
 
 **It can be swapped under a running node.** A second transport bundle loads the ordinary way: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
@@ -157,16 +157,16 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
 
-**Shared — compiled once, run by all three targets (2,171 LOC)**
+**Shared — compiled once, run by all three targets (2,203 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 554 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 574 |
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 347 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 352 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 355 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 180 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 293 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 302 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 
@@ -192,7 +192,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,237 + 5 KB |
 
-Each target therefore runs 2,171 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,203 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 

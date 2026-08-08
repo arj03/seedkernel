@@ -62,8 +62,8 @@ export interface ShellOptions {
      *  a NodeChannelFactory on listen/wsListen. */
     channels?: ChannelFactory;
     /** The signed transport bundle blob. Defaults to the one shipped in the
-     *  artifact (transport-bundle.ts); the operator's policy must admit its author
-     *  under `transportAuthors` (never the app allowlist). A shell without an
+     *  artifact (transport-bundle.ts); the operator's policy must grant its author the
+     *  `mount` privilege (never the plain `authors` list). A shell without an
      *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
     /** Live connected peers for the net/peers name. The transport owns
@@ -170,7 +170,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     });
     // ── Load the transport bundle: the node's network (§12.6) ───────────────────
     // The ONE install path, like any other bundle: verify, govern under policy, install,
-    // and — because it requires the mount-only names — stand the driver up. A policy that
+    // and — because it requires the mount names — stand the driver up. A policy that
     // does not admit the transport author leaves the node without a network, which is a
     // deliberate configuration ("this node does not speak to anyone"), not an error.
     if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {
@@ -179,7 +179,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         }
         catch (err) {
             if (isAdmissionRejected(err)) {
-                console.warn("  no transport: the policy's transportAuthors does not admit this bundle");
+                console.warn('  no transport: the policy grants "mount" to no author of this bundle');
             }
             else {
                 throw err;

@@ -123,20 +123,24 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  template literal; this table is hand-written, so guest-seam.ts checks it at
  *  construction. A bare authority added here would shadow every app's module of that name.
  *
- *  Each name carries what it is granted *for*, which is the whole of the mount rule:
- *  `"app"` is an ordinary authority any bundle may ask for, and a `"mount:…"` value
- *  says the name is the transport mount's alone (§12.5) and which half of a transport
- *  it supplies — `mount:sockets` is what the mount consumes (the platform's whole
- *  contribution to the network, behind opaque link ids), `mount:report` is what it
- *  provides back (the attributed peer, protocol id and correlation every app's `net`
- *  names reach). A mount must name both halves or neither: a bundle with sockets and
- *  nowhere to report could only stand as a transport that is not one, so a partial
+ *  Each name carries what it is granted *for*, in the form `"<privilege>:<half>"`.
+ *  `"app"` is the unprivileged case — an ordinary authority any bundle may ask for,
+ *  needing no operator grant beyond the right to load at all. Anything else names a
+ *  PRIVILEGE an operator grants per author (`PRIVILEGES`, policy.ts) and which half of
+ *  it the name supplies. Today there is one: `mount`, the node's transport, where
+ *  `mount:sockets` is what it consumes (the platform's whole contribution to the
+ *  network, behind opaque link ids) and `mount:report` is what it provides back (the
+ *  attributed peer, protocol id and correlation every app's `net` names reach). A
+ *  bundle reaching a privilege must name every half of it or none: one with sockets
+ *  and nowhere to report could only stand as a transport that is not one, so a partial
  *  claim is refused at the load rather than at the first dial. `timer/*` is
  *  deliberately `"app"` — an ordinary authority, and the transport happening to want
  *  one is not a reason to make it a privilege.
  *
- *  The table IS what says which bundle is the mount; there is no role field, because
- *  the requires already carry the fact and the signature already covers them.
+ *  The table IS what says which privileges a bundle reaches; there is no role field,
+ *  because the requires already carry the fact and the signature already covers them.
+ *  Adding a privileged name under a NEW prefix adds a privilege, and with it the
+ *  policy key an operator grants it under — no second vocabulary, no third class.
  *
  *  The one-file rule: the seam's dispatch table is TYPED against `CapabilityName`
  *  (a key here without a handler is a compile error) and walked against its own key
@@ -178,15 +182,39 @@ export type CapabilityName = keyof typeof AUTHORITY_CALLS;
 export function isGrant(name: string): name is CapabilityName {
     return Object.prototype.hasOwnProperty.call(AUTHORITY_CALLS, name);
 }
-/** The mount halves (§12.5), derived from the catalog so there is no second list to
- *  keep in step with the names. A manifest naming any mount-only authority is the
- *  transport mount, governed by the policy's transport half rather than its app half;
- *  `mountGroups` (bundle.ts) is the ONE predicate both admission paths ask, and a mount
- *  must cover every group here. */
-export type MountGroup = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
-export const MOUNT_GROUPS: readonly MountGroup[] = [
-    ...new Set(Object.values(AUTHORITY_CALLS).filter((g): g is MountGroup => g !== "app")),
+/** A grant group (§12.5): the catalog value of a name that is not plain `"app"`, in the
+ *  form `"<privilege>:<half>"`. Derived from the table so there is no second list to keep
+ *  in step with the names — `grantGroups` (bundle.ts) reads a manifest's `requires`
+ *  straight through it, and is the ONE derivation every admission path asks. */
+export type GrantGroup = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
+export const GRANT_GROUPS: readonly GrantGroup[] = [
+    ...new Set(Object.values(AUTHORITY_CALLS).filter((g): g is GrantGroup => g !== "app")),
 ];
+/** A PRIVILEGE — the unit an operator grants and a policy file is keyed on (policy.ts).
+ *
+ *  It is the group's prefix, and it is derived rather than declared for the same reason
+ *  the groups are: the catalog is where a name's authority is written down, so the set of
+ *  things an operator must say yes to is a function of that table and cannot fall behind
+ *  it. Add a privileged name under a new prefix and its policy key exists; there is
+ *  nowhere to forget to add it.
+ *
+ *  This is the one place a catalog VALUE is parsed. The rule the rest of the runtime
+ *  keeps — never read a name's authority off the name's own text — is untouched: the
+ *  values are this file's own, written here beside the split that reads them, where a
+ *  malformed one is visible in the same screen. */
+export type Privilege = GrantGroup extends `${infer P}:${string}` ? P : never;
+export function privilegeOf(group: GrantGroup): Privilege {
+    return group.slice(0, group.indexOf(":")) as Privilege;
+}
+export const PRIVILEGES: readonly Privilege[] = [...new Set(GRANT_GROUPS.map(privilegeOf))];
+/** Which halves each privilege is made of — what a bundle reaching it must name in full. */
+export const GROUPS_BY_PRIVILEGE: ReadonlyMap<Privilege, readonly GrantGroup[]> = new Map(
+    PRIVILEGES.map((p) => [p, GRANT_GROUPS.filter((g) => privilegeOf(g) === p)] as const),
+);
+/** The node's transport (§12.6). Named because the shell wires a DRIVER to whatever
+ *  occupies it — the one privilege whose grant also stands a host-side object up — not
+ *  because admission treats it specially: to the policy it is one key among `PRIVILEGES`. */
+export const PRIVILEGE_MOUNT = "mount" satisfies Privilege;
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

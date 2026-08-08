@@ -40,7 +40,7 @@ assert(transportVerified.suite === 0x02, "the shipped transport bundle is hybrid
 assert(transportVerified.authorKeys.mlDsa !== undefined, "…and carries the ML-DSA-65 public key");
 
 // A SECOND transport, version 2, signed by a different author — the realistic upgrade
-// shape, and the one that exercises both admission gates at once: `transportAuthors`
+// shape, and the one that exercises both admission gates at once: the `mount` grant
 // must list the new author, and the freshness floor (which v1 set to 1) must be
 // cleared by the new version. Same guest program, because what is under test is the
 // swap and not a different protocol.
@@ -85,7 +85,7 @@ async function makeNode(channels, listen) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, upgradeAuthor],
-    transportAuthors: [transportAuthor, upgradeAuthor],
+    grants: { mount: [transportAuthor, upgradeAuthor] },
   }));
   const shell = createShell({
     platform: {

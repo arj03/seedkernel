@@ -258,7 +258,7 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, requir
 		// itself is what routes, so a test that wants a protocol answered says so in the
 		// manifest and never through a second call. A MOUNT-shaped fixture claims none —
 		// a transport receives no dispatch, and the shell refuses a claim from one — so
-		// the field is derived from the same `requires` that decide the admission class,
+		// the field is derived from the same `requires` that decide the privileges,
 		// keeping the two facts one fact here as they are in the loader.
 		Protocols: appProtocols(app, requires),
 		Version:   version,

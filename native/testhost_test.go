@@ -110,8 +110,8 @@ func loadBundle(path string) string {
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
-// withTransportAuthor adds the artifact's own transport author to a policy's
-// transportAuthors. A node whose policy does not admit a transport bundle has no
+// withTransportAuthor adds the artifact's own transport author to a policy's authors and
+// grants it the mount. A node whose policy does not admit a transport bundle has no
 // network at all — which is also what a deliberate deny-all looks like, so the two
 // must not be confused by accident in a test.
 func withTransportAuthor(tb testing.TB, policyJSON string) string {
@@ -128,7 +128,7 @@ func withTransportAuthor(tb testing.TB, policyJSON string) string {
 	}
 	authors, _ := p["authors"].([]any)
 	p["authors"] = append(authors, author)
-	p["transportAuthors"] = []string{author}
+	p["grants"] = map[string]any{"mount": []string{author}}
 	out, err := json.Marshal(p)
 	if err != nil {
 		tb.Fatal("policy json:", err)

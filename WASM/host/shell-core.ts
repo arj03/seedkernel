@@ -18,12 +18,12 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, grantGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { MOUNT_GROUPS } from "../core/domains.js";
+import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, privilegeOf, type Privilege } from "../core/domains.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
@@ -151,9 +151,10 @@ export interface ShellPlatform {
 
 export interface CreateShellOptions {
     /** The operator's admission predicate (§12.5) — ONE `Admit`, asked once per load,
-     *  between verify and install. `ctx.role` says whether this bundle is landing as an
-     *  app or as the node's transport mount, so a deployment that answers the two
-     *  differently composes `byRole({ app, mount })`; `policyFromJson` already does.
+     *  between verify and install. `ctx.privileges` says which privileges this bundle's
+     *  requires reach — nothing for an ordinary app, `mount` for the node's transport —
+     *  so a deployment that answers per capability composes
+     *  `byPrivilege({ base, grants })`; `policyFromJson` already does.
      *  Absent ⇒ deny-all, nothing is admitted.
      *
      *  A file-backed author allowlist, a consent dialog, and "the bundle my operator
@@ -267,7 +268,7 @@ export interface Shell {
 // reach them from the same module it gets createShell from. ModuleTable rides along
 // for the same reason: the JS platforms all hand it in as their `table`, and a
 // re-export keeps that a one-line seam rather than a second import.
-export { denyAll, admitAll, authorAllowlist, byRole, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext, type AdmissionRole } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
 export { ModuleTable } from "./module-table.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
  *  re-implementing the module table, guest-seam wiring, preamble assembly, realm
@@ -416,7 +417,7 @@ export function createShell(opts: CreateShellOptions & {
      *  shell can be assembled before any bundle loads. */
     let netHost: TransportHost | null = null;
     const noTransport = (what: string): never => {
-        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the mount-only names, ${MOUNT_GROUPS.join(" + ")}, first)`);
+        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the ${PRIVILEGE_MOUNT} names, ${(GROUPS_BY_PRIVILEGE.get(PRIVILEGE_MOUNT) ?? []).join(" + ")}, first)`);
     };
     // The tail of every initiator `runGuest` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
@@ -693,28 +694,31 @@ export function createShell(opts: CreateShellOptions & {
         sodium,
         async loadBundleBlob(blob) {
             const v = verifyBundle(sodium, blob);
-            // WHICH BUNDLE THIS IS, read off the requires and nothing else. There is no
-            // `role` field and there is no second entrypoint: a transport is exactly the
-            // bundle naming mount-only names (§12.5), which the manifest signature
-            // already covers and `verifyManifest` has already checked. Restating that as a
-            // self-description, or as a choice of method, would be a second place for the
-            // same fact to live — and the requires are the one that must be right anyway,
-            // because they are what the seam actually wires.
+            // WHAT THIS BUNDLE REACHES, read off the requires and nothing else. There is
+            // no `role` field and there is no second entrypoint: the privileges are
+            // exactly the ones its declared names carry in the catalog (§12.5), which the
+            // manifest signature already covers and `verifyManifest` has already checked.
+            // Restating that as a self-description, or as a choice of method, would be a
+            // second place for the same fact to live — and the requires are the one that
+            // must be right anyway, because they are what the seam actually wires.
             //
-            // An author cannot climb into the mount by declaring them, which is the
-            // property the whole split exists for: adding `link/open` moves a bundle onto
-            // the STRICTER branch (`ctx.role === "mount"`), never the looser one. The dispatch
-            // is safe in the only direction it can be pushed.
-            const groups = mountGroups(v.manifest);
-            const isMount = groups.length > 0;
-            // Every mount half, or none. A bundle with no `mount:sockets` name has no
-            // sockets and one with no `mount:report` name has nowhere to report, so a
-            // partial claim could only stand as a transport that is not one — refused at
-            // the load rather than at the first dial.
-            const missing = MOUNT_GROUPS.filter((g) => !groups.includes(g));
-            if (isMount && missing.length > 0) {
-                throw new Error(`shell: a transport declares names in every mount half or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
+            // An author cannot shed a privilege by declaring one, which is the property
+            // the whole scheme exists for: adding `link/open` puts `mount` in this set and
+            // nothing takes it out, so the derivation is safe in the only direction it can
+            // be pushed.
+            const groups = grantGroups(v.manifest);
+            const privileges: Privilege[] = [...new Set(groups.map(privilegeOf))];
+            // Every half of a privilege, or none of it. A bundle with no `mount:sockets`
+            // name has no sockets and one with no `mount:report` name has nowhere to
+            // report, so a partial claim could only stand as a transport that is not one —
+            // refused at the load rather than at the first dial.
+            for (const priv of privileges) {
+                const missing = (GROUPS_BY_PRIVILEGE.get(priv) ?? []).filter((g) => !groups.includes(g));
+                if (missing.length > 0) {
+                    throw new Error(`shell: a bundle claims every half of a privilege or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
+                }
             }
+            const isMount = privileges.includes(PRIVILEGE_MOUNT);
             // A mount claims no protocol (§12.10). It is not an app: it receives no
             // dispatch, so a frame naming one of these ids could never arrive, and a
             // claim that can never be honored is a manifest that has misread the format
@@ -724,16 +728,16 @@ export function createShell(opts: CreateShellOptions & {
                 throw new Error(`shell: a transport claims no protocol ids; ${v.manifest.app} claims ${v.manifest.protocols!.join(", ")} — a mount receives no dispatch (§12.10)`);
             }
             // ADMISSION — one predicate, one call, one answer (§12.5). Everything a gate
-            // used to read for itself is read here, once, and handed in: the class this
-            // bundle is landing as, the persisted `(author, app)` high-water mark, and
+            // used to read for itself is read here, once, and handed in: the privileges
+            // this bundle reaches, the persisted `(author, app)` high-water mark, and
             // whether this host has written the author key off. The predicate is then a
             // pure function of `(bundle, context)`, which is what removed the ordering
             // this sequence used to have to get right — revocation before the consent
             // dialog (a written-off key must never reach a prompt), the downgrade guard
             // after the operator's yes but before anything landed. Composition (`allOf`,
-            // `byRole`) says all of that once, at construction.
+            // `byPrivilege`) says all of that once, at construction.
             const ctx: AdmissionContext = {
-                role: isMount ? "mount" : "app",
+                privileges,
                 highWater: platform.freshnessStore.get(v.author, v.manifest.app),
                 revoked: platform.freshnessStore.isRevoked(v.author),
             };

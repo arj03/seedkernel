@@ -65,8 +65,8 @@ const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI
 /** The admission context a bundle with no history lands under: an ordinary app, never
  *  loaded here before, from a key nobody has written off. The shell reads these off its
  *  freshness store; a test composing the load by hand states them. */
-const APP_CTX = { role: "app", highWater: -Infinity, revoked: false };
-const MOUNT_CTX = { ...APP_CTX, role: "mount" };
+const APP_CTX = { privileges: [], highWater: -Infinity, revoked: false };
+const MOUNT_CTX = { ...APP_CTX, privileges: ["mount"] };
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own ModuleTable without a shell. */
@@ -326,7 +326,7 @@ async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
   const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
-  const { admitAll, denyAll, byRole } = await imp("build/host/policy.js");
+  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
   const other = generateKeyPair();
@@ -346,7 +346,7 @@ async function testManifestClaimIsTheRouting() {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit: byRole({ app: admitAll, mount: denyAll }),
+    admit: byPrivilege({ base: admitAll, grants: { mount: denyAll } }),
   });
   try {
     const key = appKey(author.publicKey, "store");
@@ -755,28 +755,27 @@ async function testPolicy() {
   const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
-  // ── the transport mount is a SECOND admission class (§12.5) ────────────
-  // Mounting a transport grants raw links and channel-identity signing — the bundle
-  // that carries the node's whole network — so the ordinary author allowlist must NOT
-  // admit one, even for an author it already trusts with apps. Only a `transportAuthors`
-  // entry does.
+  // ── the mount is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
+  // The mount privilege carries raw links and channel-identity signing — the bundle that
+  // holds the node's whole network — so the ordinary author list must NOT admit one, even
+  // for an author it already trusts with apps. Only a `grants.mount` entry does.
   const goodHex = toHex(good.publicKey);
   const appOnly = JSON.stringify({ authors: [goodHex] });
-  const withTransport = JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] });
+  const withTransport = JSON.stringify({ authors: [goodHex], grants: { mount: [goodHex] } });
 
   const mountDenied = await tryLoad(appOnly, good, true);
-  assert(!mountDenied, "an author trusted for apps does NOT thereby mount the transport");
+  assert(!mountDenied, "an author trusted for apps does NOT thereby hold the mount");
   const mountAllowed = await tryLoad(withTransport, good, true);
-  assert(mountAllowed, "a transportAuthors entry admits that author to the transport mount");
+  assert(mountAllowed, "a grants.mount entry admits that author to the transport mount");
   const strangerMount = await tryLoad(withTransport, bad, true);
-  assert(!strangerMount, "an author outside the transport list is refused the mount");
+  assert(!strangerMount, "an author outside the mount grant is refused it");
   const appStillOk = await tryLoad(withTransport, good, false);
-  assert(appStillOk, "adding a transport entry does not disturb ordinary app admission");
+  assert(appStillOk, "adding a grant does not disturb ordinary app admission");
 
-  // The two classes partition the bundles: a transport list alone admits no apps.
-  const transportOnly = JSON.stringify({ transportAuthors: [goodHex] });
+  // The two answers are independent: a grant alone admits no unprivileged bundle.
+  const transportOnly = JSON.stringify({ grants: { mount: [goodHex] } });
   const appUnderTransportList = await tryLoad(transportOnly, good, false);
-  assert(!appUnderTransportList, "a transport entry is not an app grant — the app allowlist still decides apps");
+  assert(!appUnderTransportList, "a mount grant is not a licence to load — `authors` still decides that");
 
   // ── parse validation ───────────────────────────────────────────────────
   let threw = false;
@@ -786,35 +785,44 @@ async function testPolicy() {
   try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
   assert(threw, "an empty author set is rejected");
   threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [] })); } catch { threw = true; }
-  assert(threw, "an empty transport list is rejected (omit the key to allow none)");
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { mount: [] } })); } catch { threw = true; }
+  assert(threw, "an empty grant list is rejected (omit the key to grant none)");
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } })); } catch { threw = true; }
   assert(threw, "the legacy \"roles\" key fails the boot loudly rather than silently denying mounts");
   threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] })); } catch { threw = true; }
+  assert(threw, "the superseded \"transportAuthors\" key fails the boot loudly rather than silently denying mounts");
+  // The privilege NAMES come from the catalog, so a typo is a refused boot rather than a
+  // node that looks configured and holds nothing — the whole reason the key is a
+  // capability rather than free-form text.
+  threw = false;
+  try { parsePolicy(JSON.stringify({ grants: { mounts: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "a grant naming no privilege this host has is refused by name");
+  threw = false;
   try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
-  assert(threw, "a policy listing neither authors nor transportAuthors is refused");
+  assert(threw, "a policy listing neither authors nor grants is refused");
 
   console.log("  OK\n");
 }
 
-// ─── Test: the requires pick the admission class (§12.5) ───────────────────
+// ─── Test: the requires decide which privileges are in play (§12.5) ────────
 //
-// There is one install path and no `role` field, so which of the two admission classes a
-// bundle answers to is read off `guest.requires` alone. The property that has to hold is that
-// the dispatch cannot be pushed the wrong way: naming a mount-only name moves a
-// bundle onto the STRICTER predicate, never the looser one — so the MOST permissive app
-// allowlist this codebase can express (`admitAll`) still buys an author no sockets. If
-// that fails, "an app author cannot acquire socket access" is a convention rather than a
-// property, and every policy test above is a lock on an open door.
+// There is one install path and no `role` field, so what a bundle must be granted is read
+// off `guest.requires` alone. The property that has to hold is that the derivation cannot
+// be pushed the wrong way: naming a mount name puts `mount` in the set and nothing takes
+// it out — so the MOST permissive `authors` list this codebase can express (`admitAll`)
+// still buys an author no sockets. If that fails, "an app author cannot acquire socket
+// access" is a convention rather than a property, and every policy test above is a lock
+// on an open door.
 //
-// Driven through createShell, because the dispatch is the shell's: the four policy tests
+// Driven through createShell, because the derivation is the shell's: the policy tests
 // above compose verifyBundle → admit → installBundle by hand and would not see it.
-async function testRequiresPickTheAdmissionClass() {
-  console.log("Test: guest.requires decides which admission class a bundle answers to");
+async function testRequiresPickThePrivileges() {
+  console.log("Test: guest.requires decides which privileges a bundle must be granted");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
-  const { admitAll, denyAll, byRole } = await imp("build/host/policy.js");
+  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
   const blobWithRequires = (requires) => packBundle({
@@ -826,14 +834,15 @@ async function testRequiresPickTheAdmissionClass() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
-  // ONE predicate, with the class as an argument to it (`byRole`) rather than as a choice
-  // between two predicates the runtime holds — which is what the shell now asks once.
-  const mkTestShell = (app, mount) => mkShell({
+  // ONE predicate, with the capability set as an argument to it (`byPrivilege`) rather
+  // than as a choice between predicates the runtime holds — which is what the shell asks
+  // once.
+  const mkTestShell = (base, mount) => mkShell({
     platform: {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit: byRole({ app, mount }),
+    admit: byPrivilege({ base, grants: { mount } }),
   });
   const load = async (shell, requires) => {
     try { await shell.loadBundleBlob(blobWithRequires(requires)); return null; }
@@ -848,10 +857,10 @@ async function testRequiresPickTheAdmissionClass() {
     const shell = mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
     try {
       await load(shell, ["fs/get", "clock/now"]);
-      assert(appAsked === 1 && transportAsked === 0, "an ordinary app is governed by the app predicate");
+      assert(appAsked === 1 && transportAsked === 0, "a bundle reaching no privilege is governed by the base predicate");
       appAsked = transportAsked = 0;
       await load(shell, ["link/open", "transport/deliver"]);
-      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the mount-only names is governed by the transport predicate");
+      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the mount names is governed by the mount grant alone");
     } finally { shell.close(); }
   }
 
@@ -862,24 +871,24 @@ async function testRequiresPickTheAdmissionClass() {
     try {
       const err = await load(shell, ["link/open", "transport/deliver"]);
       assert(err !== null && /rejected by admission/.test(err),
-        "a permissive app allowlist does not admit a bundle naming the mount-only names");
+        "a permissive author list does not admit a bundle naming the mount names");
       assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
       assert(shell.host.isBound(appKeyFor(author.publicKey, "mod"), "fwd"),
-        "an app naming no mount-only name binds normally");
+        "a bundle reaching no privilege binds normally");
     } finally { shell.close(); }
   }
 
-  // 3. All of them or none, refused before either predicate: a bundle naming `link/open`
-  //    without any `transport/*` name has sockets and nowhere to report, so it could only
-  //    stand as a transport that is not one. It must not fall back to the app class
-  //    either — that is the exact hole a partial claim would open.
+  // 3. Every half of a privilege or none, refused before any predicate: a bundle naming
+  //    `link/open` without any `transport/*` name has sockets and nowhere to report, so it
+  //    could only stand as a transport that is not one. It must not fall back to the
+  //    unprivileged base either — that is the exact hole a partial claim would open.
   {
     let asked = 0;
     const shell = mkTestShell(() => { asked++; return true; }, () => { asked++; return true; });
     try {
       for (const requires of [["link/open"], ["transport/deliver"], ["fs/get", "link/open"]]) {
         const err = await load(shell, requires);
-        assert(err !== null && /every mount half or none/.test(err),
+        assert(err !== null && /every half of a privilege or none/.test(err),
           `a partial mount claim ${JSON.stringify(requires)} is refused as malformed`);
       }
       assert(asked === 0, "a partial mount claim never reaches a predicate at all");
@@ -969,7 +978,7 @@ async function testSlotFreshness() {
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
     await hostGates(v, {
-      role: "mount",
+      privileges: ["mount"],
       highWater: freshness.get(v.author, v.manifest.app),
       revoked: freshness.isRevoked(v.author),
     });
@@ -2381,7 +2390,7 @@ await testFs();
 await testFsKeyRule();
 await testGuestSeam();
 await testPolicy();
-await testRequiresPickTheAdmissionClass();
+await testRequiresPickThePrivileges();
 await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();
