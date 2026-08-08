@@ -66,6 +66,8 @@ const sharedRows = [
       files: ["WASM/host/guest-seam.ts", "WASM/host/realm-queue.ts"] },
     { find: /`host\/shell-core\.ts`/,
       files: ["WASM/host/shell-core.ts"] },
+    { find: /`host\/cli\.ts`/,
+      files: ["WASM/host/cli.ts"] },
     { find: /`core\/\*\.ts` \(\d+ files\)/,
       files: [...sharedSet].filter((f) => f.startsWith("WASM/core/")) },
 ];

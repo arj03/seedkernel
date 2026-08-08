@@ -28,9 +28,10 @@ func ensureBooted(tb testing.TB) {
 			return
 		}
 		benchDataDir = dir
-		if benchBootErr = boot(dir); benchBootErr != nil {
+		if benchBootErr = boot(); benchBootErr != nil {
 			return
 		}
+		evalString(tb, "openStore("+jsonString(dir)+")")
 		cfg := nodeConfig{KeyHex: testKeyHex(tb), RequestDeadline: 2000}
 		_, benchBootErr = startNode(cfg)
 	})

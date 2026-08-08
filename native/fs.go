@@ -1,6 +1,6 @@
 // fs.go — the Go target's `fs.*` platform primitive: raw bytes under an opaque,
-// flat key, one file per key under a data directory (the storage twin of the net
-// cap). The host knows nothing about content-addressing or quota —
+// flat key, one file per key under a data directory named by `__fs.open` (the storage
+// twin of the net cap). The host knows nothing about content-addressing or quota —
 // those are the storage guest's business, layered on top of these primitives. This
 // mirrors host/fs-node.ts (NodeFs) so a Go node's on-disk store behaves like a
 // Bun node's. Exposed into QuickJS as an `fs` object with the core/fs.ts `Fs`
@@ -82,8 +82,14 @@ func (f *nodeFs) scanUsed() (used int64) {
 	return used
 }
 
+// path is the one place a key becomes a filename, so it is also the one place the
+// CLOSED store is refused: `f` is nil until `__fs.open` names a directory, and a nil
+// receiver here turns every get/size/delete into the same miss they answer for an
+// unsafe key. Refusing at the join rather than in each binding means a future caller
+// cannot reach the disk by forgetting a guard — and a nil `f.dir` would otherwise join
+// to the key alone, i.e. the process's working directory.
 func (f *nodeFs) path(key string) (string, bool) {
-	if !fsKeySafe(key) {
+	if f == nil || !fsKeySafe(key) {
 		return "", false
 	}
 	return filepath.Join(f.dir, key), true
@@ -102,6 +108,11 @@ func (f *nodeFs) get(key string) []byte {
 }
 
 func (f *nodeFs) put(key string, b []byte) error {
+	// Named rather than folded into the unsafe-key error below: "no store" and "bad key"
+	// are different operator mistakes, and only one of them is about the key.
+	if f == nil {
+		return fmt.Errorf("fs: no store opened — a node writes only after --dir is read")
+	}
 	p, ok := f.path(key)
 	if !ok {
 		return fmt.Errorf("fs: unsafe key %q", key)
@@ -180,6 +191,9 @@ func (f *nodeFs) size(key string) int {
 }
 
 func (f *nodeFs) list(prefix string) []string {
+	if f == nil {
+		return nil
+	}
 	entries, err := os.ReadDir(f.dir)
 	if err != nil {
 		return nil
@@ -220,19 +234,37 @@ func (f *nodeFs) delete(key string) bool {
 
 // stat returns the cached used-bytes total (maintained by put/delete), avoiding the
 // O(N) directory walk the storage guest's per-offer admission check would otherwise pay.
-func (f *nodeFs) stat() int64 { return f.used }
+// A closed store holds nothing.
+func (f *nodeFs) stat() int64 {
+	if f == nil {
+		return 0
+	}
+	return f.used
+}
 
 // exposeFs installs `__fs` into the realm: Go byte primitives, ArrayBuffer in and out.
 // Shaping them into the async core/fs.ts `Fs` seam (Uint8Array, null for a miss) is
 // host/native-shim.ts, and the key rule is applied above that again by the shell
 // (`validatedFs`). Go grows with primitives; the reusable interface lives in JS.
-func exposeFs(qc *qjs.Context, dir string) error {
-	fs, err := newNodeFs(dir)
-	if err != nil {
-		return err
-	}
+//
+// The backend starts CLOSED and is pointed at a directory by `__fs.open`. Which
+// directory is the operator's `--dir`, and reading the command line is no longer
+// something this side does — the shared CLI (host/cli.ts) reads it and opens the store
+// before standing a node up. Until then every read answers empty and every write
+// refuses, rather than a half-configured node quietly storing blocks somewhere nobody
+// asked for.
+func exposeFs(qc *qjs.Context) {
+	var fs *nodeFs
 	o := qc.NewObject()
 
+	o.SetPropertyStr("open", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		f, err := newNodeFs(argString(t, 0))
+		if err != nil {
+			return nil, err // surfaces as a JS exception: an unusable --dir is fatal
+		}
+		fs = f
+		return t.Context().NewUndefined(), nil
+	}))
 	o.SetPropertyStr("get", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		b := fs.get(argString(t, 0))
 		if b == nil {
@@ -278,7 +310,6 @@ func exposeFs(qc *qjs.Context, dir string) error {
 		return s, nil
 	}))
 	qc.Global().SetPropertyStr("__fs", o)
-	return nil
 }
 
 // Go stops at the primitive. The shaping — get's null/Uint8Array, list's \n-joined string

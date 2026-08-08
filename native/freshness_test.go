@@ -41,7 +41,11 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	}
 
 	// The advance must have written the mark to disk (atomically — no temp left behind).
-	if _, err := os.Stat(freshnessStorePath); err != nil {
+	// Where that file is is the shared rule's (`freshnessPathFor`, bundle.ts), asked of
+	// the realm rather than recomputed here: a test that spelled the sibling-file
+	// convention itself could pass while the two targets wrote to different places.
+	markPath := evalString(t, "freshnessPathFor("+jsonString(dataDir)+")")
+	if _, err := os.Stat(markPath); err != nil {
 		t.Fatalf("freshness mark was not persisted: %v", err)
 	}
 	entries, _ := os.ReadDir(parent)

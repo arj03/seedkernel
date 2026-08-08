@@ -24,9 +24,85 @@ func bootRealm(tb testing.TB) { bootRealmIn(tb, tb.TempDir()) }
 
 func bootRealmIn(tb testing.TB, dir string) {
 	tb.Helper()
-	if err := boot(dir); err != nil {
+	if err := boot(); err != nil {
 		tb.Fatal("boot:", err)
 	}
+	// Where this node's disk is, through the same `openStore` the operator flow calls
+	// once it has read --dir (host/native-shim.ts). Go's boot no longer knows about a
+	// data directory at all, so a harness that opened the store some other way would be
+	// testing a store production never opens.
+	evalString(tb, "openStore("+jsonString(dir)+")")
+}
+
+// jsonString quotes a Go string as a JS string literal, for the few test helpers that
+// reach the realm by evaluating an expression.
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// ── the realm entry points a test drives ─────────────────────────────────────
+//
+// These are TEST drivers, not production code: the binary reaches the realm once, at
+// `runMain`, and everything below it — the config, the load, the console line — is the
+// shared CLI's. A test needs finer joints than one call, so it uses the same realm
+// exports `runCli` does, never a second formatting or a second assembly of its own.
+
+// nodeConfig is what `bootNode` takes: the operator's choices as one JSON object. In
+// production the shared CLI builds this from the flags; here a test builds it directly
+// to stand a node up without a command line.
+type nodeConfig struct {
+	PolicyJSON       *string        `json:"policyJson"`
+	KeyHex           string         `json:"keyHex"`
+	ContactSecretHex string         `json:"contactSecretHex"`
+	Listen           *hostPort      `json:"listen,omitempty"`
+	WsListen         *hostPort      `json:"wsListen,omitempty"`
+	Peers            []string       `json:"peers,omitempty"`
+	RequestDeadline  int            `json:"requestDeadlineMs,omitempty"`
+	Config           map[string]any `json:"config,omitempty"`
+}
+
+type hostPort struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
+
+// nodeStatus is what the realm reports once the node is up: who we are, and the ports
+// actually bound (0 where not listening).
+type nodeStatus struct {
+	PeerID string `json:"peerId"`
+	Port   int    `json:"port"`
+	WsPort int    `json:"wsPort"`
+}
+
+// startNode builds the node inside the realm and waits for its listeners to bind — the
+// same `bootNode` the shared CLI's `standUp` reaches, minus the command line.
+func startNode(cfg nodeConfig) (nodeStatus, error) {
+	var st nodeStatus
+	j, err := json.Marshal(cfg)
+	if err != nil {
+		return st, err
+	}
+	out, err := callRealm("bootNode", 30*time.Second, qc.NewString(string(j)))
+	if err != nil {
+		return st, err
+	}
+	return st, json.Unmarshal(out, &st)
+}
+
+// loadBundle loads a signed bundle file and returns the operator's console line for it,
+// or an `ERROR: …` string. The line is produced by `loadedLine` in the shared CLI — the
+// very line the binary prints — so a test asserting on it is asserting on what an
+// operator sees, and there is no second formatting here to drift from it.
+func loadBundle(path string) string {
+	out, err := callRealm("cliLoadBundle", 30*time.Second, qc.NewString(path))
+	if err != nil {
+		return "ERROR: " + err.Error()
+	}
+	return string(out)
 }
 
 // bootShell stands a whole node up exactly as the binary does — bootRealm, then

@@ -61,7 +61,7 @@ PEERS=""
 for i in $(seq 0 $((HOLDERS-1))); do
   port=$((BASEPORT+i)); d="$WORK/h$i"; mkdir -p "$d"
   node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" \
-    --dir "$d/data" --key "$d/key" --listen "127.0.0.1:$port" --timeout 5000 \
+    --dir "$d/data" --key "$d/key" --listen "127.0.0.1:$port" --request-deadline 5000 \
     > "$d/log" 2>&1 &
   PIDS+=($!)
 done
@@ -85,19 +85,19 @@ put() {
 check() { cmp -s "$1" "$SRC" && echo "  ✓ $2" || { echo "  ✗ $2 (mismatch)"; exit 1; }; }
 
 # 1. Go put → node get
-A=$(put "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --timeout 6000 --dir "$WORK/ga" --key "$WORK/ga.key")
+A=$(put "$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --request-deadline 6000 --dir "$WORK/ga" --key "$WORK/ga.key")
 node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" \
-  --get "$A" --out "$WORK/got1.bin" --dir "$WORK/ng" --key "$WORK/ng.key" --timeout 6000 >/dev/null 2>&1
+  --get "$A" --out "$WORK/got1.bin" --dir "$WORK/ng" --key "$WORK/ng.key" --request-deadline 6000 >/dev/null 2>&1
 check "$WORK/got1.bin" "Go put → node get"
 
 # 2. node put → Go get
-B=$(put node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --dir "$WORK/np" --key "$WORK/np.key" --timeout 6000)
-"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --get "$B" --out "$WORK/got2.bin" --dir "$WORK/gg" --key "$WORK/gg.key" --timeout 6000 >/dev/null 2>&1
+B=$(put node "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --dir "$WORK/np" --key "$WORK/np.key" --request-deadline 6000)
+"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --get "$B" --out "$WORK/got2.bin" --dir "$WORK/gg" --key "$WORK/gg.key" --request-deadline 6000 >/dev/null 2>&1
 check "$WORK/got2.bin" "node put → Go get"
 
 # 3. bun put → Go get
-C=$(put bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --dir "$WORK/bp" --key "$WORK/bp.key" --timeout 6000)
-"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --get "$C" --out "$WORK/got3.bin" --dir "$WORK/gg3" --key "$WORK/gg3.key" --timeout 6000 >/dev/null 2>&1
+C=$(put bun "$NODEMAIN" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --put "$SRC" --dir "$WORK/bp" --key "$WORK/bp.key" --request-deadline 6000)
+"$GOEXE" --bundle "$BUNDLE" --policy "$WORK/policy.json" --app-config "$WORK/app.json" --peers "$PEERS" --get "$C" --out "$WORK/got3.bin" --dir "$WORK/gg3" --key "$WORK/gg3.key" --request-deadline 6000 >/dev/null 2>&1
 check "$WORK/got3.bin" "bun put → Go get"
 
 echo "INTEROP OK — Go ↔ JS (node + bun) parity across the cohort"

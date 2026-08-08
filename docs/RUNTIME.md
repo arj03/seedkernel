@@ -550,17 +550,21 @@ whitelist is not one.
 
 ### 12.8 The shell
 
-`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — the module table, the bundle loader under its admission policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `runGuest`, `serve`); a CLI wraps it:
+`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — the module table, the bundle loader under its admission policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `runGuest`, `serve`). The CLI over it is `host/cli.ts`:
 
 ```sh
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
+     [--contact-secret ./contact.hex] [--app-config ./app.json] \
+     [--revoke <hex,…>] [--uninstall <appKey,…>] [--request-deadline <ms>] \
      [--put file] [--get hex[:hex…] --out file] \
      [--guest-timeout <ms>] [--guest-memory <MiB>]
 ```
 
-`--transport` supplies a signed transport bundle from disk instead of the artifact the build embeds (`TRANSPORT_BUNDLE_B64`) — a node with its own pinned transport author, or a newer protocol than the binary ships (§12.6).
+**The CLI is shared code, not a per-target wrapper.** `runCli` (`host/cli.ts`) owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy` (§14), the order — remedies, then the bundle, then the one-shots, then serve (§12.5) — and every line printed. A target supplies a `CliHost`: files, one console line, raw stdout, entropy, and "stand a node up on this platform". That is five members, none of which decides anything, and it is the whole difference between running a node on Node and running one from the native binary (§12.9). Argument *tokenizing* is not the point of sharing it — a dozen lines that fail loudly — the flag set and the sequence are, because a decision made twice is one that eventually gets made differently. Unknown flags are refused rather than ignored, which is the failure that used to be silent: a mistyped `--polcy` produced a deny-all node that boots, serves, installs nothing, and looks exactly like a policy doing its job.
+
+`--transport` supplies a signed transport bundle from disk instead of the artifact the build embeds (`TRANSPORT_BUNDLE_B64`) — a node with its own pinned transport author, or a newer protocol than the binary ships (§12.6). `--contact-secret` names a *file* holding 64 hex characters (§12.6.3), never the secret itself: an argument is visible in `ps` output and shell history.
 
 A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest` → `realm.call`) **and** serves its *request* side from the **same** confined realm (`serve` routes the transport's inbound requests to the guest's `handle` entrypoint through the same `realm.call`). Both may `await`; the realm serializes them (§12.3), and the driver answers an inbound request through the `respond` entrypoint on a later turn, never inline — which is what lets an app's inbound handling be asynchronous at all. The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§12.9). seed store's WASM README has a complete storage walkthrough.
 
@@ -572,7 +576,7 @@ It is a **platform target, not a reimplementation.** All protocol and app logic 
 
 This is enforced mechanically: the shared modules are compiled by `tsc` and assembled into **one** `native/host-shell.gen.js` by `scripts/bundle-loader.mjs` (`npm run build:loader-bundles`), which the loader `//go:embed`s and evaluates in QuickJS. Nothing under `native/` is a hand-written second copy. The bundle runs over a *seam* — a single TypeScript adapter (`host/native-shim.ts`) satisfying the same interfaces the JS host does (`BundleHost`, `FreshnessStore`, `ChannelFactory`, `RealmFactory`) by forwarding to Go's byte-level `bridge`, and then handing the result to the shared `createShell`. Because the adapter is typechecked against those interfaces, a shared-rule change the native target fails to honor is a **compile error**, not a silent divergence. The seam carries no rules of its own: who may install (§12.5), the name derivation (§5.1), the admit-then-bind step (§12.4), the manifest signature and its domain prefix (§12.4), the freshness arithmetic, and the deny-all default (§14) all live in the shared modules — one implementation of each to audit.
 
-**The assembly order is shared too, not just the parts.** `createShell` (`host/shell-core.ts`) is the one place a node is put together — the module table, the guest seam wired from the manifest's declared domains, the guest preamble, the confined realm's lifecycle, the protocol routing, and the inbound dispatch — and every target calls it with a `ShellPlatform` describing only what genuinely varies: `{ sodium, identity, table, fs, freshnessStore, channels, listen, wsListen, networkKey, contactSecret, admitPeer, createRealm }` — the socket seam (`channels`, `listen`, `wsListen`) where the §12.6 driver's DIAL actions and accept paths resolve, and the transport knobs (`networkKey`, `contactSecret`, `admitPeer`) that make the node's network policy-shaped. There is no `network` member to hand in: the transport bundle lands through the ordinary `loadBundleBlob`, and the driver it stands *is* the network. Since every app is a guest (§12.4), `createRealm` is a required member rather than an optional one — a shell that cannot run a guest cannot host an app. `fs` stays optional, but for a different reason than it once had: not "this shell has no guests," but simply "this node has no disk" — and a bundle declaring the `fs` cap on such a shell gets no backend wired at all, so its first `fs/*` call throws by name rather than resolving to a pretend store (§12.2). Realm creation is a *member* of that seam rather than something the shell reaches for itself, so `safe-js.ts` is the JS platform's realm factory and a second quickjs-ng runtime driven by Go's loop (`native/guest.go`) is this one's. Go therefore holds no boot sequence: `main.go` boots the engines, exposes the primitives, evaluates the one bundle, and forwards the CLI as a JSON config. There is no Go-side dispatch, no Go-side seam construction, and no Go-side notion of which app answers a protocol — which is what makes §12.10 hold identically here and in the browser.
+**The assembly order is shared too, not just the parts.** `createShell` (`host/shell-core.ts`) is the one place a node is put together — the module table, the guest seam wired from the manifest's declared domains, the guest preamble, the confined realm's lifecycle, the protocol routing, and the inbound dispatch — and every target calls it with a `ShellPlatform` describing only what genuinely varies: `{ sodium, identity, table, fs, freshnessStore, channels, listen, wsListen, networkKey, contactSecret, admitPeer, createRealm }` — the socket seam (`channels`, `listen`, `wsListen`) where the §12.6 driver's DIAL actions and accept paths resolve, and the transport knobs (`networkKey`, `contactSecret`, `admitPeer`) that make the node's network policy-shaped. There is no `network` member to hand in: the transport bundle lands through the ordinary `loadBundleBlob`, and the driver it stands *is* the network. Since every app is a guest (§12.4), `createRealm` is a required member rather than an optional one — a shell that cannot run a guest cannot host an app. `fs` stays optional, but for a different reason than it once had: not "this shell has no guests," but simply "this node has no disk" — and a bundle declaring the `fs` cap on such a shell gets no backend wired at all, so its first `fs/*` call throws by name rather than resolving to a pretend store (§12.2). Realm creation is a *member* of that seam rather than something the shell reaches for itself, so `safe-js.ts` is the JS platform's realm factory and a second quickjs-ng runtime driven by Go's loop (`native/guest.go`) is this one's. Go therefore holds no boot sequence and no operator flow: `main.go` boots the engines, exposes the primitives, evaluates the one bundle, and calls `runMain` — the shared `runCli` (§12.8) over a `CliHost` of Go primitives. There is no Go-side dispatch, no Go-side seam construction, no Go-side notion of which app answers a protocol, and no Go-side idea of what a flag means — which is what makes §12.10 hold identically here and in the browser, and what stopped `--contact-secret` from meaning a file on one target and a hex argument on the other.
 
 The §3 module table is Go's own `map[string]map[string]*boundModule` — the table is a contract, so the native target implements it rather than embedding it. Concretely the binary embeds and drives, over [wazero](https://wazero.io) (a pure-Go, cgo-free wasm runtime):
 
@@ -593,19 +597,21 @@ Three conditions make that safe, and a substitution failing *any* of them is a f
 
 Condition 3 is why Ed25519 and ML-DSA-65 stay on the shared wasm on every target (§12.4, §14.1) while BLAKE2b-256 and the ChaCha20-Poly1305 record layer do not: the first two decide whether to *accept* something, the last two only transform bytes. It is the same trade as `ws.wasm` versus a native RFC 6455, and it will come up again for every suite added under §14.1.
 
-Go-native primitives back the capability seams: `os` for the §12.1 fs backend, `net` for the raw TCP socket — one socket kind, carrying node↔node and browser↔node alike, with the codec named per link and run above Go entirely — and `crypto/rand` for entropy. WebRTC (§12.7) stays browser-only. The CLI mirrors §12.8 exactly:
+Go-native primitives back the capability seams: `os` for the §12.1 fs backend, `net` for the raw TCP socket — one socket kind, carrying node↔node and browser↔node alike, with the codec named per link and run above Go entirely — and `crypto/rand` for entropy. WebRTC (§12.7) stays browser-only. The CLI does not *mirror* §12.8 — it **is** §12.8, the same `runCli` over a Go `CliHost`, so the flag set and every default are the same object rather than two that agree:
 
 ```sh
 seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
-     --bundle ./app-bundle \
-     [--peers <pk>@host:port,…] [--put file] [--get hex[:hex…] --out file]
+     --bundle ./app-bundle [--peers <pk>@host:port,…] \
+     [--put file] [--get hex[:hex…] --out file]
 ```
 
-The `--key` file holds the node's 32-byte master seed (§12.6.2b) — the same file format
-and derivation as the JS shell's `--key`: Go reads it (or mints one from `crypto/rand`)
-and `bootNode` in the shared seam derives the `channel` and `guest` subkeys from it, so
-both targets hold one secret on disk and no key signs for two purposes.
+Go's side of it is five primitives — `argv`, `readFile`, `writeFile`, `log`, `stdout` —
+plus `__fs.open`, which is how a data directory reaches the fs backend now that Go does
+not read `--dir` to find one. Even the `--key` file is read and minted in the shared
+flow: it holds the node's 32-byte master seed (§12.6.2b), and `deriveNodeKeys` produces
+the `channel` and `guest` subkeys from it, so both targets hold one secret on disk and no
+key signs for two purposes.
 
 Because the wire and the bundles are shared, a Go node and a Node/Bun node interoperate directly in one cohort — `put` on either, `get` on the other, in both directions, against the same signed bundle and genesis (verified end-to-end for seed store by `WASM/scripts/loader-interop.sh`).
 

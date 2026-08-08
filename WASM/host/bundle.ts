@@ -777,6 +777,18 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
     }
     return files;
 }
+/** Where a data directory's freshness marks live: a SIBLING of the directory, never a
+ *  file inside it.
+ *
+ *  That placement is the whole point — a `fs`-capable guest writes files *inside* the
+ *  dir, so a mark kept there would be a downgrade guard the guarded party can edit, and
+ *  the dead-key set beside it (§12.5) would be no better off. Shared rather than
+ *  restated per target: the two hosts computing this differently would put a node's
+ *  marks somewhere its next boot does not look, which reads as "no marks" — every
+ *  downgrade guard silently dropped, with nothing to see. */
+export function freshnessPathFor(dir: string): string {
+    return dir.replace(/[/\\]+$/, "") + ".freshness.json";
+}
 /** The freshness *arithmetic*: the `(author, app)` key derivation, the monotonic
  *  never-rewind rule, the revocation set, and the
  *  `{ marks, revoked }` serialization. All of it is target-independent, so

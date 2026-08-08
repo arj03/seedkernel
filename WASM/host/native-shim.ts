@@ -18,7 +18,8 @@
 // the platform. Because it is TypeScript checked against those same interfaces, the
 // drift a hand-written second assembly accumulates is now a compile error.
 import { policyFromJson } from "./policy.js";
-import { appKeyFor, verifyBundle, FreshnessMarks } from "./bundle.js";
+import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
+import { runCli, loadedLine, type CliHost, type NodeSetup } from "./cli.js";
 import {
   createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
@@ -48,8 +49,20 @@ declare const bridge: {
   callModule(appKey: string, module: string, payload: Uint8Array): ArrayBuffer | null;
   isBound(appKey: string, module: string): boolean;
   removeApp(appKey: string): number;
-  readFreshness(): string | null;
-  writeFreshness(json: string): void;
+  /** The process arguments after the program name, as a JSON array. JSON rather than a
+   *  joined string because an argument may legitimately contain any byte. */
+  argv(): string;
+  /** Read a whole file, or null when it is absent/unreadable — the `CliFiles` contract
+   *  (cli.ts), where "absent" is a branch (`--key` on a first boot) and not a failure. */
+  readFile(path: string): ArrayBuffer | null;
+  /** Write a whole file atomically (temp + rename). `mode` is a POSIX permission bit
+   *  set, or 0 to leave the platform default. */
+  writeFile(path: string, bytes: Uint8Array, mode: number): void;
+  /** One console line on the real stdout. QuickJS's own `console.log` writes to a WASI
+   *  stdout wazero leaves disconnected, so operator output cannot go through it. */
+  log(line: string): void;
+  /** Raw bytes on stdout — `--get` with no `--out` writes the app's response verbatim. */
+  stdout(bytes: Uint8Array): void;
   createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;
   realmCall(realm: number, entry: string, payload: Uint8Array,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): void;
@@ -164,6 +177,11 @@ export const sodium: NativeSodium = wrapNativeSodium(__sodium);
  *  kind of platform fact a shim exists to absorb. Go grows with primitives, never with
  *  logic; making it construct promises would be the latter. */
 declare const __fs: {
+  /** Point the backend at a data directory, creating it if needed. Late-bound rather
+   *  than fixed at engine boot: WHICH directory is an operator's `--dir`, and Go no
+   *  longer reads the command line to find out. Until this is called the store answers
+   *  as empty and refuses writes. */
+  open(dir: string): void;
   get(key: string): ArrayBuffer | null;
   put(key: string, bytes: Uint8Array): void;
   size(key: string): number;
@@ -302,12 +320,42 @@ const table: ModuleTableBackend = {
     isBound(appKey, module) { return bridge.isBound(appKey, module); },
     removeApp(appKey) { return bridge.removeApp(appKey); },
 };
-/** The freshness store over the Go atomic-write seam (README §12.4). */
+/** The data directory a store was opened on, or null for a realm that never opened one
+ *  (the native tests' bare `makeTransportNode`, which needs no durable marks). It names
+ *  the freshness file's location and nothing else. */
+let storeDir: string | null = null;
+/** Point the `fs.*` backend at a data directory and remember where its freshness marks
+ *  belong. Called by `standUp` below once `--dir` has been read, and by the native test
+ *  harness — the one place either learns where this node's disk is. */
+function openStore(dir: string): void {
+    __fs.open(dir);
+    storeDir = dir;
+}
+/** The freshness store over the Go file seam (README §12.4). The marks live in a
+ *  SIBLING of the data dir so a `fs`-capable guest cannot reach its own mark; where
+ *  exactly is `freshnessPathFor`, shared with the Node shell rather than computed
+ *  again here. A realm with no store open keeps its marks in memory. */
 class NativeFreshnessStore extends FreshnessMarks {
-    constructor() {
-        super(bridge.readFreshness());
+    path;
+    constructor(dir: string | null) {
+        const path = dir === null ? null : freshnessPathFor(dir);
+        let json: string | null = null;
+        if (path !== null) {
+            const raw = bridge.readFile(path);
+            if (raw !== null) json = utf8dec.decode(new Uint8Array(raw));
+        }
+        super(json);
+        this.path = path;
     }
-    persist(json: string) { bridge.writeFreshness(json); }
+    persist(json: string) {
+        // Logged, not fatal: the in-memory mark still guards the running process, and
+        // only the NEXT boot would be unprotected — which the operator must see.
+        if (this.path === null) return;
+        // 0600: the marks are a node's own downgrade guard, not something a co-tenant
+        // reads. (The freshness file predates this seam at exactly this mode.)
+        try { bridge.writeFile(this.path, utf8.encode(json), 0o600); }
+        catch (err) { bridge.log(`seedkernel: could not persist freshness marks to ${this.path}: ${errMessage(err)}`); }
+    }
 }
 /** Say which codec a Go socket carries. The bytes are Go's; the boundaries are the
  *  transport bundle's, and this is the one place that decides which rule it applies. */
@@ -402,6 +450,7 @@ const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimi
  *  seam (host.call, callModule, a realm result), and the one shape Go's await harness
  *  carries out of a settled promise. A JSON report is no exception. */
 const utf8 = new TextEncoder();
+const utf8dec = new TextDecoder();
 let shell: Shell | null = null;
 /** The admission predicate in force (§12.5). It starts deny-all — the realm boots
  *  refusing everything, so the absence of a decision is never permission (README §14)
@@ -444,7 +493,17 @@ async function makeTransportNode(cfg: {
         host: string;
         port: number;
     };
+    /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate. */
+    networkKey?: Uint8Array;
     requestDeadlineMs?: number;
+    /** The §12.3 guest bounds. Both reach `createShell` from here for the reason
+     *  main.ts states about its own: a bound the shell accepts but no target can set is
+     *  a bound nobody has — which is what these were on this target until they were
+     *  threaded through. */
+    guestDeadlineMs?: number;
+    realmMemoryBytes?: number;
+    /** A transport bundle to mount instead of the artifact-shipped one (§12.6). */
+    transportBundle?: Uint8Array;
     config?: Record<string, string | number>;
 }): Promise<{
     shell: Shell;
@@ -453,26 +512,31 @@ async function makeTransportNode(cfg: {
     const s = createShell({
         platform: {
             sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, table, fs,
-            freshnessStore: new NativeFreshnessStore(),
+            freshnessStore: new NativeFreshnessStore(storeDir),
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
-            contactSecret: cfg.contactSecret, createRealm,
+            contactSecret: cfg.contactSecret, networkKey: cfg.networkKey, createRealm,
         },
         admit: (v, ctx) => admissionPolicy(v, ctx),
         requestDeadlineMs: cfg.requestDeadlineMs,
+        guestDeadlineMs: cfg.guestDeadlineMs,
+        realmMemoryBytes: cfg.realmMemoryBytes,
         config: cfg.config,
     });
     // The transport bundle IS the node's network: verify + govern under the policy's
     // `transportAuthors`, install, and the shell stands the driver up. A policy that
     // does not admit the transport author leaves the node without a network.
-    if (embeddedTransport) {
+    const transport = cfg.transportBundle ?? embeddedTransport;
+    if (transport) {
         try {
-            await s.loadBundleBlob(embeddedTransport);
+            await s.loadBundleBlob(transport);
         }
         catch (err) {
             if (!isAdmissionRejected(err)) {
-                // A deliberate configuration: this node does not speak to anyone.
                 throw err;
             }
+            // A deliberate configuration — "this node does not speak to anyone" — but
+            // one that is indistinguishable from a broken network unless it says so.
+            bridge.log("  no transport: the policy's transportAuthors does not admit this bundle");
         }
     }
     const net = s.net as unknown as TransportHost;
@@ -517,49 +581,76 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     };
     return utf8.encode(JSON.stringify(status));
 }
-/** Load a signed bundle (README §12.4). Go has read the one file — that is the whole
- *  fs seam — and passes its bytes; every check, its order, and the module binding are
- *  the shared shell's. Returns the little Go needs to report; the guest source, the
- *  requires, the signing scope and the table names never leave this realm. */
-async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
-    const b = await theShell().loadBundleBlob(new Uint8Array(blob));
-    return utf8.encode(JSON.stringify({
-        app: b.manifest.app,
-        version: b.manifest.version,
-        author: toHex(b.author),
-        appKey: appKeyFor(b.author, b.manifest.app),
-        // What this load claimed (§12.10) — the routing came with the bundle, so Go's
-        // console line reports the ids rather than taking them from the operator.
-        protocols: b.manifest.protocols ?? [],
-    }));
-}
-/** Run a loaded bundle's guest entrypoint as the *initiator* (§12.8) — the
- *  `--put` / `--get` one-shots. Arguments and results cross as raw bytes. */
-function runGuest(entry: string, arg: ArrayBuffer): Promise<Uint8Array> {
-    return theShell().runGuest(entry, new Uint8Array(arg));
-}
 /** Serve the cohort: route inbound requests to whichever installed app claims the
  *  protocol (§12.10), through the shared dispatch. */
 function serve(): Promise<void> {
     return theShell().serve();
 }
-/** Uninstall one app by its app key (§12.5). Returns the boolean JSON-encoded, not
- *  raw: the realm bridge marshals only `Uint8Array`/`ArrayBuffer` results and turns
- *  anything else into zero bytes (native/loop.go `awaitIn`), so a bare `false` would
- *  reach Go as an empty buffer and read as success. Encode it. */
-function uninstall(appKey: string): Uint8Array {
-    return utf8.encode(JSON.stringify(theShell().uninstall(appKey)));
-}
-/** Write off a compromised author key (§12.5): refuse everything it signs from here
- *  on, and tear down every app of its already running. Returns the app keys removed,
- *  JSON-encoded, for the operator's console line.
+
+// ── the operator flow ────────────────────────────────────────────────────────
+/** This platform, as `cli.ts` needs it. Files, a console line, raw stdout, entropy,
+ *  and "stand a node up here" — five members, none of which decides anything.
  *
- *  Exposed for the same reason `loadBundleBlob` is: the decision and the state are
- *  the shared shell's, and Go owns only the CLI surface and the durable write. A
- *  native loader that could install but never revoke would leave §12.5's remedy
- *  reachable on some targets and not others. */
-function revoke(authorHex: string): Uint8Array {
-    return utf8.encode(JSON.stringify(theShell().revoke(authorHex)));
+ *  Everything an operator can choose is on the other side of this record: the flag set,
+ *  the defaults, the deny-all reading of an absent `--policy`, the order remedies run
+ *  in, which failures are fatal, and the console lines. That whole flow used to be
+ *  written a second time in Go, which is how the two targets came to disagree about
+ *  what `--contact-secret` names and about whether `--guest-timeout` exists at all. */
+function nativeCliHost(): CliHost {
+    return {
+        banner: "seedkernel-loader",
+        argv: JSON.parse(bridge.argv()) as string[],
+        readFile(path) {
+            const r = bridge.readFile(path);
+            return r === null ? null : new Uint8Array(r);
+        },
+        writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
+        log(line) { bridge.log(line); },
+        stdout(bytes) { bridge.stdout(bytes); },
+        sodium,
+        async standUp(cfg: NodeSetup) {
+            // Where this node's disk is, and who may install on it — both before the
+            // transport bundle lands, because that load is governed by the policy and
+            // its freshness mark belongs beside the store.
+            openStore(cfg.dir);
+            setPolicy(cfg.policyJson ?? null);
+            const stood = await makeTransportNode({
+                identity: cfg.identity,
+                guestIdentity: cfg.guestIdentity,
+                contactSecret: cfg.contactSecret,
+                listen: cfg.listen,
+                wsListen: cfg.wsListen,
+                requestDeadlineMs: cfg.requestDeadlineMs,
+                guestDeadlineMs: cfg.guestDeadlineMs,
+                realmMemoryBytes: cfg.realmMemoryBytes,
+                transportBundle: cfg.transportBundle,
+                config: cfg.config,
+            });
+            // One "the shell" per realm, whichever entry point stood it up, so the
+            // native tests' drivers and the flow above address the same node.
+            shell = stood.shell;
+            return stood;
+        },
+    };
+}
+/** Run the operator flow. Go calls this with no arguments — every choice comes from the
+ *  argv it hands back through the bridge — and reads back whether the node is listening,
+ *  which is the one thing Go still decides: whether to keep its event loop running. */
+async function runMain(): Promise<Uint8Array> {
+    const { serving, close } = await runCli(nativeCliHost());
+    if (!serving) close();
+    return utf8.encode(JSON.stringify({ serving }));
+}
+/** Load a bundle FILE and return the operator's console line for it — byte for byte the
+ *  line `runCli` prints, because it is the same `loadedLine`.
+ *
+ *  Here for the native tests, which drive the real §12.4 load path and assert on what an
+ *  operator would actually see. A test formatting that line itself would be the second
+ *  implementation this target exists not to have. */
+async function cliLoadBundle(path: string): Promise<Uint8Array> {
+    const raw = bridge.readFile(path);
+    if (raw === null) throw new Error(`cannot read ${path}`);
+    return utf8.encode(loadedLine(await theShell().loadBundleBlob(new Uint8Array(raw))));
 }
 
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): a microtask
@@ -588,4 +679,4 @@ globalThis.__start = function (id, entry, arg) {
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, cliLoadBundle, openStore, bootNode, setPolicy, serve, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

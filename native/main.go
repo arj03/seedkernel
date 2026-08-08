@@ -3,28 +3,26 @@
 // either. The whole shell — verify + admit + install (§12.4/§12.5), the guest seam
 // (§12.2), the confined guest's lifecycle (§12.3), protocol dispatch (§12.10) — is
 // the shared host TS, compiled into the embedded host-shell.gen.js and run in
-// QuickJS (README §12.9). This Go layer is the bridge and only the bridge: it owns
-// the module table (§3), supplies the crypto (Ed25519 via libsodium, BLAKE2b
-// native), the fs directory, the sockets and the second QuickJS realm, and forwards
-// the CLI. Pure Go, no cgo (QuickJS is quickjs-ng wasm over the in-repo qjs/wazero
-// bridge) → one static binary.
+// QuickJS (README §12.9) — and so is the operator flow itself (host/cli.ts): the flag
+// set, the defaults, the order a node does things in, and every line it prints.
+//
+// This Go layer is the bridge and only the bridge: it owns the module table (§3),
+// supplies the crypto (Ed25519 via libsodium, BLAKE2b native), the fs backend, the
+// sockets, the second QuickJS realm, and the process's own facilities — argv, files,
+// stdout. Nothing here decides anything an operator can see. Pure Go, no cgo (QuickJS
+// is quickjs-ng wasm over the in-repo qjs/wazero bridge) → one static binary.
 package main
 
 import (
 	"context"
-	crand "crypto/rand"
 	_ "embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
 	"time"
 
 	"seedloader/qjs"
@@ -236,14 +234,15 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
 // boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
-// event loop, the platform primitives (sodium, fs on dataDir, TCP sockets,
-// the byte-level `bridge` below), and then the ONE shared bundle. After this the realm
-// holds `createShell` and the native platform binding over it — but no node yet; that
-// is bootNode, which needs an identity and listen addresses.
+// event loop, the platform primitives (sodium, the fs backend, TCP sockets, the
+// byte-level `bridge` below), and then the ONE shared bundle. After this the realm
+// holds the shared CLI and the native platform binding over it — but no node yet, and
+// not even a data directory: `--dir` is the operator's, so `host/cli.ts` reads it and
+// opens the store (`__fs.open`) on its way to standing a node up.
 //
 // Idempotent across calls: the tests boot repeatedly in one process, and each boot
 // releases the previous one's engines rather than stranding them.
-func boot(dataDir string) error {
+func boot() error {
 	shutdown()
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rt) // crypto primitive; the realm's bundle verification routes to it
@@ -287,14 +286,9 @@ func boot(dataDir string) error {
 	// (TextEncoder at load time, the ws codec backend) straight away.
 	installPolyfills(qc)
 	exposeSodium(qc, sd)
-	if err := exposeFs(qc, dataDir); err != nil {
-		return fmt.Errorf("fs: %w", err)
-	}
+	exposeFs(qc)
 	nh := exposeNet(qc, el)
 	exposeBridge(qc)
-	// The freshness high-water marks live in a SIBLING of the data dir, so a fs-capable
-	// guest — whose keys are files inside the dir — can never tamper with its own mark.
-	freshnessStorePath = filepath.Clean(dataDir) + ".freshness.json"
 	if _, err := qc.Eval("host-shell.gen.js", qjs.Code(hostShellJS)); err != nil {
 		return fmt.Errorf("shell bundle: %w", err)
 	}
@@ -384,29 +378,57 @@ func exposeBridge(qc *qjs.Context) {
 		return t.Context().NewInt64(int64(removeApp(t.Args()[0].String()))), nil
 	}))
 
-	// ── bundle-freshness persistence (§12.4) ──
-	// The arithmetic is shared JS, the durable write is ours: a truncated store reads
-	// back as "no marks", silently dropping every downgrade guard, so it must be atomic.
-	b.SetPropertyStr("readFreshness", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		if freshnessStorePath == "" {
+	// ── the operator's world (host/cli.ts) ──
+	// Files, arguments and stdout. Five primitives, and not one of them decides
+	// anything: which files get read, what the flags are called, what gets printed and
+	// in what order is the shared CLI's, which is the same module the Node shell runs.
+	// These used to be a `readFreshness`/`writeFreshness` pair, narrow because the only
+	// JS-driven file was the freshness store; everything else about the command line
+	// was a second implementation in Go.
+	b.SetPropertyStr("argv", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		// JSON rather than a joined string: an argument may contain any byte, including
+		// whatever separator a join would pick.
+		j, err := json.Marshal(os.Args[1:])
+		if err != nil {
+			return nil, err
+		}
+		return t.Context().NewString(string(j)), nil
+	}))
+	b.SetPropertyStr("readFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		fb, err := os.ReadFile(argString(t, 0))
+		if err != nil {
+			// null is "absent", a branch the CLI takes (a --key file on a first boot),
+			// not a failure to report from here.
 			return t.Context().NewNull(), nil
 		}
-		fb, err := os.ReadFile(freshnessStorePath)
-		if err != nil {
-			return t.Context().NewNull(), nil // absent ⇒ first boot
-		}
-		return t.Context().NewString(string(fb)), nil
+		return t.Context().NewArrayBuffer(fb), nil
 	}))
-	b.SetPropertyStr("writeFreshness", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		if freshnessStorePath == "" {
-			return t.Context().NewNull(), nil // no store configured (tests) ⇒ in-memory only
+	b.SetPropertyStr("writeFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		bytes, err := qjs.JsTypedArrayToGo(t.Args()[1])
+		if err != nil {
+			return nil, err
 		}
-		// Logged, not fatal: the in-memory mark still guards the running process; only
-		// the next boot would be unprotected, which the operator must see.
-		if err := writeFileAtomic(freshnessStorePath, []byte(t.Args()[0].String()), ".freshness-", 0); err != nil {
-			fmt.Fprintf(os.Stderr, "seedkernel: could not persist freshness mark to %s: %v\n", freshnessStorePath, err)
+		// Atomic, for every caller and not just the freshness store: a truncated
+		// freshness file reads back as "no marks" (dropping every downgrade guard in
+		// silence), and a truncated key file is a node whose identity changed.
+		if err := writeFileAtomic(argString(t, 0), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
+			return nil, err
 		}
-		return t.Context().NewNull(), nil
+		return t.Context().NewUndefined(), nil
+	}))
+	b.SetPropertyStr("log", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		// The realm's own console.log writes to a WASI stdout wazero leaves
+		// disconnected, so operator output has to come back out through here.
+		fmt.Println(argString(t, 0))
+		return t.Context().NewUndefined(), nil
+	}))
+	b.SetPropertyStr("stdout", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		bytes, err := qjs.JsTypedArrayToGo(t.Args()[0])
+		if err != nil {
+			return nil, err
+		}
+		os.Stdout.Write(bytes)
+		return t.Context().NewUndefined(), nil
 	}))
 
 	installRealmBridge(qc, b) // the confined realm (§12.3) — guest.go
@@ -458,166 +480,20 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 	return value, nil
 }
 
-// nodeConfig is everything the operator chose, handed to the realm as one JSON object
-// (host/native-shim.ts BootConfig). Parsing the flags is Go's job; acting on them is
-// the shell's, so they cross as data rather than as spliced-together JS.
-type nodeConfig struct {
-	PolicyJSON       *string        `json:"policyJson"`
-	KeyHex           string         `json:"keyHex"`
-	ContactSecretHex string         `json:"contactSecretHex"`
-	Listen           *hostPort      `json:"listen,omitempty"`
-	WsListen         *hostPort      `json:"wsListen,omitempty"`
-	Peers            []string       `json:"peers,omitempty"`
-	RequestDeadline  int            `json:"requestDeadlineMs,omitempty"`
-	Config           map[string]any `json:"config,omitempty"`
-}
-
-type hostPort struct {
-	Host string `json:"host"`
-	Port int    `json:"port"`
-}
-
-// nodeStatus is what the realm reports once the node is up: who we are, and the ports
-// actually bound (0 where not listening).
-type nodeStatus struct {
-	PeerID string `json:"peerId"`
-	Port   int    `json:"port"`
-	WsPort int    `json:"wsPort"`
-}
-
-// startNode builds the node inside the realm — identity, network, and the shared shell
-// over this platform — and waits for the listeners to bind and any cohort peers to be
-// dialled. The whole assembly order lives in createShell (README §12.9); this hands it
-// the operator's choices and reads back the result.
-func startNode(cfg nodeConfig) (nodeStatus, error) {
-	var st nodeStatus
-	j, err := json.Marshal(cfg)
-	if err != nil {
-		return st, err
-	}
-	out, err := callRealm("bootNode", 30*time.Second, qc.NewString(string(j)))
-	if err != nil {
-		return st, err
-	}
-	return st, json.Unmarshal(out, &st)
-}
-
-// loadBundle loads a signed app bundle file (README §12.4). Reading the one file is all
-// this does: the whole load — manifest signature, policy governance, freshness, per-module
-// and guest integrity, binding the modules — is the shared shell. The load also claims
-// the manifest's protocol ids (§12.10), so the console line REPORTS what this node now
-// serves rather than the operator naming it. Returns that line, or an `ERROR: …` string.
-func loadBundle(path string) string {
-	blob, err := os.ReadFile(path)
-	if err != nil {
-		return "ERROR: " + err.Error()
-	}
-	out, err := callRealm("loadBundleBlob", 30*time.Second, qc.NewArrayBuffer(blob))
-	if err != nil {
-		return "ERROR: " + err.Error()
-	}
-	var m struct {
-		App       string
-		Version   int
-		AppKey    string
-		Protocols []string
-	}
-	if err := json.Unmarshal(out, &m); err != nil {
-		return "ERROR(json): " + err.Error()
-	}
-	serves := "(nothing — this bundle claims no protocol)"
-	if len(m.Protocols) > 0 {
-		serves = strings.Join(m.Protocols, ", ")
-	}
-	return fmt.Sprintf("%s v%d  key %s  serves %s", m.App, m.Version, m.AppKey, serves)
-}
-
-// runGuest runs one of the loaded bundle's guest entrypoints as the *initiator* —
-// "the shell runs the app" (README §12.8). Arguments and results cross as raw bytes;
-// the shell owns the realm, the guest seam and the confinement.
-func runGuest(entry string, payload []byte) ([]byte, error) {
-	return callRealm("runGuest", 60*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
-}
-
-// uninstall removes one app by app key (README §12.5). The unbind, the protocols it
-// claimed and the realm disposal are all the shared shell's; Go owns only the CLI.
-func uninstall(appKey string) string {
-	out, err := callRealm("uninstall", 30*time.Second, qc.NewString(appKey))
-	if err != nil {
-		return "ERROR: " + err.Error()
-	}
-	var removed bool
-	if err := json.Unmarshal(out, &removed); err != nil {
-		return "ERROR(json): " + err.Error()
-	}
-	if !removed {
-		return appKey + " (nothing bound)"
-	}
-	return appKey
-}
-
-// revoke writes off a compromised author key (README §12.5): every bundle it signs is
-// refused from here on, and every app it already landed is torn down. Both halves in
-// one call, because either alone leaves a hole — an uninstall the key can undo by
-// publishing again, or a refusal with the compromised code still serving.
-func revoke(authorHex string) string {
-	out, err := callRealm("revoke", 30*time.Second, qc.NewString(authorHex))
-	if err != nil {
-		return "ERROR: " + err.Error()
-	}
-	var gone []string
-	if err := json.Unmarshal(out, &gone); err != nil {
-		return "ERROR(json): " + err.Error()
-	}
-	if len(gone) == 0 {
-		return authorHex + " (no apps of its were loaded)"
-	}
-	return fmt.Sprintf("%s (uninstalled %d app(s): %v)", authorHex, len(gone), gone)
-}
-
-// freshnessStorePath is where the shared loader's bundle-freshness marks are persisted
-// (README §12.4). The marks and the monotonic rule live in JS (bundle.ts FreshnessMarks);
-// Go owns only the path and the atomic write (writeFileAtomic in fs.go). Empty ⇒ purely
-// in-memory, so a fresh process starts with −∞ for every key.
-var freshnessStorePath string
-
 // ───────────────────────── entry ─────────────────────────
 
-// cliArgs is the loader's CLI surface (mirrors host/main.ts). The bundle dir is a
-// positional arg (default: the seedstore bundle) or --bundle.
-type cliArgs struct {
-	bundleDir, dataDir, policyPath, keyPath string
-	listen, wsListen, peers                 string
-	contactSecret                           string
-	put, get, out, appConfig                string
-	revokeKeys, uninstallApps               string
-	requestDeadlineMs                       int
-}
-
-func parseCLI() cliArgs {
-	var a cliArgs
-	flag.StringVar(&a.bundleDir, "bundle", "../../seedstore/WASM/bundle", "bundle directory (also accepted as a positional argument)")
-	flag.StringVar(&a.dataDir, "dir", "./data", "data directory")
-	flag.StringVar(&a.keyPath, "key", "./seedkernel.key", "identity key file")
-	flag.StringVar(&a.policyPath, "policy", "", "policy JSON file: authors allowed to install (default: deny-all — no install lands)")
-	flag.StringVar(&a.listen, "listen", "", "TCP listen address (host:port)")
-	flag.StringVar(&a.wsListen, "ws-listen", "", "WebSocket listen address (host:port)")
-	flag.StringVar(&a.peers, "peers", "", "cohort peers to dial (pk[.secret]@host:port,…)")
-	flag.StringVar(&a.contactSecret, "contact-secret", "", "32-byte hex contact secret callers must produce to reach us (default: open — answer anyone)")
-	flag.StringVar(&a.put, "put", "", "put a file, print its hash, and exit")
-	flag.StringVar(&a.get, "get", "", "get a hash and exit")
-	flag.StringVar(&a.out, "out", "", "output path for --get")
-	flag.StringVar(&a.appConfig, "app-config", "", "app config JSON")
-	flag.StringVar(&a.revokeKeys, "revoke", "", "write off compromised author keys (hex,…): refuse their bundles and uninstall what they landed")
-	flag.StringVar(&a.uninstallApps, "uninstall", "", "uninstall app keys (authorHex:app,…) without revoking the author")
-	flag.IntVar(&a.requestDeadlineMs, "request-deadline", 0, "default per-request deadline in ms (0 = the transport's own default)")
-	flag.Parse()
-	if flag.NArg() > 0 {
-		a.bundleDir = flag.Arg(0)
-	}
-	return a
-}
-
+// main is the whole of this target's startup: stand the engines up, evaluate the one
+// shared bundle, and run the operator flow inside it.
+//
+// There is no CLI here. The flags, their defaults, the order a node does things in and
+// the lines it prints are `host/cli.ts` — the same module the Node shell runs — and Go
+// contributes only the primitives it genuinely owns (argv, files, stdout, sockets, the
+// fs directory, entropy, the engines). It used to be ~300 lines of Go saying what that
+// module already said, and the two drifted: `--contact-secret` came to name a file on
+// one target and the hex itself on the other, and `--guest-timeout`/`--guest-memory`
+// were reachable on neither. Native is an embedding — "run this JS with these host
+// functions" — so the only decision left below is Go's alone: whether to keep the event
+// loop running, which is what `serving` answers.
 func main() {
 	// One P by default: every QuickJS/wasm instruction already runs on the single
 	// event-loop goroutine, so extra Ps serve only the socket goroutines — and cost
@@ -629,109 +505,34 @@ func main() {
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(1)
 	}
-	a := parseCLI()
-	if err := boot(a.dataDir); err != nil {
+	if err := boot(); err != nil {
 		fatal("boot", err)
 		return
 	}
-
-	cfg, err := configFromCLI(a)
+	// runMain resolves once the node is up, the remedies are applied, the bundle is
+	// loaded and any --put/--get has run. Anything the operator got wrong — a bad flag,
+	// an unreadable file, a bundle that will not load — arrives here as an error, and is
+	// fatal for the reason it always was: a script driving the loader must see it rather
+	// than watch a node come up as a silent bundle-less relay.
+	//
+	// No watchdog (timeout 0): the steps that can genuinely hang carry their own
+	// deadlines — a net request settles as unreachable, `ready()` resolves on its own
+	// timer — and an outer cap would only add a way to fail a `--put` that was merely
+	// slow. This is also what the Node shell does, which is the point: an operation
+	// bounded on one target and unbounded on the other is a difference nobody chose.
+	out, err := callRealm("runMain", 0)
 	if err != nil {
-		fatal("config", err)
+		fatal("seedkernel", err)
 		return
 	}
-	st, err := startNode(cfg)
-	if err != nil {
-		fatal("node", err)
+	var st struct{ Serving bool }
+	if err := json.Unmarshal(out, &st); err != nil {
+		fatal("seedkernel", err)
 		return
 	}
-
-	fmt.Printf("seedkernel-loader %s\n", st.PeerID)
-	fmt.Printf("  policy %s\n", orNone(a.policyPath))
-	fmt.Printf("  store  %s (fs.* backend)\n", a.dataDir)
-	fmt.Printf("  cohort %d peer(s)\n", len(cfg.Peers))
-	if st.Port != 0 {
-		fmt.Printf("  tcp    listening on :%d\n", st.Port)
-	}
-	if st.WsPort != 0 {
-		fmt.Printf("  ws     listening on :%d\n", st.WsPort)
-	}
-
-	// Operator remedies (§12.5), applied BEFORE the bundle load: a node told to write
-	// off a key must never briefly install what it was told to refuse. Both persist
-	// through the same atomic seam as the freshness marks, so the decision survives
-	// even if the bundle load below then fails — which it will, and should, when the
-	// revoked key is the one that signed this node's own bundle.
-	for _, authorHex := range splitList(a.revokeKeys) {
-		fmt.Println("  revoke " + revoke(authorHex))
-	}
-	for _, appKey := range splitList(a.uninstallApps) {
-		fmt.Println("  uninstall " + uninstall(appKey))
-	}
-
-	// The signed bundle: verify + install its modules, stand up its guest, and claim the
-	// protocol ids its manifest declares (§12.10) — one act, so there is no second
-	// operator step and no window in which the node is installed but answers nothing.
-	// Every invocation targets a bundle (there is always a --bundle / default dir), so a
-	// load error is fatal: the node has no app to run or serve. Exit non-zero rather than
-	// keep serving as a silent bundle-less relay, which would hide the failure from a
-	// driving script (§12.4).
-	bundleResult := loadBundle(a.bundleDir)
-	fmt.Println("  bundle " + bundleResult)
-	if strings.HasPrefix(bundleResult, "ERROR") {
-		os.Exit(1)
-	}
-
-	// One-shot client ops through the loaded guest — "the shell runs the app" as the
-	// initiator (README §12.8). Arguments/results cross as raw bytes, and every bundle
-	// has a guest to run them (§12.4), so there is no second shape to fall back to.
-	if a.put != "" {
-		data, err := os.ReadFile(a.put)
-		if err != nil {
-			fatal("put", err)
-			return
-		}
-		r, err := runGuest("put", data)
-		if err != nil {
-			fatal("put", err)
-			return
-		}
-		fmt.Printf("  PUT ok: %d B response\n    %s\n", len(r), hex.EncodeToString(r))
-	}
-	if a.get != "" {
-		arg, err := decodeGetArg(a.get)
-		if err != nil {
-			fatal("get", err)
-			return
-		}
-		data, err := runGuest("get", arg)
-		if err != nil {
-			fatal("get", err)
-			return
-		}
-		if a.out != "" {
-			if err := os.WriteFile(a.out, data, 0o644); err != nil {
-				fatal("out", err)
-				return
-			}
-			fmt.Printf("  GET ok: %d B → %s\n", len(data), a.out)
-		} else {
-			os.Stdout.Write(data)
-		}
-	}
-
-	if st.Port == 0 && st.WsPort == 0 {
+	if !st.Serving {
 		return
 	}
-	// A serving node answers for the cohort: inbound requests are routed by protocol id
-	// to whichever installed app is bound to it, and a guest app answers from its own
-	// confined realm — no app-specific host code, and no second dispatch (§12.8, §12.10).
-	if _, err := callRealm("serve", 30*time.Second); err != nil {
-		fatal("serve", err)
-		return
-	}
-	fmt.Println("  serving the app's request side from the confined guest")
-	fmt.Println("serving — Ctrl-C to stop")
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	go func() { <-sig; os.Exit(0) }()
@@ -739,151 +540,10 @@ func main() {
 	el.run()
 }
 
-// ── CLI helpers ──────────────────────────────────────────────────────────────
-
-// parseContactSecret validates the -contact-secret flag: the secret we DEMAND of inbound
-// callers, 32 bytes of hex, or empty for an open node that answers anyone.
-//
-// Checked at STARTUP rather than left to the shell because a wrong contact secret has no
-// runtime symptom. A gated node refuses callers in silence (§12.6.2) — no close, no error
-// — so a typo here produces a node that looks perfectly healthy and is reachable by
-// nobody. Parse time is the only place an operator can still be told.
-func parseContactSecret(hexStr string) (string, error) {
-	if hexStr == "" {
-		return "", nil // absent means open, not "gate on the empty string"
-	}
-	b, err := hex.DecodeString(hexStr)
-	if err != nil || len(b) != 32 {
-		return "", fmt.Errorf("contact-secret: want 32-byte hex, got %q", hexStr)
-	}
-	return hexStr, nil
-}
-
-// configFromCLI turns the parsed flags into the node config the realm boots from,
-// reading the two operator files (the policy and the app config) along the way.
-// Omitting --policy is not "no policy" but deny-all: the shell resolves a null policy
-// to an empty author set, so the node serves and nothing installs — including the
-// bundle below, whose manifest author must be listed too (README §14).
-func configFromCLI(a cliArgs) (nodeConfig, error) {
-	cfg := nodeConfig{Peers: splitList(a.peers), RequestDeadline: a.requestDeadlineMs}
-	if a.policyPath != "" {
-		pj, err := os.ReadFile(a.policyPath)
-		if err != nil {
-			return cfg, fmt.Errorf("policy: %w", err)
-		}
-		s := string(pj)
-		cfg.PolicyJSON = &s
-	}
-	var err error
-	if cfg.ContactSecretHex, err = parseContactSecret(a.contactSecret); err != nil {
-		return cfg, err
-	}
-	if cfg.Listen, err = parseHostPort(a.listen); err != nil {
-		return cfg, fmt.Errorf("listen: %w", err)
-	}
-	if cfg.WsListen, err = parseHostPort(a.wsListen); err != nil {
-		return cfg, fmt.Errorf("ws-listen: %w", err)
-	}
-	if a.appConfig != "" {
-		b, err := os.ReadFile(a.appConfig)
-		if err != nil {
-			return cfg, fmt.Errorf("app-config: %w", err)
-		}
-		if err := json.Unmarshal(b, &cfg.Config); err != nil {
-			return cfg, fmt.Errorf("app-config: %w", err)
-		}
-	}
-	if cfg.KeyHex, err = loadOrMintKey(a.keyPath); err != nil {
-		return cfg, fmt.Errorf("key: %w", err)
-	}
-	return cfg, nil
-}
-
-// fatal reports a startup / one-shot failure and exits non-zero, so a script driving the
-// loader (--put/--get, policy load, identity, network start) sees it. Callers still `return`
-// after for readability; that return is unreachable but harmless.
+// fatal reports a startup failure and exits non-zero, so a script driving the loader
+// sees it. Callers still `return` after for readability; that return is unreachable but
+// harmless.
 func fatal(stage string, err error) {
 	fmt.Println("ERROR: " + stage + ": " + err.Error())
 	os.Exit(1)
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "(none — installs disabled)"
-	}
-	return s
-}
-
-func splitList(s string) []string {
-	var out []string
-	for _, p := range strings.Split(s, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// parseHostPort parses a host:port flag; empty ⇒ nil (not listening on that transport).
-func parseHostPort(s string) (*hostPort, error) {
-	if strings.TrimSpace(s) == "" {
-		return nil, nil
-	}
-	i := strings.LastIndex(s, ":")
-	if i < 0 {
-		return nil, fmt.Errorf("expected host:port, got %q", s)
-	}
-	host := s[:i]
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	port, err := strconv.Atoi(s[i+1:])
-	if err != nil || port < 0 {
-		return nil, fmt.Errorf("bad port in %q", s)
-	}
-	return &hostPort{Host: host, Port: port}, nil
-}
-
-// loadOrMintKey returns the node's 32-byte master seed as hex: read from keyPath if
-// present, else minted from crypto/rand — the same entropy source that backs the
-// realm's randombytes_buf (sodium.go) — and persisted 0600. The seed is the whole
-// secret a node stores: every purpose-bound keypair (channel, guest) is derived from
-// it inside the shared realm at boot (deriveNodeKeys, core/subkeys.ts — the same
-// derivation the JS CLI runs), so Go never holds a derived key or a second format.
-func loadOrMintKey(keyPath string) (string, error) {
-	if b, err := os.ReadFile(keyPath); err == nil {
-		skHex := strings.TrimSpace(string(b))
-		if len(skHex) != 64 {
-			return "", fmt.Errorf("--key must hold a 32-byte master seed (hex), got %d chars", len(skHex))
-		}
-		// Validate here: the JS fromHex maps non-hex pairs to 0, so a corrupt key
-		// file would silently boot the node under a different identity.
-		if _, err := hex.DecodeString(skHex); err != nil {
-			return "", fmt.Errorf("--key %s: %w", keyPath, err)
-		}
-		return skHex, nil
-	}
-	seed := make([]byte, 32)
-	if _, err := crand.Read(seed); err != nil {
-		return "", err
-	}
-	skHex := hex.EncodeToString(seed)
-	if err := os.WriteFile(keyPath, []byte(skHex), 0o600); err != nil {
-		return "", err
-	}
-	return skHex, nil
-}
-
-// decodeGetArg parses a --get argument: colon-joined hex tokens, concatenated into
-// the raw bytes the guest's get entrypoint expects (the shell never decodes meaning).
-func decodeGetArg(s string) ([]byte, error) {
-	var out []byte
-	for _, tok := range strings.Split(s, ":") {
-		b, err := hex.DecodeString(tok)
-		if err != nil {
-			return nil, fmt.Errorf("--get token %q: %w", tok, err)
-		}
-		out = append(out, b...)
-	}
-	return out, nil
 }

@@ -89,10 +89,7 @@ func TestNodeFsNoEscape(t *testing.T) {
 // either. Go still answers from the disk in the call; the wrap that makes that a promise
 // is host/native-shim.ts, and this drives it rather than a copy of it.
 func TestFsExposedToRealm(t *testing.T) {
-	bootRealm(t)
-	if err := exposeFs(qc, t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	bootRealm(t) // opens a store on a fresh temp dir, the way --dir does
 	if _, err := qc.Eval("fs-realm-test.js", qjs.Code(`
 		const enc = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
 		const dec = (b) => { let s = ""; for (const x of b) s += String.fromCharCode(x); return s; };
@@ -120,5 +117,45 @@ func TestFsExposedToRealm(t *testing.T) {
 	const want = "payload-one|null|11|-1|blk1,blk2|0|true|-1|11"
 	if string(got) != want {
 		t.Fatalf("fs realm round trip:\n got %q\nwant %q", string(got), want)
+	}
+}
+
+// A realm whose store has not been opened is CLOSED — not pointed at the process's
+// working directory.
+//
+// `--dir` is the operator's, and Go no longer reads the command line to find it: the
+// shared CLI does, and calls `openStore` on its way to standing a node up. That leaves a
+// window in which `__fs` exists and has no directory, and the honest answer there is an
+// empty store that refuses writes. The failure this pins is the quiet one — a nil
+// backend joining a key to no directory yields the key itself, i.e. blocks scattered
+// into whatever directory the binary was started from.
+func TestFsClosedUntilOpened(t *testing.T) {
+	if err := boot(); err != nil { // deliberately no openStore
+		t.Fatal("boot:", err)
+	}
+	if _, err := qc.Eval("fs-closed-test.js", qjs.Code(`
+		globalThis.__fsClosedProbe = () => {
+			let put = "accepted";
+			try { __fs.put("blk", new Uint8Array([1])); } catch (e) { put = "refused"; }
+			return [
+				__fs.get("blk") === null ? "null" : "notnull",
+				String(__fs.size("blk")),
+				JSON.stringify(__fs.list("")),
+				String(__fs.delete("blk")),
+				String(__fs.stat().used),
+				put,
+			].join("|");
+		};
+	`)); err != nil {
+		t.Fatalf("eval: %v", err)
+	}
+	const want = `null|-1|""|false|0|refused`
+	if got := evalString(t, "__fsClosedProbe()"); got != want {
+		t.Fatalf("closed store:\n got %q\nwant %q", got, want)
+	}
+	// And nothing was written where the process happens to be running.
+	if _, err := os.Stat("blk"); err == nil {
+		os.Remove("blk")
+		t.Fatal("a closed store wrote into the working directory")
 	}
 }
