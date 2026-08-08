@@ -3,12 +3,15 @@
 // (the realm heap cap and the module memory ceiling — see DEFAULT_REALM_MEMORY_BYTES)
 // and the §4.1 scratch default every host's table must agree on.
 //
-// §4.3 names this as a residual: "an installed module can still infinite-loop or declare
-// a huge linear memory and OOM the single-threaded host." The memory half of that cannot
-// be closed *after* instantiation — `new WebAssembly.Instance` allocates the declared
-// initial memory before any export runs, so a module declaring 4 GiB has already taken
-// the host down by the time module-table.ts's scratch validation sees it. The bound has to
-// be read off the bytes first, which is what this file is for.
+// §4.3 leaves two residuals over what an installed module may CONSUME, and this file
+// closes the memory one. It cannot be closed *after* instantiation — `new
+// WebAssembly.Instance` allocates the declared initial memory before any export runs, so
+// a module declaring 4 GiB has already taken the host down by the time module-table.ts's
+// scratch validation sees it. The bound has to be read off the bytes first, which is what
+// this file is for. (The compute residual is the other one, and it is narrower than it
+// reads: a module call is synchronous, so its time is charged to the calling guest's
+// execution budget — what is missing is the ability to INTERRUPT a call that never
+// returns, since the JS platform's WebAssembly offers no fuel or timeout. §12.3.)
 //
 // The JS WebAssembly API exposes no memory limits on a compiled `Module`, so this walks
 // the binary's section headers and reads the limits directly. It is a *bounds read*, not
@@ -49,6 +52,14 @@ export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
  *  the single host thread rather than holding it forever. The shell applies it
  *  when no target overrides; the realm factories use it for a direct caller. */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
+
+/** How many deadlines one guest realm may hold at once (README §12.3). A guest cannot
+ *  create a timer for itself — there is no `setTimeout` in a fresh QuickJS context — so
+ *  every live one is an entry in a host-side table, and an unbounded `timer/arm` loop
+ *  would be a guest spending the host's memory rather than its own heap. Here with the
+ *  other two realm bounds because it is the same kind of number and applied by the same
+ *  code: the shell wires one timer table per realm, so the cap is per realm too. */
+export const DEFAULT_MAX_LIVE_TIMERS = 1 << 16;
 
 /** Default ceiling on a module's declared linear memory. Matches the guest realm's
  *  default heap cap (safe-js.ts), so the two kinds of untrusted code a bundle can ship

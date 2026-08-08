@@ -25,6 +25,8 @@ const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES, GUEST_ABI_VERSION } = await imp("build/host/guest-seam.js");
+const { createSafeRealm } = await imp("build/host/safe-js.js");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
 
@@ -142,7 +144,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
 
 console.log("\n§4.3 — the guest realm has an execution budget");
 {
-  const { createSafeRealm } = await imp("build/host/safe-js.js");
+
   const enc = new TextEncoder();
   const noop = () => new Uint8Array();
 
@@ -280,6 +282,92 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
+}
+
+console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
+{
+  // The catalog calls `timer/*` an app authority (core/domains.ts), so the property under
+  // test is that an ORDINARY app gets one: no transport bundle is mounted anywhere below.
+  // The wiring used to come off the transport driver, which admitted such an app and then
+  // failed it at its first `host.call` — a manifest the loader accepted naming a backend
+  // nothing had wired.
+  const kp = sodium.crypto_sign_keypair();
+  const guestSrc = `
+    let fired = [];
+    const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
+    register("arm", (p) => { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); });
+    register("clear", (p) => { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); });
+    register("timer", (a) => { fired.push(a[3]); return new Uint8Array(0); });
+    register("fired", () => new Uint8Array(fired));
+  `;
+  const guestBytes = new TextEncoder().encode(guestSrc);
+  const mkBlob = (requires) => {
+    const manifest = {
+      app: "ticker", version: 1, modules: [],
+      guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires },
+    };
+    return packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, kp.privateKey, kp.publicKey, manifest),
+      [GUEST_FILE]: guestBytes,
+    });
+  };
+  const newShell = () => createShell({
+    platform: {
+      sodium, identity: kp, table: new ModuleTable(),
+      freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
+    },
+    admit: admitAll,
+  });
+
+  const shell = newShell();
+  await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  await shell.runGuest("arm", new Uint8Array([7, 5]));       // id 7, in 5ms
+  await sleep(80);
+  const fired = await shell.runGuest("fired", new Uint8Array());
+  ok(fired.length === 1 && fired[0] === 7,
+    `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
+
+  // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
+  // it back: the id is the GUEST's throughout, so the host keeps no second name for it.
+  await shell.runGuest("arm", new Uint8Array([9, 5]));
+  await shell.runGuest("arm", new Uint8Array([9, 5]));
+  await shell.runGuest("clear", new Uint8Array([9]));
+  await sleep(80);
+  const after = await shell.runGuest("fired", new Uint8Array());
+  ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
+  shell.close();
+
+  // The gate is still the manifest: a bundle that did not declare `timer/arm` is refused
+  // by NAME at the seam, not handed a table because the shell has one to give.
+  const ungated = newShell();
+  await ungated.loadBundleBlob(mkBlob([]));
+  let refused = false;
+  try { await ungated.runGuest("arm", new Uint8Array([1, 1])); } catch { refused = true; }
+  ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
+  ungated.close();
+
+  // Uninstall CANCELS. A pending setTimeout holds a callback that re-enters the realm, so
+  // one outliving its realm is a call into a freed QuickJS context (§2.1) rather than an
+  // error. Driven through a stub realm, because what has to be observed is the entrypoint
+  // NOT being invoked — which a real realm would report only by crashing, or not at all.
+  let armed = null;
+  const entries = [];
+  const stub = createShell({
+    platform: {
+      sodium, identity: kp, table: new ModuleTable(),
+      freshnessStore: new FreshnessMarks(),
+      createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
+    },
+    admit: admitAll,
+  });
+  await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  await stub.runGuest("arm", new Uint8Array());
+  // Arm through the very seam the realm was handed, then drop the app underneath it.
+  await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
+  ok(stub.uninstall(appKeyFor(kp.publicKey, "ticker")) === true, "the app uninstalls with a deadline still pending");
+  await sleep(80);
+  ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);
+  stub.close();
 }
 
 summary("hardening checks");

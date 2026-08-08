@@ -8,10 +8,12 @@
 // exists, rather than a bespoke byte ABI with a hand-maintained twin in the guest:
 //
 //   guest → host ordinary `host.call` ops (guest-seam.ts). The RAW net capability
-//                  — `link/open, send, close, stat` over an opaque link id — plus
-//                  `TIMER_*` for deadlines and the `transport` domain the slot
-//                  reports its structured output through. Adding one is an op, not
-//                  an action id with a decoder on both sides.
+//                  — `link/open, send, close, stat` over an opaque link id — and the
+//                  `transport` domain the slot reports its structured output through.
+//                  Adding one is an op, not an action id with a decoder on both sides.
+//                  Its deadlines are NOT among them: `timer/*` is an ordinary authority
+//                  any guest may declare, so the table a fired timer comes out of is the
+//                  shell's, per realm (shell-core.ts), not this driver's.
 //   host → guest ordinary entrypoint invocation (`realm.call(name, bytes)`),
 //                  exactly as an app's holder `handle` is invoked. A payload shape
 //                  per entrypoint rather than one tagged union, so there is no
@@ -33,7 +35,7 @@
 // host prefixes and does not read the suffix, so no handshake shape is pinned into
 // the core and the node's key never enters the guest.
 //
-// What the host holds: the channels (by the link id this file mints), the timers, the
+// What the host holds: the channels (by the link id this file mints), the
 // promises of outbound requests (keyed by the corr the host assigns), the address book
 // for dialing, the flood caps (net-limits.ts — the module never declares the number
 // that bounds it, it only learns it at init), and the WHITELIST GATE, which is applied
@@ -43,7 +45,7 @@
 import { toHex, fromHex, writeU32BE, errMessage, enc, dec } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
-import type { RawNet, HostTimers, TransportSink } from "./guest-seam.js";
+import type { RawNet, TransportSink } from "./guest-seam.js";
 import type { SafeRealm } from "./safe-js.js";
 import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
 
@@ -146,12 +148,6 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  own. A caller moving something large, or one that wants to fail fast, passes its own
  *  to `request` rather than moving this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
-
-/** Concurrent deadlines the mounted transport may hold. One per half-open link plus one
- *  per in-flight request is the real demand, so this is headroom over both budgets
- *  rather than a tuning knob — it exists so a wedged occupant cannot grow the host's
- *  timer table without bound. */
-const MAX_LIVE_TIMERS = 1 << 16;
 
 /** Entrypoint-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
  *  length-prefixed blob, in the fixed order the entrypoint declares. There is no tag
@@ -330,7 +326,6 @@ export class TransportHost implements Network, HostTransport {
   private readonly opts: TransportHostOptions;
   private readonly channels = new Map<number, RawLink>;
   private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: number) => void }>;
-  private readonly timers = new Map<number, ReturnType<typeof setTimeout>>;
   private readonly pending = new Map<number, { resolve: (b: Uint8Array) => void; reject: (e: Error) => void }>;
   private readonly addrs = new Map<PeerId, PeerAddr>;
   private readonly connected = new Set<PeerId>;
@@ -464,29 +459,6 @@ export class TransportHost implements Network, HostTransport {
     };
   }
 
-  /** The platform's event loop. A fired timer re-enters the guest on its own turn,
- *  which is what keeps the no-re-entrancy invariant true for `arm`.
- *
- *  The live-timer bound is HERE rather than in the seam, because this map is the
- *  memory being spent — a limit belongs to whoever owns the resource — and because
- *  the seam never learns that a timer fired, so a count kept there would only ever
- *  grow. */
-  timerBackend(): HostTimers {
-    return {
-      arm: (id, ms) => {
-        if (!this.timers.has(id) && this.timers.size >= MAX_LIVE_TIMERS) {
-          throw new Error("transport: too many live timers (cap " + MAX_LIVE_TIMERS + ")");
-        }
-        this.clearTimer(id);
-        this.timers.set(id, setTimeout(() => {
-          this.timers.delete(id);
-          this.enter("timer", new Args().u32(id).build());
-        }, ms));
-      },
-      clear: (id) => this.clearTimer(id),
-    };
-  }
-
   /** Where the mounted transport reports its structured output. Everything policy-shaped
  *  is applied HERE, on what the guest reports, rather than handed to the guest. */
   sink(): TransportSink {
@@ -544,11 +516,6 @@ export class TransportHost implements Network, HostTransport {
         if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason); }
       },
     };
-  }
-
-  private clearTimer(id: number): void {
-    const t = this.timers.get(id);
-    if (t !== undefined) { clearTimeout(t); this.timers.delete(id); }
   }
 
   // ── channels ────────────────────────────────────────────────────────────────
@@ -778,7 +745,7 @@ export class TransportHost implements Network, HostTransport {
 
   // ── lifecycle ───────────────────────────────────────────────────────────────
 
-  /** Tear the driver down. Everything released here is the **host's** — the sockets, the
+  /** Tear the driver down. Everything released here is the **host's** — the sockets and
  *  timers, the outbound promises — and **none of it goes through the occupant**. The host
  *  owns the descriptor for the life of the process (README §1), so a teardown that needed
  *  the occupant's cooperation to release one would be a teardown a wedged occupant could
@@ -791,8 +758,6 @@ export class TransportHost implements Network, HostTransport {
     this.closed = true;
     for (const p of this.pending.values()) p.reject(new Error("transport closed"));
     this.pending.clear();
-    for (const t of this.timers.values()) clearTimeout(t);
-    this.timers.clear();
     if (this.readyWaiter) { clearTimeout(this.readyWaiter.timer); this.readyWaiter.resolve(); this.readyWaiter = null; }
     for (const c of this.channels.values()) {
       try { c.close(false); } catch { /* already gone */ }

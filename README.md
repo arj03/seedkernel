@@ -145,7 +145,7 @@ The reference composition stacks the layers so each depends only on the layers b
 - **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the host and is still an ordinary bundle. Keeping these separate is what stops "it's foundational" from becoming a licence to grow.
 - **Not-core is not the same as replaceable.** The bundle verifier, the guest seam and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
 - The host's dispatch does exactly one thing: resolve the protocol to an app and invoke its guest. No built-in policies, I/O, or dispatch loop beyond the seam it is handed. Lower layers gate higher layers; each layer sees only downward.
-- Untrusted code is **bounded** as well as confined. A WASM module declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **module** CPU, and it is a missing mechanism rather than a decision: WebAssembly engines on the JS platform expose no fuel or timeout to call (§4.3, §14). It is also now one step away from the wire: every inbound frame enters under the guest's execution budget, so a module can only be reached through a guest calling it by name.
+- Untrusted code is **bounded** as well as confined. A WASM module declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **module** CPU, and it is narrower than it sounds: a module call is synchronous, so its time is charged to the calling guest's budget and a module that returns is bounded like any other guest segment. What cannot be interrupted is the call itself — WebAssembly engines on the JS platform expose no fuel or timeout to call, and QuickJS ticks only while running bytecode — so a module that never returns holds the thread (§4.3, §14). It is also one step away from the wire: every inbound frame enters under the guest's execution budget, so a module can only be reached through a guest calling it by name.
 - Modules, as untrusted code, run confined. WASM modules are synchronous pure transforms — a buffer in, a buffer out, and that is the full extent of their interaction. **Every app's logic is its guest** — a confined JS program with zero ambient authority and only the single `host.call` seam, because session state and async interaction have no other home. A module is what the guest delegates a pure transform to, by its bare name over the same `host.call` seam as everything else.
 - Node-to-node links are confidential by default — the transport bundle opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket and WebRTC and needing no external TLS or Noise tunnel.
 - The channel authenticates one hop, not the whole path. An app that **relays** messages through intermediaries cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top. Bundles already work this way, which is why they need no channel at all.
@@ -157,16 +157,16 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
 
-**Shared — compiled once, run by all three targets (2,192 LOC)**
+**Shared — compiled once, run by all three targets (2,205 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 574 |
-| Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
+| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 416 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 347 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 345 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 386 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 179 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 302 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 303 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 
@@ -192,7 +192,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/src/*.js` + `ws.wasm` | 1,237 + 5 KB |
 
-Each target therefore runs 2,192 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,205 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 

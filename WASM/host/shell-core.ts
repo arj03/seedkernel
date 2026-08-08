@@ -19,12 +19,12 @@
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, grantGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall } from "./guest-seam.js";
+import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, privilegeOf, type Privilege } from "../core/domains.js";
-import { fromHex, errMessage } from "../core/util.js";
+import { fromHex, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/net.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
@@ -309,6 +309,10 @@ interface RealmHolder {
   loaded: LoadedBundle;
   realm: SafeRealm | null;
   realmP: Promise<SafeRealm> | null;
+  /** This realm's deadlines. Per SLOT rather than per shell, because a timer is a
+   *  pending re-entry into one particular realm: the cap is then one guest's to
+   *  spend, and disposing that realm is what cancels exactly its own (`disposeSlot`). */
+  timers: RealmTimers;
 }
 
 interface AppSlot extends RealmHolder {
@@ -316,6 +320,56 @@ interface AppSlot extends RealmHolder {
 }
 
 type TransportSlot = RealmHolder;
+
+/** A realm's timer table: the platform's event loop, handed to a guest that has none.
+ *
+ *  Everything here is the HOST's memory — a fresh QuickJS context has no `setTimeout`,
+ *  so an armed deadline is an entry in this map and nothing in the guest's heap. Two
+ *  consequences, and they are the whole of the type:
+ *
+ *  - the live count is **capped**, because a limit protecting a resource belongs to
+ *    whoever owns the resource, and an unbounded `timer/arm` loop is otherwise a guest
+ *    spending host memory it is not charged for;
+ *  - `clearAll` is **not** optional at teardown. A pending `setTimeout` holds a callback
+ *    that re-enters the realm, so a timer surviving its realm's disposal is a call into
+ *    a freed QuickJS context (§2.1) — the one failure mode that is a crash rather than
+ *    an error. Every disposal site goes through `disposeSlot` for that reason.
+ *
+ *  `id` is the guest's own throughout: the host keeps no name of its own for a deadline,
+ *  so an arm on a live id re-arms it and `clear` is idempotent. */
+interface RealmTimers extends HostTimers {
+  /** Cancel every live deadline. Called only from `disposeSlot`, before the realm goes. */
+  clearAll(): void;
+}
+
+/** A timer table over `fire`, which is what a fired deadline re-enters the realm with.
+ *  The table is the resource being spent, so the cap lives here rather than in the seam:
+ *  the seam never learns that a timer fired, so a count kept there would only ever grow. */
+function createRealmTimers(fire: (id: number) => void, max = DEFAULT_MAX_LIVE_TIMERS): RealmTimers {
+    const live = new Map<number, ReturnType<typeof setTimeout>>();
+    const clear = (id: number) => {
+        const t = live.get(id);
+        if (t !== undefined) { clearTimeout(t); live.delete(id); }
+    };
+    return {
+        arm(id, ms) {
+            // Counted before the re-arm, so replacing a live deadline is always allowed
+            // and only a NEW id can be the one over the line.
+            if (!live.has(id) && live.size >= max)
+                throw new Error(`guest: too many live timers (cap ${max})`);
+            clear(id);
+            // Dropped from the table BEFORE the realm is re-entered, so a guest that
+            // re-arms the same id from inside its own `timer` entrypoint arms the new
+            // deadline rather than having it cleared out from under it on the way out.
+            live.set(id, setTimeout(() => { live.delete(id); fire(id); }, ms));
+        },
+        clear,
+        clearAll() {
+            for (const t of live.values()) clearTimeout(t);
+            live.clear();
+        },
+    };
+}
 
 // ── the fs key rule, applied once (core/fs.ts `isSafeFsKey`) ─────────────────
 //
@@ -445,6 +499,40 @@ export function createShell(opts: CreateShellOptions & {
             throw new Error("shell: multiple apps loaded — supply appKey");
         return [...apps.values()][0];
     };
+    /** An empty slot for `loaded`, with its timer table already pointed at the realm
+     *  the slot does not have yet.
+     *
+     *  The knot — the table fires into the realm, the realm's seam is wired to the
+     *  table — is tied by the closure reading `holder.realm` at FIRE time rather than
+     *  capturing it now. That is not a trick to make the cycle compile: it is the
+     *  correct reading either way, because the realm a deadline must re-enter is the
+     *  one standing when it fires, and a transport handover replaces that realm while
+     *  the slot stays. A timer only exists because a guest armed it, so there is always
+     *  a realm by then; `?.` covers the disposal race rather than a cold start. */
+    const newHolder = (loaded: LoadedBundle): RealmHolder => {
+        let holder: RealmHolder;
+        const timers = createRealmTimers((id) => {
+            const args = new Uint8Array(4);
+            writeU32BE(args, 0, id);
+            // A guest that arms a deadline without registering `timer` is refused by its
+            // own realm, and an app's `timer` may legitimately throw. Neither is the
+            // shell's failure and neither has a caller to reject: the arming call
+            // returned turns ago. Reported, so it is not silent, and swallowed.
+            void holder.realm?.call("timer", args).catch((err: unknown) => {
+                console.error(`[shell] guest error in timer: ${errMessage(err)}`);
+            });
+        });
+        holder = { loaded, realm: null, realmP: null, timers };
+        return holder;
+    };
+    /** Release a slot: cancel its deadlines, THEN dispose its realm. Every teardown
+     *  path goes through this — uninstall, revoke, close, a transport handover — because
+     *  the other order leaves a `setTimeout` holding a callback into a freed QuickJS
+     *  context, which is a crash rather than an error (§2.1). */
+    const disposeSlot = (slot: RealmHolder | null | undefined) => {
+        slot?.timers.clearAll();
+        slot?.realm?.dispose();
+    };
     /** The confined realm for `slot`, created lazily on first use through the
      *  platform's factory. Both roles share it and both reach it the same way — the
      *  initiator (`runGuest`) and the holder (`dispatch`) each `realm.call`, and the
@@ -461,7 +549,7 @@ export function createShell(opts: CreateShellOptions & {
         if (!slot.realmP) {
             slot.realmP = platform.createRealm({
                 source: guestFullSource(slot.loaded),
-                hostCall: seamFor(slot.loaded, null),
+                hostCall: seamFor(slot, null),
                 memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
                 deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
             }).then((r) => { slot.realm = r; return r; },
@@ -474,11 +562,17 @@ export function createShell(opts: CreateShellOptions & {
      *  may reach (`grants`), and what this APP installed (`modules`).
      *
      *  `driver` is passed ONLY for the mounted transport bundle, and is what puts the
-     *  three grants no app holds into that realm's set: the raw net capability (sockets),
-     *  the platform's timers, and the sink the mount reports its structured output
-     *  through. Nothing else can reach a descriptor, at any point in the process's life,
-     *  because nothing else is ever handed one (README §1, capability-by-non-wiring). */
-    const seamFor = (b: LoadedBundle, driver: TransportHost | null) => {
+     *  two grants no app holds into that realm's set: the raw net capability (sockets)
+     *  and the sink the mount reports its structured output through. Nothing else can
+     *  reach a descriptor, at any point in the process's life, because nothing else is
+     *  ever handed one (README §1, capability-by-non-wiring).
+     *
+     *  Timers are NOT among them, and the asymmetry is the point: a deadline is an
+     *  ordinary authority in the catalog (`timer/*` is `"app"`, core/domains.ts), so
+     *  every realm gets its own table and the transport is simply the first guest that
+     *  happened to want one. */
+    const seamFor = (slot: RealmHolder, driver: TransportHost | null) => {
+        const b = slot.loaded;
         const appKey = appKeyFor(b.author, b.manifest.app);
         return createGuestSeam({
             platform: {
@@ -516,7 +610,10 @@ export function createShell(opts: CreateShellOptions & {
                 fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
                 transport: netHost ?? undefined,
                 rawNet: driver?.rawNet(),
-                timers: driver?.timerBackend(),
+                // This realm's own table, wired for the same reason `fs` is: unconditionally,
+                // because `names` already refuses `timer/*` for a bundle that did not declare
+                // it, and a second test here would decide one grant in two places.
+                timers: slot.timers,
                 transportSink: driver?.sink(),
             },
             // Bound to THIS app's key, so a bare `host.call` name addresses its own module
@@ -560,8 +657,9 @@ export function createShell(opts: CreateShellOptions & {
      *  losing the transport it already had. */
     const standTransport = async (slot: TransportSlot) => {
         // The driver is built BEFORE the realm and attached after, because the realm's
-        // seam resolves the slot's ops here: the guest reaches sockets, timers and the
-        // sink through the ordinary seam, so the object serving them has to exist first.
+        // seam resolves the slot's ops here: the guest reaches sockets and the sink
+        // through the ordinary seam, so the object serving them has to exist first.
+        // (Its timers do not come from here — they are the slot's, like any guest's.)
         // `attach` is what sends the one config turn.
         const driver = new TransportHost({
             identity: platform.identity,
@@ -583,7 +681,7 @@ export function createShell(opts: CreateShellOptions & {
         // `realmP` so nothing later mistakes an occupied slot for an empty one.
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
-            hostCall: seamFor(slot.loaded, driver),
+            hostCall: seamFor(slot, driver),
             memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
@@ -614,7 +712,7 @@ export function createShell(opts: CreateShellOptions & {
         const incoming = await standTransport(slot);
         if (outgoing) {
             outgoing.close();
-            transportSlot?.realm?.dispose();
+            disposeSlot(transportSlot);
         }
         netHost = incoming;
         if (state)
@@ -647,7 +745,7 @@ export function createShell(opts: CreateShellOptions & {
         if (transportKey === appKey) {
             netHost?.close();
             netHost = null;
-            transportSlot?.realm?.dispose();
+            disposeSlot(transportSlot);
             transportSlot = null;
             transportKey = null;
             return true;
@@ -655,7 +753,7 @@ export function createShell(opts: CreateShellOptions & {
         const slot = apps.get(appKey);
         const removed = host.removeApp(appKey);
         if (slot) {
-            slot.realm?.dispose();
+            disposeSlot(slot);
             apps.delete(appKey);
             // After the delete, so the app that just went cannot be re-projected — and so
             // whatever it was shadowing takes the protocol back.
@@ -759,7 +857,7 @@ export function createShell(opts: CreateShellOptions & {
             // keeps both the transport it had and the author key `revoke` needs to find
             // what that key landed.
             if (isMount) {
-                const slot: TransportSlot = { loaded, realm: null, realmP: null };
+                const slot: TransportSlot = newHolder(loaded);
                 await installTransport(slot);
                 transportSlot = slot;
                 transportKey = key;
@@ -770,7 +868,10 @@ export function createShell(opts: CreateShellOptions & {
             // `entryFor` closes over the slot, so the slot is built first and its entry
             // attached immediately — nothing can observe the placeholder between the two
             // statements, since neither yields.
-            const slot: AppSlot = { loaded, realm: null, realmP: null, entry: () => null };
+            // Extended in place rather than spread into a new object: the holder's timer
+            // table reads `slot.realm` off the object `newHolder` returned, so a copy
+            // would leave every deadline firing into a slot that never gets a realm.
+            const slot: AppSlot = Object.assign(newHolder(loaded), { entry: (() => null) as AppEntry });
             slot.entry = entryFor(slot);
             apps.set(key, slot);
             // The load admits the code AND claims the manifest's protocols (§12.10) — one
@@ -837,11 +938,11 @@ export function createShell(opts: CreateShellOptions & {
             netHost = null;
             const dispose = () => {
                 for (const slot of apps.values()) {
-                    slot.realm?.dispose();
+                    disposeSlot(slot);
                 }
                 apps.clear();
                 routes.clear();
-                transportSlot?.realm?.dispose();
+                disposeSlot(transportSlot);
                 transportSlot = null;
                 transportKey = null;
             };
