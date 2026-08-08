@@ -155,7 +155,7 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which: `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content.
 
-The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
+The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
 
 **Shared — compiled once, run by all three targets (2,171 LOC)**
 
