@@ -184,7 +184,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,344 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,121 Go + 390 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (391), the Go binding, and `native-polyfills.ts` (93), the Web globals QuickJS lacks, both TypeScript and both riding in the shared bundle | 2,047 Go + 484 TS |
 
 **Signed content — not host code at all**
 

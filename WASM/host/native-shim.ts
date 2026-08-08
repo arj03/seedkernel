@@ -61,6 +61,10 @@ declare const bridge: {
   /** One console line on the real stdout. QuickJS's own `console.log` writes to a WASI
    *  stdout wazero leaves disconnected, so operator output cannot go through it. */
   log(line: string): void;
+  /** One diagnostic line on stderr — where every `console.*` in this realm goes
+   *  (host/native-polyfills.ts), so that a diagnostic can never land in the middle of
+   *  the operator's stdout. */
+  logErr(line: string): void;
   /** Raw bytes on stdout — `--get` with no `--out` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
   createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;

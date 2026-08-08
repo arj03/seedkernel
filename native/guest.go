@@ -180,7 +180,13 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		g.close()
 		return nil, err
 	}
-	installPolyfills(g.qc)
+	// The Web globals quickjs-ng does not provide (TextEncoder/TextDecoder, atob, the
+	// microtask queue). Fetched from the host realm like the driver below rather than
+	// held here as a Go string, so both realms polyfill from ONE text
+	// (host/native-polyfills.ts). First, because everything after it may use them.
+	if _, err := g.qc.Eval("polyfills.js", qjs.Code(hostFnString(hostQc, "nativePolyfills"))); err != nil {
+		return fail(fmt.Errorf("polyfills: %w", err))
+	}
 	// The driver's __start wrapper is fetched from the host realm like the guest
 	// preamble below (native-shim.ts `guestDriver`) — the same shape as safe-js.ts's
 	// internals, so it is shared TS rather than a Go string TypeScript never saw.

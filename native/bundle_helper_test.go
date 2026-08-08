@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"seedloader/qjs"
 )
 
 // forwarderWasm is a minimal, valid pure-transform WASM module
@@ -27,22 +29,62 @@ import (
 //go:embed testdata/forwarder.wasm
 var forwarderWasm []byte
 
-// Manifest signing constants, mirroring domains.ts. The domain prefixes are disjoint from
-// every other prefix in the family (§16.1), which is what stops one signature from being
-// replayed as another over the same bytes — and, for the author prefix, what stops a
-// derived id from ever also being something someone signed.
-const (
-	domainManifest       = "seedkernel-manifest-sig-v1\x00"
-	domainManifestAuthor = "seedkernel-manifest-author-v1\x00"
-	suiteManifestGenesis = 0x01
-	suiteManifestHybrid  = 0x02
-	// The guest seam version these test bundles are written against, mirroring
-	// GUEST_ABI_VERSION in core/domains.ts. A manifest declaring anything else is refused
-	// by the shared loader, which is the point of the field (§12.2) — so a bump lands
-	// here too, and a stale native test fails loudly rather than running a guest against
-	// a seam that moved.
-	guestABIVersion = 3
-)
+// The manifest signing vocabulary — the domain prefixes, the suite bytes and the guest
+// ABI version these test bundles are written against. READ OUT OF THE SHARED BUNDLE
+// (core/domains.ts, published on the realm's global by build:loader-bundles), not
+// restated here.
+//
+// This is the line between the two kinds of test-side duplication in this file.
+// `packBundle` below is a deliberate second *implementation* of the container writer, in
+// another language, fed to the shared reader: a drift between them is what it is there
+// to catch. A constant has no such second implementation to disagree with — a copy of
+// one is a value that can only ever be right or stale, and a stale one silently stops
+// testing what it names. The domain prefixes are disjoint from every other prefix in the
+// family (§16.1), which is what stops one signature from being replayed as another over
+// the same bytes; the ABI version is the field the shared loader refuses a mismatch on
+// (§12.2). Both are the shell's to define, so both are asked of it.
+type manifestVocab struct {
+	Manifest string `json:"manifest"` // DOMAIN_MANIFEST, hex
+	Author   string `json:"author"`   // DOMAIN_MANIFEST_AUTHOR, hex
+	Genesis  int    `json:"genesis"`  // SUITE_MANIFEST_GENESIS
+	Hybrid   int    `json:"hybrid"`   // SUITE_MANIFEST_HYBRID_PQ
+	ABI      int    `json:"abi"`      // GUEST_ABI_VERSION
+}
+
+// vocab reads that vocabulary from the booted realm. Cached: the values are the shared
+// bundle's constants, so they cannot differ between two boots in one process.
+var vocabCache *manifestVocab
+
+func vocab() manifestVocab {
+	if vocabCache == nil {
+		var v manifestVocab
+		out := realmString(`JSON.stringify({
+			manifest: toHex(DOMAIN_MANIFEST), author: toHex(DOMAIN_MANIFEST_AUTHOR),
+			genesis: SUITE_MANIFEST_GENESIS, hybrid: SUITE_MANIFEST_HYBRID_PQ,
+			abi: GUEST_ABI_VERSION })`)
+		if err := json.Unmarshal([]byte(out), &v); err != nil {
+			panic("vocab: " + err.Error())
+		}
+		vocabCache = &v
+	}
+	return *vocabCache
+}
+
+// domainManifest and domainManifestAuthor are those two prefixes as the bytes a signer
+// prepends. Byte slices rather than strings because that is what the realm hands back.
+func domainManifest() []byte       { return hexBytes(vocab().Manifest) }
+func domainManifestAuthor() []byte { return hexBytes(vocab().Author) }
+func suiteManifestGenesis() byte   { return byte(vocab().Genesis) }
+func suiteManifestHybrid() byte    { return byte(vocab().Hybrid) }
+func guestABIVersion() int         { return vocab().ABI }
+
+func hexBytes(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic("hexBytes: " + err.Error())
+	}
+	return b
+}
 
 // testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).
 // Fresh per test so bundle-freshness marks (keyed by author+app) never collide.
@@ -75,15 +117,34 @@ func packBundle(files [][2]any) []byte {
 	return out
 }
 
-// appKeyFor is the §5.1 app-key derivation, mirroring bundle.ts, so a test can predict
-// which table entry a bundle's modules land under. Test-side only: the native host
-// derives no key in production — the shared JS loader hands it the finished one.
+// appKeyFor asks the realm for the §5.1 app key, so a test can predict which table entry
+// a bundle's modules land under. The shared `appKeyFor` (bundle.ts) itself, not a Go
+// restatement of it: the derivation is the loader's, and a test that computed its own
+// would agree with the table by coincidence and keep agreeing after the derivation moved.
 // The author leads the key, which is what makes ownership structural: two authors
 // shipping the same app name never collide, so nothing has to arbitrate between them.
 // A module is then addressed by the LOGICAL name from its manifest, inside that app's
 // map — there is no third component encoded into anything.
 func appKeyFor(author []byte, app string) string {
-	return hex.EncodeToString(author) + ":" + app
+	return realmString("appKeyFor(fromHex(" + jsonString(hex.EncodeToString(author)) + "), " +
+		jsonString(app) + ")")
+}
+
+// realmString evaluates an expression in the booted host realm and returns it as a
+// string — `evalString`'s twin for the helpers below, which have no `testing.TB` in hand
+// and are called from too many places to thread one through. A failure here is a broken
+// harness rather than a failed assertion, so it panics: the realm is up (every caller
+// runs after a boot) and the expression is a constant.
+func realmString(expr string) string {
+	if qc == nil {
+		panic("realmString: the realm has not booted")
+	}
+	v, err := qc.Eval("<realmString>", qjs.Code(expr))
+	if err != nil {
+		panic("realmString(" + expr + "): " + err.Error())
+	}
+	defer v.Free()
+	return v.String()
 }
 
 // The stub guest every test bundle that does not exercise the guest declares: every
@@ -120,10 +181,10 @@ func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app strin
 	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
 	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
 	// that tells it the field widths and then checks a signature committing to that same
-	// byte (§14.1). suiteManifestGenesis mirrors SUITE_MANIFEST_GENESIS in domains.ts.
-	preimage := append(append([]byte(domainManifest), suiteManifestGenesis), mjson...)
+	// byte (§14.1). The suite byte is the shell's SUITE_MANIFEST_GENESIS, asked of it.
+	preimage := append(append(domainManifest(), suiteManifestGenesis()), mjson...)
 	sig := ed25519.Sign(priv, preimage)
-	menv := append(append(append([]byte{suiteManifestGenesis}, pub...), sig...), mjson...)
+	menv := append(append(append([]byte{suiteManifestGenesis()}, pub...), sig...), mjson...)
 
 	return writeBundleFile(t, app, menv, guestSrc), appKeyFor(pub, app)
 }
@@ -142,7 +203,7 @@ func claimManifest(t *testing.T, app string, protocols ...string) []byte {
 		}},
 		"guest": map[string]any{
 			"hash":     hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
-			"abi":      guestABIVersion,
+			"abi":      guestABIVersion(),
 			"requires": []string{},
 		},
 	})
@@ -206,7 +267,7 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, requir
 		}},
 		Guest: guest{
 			Hash:     hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
-			Abi:      guestABIVersion,
+			Abi:      guestABIVersion(),
 			Requires: requires,
 		},
 	}

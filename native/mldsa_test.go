@@ -227,7 +227,7 @@ const (
 // ml_dsa_pk). Derived here rather than read back from the loader — a test that asked the
 // loader for the id would agree with the loader by construction.
 func hybridAuthorID(edPub, mlPk []byte) []byte {
-	pre := append([]byte(domainManifestAuthor), suiteManifestHybrid)
+	pre := append(domainManifestAuthor(), suiteManifestHybrid())
 	pre = append(append(pre, edPub...), mlPk...)
 	return sd.genericHash(32, pre)
 }
@@ -239,10 +239,10 @@ func hybridAuthorID(edPub, mlPk []byte) []byte {
 // here rather than in a deployment.
 func hybridEnvelope(t *testing.T, s *mldsaSigner, a hybridKeys, mjson []byte) []byte {
 	t.Helper()
-	pre := append([]byte(domainManifest), suiteManifestHybrid)
+	pre := append(domainManifest(), suiteManifestHybrid())
 	pre = append(append(append(pre, a.edPub...), a.mlPk...), mjson...)
 
-	menv := append([]byte{suiteManifestHybrid}, a.edPub...)
+	menv := append([]byte{suiteManifestHybrid()}, a.edPub...)
 	menv = append(append(menv, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
 	return append(append(menv, s.signDetached(t, pre, a.mlSk)...), mjson...)
 }

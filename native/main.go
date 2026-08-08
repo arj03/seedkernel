@@ -283,8 +283,10 @@ func boot() error {
 	el = newEventLoop(qc)
 	// The shared bundle is evaluated LAST: everything below it is a primitive it
 	// declares (host/native-shim.ts), and its module scope reaches for some of them
-	// (TextEncoder at load time, the ws codec backend) straight away.
-	installPolyfills(qc)
+	// (the console sink, the ws codec backend) straight away. The Web globals it also
+	// reaches for at load time (a TextEncoder for the DOMAIN constants) come from its
+	// own first module, host/native-polyfills.ts — which is why nothing installs them
+	// from here.
 	exposeSodium(qc, sd)
 	exposeFs(qc)
 	nh := exposeNet(qc, el)
@@ -420,6 +422,14 @@ func exposeBridge(qc *qjs.Context) {
 		// The realm's own console.log writes to a WASI stdout wazero leaves
 		// disconnected, so operator output has to come back out through here.
 		fmt.Println(argString(t, 0))
+		return t.Context().NewUndefined(), nil
+	}))
+	b.SetPropertyStr("logErr", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		// Diagnostics — every `console.*` in the host realm (host/native-polyfills.ts).
+		// Stderr rather than stdout on purpose: stdout is the operator's channel, and
+		// `--get` with no `--out` writes an app's raw response bytes there, which a
+		// diagnostic line interleaved into it would corrupt.
+		fmt.Fprintln(os.Stderr, argString(t, 0))
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("stdout", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {

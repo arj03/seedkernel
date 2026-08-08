@@ -181,8 +181,8 @@ func (el *eventLoop) install() {
 		return nil, nil
 	}))
 	// queueMicrotask is not installed here: it is not loop state but a missing Web
-	// global, so it lives with the rest of them in polyfill.go — one polyfill per
-	// global, installed on every realm the same way.
+	// global, so it lives with the rest of them in host/native-polyfills.ts — one
+	// polyfill per global, installed on every realm the same way.
 }
 
 // post hands a closure to the loop goroutine. Safe to call from any goroutine.

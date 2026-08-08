@@ -72,12 +72,14 @@ const sharedRows = [
       files: [...sharedSet].filter((f) => f.startsWith("WASM/core/")) },
 ];
 
-// `native-shim.ts` and `transport-bundle.ts` ride in the shared bundle but are counted
-// elsewhere and on purpose: the shim is the Go binding (a per-target row), and
+// `native-shim.ts`, `native-polyfills.ts` and `transport-bundle.ts` ride in the shared
+// bundle but are counted elsewhere and on purpose: the first two are the Go target's own
+// (a per-target row) — the binding and the Web globals only that target lacks — and
 // transport-bundle.ts is one line holding the signed blob's base64, which is content,
 // not host code. Named here so the reconciliation below can tell "counted elsewhere"
 // apart from "counted nowhere".
-const countedElsewhere = ["WASM/host/native-shim.ts", "WASM/host/transport-bundle.ts"];
+const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
+const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
 
 /** Per-target JS: every non-test TS under core/ and host/ that the shared bundle does
  *  not compile in. Derived rather than listed, so a new backend counts itself. */
@@ -91,13 +93,15 @@ const goFiles = readdirSync(resolve(repoDir, "native"))
     .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
     .map((f) => `native/${f}`);
 
-const shimLoc = loc("WASM/host/native-shim.ts");
+// The Native row's TS side is `nativeTs` (above): both files of the Go target's own
+// code ride in the shared bundle, so a third such file extends `nativeTs`, and the
+// row's numbers follow from it — one list, not a list plus a row.
 const rows = [
     ...sharedRows.map((r) => ({ ...r, n: sum(r.files), render: cell })),
     { find: /\*\*JS\*\* \(browser \+ Node\)/, n: sum(jsFiles),
       render: (n) => `| ${fmt(n)} TS |` },
     { find: /\*\*Native\*\* \(Go\)/, n: sum(goFiles),
-      render: (n) => `| ${fmt(n)} Go + ${fmt(shimLoc)} TS |` },
+      render: (n) => `| ${fmt(n)} Go + ${fmt(sum(nativeTs))} TS |` },
     { find: /`transport\/guest\.js` \+ `ws\.wasm`/, n: loc("WASM/transport/guest.js"),
       render: (n) => `| ${fmt(n)} + 5 KB |` },
 ];
@@ -133,6 +137,32 @@ for (const row of rows) {
     }
 }
 readme = lines.join("\n");
+
+// The Native row's prose gives each of its TS files its own figure, the style the
+// three moved-in strings already had (`native-shim.ts` (N)). Checked here like the
+// cells above — an inline figure drifts just as easily as a cell, and one already
+// did (the `(335)` a row used to carry) without anything noticing.
+const inlineChecks = [
+    { file: "WASM/host/native-shim.ts", re: /native-shim\.ts` \((\d+)\)/ },
+    { file: "WASM/host/native-polyfills.ts", re: /native-polyfills\.ts` \((\d+)\)/ },
+];
+for (const { file, re } of inlineChecks) {
+    const base = file.split("/").pop();
+    const m = readme.match(re);
+    if (!m) {
+        console.error(`  MISSING  no README count matches ${base}`);
+        drift++;
+        continue;
+    }
+    const want = loc(file);
+    if (Number(m[1]) === want) {
+        console.log(`  ok       ${String(want).padStart(5)}  ${base}`);
+    } else {
+        drift++;
+        console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(want).padStart(5)}  ${base}   README says (${m[1]})`);
+        readme = readme.replace(re, `${base}\` (${want})`);
+    }
+}
 
 // The two prose totals, which have to agree with the shared rows above. Both are
 // checked, not just the heading: they are the same claim stated twice, 30 lines apart,
