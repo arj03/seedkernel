@@ -10,7 +10,7 @@
 // It carries no crypto shape. The `TransportCrypto` interface that used to sit here
 // described "the narrow libsodium surface the channel handshake needs", and the channel
 // handshake is now the transport bundle's program, which reaches crypto through the
-// cap-bridge's `crypto/` prefix (`CapSodium`, cap-bridge.ts) like any other guest. A
+// the guest seam's `crypto/` prefix (`CapSodium`, guest-seam.ts) like any other guest. A
 // second, parallel declaration of the host's crypto surface had stopped describing
 // anything: the native shim already refuses the keyed `crypto_generichash` that
 // interface promised, and nothing noticed, because nothing called it.

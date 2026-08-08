@@ -212,7 +212,7 @@ from being wrong, and being wrong is silent: signatures still verify, just for m
 than intended. A single omitted or mismatched prefix on a signing path turns that signer
 into an oracle for every other purpose sharing the key.
 
-Key separation is a property of the **keys**. The cap-bridge `node/sign` name cannot emit a
+Key separation is a property of the **keys**. The guest seam's `node/sign` name cannot emit a
 channel handshake signature because it does not hold the channel key, whatever happens to
 the prefixes.
 

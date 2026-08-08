@@ -1,6 +1,6 @@
 // The platform-neutral shell core — the §12.9 "move one level up". Everything that
 // standing a node up involves EXCEPT the parts that genuinely vary by target lives
-// here: the module table's owner, the cap-bridge wiring, the preamble assembly, the
+// here: the module table's owner, the guest-seam wiring, the preamble assembly, the
 // realm's lifecycle, the bundle load order, the transport slot, and the inbound
 // dispatch. A target supplies the platform seam — { sodium, identity, table, fs?,
 // freshnessStore, channels?, listen?, wsListen?, createRealm } — exactly like the
@@ -17,9 +17,9 @@
 // installWasmModule is not public API on the Shell and there is no raw-bind path — the
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
-import { denyAll } from "./policy.js";
+import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createCapBridge, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
+import { createGuestSeam, appSignScope, transportSignScope, type CapSodium } from "./guest-seam.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -31,7 +31,7 @@ import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
- *  (BundleCrypto) plus the cap-bridge crypto ops (CapSodium). Any sumo libsodium
+ *  (BundleCrypto) plus the guest seam's crypto ops (CapSodium). Any sumo libsodium
  *  build satisfies both. */
 export type ShellSodium = BundleCrypto & CapSodium;
 
@@ -98,7 +98,7 @@ export interface ModuleTableBackend extends BundleHost, ModuleLookup {
  *  throws by name rather than resolving to a pretend store (§12.2). `createRealm` is
  *  REQUIRED: every app is a guest (§12.4), so a shell that cannot run a guest cannot
  *  host an app. `livePeers` feeds the net/peers name — the transport owns connectivity,
- *  the shell just passes the closure through to the cap-bridge.
+ *  the shell just passes the closure through to the guest seam.
  *
  *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
  *  seam (`channels`, `listen`/`wsListen`, the network key and contact secret) and the
@@ -108,7 +108,7 @@ export interface ShellPlatform {
     sodium: ShellSodium;
     /** The CHANNEL keypair — its public half is this node's peer id. */
     identity: Keypair;
-    /** The GUEST signing keypair (§12.9), a sibling subkey. The cap-bridge SIGN op uses
+    /** The GUEST signing keypair (§12.9), a sibling subkey. The seam's SIGN op uses
      *  this and nothing else, so a guest can never elicit a channel signature. Defaults to
      *  `identity` for hosts that supply a single keypair. */
     guestIdentity?: Keypair;
@@ -149,24 +149,18 @@ export interface ShellPlatform {
     admitPeer?: (pk: Uint8Array) => boolean;
 }
 
-/** Interactive admission callback. Runs after verifyBundle proves authenticity
- *  and integrity, before installBundle lands the modules. Return `true` to admit,
- *  `false` or throw to reject. When omitted, deny-all — nothing is admitted.
- *  This is the browser's consent seam (§12.4): the shell verifies the bundle,
- *  shows the author + manifest to the user, and only installs once the user
- *  says yes. */
-export type AdmitCallback = (v: VerifiedBundle) => boolean | Promise<boolean>;
-
 export interface CreateShellOptions {
-    /** Interactive consent callback (§12.4 browser path). Runs between verify and
-     *  install. When absent, deny-all — nothing is admitted. A file-backed author
-     *  allowlist, a consent dialog, and "the bundle my operator handed me" are
-     *  three constructors of the same predicate type (§12.5). */
-    admit?: AdmitCallback;
-    /** Admission callback for the explicitly mounted transport. This is separate from
-     *  app admission because mounting a bundle grants raw links and channel identity
-     *  signing; the manifest itself makes no such claim. */
-    admitTransport?: AdmitCallback;
+    /** The operator's admission predicate (§12.5) — ONE `Admit`, asked once per load,
+     *  between verify and install. `ctx.role` says whether this bundle is landing as an
+     *  app or as the node's transport mount, so a deployment that answers the two
+     *  differently composes `byRole({ app, mount })`; `policyFromJson` already does.
+     *  Absent ⇒ deny-all, nothing is admitted.
+     *
+     *  A file-backed author allowlist, a consent dialog, and "the bundle my operator
+     *  handed me" are three constructors of this one type. The host's own gates —
+     *  revocation and the downgrade guard — are composed AROUND whatever is passed here
+     *  (`hostGates`), so no posture supplied by an operator can be a way to lose them. */
+    admit?: Admit;
     /** How long one net request may take before it settles as unreachable, in ms, for
      *  a caller that names no deadline of its own (§12.6). Omitted ⇒ the transport's
      *  `DEFAULT_REQUEST_DEADLINE_MS`. A deployment-wide fallback, not a policy — the
@@ -226,7 +220,7 @@ export interface Shell {
      *  integrity-check + install the modules, and return the guest source. This is
      *  the §12.4 load order — the ONE install path, for apps and for the transport
      *  alike. A bundle naming the mount-only names (§12.5) is governed by the
-     *  transport half of the policy and mounted as this shell's transport instead of
+     *  `mount` half of the policy and mounted as this shell's transport instead of
      *  bound as an app; replacing a standing transport is a staged handover, where the
      *  incoming guest stands before the outgoing driver is closed and links reconnect
      *  under the new guest. */
@@ -250,7 +244,7 @@ export interface Shell {
      *  names and a fresh mark (§5.1) — not an un-revoke. */
     revoke(authorHex: string): string[];
     /** Run one of a loaded bundle's guest entrypoints through a generic
-     *  cap-bridge over the host's primitives. `appKey` defaults to the
+     *  guest seam over the host's primitives. `appKey` defaults to the
      *  only loaded app; throws when more than one is loaded and no key is
      *  given. */
     runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
@@ -273,10 +267,10 @@ export interface Shell {
 // reach them from the same module it gets createShell from. ModuleTable rides along
 // for the same reason: the JS platforms all hand it in as their `table`, and a
 // re-export keeps that a one-line seam rather than a second import.
-export { denyAll, admitAll, authorAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, byRole, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext, type AdmissionRole } from "./policy.js";
 export { ModuleTable } from "./module-table.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
- *  re-implementing the module table, cap-bridge wiring, preamble assembly, realm
+ *  re-implementing the module table, guest-seam wiring, preamble assembly, realm
  *  creation, and transport routing. */
 /** An app's ONE inbound entrypoint (§12.10): the authenticated `senderPk ‖ payload`
  *  in, the response bytes out, or null for "this app answers nothing". Every app is a
@@ -401,8 +395,11 @@ export function createShell(opts: CreateShellOptions & {
     // checked is the composite key the medium actually sees.
     const fs = platform.fs ? validatedFs(platform.fs) : undefined;
     const host = platform.table;
-    const admit = opts.admit ?? denyAll;
-    const admitTransport = opts.admitTransport ?? denyAll;
+    // THE admission predicate — one function, asked once per load (§12.5). The host's own
+    // invariants come first and are composed here rather than by the operator: an
+    // `admitAll` posture, or a consent dialog that always says yes, must not be a way to
+    // lose revocation or the downgrade guard.
+    const admit: Admit = allOf(hostGates, opts.admit ?? denyAll);
     const peerId = toHex(platform.identity.publicKey);
     const apps = new Map<string, AppSlot>();
     /** protocol id → app key (§12.10) — a PROJECTION of what is installed, never a
@@ -451,7 +448,7 @@ export function createShell(opts: CreateShellOptions & {
         if (!slot.realmP) {
             slot.realmP = platform.createRealm({
                 source: guestFullSource(slot.loaded),
-                bridge: buildBridge(slot.loaded, null),
+                bridge: seamFor(slot.loaded, null),
                 memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
                 deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
             }).then((r) => { slot.realm = r; return r; },
@@ -459,54 +456,62 @@ export function createShell(opts: CreateShellOptions & {
         }
         return slot.realmP;
     };
-    /** The bridge for one admitted bundle. `driver` is passed ONLY for the mounted
-     *  transport bundle, and is what wires the three seams no app holds: the
-     *  raw net capability (sockets), the platform's timers, and the sink the mount
-     *  reports its structured output through. Nothing else can reach a descriptor, at
-     *  any point in the process's life, because nothing else is ever handed one
-     *  (README §1, capability-by-non-wiring). */
-    const buildBridge = (b: LoadedBundle, driver: TransportHost | null) => {
-        const names = new Set(b.manifest.guest.requires);
+    /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
+     *  as the three things that own it: what this NODE is (`platform`), what this REALM
+     *  may reach (`grants`), and what this APP installed (`modules`).
+     *
+     *  `driver` is passed ONLY for the mounted transport bundle, and is what puts the
+     *  three grants no app holds into that realm's set: the raw net capability (sockets),
+     *  the platform's timers, and the sink the mount reports its structured output
+     *  through. Nothing else can reach a descriptor, at any point in the process's life,
+     *  because nothing else is ever handed one (README §1, capability-by-non-wiring). */
+    const seamFor = (b: LoadedBundle, driver: TransportHost | null) => {
         const appKey = appKeyFor(b.author, b.manifest.app);
-        return createCapBridge({
-            rawNet: driver?.rawNet(),
-            timers: driver?.timerBackend(),
-            transportSink: driver?.sink(),
-            sodium: platform.sodium,
-            identity: platform.guestIdentity ?? platform.identity,
+        return createGuestSeam({
+            platform: {
+                sodium: platform.sodium,
+                identity: platform.guestIdentity ?? platform.identity,
+                peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
+                now: platform.now ?? (() => Date.now()),
+            },
+            grants: {
+                // The declared requires ARE the gate — a `host.call` resolves iff the name
+                // itself is one of these (`crypto/*` and the bundle's own bare module names
+                // exempt: never grants — a fixed catalog and the app's own code). The
+                // vocabulary was checked at load (verifyManifest).
+                names: new Set(b.manifest.guest.requires),
+                // What SIGN signs under — and what VERIFY checks against — is chosen HERE,
+                // by the slot the bundle occupies, the one place that knows it (§12.2). The
+                // transport slot signs handshake transcripts under DOMAIN_channel with the
+                // node's channel key; every ordinary app signs under DOMAIN_guest with the
+                // guest subkey, in its own bundle's scope. The seam prefixes and never
+                // parses, so neither can produce the other's signature and no op signs raw
+                // bytes.
+                signScope: driver
+                    ? transportSignScope(platform.identity, platform.networkKey)
+                    : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
+                // Scoped to this app key, so `fs` grants reach over this app's own keyspace
+                // and not the node's (fs.ts). Two admitted apps can no longer read,
+                // enumerate or delete each other's data, which brings `fs` into line with
+                // the structural ownership module names already have (§5.1).
+                //
+                // Wired whenever the node has an fs at all, without consulting the manifest:
+                // `names` refuses every `fs/*` name the bundle did not declare, so a second
+                // test here would be the same grant decided in two places — and the one
+                // that reads a prefix off a name, which is exactly what the name catalog
+                // exists to stop.
+                fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
+                transport: netHost ?? undefined,
+                rawNet: driver?.rawNet(),
+                timers: driver?.timerBackend(),
+                transportSink: driver?.sink(),
+            },
             // Bound to THIS app's key, so a bare `host.call` name addresses its own module
             // map by logical name and has no way to name another app's (§12.2).
-            callModule: (name, p) => host.callModule(appKey, name, p),
-            hasModule: (name) => host.isBound(appKey, name),
-            transport: netHost ?? undefined,
-            peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
-            // Scoped to this app key, so `fs` grants reach over this app's own keyspace and
-            // not the node's (fs.ts). Two admitted apps can no longer read, enumerate or
-            // delete each other's data, which brings `fs` into line with the structural
-            // ownership module names already have (§5.1).
-            //
-            // Wired whenever the node has an fs at all, without consulting the manifest:
-            // the gate below refuses every `fs/*` name the bundle did not declare, so a
-            // second test here would be the same grant decided in two places — and the
-            // one that reads a prefix off a name, which is exactly what the name catalog
-            // exists to stop.
-            fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
-            now: platform.now ?? (() => Date.now()),
-            // The declared requires ARE the bridge's gate — a `host.call` resolves iff
-            // the name itself is one of these (`crypto/*` and the bundle's own bare module
-            // names exempt: never grants — a fixed catalog and the app's own code). The
-            // vocabulary was checked at load (verifyManifest).
-            allowedNames: names,
-            // What SIGN signs under — and what VERIFY checks against — is chosen HERE, by
-            // the slot the bundle occupies, the one place that knows it (§12.2). The
-            // transport slot signs handshake transcripts under DOMAIN_channel with the
-            // node's channel key; every ordinary app signs under DOMAIN_guest with the
-            // guest subkey, in its own bundle's scope. The bridge prefixes and never
-            // parses, so neither can produce the other's signature and no op signs raw
-            // bytes.
-            signScope: driver
-                ? transportSignScope(platform.identity, platform.networkKey)
-                : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
+            modules: {
+                call: (name, p) => host.callModule(appKey, name, p),
+                has: (name) => host.isBound(appKey, name),
+            },
         });
     };
     const guestFullSource = (b: LoadedBundle) => `const APP = ${JSON.stringify({ ...(b.manifest.guest.config ?? {}), ...(opts.config ?? {}) })};\n`
@@ -565,7 +570,7 @@ export function createShell(opts: CreateShellOptions & {
         // `realmP` so nothing later mistakes an occupied slot for an empty one.
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
-            bridge: buildBridge(slot.loaded, driver),
+            bridge: seamFor(slot.loaded, driver),
             memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
@@ -698,7 +703,7 @@ export function createShell(opts: CreateShellOptions & {
             //
             // An author cannot climb into the mount by declaring them, which is the
             // property the whole split exists for: adding `link/open` moves a bundle onto
-            // the STRICTER predicate (`admitTransport`), never the looser one. The dispatch
+            // the STRICTER branch (`ctx.role === "mount"`), never the looser one. The dispatch
             // is safe in the only direction it can be pushed.
             const groups = mountGroups(v.manifest);
             const isMount = groups.length > 0;
@@ -718,20 +723,21 @@ export function createShell(opts: CreateShellOptions & {
             if (isMount && (v.manifest.protocols?.length ?? 0) > 0) {
                 throw new Error(`shell: a transport claims no protocol ids; ${v.manifest.app} claims ${v.manifest.protocols!.join(", ")} — a mount receives no dispatch (§12.10)`);
             }
-            // Revocation before `admit`, not just inside installBundle. The predicate is
-            // where an interactive shell puts its consent dialog (§12.4), so asking it
-            // first would show a user the author and metadata of a bundle this host has
-            // already decided to refuse, take their approval, and only then fail. A written-
-            // off key should never reach the prompt. The check in installBundle stays as the
-            // backstop for callers that reach it another way.
-            if (platform.freshnessStore.isRevoked(v.author)) {
-                throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
-            }
-            // The two admission CLASSES (§12.5). Admitting an app risks that app; admitting
-            // a transport risks the channel, which sees all plaintext and holds the session
-            // keys — so an author trusted for apps is not thereby trusted for the mount,
-            // and the policy answers the two separately.
-            if (!(await (isMount ? admitTransport : admit)(v)))
+            // ADMISSION — one predicate, one call, one answer (§12.5). Everything a gate
+            // used to read for itself is read here, once, and handed in: the class this
+            // bundle is landing as, the persisted `(author, app)` high-water mark, and
+            // whether this host has written the author key off. The predicate is then a
+            // pure function of `(bundle, context)`, which is what removed the ordering
+            // this sequence used to have to get right — revocation before the consent
+            // dialog (a written-off key must never reach a prompt), the downgrade guard
+            // after the operator's yes but before anything landed. Composition (`allOf`,
+            // `byRole`) says all of that once, at construction.
+            const ctx: AdmissionContext = {
+                role: isMount ? "mount" : "app",
+                highWater: platform.freshnessStore.get(v.author, v.manifest.app),
+                revoked: platform.freshnessStore.isRevoked(v.author),
+            };
+            if (!(await admit(v, ctx)))
                 throw new Error(ADMISSION_REJECTED);
             // A transport's load is not done when its modules bind — it is done when its
             // DRIVER stands, below — so its mark is deferred (`deferMark`) and advanced

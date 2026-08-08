@@ -24,7 +24,7 @@ const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packB
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createCapBridge, UNRESTRICTED_NAMES, GUEST_ABI_VERSION } = await imp("build/host/cap-bridge.js");
+const { createGuestSeam, UNRESTRICTED_NAMES, GUEST_ABI_VERSION } = await imp("build/host/guest-seam.js");
 
 const { ok, throws, summary } = testkit();
 
@@ -110,32 +110,34 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
 {
   const identity = sodium.crypto_sign_keypair();
   const base = {
-    sodium, identity, callModule: () => null, hasModule: () => false,
-    transport: { request: async () => new Uint8Array() },
-    peers: () => [], fs: new MemoryFs(),
+    platform: { sodium, identity, peers: () => [] },
+    grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs() },
+    modules: { call: () => null, has: () => false },
   };
-  throws(() => createCapBridge({ ...base }), "omitting allowedNames throws at construction");
-  ok(typeof createCapBridge({ ...base, allowedNames: UNRESTRICTED_NAMES }) === "function",
+  throws(() => createGuestSeam({ ...base }), "omitting grants.names throws at construction");
+  ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: UNRESTRICTED_NAMES } }) === "function",
     "naming the sentinel is accepted");
 
   // A guest reaches its own app's modules with NO grant at all: a bare name is a
   // primitive — the asking bundle's own code, scoped structurally by the app key the
-  // bridge was built with — so it resolves under an empty requires set, exactly like
+  // seam was wired with — so it resolves under an empty requires set, exactly like
   // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
   const chat = new ModuleTable();
   chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
   chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
-  const scoped = createCapBridge({
+  const scoped = createGuestSeam({
     ...base,
-    callModule: (n, p) => chat.callModule("aa:chat", n, p),
-    hasModule: (n) => chat.isBound("aa:chat", n),
-    allowedNames: [],
+    grants: { ...base.grants, names: [] },
+    modules: {
+      call: (n, p) => chat.callModule("aa:chat", n, p),
+      has: (n) => chat.isBound("aa:chat", n),
+    },
   });
   // The forwarder echoes its input, so a resolved module answers with the body; a name
   // this app never installed is refused like any other unknown name in the catalog.
   ok(scoped("codec", new Uint8Array([7, 7, 7])).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
-    "another app's module name reaches nothing through this bridge");
+    "another app's module name reaches nothing through this seam");
 }
 
 console.log("\n§4.3 — the guest realm has an execution budget");

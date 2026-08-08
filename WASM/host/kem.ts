@@ -1,6 +1,6 @@
 // kem.ts — ML-KEM-768 (FIPS 203) for the primitive catalog (§12.2, §14.1), driven
 // from browser/mlkem768.wasm and exposed under `sodium`-shaped method names so it
-// mixes straight into the object the cap-bridge already consumes, exactly as pq.ts
+// mixes straight into the object the guest seam already consumes, exactly as pq.ts
 // does for ML-DSA-65.
 //
 // **Host code, not core**, on the same grounds as pq.ts: this is the JS targets'
@@ -25,7 +25,7 @@
 // the cheapest way not to discover that in production is not to have two.
 //
 // **Nothing here draws entropy.** Every operation takes its coins as an argument,
-// because a catalog entry is a pure function of its argument bytes (cap-bridge.ts):
+// because a catalog entry is a pure function of its argument bytes (guest-seam.ts):
 // a guest gets randomness from `node/random`, an authority it was granted, and hands it
 // in — the same shape as an ephemeral X25519 pair being `node/random(32)` plus
 // `x25519/dh`. Keeping the grant out of the primitive is what makes the primitive
@@ -74,7 +74,7 @@ interface MlKemExports {
 
 /** Instantiate mlkem768.wasm. Async because browsers refuse synchronous
  *  compilation of anything over 4 KB on the main thread — but only the *load* is
- *  async: every operation below is synchronous, which is what lets the cap-bridge's
+ *  async: every operation below is synchronous, which is what lets the seam's
  *  `crypto/` prefix stay a synchronous byte transform. */
 export async function loadMlKem768(wasm: BufferSource): Promise<MlKem768> {
   const { instance } = await WebAssembly.instantiate(wasm, {});

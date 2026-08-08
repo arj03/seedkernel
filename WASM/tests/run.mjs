@@ -34,8 +34,8 @@ const sodium = await loadCrypto();
 // hands it out with its address; a single value here just means every test node is
 // reachable by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createCapBridge, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION }
-  = await imp("build/host/cap-bridge.js");
+const { createGuestSeam, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION }
+  = await imp("build/host/guest-seam.js");
 // ws.wasm through the same 4-op ABI the transport bundle drives it over — the codec
 // itself is the bundle's now, so what is reachable from here is the module.
 const { MemoryFs } = await imp("build/host/fs-memory.js");
@@ -50,7 +50,7 @@ import { bytesEqual } from "./bytes.mjs";
 const { appKeyFor, genesisHash: bundleGenesisHash,
          signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
-const { policyFromJson, authorAllowlist } = await imp("build/host/policy.js");
+const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 const { withMlKem768, loadMlKem768 } = await imp("build/host/kem.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
@@ -62,15 +62,21 @@ const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
 
+/** The admission context a bundle with no history lands under: an ordinary app, never
+ *  loaded here before, from a key nobody has written off. The shell reads these off its
+ *  freshness store; a test composing the load by hand states them. */
+const APP_CTX = { role: "app", highWater: -Infinity, revoked: false };
+const MOUNT_CTX = { ...APP_CTX, role: "mount" };
+
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own ModuleTable without a shell. */
 // The two halves of a load with the admission seam between them (§12.4). `admit` may
 // answer with a Promise — a composed policy does — so this awaits it: reading an
 // unawaited Promise as a verdict is fail-OPEN, which is the one way this seam must never
 // be wrong.
-async function loadBundle(host, blob, admit) {
+async function loadBundle(host, blob, admit, ctx = APP_CTX) {
   const v = verifyBundle(sodium, blob);
-  if (!(await admit(v))) throw new Error("admit rejected");
+  if (!(await admit(v, ctx))) throw new Error("admit rejected");
   return installBundle(host, v);
 }
 
@@ -108,7 +114,7 @@ const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.w
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 // And ML-KEM-768, the catalog primitive the same seam mixes in (kem.ts): a manifest is
 // checked against PRIMITIVE_NAMES, so the methods behind those names have to be on the
-// object every target hands the cap-bridge.
+// object every target hands the guest seam.
 withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm"))));
 
 // Install one verified module as the whole of `appKey`'s module set. Bundles are the only
@@ -146,7 +152,7 @@ async function testFullLifecycle() {
 
   // Reach it by name: the host stages input at the module's scratch, calls handle, and
   // reads the response back (README §4). A guest reaches the same module through the
-  // cap-bridge by its bare name (§12.2), against the app key its bridge holds; here the host
+  // guest seam by its bare name (§12.2), against the app key its seam holds; here the host
   // calls it directly.
   const text = new TextEncoder().encode("hello from author");
   const resp = host.callModule(chatKey, "chat", text);
@@ -214,7 +220,7 @@ async function testDenyAllPolicyRejects() {
   // `policyFromJson(null)` is the boot default every target shares: a predicate
   // that returns false for every bundle. The absence of a decision is never permission.
   const admit = policyFromJson(null);
-  assert(!admit.apps({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }),
+  assert(!admit({ author: new Uint8Array(32), manifest: { app: "x", version: 1, modules: [] }, modules: [], guestSource: "" }, APP_CTX),
     "deny-all predicate returns false for any VerifiedBundle");
 
   const { host } = await makeHost();
@@ -226,7 +232,7 @@ async function testDenyAllPolicyRejects() {
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   let threw = false;
-  try { await loadBundle(host, blob, admit.apps); } catch { threw = true; }
+  try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a deny-all admit predicate prevents install");
 
   console.log("  OK\n");
@@ -320,7 +326,7 @@ async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
   const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
-  const { admitAll, denyAll } = await imp("build/host/policy.js");
+  const { admitAll, denyAll, byRole } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
   const other = generateKeyPair();
@@ -340,7 +346,7 @@ async function testManifestClaimIsTheRouting() {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit: admitAll, admitTransport: denyAll,
+    admit: byRole({ app: admitAll, mount: denyAll }),
   });
   try {
     const key = appKey(author.publicKey, "store");
@@ -571,11 +577,11 @@ async function testFsKeyRule() {
 // Fan-out is no longer a host op: with real promises at the seam, a confined guest
 // scatters a DISTINCT request per peer itself with Promise.all over net/send and
 // gathers the responses. This is what NET_SEND_MANY used to do host-side. We drive
-// it through the cap-bridge's single-peer net/send name, concurrently, from an async
+// it through the seam's single-peer net/send name, concurrently, from an async
 // safe-js realm — proving the round trips genuinely overlap in one realm.
 
 async function testCapBridge() {
-  console.log("Test: cap-bridge — generic primitive capabilities, no app vocabulary (step 7)");
+  console.log("Test: guest seam — generic primitive capabilities, no app vocabulary (step 7)");
 
   const id = generateKeyPair();
   const otherKey = generateKeyPair();
@@ -594,14 +600,15 @@ async function testCapBridge() {
   // namespace (README §12.2); a real node derives it from the manifest's (author, app).
   const signScope = appSignScope(id, id.publicKey, "testapp");
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
-  const bridge = createCapBridge({
-    sodium, identity: id,
+  const bridge = createGuestSeam({
+    platform: { sodium, identity: id, peers: () => [toHex(id.publicKey)] },
+    grants: { names: UNRESTRICTED_NAMES, signScope, fs, transport },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
-    callModule: (name, p) => host.callModule(testKey, name, p),
-    hasModule: (name) => host.isBound(testKey, name),
-    transport, peers: () => [toHex(id.publicKey)], fs, signScope,
-    allowedNames: UNRESTRICTED_NAMES,
+    modules: {
+      call: (name, p) => host.callModule(testKey, name, p),
+      has: (name) => host.isBound(testKey, name),
+    },
   });
   const U = (...xs) => new Uint8Array(xs);
 
@@ -737,7 +744,7 @@ async function testPolicy() {
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { await loadBundle(host, blob, mount ? admit.transport : admit.apps); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit, mount ? MOUNT_CTX : APP_CTX); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -807,7 +814,7 @@ async function testRequiresPickTheAdmissionClass() {
   console.log("Test: guest.requires decides which admission class a bundle answers to");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
-  const { admitAll, denyAll } = await imp("build/host/policy.js");
+  const { admitAll, denyAll, byRole } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
   const blobWithRequires = (requires) => packBundle({
@@ -819,12 +826,14 @@ async function testRequiresPickTheAdmissionClass() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
-  const mkTestShell = (admit, admitTransport) => mkShell({
+  // ONE predicate, with the class as an argument to it (`byRole`) rather than as a choice
+  // between two predicates the runtime holds — which is what the shell now asks once.
+  const mkTestShell = (app, mount) => mkShell({
     platform: {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit, admitTransport,
+    admit: byRole({ app, mount }),
   });
   const load = async (shell, requires) => {
     try { await shell.loadBundleBlob(blobWithRequires(requires)); return null; }
@@ -953,8 +962,18 @@ async function testSlotFreshness() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
-  const land = (host, freshness, author, version) => {
-    installBundle(host, verifyBundle(sodium, blobFrom(author, version)), freshness);
+  // The load path as the shell composes it: the host's own gates read the store into an
+  // `AdmissionContext` and answer once (`freshVersion`), then installBundle lands the
+  // modules and advances the mark. The predicate never touches the store, which is what
+  // makes "who refuses a downgrade" a single place.
+  const land = async (host, freshness, author, version) => {
+    const v = verifyBundle(sodium, blobFrom(author, version));
+    await hostGates(v, {
+      role: "mount",
+      highWater: freshness.get(v.author, v.manifest.app),
+      revoked: freshness.isRevoked(v.author),
+    });
+    installBundle(host, v, freshness);
   };
 
   // Versions are an author's own lineage, mount or no mount. A's v5 landing does NOT bind
@@ -964,9 +983,9 @@ async function testSlotFreshness() {
   {
     const freshness = new FreshnessMarks();
     const host = new ModuleTable();
-    land(host, freshness, a, 5);
+    await land(host, freshness, a, 5);
     assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a transport advances its (author, app) mark");
-    land(host, freshness, b, 1);
+    await land(host, freshness, b, 1);
     assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's transport answers to its own lineage");
   }
 
@@ -975,9 +994,9 @@ async function testSlotFreshness() {
   {
     const freshness = new FreshnessMarks();
     const host = new ModuleTable();
-    land(host, freshness, a, 5);
+    await land(host, freshness, a, 5);
     let refused = false;
-    try { land(host, freshness, a, 4); } catch { refused = true; }
+    try { await land(host, freshness, a, 4); } catch { refused = true; }
     assert(refused, "an author's own stale transport is still refused as a downgrade");
   }
 
@@ -1464,14 +1483,14 @@ async function testRealmSerialization() {
 // ─── sender-bound responses, WS fragmentation, redial after failure ──────
 
 async function testCapBridgeEnforcement() {
-  console.log("Test: cap-bridge enforces the manifest's declared requires + allocation caps");
+  console.log("Test: the guest seam enforces the manifest's declared requires + allocation caps");
 
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
-  const mk = (allowedNames) => createCapBridge({
-    sodium, identity: id, callModule: () => null, hasModule: () => false,
-    transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedNames,
+  const mk = (names) => createGuestSeam({
+    platform: { sodium, identity: id, peers: () => [] },
+    grants: { names, transport: stubTransport, fs: new MemoryFs() },
+    modules: { call: () => null, has: () => false },
   });
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
@@ -1514,11 +1533,11 @@ async function testCapBridgeEnforcement() {
   assert(threw, "declaring a bare prefix grants no name — requires are exact");
 
   // guest-controlled allocation caps. UNRESTRICTED_NAMES is the host-side caller that
-  // opts out of gating *by name* — omitting allowedNames entirely now throws (§12.2).
+  // opts out of gating *by name* — omitting grants.names entirely now throws (§12.2).
   const open = mk(UNRESTRICTED_NAMES);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
-  assert(omitted, "omitting allowedNames throws rather than granting every name");
+  assert(omitted, "omitting grants.names throws rather than granting every name");
   assertEqual((await open("node/random", U(0, 0, 4, 0))).length, 1024, "node/random under the cap works");
   threw = false;
   try { await open("node/random", U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
@@ -1526,11 +1545,14 @@ async function testCapBridgeEnforcement() {
 
   // requires → names: a bundle declares the EXACT names and the bridge enforces them
   // as exact-membership checks.
-  const nodeOnly = createCapBridge({
-    sodium, identity: id, callModule: () => null, hasModule: () => false,
-    transport: stubTransport, peers: () => [], fs: new MemoryFs(),
-    allowedNames: ["node/sign"],
-    signScope: appSignScope(id, new Uint8Array(32), "probe"),
+  const nodeOnly = createGuestSeam({
+    platform: { sodium, identity: id, peers: () => [] },
+    grants: {
+      names: ["node/sign"],
+      signScope: appSignScope(id, new Uint8Array(32), "probe"),
+      transport: stubTransport, fs: new MemoryFs(),
+    },
+    modules: { call: () => null, has: () => false },
   });
   assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign is granted by its declared name");
   assertEqual((await nodeOnly("crypto/blake2b-256", U(1, 2))).length, 32,
@@ -1568,7 +1590,7 @@ async function testCallModuleGuards() {
     "callModule returns null for an app that installed nothing");
 
   // An installed module is reached by name. A confined guest reaches the same module
-  // through the cap-bridge by its bare name (§12.2).
+  // through the guest seam by its bare name (§12.2).
   installMod(host, guards, "echo", forwarderBytes);
   const r = host.callModule(guards, "echo", new Uint8Array([5]));
   assertEqual([...r], [5], "callModule reaches an installed module");
@@ -1810,7 +1832,7 @@ async function testMlKemAcvpVectors() {
   }
 
   // Wrong-width arguments are the same rejection as a malformed key, never a throw: the
-  // cap-bridge turns `null` into a leading zero byte, and there is no second channel for
+  // the seam turns `null` into a leading zero byte, and there is no second channel for
   // a structural failure to come back through.
   assertEqual(kem.ml_kem768_encaps(new Uint8Array(10), new Uint8Array(32)), null,
     "a wrong-width encapsulation key is null, not a throw");
@@ -1961,12 +1983,12 @@ async function testPolicyManifestSuite() {
     authors: [toHex(classical.author), toHex(hybrid.author)],
     manifestSuites: [2],
   }));
-  assert(await pqOnly.apps(hybrid) === true, "a hybrid-signed bundle is admitted");
-  assert(await pqOnly.apps(classical) === false, "an Ed25519-only bundle from a trusted author is refused");
+  assert(await pqOnly(hybrid, APP_CTX) === true, "a hybrid-signed bundle is admitted");
+  assert(await pqOnly(classical, APP_CTX) === false, "an Ed25519-only bundle from a trusted author is refused");
 
   // Absent, the field constrains nothing — an existing policy file keeps its meaning.
   const anySuite = policyFromJson(JSON.stringify({ authors: [toHex(classical.author)] }));
-  assert(await anySuite.apps(classical) === true, "a policy without manifestSuites admits any suite");
+  assert(await anySuite(classical, APP_CTX) === true, "a policy without manifestSuites admits any suite");
 
   // Strict parsing, like every other field: a typo fails the boot loudly.
   for (const bad of [{ manifestSuites: 2 }, { manifestSuites: [] }, { manifestSuites: ["2"] }]) {

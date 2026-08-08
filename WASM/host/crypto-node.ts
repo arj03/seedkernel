@@ -34,7 +34,7 @@ const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sum
 // Mixed in once here, at the target's one crypto seam, so "does this host accept
 // manifest suite 0x02" has exactly one answer, set in one place.
 // ML-KEM-768 rides on the same object for the same reason, but answers to a different
-// consumer: it is a `PRIMITIVE_NAMES` entry (domains.ts), so the cap-bridge dispatches
+// consumer: it is a `PRIMITIVE_NAMES` entry (domains.ts), so the guest seam dispatches
 // `ml-kem-768/*` straight to `sodium.ml_kem768_*`. A catalog name this target advertises
 // at load and then cannot serve at call time is the worst of both — the manifest check
 // passes and the guest fails mid-run — so the two PQ modules are mixed in together, on

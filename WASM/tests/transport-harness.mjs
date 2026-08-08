@@ -70,8 +70,7 @@ export async function makeTransportHost(opts = {}) {
       connsPerPeer: opts.connsPerPeer,
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: policy.apps,
-    admitTransport: policy.transport,
+    admit: policy,
     requestDeadlineMs: opts.requestDeadlineMs,
     transportHalfOpen: opts.transportHalfOpen,
   });

@@ -4,7 +4,7 @@
 // capabilities the guest holds.
 // The shell verifies the manifest signature, governs it against its policy (author +
 // module hashes), and installs the modules; the guest's `requires` describe the seam it is
-// wired over, honored by the generic cap bridge (README §12.2).
+// wired over, honored by the generic guest seam (README §12.2).
 //
 // The FORMAT here is application-neutral; seedstore fills in storage content
 // (its build-bundle script). A bundle is ONE blob — the container below — holding:
@@ -83,7 +83,7 @@ export interface BundleGuest {
      *  who meant the old one. There is nothing to infer here, so the format asks. */
     abi: number;
     /** EXACTLY the authorities this guest is granted (`AUTHORITY_CALLS`, core/domains.ts):
-     *  `node/sign`, `fs/get`, `net/send`, … — each name enforced at the bridge by exact
+     *  `node/sign`, `fs/get`, `net/send`, … — each name enforced at the seam by exact
      *  match, so a guest reaches what its bundle declared and nothing beside it. Required
      *  whenever a guest exists; an empty array is a guest with no authority at all, which
      *  is the common case and reads as one.
@@ -361,7 +361,7 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
  *  it is. The app path refuses a manifest for which this is non-empty; the mount path
  *  requires EVERY group in `MOUNT_GROUPS`. Two different questions, one derivation from
  *  the catalog, so neither can drift from the other or from the vocabulary — the same
- *  argument that keeps the catalog in domains.ts and out of cap-bridge.ts.
+ *  argument that keeps the catalog in domains.ts and out of guest-seam.ts.
  *
  *  Not folded into `verifyManifest`: this is not a well-formedness question. The same
  *  manifest is legitimate at one admission point and refused at the other, so the
@@ -957,14 +957,18 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     }
     return result;
 }
-/** Land a verified bundle (README §12.4 steps 3, 4b): enforce version freshness,
- *  then instantiate every verified module (pure, no table effect) and bind them all
- *  atomically. If any module fails to instantiate the whole load fails — a half-landed
- *  bundle is exactly the incoherent state the manifest exists to prevent.
+/** Land a verified bundle (README §12.4 steps 4b, 5b): instantiate every verified module
+ *  (pure, no table effect), bind them all atomically, and advance the `(author, app)`
+ *  freshness mark. If any module fails to instantiate the whole load fails — a
+ *  half-landed bundle is exactly the incoherent state the manifest exists to prevent.
  *
- *  Admission (§12.5) runs BEFORE this function, between verifyBundle and installBundle.
- *  By the time a bundle reaches here the decision is already settled — this function
- *  only handles mechanics (freshness + instantiate + bind), not governance.
+ *  Admission (§12.5) runs BEFORE this function, between verifyBundle and installBundle,
+ *  as the ONE predicate (policy.ts `Admit`) — which is where revocation and the version
+ *  floor now live, reading the same store this function writes. By the time a bundle
+ *  reaches here every decision is settled: this function is mechanics only (instantiate,
+ *  bind, mark), and the store it takes is a place to WRITE rather than a second gate.
+ *  Splitting it that way is what removed the "policy said yes but freshness said no"
+ *  interleaving — there is one answer, from one call, before anything lands.
  *
  *  There is no per-module admission callback: the manifest's `modules[].hash` commits to
  *  exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
@@ -976,42 +980,16 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  built from the guest source can fail there, and the node then keeps the transport
  *  it had — so advancing the mark inside would raise the (author, app) mark before that
  *  was known, bricking a rollback to the last good version
- *  (the exact outcome the downgrade refusals above exist to prevent). The caller
+ *  (the exact outcome `freshVersion` exists to prevent). The caller
  *  passes `deferMark` for the transport mount and advances at the point the load is
  *  complete (§12.4: "the mark must record the highest version that actually loaded"). */
 export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): LoadedBundle {
-    // Freshness (README §12.4 step 3): the `version` is an enforced monotonic integer
-    // (verifyManifest already shape-checked it). Refuse a load below the persisted
-    // `(author, app)` high-water mark as a downgrade — nothing lands — otherwise advance
-    // the mark. Equal versions reload (an ordinary reboot re-reads the same bundle);
-    // the mark is never rewound.
+    // The `version` is an enforced monotonic integer (verifyManifest shape-checked it);
+    // whether THIS one may land was already answered by the admission predicate, which
+    // read this same store's mark and revocation set as `AdmissionContext` (policy.ts
+    // `freshVersion`, `notRevoked`). Nothing re-asks here — the store below is written,
+    // never consulted.
     const version = v.manifest.version;
-    if (freshness) {
-        // Revocation (§12.5) before freshness. A stolen key satisfies freshness trivially
-        // — it signs `version + 1` — so this is the check that has anything to say about
-        // it, and it must speak first or the load succeeds. It sits HERE rather than in
-        // the admission predicate (§12.5) because a predicate is a pure function of the
-        // bundle and every target writes its own: `admitAll` would silently have no
-        // revocation, and an OFFER-delivered bundle (§11) is exactly the path that needs
-        // one. One check on the one install path covers every target.
-        if (freshness.isRevoked(v.author)) {
-            throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${version}`);
-        }
-        const highWater = freshness.get(v.author, v.manifest.app);
-        if (version < highWater) {
-            throw new Error(`bundle: version ${version} is below the (author, app) freshness high-water mark ${highWater} — downgrade refused`);
-        }
-        // The mounted transport is checked no differently: versions are an author's own
-        // lineage, so the transport carries the ordinary `(author, app)` mark and nothing
-        // second keyed to the mount. A floor keyed to it would bind every author of the
-        // mount to one shared version line — B could not replace A's v5 without numbering
-        // above it, a sequence with no owner — and it would buy protection only where an
-        // attacker chooses which signed bundle arrives. Nothing delivers a bundle but the
-        // operator (§12.4), so the answer to "two trusted authors, one stale" is to trust
-        // one author for the mount at a time (§12.5).
-        // NB: the mark is advanced at the *end* of this function, only after every module
-        // has instantiated and bound — not here. See below.
-    }
     // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
     // instantiation is what allocates the declared initial memory, so a host-side check
     // could only run after the damage. It sits here, on the shared admission path, rather
@@ -1037,9 +1015,10 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     }
     // Advance the freshness mark only now — after a fully successful load (or, with
     // `deferMark`, leave it to the caller at its own completion point). Advancing it
-    // during the downgrade check above would brick rollback: a partially written or
-    // corrupt *newer* bundle — manifest intact and signed, but one module or the guest
-    // wrong — would raise the mark to the new version, then throw. Nothing runs, yet
+    // where the downgrade is DECIDED — in the admission predicate — would brick rollback:
+    // a partially written or corrupt *newer* bundle — manifest intact and signed, but one
+    // module or the guest wrong — would raise the mark to the new version, then throw.
+    // Which is exactly why the predicate is pure and this is the only writer. Nothing runs, yet
     // reloading the known-good older bundle is now refused as a downgrade until an
     // operator hand-edits the freshness file. The mark must record the highest version
     // that actually loaded (README §12.4). Integrity was verified by verifyBundle before

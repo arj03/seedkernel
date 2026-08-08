@@ -7,7 +7,7 @@
 // **There is no second seam here.** Both directions use the mechanism that already
 // exists, rather than a bespoke byte ABI with a hand-maintained twin in the guest:
 //
-//   guest → host ordinary `host.call` ops (cap-bridge.ts). The RAW net capability
+//   guest → host ordinary `host.call` ops (guest-seam.ts). The RAW net capability
 //                  — `link/open, send, close, stat` over an opaque link id — plus
 //                  `TIMER_*` for deadlines and the `transport` domain the slot
 //                  reports its structured output through. Adding one is an op, not
@@ -25,7 +25,7 @@
 // answers through the `respond` entrypoint rather than inline. That last one is not a
 // concession: it is also what keeps an asynchronous app handler possible.
 //
-// The crypto surface the guest reaches is the cap-bridge's, and it names no algorithm
+// The crypto surface the guest reaches is the seam's, and it names no algorithm
 // the host understands: the record layer and the ephemeral DH go
 // through `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and
 // the transcript signature is the ordinary node/sign name, which the bridge scopes to
@@ -43,7 +43,7 @@
 import { toHex, fromHex, writeU32BE, errMessage, enc, dec } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
-import type { RawNet, HostTimers, TransportSink } from "./cap-bridge.js";
+import type { RawNet, HostTimers, TransportSink } from "./guest-seam.js";
 import type { SafeRealm } from "./safe-js.js";
 import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
 
@@ -124,7 +124,7 @@ const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
 // The link close-reason codes are the transport occupant's vocabulary — the host
-// only relays the number it reports through transport/link-down (cap-bridge.ts) to
+// only relays the number it reports through transport/link-down (guest-seam.ts) to
 // whoever handed the channel in, never interpreting it. The codes live with the
 // occupant (transport/guest.js, `REASON_*`) and with the tests that assert them
 // (tests/transport-harness.mjs).
@@ -267,7 +267,7 @@ export interface OpenLinkOptions {
 }
 
 /** The request/response face of the transport bundle — the shape shell-core's
- *  cap-bridge wiring and the shell's `transport` field consume. */
+ *  guest-seam wiring and the shell's `transport` field consume. */
 export interface HostTransport {
   readonly peerId: PeerId;
   request(to: PeerId, proto: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
@@ -313,12 +313,12 @@ export interface TransportHandover {
 }
 
 /** The host-side face of the transport bundle. Implements the Network shape the shell
- *  and its cap-bridge consume (net.ts's PeerId, Endpoint, RequestHandler), so callers
+ *  and its guest seam consume (net.ts's PeerId, Endpoint, RequestHandler), so callers
  *  changed only in construction: the driver is built by the shell when the transport
  *  bundle is admitted, not by each target.
  *
  *  Constructed BEFORE the realm and attached to it after, because the realm's
- *  cap-bridge needs this object: the guest's raw-net, timer and transport ops resolve
+ *  guest seam needs this object: the guest's raw-net, timer and transport ops resolve
  *  here. `attach` is what sends the one config turn.
  */
 export class TransportHost implements Network, HostTransport {
@@ -417,7 +417,7 @@ export class TransportHost implements Network, HostTransport {
   // ── entering the guest ──────────────────────────────────────────────────────
 
   /** Invoke a guest entrypoint. The occupant answers by calling ops back out through
- *  the cap-bridge, so there is nothing to decode here — the return value is unused,
+ *  the guest seam, so there is nothing to decode here — the return value is unused,
  *  and an entrypoint that throws is a wedged transport whose links are moot, not a
  *  reason to take the host down.
  *

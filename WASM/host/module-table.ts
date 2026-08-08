@@ -30,7 +30,7 @@
 // `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
 // response back from `scratch`. Modules import nothing — no host seam, no I/O, no
 // callback. Inbound delivery reaches an app's GUEST (§12.10), and the guest drives its
-// modules by their bare name through the cap-bridge (README §12.2); a host-side
+// modules by their bare name through the guest seam (README §12.2); a host-side
 // embedder reaches the same path directly with `callModule`, and does all I/O and
 // authorization itself. Every entry is an installed WASM module: a bundle is the one
 // way code arrives (§12.4), so the table holds one kind of thing and `callModule` has
@@ -189,7 +189,7 @@ export class ModuleTable {
    *  scratch-region contract (README §4): write input at the module's scratch offset,
    *  call handle(input_len), read the response back from the same offset. The generic
    *  "run a transform" primitive: the host uses it directly, and a guest reaches it
-   *  through the cap-bridge by its bare name (README §12.2) — with the app key bound at
+   *  through the guest seam by its bare name (README §12.2) — with the app key bound at
    *  bridge construction, so `module` is the LOGICAL name from the guest's own manifest
    *  and a guest cannot address another app's modules by naming one. Modules cannot
    *  call back, so there is no re-entrancy. */

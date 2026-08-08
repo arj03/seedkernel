@@ -40,19 +40,19 @@ register("get", async (id) => {
   return r.slice(1);
 });
 register("probe", () => {
-  const names = ["sodium", "fs", "__net", "__capBridge", "__callBridge", "bridge", "createShell", "process", "Bun"];
+  const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "createShell", "process", "Bun"];
   const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
   return new TextEncoder().encode(leaked.join(","));
 });
 `
 
 func TestGuestPutGetAndConfinement(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
-	// Host realm: build the cap-bridge granting fs/put + fs/get (no net).
+	// Host realm: build the guest seam granting fs/put + fs/get (no net).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["fs/put", "fs/get"], __id, null, []);
+		__buildGuestSeam(["fs/put", "fs/get"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -99,11 +99,11 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 // runtime creation and is easy to drop there silently. The modest allocation is the
 // control: without it a realm that was simply broken would pass the same test.
 func TestGuestRealmHeapCapped(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge([], __id, null, []);
+		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -140,11 +140,11 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 // The trivial call first is the control: without it a realm that was simply broken would
 // pass the same test.
 func TestGuestRealmExecutionBudget(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge([], __id, null, []);
+		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -181,14 +181,14 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 // node rather than failing it. A hang is strictly worse than an error: the caller cannot
 // retry, time out on its own, or even tell that anything went wrong.
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
 	// A stub transport is enough: net/send only needs a promise that settles on the
 	// loop, and using one keeps the kill (not a socket) as the only variable.
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildCapBridge(["net/send"], __id,
+		__buildGuestSeam(["net/send"], __id,
 			{ request: async () => new Uint8Array([9]) }, [__peer]);
 	`)); err != nil {
 		t.Fatal("setup:", err)
@@ -234,10 +234,10 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 // Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
 // the loop must be driven by whoever is waiting on it.
 func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge([], __id, null, []);
+		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
@@ -264,11 +264,11 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 // something that can no longer be resolved. safe-js's dispose() fails its pending
 // callers for this reason; close() has to as well.
 func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildCapBridge(["net/send"], __id,
+		__buildGuestSeam(["net/send"], __id,
 			{ request: () => new Promise(() => {}) }, [__peer]);
 	`)); err != nil {
 		t.Fatal("setup:", err)

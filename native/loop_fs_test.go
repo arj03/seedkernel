@@ -24,10 +24,10 @@ import (
 // the blocks are already written and the response is never produced. This test removes
 // the incidental traffic entirely: no net, no timers, just a chain of fs awaits.
 func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge(["fs/put", "fs/get", "fs/size"], __id, null, []);
+		__buildGuestSeam(["fs/put", "fs/get", "fs/size"], __id, null, []);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}

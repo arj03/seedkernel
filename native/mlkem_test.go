@@ -124,7 +124,7 @@ func TestMlKemAcvpVectors(t *testing.T) {
 	}
 
 	// Wrong-width arguments are the same rejection as a malformed key, never a panic:
-	// the cap-bridge turns them into a leading zero byte, and there is no second
+	// the guest seam turns them into a leading zero byte, and there is no second
 	// channel for a structural failure to come back through.
 	if _, _, ok := mk.encapsulate(make([]byte, 10), make([]byte, mlkemCoinsBytes)); ok {
 		t.Fatal("a wrong-width encapsulation key must be refused")
@@ -142,22 +142,22 @@ func TestMlKemAcvpVectors(t *testing.T) {
 // so a host whose `__sodium` lacked these methods would admit a bundle by name and then
 // fail it at first use — the legibility failure the check exists to prevent.
 //
-// It also pins the thing the Go wrapper alone cannot: that the shared cap-bridge, the
+// It also pins the thing the Go wrapper alone cannot: that the shared guest seam, the
 // sodium shim's ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract
 // line up. A bundle declaring NO requires runs it, because a pure transform is
 // not a capability.
 func TestMlKemThroughCatalog(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildCapBridge([], __id, null, [], appSignScope(__id, __id.publicKey, "testapp"));
+		__buildGuestSeam([], __id, null, [], appSignScope(__id, __id.publicKey, "testapp"));
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
 	prim := func(name string, args []byte) []byte {
 		t.Helper()
-		fn := qc.Global().GetPropertyStr("__callBridge")
+		fn := qc.Global().GetPropertyStr("__callSeam")
 		v, err := qc.Invoke(fn, qc.NewUndefined(), qc.NewString("crypto/"+name), qc.NewArrayBuffer(args))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)

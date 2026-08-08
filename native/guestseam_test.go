@@ -9,12 +9,12 @@ import (
 	"seedloader/qjs"
 )
 
-// The shared cap-bridge.ts runs in the host realm over the Go
+// The shared guest-seam.ts runs in the host realm over the Go
 // primitives (sodium + fs), reused verbatim. Each name is exercised through the
-// single `__capBridge(name, bytes)` funnel and checked against the underlying
+// single `__guestSeam(name, bytes)` funnel and checked against the underlying
 // primitive, plus the cap-domain gate (a name under an undeclared prefix is refused).
 
-// The names of cap-bridge.ts's cap catalog, written here so a rename shows up as
+// The names of guest-seam.ts's cap catalog, written here so a rename shows up as
 // one edit rather than as bare strings scattered through the assertions.
 const (
 	nameSign     = "node/sign"
@@ -27,8 +27,8 @@ const (
 	nameLinkSend = "link/send"
 )
 
-func TestCapBridgeOps(t *testing.T) {
-	capBridgeRealm(t)
+func TestGuestSeamOps(t *testing.T) {
+	guestSeamRealm(t)
 
 	// Grant node/sign, node/verify, node/identity, fs/put, fs/get and clock/now (not
 	// net, not link) and an identity from sodium. The
@@ -43,13 +43,13 @@ func TestCapBridgeOps(t *testing.T) {
 		// test rebuilds the raw preimage from to prove node/verify applies it.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
-		__buildCapBridge(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
+		__buildGuestSeam(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
 	`)); err != nil {
 		t.Fatal("build bridge:", err)
 	}
 
 	call := func(name string, payload []byte) (*qjs.Value, error) {
-		fn := qc.Global().GetPropertyStr("__callBridge")
+		fn := qc.Global().GetPropertyStr("__callSeam")
 		return qc.Invoke(fn, qc.NewUndefined(), qc.NewString(name), qc.NewArrayBuffer(payload))
 	}
 	callBytes := func(name string, payload []byte) []byte {
@@ -139,7 +139,7 @@ func TestCapBridgeOps(t *testing.T) {
 	// and the seam is one shape on every target (core/fs.ts).
 	awaitBytes := func(name string, payload []byte) []byte {
 		t.Helper()
-		b, err := callRealm("__callBridgeAwait", 5*time.Second,
+		b, err := callRealm("__callSeamAwait", 5*time.Second,
 			qc.NewString(name), qc.NewArrayBuffer(payload))
 		if err != nil {
 			t.Fatalf("call %s: %v", name, err)

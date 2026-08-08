@@ -135,7 +135,7 @@ function utf8Decode(b) {
   return s;
 }
 
-// ── capability names (must match the cap-bridge's dispatch table) ─────────────
+// ── capability names (must match the guest seam's dispatch table) ─────────────
 
 // Authorities only — a primitive has no name of its own beyond `crypto/<name>` (see
 // below).

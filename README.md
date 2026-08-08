@@ -118,7 +118,7 @@ The reference composition stacks the layers so each depends only on the layers b
 │   guest (confined JS) +             │
 │   pure-transform WASM modules       │
 ├─────────────────────────────────────┤
-│   Cap-bridge                        │
+│   Guest seam                        │
 │   the guest's host.call seam —      │
 │   its only reach to real I/O        │
 ├─────────────────────────────────────┤
@@ -143,7 +143,7 @@ The reference composition stacks the layers so each depends only on the layers b
 
 - **The core is what the endpoints cannot do for themselves.** Authenticity, confidentiality, framing and routing all have endpoint substitutes and are therefore content. Transmission does not, and is therefore core.
 - **Lower is not the same as core.** Layering says who may call whom; core-ness says what cannot be replaced without a rebuild. The transport sits beneath the host and is still an ordinary bundle. Keeping these separate is what stops "it's foundational" from becoming a licence to grow.
-- **Not-core is not the same as replaceable.** The bundle verifier, the cap-bridge and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
+- **Not-core is not the same as replaceable.** The bundle verifier, the guest seam and the shell's assembly order all fail the end-to-end test — an endpoint could check a signature perfectly well — and are still permanently compiled in, because each is what would have to admit its own replacement. Core-ness bounds what the design owes the endpoints; the trust root bounds what a rebuild can avoid. They are different sets, and a component outside the core can still be stuck.
 - The host's dispatch does exactly one thing: resolve the protocol to an app and invoke its guest. No built-in policies, I/O, or dispatch loop beyond the seam it is handed. Lower layers gate higher layers; each layer sees only downward.
 - Untrusted code is **bounded** as well as confined. A WASM module declares its linear-memory ceiling in its signed manifest and the loader refuses anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced by a QuickJS interrupt handler on the JS targets and a wazero deadline on the native one. The one gap is **module** CPU, and it is a missing mechanism rather than a decision: WebAssembly engines on the JS platform expose no fuel or timeout to call (§4.3, §14). It is also now one step away from the wire: every inbound frame enters under the guest's execution budget, so a module can only be reached through a guest calling it by name.
 - Modules, as untrusted code, run confined. WASM modules are synchronous pure transforms — a buffer in, a buffer out, and that is the full extent of their interaction. **Every app's logic is its guest** — a confined JS program with zero ambient authority and only the single `host.call` seam, because session state and async interaction have no other home. A module is what the guest delegates a pure transform to, by its bare name over the same `host.call` seam as everything else.
@@ -157,19 +157,19 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
 
-**Shared — compiled once, run by all three targets (2,036 LOC)**
+**Shared — compiled once, run by all three targets (2,052 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 541 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 551 |
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
-| Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 401 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 356 |
+| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 411 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 352 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 293 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 
-- **Trust root.** The bundle format and admission policy, the cap-bridge, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
+- **Trust root.** The bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
 - **Vocabulary.** The domain prefixes, manifest suite ids, primitive names and flood bounds in `core/`. A bundle is replaceable and the vocabulary it draws on is not (§14.1); a bundle defining the vocabulary its own signature is verified under is circular.
 - **A stable adapter.** The transport driver holds the link ids, the flood caps and the whitelist gate, and it is what keeps the app-facing `send` unchanged *across* a transport swap. Folding it into the thing being swapped is backwards.
 - **Reuse.** Protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule — a manifest's claim, one dispatch — on every target, not because agreement is load-bearing.
@@ -182,8 +182,8 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,447 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,386 Go + 337 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,446 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,386 Go + 336 TS |
 
 **Signed content — not host code at all**
 
@@ -191,7 +191,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,237 + 5 KB |
 
-Each target therefore runs 2,036 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,052 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 
@@ -236,7 +236,7 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 | Doc | Sections | Contents |
 | --- | --- | --- |
 | [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The module table, host-level module management, standing a host up, the pure-transform WASM module ABI, layering, the protocol constants. |
-| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the shell: capability backends, the cap-bridge guest ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
+| [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the shell: capability backends, the guest-seam ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 | [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the four messages do, the three secrets and their different jobs, purpose-bound key derivation, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
 | [EXPORTS](docs/EXPORTS.md) | — | The published entry points and which app consumes each, plus the two traps that table exists to prevent. Maintenance surface, not protocol. |

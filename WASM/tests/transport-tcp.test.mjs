@@ -49,8 +49,7 @@ async function makeNode(ws = false) {
       ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: policy.apps,
-    admitTransport: policy.transport,
+    admit: policy,
     requestDeadlineMs: 2000,
   });
   await shell.loadBundleBlob(transportBlob);

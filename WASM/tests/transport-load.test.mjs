@@ -32,7 +32,7 @@ import { testkit } from "./testkit.mjs";
 const CONTACT = new Uint8Array(32).fill(3);
 
 /** The node's sodium, wrapped to charge the asymmetric operations to a counter.
- *  The guest reaches all of these through the cap-bridge's primitive catalog, so this
+ *  The guest reaches all of these through the guest seam's primitive catalog, so this
  *  is the real bill for a connection — including the ephemeral keypair, which is
  *  `RANDOM(32)` followed by an `x25519/dh` against the base point and therefore shows
  *  up as a scalarmult. */

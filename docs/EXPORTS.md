@@ -7,7 +7,7 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 | `.` (Node host) | ✓ | ✓ |
 | `./shell`, `./shell-core` | ✓ | `shell-core` |
 | `./bundle` | ✓ | ✓ |
-| `./cap-bridge` | ✓ | |
+| `./guest-seam` | ✓ | |
 | `./safe-js` | ✓ | ✓ |
 | `./transport-host` | ✓ | |
 | `./transport-bundle` | ✓ | ✓ |

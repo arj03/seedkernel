@@ -1,6 +1,6 @@
 // seedkernel native shell. Apps arrive as signed bundles (README §12) — nothing
 // application-specific lives here, and nothing about how a node is assembled does
-// either. The whole shell — verify + admit + install (§12.4/§12.5), the cap-bridge
+// either. The whole shell — verify + admit + install (§12.4/§12.5), the guest seam
 // (§12.2), the confined guest's lifecycle (§12.3), protocol dispatch (§12.10) — is
 // the shared host TS, compiled into the embedded host-shell.gen.js and run in
 // QuickJS (README §12.9). This Go layer is the bridge and only the bridge: it owns
@@ -34,7 +34,7 @@ import (
 )
 
 // hostShellJS is the shared shell: the bundle format and its load order, the
-// admission policy, the cap-bridge and guest ABI preamble, the transport + routing,
+// admission policy, the guest seam and guest ABI preamble, the transport + routing,
 // the WebSocket codec, the protocol routing, `createShell` — and the native
 // platform binding that hands `createShell` the primitives exposed below
 // (host/native-shim.ts). Bundled from build/host/*.js by scripts/bundle-loader.mjs;
@@ -119,7 +119,7 @@ func removeApp(appKey string) int {
 
 // callModule invokes one app's module by its logical name (README §4), returning its
 // response or nil if nothing is bound there or the module produced nothing. The one way
-// into an installed module: the shell uses it directly and the cap-bridge routes a
+// into an installed module: the shell uses it directly and the guest seam routes a
 // guest's bare-name calls (§12.2) through it, with the app key bound when the bridge
 // was built.
 // Modules are pure transforms and cannot call back, so there is no re-entrancy to guard.
@@ -534,7 +534,7 @@ func loadBundle(path string) string {
 
 // runGuest runs one of the loaded bundle's guest entrypoints as the *initiator* —
 // "the shell runs the app" (README §12.8). Arguments and results cross as raw bytes;
-// the shell owns the realm, the cap-bridge and the confinement.
+// the shell owns the realm, the guest seam and the confinement.
 func runGuest(entry string, payload []byte) ([]byte, error) {
 	return callRealm("runGuest", 60*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
 }

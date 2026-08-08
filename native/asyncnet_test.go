@@ -18,12 +18,12 @@ import (
 // awaiting entrypoint — all driven by one loop pumping both realms.
 //
 // Topology: one host realm, two networks. A (responder) listens and echoes
-// [type, ...payload]; B (the guest's node) holds the cap-bridge over its transport.
+// [type, ...payload]; B (the guest's node) holds the guest seam over its transport.
 // The guest, running as initiator, asks A and returns the echoed bytes.
 func TestAsyncNetInitiator(t *testing.T) {
-	capBridgeRealm(t)
+	guestSeamRealm(t)
 
-	// A (responder, listens) and B (the guest's node). The guest's cap-bridge is built
+	// A (responder, listens) and B (the guest's node). The guest's seam is built
 	// over B's identity + transport, granting net/send only. A's onRequest echoes
 	// the payload so the round-trip result is checkable.
 	if _, err := qc.Eval("setup.js", qjs.Code(`
@@ -42,7 +42,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.netA = a.net;
 		  globalThis.netB = b.net;
 		  netA.onRequest((from, proto, payload) => payload);
-		  __buildCapBridge(["net/send"], idB, netB, [aId]);
+		  __buildGuestSeam(["net/send"], idB, netB, [aId]);
 		})();
 	`)); err != nil {
 		t.Fatal("setup:", err)

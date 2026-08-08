@@ -48,7 +48,7 @@ export interface ShellOptions {
      *  is the peer id. */
     identity: Keypair;
     /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`, used only by
-     *  the cap-bridge SIGN op. Separate so guest signing structurally cannot produce a
+     *  the seam's SIGN op. Separate so guest signing structurally cannot produce a
      *  channel handshake signature, whatever happens to the domain prefixes. Defaults to
      *  `identity`, so an embedding host that supplies one keypair still works. */
     guestIdentity?: Keypair;
@@ -74,7 +74,7 @@ export interface ShellOptions {
      *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
     /** Live connected peers for the net/peers name. The transport owns
-     *  connectivity; this closure feeds it into the cap-bridge. */
+     *  connectivity; this closure feeds it into the guest seam. */
     livePeers?: () => PeerId[];
     /** Default per-request deadline in ms — how long one net request may take before
      *  it settles as unreachable, for a caller that names none of its own (§12.6). */
@@ -174,8 +174,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
             contactSecret: opts.contactSecret, networkKey: opts.networkKey,
             createRealm, livePeers: opts.livePeers,
         },
-        admit: policy.apps,
-        admitTransport: policy.transport,
+        admit: policy,
         requestDeadlineMs: opts.requestDeadlineMs,
         guestDeadlineMs: opts.guestDeadlineMs,
         realmMemoryBytes: opts.realmMemoryBytes,

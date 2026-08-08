@@ -43,6 +43,6 @@ Synchronous only — the bridge exports no Promises/async/`js_std_await`; every 
 call is a plain synchronous Go→wasm call. The loader builds everything async *on top*
 of this surface — a Go-owned event loop, timers, and blocking net — in `../loop.go`.
 A separate `Runtime` is created per realm: a trusted host realm (the sodium/fs/net
-shims + the shared installer/net/cap-bridge JS) and a zero-authority confined
+shims + the shared installer/net/guest-seam JS) and a zero-authority confined
 guest realm whose only seam is `host.call`. The wasm links quickjs-libc (WASI);
 confinement hardening of that surface is future work.

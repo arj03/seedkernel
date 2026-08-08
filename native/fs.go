@@ -4,7 +4,7 @@
 // those are the storage guest's business, layered on top of these primitives. This
 // mirrors host/fs-node.ts (NodeFs) so a Go node's on-disk store behaves like a
 // Bun node's. Exposed into QuickJS as an `fs` object with the core/fs.ts `Fs`
-// shape, ready for the cap-bridge to wire as its fs backend.
+// shape, ready for the guest seam to wire as its fs backend.
 package main
 
 import (

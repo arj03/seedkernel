@@ -5,9 +5,9 @@
 //
 // A realm is a second, zero-authority QuickJS runtime: a fresh context holds only the
 // ECMAScript intrinsics, so the guest cannot even *name* sodium / fs / net. Its single
-// seam is host.call(name, bytes), which Go funnels into the cap-bridge the shell built
+// seam is host.call(name, bytes), which Go funnels into the guest seam the shell built
 // for that app — a JS function in the host realm, retained here. Nothing in this file
-// knows what a name means or which domains an app may reach; that is the cap-bridge's,
+// knows what a name means or which domains an app may reach; that is the guest seam's,
 // and the manifest's, business.
 //
 // The async seam: a sync name (the primitive catalog, clock, module, the raw-link and
@@ -43,7 +43,7 @@ import (
 
 var (
 	// realms are the live confined realms, keyed by the opaque handle JS holds. A
-	// shell with two guest apps loaded has two, each with its own cap-bridge — which
+	// shell with two guest apps loaded has two, each with its own guest seam — which
 	// is why the net-settle routing is per realm rather than a single global hook.
 	realms   = map[int64]*guestRealm{}
 	realmSeq int64
@@ -85,7 +85,7 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 
 // installRealmBridge adds the confined-realm powers to the `bridge` object: create a
 // realm, call into it (as initiator or synchronously), settle a parked net op, dispose.
-// This is the whole of Go's involvement with a guest — no cap-bridge, no preamble
+// This is the whole of Go's involvement with a guest — no guest seam, no preamble
 // assembly, no bundle facts, no dispatch.
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 	b.SetPropertyStr("createRealm", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
@@ -192,7 +192,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	loop.addContext(g.qc, g.pump)
 
 	// The single seam. Read (name, callId, payload) from the guest and shuttle the call
-	// to the cap-bridge in the host realm. A sync name returns its bytes here; an async
+	// to the guest seam in the host realm. A sync name returns its bytes here; an async
 	// name returns null (its promise isn't settled yet) and we return null too — the
 	// guest preamble then parks a Promise under callId, which settleNet resolves later.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
@@ -218,7 +218,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		// shim's synchronous __fs primitives are still wrapped into a resolved Promise).
 		// The remaining sync names (crypto, clock, and a bundle's own modules) return
 		// their bytes here. A sync name returning null/undefined would be mistaken for an
-		// async one and leave a guest Promise pending forever — which is why cap-bridge.ts
+		// async one and leave a guest Promise pending forever — which is why guest-seam.ts
 		// maps an empty module reply to NONE rather than null.
 		if res.IsNull() {
 			// The call parked, and its settlement will arrive as a HOST-realm microtask

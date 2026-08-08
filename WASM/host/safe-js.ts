@@ -19,7 +19,7 @@
 // quickjs-emscripten's `newPromise()` deferred: keeping the async half in plain
 // ECMAScript is what lets this host and the native loader (guest.go, quickjs-ng over
 // wazero, which has no promise primitive) share ONE preamble — see `guestPreamble` in
-// cap-bridge.ts.
+// guest-seam.ts.
 //
 // There is no Asyncify and no host-driven step loop: a suspended async guest is just heap
 // state. There is exactly ONE way in — `call` — serving both roles, the initiator that
@@ -57,7 +57,7 @@ const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
-import { guestPreamble } from "./cap-bridge.js";
+import { guestPreamble } from "./guest-seam.js";
 import { serializeCalls } from "./realm-queue.js";
 
 /** The one capability seam. `name` addresses a host capability by its opaque name

@@ -152,7 +152,7 @@ func (m *mlkem) decapsulate(sk, ct []byte) (ss []byte, ok bool) {
 }
 
 // exposeMlKem adds the three ml_kem768_* methods to the realm's `__sodium` object,
-// in the shape kem.ts gives the JS targets — the cap-bridge's catalog calls them by
+// in the shape kem.ts gives the JS targets — the guest seam's catalog calls them by
 // those names, so the shared TS runs unchanged here.
 func exposeMlKem(qc *qjs.Context, o *qjs.Value, m *mlkem) {
 	o.SetPropertyStr("ml_kem768_keypair_from_seed", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {

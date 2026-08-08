@@ -95,8 +95,7 @@ async function makeNode(channels, listen) {
       channels, listen,
       createRealm: async (o) => createSafeRealm(o),
     },
-    admit: policy.apps,
-    admitTransport: policy.transport,
+    admit: policy,
     requestDeadlineMs: 800,
   });
   await shell.loadBundleBlob(transportBlob);

@@ -29,7 +29,7 @@ export const DOMAIN_MANIFEST = domain("seedkernel-manifest-sig-v1\0");
  *  others do: it must be disjoint from every signing prefix, so a derived author id
  *  can never also be a preimage someone signed. See `hybridAuthorId` (bundle.ts). */
 export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
-/** Cap-bridge SIGN (§12.2): prefixes `scope ‖ msg`, scope host-derived from the
+/** Guest-seam SIGN (§12.2): prefixes `scope ‖ msg`, scope host-derived from the
  *  manifest — a guest's signature stays in its bundle's namespace, not a key oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
 /** Channel AUTH (§12.6): prefixes the AKE transcript, so an AUTH signature names
@@ -56,24 +56,24 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  expected, a wrong answer rather than an error, and one no amount of care at the call
  *  site turns into a loud one. Declaring the seam version makes it a refused load.
  *
- *  **It lives HERE, with the suite ids, rather than in cap-bridge.ts where the seam it
+ *  **It lives HERE, with the suite ids, rather than in guest-seam.ts where the seam it
  *  versions is defined.** It is the same kind of thing they are — a number naming which
  *  version of a contract a signed document was written for, read by the loader before
  *  anything is trusted — and putting it here is what keeps the loader from importing the
  *  guest bridge to check a manifest field. That edge would drag the whole name catalog
  *  and preamble into every page that verifies a bundle, including pages that only
- *  inspect one and never build a bridge at all. cap-bridge.ts re-exports it, so a
+ *  inspect one and never build a bridge at all. guest-seam.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
 export const GUEST_ABI_VERSION = 3;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
- *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (cap-bridge.ts)
+ *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (guest-seam.ts)
  *  is total over this list: a host that has that file has every name in it, so a partial
  *  catalog is unrepresentable and there is nothing for a bundle to require. What a guest
  *  needs from the pure half is covered by `abi` — the version of the seam it was written
  *  against, which is the version of everything in it.
  *
- *  Here rather than in cap-bridge.ts for exactly the reason `GUEST_ABI_VERSION` is: it
- *  belongs with the vocabulary, and cap-bridge.ts's table keys are the template literal
+ *  Here rather than in guest-seam.ts for exactly the reason `GUEST_ABI_VERSION` is: it
+ *  belongs with the vocabulary, and guest-seam.ts's table keys are the template literal
  *  over this list, so the names and the transforms cannot drift.
  *
  *  **Adding a name here is the whole cost of a new algorithm** — no op number, no ABI
@@ -120,7 +120,7 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  `host.call` by their bare logical name, and a manifest holds module names to
  *  `[A-Za-z0-9_-]` (bundle.ts) — so the two halves of the catalog are disjoint by charset
  *  and the dispatch tells them apart by the name alone. `crypto/*` gets the slash from its
- *  template literal; this table is hand-written, so cap-bridge.ts checks it at
+ *  template literal; this table is hand-written, so guest-seam.ts checks it at
  *  construction. A bare authority added here would shadow every app's module of that name.
  *
  *  Each name carries what it is granted *for*, which is the whole of the mount rule:

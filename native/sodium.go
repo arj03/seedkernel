@@ -4,7 +4,7 @@
 // byte-identical to a Bun node's, which only the exact same libsodium binary
 // guarantees. This file is the FFI seam over the emscripten ABI (malloc / copy-in /
 // call / copy-out) plus a `sodium` object into the QuickJS realm carrying
-// libsodium-wrappers method names — so the shared host JS (and, later, cap-bridge.ts)
+// libsodium-wrappers method names — so the shared host JS (and, later, guest-seam.ts)
 // calls `sodium.*` unchanged.
 //
 // Two primitives run on native Go instead, under the native fast-path rule (§12.9):
@@ -105,9 +105,9 @@ var sodiumExports = map[string]string{
 	"crypto_box_seal_open":                 "hb",
 	// The §12.6 transport AKE's X25519 stays on wasm (handshake-only, amortized over
 	// the link). One export covers it: the transport bundle reaches scalarmult through
-	// the cap-bridge's `x25519/dh`, and derives its ephemeral PUBLIC key with that same
+	// the guest seam's `x25519/dh`, and derives its ephemeral PUBLIC key with that same
 	// entry against the base point — so there is no separate keypair primitive to export
-	// (cap-bridge.ts says as much). The ChaCha20-Poly1305-IETF record layer is native Go
+	// (guest-seam.ts says as much). The ChaCha20-Poly1305-IETF record layer is native Go
 	// (see aeadEncrypt / the file header), so it needs no export here.
 	"crypto_scalarmult": "Dg",
 }
@@ -493,7 +493,7 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 	// same object: the shared loader's crypto surface is one `sodium`, and it
 	// feature-detects suite 0x02 by the presence of this method.
 	exposeMlDsa(qc, o, md)
-	// And the catalog's KEM, on the same object for the same reason — the cap-bridge
+	// And the catalog's KEM, on the same object for the same reason — the guest seam
 	// reaches every primitive through one `sodium` (mlkem.go).
 	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)

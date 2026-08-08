@@ -1,19 +1,29 @@
-// cap-bridge — the capability counterpart to `safe-js` (exported as
-// `seedkernel-wasm/cap-bridge`). Given a safe-js realm, it services the guest's
-// single `host.call(name, bytes)` seam from the host's *primitive* capabilities
-// and nothing else: crypto primitives (sumo), raw net (bytes over an opaque link id)
-// and the structured net the mounted transport builds on it, fs (raw bytes under an
-// opaque key), an installed-module call, timers, clock, and identity. Every name is
-// application-neutral — the bridge has no idea it is
-// hosting storage (or chat, or anything). All structure — content addressing,
-// descriptor envelopes, the HAVE/OFFER/STORE wire format, Reed–Solomon, the
-// nonce convention — is the guest's business, built on top of these primitives.
+// guest-seam — THE seam (exported as `seedkernel-wasm/guest-seam`): the one
+// implementation of `host.call(name, bytes)` a realm is wired with, and therefore the
+// whole of a guest's view of the host. There is no "bridge" object standing between the
+// shell and the guest with a foot on each side; there is a realm, and there is the
+// function it calls out through. The shell owns admission, the module table, realm
+// lifecycle and dispatch (shell-core.ts); this file owns what a realm may *utter*.
 //
-// This is what lets the seedkernel shell run an arbitrary signed guest: it
-// constructs a cap-bridge from host primitives it already holds (README
-// §12.2). A host-side caller that holds the same primitives constructs the
-// identical bridge, so output orchestrated through the confined guest is
-// byte-compatible with a host-side reference path.
+// It is a pure function of three things, and the split is the ownership:
+//
+//   platform — per NODE:  crypto (sumo), the node identity, the peer set, the clock.
+//   grants   — per REALM: exactly what this realm may reach — the names its manifest
+//              declared, the scope its signatures are bound to, and the backends behind
+//              the gated names (fs, transport, sockets, timers, the transport sink).
+//              Nothing is reachable that is not wired here, which is the whole of §1's
+//              capability-by-non-wiring: a realm holding no `rawNet` cannot acquire one.
+//   modules  — per APP:   this bundle's own WASM modules, by their logical names.
+//
+// Every name is application-neutral — the seam has no idea it is hosting storage (or
+// chat, or anything). All structure — content addressing, descriptor envelopes, the
+// HAVE/OFFER/STORE wire format, Reed–Solomon, the nonce convention — is the guest's
+// business, built on top of these.
+//
+// This is what lets the seedkernel shell run an arbitrary signed guest: it wires a seam
+// from host primitives it already holds (README §12.2). A host-side caller that holds
+// the same primitives wires the identical seam, so output orchestrated through the
+// confined guest is byte-compatible with a host-side reference path.
 import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, type PrimitiveName, type CapabilityName } from "../core/domains.js";
 import { type PeerId } from "../core/net.js";
@@ -75,7 +85,7 @@ export interface CapSodium {
 
 /** The request/response transport the net/send name drives. The mounted transport's driver
  *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
- *  over `net/send`, so the bridge needs only single-peer request/response — no
+ *  over `net/send`, so the seam needs only single-peer request/response — no
  *  host-side scatter-gather. */
 export interface CapTransport {
     request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
@@ -161,42 +171,51 @@ export interface TransportSink {
     linkDown(linkId: number, reason: number): void;
 }
 
-/** Everything a cap-bridge needs — all host primitives, zero app knowledge. */
-export interface CapBridgeDeps {
+/** Per-NODE facts every realm on this host shares. Nothing here is a grant — a realm
+ *  holds these because it is running on this node at all — so nothing here is gated. */
+export interface SeamPlatform {
     sodium: CapSodium;
     /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key
-     *  SIGN uses is `signScope.key`, chosen by the slot — not this. */
+     *  SIGN uses is `grants.signScope.key`, chosen by the slot — not this. */
     identity: {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
+    /** The peers this node can reach (its cohort / connected set). */
+    peers: () => PeerId[];
+    /** Wall clock (ms). Defaults to Date.now. */
+    now?: () => number;
+}
+
+/** Per-REALM: exactly what THIS realm may reach. The set of names it may utter, the
+ *  scope its signatures are bound to, and the backends behind the gated names.
+ *
+ *  Two mechanisms, and both are here because they are the same decision seen twice: a
+ *  name outside `names` is refused, and a backend that was never wired cannot be reached
+ *  whatever the manifest says. The second is the load-bearing one (README §1,
+ *  capability-by-non-wiring) — a realm handed no `rawNet` cannot acquire one at any point
+ *  in the process's life — and the first is what makes an undeclared name a refusal by
+ *  name rather than a null backend surfacing later as a confusing failure. */
+export interface SeamGrants {
+    /** The allowed names, EXACTLY the manifest's declared `guest.requires` (README
+     *  §12.2). Any `host.call` naming an authority outside this set is refused — so
+     *  a guest reaches exactly what its bundle declared, name by name, and nothing
+     *  else. Names that are not authorities (`isGrant`) pass regardless: they are
+     *  never grants. Required: pass `UNRESTRICTED_NAMES` to opt out deliberately (a
+     *  host-side caller that holds the primitives anyway). */
+    names: Iterable<string> | typeof UNRESTRICTED_NAMES;
     /** What SIGN signs and VERIFY checks under, derived by the host from the asking
      *  bundle's slot (`appSignScope` / `transportSignScope`). Both bind every
      *  signature to `domain ‖ scope ‖ msg` and read none of `msg`; without a scope
      *  both are unavailable, because guest signing and scoped verification are never
      *  raw. A host-side caller that never exposes them may omit it. */
     signScope?: SignScope;
-    /** Reach one of THIS app's WASM modules by its logical name — the shell binds the app
-     *  key when it builds the bridge (`ModuleTable.callModule`), so what arrives here is
-     *  already scoped and a guest naming a module it does not have resolves to nothing.
-     *  A guest reaches these through the SAME `host.call` as everything else, by the bare
-     *  logical name (§12.2); the dispatch knows a bare name is one of these because no
-     *  host name is bare.
-     *
-     *  There is no logical→table map to pass and no opt-out sentinel guarding it. The
-     *  guest's namespace and the app's module map are the same map, so "a guest reaches
-     *  only its own modules" is the shape rather than a lookup that could be omitted. */
-    callModule: (name: string, payload: Uint8Array) => Uint8Array | null;
-    /** Whether this app declares a module by that name (`ModuleTable.isBound`, app key
-     *  bound with `callModule`'s). It exists to keep ONE error surface over the unified
-     *  catalog: an unknown name is refused whichever half it would have come from. It
-     *  cannot be read off `callModule`, whose `null` also means a trap or an oversized
-     *  payload — a module that FAILS still answers empty, as it always has, and only a
-     *  name that was never installed is a refusal. */
-    hasModule: (name: string) => boolean;
+    /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
+     *  (`scopedFs`). Optional: a node that only initiates never reads it. */
+    fs?: Fs;
     /** The request/response transport the net/send name drives. `TransportHost` satisfies
      *  it. A confined guest fans out itself with `Promise.all` over `net/send`, so the
-     *  bridge needs only single-peer request/response — no host-side scatter-gather.
+     *  seam needs only single-peer request/response — no host-side scatter-gather.
      *
      *  Optional ONLY for a bundle that never declares the `net` domain — the transport
      *  bundle itself (whose net/send would loop back into itself) is that caller.
@@ -212,30 +231,45 @@ export interface CapBridgeDeps {
     /** Where the transport slot's occupant reports its structured output. Wired with
      *  `rawNet` and for the same bundle. */
     transportSink?: TransportSink;
-    /** The peers this node can reach (its cohort / connected set). */
-    peers: () => PeerId[];
-    /** Raw-byte fs backend. Optional: a node that only initiates never reads it. */
-    fs?: Fs;
-    /** Wall clock (ms). Defaults to Date.now. */
-    now?: () => number;
-    /** The allowed names, EXACTLY the manifest's declared `guest.requires` (README
-     *  §12.2). The bridge refuses any `host.call` naming an authority outside it — so
-     *  a guest reaches exactly what its bundle declared, name by name, and nothing
-     *  else. Names that are not authorities (`isGrant`) pass regardless: they are
-     *  never grants. Required: pass `UNRESTRICTED_NAMES` to opt out deliberately (a
-     *  host-side caller that holds the primitives anyway). */
-    allowedNames: Iterable<string> | typeof UNRESTRICTED_NAMES;
+}
+
+/** Per-APP: this bundle's OWN WASM modules, by the logical names its manifest declared.
+ *
+ *  Not a grant and not gated — the code was installed and verified with the guest, so
+ *  calling one reaches nothing the guest does not already hold. The shell binds the app
+ *  key when it wires the seam (`ModuleTable`), so what arrives here is already scoped:
+ *  there is no logical→table map to pass and no opt-out sentinel, because the guest's
+ *  namespace and the app's module map are the same map. "A guest reaches only its own
+ *  modules" is the shape rather than a lookup that could be omitted. */
+export interface SeamModules {
+    /** Reach one of this app's modules. A guest calls it through the SAME `host.call` as
+     *  everything else, by the bare logical name (§12.2); the dispatch knows a bare name
+     *  is one of these because no host name is bare. */
+    call: (name: string, payload: Uint8Array) => Uint8Array | null;
+    /** Whether this app declares a module by that name. It exists to keep ONE error
+     *  surface over the unified catalog: an unknown name is refused whichever half it
+     *  would have come from. It cannot be read off `call`, whose `null` also means a trap
+     *  or an oversized payload — a module that FAILS still answers empty, as it always
+     *  has, and only a name that was never installed is a refusal. */
+    has: (name: string) => boolean;
+}
+
+/** Everything the seam needs, in the three groups that own it. */
+export interface GuestSeamDeps {
+    platform: SeamPlatform;
+    grants: SeamGrants;
+    modules: SeamModules;
 }
 
 /** The version of the seam defined below — re-exported so a reader of the seam finds it
- *  beside them, and so `seedkernel-wasm/cap-bridge` is the import a bundle builder
+ *  beside them, and so `seedkernel-wasm/guest-seam` is the import a bundle builder
  *  reaches for (it is stamping "which host contract is this guest written against",
  *  which is this file's subject). It is DECLARED in domains.ts, with the suite ids, so
- *  the loader can check a manifest's `guest.abi` without importing the guest bridge —
+ *  the loader can check a manifest's `guest.abi` without importing the seam —
  *  see the note there. Anything that changes what an existing name returns bumps it. */
 export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../core/domains.js";
 /** The `crypto/` members of the catalog — the template literal over `PRIMITIVE_NAMES`,
- *  so the vocabulary a manifest is checked against and the table the bridge dispatches
+ *  so the vocabulary a manifest is checked against and the table the seam dispatches
  *  through cannot drift: adding a primitive to one without the matching key in the
  *  other is a type error. */
 type CryptoCapName = `crypto/${PrimitiveName}`;
@@ -424,8 +458,8 @@ globalThis.__invoke = (name, argBuf) => {
 /** The authority catalog — declared in core/domains.ts and re-exported so a reader of the
  *  seam finds it beside the names it governs. A bundle's signed manifest declares the
  *  authorities its guest holds (its `requires`), the loader checks them against this table
- *  before anything is trusted, and the shell passes them to the bridge as the exact set it
- *  enforces (`allowedNames`). Fine-grained and human-auditable: "this app reaches
+ *  before anything is trusted, and the shell passes them to the seam as the exact set it
+ *  enforces (`grants.names`). Fine-grained and human-auditable: "this app reaches
  *  `node/sign` + `fs/get`", not a prefix that grows every op ever added under it.
  *
  *  **Only authorities are grants; `crypto/*` and a bundle's own modules are not.**
@@ -453,7 +487,7 @@ export { AUTHORITY_CALLS, MOUNT_GROUPS } from "../core/domains.js";
 export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
     const appBytes = enc.encode(app);
     if (appBytes.length > 255)
-        throw new Error("cap-bridge: app name too long for a scope (>255 bytes)");
+        throw new Error("guest-seam: app name too long for a scope (>255 bytes)");
     const out = new Uint8Array(author.length + 1 + appBytes.length);
     out.set(author, 0);
     out[author.length] = appBytes.length;
@@ -482,7 +516,7 @@ export function transportSignScope(key: {
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// `allowedNames` governs how far a guest reaches, and it once had a permissive meaning for
+// `grants.names` governs how far a guest reaches, and it once had a permissive meaning for
 // the *absent* value — omit it and the guest got every name in the catalog. That is the
 // wrong default in the one file where a mistake is a capability escalation: it makes full
 // authority the thing a new call site gets by forgetting a field, in a runtime whose
@@ -490,12 +524,12 @@ export function transportSignScope(key: {
 //
 // It is now required, and the permissive case is a value a caller has to name. There IS a
 // legitimate permissive caller — a host-side orchestrator that already holds every
-// primitive the bridge wraps, so gating it protects nothing — and this sentinel is for it.
+// primitive the seam wraps, so gating it protects nothing — and this sentinel is for it.
 // A symbol rather than a string or `null`: a symbol cannot arrive from parsed config or be
 // produced by a manifest, so the only way to reach the permissive branch is to import the
 // constant and mean it.
 //
-// Module scoping used to need the same treatment, and no longer does: `callModule` is
+// Module scoping used to need the same treatment, and no longer does: `modules.call` is
 // bound to one app's module map (ModuleTable), so there is no wider namespace an omitted
 // argument could open onto and nothing to opt out of.
 /** Run without name gating: every authority resolves. For a host-side
@@ -504,7 +538,7 @@ export function transportSignScope(key: {
 export const UNRESTRICTED_NAMES = Symbol("seedkernel.cap.unrestricted-names");
 // Host-side allocation bounds for guest-controlled sizes. The realm's own
 // 64 MiB memory limit does not cover host allocations the guest requests, so
-// the bridge caps them itself (a confined guest must not be able to size a
+// the seam caps them itself (a confined guest must not be able to size a
 // host buffer past these).
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
 const ONE = new Uint8Array([1]);
@@ -516,28 +550,29 @@ function u64be(value: number): Uint8Array {
     writeU32BE(out, 4, value >>> 0);
     return out;
 }
-/** Build the single capability funnel for one node. Most names resolve *synchronously*
- *  (returns bytes); the ones that genuinely round-trip — `net/send` and every `fs/*` —
- *  return a Promise the guest `await`s. Which side of that line a name sits on is the
- *  ABI (§12.2), which is what `guest.abi` versions.
+/** Wire the one `host.call` implementation a realm runs against. Most names resolve
+ *  *synchronously* (returns bytes); the ones that genuinely round-trip — `net/send` and
+ *  every `fs/*` — return a Promise the guest `await`s. Which side of that line a name
+ *  sits on is the ABI (§12.2), which is what `guest.abi` versions.
  *
- *  One bridge serves both roles. The **holder** path awaits like the initiator does — it
+ *  One seam serves both roles. The **holder** path awaits like the initiator does — it
  *  answers from local fs, and fs is not answerable in the same turn on a target whose
  *  storage backend is asynchronous — so the two are the same shape, and what keeps one
  *  entrypoint invocation from interleaving with the next is the realm's serialization
  *  queue (realm-queue.ts) rather than anything here. */
-export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
-    const { sodium, identity, callModule, hasModule, transport } = deps;
-    const now = deps.now ?? (() => Date.now());
+export function createGuestSeam(deps: GuestSeamDeps): SafeRealmBridge {
+    const { platform, grants, modules } = deps;
+    const { sodium, identity } = platform;
+    const now = platform.now ?? (() => Date.now());
     // Checked at runtime, not only in the types: the native target evaluates the COMPILED
     // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
     // to enforce anything. A gate that only holds on one of two targets is not a gate, so
     // an absent value throws here rather than resolving to the permissive branch.
-    if (deps.allowedNames === undefined) {
-        throw new Error("cap-bridge: allowedNames is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
+    if (grants.names === undefined) {
+        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
     }
     // null means "the caller named the sentinel" — never "the caller forgot".
-    const allowed = deps.allowedNames === UNRESTRICTED_NAMES ? null : new Set(deps.allowedNames);
+    const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
     // ── the catalog — the seam ABI (§12.2), ONE table: the HOST names a guest can call
     // are the keys of this object — no second list, no numbers, never a wire value. The
     // bundle's own modules are the catalog's other source of names, resolved past the end
@@ -549,24 +584,24 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
     // the platform's raw contribution; the slot holds both, an app holds only `net`.
     const fs = () => {
-        if (!deps.fs)
-            throw new Error("cap-bridge: fs.* used but no fs backend wired");
-        return deps.fs;
+        if (!grants.fs)
+            throw new Error("guest-seam: fs.* used but no fs backend wired");
+        return grants.fs;
     };
     const rawNet = () => {
-        if (!deps.rawNet)
-            throw new Error("cap-bridge: link.* used but no raw net is wired (only the transport slot holds sockets)");
-        return deps.rawNet;
+        if (!grants.rawNet)
+            throw new Error("guest-seam: link.* used but no raw net is wired (only the transport slot holds sockets)");
+        return grants.rawNet;
     };
     const timers = () => {
-        if (!deps.timers)
-            throw new Error("cap-bridge: timer.* used but no timer backend wired");
-        return deps.timers;
+        if (!grants.timers)
+            throw new Error("guest-seam: timer.* used but no timer backend wired");
+        return grants.timers;
     };
     const sink = () => {
-        if (!deps.transportSink)
-            throw new Error("cap-bridge: the transport names are the mounted transport's, and this bridge is not it");
-        return deps.transportSink;
+        if (!grants.transportSink)
+            throw new Error("guest-seam: the transport names are the mounted transport's, and this realm is not it");
+        return grants.transportSink;
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` (and "constructor", "valueOf", …) with
@@ -580,7 +615,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // Ungated by a rule rather than by omission — computation the guest could have
         // done with code of its own, so there is nothing to grant (§12.1). The bundle's
         // own modules are the other ungated half, and they are not in this table at all:
-        // they are the app's, resolved per bridge at the bottom of this function.
+        // they are the app's, resolved per seam at the bottom of this function.
         ...cryptoCatalog(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
         // node/sign and node/verify are scoped, never raw: both apply `domain ‖ scope`
@@ -588,9 +623,9 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // `SignScope` above), so a guest checks signatures without ever reconstructing
         // host-owned bytes.
         "node/sign": (payload) => {
-            const s = deps.signScope;
+            const s = grants.signScope;
             if (!s)
-                throw new Error("cap-bridge: node/sign needs a slot-derived scope (signing is never raw)");
+                throw new Error("guest-seam: node/sign needs a slot-derived scope (signing is never raw)");
             return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
         },
         // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the
@@ -605,11 +640,11 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // actually checked. Only the check itself is caught, and an empty `msg` is a
         // legitimate question, so the bound is exactly the fixed prefix.
         "node/verify": (payload) => {
-            const s = deps.signScope;
+            const s = grants.signScope;
             if (!s)
-                throw new Error("cap-bridge: node/verify needs a slot-derived scope (verification is never raw)");
+                throw new Error("guest-seam: node/verify needs a slot-derived scope (verification is never raw)");
             if (payload.length < 96)
-                throw new Error("cap-bridge: node/verify takes [pk 32][sig 64][msg ..]");
+                throw new Error("guest-seam: node/verify takes [pk 32][sig 64][msg ..]");
             try {
                 return sodium.crypto_sign_verify_detached(payload.slice(32, 96), concatBytes([s.domain, s.scope, payload.slice(96)]), payload.slice(0, 32)) ? ONE : ZERO;
             }
@@ -621,22 +656,22 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         "node/random": (payload) => {
             const n = readU32BE(payload, 0);
             if (n > MAX_RANDOM_BYTES)
-                throw new Error("cap-bridge: node/random size over cap");
+                throw new Error("guest-seam: node/random size over cap");
             return sodium.randombytes_buf(n);
         },
         // ── net: net/send is the only async name — a real round trip → a Promise ──
         "net/send": (payload) => {
-            if (!transport)
-                throw new Error("cap-bridge: net/send used but no transport is wired (the transport bundle itself must not declare net)");
+            if (!grants.transport)
+                throw new Error("guest-seam: net/send used but no transport is wired (the transport bundle itself must not declare net)");
             const peer = toHex(payload.slice(0, 32));
             const pidLen = payload[32];
             const proto = payload.slice(33, 33 + pidLen);
             const off = 33 + pidLen;
-            return transport.request(peer, proto, payload.slice(off)).then((resp) => concatBytes([ONE, resp]), () => ZERO);
+            return grants.transport.request(peer, proto, payload.slice(off)).then((resp) => concatBytes([ONE, resp]), () => ZERO);
         },
         // net/peers — -> [count u32][pk 32 …]
         "net/peers": () => {
-            const peers = deps.peers();
+            const peers = platform.peers();
             const head = new Uint8Array(4);
             writeU32BE(head, 0, peers.length);
             return concatBytes([head, ...peers.map(fromHex)]);
@@ -764,10 +799,10 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // check a typo'd EXTRA key would trip.
     for (const name of Object.keys(handlers)) {
         if (!HANDLER_KEYS.includes(name)) {
-            throw new Error(`cap-bridge: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no primitive (PRIMITIVE_NAMES)`);
+            throw new Error(`guest-seam: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no primitive (PRIMITIVE_NAMES)`);
         }
         if (!name.includes("/")) {
-            throw new Error(`cap-bridge: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
+            throw new Error(`guest-seam: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
         }
     }
     return (name, payload) => {
@@ -780,7 +815,7 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // so gating it would make a guest ask permission to compute a function of
         // bytes it already has.
         if (allowed && isGrant(name) && !allowed.has(name)) {
-            throw new Error("cap-bridge: " + name + " not declared by the bundle manifest requires");
+            throw new Error("guest-seam: " + name + " not declared by the bundle manifest requires");
         }
         // ONE catalog, two sources of names, told apart by the name itself (§12.2). A
         // `/` says a host name: the table lookup IS the dispatch, and an unknown name
@@ -788,13 +823,13 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         if (name.includes("/")) {
             const fn = handlers[name];
             if (!fn)
-                throw new Error("cap-bridge: no such name " + name);
+                throw new Error("guest-seam: no such name " + name);
             return fn(payload);
         }
         // A bare name is one of THIS bundle's own modules, by the logical name from its
         // manifest (README §5.1) — which is the name it is bound under inside this app's
         // module map, so there is nothing to resolve and no scoping to apply. The app key
-        // was fixed when the shell built this bridge, so no name reaches another app at
+        // was fixed when the shell wired this seam, so no name reaches another app at
         // all. Ungated like `crypto/*`: its own bundle's code is a pure transform the
         // guest already holds, installed and verified with it, so calling one reaches
         // nothing the guest does not have.
@@ -803,8 +838,8 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // an unknown host name — that uniformity is what the unified catalog buys. A
         // module that runs and FAILS is a different event and keeps its old answer: empty
         // bytes, which is also what a module returning nothing says.
-        if (!hasModule(name))
-            throw new Error("cap-bridge: no such name " + name + " (this bundle installs no module by that name)");
-        return callModule(name, payload) ?? NONE;
+        if (!modules.has(name))
+            throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
+        return modules.call(name, payload) ?? NONE;
     };
 }

@@ -10,7 +10,7 @@
 // `ShellPlatform`) and hands the result to `createShell`. Everything above the
 // primitives — which checks run and in what order (§12.4), who may install (§12.5),
 // the name derivation (§5.1), the freshness arithmetic, the deny-all default (§14),
-// how a cap-bridge is built for a bundle's declared domains (§12.2), which app a
+// how the guest seam is wired for a bundle's declared domains (§12.2), which app a
 // protocol is delivered to (§12.10) — comes from those shared modules.
 //
 // The ASSEMBLY ORDER is the point. It is the last thing two hosts could disagree
@@ -89,7 +89,7 @@ declare const __sodium: {
  *
  *  `crypto_generichash` is restated with its key OPTIONAL, which is what satisfies both
  *  halves of `ShellSodium` at once: the loader calls it with an explicit `null` key and
- *  the cap-bridge calls it with two arguments. */
+ *  the guest seam calls it with two arguments. */
 export interface NativeSodium extends ShellSodium {
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
   crypto_sign_keypair(): Keypair;
@@ -457,8 +457,7 @@ async function makeTransportNode(cfg: {
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
             contactSecret: cfg.contactSecret, createRealm,
         },
-        admit: (v) => admissionPolicy.apps(v),
-        admitTransport: (v) => admissionPolicy.transport(v),
+        admit: (v, ctx) => admissionPolicy(v, ctx),
         requestDeadlineMs: cfg.requestDeadlineMs,
         config: cfg.config,
     });
@@ -566,7 +565,7 @@ function revoke(authorHex: string): Uint8Array {
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): a microtask
  *  queue over the shared loop and one pre-compiled `__start` wrapper, so an initiator
  *  call costs an Invoke rather than a parse. Not the guest ABI (that is
- *  `guestPreamble`, cap-bridge.ts), but this driver's twin of what safe-js.ts does in
+ *  `guestPreamble`, guest-seam.ts), but this driver's twin of what safe-js.ts does in
  *  TypeScript — fetched by Go like the preamble is, rather than restated as a Go
  *  string that TypeScript never saw. */
 function guestDriver(): string {

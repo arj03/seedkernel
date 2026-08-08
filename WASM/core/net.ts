@@ -4,7 +4,7 @@ export type PeerId = string;
  *
  *  There is no inbound sink here. Attribution is the transport's output, so inbound
  *  content arrives as *attributed* traffic through the transport slot's own seam
- *  (cap-bridge `TransportSink`) and never as raw frames on this shape. The `onFrame`
+ *  (guest-seam `TransportSink`) and never as raw frames on this shape. The `onFrame`
  *  member this interface used to carry was the last of the pre-split arrangement: a
  *  field the driver wrote and nothing ever read. */
 export interface Endpoint {

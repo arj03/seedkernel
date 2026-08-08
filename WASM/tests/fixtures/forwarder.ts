@@ -7,7 +7,7 @@
 // It echoes its input: the host stages bytes at `scratch`, calls `handle`, and reads
 // the response back from `scratch` (README §4). Returning `input_len` hands the same
 // bytes straight back — so a caller reaching it by name (host `callModule`, or a
-// guest through the cap-bridge by its bare name, §12.2) gets its payload returned.
+// guest through the guest seam by its bare name, §12.2) gets its payload returned.
 //
 // Not a chat module: the chat-shell demo has its own modules under
 // assembly/chat-app-v*.

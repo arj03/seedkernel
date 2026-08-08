@@ -110,7 +110,7 @@ func serveNode(t *testing.T, authorPub []byte) nodeStatus {
 // A guest app serves its request side from its own confined realm: the shell resolves
 // the protocol to the app, then calls the guest's synchronous `handle` (§12.8). This
 // wires the whole stack — a real socket, the shared Transport, the protocol routing, the
-// cap-bridge the shell built from the manifest's declared domains, and the realm — and
+// guest seam the shell built from the manifest's declared domains, and the realm — and
 // proves it against a storage-shaped app: a peer stores a value and fetches it back.
 func TestServeGuestApp(t *testing.T) {
 	author, authorPub := testAuthor(t)

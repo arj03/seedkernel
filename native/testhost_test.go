@@ -114,50 +114,52 @@ func applyPolicy(policyJSON string) error {
 	return err
 }
 
-// testCapBridgeJS installs __buildCapBridge / __callBridge: a TEST-ONLY convenience
-// over the shared createCapBridge, so a test can hand a realm a capability funnel with
-// no signed bundle behind it. Production never takes this path — createShell builds
-// the bridge from the admitted manifest's declared requires (§12.2) — which is why this
+// testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience
+// over the shared createGuestSeam, so a test can hand a realm a capability funnel with
+// no signed bundle behind it. Production never takes this path — createShell wires the
+// seam from the admitted manifest's declared requires (§12.2) — which is why this
 // lives in a _test file and not in the shipped glue.
-const testCapBridgeJS = `
+const testGuestSeamJS = `
 "use strict";
-globalThis.__buildCapBridge = function (names, identity, transport, peers, scope) {
-  globalThis.__capBridge = createCapBridge({
-    sodium, identity, fs,
-    // No app behind this harness, so a bare name reaches nothing. Nothing to scope
-    // either: the bridge is built against ONE app's module map, so "a guest reaches
-    // only its own modules" needs no argument here to stay true.
-    callModule: () => null,
-    hasModule: () => false,
-    transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
-    peers: () => peers || [],
-    now: () => Date.now(),
-    // The granted names, straight through: a call resolves iff the name itself is
-    // one of these (or crypto/*, or one of the bundle's own modules — never grants).
-    allowedNames: names,
-    signScope: scope || undefined,
+globalThis.__buildGuestSeam = function (names, identity, transport, peers, scope) {
+  globalThis.__guestSeam = createGuestSeam({
+    // Per NODE.
+    platform: { sodium, identity, peers: () => peers || [], now: () => Date.now() },
+    // Per REALM: the granted names straight through — a call resolves iff the name
+    // itself is one of these (or crypto/*, or one of the bundle's own modules — never
+    // grants) — plus the backends behind them.
+    grants: {
+      names,
+      signScope: scope || undefined,
+      fs,
+      transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
+    },
+    // Per APP: no app behind this harness, so a bare name reaches nothing. Nothing to
+    // scope either — the seam is wired against ONE app's module map, so "a guest
+    // reaches only its own modules" needs no argument here to stay true.
+    modules: { call: () => null, has: () => false },
   });
-  return __capBridge;
+  return __guestSeam;
 };
-globalThis.__callBridge = (name, ab) => __capBridge(name, new Uint8Array(ab));
+globalThis.__callSeam = (name, ab) => __guestSeam(name, new Uint8Array(ab));
 // The round-tripping names — net/send and every fs/* — hand back a Promise (§12.2),
 // so a caller that wants their bytes has to settle it. Driven through callRealm,
 // which already knows how to pump the loop until a realm promise settles.
-globalThis.__callBridgeAwait = async (name, ab) => __capBridge(name, new Uint8Array(ab));
+globalThis.__callSeamAwait = async (name, ab) => __guestSeam(name, new Uint8Array(ab));
 `
 
-// capBridgeRealm boots a realm and adds the test-only cap-bridge builder above.
-func capBridgeRealm(tb testing.TB) {
+// guestSeamRealm boots a realm and adds the test-only guest-seam builder above.
+func guestSeamRealm(tb testing.TB) {
 	tb.Helper()
 	bootRealm(tb)
-	if _, err := qc.Eval("test-capbridge.js", qjs.Code(testCapBridgeJS)); err != nil {
-		tb.Fatal("test cap-bridge:", err)
+	if _, err := qc.Eval("test-guest-seam.js", qjs.Code(testGuestSeamJS)); err != nil {
+		tb.Fatal("test guest-seam:", err)
 	}
 }
 
 // newTestRealm creates a confined realm through the SAME factory production uses
 // (createRealm, host/native-shim.ts) over a bridge the caller has already installed at
-// `__capBridge`, and parks it at `__realm`. `source` is fronted with the shared cap
+// `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared cap
 // preamble and the given APP config, mirroring what createShell composes for a real
 // bundle's guest.
 func newTestRealm(tb testing.TB, appJSON, source string) {
@@ -174,7 +176,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {
-			globalThis.__realm = await createRealm({ source: __src, bridge: __capBridge,
+			globalThis.__realm = await createRealm({ source: __src, bridge: __guestSeam,
 				deadlineMs: __deadlineMs || undefined });
 			globalThis.__realmCall = (entry, arg) => __realm.call(entry, new Uint8Array(arg));
 			return new Uint8Array(0);
