@@ -11,10 +11,10 @@ import (
 
 // The shared guest-seam.ts runs in the host realm over the Go
 // primitives (sodium + fs), reused verbatim. Each name is exercised through the
-// single `__guestSeam(name, bytes)` funnel and checked against the underlying
-// primitive, plus the cap-domain gate (a name under an undeclared prefix is refused).
+// single `__guestSeam(name, bytes)` seam and checked against the underlying
+// primitive, plus the name gate (an undeclared authority is refused).
 
-// The names of guest-seam.ts's cap catalog, written here so a rename shows up as
+// The names of guest-seam.ts's catalog, written here so a rename shows up as
 // one edit rather than as bare strings scattered through the assertions.
 const (
 	nameSign     = "node/sign"
@@ -45,7 +45,7 @@ func TestGuestSeamOps(t *testing.T) {
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
 		__buildGuestSeam(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 
 	call := func(name string, payload []byte) (*qjs.Value, error) {
@@ -66,7 +66,7 @@ func TestGuestSeamOps(t *testing.T) {
 	}
 
 	// The node pubkey. JsTypedArrayToGo copies on read and leaves __id.publicKey intact
-	// for the bridge's own use, so it can be read directly.
+	// for the seam's own use, so it can be read directly.
 	pk := jsBytes(t, qc, `__id.publicKey`)
 
 	// A primitive is reached BY NAME through the `crypto/` prefix, so there is no op
@@ -171,9 +171,9 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatal("net/peers resolved despite not being a declared name")
 	}
 	// And raw net is not merely undeclared here — it is the transport slot's, so no app
-	// bridge is ever wired one.
+	// seam is ever wired one.
 	if _, err := call(nameLinkSend, make([]byte, 8)); err == nil {
-		t.Fatal("a link/* name resolved on an app bridge")
+		t.Fatal("a link/* name resolved on an app seam")
 	}
 }
 

@@ -15,7 +15,7 @@
  *                           keeps the catalog PURELY FUNCTIONAL — a bundle draws
  *                           its coins from `RANDOM`, an authority, and hands them
  *                           in, exactly as an ephemeral X25519 pair is `RANDOM(32)`
- *                           plus `x25519/dh` (cap-bridge.ts).
+ *                           plus `x25519/dh` (guest-seam.ts).
  *  - CUSTOM_MEMCPY/SET      mlkem-native's whole libc dependency is memcpy and
  *                           memset (STDLIB.md). Supplying both here means the build
  *                           needs no sysroot, no wasi-libc, no emscripten — just

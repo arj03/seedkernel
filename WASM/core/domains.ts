@@ -60,9 +60,9 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  versions is defined.** It is the same kind of thing they are — a number naming which
  *  version of a contract a signed document was written for, read by the loader before
  *  anything is trusted — and putting it here is what keeps the loader from importing the
- *  guest bridge to check a manifest field. That edge would drag the whole name catalog
+ *  guest seam to check a manifest field. That edge would drag the whole name catalog
  *  and preamble into every page that verifies a bundle, including pages that only
- *  inspect one and never build a bridge at all. guest-seam.ts re-exports it, so a
+ *  inspect one and never build a seam at all. guest-seam.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
 export const GUEST_ABI_VERSION = 3;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
@@ -138,7 +138,7 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  The table IS what says which bundle is the mount; there is no role field, because
  *  the requires already carry the fact and the signature already covers them.
  *
- *  The one-file rule: the bridge's dispatch table is TYPED against `CapabilityName`
+ *  The one-file rule: the seam's dispatch table is TYPED against `CapabilityName`
  *  (a key here without a handler is a compile error) and walked against its own key
  *  set at construction (the compiled-JS half the native target evaluates, and the
  *  check a typo'd extra key trips). Adding a name here is the whole cost of a new op. */
@@ -170,7 +170,7 @@ export const AUTHORITY_CALLS = {
     "transport/link-down": "mount:report",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
-/** Whether a name is a *grant* — the one question the bridge's gate asks, and the one
+/** Whether a name is a *grant* — the one question the seam's gate asks, and the one
  *  the manifest does not answer. `crypto/*` and a bundle's own module names are false
  *  here by being absent from `AUTHORITY_CALLS` rather than by a parse of their prefix: a
  *  primitive is a function of its arguments and a module is the asking bundle's own, so

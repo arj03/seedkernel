@@ -6,7 +6,7 @@
 // disqualified on exactly this; see the ShadowRealm probes). The single seam to the
 // outside is one injected host function, `__host_call`, which funnels every capability
 // access through a copy-model byte boundary, the same shape as the ModuleTable's own
-// module bridges.
+// `callModule(name, payload) -> bytes`.
 //
 // Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
 // `host.call(name, bytes)` resolves a **sync name** (the primitive catalog, clock,
@@ -57,22 +57,21 @@ const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
-import { guestPreamble } from "./guest-seam.js";
+import { guestPreamble, type HostCall } from "./guest-seam.js";
 import { serializeCalls } from "./realm-queue.js";
 
-/** The one capability seam. `name` addresses a host capability by its opaque name
- *  (net / fs / crypto / clock / rand, mapped by the host); `payload`/return are opaque
- *  bytes, exactly like the table's `callModule(name, payload) -> bytes`. A sync name returns bytes
- *  directly; a round-tripping one — `net/send` and every `fs/*` — returns a Promise the
- *  guest awaits. */
-export type SafeRealmBridge = (name: string, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+/** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
+ *  caller standing one up. It is DECLARED in guest-seam.ts, beside the names it carries:
+ *  this file is a realm *factory*, one consumer of the seam among two, and the signature
+ *  of what the seam produces is not a consumer's to own. */
+export type { HostCall };
 
 export interface SafeRealmOptions {
   /** Guest source. Runs in the sandbox; registers entrypoints via the injected
    *  `register(name, fn)` (see the preamble below). */
   source: string;
-  /** The single host capability funnel. */
-  bridge: SafeRealmBridge;
+  /** The seam this realm calls out through — its whole view of the host. */
+  hostCall: HostCall;
   /** Hard cap on the realm's heap (default 64 MiB). A runaway guest hits this
    *  instead of the host's memory. */
   memoryLimitBytes?: number;
@@ -81,7 +80,7 @@ export interface SafeRealmOptions {
    *  surfaces to the caller as a thrown error.
    *
    *  This measures time the guest is actually **running**, not wall clock: the budget
-   *  is stopped whenever the guest is parked awaiting a host bridge and resumed when
+   *  is stopped whenever the guest is parked awaiting a host seam and resumed when
    *  its continuation runs (see `execClock`). That is what lets one number be correct
    *  for both roles — an initiator legitimately spends seconds parked on a network
    *  request without spending any of its budget, while a holder that loops forever
@@ -97,7 +96,7 @@ export interface SafeRealm {
   /** Invoke a guest entrypoint — the **only** way into the realm, for both roles: the
    *  initiator that may `await` net, and the holder answering an inbound request. The arg
    *  and result cross as raw bytes (the copy model). Resolves when the guest promise
-   *  settles, including all awaited host bridges.
+   *  settles, including all awaited host calls.
    *
    *  **Invocations are serialized per realm.** A call does not begin until the previous
    *  one has settled, so no two guest frames are ever in flight in one realm and neither
@@ -133,7 +132,7 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
  *  during which guest code actually holds the thread. A segment opens when the host
  *  enters the realm — `evalCode` for an entrypoint, `callFunction` + `executePendingJobs`
  *  when settling a parked net op — and closes when control returns to the host. Time
- *  between segments, which is the host awaiting a bridge on the guest's behalf, is
+ *  between segments, which is the host awaiting the seam on the guest's behalf, is
  *  nobody's budget.
  *
  *  Without the split, one number cannot serve both roles: an initiator parked 2s on a
@@ -321,12 +320,12 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // The single seam. QuickJS calls it synchronously: a sync name resolves to its bytes
   // and we hand the ArrayBuffer straight back; a net/fs name genuinely round-trips, so
   // we return null — the preamble parks a Promise under callId — and settle it when the
-  // bridge promise resolves. Returning null (rather than a host-created deferred) is
+  // seam's promise resolves. Returning null (rather than a host-created deferred) is
   // what keeps this seam identical to the native loader's; see guestPreamble.
-  const hostCall = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
+  const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    const result = opts.bridge(name, copyPayload(ctx, payloadHandle));
+    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle));
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
       // Sync name — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
@@ -344,8 +343,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     );
     return ctx.null;
   });
-  ctx.setProp(ctx.global, "__host_call", hostCall);
-  hostCall.dispose();
+  ctx.setProp(ctx.global, "__host_call", hostCallFn);
+  hostCallFn.dispose();
 
   // Load the ABI preamble, then the guest. Neither has authority. Each eval's completion
   // value (the trailing assignment) is an owned handle — dispose it so nothing leaks past
@@ -376,7 +375,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       pumpJobs();
     } finally {
       // Closed before the await below: everything past this point is the host
-      // waiting on a bridge, which is not the guest's time to spend.
+      // waiting on the seam, which is not the guest's time to spend.
       clock.end();
       // resolvePromise has consumed the value; the eval handle is no longer needed
       // and must go back even when pumpJobs throws above — an orphaned handle keeps
@@ -395,7 +394,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       pending.delete(rejectThis);
       // An invocation that lost the race to failPending — a budget interrupt or
       // dispose() — has no consumer for the settled result. If the guest promise
-      // still settles afterwards (a bridge op resolving after the interrupt), its
+      // still settles afterwards (a seam op resolving after the interrupt), its
       // dup'd result handle would be orphaned, keeping the value on the runtime's
       // GC list and aborting the module at runtime free. Release it when it lands.
       // Safe by construction: `consumed` is set by the await continuation above,

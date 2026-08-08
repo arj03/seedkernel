@@ -191,8 +191,8 @@ func applyPolicy(policyJSON string) error {
 }
 
 // testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience
-// over the shared createGuestSeam, so a test can hand a realm a capability funnel with
-// no signed bundle behind it. Production never takes this path — createShell wires the
+// over the shared createGuestSeam, so a test can hand a realm a seam with no signed
+// bundle behind it. Production never takes this path — createShell wires the
 // seam from the admitted manifest's declared requires (§12.2) — which is why this
 // lives in a _test file and not in the shipped glue.
 const testGuestSeamJS = `
@@ -234,8 +234,8 @@ func guestSeamRealm(tb testing.TB) {
 }
 
 // newTestRealm creates a confined realm through the SAME factory production uses
-// (createRealm, host/native-shim.ts) over a bridge the caller has already installed at
-// `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared cap
+// (createRealm, host/native-shim.ts) over a seam the caller has already installed at
+// `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared guest
 // preamble and the given APP config, mirroring what createShell composes for a real
 // bundle's guest.
 func newTestRealm(tb testing.TB, appJSON, source string) {
@@ -252,7 +252,7 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {
-			globalThis.__realm = await createRealm({ source: __src, bridge: __guestSeam,
+			globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
 				deadlineMs: __deadlineMs || undefined });
 			globalThis.__realmCall = (entry, arg) => __realm.call(entry, new Uint8Array(arg));
 			return new Uint8Array(0);

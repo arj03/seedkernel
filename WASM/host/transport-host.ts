@@ -28,7 +28,7 @@
 // The crypto surface the guest reaches is the seam's, and it names no algorithm
 // the host understands: the record layer and the ephemeral DH go
 // through `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and
-// the transcript signature is the ordinary node/sign name, which the bridge scopes to
+// the transcript signature is the ordinary node/sign name, which the seam scopes to
 // `DOMAIN_channel ‖ networkKey` because THIS bundle claims the transport slot. The
 // host prefixes and does not read the suffix, so no handshake shape is pinned into
 // the core and the node's key never enters the guest.
@@ -436,11 +436,11 @@ export class TransportHost implements Network, HostTransport {
     return this.opts.admitPeer ? this.opts.admitPeer(pk) : true;
   }
 
-  // ── the capability backends the transport guest's bridge is wired to ────────
+  // ── the capability backends the transport guest's seam is wired to ──────────
 
   /** The RAW net capability, as this node implements it: an opaque link id over the
  *  platform's sockets. This is the whole of what the host contributes to the
- *  network, and it is wired to no bridge but the transport slot's. */
+ *  network, and it is wired to no seam but the transport slot's. */
   rawNet(): RawNet {
     return {
       open: (dest) => {
@@ -472,9 +472,9 @@ export class TransportHost implements Network, HostTransport {
   /** The platform's event loop. A fired timer re-enters the guest on its own turn,
  *  which is what keeps the no-re-entrancy invariant true for `arm`.
  *
- *  The live-timer bound is HERE rather than in the bridge, because this map is the
+ *  The live-timer bound is HERE rather than in the seam, because this map is the
  *  memory being spent — a limit belongs to whoever owns the resource — and because
- *  the bridge never learns that a timer fired, so a count kept there would only ever
+ *  the seam never learns that a timer fired, so a count kept there would only ever
  *  grow. */
   timerBackend(): HostTimers {
     return {

@@ -1,7 +1,7 @@
 package main
 
 // JsTypedArrayToGo is the JS→Go byte seam every subsystem crosses (fs.put, __net.send,
-// sodium args, capbridge payloads). The view path must copy exactly the view's window —
+// sodium args, guest-seam payloads). The view path must copy exactly the view's window —
 // O(view), not O(backing buffer) — and leave the source intact for re-reads.
 
 import (

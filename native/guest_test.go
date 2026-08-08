@@ -54,7 +54,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam(["fs/put", "fs/get"], __id, null, []);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 	newTestRealm(t, "{}", storeGuestSource)
 
@@ -105,7 +105,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 	// Twice the shared 64 MiB default (core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
 	// resolved by the shim) — mirrored here because the runtime no longer owns a copy.
@@ -146,7 +146,7 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
 		register("ok",   () => new Uint8Array([7]));
@@ -239,7 +239,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null, []);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
 		register("park", async () => {

@@ -13,7 +13,7 @@ import (
 // carry on its own. pumpAll drains the host realm and THEN the guest realms, so a host
 // job that schedules a guest job lands in the same round. The reverse does not: a guest
 // continuation that issues `await host.call("fs/*")` parks, and its settlement is a
-// HOST-realm microtask (native-shim.ts capCall attaches `.then` → bridge.realmSettle)
+// HOST-realm microtask (native-shim.ts nativeCall attaches `.then` → bridge.realmSettle)
 // queued after el.c was already drained this round. Nothing schedules the next round —
 // step() blocks with no timer and no task — so without the wake in __host_call the chain
 // advances exactly one fs call per externally-provoked round and then stops dead.
@@ -29,7 +29,7 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam(["fs/put", "fs/get", "fs/size"], __id, null, []);
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 
 	// Each iteration is PUT then GET then SIZE — three parked ops, so a 24-block run is

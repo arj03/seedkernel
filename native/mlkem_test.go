@@ -153,7 +153,7 @@ func TestMlKemThroughCatalog(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		__buildGuestSeam([], __id, null, [], appSignScope(__id, __id.publicKey, "testapp"));
 	`)); err != nil {
-		t.Fatal("build bridge:", err)
+		t.Fatal("build seam:", err)
 	}
 	prim := func(name string, args []byte) []byte {
 		t.Helper()

@@ -1,5 +1,5 @@
 // Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and
-// cap gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each
+// seam gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each
 // block is a tight loop over one seam; run.mjs covers the same ground end-to-end.
 //
 // Run: node tests/verify-hardening.mjs   (after `npm run build`)
@@ -149,7 +149,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // A holder that loops forever is interrupted rather than wedging the host thread.
   const spinner = await createSafeRealm({
     source: 'register("handle", () => { for(;;){} });',
-    bridge: noop, deadlineMs: 300,
+    hostCall: noop, deadlineMs: 300,
   });
   const t0 = Date.now();
   let interrupted = false;
@@ -159,15 +159,15 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(spent < 3000, `it is interrupted near its budget, not eventually (${spent}ms)`);
   spinner.dispose();
 
-  // The budget is guest RUN time: parking on a slow bridge does not spend it, so an
+  // The budget is guest RUN time: parking on a slow seam does not spend it, so an
   // initiator legitimately awaiting the network outlives a budget far shorter than
   // the wait. This is the case a wall-clock deadline would have killed.
-  const slowBridge = (name) => name === "slow"
+  const slowSeam = (name) => name === "slow"
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
   const waiter = await createSafeRealm({
     source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); });',
-    bridge: slowBridge, deadlineMs: 200,
+    hostCall: slowSeam, deadlineMs: 200,
   });
   const out = await waiter.call("go", new Uint8Array());
   ok(out.length === 1 && out[0] === 9, "an initiator parked 400ms on a 200ms budget still completes");
@@ -181,7 +181,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   const both = await createSafeRealm({
     source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });'
           + 'register("handle", () => new Uint8Array([2]));',
-    bridge: slowBridge, deadlineMs: 200,
+    hostCall: slowSeam, deadlineMs: 200,
   });
   const parked = both.call("go", new Uint8Array()).then((r) => { order.push("initiator"); return r; });
   const holder = both.call("handle", new Uint8Array()).then((r) => { order.push("holder"); return r; });
@@ -195,7 +195,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // entering a torn-down realm, which is what aborts the whole wasm module.
   const closing = await createSafeRealm({
     source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });',
-    bridge: slowBridge, deadlineMs: 5000,
+    hostCall: slowSeam, deadlineMs: 5000,
   });
   const first = closing.call("go", new Uint8Array()).catch(() => "failed");
   const queued = closing.call("go", new Uint8Array()).catch(() => "failed");
@@ -204,8 +204,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(await queued === "failed", "and so is one still waiting in the queue");
 
   // Default is a real number, so forgetting the field bounds the guest rather than
-  // unbounding it — the same posture as the cap gates above.
-  const defaulted = await createSafeRealm({ source: 'register("handle", () => { for(;;){} });', bridge: noop });
+  // unbounding it — the same posture as the seam gates above.
+  const defaulted = await createSafeRealm({ source: 'register("handle", () => { for(;;){} });', hostCall: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
   try { await defaulted.call("handle", new Uint8Array()); } catch { defaultInterrupted = true; }

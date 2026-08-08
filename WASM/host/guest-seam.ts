@@ -28,7 +28,6 @@ import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "..
 import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, type PrimitiveName, type CapabilityName } from "../core/domains.js";
 import { type PeerId } from "../core/net.js";
 import { type Fs } from "../core/fs.js";
-import { type SafeRealmBridge } from "./safe-js.js";
 
 /** What `node/sign` signs under — and what `node/verify` checks against — derived by
  *  the host from which admission point the asking bundle came through, never from
@@ -63,7 +62,7 @@ export interface SignScope {
 
 /** The libsodium surface the crypto names use — structural so any sumo build
  *  (the host's bundled `libsodium-wrappers-sumo`) satisfies it. */
-export interface CapSodium {
+export interface SeamCrypto {
     crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
     crypto_stream_xchacha20_xor(message: Uint8Array, nonce: Uint8Array, key: Uint8Array): Uint8Array;
     crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
@@ -87,7 +86,7 @@ export interface CapSodium {
  *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
  *  over `net/send`, so the seam needs only single-peer request/response — no
  *  host-side scatter-gather. */
-export interface CapTransport {
+export interface RequestTransport {
     request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
 }
 
@@ -174,7 +173,7 @@ export interface TransportSink {
 /** Per-NODE facts every realm on this host shares. Nothing here is a grant — a realm
  *  holds these because it is running on this node at all — so nothing here is gated. */
 export interface SeamPlatform {
-    sodium: CapSodium;
+    sodium: SeamCrypto;
     /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key
      *  SIGN uses is `grants.signScope.key`, chosen by the slot — not this. */
     identity: {
@@ -220,7 +219,7 @@ export interface SeamGrants {
      *  Optional ONLY for a bundle that never declares the `net` domain — the transport
      *  bundle itself (whose net/send would loop back into itself) is that caller.
      *  net/send without a transport throws rather than resolving to nothing. */
-    transport?: CapTransport;
+    transport?: RequestTransport;
     /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for the bundle
      *  claiming the transport slot: a confined module holds no ambient authority by
      *  construction, so nothing else can ever reach a descriptor no matter what has already
@@ -261,6 +260,18 @@ export interface GuestSeamDeps {
     modules: SeamModules;
 }
 
+/** What the seam IS — the host half of `host.call`, and what `createGuestSeam` below
+ *  returns. `name` addresses a host capability by its opaque name; `payload` and the
+ *  return are opaque bytes, exactly like the table's `callModule(name, payload) -> bytes`.
+ *  A sync name returns bytes directly; a round-tripping one — `net/send` and every
+ *  `fs/*` — returns a Promise the guest awaits (§12.2).
+ *
+ *  It is declared HERE, beside the names it can carry, rather than in the realm that
+ *  runs against it: a realm factory (safe-js.ts, native-shim.ts) is a *consumer* of the
+ *  seam, and the signature of what this file produces is not a consumer's to own. Both
+ *  factories import it from here, so the dependency runs one way. */
+export type HostCall = (name: string, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+
 /** The version of the seam defined below — re-exported so a reader of the seam finds it
  *  beside them, and so `seedkernel-wasm/guest-seam` is the import a bundle builder
  *  reaches for (it is stamping "which host contract is this guest written against",
@@ -272,7 +283,7 @@ export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../cor
  *  so the vocabulary a manifest is checked against and the table the seam dispatches
  *  through cannot drift: adding a primitive to one without the matching key in the
  *  other is a type error. */
-type CryptoCapName = `crypto/${PrimitiveName}`;
+type CryptoName = `crypto/${PrimitiveName}`;
 /** The keys the dispatch table must cover — every authority (`CapabilityName`, the keys
  *  of `AUTHORITY_CALLS` in domains.ts) and every crypto primitive. The table literal is
  *  typed against this union, so the names are written in exactly ONE place: a name added
@@ -286,7 +297,7 @@ type CryptoCapName = `crypto/${PrimitiveName}`;
  *  the name alone. The construction check below holds the invariant on the host side;
  *  `PRIMITIVE_NAMES` gets it from the `crypto/` template literal, and `AUTHORITY_CALLS`
  *  is hand-written, which is exactly the half that needs checking. */
-type HandlerKey = CapabilityName | CryptoCapName;
+type HandlerKey = CapabilityName | CryptoName;
 /** The same union as a runtime list, for the construction check below — the compiled-JS
  *  half of the one-file rule, where `HandlerKey` is not present to enforce anything.
  *  Derived here, next to the table it describes, because it is nobody else's business:
@@ -297,12 +308,12 @@ const HANDLER_KEYS: readonly string[] = [
 ];
 /** One catalog entry's implementation: argument bytes in, response bytes out (or a
  *  Promise of them, for the round-tripping `net/send` and `fs/*` names). */
-type CapHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 /** The primitive half of the catalog (§12.1): a flat name→transform map. Every entry
  *  is a pure function of its argument bytes — no host key, no entropy, no state — so
  *  nothing gates it, and a new algorithm is a catalog entry rather than an op number
  *  or an ABI rev (a host that lacks one refuses the load by name, bundle.ts). */
-function cryptoCatalog(sodium: CapSodium): Record<CryptoCapName, CapHandler> {
+function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     return {
         "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
         "crypto/ed25519/verify": (a) => {
@@ -535,7 +546,7 @@ export function transportSignScope(key: {
 /** Run without name gating: every authority resolves. For a host-side
  *  caller that already holds the primitives; never for a bundle's guest, whose reach is
  *  its manifest `requires` and nothing else (§12.2). */
-export const UNRESTRICTED_NAMES = Symbol("seedkernel.cap.unrestricted-names");
+export const UNRESTRICTED_NAMES = Symbol("seedkernel.seam.unrestricted-names");
 // Host-side allocation bounds for guest-controlled sizes. The realm's own
 // 64 MiB memory limit does not cover host allocations the guest requests, so
 // the seam caps them itself (a confined guest must not be able to size a
@@ -550,39 +561,26 @@ function u64be(value: number): Uint8Array {
     writeU32BE(out, 4, value >>> 0);
     return out;
 }
-/** Wire the one `host.call` implementation a realm runs against. Most names resolve
- *  *synchronously* (returns bytes); the ones that genuinely round-trip — `net/send` and
- *  every `fs/*` — return a Promise the guest `await`s. Which side of that line a name
- *  sits on is the ABI (§12.2), which is what `guest.abi` versions.
+/** The host half of the catalog — the ONE table of names a host call may utter, built
+ *  from the platform (crypto, identity, peers, clock) and the grants (the backends
+ *  behind the gated names). It IS the seam ABI (§12.2): the HOST names a guest can call
+ *  are the keys of the table it builds — no second list, no numbers, never a wire value.
+ *  The bundle's own modules are the catalog's other source of names, resolved past the
+ *  end of this table by the dispatch because they are the app's rather than the host's.
  *
- *  One seam serves both roles. The **holder** path awaits like the initiator does — it
- *  answers from local fs, and fs is not answerable in the same turn on a target whose
- *  storage backend is asynchronous — so the two are the same shape, and what keeps one
- *  entrypoint invocation from interleaving with the next is the realm's serialization
- *  queue (realm-queue.ts) rather than anything here. */
-export function createGuestSeam(deps: GuestSeamDeps): SafeRealmBridge {
-    const { platform, grants, modules } = deps;
+ *  A function of its two arguments and nothing else, which is the point of the split:
+ *  the same platform and grants produce the same table, so this is the whole of what a
+ *  realm may *utter*, and `createGuestSeam` below is nothing but the gate in front of it.
+ *
+ *  The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
+ *  reach nothing a guest does not already hold, so they are ungated by a rule; every
+ *  other name is an authority, gated by EXACT membership in the manifest's declared
+ *  requires. Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT,
+ *  `link/*` is the platform's raw contribution; the slot holds both, an app holds
+ *  only `net`. */
+function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
     const { sodium, identity } = platform;
     const now = platform.now ?? (() => Date.now());
-    // Checked at runtime, not only in the types: the native target evaluates the COMPILED
-    // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
-    // to enforce anything. A gate that only holds on one of two targets is not a gate, so
-    // an absent value throws here rather than resolving to the permissive branch.
-    if (grants.names === undefined) {
-        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
-    }
-    // null means "the caller named the sentinel" — never "the caller forgot".
-    const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
-    // ── the catalog — the seam ABI (§12.2), ONE table: the HOST names a guest can call
-    // are the keys of this object — no second list, no numbers, never a wire value. The
-    // bundle's own modules are the catalog's other source of names, resolved past the end
-    // of this table because they are the app's rather than the host's.
-    // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
-    // reach nothing a guest does
-    // not already hold, so they are ungated by a rule; every other name is an
-    // authority, gated by EXACT membership in the manifest's declared requires.
-    // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
-    // the platform's raw contribution; the slot holds both, an app holds only `net`.
     const fs = () => {
         if (!grants.fs)
             throw new Error("guest-seam: fs.* used but no fs backend wired");
@@ -610,7 +608,7 @@ export function createGuestSeam(deps: GuestSeamDeps): SafeRealmBridge {
     // a lookup — but a lookup that can resolve to something nobody put
     // in the table is the wrong shape for this file, and the construction check below
     // walks own keys, so it could never see them.
-    const handlers: Record<string, CapHandler> = Object.assign(Object.create(null), {
+    const handlers: Record<string, SeamHandler> = Object.assign(Object.create(null), {
         // ── the primitive seam (§12.2): a function of bytes the guest already holds ──
         // Ungated by a rule rather than by omission — computation the guest could have
         // done with code of its own, so there is nothing to grant (§12.1). The bundle's
@@ -780,7 +778,7 @@ export function createGuestSeam(deps: GuestSeamDeps): SafeRealmBridge {
             sink().linkDown(readU32BE(payload, 0), payload[4]);
             return NONE;
         },
-    } satisfies Record<HandlerKey, CapHandler>);
+    } satisfies Record<HandlerKey, SeamHandler>);
     // The one-file rule, checked at construction: every name this table dispatches
     // through is a `HandlerKey` — an authority the loader knows (`AUTHORITY_CALLS`) or a
     // primitive (`PRIMITIVE_NAMES`). A key outside that set would be a name no manifest
@@ -805,6 +803,35 @@ export function createGuestSeam(deps: GuestSeamDeps): SafeRealmBridge {
             throw new Error(`guest-seam: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
         }
     }
+    return handlers;
+}
+/** Wire the one `host.call` implementation a realm runs against. Most names resolve
+ *  *synchronously* (returns bytes); the ones that genuinely round-trip — `net/send` and
+ *  every `fs/*` — return a Promise the guest `await`s. Which side of that line a name
+ *  sits on is the ABI (§12.2), which is what `guest.abi` versions.
+ *
+ *  One seam serves both roles. The **holder** path awaits like the initiator does — it
+ *  answers from local fs, and fs is not answerable in the same turn on a target whose
+ *  storage backend is asynchronous — so the two are the same shape, and what keeps one
+ *  entrypoint invocation from interleaving with the next is the realm's serialization
+ *  queue (realm-queue.ts) rather than anything here.
+ *
+ *  The constructor is the gate plus the dispatch — nothing else. The closed set of
+ *  names comes from `hostCatalog` above (which also runs the one-file rule at
+ *  construction), so the only decision made here is the one the shell made when it
+ *  built `grants`: `allowed` and the name-based dispatch that follows from it. */
+export function createGuestSeam(deps: GuestSeamDeps): HostCall {
+    const { platform, grants, modules } = deps;
+    // Checked at runtime, not only in the types: the native target evaluates the COMPILED
+    // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
+    // to enforce anything. A gate that only holds on one of two targets is not a gate, so
+    // an absent value throws here rather than resolving to the permissive branch.
+    if (grants.names === undefined) {
+        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
+    }
+    // null means "the caller named the sentinel" — never "the caller forgot".
+    const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
+    const handlers = hostCatalog(platform, grants);
     return (name, payload) => {
         // The gate covers authorities, and a granted authority is an EXACT-name check:
         // the name itself must be one of the manifest's declared requires — an

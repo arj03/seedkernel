@@ -12,7 +12,7 @@
  * artifact instantiates identically under Node, under a browser, and under wazero
  * in the Go host with no per-target glue to disagree about (§12.9). And it is what
  * lets the KEM enter the primitive catalog at all: a catalog entry is a pure
- * function of its argument bytes (cap-bridge.ts), so the coins come from `RANDOM`
+ * function of its argument bytes (guest-seam.ts), so the coins come from `RANDOM`
  * — an authority the guest already holds — rather than from inside the primitive.
  *
  * There is no `check_pk` / `check_sk` export. FIPS 203's modulus and hash checks

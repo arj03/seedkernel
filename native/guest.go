@@ -12,7 +12,7 @@
 //
 // The async seam: a sync name (the primitive catalog, clock, module, the raw-link and
 // transport names) returns its bytes immediately. A round-tripping name — net/send and
-// every fs/* — returns null from the cap call, and the guest preamble hands the guest a
+// every fs/* — returns null from the seam, and the guest preamble hands the guest a
 // real Promise it `await`s; when the shim's promise settles it calls bridge.realmSettle
 // and this file resolves the parked guest Promise. The shared loop (loop.go) then pumps
 // the guest realm so the awaiting entrypoint resumes. There is no blocking and no
@@ -55,8 +55,8 @@ type guestRealm struct {
 	qc     *qjs.Context
 	loop   *eventLoop
 
-	capCall *qjs.Value // retained host-realm cap call — this app's whole authority
-	start   *qjs.Value // guest-realm __start — the one way in (see the file header)
+	hostCall *qjs.Value // retained host-realm seam — this app's whole authority
+	start    *qjs.Value // guest-realm __start — the one way in (see the file header)
 
 	netResolve *qjs.Value // guest-realm __netResolve (a net op fulfilled)
 	netReject  *qjs.Value // guest-realm __netReject (a net op failed)
@@ -68,7 +68,7 @@ type guestRealm struct {
 
 	// Execution budget (README §12.3), mirroring safe-js.ts's ExecClock. `budget` is the
 	// per-entrypoint allowance; `consumed` accumulates only the segments during which
-	// guest code actually holds the thread, so time the host spends awaiting a bridge on
+	// guest code actually holds the thread, so time the host spends awaiting the seam on
 	// the guest's behalf is nobody's budget. Without that split one number cannot serve
 	// both roles: an initiator parked on a 2s request would be killed by any budget tight
 	// enough to catch a holder's infinite loop.
@@ -157,8 +157,8 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 // newGuestRealm builds a confined realm running `source` — which the shell has already
 // fronted with the guest preamble, the bundle facts and the app config, so what arrives
 // here is exactly what a safe-js realm would be handed — with host.call funnelled into
-// `capCall`, a host-realm function the shell built for this app.
-func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
+// `hostCall`, a host-realm function the shell built for this app.
+func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
 	hostQc := loop.c
 	// Interruptibility is paired with the budget: armed only when there is one to
 	// enforce, so a realm explicitly run unbounded (deadlineMs: Infinity) does not pay
@@ -173,7 +173,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 	}
 	g := &guestRealm{
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
-		capCall: capCall.Dup(), calls: map[int64]*initiatorCall{},
+		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		budget: budget,
 	}
 	fail := func(err error) (*guestRealm, error) {
@@ -211,14 +211,14 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		// leaked a host-realm string and ArrayBuffer.
 		nv := hostQc.NewString(t.Args()[0].String())
 		pv := hostQc.NewArrayBuffer(payload)
-		res, err := hostQc.Invoke(g.capCall, hostQc.NewUndefined(),
+		res, err := hostQc.Invoke(g.hostCall, hostQc.NewUndefined(),
 			nv, pv, hostQc.NewInt64(t.Args()[1].Int64()))
 		pv.Free()
 		nv.Free()
 		if err != nil {
 			return nil, err
 		}
-		defer res.Free() // the cap call's own-ref result (sync bytes, or the JS_NULL immediate)
+		defer res.Free() // the seam's own-ref result (sync bytes, or the JS_NULL immediate)
 		// CONTRACT: null is RESERVED for an async name whose promise hasn't settled —
 		// net/send and every fs/* (core/fs.ts is async on every target, so the native
 		// shim's synchronous __fs primitives are still wrapped into a resolved Promise).
@@ -228,7 +228,7 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		// maps an empty module reply to NONE rather than null.
 		if res.IsNull() {
 			// The call parked, and its settlement will arrive as a HOST-realm microtask
-			// (native-shim.ts capCall attaches `.then` → bridge.realmSettle). We are running
+			// (native-shim.ts nativeCall attaches `.then` → bridge.realmSettle). We are running
 			// inside the guest pump of some round, i.e. AFTER pumpAll already drained el.c
 			// this round — so without a nudge that microtask sits unqueued-for until
 			// something else happens to wake the loop, and step() blocks with no timer and
@@ -554,7 +554,7 @@ func (g *guestRealm) close() {
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 	g.settleAll("guest realm closed")
-	g.capCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
+	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()
 	g.rt = nil
 }

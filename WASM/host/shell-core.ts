@@ -19,21 +19,21 @@
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createGuestSeam, appSignScope, transportSignScope, type CapSodium } from "./guest-seam.js";
+import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall } from "./guest-seam.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { MOUNT_GROUPS } from "../core/domains.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
-import { type SafeRealm, type SafeRealmBridge } from "./safe-js.js";
+import { type SafeRealm } from "./safe-js.js";
 import { type Network, type PeerId } from "../core/net.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
- *  (BundleCrypto) plus the guest seam's crypto ops (CapSodium). Any sumo libsodium
+ *  (BundleCrypto) plus the guest seam's crypto ops (SeamCrypto). Any sumo libsodium
  *  build satisfies both. */
-export type ShellSodium = BundleCrypto & CapSodium;
+export type ShellSodium = BundleCrypto & SeamCrypto;
 
 /** The one reason a bundle load is refused without being an error worth reporting:
  *  the policy predicate said no (§12.4). The transport mount's installers treat this
@@ -57,7 +57,7 @@ export function isAdmissionRejected(err: unknown): boolean {
  *  decide "omitted means what"; a factory that is called directly may still default. */
 export type RealmFactory = (opts: {
     source: string;
-    bridge: SafeRealmBridge;
+    hostCall: HostCall;
     memoryLimitBytes?: number;
     /** Budget of guest *execution* time per entrypoint invocation, in ms. Omitted ⇒ the
      *  factory's own default — which is the shared `DEFAULT_GUEST_DEADLINE_MS` on both
@@ -178,7 +178,7 @@ export interface CreateShellOptions {
     /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒ the
      *  shared default (`DEFAULT_GUEST_DEADLINE_MS`, core/wasm-limits.ts — 5s, §16.1).
      *  Counts time the guest is *running*, not time
-     *  it spends parked on a host bridge, so it bounds a wedged guest without penalising
+     *  it spends parked on a host seam, so it bounds a wedged guest without penalising
      *  one legitimately awaiting the network. `Infinity` disables it.
      *
      *  This is the operator's number, not the author's: unlike the module memory ceiling
@@ -412,7 +412,7 @@ export function createShell(opts: CreateShellOptions & {
     let transportSlot: TransportSlot | null = null;
     let transportKey: string | null = null;
     /** The transport driver, standing once the transport bundle is mounted. The app
-     *  bridges and the shell's net/transport fields read this indirection, so the
+     *  seams and the shell's net/transport fields read this indirection, so the
      *  shell can be assembled before any bundle loads. */
     let netHost: TransportHost | null = null;
     const noTransport = (what: string): never => {
@@ -448,7 +448,7 @@ export function createShell(opts: CreateShellOptions & {
         if (!slot.realmP) {
             slot.realmP = platform.createRealm({
                 source: guestFullSource(slot.loaded),
-                bridge: seamFor(slot.loaded, null),
+                hostCall: seamFor(slot.loaded, null),
                 memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
                 deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
             }).then((r) => { slot.realm = r; return r; },
@@ -547,7 +547,7 @@ export function createShell(opts: CreateShellOptions & {
      *  losing the transport it already had. */
     const standTransport = async (slot: TransportSlot) => {
         // The driver is built BEFORE the realm and attached after, because the realm's
-        // bridge resolves the slot's ops here: the guest reaches sockets, timers and the
+        // seam resolves the slot's ops here: the guest reaches sockets, timers and the
         // sink through the ordinary seam, so the object serving them has to exist first.
         // `attach` is what sends the one config turn.
         const driver = new TransportHost({
@@ -564,13 +564,13 @@ export function createShell(opts: CreateShellOptions & {
             maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
             maxHalfOpenVerified: opts.transportHalfOpen?.verified,
         });
-        // Not `ensureRealm`: this realm's bridge is the only one wired to a driver, so it
+        // Not `ensureRealm`: this realm's seam is the only one wired to a driver, so it
         // cannot be the one a lazy caller would have built. Both fields are set for the
         // same reason they exist — `realm` so a handover can dispose it synchronously,
         // `realmP` so nothing later mistakes an occupied slot for an empty one.
         slot.realm = await platform.createRealm({
             source: guestFullSource(slot.loaded),
-            bridge: seamFor(slot.loaded, driver),
+            hostCall: seamFor(slot.loaded, driver),
             memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
@@ -699,7 +699,7 @@ export function createShell(opts: CreateShellOptions & {
             // already covers and `verifyManifest` has already checked. Restating that as a
             // self-description, or as a choice of method, would be a second place for the
             // same fact to live — and the requires are the one that must be right anyway,
-            // because they are what the bridge actually wires.
+            // because they are what the seam actually wires.
             //
             // An author cannot climb into the mount by declaring them, which is the
             // property the whole split exists for: adding `link/open` moves a bundle onto

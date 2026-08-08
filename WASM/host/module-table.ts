@@ -190,7 +190,7 @@ export class ModuleTable {
    *  call handle(input_len), read the response back from the same offset. The generic
    *  "run a transform" primitive: the host uses it directly, and a guest reaches it
    *  through the guest seam by its bare name (README §12.2) — with the app key bound at
-   *  bridge construction, so `module` is the LOGICAL name from the guest's own manifest
+   *  seam construction, so `module` is the LOGICAL name from the guest's own manifest
    *  and a guest cannot address another app's modules by naming one. Modules cannot
    *  call back, so there is no re-entrancy. */
   callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null {

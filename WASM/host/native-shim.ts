@@ -37,11 +37,12 @@ import { isAdmissionRejected } from "./shell-core.js";
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 
-/** The guest→host seam Go calls into. A null return means the call parked: Go holds
- *  the guest's Promise under `callId` and settles it later through
- *  `bridge.realmSettle` — the same null-means-async contract safe-js.ts implements.
- *  A sync name returns its bytes here instead. */
-type CapCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
+/** The seam as Go calls into it — `HostCall` (guest-seam.ts) in the currency this
+ *  boundary carries. A null return means the call parked: Go holds the guest's Promise
+ *  under `callId` and settles it later through `bridge.realmSettle` — the same
+ *  null-means-async contract safe-js.ts implements. A sync name returns its bytes here
+ *  instead. */
+type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
 /** The module table and realm plumbing Go exposes (main.go). */
 declare const bridge: {
@@ -67,7 +68,7 @@ declare const bridge: {
   logErr(line: string): void;
   /** Raw bytes on stdout — `--get` with no `--out` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
-  createRealm(source: string, capCall: CapCall, memoryLimitBytes: number, deadlineMs: number): number;
+  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
   realmCall(realm: number, entry: string, payload: Uint8Array,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): void;
   realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
@@ -408,7 +409,7 @@ const embeddedTransportAuthor = (() => {
  *  driven by Go's event loop. safe-js.ts is the JS platform's answer to the same
  *  seam; both present the same `SafeRealm`, so the shell drives either.
  *
- *  The promise plumbing stays here rather than in Go: `capCall` closes over this
+ *  The promise plumbing stays here rather than in Go: `nativeCall` closes over this
  *  realm, so a settled net op routes to the realm that parked it structurally, and
  *  an initiator's result is delivered into a Promise built in plain ECMAScript. Go
  *  needs no promise primitive of its own. */
@@ -423,18 +424,18 @@ const embeddedTransportAuthor = (() => {
 // argument is inert in the vendored qjs.wasm (a 1 ms limit does not interrupt a spinning
 // loop), so guest.go arms a wazero deadline instead. That makes a budget kill fatal to the
 // realm rather than a catchable JS error — see qjs.Runtime.Budget.
-const createRealm: RealmFactory = async ({ source, bridge: capBridge, memoryLimitBytes, deadlineMs }) => {
+const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
     // Assigned before any guest code can call back: bridge.createRealm evaluates the
     // guest, whose top-level can only reach sync names (a Promise it could not await).
     let realm: number;
-    const capCall: CapCall = (name, payload, callId) => {
-        const r = capBridge(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
+    const nativeCall: NativeHostCall = (name, payload, callId) => {
+        const r = hostCall(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
             return r as Uint8Array;
         (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)));
         return null;
     };
-    realm = bridge.createRealm(source, capCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
+    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
     let disposed = false;
     return {
         // Serialized here, in the shared TS, rather than in Go: the guarantee is the

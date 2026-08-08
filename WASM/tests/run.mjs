@@ -580,7 +580,7 @@ async function testFsKeyRule() {
 // it through the seam's single-peer net/send name, concurrently, from an async
 // safe-js realm — proving the round trips genuinely overlap in one realm.
 
-async function testCapBridge() {
+async function testGuestSeam() {
   console.log("Test: guest seam — generic primitive capabilities, no app vocabulary (step 7)");
 
   const id = generateKeyPair();
@@ -600,7 +600,7 @@ async function testCapBridge() {
   // namespace (README §12.2); a real node derives it from the manifest's (author, app).
   const signScope = appSignScope(id, id.publicKey, "testapp");
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
-  const bridge = createGuestSeam({
+  const seam = createGuestSeam({
     platform: { sodium, identity: id, peers: () => [toHex(id.publicKey)] },
     grants: { names: UNRESTRICTED_NAMES, signScope, fs, transport },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
@@ -616,7 +616,7 @@ async function testCapBridge() {
     // Primitives are reached BY NAME through the `crypto/` prefix: there is no op
     // number per algorithm, so adding one is a catalog entry and the seam never learns
     // what a cipher suite is.
-    const prim = (name, argBytes) => bridge(`crypto/${name}`, argBytes);
+    const prim = (name, argBytes) => seam(`crypto/${name}`, argBytes);
     const msg = U(1, 2, 3, 4, 5);
     assert(bytesEqual(await prim("blake2b-256", msg), sodium.crypto_generichash(32, msg)), "crypto/blake2b-256, by name");
     const key = sodium.randombytes_buf(32), nonce = sodium.randombytes_buf(24);
@@ -626,20 +626,20 @@ async function testCapBridge() {
     // node/verify applies the SAME scope host-side, so a guest checks a signature by
     // naming the key, never by reconstructing the prefix the host owns.
     const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
-    const sig = await bridge("node/sign", msg);
+    const sig = await seam("node/sign", msg);
     const preimage = concatBytes([DOMAIN_GUEST, scopeBytes, msg]);
     assert(sodium.crypto_sign_verify_detached(sig, preimage, id.publicKey), "node/sign signs DOMAIN_guest ‖ scope ‖ msg under the node identity");
     assert(!sodium.crypto_sign_verify_detached(sig, msg, id.publicKey), "node/sign never signs the raw message (scoped, not raw)");
-    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "node/verify accepts what node/sign signed — the same scope, host-applied");
-    assertEqual((await bridge("node/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "node/verify rejects the signature under a different key");
-    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "node/verify rejects a forged message");
+    assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, msg])))[0], 1, "node/verify accepts what node/sign signed — the same scope, host-applied");
+    assertEqual((await seam("node/verify", concatBytes([otherKey.publicKey, sig, msg])))[0], 0, "node/verify rejects the signature under a different key");
+    assertEqual((await seam("node/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "node/verify rejects a forged message");
     // A mis-framed call is not a failed verification: too few bytes to hold [pk][sig]
     // throws, where 0 would have been a verdict about bytes nothing checked. The bound
     // is exactly the fixed prefix — an empty message is a legitimate question.
-    const emptySig = await bridge("node/sign", new Uint8Array(0));
-    assertEqual((await bridge("node/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "node/verify takes an empty message — 96 bytes is a whole call");
+    const emptySig = await seam("node/sign", new Uint8Array(0));
+    assertEqual((await seam("node/verify", concatBytes([id.publicKey, emptySig])))[0], 1, "node/verify takes an empty message — 96 bytes is a whole call");
     let verifyThrew = false;
-    try { await bridge("node/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
+    try { await seam("node/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
     assert(verifyThrew, "node/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
     assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "crypto/ed25519/verify accepts the scoped preimage — the raw primitive node/verify wraps");
     assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "crypto/ed25519/verify rejects a forged message");
@@ -649,11 +649,11 @@ async function testCapBridge() {
     // Derandomized, so the coins come from node/random (an authority the guest holds)
     // and the entry stays a pure function.
     {
-      const seed = await bridge("node/random", U(0, 0, 0, 64));
+      const seed = await seam("node/random", U(0, 0, 0, 64));
       const kp = await prim("ml-kem-768/keypair", seed);
       assertEqual(kp.length, 1184 + 2400, "crypto/ml-kem-768/keypair returns [pk 1184][sk 2400]");
       const kemPk = kp.slice(0, 1184), kemSk = kp.slice(1184);
-      const coins = await bridge("node/random", U(0, 0, 0, 32));
+      const coins = await seam("node/random", U(0, 0, 0, 32));
       const enc = await prim("ml-kem-768/encaps", concatBytes([kemPk, coins]));
       assertEqual(enc[0], 1, "crypto/ml-kem-768/encaps accepts a well-formed encapsulation key");
       assertEqual(enc.length, 1 + 1088 + 32, "encaps returns [ok][ct 1088][ss 32]");
@@ -678,19 +678,19 @@ async function testCapBridge() {
       assert(!bytesEqual(implicit.slice(1), ss), "…but derives an unrelated shared secret");
     }
 
-    assert(bytesEqual(await bridge("node/identity", U()), id.publicKey), "node/identity = the node pubkey");
-    assertEqual((await bridge("node/random", U(0, 0, 0, 16))).length, 16, "node/random returns n bytes");
-    assertEqual((await bridge("clock/now", U())).length, 8, "clock/now returns a u64");
+    assert(bytesEqual(await seam("node/identity", U()), id.publicKey), "node/identity = the node pubkey");
+    assertEqual((await seam("node/random", U(0, 0, 0, 16))).length, 16, "node/random returns n bytes");
+    assertEqual((await seam("clock/now", U())).length, 8, "clock/now returns a u64");
 
     // fs.* over the raw backend
     const fk = new TextEncoder().encode("dead.blk"), fv = U(7, 7, 7);
-    await bridge("fs/put", concatBytes([U(0, 0, 0, fk.length), fk, fv]));
-    const got = await bridge("fs/get", fk);
+    await seam("fs/put", concatBytes([U(0, 0, 0, fk.length), fk, fv]));
+    const got = await seam("fs/get", fk);
     assert(got[0] === 1 && bytesEqual(got.slice(1), fv), "fs/put + fs/get round-trips under an opaque key");
-    assertEqual((await bridge("fs/get", new TextEncoder().encode("missing")))[0], 0, "fs/get of an absent key → [0]");
-    const szPresent = await bridge("fs/size", fk);
+    assertEqual((await seam("fs/get", new TextEncoder().encode("missing")))[0], 0, "fs/get of an absent key → [0]");
+    const szPresent = await seam("fs/size", fk);
     assertEqual(new DataView(szPresent.buffer, szPresent.byteOffset).getUint32(0, false), fv.length, "fs/size returns the value's byte length");
-    const szAbsent = await bridge("fs/size", new TextEncoder().encode("missing"));
+    const szAbsent = await seam("fs/size", new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "fs/size of an absent key → -1 (0xFFFFFFFF)");
 
     // Sync vs async, and which side of that line a name sits on is the ABI (§12.2): a
@@ -698,24 +698,24 @@ async function testCapBridge() {
     // genuinely round-trip and hand back a Promise. Which side a name sits on is what
     // `guest.abi` versions, which is why it is declared and checked rather than assumed.
     assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
-    assert(bridge("fs/size", fk) instanceof Promise, "fs/size returns a Promise (fs round-trips)");
-    assert(bridge("net/peers", U()) instanceof Uint8Array, "net/peers is synchronous");
+    assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise (fs round-trips)");
+    assert(seam("net/peers", U()) instanceof Uint8Array, "net/peers is synchronous");
     const protoEnc = new TextEncoder().encode("_test");
     const sendFrame = concatBytes([id.publicKey, U(protoEnc.length), protoEnc, U(7)]);
-    const sendResult = bridge("net/send", sendFrame);
+    const sendResult = seam("net/send", sendFrame);
     assert(sendResult instanceof Promise, "net/send returns a Promise (a real round trip)");
     await sendResult.catch(() => {}); // drain (no live peer) so it doesn't dangle
 
     // net/peers
-    const peers = await bridge("net/peers", U());
+    const peers = await seam("net/peers", U());
     assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "net/peers counts the cohort");
 
     // A bare name reaches this app's module by its LOGICAL name — the same `host.call`
     // shape as every other name, with no second framing (§12.2), and the app key is the
-    // one the bridge was built with, never something the caller supplies.
-    assertEqual([...await bridge("echo", U(8, 9))], [8, 9], "a bare name invokes this app's module");
+    // one the seam was built with, never something the caller supplies.
+    assertEqual([...await seam("echo", U(8, 9))], [8, 9], "a bare name invokes this app's module");
     let noSuch = false;
-    try { await bridge("nosuchmodule", U(1)); } catch { noSuch = true; }
+    try { await seam("nosuchmodule", U(1)); } catch { noSuch = true; }
     assert(noSuch, "a bare name this app never installed is refused, like any unknown name");
   } finally {
     transport.close();
@@ -1245,7 +1245,7 @@ async function testGuestBundleAndArchive() {
 // host-call seam. This is a seedkernel capability (`./safe-js`); storage's
 // Tier-2 orchestration is built on top of it and tested in seedstore. Proves the
 // three load-bearing properties — airtight by construction, the Asyncify async
-// seam + byte boundary, and realm isolation — with stand-in bridges.
+// seam + byte boundary, and realm isolation — with stand-in seams.
 
 async function testSafeJs() {
   console.log("Test: safe-js — zero-authority JS confinement (§2.1)");
@@ -1265,7 +1265,7 @@ async function testSafeJs() {
         return out;
       });
     `;
-    const realm = await createSafeRealm({ source: probeSrc, bridge: async () => new Uint8Array() });
+    const realm = await createSafeRealm({ source: probeSrc, hostCall: async () => new Uint8Array() });
     const res = await realm.call("probe", new Uint8Array());
     for (let i = 0; i < DANGER.length - 1; i++) {
       assertEqual(res[i], 0, `${DANGER[i]} is unreachable in the realm`);
@@ -1280,7 +1280,7 @@ async function testSafeJs() {
         catch { return new Uint8Array([0]); }
       });
     `;
-    const realm = await createSafeRealm({ source: src, bridge: async () => new Uint8Array() });
+    const realm = await createSafeRealm({ source: src, hostCall: async () => new Uint8Array() });
     const res = await realm.call("tryImport", new Uint8Array());
     assertEqual(res[0], 0, "import('node:fs') rejects — no path out of the realm");
     realm.dispose();
@@ -1289,9 +1289,9 @@ async function testSafeJs() {
   // 2. The seam: a sync name returns bytes directly (no yield); a net-like name returns a
   //    real Promise the guest awaits. Bytes round-trip across the copy boundary both ways.
   {
-    let bridgeCalls = 0;
-    const bridge = (name, payload) => {
-      bridgeCalls++;
+    let hostCalls = 0;
+    const hostCall = (name, payload) => {
+      hostCalls++;
       if (name === "inc") return payload.map((b) => (b + 1) & 0xff);                          // sync name — bytes directly
       if (name === "slow") return sleep(3).then(() => payload.map((b) => (b + 1) & 0xff));     // net-like name — a Promise
       return new Uint8Array();
@@ -1300,13 +1300,13 @@ async function testSafeJs() {
       register("sync", (arg) => host.call("inc", arg));                  // sync name: host.call returns bytes, no await
       register("net", async (arg) => { return await host.call("slow", arg); });  // net-like name: a genuinely awaited Promise
     `;
-    const realm = await createSafeRealm({ source: src, bridge });
+    const realm = await createSafeRealm({ source: src, hostCall });
     const input = new Uint8Array([0, 1, 2, 254, 255]);
     const sync = await realm.call("sync", input);
     assertEqual([...sync], [1, 2, 3, 255, 0], "sync name: bytes crossed in and back with no promise");
     const asyncR = await realm.call("net", input);
     assertEqual([...asyncR], [1, 2, 3, 255, 0], "net-like name: await host.call resolves the real Promise");
-    assert(bridgeCalls === 2, "the host bridge was invoked for each call");
+    assert(hostCalls === 2, "the host seam was invoked for each call");
     const again = await realm.call("sync", new Uint8Array([10]));
     assertEqual([...again], [11], "realm is reusable across calls");
     realm.dispose();
@@ -1316,7 +1316,7 @@ async function testSafeJs() {
   //    concurrent fan-out with the guest's own Promise.all over a net-like name — the
   //    real-promise seam is what makes this possible in one realm.
   {
-    const bridge = (name, payload) => {
+    const hostCall = (name, payload) => {
       const peer = payload[0];
       if (name === "offer") return sleep(1).then(() => new Uint8Array([peer % 2 === 0 ? 1 : 0]));
       if (name === "have") return sleep(1).then(() => new Uint8Array([peer % 3 === 0 ? 1 : 0]));
@@ -1340,7 +1340,7 @@ async function testSafeJs() {
         return new Uint8Array([placed.length, holders, ...placed]);
       });
     `;
-    const realm = await createSafeRealm({ source: src, bridge });
+    const realm = await createSafeRealm({ source: src, hostCall });
     const res = await realm.call("orchestrate", new Uint8Array([3, 10]));
     assertEqual(res[0], 3, "loop placed exactly `count` blocks on distinct peers");
     assertEqual([...res.slice(2)], [0, 2, 4], "placement followed peer order and the accept rule");
@@ -1352,11 +1352,11 @@ async function testSafeJs() {
   {
     const a = await createSafeRealm({
       source: `globalThis.SECRET = 42; register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
-      bridge: async () => new Uint8Array(),
+      hostCall: async () => new Uint8Array(),
     });
     const b = await createSafeRealm({
       source: `register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
-      bridge: async () => new Uint8Array(),
+      hostCall: async () => new Uint8Array(),
     });
     const ra = await a.call("leak", new Uint8Array());
     const rb = await b.call("leak", new Uint8Array());
@@ -1382,19 +1382,19 @@ async function testSafeJs() {
 async function testRealmSerialization() {
   console.log("Test: one entry seam, serialized per realm (§12.3)");
 
-  // 1. A synchronous entrypoint over a synchronous bridge still round-trips, and the
+  // 1. A synchronous entrypoint over a synchronous seam still round-trips, and the
   //    realm is reusable — it just resolves through a promise like everything else.
   {
     let calls = 0;
-    const bridge = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
+    const hostCall = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
     const realm = await createSafeRealm({
       source: `register("inc", (arg) => host.call("inc", arg));`,
-      bridge,
+      hostCall,
     });
     const out = await realm.call("inc", new Uint8Array([0, 9, 255]));
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
     assertEqual([...(await realm.call("inc", new Uint8Array([41])))], [42], "the realm is reusable across calls");
-    assertEqual(calls, 2, "the synchronous bridge was invoked once per call");
+    assertEqual(calls, 2, "the synchronous seam was invoked once per call");
     realm.dispose();
   }
 
@@ -1405,7 +1405,7 @@ async function testRealmSerialization() {
   {
     let release;
     const gate = new Promise((r) => { release = r; });
-    const bridge = (name, payload) => {
+    const hostCall = (name, payload) => {
       if (name === "park") return gate.then(() => new Uint8Array([42]));   // parks until released
       if (name === "inc") return payload.map((b) => (b + 1) & 0xff);       // sync — holder path
       return new Uint8Array();
@@ -1413,7 +1413,7 @@ async function testRealmSerialization() {
     const realm = await createSafeRealm({
       source: `register("init", async () => host.call("park", new Uint8Array()));
                register("hold", (arg) => host.call("inc", arg));`,
-      bridge,
+      hostCall,
     });
     const order = [];
     const initP = realm.call("init", new Uint8Array()).then((r) => { order.push("init"); return r; });
@@ -1434,7 +1434,7 @@ async function testRealmSerialization() {
   {
     const realm = await createSafeRealm({
       source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
-      bridge: async () => new Uint8Array(),
+      hostCall: async () => new Uint8Array(),
     });
     const r = await realm.call("probe", new Uint8Array());
     assertEqual([...r], [0, 0], "process / fetch are unreachable from an entrypoint");
@@ -1452,7 +1452,7 @@ async function testRealmSerialization() {
   {
     const realm = await createSafeRealm({
       source: `register("park", async () => await host.call("park", new Uint8Array()));`,
-      bridge: (name) => (name === "park" ? new Promise(() => {}) : new Uint8Array()),  // never settles
+      hostCall: (name) => (name === "park" ? new Promise(() => {}) : new Uint8Array()),  // never settles
     });
     const parked = realm.call("park", new Uint8Array());
     for (let i = 0; i < 10; i++) await Promise.resolve();   // let it reach its await
@@ -1469,7 +1469,7 @@ async function testRealmSerialization() {
     await sleep(1);
     const next = await createSafeRealm({
       source: `register("ping", (arg) => arg);`,
-      bridge: async () => new Uint8Array(),
+      hostCall: async () => new Uint8Array(),
     });
     assertEqual([...(await next.call("ping", new Uint8Array([7])))], [7],
       "the engine is still alive after the parked realm's context was freed");
@@ -1479,10 +1479,10 @@ async function testRealmSerialization() {
   console.log("  OK\n");
 }
 
-// ─── Test: PR-review hardening — cap enforcement, guarded callModule, ───
+// ─── Test: PR-review hardening — seam gating, guarded callModule, ───────
 // ─── sender-bound responses, WS fragmentation, redial after failure ──────
 
-async function testCapBridgeEnforcement() {
+async function testSeamGating() {
   console.log("Test: the guest seam enforces the manifest's declared requires + allocation caps");
 
   const id = generateKeyPair();
@@ -1496,7 +1496,7 @@ async function testCapBridgeEnforcement() {
   let threw = false;
 
   // A PRIMITIVE is exempt from the gate by a rule about one prefix: `crypto/` reaches
-  // nothing, so there is nothing to grant. A bridge built for a bundle declaring NO
+  // nothing, so there is nothing to grant. A seam built for a bundle declaring NO
   // names still hashes.
   const clockOnly = mk(["clock/now"]);
   assertEqual((await clockOnly("crypto/blake2b-256", U(1, 2))).length, 32,
@@ -1505,8 +1505,8 @@ async function testCapBridgeEnforcement() {
   try { await clockOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
   // A bare name is the same KIND of name: the asking bundle's own module map — code it
-  // already holds, scoped structurally by the app key the bridge was built with — so it
-  // passes the gate under an empty requires set. (This bridge's `hasModule` says no, so
+  // already holds, scoped structurally by the app key the seam was built with — so it
+  // passes the gate under an empty requires set. (This seam's `hasModule` says no, so
   // it is refused for NOT EXISTING, never for not being declared — the message is the
   // assertion.)
   let gateMsg = "";
@@ -1519,10 +1519,10 @@ async function testCapBridgeEnforcement() {
   // grants only it.
   threw = false;
   try { await clockOnly("node/sign", U(1)); } catch { threw = true; }
-  assert(threw, "an undeclared authority (node/sign) is refused by the bridge");
+  assert(threw, "an undeclared authority (node/sign) is refused by the seam");
   threw = false;
   try { await clockOnly("fs/delete", U(120)); } catch { threw = true; }
-  assert(threw, "an undeclared authority (fs/delete) is refused by the bridge");
+  assert(threw, "an undeclared authority (fs/delete) is refused by the seam");
   threw = false;
   try { await clockOnly("clock/now", U()); } catch { threw = true; }
   assert(!threw, "clock/now resolves under the declared name");
@@ -1543,7 +1543,7 @@ async function testCapBridgeEnforcement() {
   try { await open("node/random", U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "node/random over the cap is refused");
 
-  // requires → names: a bundle declares the EXACT names and the bridge enforces them
+  // requires → names: a bundle declares the EXACT names and the seam enforces them
   // as exact-membership checks.
   const nodeOnly = createGuestSeam({
     platform: { sodium, identity: id, peers: () => [] },
@@ -1565,7 +1565,7 @@ async function testCapBridgeEnforcement() {
   assert(threw, "a name beside the declared one (node/identity under node/sign) is refused");
 
   // The vocabulary is closed at LOAD, not at first use: an unknown name in a manifest
-  // is a refused bundle (verifyManifest, bundle.ts) — the bridge itself answers "no
+  // is a refused bundle (verifyManifest, bundle.ts) — the seam itself answers "no
   // such name" for anything it was not built to serve.
   threw = false;
   try { await open("transform/do", U()); } catch { threw = true; }
@@ -1614,7 +1614,7 @@ async function testSafeRealmConcurrency() {
   // no host-side serialization needed.
   const realm = await createSafeRealm({
     source: `register("echo", async (a) => await host.call("echo", a));`,
-    bridge: (_name, p) => sleep(10).then(() => p),
+    hostCall: (_name, p) => sleep(10).then(() => p),
   });
   try {
     const [r1, r2] = await Promise.all([
@@ -2379,7 +2379,7 @@ await testManifestClaimIsTheRouting();
 await testInstallerRemove();
 await testFs();
 await testFsKeyRule();
-await testCapBridge();
+await testGuestSeam();
 await testPolicy();
 await testRequiresPickTheAdmissionClass();
 await testGuestAbi();
@@ -2390,7 +2390,7 @@ await testGuestBundleAndArchive();
 await testBundleCorruptNewerRollback();
 await testSafeJs();
 await testRealmSerialization();
-await testCapBridgeEnforcement();
+await testSeamGating();
 await testCallModuleGuards();
 await testManifestSuiteByte();
 await testMlDsaAcvpVectors();

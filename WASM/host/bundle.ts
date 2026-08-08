@@ -336,7 +336,7 @@ export function moduleFile(name: string): string { return name + ".wasm"; }
  *  App keys never leave the host. Nothing on the wire names another node's app: a peer
  *  sends a protocol id or an opcode and the receiving host resolves it through its own
  *  routing (§12.10) to whichever of its apps claims it. A guest reaches its own modules by logical
- *  name through `host.call`, against the app key its bridge was built with — so the guest
+ *  name through `host.call`, against the app key its seam was built with — so the guest
  *  never sees an app key at all. This needs to be unambiguous within one node, not agreed
  *  across a deployment. */
 export function appKeyFor(author: Uint8Array, app: string): string {

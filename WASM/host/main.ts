@@ -74,7 +74,7 @@ export interface ShellOptions {
     requestDeadlineMs?: number;
     /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3, §16.1).
      *  Omitted ⇒ the 5s default. Counts time the guest is running, not time it spends
-     *  parked on a host bridge, so it bounds a wedged guest without penalising one
+     *  parked on a host seam, so it bounds a wedged guest without penalising one
      *  legitimately awaiting the network. `Infinity` disables it.
      *
      *  Reaching `createShell` from here is the point: a bound the shell accepts but no
