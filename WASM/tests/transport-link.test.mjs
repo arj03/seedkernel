@@ -2,7 +2,7 @@
 // §12.6.2 concealed handshake.
 //
 // The AKE, the record layer, the half-open limiter and the link router are the signed
-// transport bundle's (`transport/guest.js`), where no test can reach in and hold an
+// transport bundle's (`transport/src`), where no test can reach in and hold an
 // object. So each property is pinned where it ships — through the real host stack,
 // shell → driver (TransportHost) → guest realm — with an instrumented in-process
 // channel standing in for the socket.

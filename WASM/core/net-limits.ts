@@ -2,7 +2,7 @@
 // descriptor (README §12.6, §16.1).
 //
 // **Why these are not in the transport bundle.** Whoever imposes the boundaries applies
-// the check — the transport bundle's framers (transport/guest.js), which refuse an
+// the check — the transport bundle's framers (transport/src/framing.js), which refuse an
 // over-cap declaration on sight, before the body it announces is ever allocated. But a
 // host that imported its own flood bound from the module it is bounding would be taking
 // the bounded party's word for the bound. So the numbers live here, in the core, and the

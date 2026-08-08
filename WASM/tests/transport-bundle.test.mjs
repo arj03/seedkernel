@@ -10,6 +10,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { testkit } from "./testkit.mjs";
+// The same assembler the build signs through, imported rather than mirrored: these
+// bundles must be signed over the byte-for-byte guest production signs, and a second copy
+// of the part order here would quietly sign a different program (scripts/guest-source.mjs).
+import { readGuestSource } from "../scripts/guest-source.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -54,7 +58,7 @@ const upgradeAuthor = Buffer.from(upgradeKeys.publicKey).toString("hex");
 // a program that cannot compile, to fail the load at the point where the DRIVER stands
 // rather than at verify.
 function transportBundleAt(version, keys, guestSource) {
-  const guest = guestSource ?? new Uint8Array(readFileSync(join(root, "transport/guest.js")));
+  const guest = guestSource ?? new Uint8Array(readGuestSource());
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const manifest = {
     app: "transport", version,
@@ -64,8 +68,8 @@ function transportBundleAt(version, keys, guestSource) {
       // Read, never restated: a hardcoded number here would pass a test that the
       // production loader would refuse the moment the seam revved (§12.4).
       abi: GUEST_ABI_VERSION,
-      // Exactly the authorities transport/guest.js holds — mirror of the artifact
-      // manifest (scripts/build-transport-bundle.mjs). Its `crypto/*` and its own module name
+      // Exactly the authorities the transport guest (transport/src) holds — mirror of
+      // the artifact manifest (scripts/build-transport-bundle.mjs). Its `crypto/*` and its own module name
       // calls are not grants and are not declared. `link/*` + `transport/*` are the two
       // mount halves the admission dispatch reads (§12.5).
       requires: [

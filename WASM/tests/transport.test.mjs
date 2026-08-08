@@ -1,7 +1,7 @@
 // The ws.wasm module's RFC 6455 conformance, plus peer-address parsing.
 //
 // The framing STATE MACHINE — the residual buffer, the two-stage cap, fragment
-// reassembly — belongs to the transport bundle's guest (transport/guest.js `WsFramer`)
+// reassembly — belongs to the transport bundle's guest (transport/src/framing.js `WsFramer`)
 // and is covered end to end by transport-tcp.test.mjs, which stands two nodes over a
 // real WS upgrade. What is tested here is the module those framers call: one whole
 // frame in, one decoded frame out, and the refusals it owes its callers — far easier to

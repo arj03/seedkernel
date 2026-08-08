@@ -126,7 +126,7 @@ const LINK_OPEN = 1;
 // The link close-reason codes are the transport occupant's vocabulary — the host
 // only relays the number it reports through transport/link-down (guest-seam.ts) to
 // whoever handed the channel in, never interpreting it. The codes live with the
-// occupant (transport/guest.js, `REASON_*`) and with the tests that assert them
+// occupant (transport/src/ake.js, `REASON_*`) and with the tests that assert them
 // (tests/transport-harness.mjs).
 
 const EMPTY = new Uint8Array(0);

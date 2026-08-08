@@ -4,7 +4,7 @@
 // This is the only networking in Go. Everything structural — the wire codec that
 // imposes those boundaries, the PeerLink handshake, the routing table, the
 // request/response layer — is the transport bundle's guest program
-// (transport/guest.js, driven by host/transport-host.ts) running in QuickJS over this
+// (transport/src, driven by host/transport-host.ts) running in QuickJS over this
 // via __net (sock.go).
 package main
 
@@ -256,7 +256,7 @@ func (c *sockChannel) fail() {
 // ── the wire: a raw byte duplex — bytes pass through verbatim, no framing ──────
 //
 // Go imposes no message boundaries at all. Whether a link is length-prefixed or
-// RFC 6455 framed is the transport bundle's decision and its code (transport/guest.js),
+// RFC 6455 framed is the transport bundle's decision and its code (transport/src),
 // so this file moves bytes and nothing else.
 func (c *sockChannel) writeMsg(bytes []byte) {
 	if _, err := c.conn.Write(bytes); err != nil {

@@ -1,7 +1,7 @@
 // The ws.wasm ABI constants, compiled into the module itself
 // (assembly/ws/index.ts). The transport bundle's framers speak this ABI from the other
-// side; their copy of the op numbers is in transport/guest.js, because a zero-authority
-// guest is one self-contained source file and imports nothing.
+// side; their copy of the op numbers is in transport/src/framing.js, because a zero-authority
+// guest is one self-contained concatenated source and imports nothing.
 //
 // Keep this free of imports and of any host or runtime API — it is compiled into the
 // wasm, which may import nothing but the AS shims (§4.2).

@@ -1,8 +1,8 @@
 // Build the transport bundle — the signed artifact the host ships and loads at
-// boot (§12.6). Reads transport/guest.js (the AKE,
-// record layer, link routing and request/response layer as a zero-authority guest
-// program), signs a transport manifest with the transport author key,
-// packs the container, and writes:
+// boot (§12.6). Assembles the guest — the AKE, record layer, link routing and
+// request/response layer as a zero-authority program, concatenated from its parts
+// by scripts/guest-source.mjs — signs a transport manifest with the transport
+// author key, packs the container, and writes:
 //
 //   build/transport.skb        the bundle blob (--transport for the CLI)
 //   host/transport-bundle.ts   base64 inline for the JS targets (like ws-wasm.ts)
@@ -34,6 +34,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers-sumo";
+import { readGuestSource } from "./guest-source.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -173,7 +174,7 @@ async function main() {
   const mldsa = makeMlDsa(readFileSync(join(root, "browser", "mldsa65.wasm")));
   const pq = mldsa.keypair(pqSeed);
 
-  const guest = readFileSync(join(root, "transport", "guest.js"));
+  const guest = readGuestSource();
   // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through
   // the one install path signed by this program's own author and is reached by logical
   // name through host.call. It is an ordinary §4 pure transform — three exports, no

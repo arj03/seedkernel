@@ -1,7 +1,7 @@
 // sock.go — the TCP socket primitive exposed to QuickJS as `__net`. This is the only
 // networking that stays in Go: open a socket, hand its bytes to JS, send, close. There
 // are no message boundaries here — the wire codec, the PeerLink handshake, routing and
-// request/response all run as the transport bundle's guest program (transport/guest.js)
+// request/response all run as the transport bundle's guest program (transport/src)
 // over the unframed RawLink shape this module hands it.
 //
 // Bytes cross the Go↔JS boundary only on the event-loop goroutine: socket reader

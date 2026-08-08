@@ -23,6 +23,7 @@
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import { guestSourcePaths } from "./guest-source.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const wasmDir = resolve(here, "..");
@@ -102,7 +103,11 @@ const rows = [
       render: (n) => `| ${fmt(n)} TS |` },
     { find: /\*\*Native\*\* \(Go\)/, n: sum(goFiles),
       render: (n) => `| ${fmt(n)} Go + ${fmt(sum(nativeTs))} TS |` },
-    { find: /`transport\/guest\.js` \+ `ws\.wasm`/, n: loc("WASM/transport/guest.js"),
+    // The transport bundle's guest is split into parts but counted as one row: the README
+    // names the concatenated source, and `n` sums the parts the build assembles into it.
+    // The list is read from the assembler, so a part added to the guest is counted here
+    // without touching this file (scripts/guest-source.mjs).
+    { find: /`transport\/src\/\*\.js` \+ `ws\.wasm`/, n: sum(guestSourcePaths()),
       render: (n) => `| ${fmt(n)} + 5 KB |` },
 ];
 const sharedTotal = sharedRows.reduce((n, r) => n + sum(r.files), 0);

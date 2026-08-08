@@ -23,7 +23,7 @@ export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest reports through transport/link-down
- *  (transport/guest.js, `REASON_*`). The host only relays the number to whoever
+ *  (transport/src/ake.js, `REASON_*`). The host only relays the number to whoever
  *  handed the channel in, so the vocabulary lives with the occupant and here,
  *  where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };

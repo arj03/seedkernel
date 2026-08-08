@@ -11,7 +11,7 @@
 // WebSocket exists only because browsers cannot speak raw TCP, so it is handled as
 // a wire codec *over a raw TCP listener*: this file binds the listener and says which
 // codec applies, and the RFC 6455 handshake and framing themselves run in the
-// transport bundle (transport/guest.js over its own ws.wasm module). No dependency on
+// transport bundle (transport/src over its own ws.wasm module). No dependency on
 // node:http and no Bun-native fast path — one WS code path, and it is not host code.
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 

@@ -232,7 +232,7 @@ export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
 // **The CHANNEL suite is not here, and the asymmetry is the point.** A manifest suite
 // is read by the loader before anything is trusted, so it is the host's to declare — the
 // same argument that puts the flood bounds in net-limits.ts. A channel suite is read by
-// the AKE, which is entirely the transport bundle's program (transport/guest.js declares
+// the AKE, which is entirely the transport bundle's program (transport/src/ake.js declares
 // its own), so it is content: replaceable by shipping a new signed bundle, on its own
 // clock. They are independent namespaces and always were; the channel half sat here only
 // as a leftover of the pre-bundle transport. See §14.1, and docs/PROTOCOL.md for the
