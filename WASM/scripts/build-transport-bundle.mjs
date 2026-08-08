@@ -176,7 +176,7 @@ async function main() {
   const guest = readFileSync(join(root, "transport", "guest.js"));
   // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through
   // the one install path signed by this program's own author and is reached by logical
-  // name through module/call. It is an ordinary §4 pure transform — three exports, no
+  // name through host.call. It is an ordinary §4 pure transform — three exports, no
   // imports but the AS shims — so the loader admits it like any other module.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
   const manifest = {
@@ -185,7 +185,7 @@ async function main() {
     modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
-      abi: 2,
+      abi: 3,
       // EXACTLY the authorities this program holds — and, since the list is grants only,
       // exactly what an operator is agreeing to when they mount it. `node/sign` +
       // `node/verify` (slot-scoped signing and its verification twin) and
@@ -199,9 +199,9 @@ async function main() {
       // own net/send would loop back into itself.
       //
       // Its ws.wasm and its crypto are absent because neither is a grant and neither can
-      // be missing — `module/call` reaches modules that arrived in this same signed
-      // bundle, and the primitive catalog is total on any host that has a cap bridge at
-      // all. What this program needs of them is `abi: 2` above (§12.1).
+      // be missing — a bare `host.call` name reaches modules that arrived in this same
+      // signed bundle, and the primitive catalog is total on any host that has a cap
+      // bridge at all. What this program needs of them is `abi: 3` above (§12.1).
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",

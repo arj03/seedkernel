@@ -179,11 +179,21 @@ export interface CapBridgeDeps {
     /** Reach one of THIS app's WASM modules by its logical name — the shell binds the app
      *  key when it builds the bridge (`ModuleTable.callModule`), so what arrives here is
      *  already scoped and a guest naming a module it does not have resolves to nothing.
+     *  A guest reaches these through the SAME `host.call` as everything else, by the bare
+     *  logical name (§12.2); the dispatch knows a bare name is one of these because no
+     *  host name is bare.
      *
      *  There is no logical→table map to pass and no opt-out sentinel guarding it. The
      *  guest's namespace and the app's module map are the same map, so "a guest reaches
      *  only its own modules" is the shape rather than a lookup that could be omitted. */
     callModule: (name: string, payload: Uint8Array) => Uint8Array | null;
+    /** Whether this app declares a module by that name (`ModuleTable.isBound`, app key
+     *  bound with `callModule`'s). It exists to keep ONE error surface over the unified
+     *  catalog: an unknown name is refused whichever half it would have come from. It
+     *  cannot be read off `callModule`, whose `null` also means a trap or an oversized
+     *  payload — a module that FAILS still answers empty, as it always has, and only a
+     *  name that was never installed is a refusal. */
+    hasModule: (name: string) => boolean;
     /** The request/response transport the net/send name drives. `TransportHost` satisfies
      *  it. A confined guest fans out itself with `Promise.all` over `net/send`, so the
      *  bridge needs only single-peer request/response — no host-side scatter-gather.
@@ -230,18 +240,25 @@ export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../cor
  *  other is a type error. */
 type CryptoCapName = `crypto/${PrimitiveName}`;
 /** The keys the dispatch table must cover — every authority (`CapabilityName`, the keys
- *  of `AUTHORITY_CALLS` in domains.ts), the bundle's own module map, and every crypto
- *  primitive. The table literal is typed against this union, so the names are written in
- *  exactly ONE place: a name added to the vocabulary without a handler here is a compile
- *  error, and so is a handler whose name the loader would refuse. */
-type HandlerKey = CapabilityName | CryptoCapName | "module/call";
+ *  of `AUTHORITY_CALLS` in domains.ts) and every crypto primitive. The table literal is
+ *  typed against this union, so the names are written in exactly ONE place: a name added
+ *  to the vocabulary without a handler here is a compile error, and so is a handler whose
+ *  name the loader would refuse.
+ *
+ *  **Every one of them contains a `/`, and that is load-bearing** (§12.2). A bundle's
+ *  module names are held to `[A-Za-z0-9_-]` by the manifest (bundle.ts), so they cannot
+ *  spell one of these — which is what lets a guest call its own modules by their bare
+ *  logical name through the same `host.call` and lets the dispatch tell the two apart by
+ *  the name alone. The construction check below holds the invariant on the host side;
+ *  `PRIMITIVE_NAMES` gets it from the `crypto/` template literal, and `AUTHORITY_CALLS`
+ *  is hand-written, which is exactly the half that needs checking. */
+type HandlerKey = CapabilityName | CryptoCapName;
 /** The same union as a runtime list, for the construction check below — the compiled-JS
  *  half of the one-file rule, where `HandlerKey` is not present to enforce anything.
  *  Derived here, next to the table it describes, because it is nobody else's business:
  *  the loader's vocabulary is `AUTHORITY_CALLS` alone (a manifest never names the rest). */
 const HANDLER_KEYS: readonly string[] = [
     ...Object.keys(AUTHORITY_CALLS),
-    "module/call",
     ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
 ];
 /** One catalog entry's implementation: argument bytes in, response bytes out (or a
@@ -328,8 +345,8 @@ function cryptoCatalog(sodium: CapSodium): Record<CryptoCapName, CapHandler> {
  *
  *    __host_call(name: string, callId, payload: ArrayBuffer) -> ArrayBuffer | null
  *
- *  Returning bytes completes a **sync** name (the primitive catalog, clock, module, the
- *  raw-link and transport names) inline. Returning `null` means the host started an
+ *  Returning bytes completes a **sync** name (the primitive catalog, clock, the bundle's
+ *  own modules, the raw-link and transport names) inline. Returning `null` means the host started an
  *  **async** name under `callId` — `net/send` and every `fs/*` — and the guest parks a
  *  Promise here, which the host later settles with `__netResolve(callId, bytes)` or
  *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync name that ever returned
@@ -364,7 +381,10 @@ globalThis.host = {
   // so a guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op)
   // and a fan-out is just 'await Promise.all(peers.map(p => host.call("net/send", ...)))'.
   // The name is the seam: a guest asks for a capability by NAME — "fs/get",
-  // "net/send", "crypto/blake2b-256" — never by a number.
+  // "net/send", "crypto/blake2b-256" — never by a number. A name with no "/" is one of
+  // the bundle's OWN modules, called by the logical name its manifest declared ("ws",
+  // "codec"): one call shape over host primitives, host authorities and app modules,
+  // because a module name cannot spell a host name (§12.2).
   //
   // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
   // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
@@ -408,16 +428,16 @@ globalThis.__invoke = (name, argBuf) => {
  *  enforces (`allowedNames`). Fine-grained and human-auditable: "this app reaches
  *  `node/sign` + `fs/get`", not a prefix that grows every op ever added under it.
  *
- *  **Only authorities are grants; `crypto/*` and `module/call` are not.**
+ *  **Only authorities are grants; `crypto/*` and a bundle's own modules are not.**
  *  `node/sign` is a signing oracle under the node identity, `node/identity` hands out
  *  the node's public key, `node/random` reaches the OS entropy source — each a grant
  *  over something the host owns. The `crypto/` primitives are functions of their
  *  arguments, so a guest holding them computes only what it could have computed with
  *  code of its own, and a manifest that had to ask before hashing a byte string
- *  would be describing an authority that does not exist. `module/call` is exempt for
- *  the same reason: the modules it reaches are the asking bundle's own, installed
- *  and verified with it, so calling one reaches nothing the guest does not already
- *  hold — its scope (one app's map) is the shape, not a grant.
+ *  would be describing an authority that does not exist. A bare name — one of the asking
+ *  bundle's own modules — is exempt for the same reason: that code was installed and
+ *  verified with the guest, so calling it reaches nothing the guest does not already
+ *  hold, and its scope (one app's map) is the shape, not a grant.
  *
  *  Neither exemption is a parse of the name: the gate asks `isGrant`, which is
  *  membership in this table, so a name is an authority exactly by being one the host owns
@@ -507,7 +527,7 @@ function u64be(value: number): Uint8Array {
  *  entrypoint invocation from interleaving with the next is the realm's serialization
  *  queue (realm-queue.ts) rather than anything here. */
 export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
-    const { sodium, identity, callModule, transport } = deps;
+    const { sodium, identity, callModule, hasModule, transport } = deps;
     const now = deps.now ?? (() => Date.now());
     // Checked at runtime, not only in the types: the native target evaluates the COMPILED
     // JS of this file inside QuickJS (§12.9), where a TypeScript signature is not present
@@ -518,10 +538,12 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     }
     // null means "the caller named the sentinel" — never "the caller forgot".
     const allowed = deps.allowedNames === UNRESTRICTED_NAMES ? null : new Set(deps.allowedNames);
-    // ── the catalog — the seam ABI (§12.2), ONE table: the names a guest can call
-    // are the keys of this object — no second list, no numbers, never a wire value.
+    // ── the catalog — the seam ABI (§12.2), ONE table: the HOST names a guest can call
+    // are the keys of this object — no second list, no numbers, never a wire value. The
+    // bundle's own modules are the catalog's other source of names, resolved past the end
+    // of this table because they are the app's rather than the host's.
     // The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
-    // and `module/call` (the asking bundle's own module map) reach nothing a guest does
+    // reach nothing a guest does
     // not already hold, so they are ungated by a rule; every other name is an
     // authority, gated by EXACT membership in the manifest's declared requires.
     // Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT, `link/*` is
@@ -554,29 +576,12 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
     // in the table is the wrong shape for this file, and the construction check below
     // walks own keys, so it could never see them.
     const handlers: Record<string, CapHandler> = Object.assign(Object.create(null), {
-        // ── the primitive seam (§12.2): two ungated halves ─────────────────────────
-        // The catalog's `crypto/*` half reaches nothing a guest does not already hold,
-        // and the app-supplied half below reaches the asking bundle's own module map —
-        // both are computation the guest could have done itself, so neither prefix is
-        // a grant (§12.1).
+        // ── the primitive seam (§12.2): a function of bytes the guest already holds ──
+        // Ungated by a rule rather than by omission — computation the guest could have
+        // done with code of its own, so there is nothing to grant (§12.1). The bundle's
+        // own modules are the other ungated half, and they are not in this table at all:
+        // they are the app's, resolved per bridge at the bottom of this function.
         ...cryptoCatalog(sodium),
-        // ── the app-supplied half: the asking bundle's own modules ────────────────
-        "module/call": (payload) => {
-            // The guest calls its own modules by the logical name from its manifest
-            // (README §5.1), and that is the name they are bound under inside this app's
-            // module map — so there is nothing to resolve and no scoping to apply. The
-            // app key was fixed when the shell built this bridge; a name the app does not
-            // have resolves to nothing, and no name reaches another app at all. Its own
-            // bundle's code is a pure transform the guest already holds, so this is
-            // ungated like `crypto` — a primitive, never a grant.
-            if (payload.length < 1)
-                return NONE;
-            const nameLen = payload[0];
-            if (payload.length < 1 + nameLen)
-                return NONE;
-            const r = callModule(dec.decode(payload.slice(1, 1 + nameLen)), payload.slice(1 + nameLen));
-            return r ?? NONE;
-        },
         // ── authorities: each reaches something no confined guest can hold ──────────
         // node/sign and node/verify are scoped, never raw: both apply `domain ‖ scope`
         // to the message with the key the asking bundle's slot selected (see
@@ -742,18 +747,27 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         },
     } satisfies Record<HandlerKey, CapHandler>);
     // The one-file rule, checked at construction: every name this table dispatches
-    // through is a `HandlerKey` — an authority the loader knows (`AUTHORITY_CALLS`), a
-    // primitive (`PRIMITIVE_NAMES`), or `module/call`. A key outside that set would be a
-    // name no manifest could ever reach, and an authority the loader knows but the table
-    // lacks would answer "no such name" at the guest's first call.
+    // through is a `HandlerKey` — an authority the loader knows (`AUTHORITY_CALLS`) or a
+    // primitive (`PRIMITIVE_NAMES`). A key outside that set would be a name no manifest
+    // could ever reach, and an authority the loader knows but the table lacks would
+    // answer "no such name" at the guest's first call.
     //
-    // The `satisfies` above is the compile-time half of the same rule (a missing
+    // The second half is the namespace invariant (`HandlerKey`): a host name contains a
+    // `/` and a module name cannot, which is the whole of how the dispatch below tells
+    // them apart. `crypto/*` gets it from its template literal; `AUTHORITY_CALLS` is
+    // hand-written, so a future bare `"ping"` would silently shadow every app's module of
+    // that name. It is refused here instead.
+    //
+    // The `satisfies` above is the compile-time half of the one-file rule (a missing
     // authority is a type error); this walk is the runtime half, holding on the COMPILED
     // JS the native target evaluates (§12.9) where the types are gone — and it is the one
     // check a typo'd EXTRA key would trip.
     for (const name of Object.keys(handlers)) {
         if (!HANDLER_KEYS.includes(name)) {
-            throw new Error(`cap-bridge: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS), no primitive (PRIMITIVE_NAMES), and not module/call`);
+            throw new Error(`cap-bridge: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no primitive (PRIMITIVE_NAMES)`);
+        }
+        if (!name.includes("/")) {
+            throw new Error(`cap-bridge: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
         }
     }
     return (name, payload) => {
@@ -762,18 +776,35 @@ export function createCapBridge(deps: CapBridgeDeps): SafeRealmBridge {
         // undeclared `node/identity` is refused even beside a declared `node/sign`.
         // What counts as an authority is `isGrant` — membership in the catalog's
         // authority table (domains.ts) — never a prefix read off the name: `crypto/*`
-        // is a fixed host-side catalog of functions of bytes the guest already holds
-        // and `module/call` reaches the asking bundle's own module map, so neither is
-        // something to grant. Gating either would make a guest ask permission to
-        // compute a function of bytes it already has.
+        // is a fixed host-side catalog of functions of bytes the guest already holds,
+        // so gating it would make a guest ask permission to compute a function of
+        // bytes it already has.
         if (allowed && isGrant(name) && !allowed.has(name)) {
             throw new Error("cap-bridge: " + name + " not declared by the bundle manifest requires");
         }
-        // The table lookup IS the dispatch: an unknown name (or a primitive this host
-        // does not carry) reads `undefined` and is refused by name.
-        const fn = handlers[name];
-        if (!fn)
-            throw new Error("cap-bridge: no such name " + name);
-        return fn(payload);
+        // ONE catalog, two sources of names, told apart by the name itself (§12.2). A
+        // `/` says a host name: the table lookup IS the dispatch, and an unknown name
+        // (or a primitive this host does not carry) reads `undefined` and is refused.
+        if (name.includes("/")) {
+            const fn = handlers[name];
+            if (!fn)
+                throw new Error("cap-bridge: no such name " + name);
+            return fn(payload);
+        }
+        // A bare name is one of THIS bundle's own modules, by the logical name from its
+        // manifest (README §5.1) — which is the name it is bound under inside this app's
+        // module map, so there is nothing to resolve and no scoping to apply. The app key
+        // was fixed when the shell built this bridge, so no name reaches another app at
+        // all. Ungated like `crypto/*`: its own bundle's code is a pure transform the
+        // guest already holds, installed and verified with it, so calling one reaches
+        // nothing the guest does not have.
+        //
+        // A name the app never installed is a *typo* and is refused by name, the same as
+        // an unknown host name — that uniformity is what the unified catalog buys. A
+        // module that runs and FAILS is a different event and keeps its old answer: empty
+        // bytes, which is also what a module returning nothing says.
+        if (!hasModule(name))
+            throw new Error("cap-bridge: no such name " + name + " (this bundle installs no module by that name)");
+        return callModule(name, payload) ?? NONE;
     };
 }

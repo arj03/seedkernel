@@ -32,14 +32,12 @@ const holderGuestSource = `
 	});
 `
 
-// The echo guest: forwards its input to the bundle's own "fwd" module by name through
-// module/call — the shape every app has now that module-only apps are retired (§12.4):
-// inbound delivery reaches the guest, and the guest drives its module library.
+// The echo guest: forwards its input to the bundle's own "fwd" module by its bare name
+// over the same host.call as everything else (§12.2) — the shape every app has now that
+// module-only apps are retired (§12.4): inbound delivery reaches the guest, and the guest
+// drives its module library.
 const echoGuestSource = `
-	register("handle", (arg) => {
-	  const name = new TextEncoder().encode("fwd");
-	  return host.call("module/call", new Uint8Array([name.length, ...name, ...arg]));
-	});
+	register("handle", (arg) => host.call("fwd", arg));
 `
 
 // requesterJS stands a second, bundle-less node up in the same realm — just a network
@@ -179,7 +177,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	peerID := startRequester(t, st.PeerID, st.Port)
 
 	// The module arm: the guest `handle` receives the input, forwards it through
-	// module/call, and the forwarder's echo makes both halves directly checkable — the
+	// a bare-name module call, and the forwarder's echo makes both halves checkable — the
 	// authenticated sender arrives prepended (§12.8), inside the module's input.
 	payload := []byte("who is asking?")
 	got := ask(t, st.PeerID, "echoapp", payload)

@@ -65,7 +65,7 @@ function transportBundleAt(version, keys, guestSource) {
       // production loader would refuse the moment the seam revved (§12.4).
       abi: GUEST_ABI_VERSION,
       // Exactly the authorities transport/guest.js holds — mirror of the artifact
-      // manifest (scripts/build-transport-bundle.mjs). Its `crypto/*` and `module/call`
+      // manifest (scripts/build-transport-bundle.mjs). Its `crypto/*` and its own module name
       // calls are not grants and are not declared. `link/*` + `transport/*` are the two
       // mount halves the admission dispatch reads (§12.5).
       requires: [

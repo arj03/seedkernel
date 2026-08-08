@@ -45,9 +45,9 @@
 //     link id, opened and closed. `timer` — deadlines, because a zero-authority realm
 //     has no setTimeout. `transport` — where this program reports its structured
 //     OUTPUT (an attributed peer, a protocol id, a correlation), which every app then
-//     reaches through the ordinary `net` domain. Its own ws.wasm is NOT here:
-//     `module/call` is a primitive — the bundle's own code, ungated like `crypto`
-//     (§12.1) — so no grant is needed to name it.
+//     reaches through the ordinary `net` domain. Its own ws.wasm is NOT here: a bare
+//     name is a primitive — the bundle's own code, ungated like `crypto` (§12.1) — so
+//     no grant is needed to name it.
 //
 //     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
 //     attribution this program reports (transport/link-auth answers with the verdict,
@@ -142,7 +142,10 @@ function utf8Decode(b) {
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
 const N_RANDOM = "node/random";
-const N_MODULE_CALL = "module/call";
+/** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
+ *  name — no `/` — is what makes it a module rather than a host name (§12.2), and it is
+ *  ungated for the same reason `crypto/*` is: it is this bundle's own verified code. */
+const N_WS = "ws";
 
 // The raw net capability: bytes over an opaque link id, opened and closed. This is
 // the whole of what the platform contributes — there is no peer here, no framing and
@@ -557,19 +560,10 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 /** An HTTP upgrade head is tiny; anything larger is not one. */
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
-/** Call one of THIS bundle's modules by its logical name (the bridge resolves it to a
- *  table name, which a guest never sees). */
-function moduleCall(name, req) {
-  const n = utf8Encode(name);
-  const out = new Uint8Array(1 + n.length + req.length);
-  out[0] = n.length;
-  out.set(n, 1);
-  out.set(req, 1 + n.length);
-  return host.call(N_MODULE_CALL, out);
-}
-
+/** Run this bundle's own ws.wasm — an ordinary `host.call`, like every other name this
+ *  program uses. An empty answer is the module's failure signal (§4). */
 function wsCall(req) {
-  const out = moduleCall("ws", req);
+  const out = host.call(N_WS, req);
   if (out.length === 0) throw new Error("ws: module error");
   return out;
 }

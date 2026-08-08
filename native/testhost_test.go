@@ -124,15 +124,16 @@ const testCapBridgeJS = `
 globalThis.__buildCapBridge = function (names, identity, transport, peers, scope) {
   globalThis.__capBridge = createCapBridge({
     sodium, identity, fs,
-    // No app behind this harness, so module/call reaches nothing. Nothing to scope
+    // No app behind this harness, so a bare name reaches nothing. Nothing to scope
     // either: the bridge is built against ONE app's module map, so "a guest reaches
     // only its own modules" needs no argument here to stay true.
     callModule: () => null,
+    hasModule: () => false,
     transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
     peers: () => peers || [],
     now: () => Date.now(),
     // The granted names, straight through: a call resolves iff the name itself is
-    // one of these (or crypto/module, which are never grants).
+    // one of these (or crypto/*, or one of the bundle's own modules — never grants).
     allowedNames: names,
     signScope: scope || undefined,
   });

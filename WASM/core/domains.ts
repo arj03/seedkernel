@@ -64,7 +64,7 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  and preamble into every page that verifies a bundle, including pages that only
  *  inspect one and never build a bridge at all. cap-bridge.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
-export const GUEST_ABI_VERSION = 2;
+export const GUEST_ABI_VERSION = 3;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
  *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (cap-bridge.ts)
  *  is total over this list: a host that has that file has every name in it, so a partial
@@ -108,13 +108,20 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *  names a subset of these keys and nothing else, so the list an operator reads is the
  *  list of what the bundle can reach.
  *
- *  `crypto/*` and `module/call` are not here, and that absence is the whole gate rule: a
- *  name is a grant iff it is a key of this table (`isGrant`), so the dispatcher never
- *  parses a name to decide (§12.1). They are also, for the same reason, not declarable —
- *  a manifest naming one is refused. Neither can be absent from a host (`cryptoCatalog`
- *  is total; a bundle's modules arrive with it), so requiring them would be a requirement
- *  on something that cannot fail, and it would bury the three or four names that carry
- *  the bundle's actual authority under a dozen that carry none.
+ *  `crypto/*` and a bundle's own module names are not here, and that absence is the whole
+ *  gate rule: a name is a grant iff it is a key of this table (`isGrant`), so the
+ *  dispatcher never parses a name to decide (§12.1). They are also, for the same reason,
+ *  not declarable — a manifest naming one is refused. Neither can be absent from a host
+ *  (`cryptoCatalog` is total; a bundle's modules arrive with it), so requiring them would
+ *  be a requirement on something that cannot fail, and it would bury the three or four
+ *  names that carry the bundle's actual authority under a dozen that carry none.
+ *
+ *  **Every key here must contain a `/`.** A guest calls its own modules through the same
+ *  `host.call` by their bare logical name, and a manifest holds module names to
+ *  `[A-Za-z0-9_-]` (bundle.ts) — so the two halves of the catalog are disjoint by charset
+ *  and the dispatch tells them apart by the name alone. `crypto/*` gets the slash from its
+ *  template literal; this table is hand-written, so cap-bridge.ts checks it at
+ *  construction. A bare authority added here would shadow every app's module of that name.
  *
  *  Each name carries what it is granted *for*, which is the whole of the mount rule:
  *  `"app"` is an ordinary authority any bundle may ask for, and a `"mount:…"` value
@@ -164,10 +171,10 @@ export const AUTHORITY_CALLS = {
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
 /** Whether a name is a *grant* — the one question the bridge's gate asks, and the one
- *  the manifest does not answer. `crypto/*` and `module/call` are false here by being
- *  absent from `AUTHORITY_CALLS` rather than by a parse of their prefix: a primitive is
- *  a function of its arguments and a module is the asking bundle's own, so neither
- *  reaches anything a guest does not already hold (§12.1). */
+ *  the manifest does not answer. `crypto/*` and a bundle's own module names are false
+ *  here by being absent from `AUTHORITY_CALLS` rather than by a parse of their prefix: a
+ *  primitive is a function of its arguments and a module is the asking bundle's own, so
+ *  neither reaches anything a guest does not already hold (§12.1). */
 export function isGrant(name: string): name is CapabilityName {
     return Object.prototype.hasOwnProperty.call(AUTHORITY_CALLS, name);
 }

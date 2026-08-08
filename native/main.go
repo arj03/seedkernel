@@ -119,8 +119,9 @@ func removeApp(appKey string) int {
 
 // callModule invokes one app's module by its logical name (README §4), returning its
 // response or nil if nothing is bound there or the module produced nothing. The one way
-// into an installed module: the shell uses it directly and the cap-bridge routes
-// module/call (§12.2) through it, with the app key bound when the bridge was built.
+// into an installed module: the shell uses it directly and the cap-bridge routes a
+// guest's bare-name calls (§12.2) through it, with the app key bound when the bridge
+// was built.
 // Modules are pure transforms and cannot call back, so there is no re-entrancy to guard.
 func callModule(appKey, module string, payload []byte) []byte {
 	w := apps[appKey][module]

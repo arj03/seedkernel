@@ -474,9 +474,10 @@ export function createShell(opts: CreateShellOptions & {
             transportSink: driver?.sink(),
             sodium: platform.sodium,
             identity: platform.guestIdentity ?? platform.identity,
-            // Bound to THIS app's key, so the guest's `module/call` addresses its own
-            // module map by logical name and has no way to name another app's (§12.2).
+            // Bound to THIS app's key, so a bare `host.call` name addresses its own module
+            // map by logical name and has no way to name another app's (§12.2).
             callModule: (name, p) => host.callModule(appKey, name, p),
+            hasModule: (name) => host.isBound(appKey, name),
             transport: netHost ?? undefined,
             peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
             // Scoped to this app key, so `fs` grants reach over this app's own keyspace and
@@ -492,8 +493,8 @@ export function createShell(opts: CreateShellOptions & {
             fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
             now: platform.now ?? (() => Date.now()),
             // The declared requires ARE the bridge's gate — a `host.call` resolves iff
-            // the name itself is one of these (`crypto/*` and `module/call` exempt:
-            // never grants — a fixed catalog and the app's own module map). The
+            // the name itself is one of these (`crypto/*` and the bundle's own bare module
+            // names exempt: never grants — a fixed catalog and the app's own code). The
             // vocabulary was checked at load (verifyManifest).
             allowedNames: names,
             // What SIGN signs under — and what VERIFY checks against — is chosen HERE, by

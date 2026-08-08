@@ -146,7 +146,7 @@ async function testFullLifecycle() {
 
   // Reach it by name: the host stages input at the module's scratch, calls handle, and
   // reads the response back (README §4). A guest reaches the same module through the
-  // cap-bridge's module/call (§12.2), against the app key its bridge holds; here the host
+  // cap-bridge by its bare name (§12.2), against the app key its bridge holds; here the host
   // calls it directly.
   const text = new TextEncoder().encode("hello from author");
   const resp = host.callModule(chatKey, "chat", text);
@@ -584,7 +584,7 @@ async function testCapBridge() {
   // to itself drops at the guest's own-frame guard, so net/send drains.
   const { driver: transport } = await makeTransportHost({ identity: id, requestDeadlineMs: 200 });
 
-  // A module reachable by name, to exercise module/call. The forwarder fixture
+  // A module reachable by name, to exercise the catalog's app-module half. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
   const testKey = appKey(id.publicKey, "testapp");
@@ -596,9 +596,10 @@ async function testCapBridge() {
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const bridge = createCapBridge({
     sodium, identity: id,
-    // Scoped to one app, exactly as the shell scopes it: module/call names a module
+    // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     callModule: (name, p) => host.callModule(testKey, name, p),
+    hasModule: (name) => host.isBound(testKey, name),
     transport, peers: () => [toHex(id.publicKey)], fs, signScope,
     allowedNames: UNRESTRICTED_NAMES,
   });
@@ -702,13 +703,13 @@ async function testCapBridge() {
     const peers = await bridge("net/peers", U());
     assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "net/peers counts the cohort");
 
-    // module/call reaches this app's module by its LOGICAL name — the name crosses the
-    // seam as its UTF-8 bytes (§12.2 module/call: [nameLen u8][name utf8][req]), and the
-    // app key is the one the bridge was built with, never something the caller supplies.
-    const echoNameBytes = new TextEncoder().encode("echo");
-    const mc = new Uint8Array(1 + echoNameBytes.length + 2);
-    mc[0] = echoNameBytes.length; mc.set(echoNameBytes, 1); mc.set(U(8, 9), 1 + echoNameBytes.length);
-    assertEqual([...await bridge("module/call", mc)], [8, 9], "module/call invokes the named module");
+    // A bare name reaches this app's module by its LOGICAL name — the same `host.call`
+    // shape as every other name, with no second framing (§12.2), and the app key is the
+    // one the bridge was built with, never something the caller supplies.
+    assertEqual([...await bridge("echo", U(8, 9))], [8, 9], "a bare name invokes this app's module");
+    let noSuch = false;
+    try { await bridge("nosuchmodule", U(1)); } catch { noSuch = true; }
+    assert(noSuch, "a bare name this app never installed is refused, like any unknown name");
   } finally {
     transport.close();
   }
@@ -920,8 +921,9 @@ async function testGuestAbi() {
   // the primitive catalog (§12.1) — is not declarable: neither can be absent from a
   // host, so requiring one is a requirement on something that cannot fail, and the
   // format says so by refusing it rather than accepting a no-op. A bare `module`, the
-  // shape the coarse-domain format used, is refused the same way a typo is.
-  for (const name of ["module", "module/call", "crypto/blake2b-256", "fs"]) {
+  // shape the coarse-domain format used, is refused the same way a typo is — and so is
+  // a bundle's own module name, which is never a grant.
+  for (const name of ["module", "codec", "crypto/blake2b-256", "fs"]) {
     let refused = "";
     try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: [name] })); }
     catch (e) { refused = e.message; }
@@ -1467,7 +1469,7 @@ async function testCapBridgeEnforcement() {
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (allowedNames) => createCapBridge({
-    sodium, identity: id, callModule: () => null,
+    sodium, identity: id, callModule: () => null, hasModule: () => false,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
     allowedNames,
   });
@@ -1483,12 +1485,15 @@ async function testCapBridgeEnforcement() {
   threw = false;
   try { await clockOnly("crypto/no-such-primitive", U(1)); } catch { threw = true; }
   assert(threw, "an unknown crypto name is refused by name (this host cannot serve it)");
-  // module/call is the same KIND of name: the asking bundle's own module map — code it
-  // already holds, scoped structurally by the app key the bridge was built with — so a
-  // bundle naming no module name still reaches it.
-  threw = false;
-  try { await clockOnly("module/call", U(1, 120)); } catch { threw = true; }
-  assert(!threw, "module/call resolves for a bundle naming no module name — the bundle's own modules are not a grant");
+  // A bare name is the same KIND of name: the asking bundle's own module map — code it
+  // already holds, scoped structurally by the app key the bridge was built with — so it
+  // passes the gate under an empty requires set. (This bridge's `hasModule` says no, so
+  // it is refused for NOT EXISTING, never for not being declared — the message is the
+  // assertion.)
+  let gateMsg = "";
+  try { await clockOnly("echo", U(1, 120)); } catch (e) { gateMsg = e.message; }
+  assert(gateMsg.includes("no module by that name"),
+    `a bare name passes the gate ungated and fails only on existence (got: ${gateMsg})`);
 
   // Authorities are gated by EXACT name, and each one names something no
   // confined module can hold: declaring `node` grants nothing, declaring `node/sign`
@@ -1522,7 +1527,7 @@ async function testCapBridgeEnforcement() {
   // requires → names: a bundle declares the EXACT names and the bridge enforces them
   // as exact-membership checks.
   const nodeOnly = createCapBridge({
-    sodium, identity: id, callModule: () => null,
+    sodium, identity: id, callModule: () => null, hasModule: () => false,
     transport: stubTransport, peers: () => [], fs: new MemoryFs(),
     allowedNames: ["node/sign"],
     signScope: appSignScope(id, new Uint8Array(32), "probe"),
@@ -1563,7 +1568,7 @@ async function testCallModuleGuards() {
     "callModule returns null for an app that installed nothing");
 
   // An installed module is reached by name. A confined guest reaches the same module
-  // through the cap-bridge's module/call (§12.2).
+  // through the cap-bridge by its bare name (§12.2).
   installMod(host, guards, "echo", forwarderBytes);
   const r = host.callModule(guards, "echo", new Uint8Array([5]));
   assertEqual([...r], [5], "callModule reaches an installed module");

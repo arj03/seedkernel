@@ -34,9 +34,10 @@ import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm
 export interface BundleModule {
     /** Logical name, e.g. "codec". Two jobs, one value: the module's file in the
      *  container (`<name>.wasm`), and the key it binds at inside its app's module map —
-     *  which is the same key the guest addresses it by through module/call, so there is
-     *  no second name to resolve between them. Unique within a manifest, and restricted
-     *  to `[A-Za-z0-9_-]` so it is unambiguous as a filename. */
+     *  which is the same bare name the guest addresses it by through `host.call`, so
+     *  there is no second name to resolve between them. Unique within a manifest, and
+     *  restricted to `[A-Za-z0-9_-]` so it is unambiguous as a filename — and, because
+     *  that charset excludes `/`, so it can never spell a host-call name (§12.2). */
     name: string;
     /** genesisHash(wasm) hex — content integrity for the module bytes (§5.1, §12.4). */
     hash: string;
@@ -88,7 +89,7 @@ export interface BundleGuest {
      *  is the common case and reads as one.
      *
      *  **Only grants appear here, so the list an operator reads IS the bundle's reach.**
-     *  A guest also calls `crypto/*` and `module/call`, and those are deliberately not
+     *  A guest also calls `crypto/*` and its own modules, and those are deliberately not
      *  declarable: neither can be absent from a host (the primitive catalog is total, and
      *  a bundle's modules arrive inside it), so declaring them would be a requirement on
      *  something that cannot fail — and a dozen such names would bury the two or three
@@ -335,7 +336,7 @@ export function moduleFile(name: string): string { return name + ".wasm"; }
  *  App keys never leave the host. Nothing on the wire names another node's app: a peer
  *  sends a protocol id or an opcode and the receiving host resolves it through its own
  *  routing (§12.10) to whichever of its apps claims it. A guest reaches its own modules by logical
- *  name through module/call, against the app key its bridge was built with — so the guest
+ *  name through `host.call`, against the app key its bridge was built with — so the guest
  *  never sees an app key at all. This needs to be unambiguous within one node, not agreed
  *  across a deployment. */
 export function appKeyFor(author: Uint8Array, app: string): string {
@@ -709,7 +710,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
             const near = Object.keys(AUTHORITY_CALLS).filter((n) => n.startsWith(prefix));
             const hint = near.length > 0
                 ? `this host grants: ${near.join(", ")}`
-                : `no authority under "${prefix}" exists — a pure name (crypto/*, module/call) is not a grant and is not declared`;
+                : `no authority under "${prefix}" exists — a pure name (crypto/*, or one of this bundle's own modules) is not a grant and is not declared`;
             throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
         }
     }

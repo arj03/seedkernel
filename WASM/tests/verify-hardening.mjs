@@ -110,7 +110,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
 {
   const identity = sodium.crypto_sign_keypair();
   const base = {
-    sodium, identity, callModule: () => null,
+    sodium, identity, callModule: () => null, hasModule: () => false,
     transport: { request: async () => new Uint8Array() },
     peers: () => [], fs: new MemoryFs(),
   };
@@ -118,7 +118,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   ok(typeof createCapBridge({ ...base, allowedNames: UNRESTRICTED_NAMES }) === "function",
     "naming the sentinel is accepted");
 
-  // A guest reaches its own app's modules with NO grant at all: module/call is a
+  // A guest reaches its own app's modules with NO grant at all: a bare name is a
   // primitive — the asking bundle's own code, scoped structurally by the app key the
   // bridge was built with — so it resolves under an empty requires set, exactly like
   // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
@@ -128,16 +128,14 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   const scoped = createCapBridge({
     ...base,
     callModule: (n, p) => chat.callModule("aa:chat", n, p),
+    hasModule: (n) => chat.isBound("aa:chat", n),
     allowedNames: [],
   });
-  // The forwarder echoes its input, so a resolved module answers with the body and an
-  // unresolved one answers empty — which is what tells the two apart.
-  const call = (name) => {
-    const n = new TextEncoder().encode(name);
-    return scoped("module/call", new Uint8Array([n.length, ...n, 7, 7, 7]));
-  };
-  ok(call("codec").length === 3, "a module of this app resolves and runs");
-  ok(call("evil").length === 0, "another app's module name reaches nothing through this bridge");
+  // The forwarder echoes its input, so a resolved module answers with the body; a name
+  // this app never installed is refused like any other unknown name in the catalog.
+  ok(scoped("codec", new Uint8Array([7, 7, 7])).length === 3, "a module of this app resolves and runs");
+  throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
+    "another app's module name reaches nothing through this bridge");
 }
 
 console.log("\n§4.3 — the guest realm has an execution budget");

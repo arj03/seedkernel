@@ -216,10 +216,10 @@ func newGuestRealm(loop *eventLoop, source string, capCall *qjs.Value, memoryLim
 		// CONTRACT: null is RESERVED for an async name whose promise hasn't settled —
 		// net/send and every fs/* (core/fs.ts is async on every target, so the native
 		// shim's synchronous __fs primitives are still wrapped into a resolved Promise).
-		// The remaining sync names (crypto/clock/module) return their bytes here. A sync
-		// name returning null/undefined would be mistaken for an async one and leave a
-		// guest Promise pending forever — which is why cap-bridge.ts maps an empty
-		// module/call reply to NONE rather than null.
+		// The remaining sync names (crypto, clock, and a bundle's own modules) return
+		// their bytes here. A sync name returning null/undefined would be mistaken for an
+		// async one and leave a guest Promise pending forever — which is why cap-bridge.ts
+		// maps an empty module reply to NONE rather than null.
 		if res.IsNull() {
 			// The call parked, and its settlement will arrive as a HOST-realm microtask
 			// (native-shim.ts capCall attaches `.then` → bridge.realmSettle). We are running
