@@ -5,27 +5,25 @@
 //
 // The transport itself — the identity handshake, the record layer, the routing —
 // runs in the transport bundle's guest program, driven by the shared TransportHost
-// (transport-host.ts). This file is what remains of the old RtcNetwork: the
-// WebRTC socket seam. It manages RTCPeerConnections and signaling; each data
-// channel is handed to the driver's openLink(), and everything above is the
-// bundle's, identical to the TCP path with only the bottom swapped.
+// (transport-host.ts). This file is the WebRTC socket seam: it manages
+// RTCPeerConnections and signaling; each data channel is handed to the driver's
+// openLink(), and everything above is the bundle's, identical to the TCP path
+// with only the bottom swapped.
 //
 // Identity: the transport runs its HELLO/AUTH challenge *inside* the channel,
-// proving each end holds the channel private key for the pubkey it claims. That
-// subsumes the SDP-fingerprint signing chat-shell.js does at the signaling layer —
-// and is stronger, because it is continuous channel binding rather than a one-shot
-// SDP assertion: a MITM relay can splice SDP and bring up DTLS to itself, but it
-// can never complete AUTH without the peer's private key, so the link never
-// authenticates and never delivers a byte.
+// proving each end holds the channel private key for the pubkey it claims. It is
+// continuous channel binding rather than a one-shot SDP-fingerprint assertion at
+// the signaling layer: a MITM relay can splice SDP and bring up DTLS to itself,
+// but it can never complete AUTH without the peer's private key, so the link
+// never authenticates and never delivers a byte.
 //
 // This module is browser-native (it uses the platform RTCPeerConnection /
 // RTCDataChannel / WebSocket). A Node/Bun console peer joins the same mesh by
 // passing a werift-backed `peerConnectionFactory` (./net-rtc-node
-// `weriftPeerConnectionFactory`) behind the same RtcChannel / Signaling —
-// everything above the channel is untouched, the same "swap the connection, keep
-// the stack" move net-node.ts documents for the engine build. The browser globals
-// are referenced only inside RtcNetwork / relaySignaling, never at module scope,
-// so importing this module under Node (e.g. to unit-test RtcChannel) is safe.
+// `weriftPeerConnectionFactory`) behind the same RtcChannel / Signaling — only
+// the connection implementation differs. The browser globals are referenced only
+// inside RtcNetwork / relaySignaling, never at module scope, so importing this
+// module under Node (e.g. to unit-test RtcChannel) is safe.
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { type PeerId } from "../core/net.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
@@ -70,10 +68,9 @@ export interface RtcNetworkOptions {
     /** Factory for the underlying RTCPeerConnection. Defaults to the platform
      *  global, which is what a browser tab uses. A Node/Bun *console* node passes a
      *  werift-backed factory (./net-rtc-node `weriftPeerConnectionFactory`) so this
-     *  exact stack runs off-browser — "swap the connection, keep the stack", the
-     *  same move net-node.ts documents for TCP. Referenced only inside ensurePeer(),
-     *  never at module scope, so importing this module under Node without a factory
-     *  stays safe. */
+     *  exact stack runs off-browser — "swap the connection, keep the stack".
+     *  Referenced only inside ensurePeer(), never at module scope, so importing this
+     *  module under Node without a factory stays safe. */
     peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
     /** Optional peer whitelist, applied to SIGNALING messages. Absent (the default)
      *  admits every peer to the rendezvous; the in-channel whitelist gate (the
@@ -100,8 +97,8 @@ export class RtcChannel extends MessageChannel {
 }
 // Cap on speculative (unauthenticated) peer entries the relay can force us to
 // allocate by spamming `hello`s with arbitrary `from` values. Authenticated peers
-// do not count, so genuine fleet size is unconstrained (mirrors chat-shell.js's
-// MAX_UNAUTHED_PEERS). 256 is comfortable headroom for a churn storm.
+// do not count, so genuine fleet size is unconstrained. 256 is comfortable
+// headroom for a churn storm.
 const MAX_UNAUTHED_PEERS = 256;
 export class RtcNetwork extends SingleIdentityNetwork {
     opts;
@@ -194,7 +191,7 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.peers.clear();
         this.opts.signaling.close();
     }
-    // ── per-peer connection (perfect negotiation, adapted from chat-shell.js) ─────
+    // ── per-peer connection (perfect negotiation) ───────────────────────────────────
     /** Whether a NEW (pre-auth) peer entry may be created. The relay can force
      *  speculative entries by naming arbitrary peers in hellos AND in offers, so
      *  every path that would CREATE an entry answers to the same cap; a peer with

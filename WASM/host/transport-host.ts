@@ -68,10 +68,8 @@ export function isHex64(s: string): boolean {
  *
  *  **The grammar is written once.** Where a peer LIVES differs by transport — a
  *  `host:port` to dial, a whole `ws://` URL for the browser edge — but who they are does
- *  not, and it used to be parsed twice, here and in net-ws.ts, by two functions that had
- *  already drifted on trimming and on how much they validated. `location` comes back
- *  unparsed, so each caller reads its own address form out of it and nothing else is
- *  duplicated.
+ *  not. `location` comes back unparsed, so each caller reads its own address form out of
+ *  it and nothing else is duplicated.
  *
  *  Host code, with the driver that consumes what it produces: every check here is a
  *  syntax check, so nothing about admission or trust would change if a target hand-rolled
@@ -136,9 +134,8 @@ const EMPTY = new Uint8Array(0);
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 
-/** Default half-open budgets, shipped to the transport guest at init (the old
- *  net-link.ts constants; the guest enforces them). Tests shrink them via
- *  TransportHostOptions. */
+/** Default half-open budgets, shipped to the transport guest at init and enforced
+ *  there. Tests shrink them via TransportHostOptions. */
 export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
 export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
 export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
@@ -210,8 +207,7 @@ export interface TransportHostOptions {
  *  the number that bounds it. */
   maxFrameBytes?: number;
   /** Concurrent half-open budgets, enforced in the transport guest. Defaults
- *  match the old net-link constants (1024 unverified / 8 per source / 256
- *  verified); tests shrink them. */
+  *  are 1024 unverified / 8 per source / 256 verified; tests shrink them. */
   maxHalfOpenUnverified?: number;
   maxHalfOpenPerSource?: number;
   maxHalfOpenVerified?: number;
@@ -325,10 +321,9 @@ export class TransportHost implements Network, HostTransport {
   readonly peerId: PeerId;
   port = 0;
   wsPort = 0;
-  /** Frames delivered to the app side — a diagnostic mirroring the old
- *  LoopbackNetwork.framesDelivered. */
+  /** Frames delivered to the app side — a diagnostic counter. */
   framesDelivered = 0;
-  /** Frames issued into the fabric — a diagnostic mirroring NodeNetworkCore. */
+  /** Frames issued into the fabric — a diagnostic counter. */
   framesSent = 0;
 
   private realm: SafeRealm | null = null;
@@ -660,9 +655,8 @@ export class TransportHost implements Network, HostTransport {
    *  the shortfall to connsPerPeer and opens links through the raw capability.
    *
    *  Joining, not racing: a second `ready()` while one is in flight returns the
-   *  SAME pending promise rather than overwriting the waiter — the old behaviour
-   *  resolved the second caller's promise from the first caller's timer and left
-   *  the first caller hanging forever. Both callers settle together. */
+   *  SAME pending promise rather than overwriting the waiter, so both callers
+   *  settle together. */
   ready(timeoutMs = 5000): Promise<void> {
     if (this.readyWaiter) return this.readyWaiter.promise;
     let resolve!: () => void;

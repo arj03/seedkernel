@@ -15,15 +15,14 @@
 //
 // The ASSEMBLY ORDER is the point. It is the last thing two hosts could disagree
 // about, so it is not restated here: `createShell` owns it, and this file only names
-// the platform. Because it is TypeScript checked against those same interfaces, the
-// drift a hand-written second assembly accumulates is now a compile error.
+// the platform. Because it is TypeScript checked against those same interfaces, drift
+// in a hand-written second assembly is a compile error.
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { runCli, loadedLine, type CliHost, type NodeSetup } from "./cli.js";
 import {
   createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
-import { TransportHost } from "./transport-host.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -117,13 +116,11 @@ export interface NativeSodium extends ShellSodium {
 /** libsodium, in libsodium-wrappers method names, over Go's primitives: Uint8Array
  *  results, `{publicKey, privateKey}` keypairs, and a throw where the wrappers throw.
  *
- *  **This adaptation is here rather than in Go**, where it used to be a JS string
- *  literal (`sodiumShimJS`). It is ordinary shaping code — the kind that must be
- *  identical on every target — and as a string it was the one part of the seam
- *  TypeScript never saw: the `ShellSodium` annotation below was an assertion about a
- *  Go constant rather than a check of it. Now a primitive that stops satisfying the
- *  surface fails the build, which is what the annotation always claimed. Go keeps the
- *  byte primitives and nothing else.
+ *  **This adaptation is here rather than in Go.** It is ordinary shaping code — the
+ *  kind that must be identical on every target — so it is TypeScript the compiler
+ *  checks: the `ShellSodium` annotation below is a check of it, not an assertion about
+ *  a Go constant. A primitive that stops satisfying the surface fails the build. Go
+ *  keeps the byte primitives and nothing else.
  *
  *  `null` means different things on the two halves and both are preserved: libsodium's
  *  wrappers throw on a failed open or a bad scalarmult, while ML-KEM's `null` is a
@@ -240,15 +237,14 @@ declare const __net: {
   closeListeners(): void;
 };
 
-// ── the RawLink shaping — ex sock.go's `netShimJS` string ────────────────────
+// ── the RawLink shaping ─────────────────────────────────────────────────────
 //
 // Go's byte-level `__net` becomes the RawLink objects below, and Go's socket
 // reader goroutines route deliveries through the three dispatchers defined at the
-// end of this block. The dispatchers used to be a JS string literal in Go (the
-// `netShimJS` constant), evaluated before the shared bundle loaded so Go could
-// retain them early; they are typed TS now, and Go picks them up AFTER the bundle
-// evaluates (main.go boot: exposeNet → eval host-shell.gen.js → netHost.retain) —
-// the deferred retention is what lets the shaping live where TypeScript sees it.
+// end of this block. The dispatchers are typed TS here, and Go picks them up AFTER
+// the bundle evaluates (main.go boot: exposeNet → eval host-shell.gen.js →
+// netHost.retain) — the deferred retention is what lets the shaping live where
+// TypeScript sees it.
 
 /** Channel table + accept registry, keyed by Go's socket ids / bound ports. */
 const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
@@ -510,10 +506,7 @@ async function makeTransportNode(cfg: {
     /** A transport bundle to mount instead of the artifact-shipped one (§12.6). */
     transportBundle?: Uint8Array;
     config?: Record<string, string | number>;
-}): Promise<{
-    shell: Shell;
-    net: TransportHost;
-}> {
+}): Promise<Shell> {
     const s = createShell({
         platform: {
             sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, table, fs,
@@ -544,10 +537,10 @@ async function makeTransportNode(cfg: {
             bridge.log('  no transport: the policy grants "mount" to no author of this bundle');
         }
     }
-    const net = s.net as unknown as TransportHost;
-    if (net instanceof TransportHost)
-        await net.start();
-    return { shell: s, net };
+    // Conditional on there BEING a driver: a policy granting `mount` to nobody leaves
+    // this node with no network, which is a configuration rather than a failure.
+    await s.transport?.start();
+    return s;
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so
@@ -561,7 +554,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     // signing for both. Go holds the seed and nothing derived from it.
     const keys = deriveNodeKeys(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
-    const { shell: s, net: network } = await makeTransportNode({
+    const s = await makeTransportNode({
         identity: keys.channel,
         guestIdentity: keys.guest,
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
@@ -571,7 +564,8 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         config: cfg.config,
     });
     shell = s;
-    if (network instanceof TransportHost) {
+    const network = s.transport;
+    if (network) {
         for (const spec of cfg.peers ?? []) {
             const { peerId, addr } = parsePeerSpec(spec, "tcp");
             network.addPeerAddr(peerId, addr);
@@ -582,7 +576,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
             await network.ready();
     }
     const status = {
-        peerId: toHex(keys.channel.publicKey), port: network.port, wsPort: network.wsPort,
+        peerId: toHex(keys.channel.publicKey), port: network?.port, wsPort: network?.wsPort,
     };
     return utf8.encode(JSON.stringify(status));
 }
@@ -598,9 +592,8 @@ function serve(): Promise<void> {
  *
  *  Everything an operator can choose is on the other side of this record: the flag set,
  *  the defaults, the deny-all reading of an absent `--policy`, the order remedies run
- *  in, which failures are fatal, and the console lines. That whole flow used to be
- *  written a second time in Go, which is how the two targets came to disagree about
- *  what `--contact-secret` names and about whether `--guest-timeout` exists at all. */
+ *  in, which failures are fatal, and the console lines. None of it is restated for this
+ *  platform — cli.ts owns it once. */
 function nativeCliHost(): CliHost {
     return {
         banner: "seedkernel-loader",
@@ -633,7 +626,7 @@ function nativeCliHost(): CliHost {
             });
             // One "the shell" per realm, whichever entry point stood it up, so the
             // native tests' drivers and the flow above address the same node.
-            shell = stood.shell;
+            shell = stood;
             return stood;
         },
     };

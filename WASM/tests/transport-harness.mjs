@@ -50,7 +50,7 @@ export function transportPolicy(authorHex) {
 }
 
 /** One transport host: a shell over a fresh identity + the transport bundle. The
- *  driver (shell.net) is the node's network. Options pass through to the shell's
+ *  driver (shell.transport) is the node's network. Options pass through to the shell's
  *  platform (admitPeer for the peer whitelist, networkKey, contactSecret, channels)
  *  and to the shell's createShell opts (requestDeadlineMs, transportHalfOpen). */
 export async function makeTransportHost(opts = {}) {
@@ -75,7 +75,7 @@ export async function makeTransportHost(opts = {}) {
     transportHalfOpen: opts.transportHalfOpen,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
-  return { shell, driver: shell.net, identity };
+  return { shell, driver: shell.transport, identity };
 }
 
 /** Await a condition with a deadline — the tests' tick, bounded. */

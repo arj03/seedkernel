@@ -46,8 +46,8 @@ const netBenchHarness = `
 	globalThis.__netSetup = (async () => {
 	  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 	  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
-	  globalThis.netA = a.net;
-	  globalThis.netB = b.net;
+	  globalThis.netA = a.transport;
+	  globalThis.netB = b.transport;
 
 	  const block64k = new Uint8Array(65536); block64k.fill(0x5a);
 	  netA.onRequest((from, proto, payload) => {

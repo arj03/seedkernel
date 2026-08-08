@@ -39,12 +39,11 @@ import {
   type QuickJSHandle,
 } from "quickjs-emscripten";
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
-// ceiling and the same budget whether its realm is this one or the native target's
-// (native/guest.go, whose bridge used to carry its own copies of these numbers).
+// ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { errMessage } from "../core/util.js";
 // Use the actively-maintained quickjs-ng build rather than quickjs-emscripten's default
-// (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed now — net is
+// (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed — net is
 // a real Promise resolved by the host, not an Asyncify stack unwind.
 //
 // This variant package is CJS, so under `nodenext` TypeScript types its default export as

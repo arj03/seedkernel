@@ -12,7 +12,6 @@ import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { runCli, type CliHost, type NodeSetup } from "./cli.js";
 import { boot } from "./main.js";
 import { loadCrypto } from "./crypto-node.js";
-import { TransportHost } from "./transport-host.js";
 import { errMessage } from "../core/util.js";
 
 /** Write atomically: a temp beside the target, then a rename onto it. The two files
@@ -43,8 +42,7 @@ async function nodeHost(): Promise<CliHost> {
     async standUp(cfg: NodeSetup) {
       // ShellOptions is NodeSetup plus this platform's own optional members, so the
       // config crosses unchanged — no field-by-field copy to fall out of step.
-      const shell = await boot(cfg);
-      return { shell, net: shell.net as unknown as TransportHost };
+      return boot(cfg);
     },
   };
 }

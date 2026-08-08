@@ -2,13 +2,12 @@
 // the one install path. Admission is the single seam between verifyBundle and
 // installBundle (§12.4): governance is this file, mechanics is installBundle.
 //
-// **One predicate, not four gates.** A load used to pass through a revocation check, a
-// version floor, and a per-class operator predicate, each in a different file and each
-// with its own place in a carefully ordered sequence — so "the policy said yes but
-// freshness said no" was a real interleaving somebody had to keep right. They are now
-// one `Admit`, composed at shell construction and evaluated in one call. Everything a
-// gate used to read for itself arrives as `AdmissionContext`, so the predicate is a pure
-// function of `(bundle, context)` — no store, no I/O, no order to get wrong.
+// **One predicate, not four gates.** Admission is a revocation check, a version floor,
+// and a per-class operator predicate composed into one `Admit` at shell construction and
+// evaluated in one call — so "the policy said yes but freshness said no" cannot happen:
+// there is one answer from one call. Everything a gate needs arrives as
+// `AdmissionContext`, so the predicate is a pure function of `(bundle, context)` — no
+// store, no I/O, no order to get wrong.
 //
 // The host's own two — `notRevoked` and `freshVersion` — are composed by the SHELL, not
 // by the operator. That matters: they are invariants rather than posture, so `admitAll`
@@ -49,8 +48,8 @@ import { toHex } from "../core/util.js";
 import { PRIVILEGES, type Privilege } from "../core/domains.js";
 import type { VerifiedBundle } from "./bundle.js";
 
-/** Everything a gate used to read for itself, read ONCE by the shell and handed to the
- *  predicate — which is what makes the predicate pure and its order irrelevant. */
+/** Everything a gate needs, read ONCE by the shell and handed to the predicate —
+ *  which is what makes the predicate pure and its order irrelevant. */
 export interface AdmissionContext {
   /** The privileges this bundle's `requires` reach (§12.5), derived by the shell from
    *  the catalog and never from anything the bundle says about itself. Empty ⇒ it

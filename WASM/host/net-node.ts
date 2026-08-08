@@ -2,17 +2,17 @@
 // browser↔node over WebSocket. It implements ChannelFactory (core/socket-seam.ts):
 // it knows how to open node:net sockets and wrap them as RawLinks, and nothing
 // else. The transport itself — the PeerLink handshake, link routing, the
-// request/response layer — now runs in the transport bundle's guest program,
-// driven by the shared TransportHost (transport-host.ts), which the shell stands
-// up when the transport bundle is mounted. This file is what
-// remains of the old NodeNetworkCore wiring: the factory the driver's DIAL
-// actions and listeners go through, and the peer-spec parsing for the CLI.
+// request/response layer — runs in the transport bundle's guest program, driven
+// by the shared TransportHost (transport-host.ts), which the shell stands up when
+// the transport bundle is mounted. This file is the socket seam's host half: the
+// factory the driver's DIAL actions and listeners go through, and the peer-spec
+// parsing for the CLI.
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so it is handled as
 // a wire codec *over a raw TCP listener*: this file binds the listener and says which
 // codec applies, and the RFC 6455 handshake and framing themselves run in the
-// transport bundle (transport/src over its own ws.wasm module). No dependency on
-// node:http and no Bun-native fast path — one WS code path, and it is not host code.
+// transport bundle (transport/src over its own ws.wasm module) — one WS code
+// path, with no node:http dependency on the host side.
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";

@@ -64,7 +64,7 @@ console.log("Test: transport bundle frames its own TCP links (unframed RawLink)"
 
 const a = await makeNode();
 const b = await makeNode();
-const aNet = a.net, bNet = b.net;
+const aNet = a.transport, bNet = b.transport;
 
 await aNet.start();
 await bNet.start();
@@ -119,7 +119,7 @@ console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle modu
 
 const c = await makeNode(true);
 const d = await makeNode(true);
-const cNet = c.net, dNet = d.net;
+const cNet = c.transport, dNet = d.transport;
 await cNet.start();
 await dNet.start();
 assert(dNet.wsPort > 0, "the WS listener bound");

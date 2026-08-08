@@ -47,11 +47,11 @@ export interface BundleModule {
  *  satisfies it directly (as does the native loader's Go-backed `sodium`, §12.9): verify
  *  the manifest signature, and hash content with the genesis hash.
  *
- *  It adds nothing to `ManifestVerifier` since the hash moved there (a multi-key suite
- *  derives its author id by hashing, §14.1) — the name survives because it is what the
- *  shell's `ShellSodium` and every call site are written against, and because the two
- *  answer different questions: one is "what does a *load* need", the other "what does a
- *  *manifest* need". */
+ *  It adds nothing to `ManifestVerifier` — hashing lives there (a multi-key suite
+ *  derives its author id by hashing, §14.1) — and the type stays separate because it is
+ *  what the shell's `ShellSodium` and every call site are written against, and because
+ *  the two answer different questions: one is "what does a *load* need", the other
+ *  "what does a *manifest* need". */
 export interface BundleCrypto extends ManifestVerifier {
 }
 
@@ -226,7 +226,7 @@ export interface VerifiedManifest {
  *  The two live in one store because they are the same KIND of thing — persisted
  *  operator decisions about an author, read on the same load path, written through
  *  the same atomic seam — and because the dead-key set is worth nothing if a
- *  truncated write can drop it. The name still says "freshness" for the older half;
+ *  truncated write can drop it. The name says "freshness" for the marks half;
  *  renaming it would touch every target for no behavioural gain. */
 export interface FreshnessStore {
     /** The highest `version` ever loaded for this `(author, app)`, or −Infinity if none. */
@@ -673,7 +673,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // the same courtesy an unimplemented ABI or an unknown required name gets below, and for
     // the same reason: "this bundle is not shaped like an app this runtime runs" is a
     // rule an author should learn, not something to report as "malformed manifest". It is
-    // also the one manifest a bundle written against the older, module-only format
+    // also the one manifest a bundle written against the module-only format
     // produces, so it is exactly the error worth spelling out.
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
         && (parsed as Record<string, unknown>).guest === undefined) {
@@ -980,8 +980,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  floor now live, reading the same store this function writes. By the time a bundle
  *  reaches here every decision is settled: this function is mechanics only (instantiate,
  *  bind, mark), and the store it takes is a place to WRITE rather than a second gate.
- *  Splitting it that way is what removed the "policy said yes but freshness said no"
- *  interleaving — there is one answer, from one call, before anything lands.
+ *  Splitting it that way means there is one answer, from one call, before anything
+ *  lands — no "policy said yes but freshness said no" interleaving.
  *
  *  There is no per-module admission callback: the manifest's `modules[].hash` commits to
  *  exactly which bytes are authorized, and `verifyBundle` already proved the bytes match.
@@ -1031,9 +1031,10 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // where the downgrade is DECIDED — in the admission predicate — would brick rollback:
     // a partially written or corrupt *newer* bundle — manifest intact and signed, but one
     // module or the guest wrong — would raise the mark to the new version, then throw.
-    // Which is exactly why the predicate is pure and this is the only writer. Nothing runs, yet
-    // reloading the known-good older bundle is now refused as a downgrade until an
-    // operator hand-edits the freshness file. The mark must record the highest version
+    // Which is exactly why the predicate is pure and this is the only writer. The flip
+    // side of that discipline: once a good newer version has landed, reloading the
+    // known-good older bundle is refused as a downgrade until an operator hand-edits
+    // the freshness file. The mark must record the highest version
     // that actually loaded (README §12.4). Integrity was verified by verifyBundle before
     // this function was called, so the freshness advance is always behind a successful
     // verify — and, with `deferMark`, behind the driver standing as well.

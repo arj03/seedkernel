@@ -24,7 +24,7 @@ export class NodeFs implements Fs {
    *  backend by `validatedFs` (shell-core.ts) where the shell takes one — not restated
    *  here, because a backend's copy of that rule is how the key space starts differing
    *  between targets.
-   *  What survives is one containment check: a key that reached this far and still holds
+   *  What this backend adds is containment: a key that reached this far and still holds
    *  a separator would escape `dir`, so refuse it whatever admitted it. */
   private path(key: string): string {
     if (key.includes("/") || key.includes("\\") || key === "." || key === "..") {

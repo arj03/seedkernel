@@ -1,12 +1,10 @@
 // A werift-backed RTCPeerConnection for the *console* side of net-rtc.ts.
 //
 // net-rtc.ts is browser-native: RtcNetwork builds connections from the platform
-// RTCPeerConnection / RTCDataChannel, and its header promises a Node peer "joins
-// the same mesh by swapping those for node-datachannel's equivalents behind the
-// same RtcChannel / Signaling — everything above the channel is untouched". This
-// module is that swap, implemented in *pure JS* with werift (no native addon, so
-// it also bundles into the `bun --compile` shell), and wired through the single
-// `peerConnectionFactory` seam RtcNetwork now exposes.
+// RTCPeerConnection / RTCDataChannel. This module is the Node side of that swap,
+// implemented in *pure JS* with werift (no native addon, so it also bundles into the
+// `bun --compile` shell), and wired through the single `peerConnectionFactory` seam
+// RtcNetwork exposes.
 //
 //   browser tab  ──RTCDataChannel──┐
 //                                  ├── relay (signaling only) ── same room

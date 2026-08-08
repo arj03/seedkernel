@@ -3,18 +3,13 @@
 // them). Both of that target's realms take them from here: the host realm by evaluating
 // this module, the confined realm by evaluating the same text (native/guest.go).
 //
-// It used to be a Go string constant (`native/polyfill.go`), the last of them —
-// `netShimJS`, `sodiumShimJS` and `guestDriverJS` had already moved out. What Go held
-// was ordinary JavaScript that has to behave the same on every target and that Go had
-// no reason to own; keeping it there put the one part of the seam TypeScript never saw
-// beside the parts it does.
-//
-// One text for both realms is the point of the string: the host realm cannot fetch it
+// These are ordinary JavaScript that has to behave the same on every target, and one
+// text serves both realms — the point of the string: the host realm cannot fetch it
 // from the shell (the shell IS what needs it — `core/domains.ts` builds its DOMAIN
 // constants with a `TextEncoder` at module scope), so this module is first in the
 // loader bundle and installs them on the way past. A second, TypeScript-typed copy for
-// the host realm would be two implementations of one polyfill, which is exactly the
-// shape this file exists to remove.
+// the host realm would be two implementations of one polyfill, which is the shape this
+// file prevents.
 const POLYFILLS = `
 "use strict";
 (function () {

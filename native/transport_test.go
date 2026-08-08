@@ -50,10 +50,10 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const aId = toHex(idA.publicKey), bId = toHex(idB.publicKey);
 		  const a = await makeTransportNode({ identity: idA, %s timeoutMs: 1000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 1000 });
-		  await a.net.start();
-		  a.net.onRequest((from, proto, payload) => payload);
-		  b.net.addPeerAddr(aId, { host: "127.0.0.1", port: a.net.%s, transport: "%s" });
-		  return await b.net.request(aId, new TextEncoder().encode("_test"), new Uint8Array([10, 20, 30]));
+		  await a.transport.start();
+		  a.transport.onRequest((from, proto, payload) => payload);
+		  b.transport.addPeerAddr(aId, { host: "127.0.0.1", port: a.transport.%s, transport: "%s" });
+		  return await b.transport.request(aId, new TextEncoder().encode("_test"), new Uint8Array([10, 20, 30]));
 		};
 	`, listenArgs, portField, transport)
 	if _, err := qc.Eval("transport-harness.js", qjs.Code(harness)); err != nil {

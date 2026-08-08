@@ -114,8 +114,8 @@ const listen = { host: "loopback", port: 0 };
 // outgoing driver, and a whole-fabric close would unbind the other node's listener too.
 const a = await makeNode(fabric.view(), listen);
 const b = await makeNode(fabric.view(), listen);
-const aNet = a.net;
-const bNet = b.net;
+const aNet = a.transport;
+const bNet = b.transport;
 const bId = b.transport.peerId;
 
 console.log("  starting listeners…");
@@ -141,7 +141,7 @@ console.log("  upgrading A's transport in place…");
 const oldDriver = a.transport;
 const oldPort = aNet.port;
 await a.loadBundleBlob(transportBundleAt(2, upgradeKeys));
-const aNet2 = a.net;
+const aNet2 = a.transport;
 
 assert(aNet2 !== oldDriver, "the standing transport was replaced");
 // The old driver is CLOSED, not merely dropped: its realm is gone, its links are torn
@@ -149,7 +149,7 @@ assert(aNet2 !== oldDriver, "the standing transport was replaced");
 // released rather than left bound for the life of the process.
 assert(oldDriver.isClosed === true, "the outgoing driver was closed, not leaked");
 assert(aNet2.port === oldPort, "the node came back on the SAME port its peers hold");
-assert(a.net.peerId === aNet.peerId, "the node identity is the host's, untouched by the swap");
+assert(a.transport.peerId === aNet.peerId, "the node identity is the host's, untouched by the swap");
 
 // Live links do not survive and are not meant to: session keys live in the outgoing
 // guest's private memory. What survives is the host's half — the address book — so the
@@ -168,7 +168,7 @@ let refused = false;
 try { await a.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version from the same author is refused after the upgrade");
-assert(a.net === aNet2, "…and the refused load left the standing transport in place");
+assert(a.transport === aNet2, "…and the refused load left the standing transport in place");
 
 // ── A version that never ran must not consume the slot ───────────────────────────
 // A transport mount's load is not done when its modules bind — it is done when its DRIVER
@@ -183,13 +183,13 @@ let v3Failed = false;
 try { await a.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
 catch { v3Failed = true; }
 assert(v3Failed, "a v3 whose guest cannot compile fails the load");
-assert(a.net === aNet2, "…and the node keeps the transport that was standing");
+assert(a.transport === aNet2, "…and the node keeps the transport that was standing");
 
 let v2Reloaded = true;
 try { await a.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what loaded");
-assert(a.net !== aNet2, "…as a genuinely re-stood driver, not the old one left in place");
+assert(a.transport !== aNet2, "…as a genuinely re-stood driver, not the old one left in place");
 
 a.close();
 b.close();

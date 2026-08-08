@@ -1,15 +1,14 @@
 // Browser↔node edge over a plain WebSocket (the README's "browser edge over
 // WebSocket"). A browser cannot open raw TCP, and WebRTC (net-rtc.ts) needs a
 // signaling relay + STUN; when a node is directly reachable — a public IP, a LAN,
-// a port-forward — the simplest path is the oldest one: the browser opens a
-// WebSocket straight at the node's --ws-listen endpoint.
+// a port-forward — the simplest path is a WebSocket straight at the node's
+// --ws-listen endpoint.
 //
 // The transport itself — the identity handshake, the record layer, the routing —
 // runs in the transport bundle's guest program, driven by the shared TransportHost
-// (transport-host.ts). This file is what remains of the old WsNetwork: the browser
-// side of the socket seam. It opens platform WebSockets and hands them to the
-// driver's openLink() — everything above is the bundle's, identical to the TCP
-// path with only the bottom swapped.
+// (transport-host.ts). This file is the browser end of the socket seam: it opens
+// platform WebSockets and hands them to the driver's openLink() — everything above
+// is the bundle's, identical to the TCP path with only the bottom swapped.
 //
 // Platform-neutral: the WebSocket global is touched only inside a dial (or an
 // injected factory), so importing this module where WebSocket is absent is safe.
@@ -135,8 +134,8 @@ export class WsNetwork extends SingleIdentityNetwork implements Network {
  *  ws:// scheme; pass wss:// explicitly for TLS.
  *
  *  Who the peer is comes from `parsePeerRef` (transport-host.ts) — the one place that
- *  grammar is written. All that is left here is this edge's own address form, which is a
- *  URL rather than a host:port and is the only reason a second entry point exists. */
+ *  grammar is written. This edge's own address form is a URL rather than a host:port,
+ *  which is the only reason a second entry point exists. */
 export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
   const { peerId, contactSecret, location } = parsePeerRef(spec);
   const url = (location.startsWith("ws://") || location.startsWith("wss://")) ? location : "ws://" + location;

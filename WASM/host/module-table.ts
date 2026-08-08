@@ -88,7 +88,7 @@ export class ModuleTable {
    *
    *  Every module is instantiated and validated BEFORE anything is written, so a bundle
    *  whose third module is malformed leaves the table exactly as it was rather than
-   *  half-replaced. Atomicity is now visible rather than argued: the app's whole module
+   * half-replaced. The atomicity is structural rather than argued: the app's whole module
    *  map is built first and then assigned under its key, so the commit is ONE assignment
    *  and there is no window in which some of an app's modules are the new version and
    *  the rest are the old.
@@ -209,10 +209,10 @@ export class ModuleTable {
   }
 
   /** Drop an app and everything it landed, returning how many modules went — the §3.1
-   *  unbind, and the whole of it. The unit is an APP, which is now simply the key: the
+   *  unbind, and the whole of it. The unit is an APP, which is simply the key: the
    *  shell's `uninstall` and `revoke` (§12.5) are the only callers, and both mean exactly
-   *  this. Install and removal are visibly the same unit, so there is no asymmetry left
-   *  to explain.
+   *  this. Install and removal are visibly the same unit, so there is no asymmetry to
+   *  explain.
    *
    *  There is no single-module remove. Nothing wants one — a module is not a unit anything
    *  installs or revokes — and with modules living inside their app there is no shared

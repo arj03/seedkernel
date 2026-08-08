@@ -527,22 +527,19 @@ export function transportSignScope(key: {
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
-// `grants.names` governs how far a guest reaches, and it once had a permissive meaning for
-// the *absent* value — omit it and the guest got every name in the catalog. That is the
-// wrong default in the one file where a mistake is a capability escalation: it makes full
-// authority the thing a new call site gets by forgetting a field, in a runtime whose
-// admission policy is otherwise deny-all (policy.ts).
+// `grants.names` governs how far a guest reaches, and the absent value must NOT mean
+// permissive: a mistake there is a capability escalation — full authority is what a new
+// call site gets by forgetting a field, in a runtime whose admission policy is otherwise
+// deny-all (policy.ts). So `grants.names` is required, and the permissive case is a value
+// a caller has to name. There IS a legitimate permissive caller — a host-side orchestrator
+// that already holds every primitive the seam wraps, so gating it protects nothing — and
+// this sentinel is for it. A symbol rather than a string or `null`: a symbol cannot arrive
+// from parsed config or be produced by a manifest, so the only way to reach the permissive
+// branch is to import the constant and mean it.
 //
-// It is now required, and the permissive case is a value a caller has to name. There IS a
-// legitimate permissive caller — a host-side orchestrator that already holds every
-// primitive the seam wraps, so gating it protects nothing — and this sentinel is for it.
-// A symbol rather than a string or `null`: a symbol cannot arrive from parsed config or be
-// produced by a manifest, so the only way to reach the permissive branch is to import the
-// constant and mean it.
-//
-// Module scoping used to need the same treatment, and no longer does: `modules.call` is
-// bound to one app's module map (ModuleTable), so there is no wider namespace an omitted
-// argument could open onto and nothing to opt out of.
+// Module scoping needs no such case: `modules.call` is bound to one app's module map
+// (ModuleTable), so there is no wider namespace an omitted argument could open onto and
+// nothing to opt out of.
 /** Run without name gating: every authority resolves. For a host-side
  *  caller that already holds the primitives; never for a bundle's guest, whose reach is
  *  its manifest `requires` and nothing else (§12.2). */

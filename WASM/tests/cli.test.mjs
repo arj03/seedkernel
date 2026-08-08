@@ -78,16 +78,16 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
     async standUp(cfg) {
       host.stood = cfg;
       return {
-        shell: {
-          revoke: () => [],
-          uninstall: () => false,
-          loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
-          runGuest: async () => new Uint8Array(0),
-          serve: async () => {},
-          close: () => { host.closed = true; },
-          ...shell,
-        },
-        net: { port, wsPort },
+        revoke: () => [],
+        uninstall: () => false,
+        loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
+        runGuest: async () => new Uint8Array(0),
+        serve: async () => {},
+        close: () => { host.closed = true; },
+        // The node's transport driver — the one field the flow reads its ports and its
+        // address book off. `null` here would be the no-transport-bundle node.
+        transport: { port, wsPort },
+        ...shell,
       };
     },
   };
@@ -204,12 +204,13 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }
 // --peers with no transport bundle admitted says what is wrong, rather than throwing a
-// TypeError off the null face's missing members.
+// TypeError off the null the shell hands back.
 {
-  const host = fakeHost(["--key", join(work, "p.key"), "--peers", `${good}@127.0.0.1:7000`]);
+  const host = fakeHost(["--key", join(work, "p.key"), "--peers", `${good}@127.0.0.1:7000`],
+    { shell: { transport: null } });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("no transport bundle"), "--peers without a transport explains itself");
+  ok(msg.includes("the transport bundle is not loaded"), "--peers without a transport explains itself");
 }
 
 console.log("\n— the load line —");

@@ -20,13 +20,13 @@
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, grantGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall } from "./guest-seam.js";
-import { TransportHost, type HostTransport } from "./transport-host.js";
+import { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, privilegeOf, type Privilege } from "../core/domains.js";
-import { toHex, fromHex, errMessage } from "../core/util.js";
+import { fromHex, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
-import { type Network, type PeerId } from "../core/net.js";
+import { type PeerId } from "../core/net.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
@@ -62,9 +62,7 @@ export type RealmFactory = (opts: {
     /** Budget of guest *execution* time per entrypoint invocation, in ms. Omitted ⇒ the
      *  factory's own default — which is the shared `DEFAULT_GUEST_DEADLINE_MS` on both
      *  targets. Both resource bounds cross this seam, so a guard a factory implements
-     *  is one the shell can actually reach — `deadlineMs` existed in safe-js before
-     *  this field did and was therefore dead code, since the shell is the only caller
-     *  and had no way to pass it. */
+     *  is one the shell can actually reach. */
     deadlineMs?: number;
 }) => Promise<SafeRealm>;
 
@@ -208,11 +206,15 @@ export interface Shell {
     /** Every protocol this node serves, as `[proto, appKey]` — what an operator's console
      *  line or a shell's UI lists. A snapshot, not the live map. */
     routes(): [string, string][];
-    /** The transport bundle's driver — the node's Network. Absent until the
-     *  transport bundle is mounted; a shell without one has no net. */
-    net: Network;
-    /** The request/response face of the same driver (the old Transport shape). */
-    transport: HostTransport;
+    /** The transport bundle's driver, or `null` until one is mounted (§12.6).
+     *
+     *  ONE object, not one per face: `TransportHost implements Network, HostTransport`,
+     *  so the endpoint vend, the request/response pair every app's `net` names reach,
+     *  and the host-side address book a console line drives are all reached through
+     *  this field. A shell that never admitted a transport bundle has no network at
+     *  all, and the `null` is that answer — a caller that needs one says so with
+     *  {@link requireTransport} rather than calling into a stub that throws. */
+    transport: TransportHost | null;
     /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
      *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
     fs?: Fs;
@@ -263,6 +265,20 @@ export interface Shell {
     close(): void;
 }
 
+/** The transport driver, or a diagnosis of why there is none.
+ *
+ *  A node without a transport bundle is a legitimate configuration (§12.6) — the
+ *  policy simply granted `mount` to nobody — so `shell.transport` is nullable and
+ *  every caller sees that in the type. This is for the callers that genuinely cannot
+ *  proceed (a CLI dialing a peer): it turns the null into the sentence an operator
+ *  can act on, naming the privilege and the halves a bundle must declare to hold it.
+ *  Nothing on the Shell throws this on the caller's behalf — a stub that answers a
+ *  `Network` shape and throws on use would be a transport that is not one. */
+export function requireTransport(shell: Pick<Shell, "transport">, what: string): TransportHost {
+    if (shell.transport) return shell.transport;
+    throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the ${PRIVILEGE_MOUNT} names, ${(GROUPS_BY_PRIVILEGE.get(PRIVILEGE_MOUNT) ?? []).join(" + ")}, first)`);
+}
+
 // Re-export the admission predicate constructors so a target that gates admission
 // on consent (the browser) or on which bundle it was handed (a StorageNode) can
 // reach them from the same module it gets createShell from. ModuleTable rides along
@@ -283,7 +299,7 @@ type AppEntry = (input: Uint8Array) => Promise<Uint8Array> | null;
  *  handle, and it is what teardown reads — disposing has to be synchronous, because
  *  the callers that do it (uninstall, close, a transport handover) are deciding
  *  right then what the node holds. `realmP` is the in-flight construction, and it
- *  is the memo: `ensureRealm` is now reached concurrently — two inbound frames for
+ *  is the memo: `ensureRealm` is reached concurrently — two inbound frames for
  *  an app whose realm does not exist yet both arrive before either factory call
  *  resolves — so without a promise to share, each caller would build its own realm
  *  and every one but the last would be orphaned: never disposed, still holding its
@@ -308,11 +324,11 @@ type TransportSlot = RealmHolder;
 // contributes is the two places the host APPLIES it. `validatedFs` wraps whatever
 // backend a target supplies so every host admits exactly the same key space, and
 // `scopedFs` scopes a backend to one app's private keyspace (README §12.2) so two
-// apps sharing the domain still cannot read each other's keys. Both used to live
-// in core/fs.ts; they are host mechanics rather than vocabulary, so they sit here
-// with the only production caller (createShell). The argument each wraps is in
-// core/fs.ts; see the scoping note in `appScopeFor` (bundle.ts) for why `scope`
-// must be a fixed-length derived prefix.
+// apps sharing the domain still cannot read each other's keys. They are host
+// mechanics rather than vocabulary, so they sit here with the only production
+// caller (createShell). The argument each wraps is in core/fs.ts; see the scoping
+// note in `appScopeFor` (bundle.ts) for why `scope` must be a fixed-length
+// derived prefix.
 
 /** Apply the key rule over a backend, once, for every target.
  *
@@ -362,8 +378,8 @@ export function validatedFs(inner: Fs): Fs {
  *
  *  `stat()` is deliberately NOT scoped — `used`/`available` describe the physical
  *  backend, and reporting a per-app figure for `available` would be a fiction. An app
- *  that wants its own footprint sums `size()` over its own `list()`, which is now
- *  exactly its own keys. */
+ *  that wants its own footprint sums `size()` over its own `list()` — exactly its own
+ *  keys. */
 export function scopedFs(inner: Fs, scope: string): Fs {
   // A scope prefix must survive the key rule — it is the head of every key this app
   // will ever reach — so it is checked here, at construction, rather than on the first
@@ -376,7 +392,7 @@ export function scopedFs(inner: Fs, scope: string): Fs {
     get: (key) => inner.get(outward(key)),
     put: (key, bytes) => inner.put(outward(key), bytes),
     size: (key) => inner.size(outward(key)),
-    // An absent prefix means "everything I can see", which is now everything in this
+    // An absent prefix means "everything I can see", which is everything in this
     // scope and nothing else. Keys come back stripped, so the guest only ever handles
     // the names it chose and the scope stays a host-side fact.
     list: async (prefix) => (await inner.list(outward(prefix ?? ""))).map((k) => k.slice(scope.length)),
@@ -401,7 +417,6 @@ export function createShell(opts: CreateShellOptions & {
     // `admitAll` posture, or a consent dialog that always says yes, must not be a way to
     // lose revocation or the downgrade guard.
     const admit: Admit = allOf(hostGates, opts.admit ?? denyAll);
-    const peerId = toHex(platform.identity.publicKey);
     const apps = new Map<string, AppSlot>();
     /** protocol id → app key (§12.10) — a PROJECTION of what is installed, never a
      *  structure of its own. Every entry comes from some installed manifest's signed
@@ -413,12 +428,9 @@ export function createShell(opts: CreateShellOptions & {
     let transportSlot: TransportSlot | null = null;
     let transportKey: string | null = null;
     /** The transport driver, standing once the transport bundle is mounted. The app
-     *  seams and the shell's net/transport fields read this indirection, so the
-     *  shell can be assembled before any bundle loads. */
+     *  seams and the shell's `transport` field read this indirection, so the shell
+     *  can be assembled before any bundle loads. */
     let netHost: TransportHost | null = null;
-    const noTransport = (what: string): never => {
-        throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the ${PRIVILEGE_MOUNT} names, ${(GROUPS_BY_PRIVILEGE.get(PRIVILEGE_MOUNT) ?? []).join(" + ")}, first)`);
-    };
     // The tail of every initiator `runGuest` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
     // is never resumed into a freed realm — a QuickJS use-after-free (§2.1).
@@ -492,9 +504,9 @@ export function createShell(opts: CreateShellOptions & {
                     ? transportSignScope(platform.identity, platform.networkKey)
                     : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
                 // Scoped to this app key, so `fs` grants reach over this app's own keyspace
-                // and not the node's (fs.ts). Two admitted apps can no longer read,
-                // enumerate or delete each other's data, which brings `fs` into line with
-                // the structural ownership module names already have (§5.1).
+                // and not the node's (fs.ts). Two admitted apps cannot read, enumerate or
+                // delete each other's data — the same structural ownership module names
+                // have (§5.1).
                 //
                 // Wired whenever the node has an fs at all, without consulting the manifest:
                 // `names` refuses every `fs/*` name the bundle did not declare, so a second
@@ -678,18 +690,10 @@ export function createShell(opts: CreateShellOptions & {
         host,
         resolve: (proto) => routes.get(proto) ?? null,
         routes: () => [...routes],
-        // Both fields are the transport driver, reached through the indirection so
-        // the shell can be assembled before any bundle loads.
-        get net() { return netHost ?? { endpoint: () => noTransport("net is unavailable") }; },
-        get transport() {
-            return netHost ?? {
-                peerId,
-                request: () => noTransport("request"),
-                send: () => noTransport("send"),
-                onRequest: () => noTransport("onRequest"),
-                close: () => noTransport("close"),
-            };
-        },
+        // A getter, not a captured value: the slot is filled at mount and REPLACED by
+        // a handover (§12.6), so a caller reading this field always sees the driver
+        // standing now rather than the one standing when it took the reference.
+        get transport() { return netHost; },
         fs,
         sodium,
         async loadBundleBlob(blob) {
@@ -728,14 +732,13 @@ export function createShell(opts: CreateShellOptions & {
                 throw new Error(`shell: a transport claims no protocol ids; ${v.manifest.app} claims ${v.manifest.protocols!.join(", ")} — a mount receives no dispatch (§12.10)`);
             }
             // ADMISSION — one predicate, one call, one answer (§12.5). Everything a gate
-            // used to read for itself is read here, once, and handed in: the privileges
-            // this bundle reaches, the persisted `(author, app)` high-water mark, and
-            // whether this host has written the author key off. The predicate is then a
-            // pure function of `(bundle, context)`, which is what removed the ordering
-            // this sequence used to have to get right — revocation before the consent
-            // dialog (a written-off key must never reach a prompt), the downgrade guard
-            // after the operator's yes but before anything landed. Composition (`allOf`,
-            // `byPrivilege`) says all of that once, at construction.
+            // needs is read here, once, and handed in: the privileges this bundle
+            // reaches, the persisted `(author, app)` high-water mark, and whether this
+            // host has written the author key off. The predicate is a pure function of
+            // `(bundle, context)`; the ordering constraints — revocation before the
+            // consent dialog (a written-off key must never reach a prompt), the
+            // downgrade guard after the operator's yes but before anything landed — are
+            // the composition's (`allOf`, `byPrivilege`), stated once at construction.
             const ctx: AdmissionContext = {
                 privileges,
                 highWater: platform.freshnessStore.get(v.author, v.manifest.app),

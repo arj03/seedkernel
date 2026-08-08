@@ -2,14 +2,8 @@
 //
 // What an operator types, what each flag defaults to, what order the node does things
 // in, and what it prints while doing them. None of that is platform: it is the same
-// decision on Node, on Bun and inside the native binary's QuickJS, and it used to be
-// made twice — once here in TypeScript and once again in Go (`native/main.go`'s
-// `parseCLI` + `main`). The two drifted exactly where you would expect a hand-copied
-// flow to drift: `--contact-secret` came to mean a *file* on one target and the hex
-// *itself* on the other, `--guest-timeout`/`--guest-memory` were added here and never
-// reached the native target at all, and the two disagreed about where `--dir` points
-// when it is omitted. This file is the fix: one flow, and a `CliHost` naming the few
-// things that genuinely differ.
+// decision on Node, on Bun and inside the native binary's QuickJS, so this module is
+// one flow, with a `CliHost` naming the few things that genuinely differ by target.
 //
 // **Argument tokenizing is not what is shared here.** Splitting `--name value` is a
 // dozen lines in any language and a bad split fails loudly; the reason this module
@@ -23,20 +17,19 @@
 import { toHex, fromHex, concatBytes, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { appKeyFor, type LoadedBundle } from "./bundle.js";
-import { parseHostPort, parsePeerSpec, TransportHost } from "./transport-host.js";
-import type { Shell } from "./shell-core.js";
+import { parseHostPort, parsePeerSpec } from "./transport-host.js";
+import { requireTransport, type Shell } from "./shell-core.js";
 
-/** Where a node's store lives when `--dir` is omitted. One value on every target: the
- *  two used to differ (`./data` natively, `./seedkernel-data` on Node), which meant the
- *  same command line ran two different nodes over two different stores. */
+/** Where a node's store lives when `--dir` is omitted. One value on every target, so
+ *  the same command line runs the same node over the same store wherever it runs. */
 export const DEFAULT_DIR = "./data";
 /** Where the node's 32-byte master seed lives when `--key` is omitted (§12.6.2b). */
 export const DEFAULT_KEY = "./seedkernel.key";
 
 /** Every flag the shell accepts. An allowlist rather than a parse-and-ignore, because
- *  the failure it prevents is silent: a mistyped `--polcy` left the old JS parser
- *  building a deny-all node that boots, serves, and installs nothing — which looks
- *  exactly like a node whose policy is doing its job. Now it says so. */
+ *  the failure an unknown flag would hide is silent: a mistyped `--polcy` would build a
+ *  deny-all node that boots, serves, and installs nothing — which looks exactly like a
+ *  node whose policy is doing its job. The allowlist makes the typo say so. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
   "bundle", "put", "get", "out", "app-config", "revoke", "uninstall",
@@ -87,7 +80,7 @@ export interface CliHost extends CliFiles {
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
   /** Assemble a node on this platform: the platform seam, `createShell`, and the
    *  transport bundle that is its network. */
-  standUp(cfg: NodeSetup): Promise<{ shell: Shell; net: TransportHost }>;
+  standUp(cfg: NodeSetup): Promise<Shell>;
 }
 
 /** What `runCli` leaves behind: whether the node is listening (so the caller knows to
@@ -206,7 +199,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const keys = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
 
-  const { shell, net } = await host.standUp({
+  const shell = await host.standUp({
     dir,
     policyJson,
     identity: keys.channel,
@@ -234,31 +227,33 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       ? JSON.parse(utf8.decode(mustRead(host, args.get("app-config")!, "--app-config")))
       : undefined,
   });
+  // The node's transport driver, or null when the policy admitted no transport bundle.
+  // Read once and held: nothing below this line mounts a second one, and every use is
+  // guarded on the null rather than on which class the object turned out to be.
+  const net = shell.transport;
 
   // Cohort peers the guest may reach: teach the transport their addresses so it can
   // dial them. The transport owns connectivity (§12.10), so a policy admitting no
-  // transport bundle leaves nothing to dial FROM — say that, rather than surfacing a
-  // raw TypeError off the null face's missing members.
+  // transport bundle leaves nothing to dial FROM — say that, rather than letting the
+  // flag pass silently on a node with no network.
   const peers = list(args.get("peers"));
   if (peers.length > 0) {
-    if (!(net instanceof TransportHost)) {
-      throw new Error("--peers given, but the policy admits no transport bundle — there is nothing to dial from");
-    }
+    const dialer = requireTransport(shell, "--peers given, but there is nothing to dial from");
     for (const spec of peers) {
       const { peerId, addr } = parsePeerSpec(spec, "tcp");
-      net.addPeerAddr(peerId, addr);
+      dialer.addPeerAddr(peerId, addr);
     }
     // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
     // cohort member that is not up yet delays the boot but never fails it.
-    await net.ready();
+    await dialer.ready();
   }
 
   host.log(`${host.banner} ${toHex(keys.channel.publicKey)}`);
   host.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  if (net.port) host.log(`  tcp    listening on :${net.port}`);
-  if (net.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
+  if (net?.port) host.log(`  tcp    listening on :${net.port}`);
+  if (net?.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
 
   // Operator remedies (§12.5), applied BEFORE the bundle deliberately: a node booting
   // with both should never briefly install what it was told to refuse. --revoke is the
@@ -314,7 +309,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   const close = () => shell.close();
-  if (!net.port && !net.wsPort) return { serving: false, close };
+  if (!net?.port && !net?.wsPort) return { serving: false, close };
   // A serving node with an app loaded also answers for the cohort: inbound requests are
   // routed by protocol id to whichever installed app claims it, and a guest app answers
   // from its own confined realm — no app-specific host code, no second dispatch
