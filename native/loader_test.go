@@ -68,32 +68,27 @@ func TestBundleModuleRuns(t *testing.T) {
 	}
 }
 
-// TestBindNamesAnInstalledApp covers --bind's one check (§12.10). Which app answers a
-// protocol is entirely the operator's, but an app key nothing is installed under is a
-// mistake rather than a choice: install is inert, so nothing else would ever catch it,
-// and its only runtime symptom is a node that boots clean and answers an empty body on
-// that protocol forever. The bind is refused, and main() exits on the error.
-func TestBindNamesAnInstalledApp(t *testing.T) {
+// TestManifestClaimIsTheRouting covers the load-time claim (§12.10). The manifest names
+// the protocol ids the app serves, and the load that admits the code claims them — so
+// there is no operator step between installing an app and it answering, and no app key to
+// retype into a typo whose only symptom is a node that boots clean and answers an empty
+// body on that protocol forever. The id's format is checked at the load, on the shared
+// path both targets run, so an unroutable claim is refused where the refusal can name it.
+func TestManifestClaimIsTheRouting(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author, authorPub := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, appKey := writeTestBundle(t, author, authorPub, "bindapp", 1)
-	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "bindapp v1  key "+appKey) {
-		t.Fatalf("bundle load: %s", status)
+	bundlePath, appKey := writeTestBundle(t, author, authorPub, "claimapp", 1)
+	if status := loadBundle(bundlePath); status != loadedLine("claimapp", 1, appKey, "claimapp") {
+		t.Fatalf("the load must claim what the manifest declares: %s", status)
 	}
-	if line, err := bindProtocol("bindapp/v1", appKey); err != nil {
-		t.Fatalf("bind to the installed app: %v", err)
-	} else if line != "bindapp/v1 → "+appKey {
-		t.Fatalf("bind line = %q", line)
-	}
-	_, err := bindProtocol("bindapp/v1", appKey+"-typo")
-	if err == nil {
-		t.Fatal("a bind naming an app key nothing is installed under must be refused")
-	}
-	if !strings.Contains(err.Error(), "no app") {
-		t.Fatalf("the refusal must name the rule, got %v", err)
+	// A space is not in the protocol charset (§12.10), so this bundle is refused whole —
+	// an id nothing could route is a manifest its author got wrong, not an entry to drop.
+	badPath, _ := signBundleJSON(t, author, authorPub, "badclaim", claimManifest(t, "badclaim", "bad id"), stubGuestSrc)
+	if status := loadBundle(badPath); !strings.Contains(status, "malformed manifest") {
+		t.Fatalf("a malformed protocol id must be refused at the load: %s", status)
 	}
 }
 

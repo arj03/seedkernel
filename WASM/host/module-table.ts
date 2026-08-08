@@ -22,7 +22,7 @@
 // fixed-width author half so the app half could, a prefix scan for the unbind, and an
 // argument about why the author hex must not be truncated lest one author grind their way
 // onto another's names. Every one of those defends a shared namespace, and there is no
-// shared namespace: a guest reaches only its own app's modules, bindings point at app
+// shared namespace: a guest reaches only its own app's modules, the routing points at app
 // keys, and a table name never leaves the host (§5.1). The outer key IS the ownership,
 // visible without parsing anything.
 //

@@ -128,6 +128,42 @@ func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app strin
 	return writeBundleFile(t, app, menv, guestSrc), appKeyFor(pub, app)
 }
 
+// claimManifest builds a manifest body claiming exactly the given protocol ids — the one
+// field the ordinary fixture derives, spelled out, so a test can feed the loader an id the
+// format refuses (§12.10). Everything else matches manifestJSON.
+func claimManifest(t *testing.T, app string, protocols ...string) []byte {
+	t.Helper()
+	mjson, err := json.Marshal(map[string]any{
+		"app":       app,
+		"version":   1,
+		"protocols": protocols,
+		"modules": []map[string]string{{
+			"name": "fwd", "hash": hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
+		}},
+		"guest": map[string]any{
+			"hash":     hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
+			"abi":      guestABIVersion,
+			"requires": []string{},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mjson
+}
+
+// appProtocols is the fixture's claim: the app's own name, or nothing at all when the
+// requires name a mount half (§12.5) — those bundles are transports, and a transport
+// claiming a protocol id is refused at the load (§12.10).
+func appProtocols(app string, requires []string) []string {
+	for _, r := range requires {
+		if r == "link/open" || r == "transport/deliver" {
+			return nil
+		}
+	}
+	return []string{app}
+}
+
 // manifestJSON builds the manifest body both suites sign: one forwarder module plus the
 // given guest. Every app is a guest (§12.4), so the manifest always declares one — the
 // guest's authority is the `requires` list, which may be empty. The bytes are the signed
@@ -150,13 +186,21 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, requir
 		Requires []string `json:"requires"`
 	}
 	manifest := struct {
-		App     string `json:"app"`
-		Version int    `json:"version"`
-		Modules []mod  `json:"modules"`
-		Guest   guest  `json:"guest"`
+		App       string   `json:"app"`
+		Version   int      `json:"version"`
+		Protocols []string `json:"protocols,omitempty"`
+		Modules   []mod    `json:"modules"`
+		Guest     guest    `json:"guest"`
 	}{
-		App:     app,
-		Version: version,
+		App: app,
+		// The protocol this fixture claims (§12.10), which is its app name: the load
+		// itself is what routes, so a test that wants a protocol answered says so in the
+		// manifest and never through a second call. A MOUNT-shaped fixture claims none —
+		// a transport receives no dispatch, and the shell refuses a claim from one — so
+		// the field is derived from the same `requires` that decide the admission class,
+		// keeping the two facts one fact here as they are in the loader.
+		Protocols: appProtocols(app, requires),
+		Version:   version,
 		Modules: []mod{{
 			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
 		}},

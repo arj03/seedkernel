@@ -308,22 +308,27 @@ async function testDerivedNamesKeepAuthorsApart() {
   console.log("  OK\n");
 }
 
-// ─── Test: installation is inert — a bundle lands serving no protocol (§12.10) ──
+// ─── Test: the manifest's claim IS the routing (§12.10) ──────────────────────
 //
-// Protocol choice is explicitly operator-owned. Landing a bundle writes nothing to the
-// bindings table: there is no declared list to honor, no default to the app's own name,
-// and no update rule to inherit a binding. A protocol gains a destination only through
-// the operator's one action — `shell.bind("seedstore/v1", appKey)` — and nothing else.
-async function testInstallIsInert() {
-  console.log("Test: installation is inert — a bundle lands serving no protocol (§12.10)");
+// A bundle declares the protocol ids it serves and the load claims them: one act, no
+// operator step between installing an app and it answering. The table is a PROJECTION
+// of the installed manifests, so everything about it follows from that one rule —
+// an update re-projects from the new manifest (a dropped claim stops serving), a later
+// load takes a contested id over, and an uninstall hands it back to whoever else claims
+// it rather than leaving it dark.
+async function testManifestClaimIsTheRouting() {
+  console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
-  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
   const { admitAll, denyAll } = await imp("build/host/policy.js");
 
   const author = generateKeyPair();
-  const blob = (version) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
-      app: "store", version,
+  const other = generateKeyPair();
+  // One bundle shape, parameterised by who signs it, what it is called, which version it
+  // is, and what it claims — every case below is a different point in that space.
+  const blob = (signer, app, version, protocols) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, signer.privateKey, signer.publicKey, {
+      app, version, protocols,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST(),
     }),
@@ -339,50 +344,53 @@ async function testInstallIsInert() {
   });
   try {
     const key = appKey(author.publicKey, "store");
-    await shell.loadBundleBlob(blob(1));
+    await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
     assert(shell.host.isBound(key, "fwd"), "the bundle's modules are installed");
-    assert(shell.bindings.boundApp("store") === null,
-      "no protocol is bound — install wrote nothing to the bindings table");
-    assert(shell.bindings.boundApp("seedstore/v1") === null, "there is no default binding either");
+    assertEqual(shell.resolve("seedstore/v1"), key,
+      "the load claimed the manifest's protocol — no second operator action");
+    assert(shell.resolve("store") === null,
+      "…and exactly the id it declared, never a default to the app's own name");
 
-    // The operator's one action is the only way a protocol gains a destination.
-    shell.bind("seedstore/v1", key);
-    assert(shell.bindings.boundApp("seedstore/v1") === key,
-      "an explicit bind is the only way a protocol gains a destination");
-    assert(shell.bindings.boundApp("store") === null,
-      "…and it names exactly the protocol the operator chose, not the app's own name");
+    // An app that claims nothing serves nothing: the initiator-only shape (§12.8), and
+    // the reason the field is optional rather than a required empty list.
+    const quiet = appKey(author.publicKey, "quiet");
+    await shell.loadBundleBlob(blob(author, "quiet", 1, undefined));
+    assertEqual(shell.routes().length, 1, "a bundle claiming nothing adds no route");
 
-    // The one thing an operator cannot do is name an app that is not here. With install
-    // inert, a mistyped key is otherwise a node that boots clean and answers an empty
-    // body on that protocol forever — so it is refused at the bind, naming the key.
-    let threw = false;
-    try { shell.bind("chat", appKey(generateKeyPair().publicKey, "store")); }
-    catch (e) { threw = /no app/.test(String(e)); }
-    assert(threw, "binding a protocol to an app key nothing is installed under is refused");
-    assert(shell.bindings.boundApp("chat") === null, "…and the refused bind wrote nothing");
+    // An update re-projects from the NEW manifest, so a claim that was dropped stops
+    // being served — the table cannot outlive the manifest that put it there.
+    await shell.loadBundleBlob(blob(author, "store", 2, ["seedstore/v2"]));
+    assertEqual(shell.resolve("seedstore/v2"), key, "an update claims what the new manifest declares");
+    assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
-    // A legacy bundle carrying the removed `handles` field still loads — the field is a
-    // dead key now, ignored by the schema — but binds nothing, not even into a vacancy.
-    const legacy = packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
-        app: "legacy", version: 1, handles: ["chat", "natter"],
-        modules: [], guest: GUEST(),
-      }),
-      [GUEST_FILE]: GUEST_BYTES,
-    });
-    await shell.loadBundleBlob(legacy);
-    assert(shell.bindings.boundApp("chat") === null, "a legacy `handles` declaration binds nothing");
-    assert(shell.bindings.boundApp("natter") === null, "…not even into a vacancy");
+    // A second author's app claiming the same id takes it over — that is the §12.10
+    // rebind, fused into the install the operator was always going to run. The displaced
+    // app stays installed, and gets the protocol back when the newcomer leaves.
+    const rival = appKey(other.publicKey, "store");
+    await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"]));
+    assertEqual(shell.resolve("seedstore/v2"), rival, "the last app to claim an id serves it");
+    assert(shell.host.isBound(key, "fwd"), "…and the displaced app is still installed, just idle");
+    shell.uninstall(rival);
+    assertEqual(shell.resolve("seedstore/v2"), key,
+      "uninstalling the newcomer hands the id back to the app that still claims it");
 
-    // An update (same author, same app name, higher version) re-lands on the same app
-    // key and changes nothing about the table — there is no inheritance to apply.
-    await shell.loadBundleBlob(blob(2));
-    assert(shell.bindings.boundApp("seedstore/v1") === key,
-      "an update leaves the operator's binding untouched — nothing re-applies or inherits it");
-
-    // Uninstall takes the app's bindings with it; the app does not linger as a route.
+    // Uninstall drops what the app claimed: a route never outlives its app.
     shell.uninstall(key);
-    assert(shell.bindings.boundApp("seedstore/v1") === null, "uninstall drops the app's bindings");
+    shell.uninstall(quiet);
+    assert(shell.resolve("seedstore/v2") === null, "uninstall drops the app's claims");
+    assertEqual(shell.routes().length, 0, "…leaving no route behind");
+
+    // The format's half of the rule: an id that is not routable is a manifest its author
+    // got wrong, refused whole at verify rather than dropped quietly. `_offer`-shaped ids
+    // are the shell's own (§12.10) and a bundle cannot spell one.
+    for (const bad of [["bad id"], ["_offer"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
+      let threw = false;
+      try {
+        verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+          { app: "bad", version: 1, protocols: bad, modules: [], guest: GUEST() }));
+      } catch (e) { threw = /malformed manifest/.test(String(e)); }
+      assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
+    }
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -2340,7 +2348,7 @@ await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
-await testInstallIsInert();
+await testManifestClaimIsTheRouting();
 await testInstallerRemove();
 await testFs();
 await testFsKeyRule();

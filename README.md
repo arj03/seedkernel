@@ -6,7 +6,7 @@
 
 A minimal runtime: a **host** admits signed **bundles**, and every bundle is an app with exactly one shape — a confined JS **guest** (the app's logic) plus, optionally, any number of pure-transform WASM **modules** that serve as the app's library. The guest is the only thing an inbound frame reaches: the host resolves the protocol to an app, invokes the guest's one `handle` entrypoint, and the guest drives its own modules by name when it needs a transform. Authorization, capability gating, confinement and application logic are the **host** and its **guests** — layers that compose around the seam without the host knowing what any of them mean. Installing an app is one signed record: the author-derived app key, the guest source, and the module map. Code arrives as a signed **bundle** and the host binds it under a policy. The system bootstraps from one trusted policy (the authors it will install, or none) into arbitrarily complex behaviour.
 
-**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be a bindings lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle.
+**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be one routing lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle.
 
 Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
 
@@ -95,7 +95,7 @@ socket delivers bytes                    host: raw net + flood limits
 transport bundle: record open, attribute to peer      §12.6
         │
         ▼
-host resolves the app through its bindings,
+host resolves the app that claims the protocol,
 prepends the authenticated sender key        §12.10
         │
         ▼
@@ -157,14 +157,14 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**, and it is not a matter of opinion: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Counts are lines of code — non-test sources with blank lines and comments excluded — and they are **computed, not remembered**: `npm run loc` (in `WASM/`) recounts every figure below, fails on any that has drifted, and `npm run loc -- --write` corrects them. It reads the shared set from `build:loader-bundles` rather than a list of its own, so a file that joins the shared bundle without joining a row below is an error rather than a silence.
 
-**Shared — compiled once, run by all three targets (2,044 LOC)**
+**Shared — compiled once, run by all three targets (2,036 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 527 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 541 |
 | Transport driver — channels by link id, timers, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 445 |
 | Cap-bridge — the guest ABI seam (§12.2) | `host/cap-bridge.ts`, `host/realm-queue.ts` | 402 |
-| Shell and protocol-id bindings (§12.10) | `host/shell-core.ts`, `host/bindings.ts` | 377 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 355 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 293 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
@@ -172,7 +172,7 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 - **Trust root.** The bundle format and admission policy, the cap-bridge, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
 - **Vocabulary.** The domain prefixes, manifest suite ids, primitive names and flood bounds in `core/`. A bundle is replaceable and the vocabulary it draws on is not (§14.1); a bundle defining the vocabulary its own signature is verified under is circular.
 - **A stable adapter.** The transport driver holds the link ids, the flood caps and the whitelist gate, and it is what keeps the app-facing `send` unchanged *across* a transport swap. Folding it into the thing being swapped is backwards.
-- **Reuse.** The protocol-id bindings carry no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one operator-owned table — one bind call, one dispatch — on every target — not because agreement is load-bearing.
+- **Reuse.** Protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule — a manifest's claim, one dispatch — on every target, not because agreement is load-bearing.
 
 **Wire framing is in none of them, and so it is not here.** Length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test — state machines over whole messages, which an endpoint can run — so they are the transport bundle's, over `ws.wasm` as one of *its* modules. What the host says about a link is which of those codecs applies (`FRAMING`, §12.1); what to do about it is entirely the bundle's. The browser needs none of it: a platform `WebSocket` and an `RTCDataChannel` arrive framed already and go to the driver as they are.
 
@@ -182,8 +182,8 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,453 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,402 Go + 339 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,447 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (335), the Go binding, which is TypeScript and rides in the shared bundle | 2,386 Go + 337 TS |
 
 **Signed content — not host code at all**
 
@@ -191,7 +191,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/guest.js` + `ws.wasm` | 1,245 + 5 KB |
 
-Each target therefore runs 2,044 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,036 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 

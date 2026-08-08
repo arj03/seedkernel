@@ -119,6 +119,30 @@ export interface BundleManifest {
      *  a persisted per-`(author, app)` high-water mark: a load whose `version` is below
      *  the mark is refused as a downgrade. An integer, not a label. */
     version: number;
+    /** The wire protocol id(s) this app serves (§12.10) — the app's CLAIM, signed with
+     *  the rest of the manifest, and the whole of the routing table: a load admits the
+     *  code AND claims these ids, an uninstall drops them, and nothing else writes
+     *  routing anywhere. Which protocol an app speaks is the author's fact, not the
+     *  operator's — a chat app knows it speaks `chat-v1` — so it is stated once, in the
+     *  thing the author signs, rather than retyped at every deployment where a typo's
+     *  only symptom is a node that boots clean and answers an empty body forever.
+     *
+     *  Optional, and an absent list is not a degenerate app: a bundle the shell only ever
+     *  drives as the *initiator* (§12.8 — the `--put`/`--get` one-shots) receives no
+     *  frames and claims nothing. Empty and absent mean the same thing.
+     *
+     *  A claim is not authority. It routes frames a peer already chose to send to this
+     *  node, to code this node's policy already admitted (§12.5); it cannot widen a
+     *  guest's `requires`, reach another app's keyspace, or make unadmitted code run.
+     *  The last claimant of an id wins, so installing an app takes over a protocol an
+     *  installed app was serving — the displaced app stays installed and idle, and
+     *  resumes if the newcomer is uninstalled (shell-core `rebuildRoutes`). That is the
+     *  §12.10 rebind, fused into the one act that was always going to precede it.
+     *
+     *  Mount bundles (§12.5) declare NONE: a transport is not an app, receives no
+     *  dispatch, and a protocol pointed at it could never arrive — refused at the load
+     *  (shell-core), where the refusal can say so. */
+    protocols?: string[];
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
      *  integrity-checks `guest.js` and hands the source back for the shell to run in a
@@ -179,7 +203,7 @@ export interface ManifestAuthorKeys {
 
 /** What a verified envelope yields. `author` is 32 bytes under every suite — the
  *  Ed25519 key under `0x01`, the derived id under `0x02` (`hybridAuthorId`) — so every
- *  consumer downstream (names, policy, freshness, bindings) is suite-agnostic and needs
+ *  consumer downstream (names, policy, freshness, routing) is suite-agnostic and needs
  *  no change when a suite is added. `authorKeys` and `suite` are for the few callers
  *  that legitimately care *how* it was signed: a policy that requires PQ signing
  *  (§12.5), or a shell showing an operator what they are admitting. */
@@ -290,7 +314,7 @@ export const GUEST_FILE = "guest.js";
 export function moduleFile(name: string): string { return name + ".wasm"; }
 /** An app's identity: `"<author hex>:<app>"` (§12.4). One value, three jobs — the
  *  freshness high-water key (FreshnessMarks below), the key an app's modules live under
- *  on the module table (§5.1), and what a shell's protocol bindings point at (§12.10).
+ *  on the module table (§5.1), and what a shell's protocol routing points at (§12.10).
  *  Both halves are signed, so an app key is derived from the manifest and never declared.
  *
  *  **Ownership is structural.** The author's key is half of the identity, so one author's
@@ -310,7 +334,7 @@ export function moduleFile(name: string): string { return name + ".wasm"; }
  *
  *  App keys never leave the host. Nothing on the wire names another node's app: a peer
  *  sends a protocol id or an opcode and the receiving host resolves it through its own
- *  bindings (§12.10) to whichever app it holds. A guest reaches its own modules by logical
+ *  routing (§12.10) to whichever of its apps claims it. A guest reaches its own modules by logical
  *  name through module/call, against the app key its bridge was built with — so the guest
  *  never sees an app key at all. This needs to be unambiguous within one node, not agreed
  *  across a deployment. */
@@ -387,6 +411,18 @@ const H_OFF_JSON = H_OFF_ML_SIG + ML_DSA_SIG_LEN;
  *  path) a traversal name could not escape anything, but a name that needs quoting or
  *  normalizing to be used as either is a name the format should not accept at all. */
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
+/** A protocol id's charset (§12.10). These travel on the wire and are what a receiving
+ *  host routes by, so they are held to something unambiguous: an alphanumeric first
+ *  character, then alphanumerics and `._/-`, at most 64 bytes — which covers the ids in
+ *  use (`seedstore/v1`, `chat-v1`) and rejects the whitespace, control and lookalike
+ *  characters an operator reading a console line could not tell apart.
+ *
+ *  The leading-alphanumeric rule is load-bearing rather than cosmetic: a shell may answer
+ *  protocols of its own ahead of dispatch, and it spells them with a leading `_` (`_offer`,
+ *  §12.10). Refusing that first character here means a bundle cannot spell one — the
+ *  reservation is a property of the format instead of a list every shell must remember to
+ *  check. */
+const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
 // Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // `"seedkernel-manifest-sig-v1\0"` — from the one domain family (domains.ts, §16.1).
 // Prepended to the manifest JSON before signing/verifying, never stored in the
@@ -434,7 +470,7 @@ function hybridPreimage(suite: number, edPk: Uint8Array, mlDsaPk: Uint8Array, js
  *
  *  **Why a hash and not a longer id.** 32 bytes is load-bearing far outside this file —
  *  `appKeyFor` parses a fixed-length author prefix, policy files list 64 hex characters,
- *  bindings and freshness marks are keyed by it. A suite that widened the id would
+ *  routing and freshness marks are keyed by it. A suite that widened the id would
  *  change all of that; hashing keeps every one of them untouched while the key material
  *  under it changes shape. The one cost is that an author migrating from `0x01` to
  *  `0x02` gets a *new* identity — new app keys, a fresh freshness lineage, a new
@@ -504,6 +540,23 @@ function isValidManifest(m: unknown): m is BundleManifest {
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
         return false;
+    // The claimed protocol ids (§12.10), checked exactly like module names below and for
+    // the same reason: they are keys — of the routing table here, of the module map there
+    // — so a duplicate is ambiguous rather than merely redundant, and one that needs
+    // quoting or normalising to be read back is one the format should not accept. Absent
+    // is legal (an initiator-only app claims nothing); `[]` says the same thing.
+    if (o.protocols !== undefined) {
+        if (!Array.isArray(o.protocols))
+            return false;
+        const claimed = new Set();
+        for (const p of o.protocols) {
+            if (typeof p !== "string" || !PROTO_RE.test(p))
+                return false;
+            if (claimed.has(p))
+                return false;
+            claimed.add(p);
+        }
+    }
     if (!Array.isArray(o.modules))
         return false;
     const seen = new Set();

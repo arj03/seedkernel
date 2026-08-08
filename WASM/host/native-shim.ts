@@ -528,24 +528,19 @@ async function loadBundleBlob(blob: ArrayBuffer): Promise<Uint8Array> {
         app: b.manifest.app,
         version: b.manifest.version,
         author: toHex(b.author),
-        // The app key the operator's `bind` names — install is inert (§12.10), so the
-        // console line prints the key a protocol must be explicitly bound to.
         appKey: appKeyFor(b.author, b.manifest.app),
+        // What this load claimed (§12.10) — the routing came with the bundle, so Go's
+        // console line reports the ids rather than taking them from the operator.
+        protocols: b.manifest.protocols ?? [],
     }));
-}
-/** Point a wire protocol at an installed app (§12.10) — the operator's one action,
- *  with nothing inferred: no defaults, no install-time auto-binding. The bundle's
- *  load above landed code and nothing else. */
-function bind(proto: string, appKey: string): void {
-    theShell().bind(proto, appKey);
 }
 /** Run a loaded bundle's guest entrypoint as the *initiator* (§12.8) — the
  *  `--put` / `--get` one-shots. Arguments and results cross as raw bytes. */
 function runGuest(entry: string, arg: ArrayBuffer): Promise<Uint8Array> {
     return theShell().runGuest(entry, new Uint8Array(arg));
 }
-/** Serve the cohort: route inbound requests to whichever installed app the
- *  protocol is bound to (§12.10), through the shared dispatch. */
+/** Serve the cohort: route inbound requests to whichever installed app claims the
+ *  protocol (§12.10), through the shared dispatch. */
 function serve(): Promise<void> {
     return theShell().serve();
 }
@@ -594,4 +589,4 @@ globalThis.__start = function (id, entry, arg) {
 // helpers are here as much for the native tests as for the boot above: a test that
 // stands up a guest or a second node drives the very factories production does, so
 // there is no test-only wiring to keep in step with the real one.
-export { bootNode, setPolicy, loadBundleBlob, bind, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { bootNode, setPolicy, loadBundleBlob, runGuest, serve, uninstall, revoke, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

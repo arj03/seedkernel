@@ -132,7 +132,7 @@ export interface HostTimers {
  *
  *  This is the provision half of the split: the mounted transport reads raw bytes off links
  *  and reports *attributed* traffic here, where the host binds it to the promises apps
- *  are awaiting and to the protocol bindings that route inbound requests. Like `RawNet`,
+ *  are awaiting and to the protocol routing that reaches inbound requests. Like `RawNet`,
  *  no method may re-enter the realm synchronously — `deliver` in particular answers
  *  through the `respond` entrypoint on a later turn, which is also what keeps an
  *  asynchronous app handler possible. */

@@ -20,7 +20,6 @@
 import { denyAll } from "./policy.js";
 import { appKeyFor, appScopeFor, mountGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createCapBridge, appSignScope, transportSignScope, type CapSodium } from "./cap-bridge.js";
-import { Bindings } from "./bindings.js";
 import { TransportHost, type HostTransport } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -208,21 +207,12 @@ export interface Shell {
      *  check occupancy. installWasmModule is NOT on this interface — code lands
      *  only via loadBundleBlob (§12.4). */
     host: ModuleLookup;
-    /** Protocol bindings (§12.10): the operator-owned routing table. A protocol gains a
-     *  destination only through `bind` below — installation is inert and writes nothing
-     *  here. */
-    bindings: Bindings;
-    /** The one way a protocol gains a destination (§12.10). Install is inert: a bundle
-     *  lands and serves nothing until the operator points a wire protocol at its app key,
-     *  `shell.bind("seedstore/v1", appKey)`. Rebinding is the operator's move too — a
-     *  protocol's destination changes by a second `bind`, never by an install or update.
-     *
-     *  Throws if no app is installed under `appKey`: the routing is the operator's, but a
-     *  destination that does not exist is a mistake rather than a choice, and the only
-     *  other way it surfaces is silence on the wire. */
-    bind(proto: string, appKey: string): void;
-    /** Drop a protocol's destination; the app stays installed. */
-    unbind(proto: string): void;
+    /** Which app serves this protocol, or null (§12.10). A read of the projection the
+     *  installed manifests define — there is nothing to write here. */
+    resolve(proto: string): string | null;
+    /** Every protocol this node serves, as `[proto, appKey]` — what an operator's console
+     *  line or a shell's UI lists. A snapshot, not the live map. */
+    routes(): [string, string][];
     /** The transport bundle's driver — the node's Network. Absent until the
      *  transport bundle is mounted; a shell without one has no net. */
     net: Network;
@@ -242,7 +232,7 @@ export interface Shell {
      *  under the new guest. */
     loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
     /** Uninstall an app: remove every module derived from `appKey`,
-     *  drop every protocol binding for it, and dispose the confined realm if
+     *  drop the protocols it claimed, and dispose the confined realm if
      *  this was its last app. Returns true if any modules were removed.
      *  The one uninstall path, symmetric with loadBundleBlob (§12.5). */
     uninstall(appKey: string): boolean;
@@ -264,16 +254,16 @@ export interface Shell {
      *  only loaded app; throws when more than one is loaded and no key is
      *  given. */
     runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
-    /** Dispatch an inbound request to the right app via protocol bindings (§12.10):
-     *  resolve the protocol to an app and invoke that app's guest `handle` entrypoint
-     *  with `senderPk ‖ payload`. Null when no bound app handles the protocol.
+    /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
+     *  the app claiming it and invoke that app's guest `handle` entrypoint with
+     *  `senderPk ‖ payload`. Null when no installed app claims the protocol.
      *
      *  Every app is a guest, so the answer is always the realm's — a Promise the
      *  transport driver awaits — never raw bytes; there is no second, synchronous
      *  delivery shape. */
     dispatch(from: PeerId, proto: string, payload: Uint8Array): Promise<Uint8Array> | null;
     /** Wire transport.onRequest to the shell's dispatch. After this, every
-     *  inbound frame resolves through the bindings table to its app (§12.10). */
+     *  inbound frame resolves through the routing table to its app (§12.10). */
     serve(): Promise<void>;
     close(): void;
 }
@@ -284,7 +274,6 @@ export interface Shell {
 // for the same reason: the JS platforms all hand it in as their `table`, and a
 // re-export keeps that a one-line seam rather than a second import.
 export { denyAll, admitAll, authorAllowlist, allOf, anyOf, policyFromJson } from "./policy.js";
-export { Bindings } from "./bindings.js";
 export { ModuleTable } from "./module-table.js";
 /** Assemble the platform-neutral shell. Every target calls this instead of
  *  re-implementing the module table, cap-bridge wiring, preamble assembly, realm
@@ -412,11 +401,17 @@ export function createShell(opts: CreateShellOptions & {
     // checked is the composite key the medium actually sees.
     const fs = platform.fs ? validatedFs(platform.fs) : undefined;
     const host = platform.table;
-    const bindings = new Bindings();
     const admit = opts.admit ?? denyAll;
     const admitTransport = opts.admitTransport ?? denyAll;
     const peerId = toHex(platform.identity.publicKey);
-    const apps = new Map();
+    const apps = new Map<string, AppSlot>();
+    /** protocol id → app key (§12.10) — a PROJECTION of what is installed, never a
+     *  structure of its own. Every entry comes from some installed manifest's signed
+     *  `protocols`, so there is nothing here to write, to persist, or to keep in step
+     *  with the app set: the routing IS the app set, read through one field. It is
+     *  materialized rather than scanned for because it is read once per inbound frame
+     *  (§12.10: one lookup, one guest call). */
+    const routes = new Map<string, string>();
     let transportSlot: TransportSlot | null = null;
     let transportKey: string | null = null;
     /** The transport driver, standing once the transport bundle is mounted. The app
@@ -606,6 +601,27 @@ export function createShell(opts: CreateShellOptions & {
         if (state)
             await incoming.adopt(state);
     };
+    /** Recompute the whole projection from the installed apps (§12.10). Called on every
+     *  install and every uninstall, and never anything narrower — the alternatives are
+     *  all wrong in a way a recompute cannot be:
+     *
+     *  - Adding just the new app's claims would leave an UPDATE that dropped a protocol
+     *    from its manifest still serving it, because the old entry pointed at the same
+     *    app key and nothing would have cleared it.
+     *  - Deleting just the leaving app's claims would leave a protocol an earlier-loaded
+     *    app also claims permanently dark, when the honest answer is that the earlier
+     *    claimant serves it again.
+     *
+     *  Order is load order — `apps` is insertion-ordered and an update re-`set`s an
+     *  existing key, which keeps its original position — so the LAST app installed wins a
+     *  contested id, and an update never jumps ahead of an app loaded after it. Nothing is
+     *  stored to make that true; it is the map's own order. */
+    const rebuildRoutes = () => {
+        routes.clear();
+        for (const [key, slot] of apps) {
+            for (const proto of slot.loaded.manifest.protocols ?? []) routes.set(proto, key);
+        }
+    };
     const doUninstall = (appKey: string) => {
         // The transport slot is not an app, but it IS uninstallable: dropping it
         // stops the node's net.
@@ -619,18 +635,20 @@ export function createShell(opts: CreateShellOptions & {
         }
         const slot = apps.get(appKey);
         const removed = host.removeApp(appKey);
-        bindings.removeApp(appKey);
         if (slot) {
             slot.realm?.dispose();
             apps.delete(appKey);
+            // After the delete, so the app that just went cannot be re-projected — and so
+            // whatever it was shadowing takes the protocol back.
+            rebuildRoutes();
         }
         // "Was there anything here": an app is its modules AND its realm, and a
         // guest-only bundle legitimately has no modules at all (§12.4), so counting
         // modules alone would report a successful uninstall as a failure.
         return removed > 0 || slot !== undefined;
     };
-    /** Route an inbound request to its app (§12.10): resolve the protocol to an app key,
-     *  prepend the authenticated sender, hand it to that app's one entrypoint.
+    /** Route an inbound request to its app (§12.10): resolve the protocol to the app
+     *  claiming it, prepend the authenticated sender, hand it to that app's one entrypoint.
      *
      *  There is no branch on how the app is implemented — every app presents the same
      *  `senderPk ‖ payload` shape and the same single entry, resolved at install
@@ -639,7 +657,7 @@ export function createShell(opts: CreateShellOptions & {
      *  later turn rather than inline (transport-host.ts) — the seam an asynchronous
      *  holder needs, since `fs` is async (core/fs.ts). */
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
-        const key = bindings.boundApp(proto);
+        const key = routes.get(proto);
         const slot = key ? apps.get(key) : undefined;
         if (!slot)
             return null;
@@ -651,20 +669,8 @@ export function createShell(opts: CreateShellOptions & {
     };
     return {
         host,
-        bindings,
-        bind: (proto, appKey) => {
-            // A binding names an app that is here. Refusing an unknown key at bind time
-            // is the whole reason this wrapper exists: with install inert (§12.10), a
-            // mistyped key is no longer impossible the way it was when the load wrote the
-            // table, and its only other symptom is `dispatch` resolving to nothing — a
-            // node that boots clean and answers an empty body forever. The transport key
-            // is unknown here by the same rule that keeps it out of `apps`: it is not an
-            // app and receives no dispatch, so a protocol bound to it could never arrive.
-            if (!apps.has(appKey))
-                throw new Error(`shell: bind ${JSON.stringify(proto)}: no app ${JSON.stringify(appKey)} is installed`);
-            bindings.bind(proto, appKey);
-        },
-        unbind: (proto) => bindings.unbind(proto),
+        resolve: (proto) => routes.get(proto) ?? null,
+        routes: () => [...routes],
         // Both fields are the transport driver, reached through the indirection so
         // the shell can be assembled before any bundle loads.
         get net() { return netHost ?? { endpoint: () => noTransport("net is unavailable") }; },
@@ -703,6 +709,14 @@ export function createShell(opts: CreateShellOptions & {
             if (isMount && missing.length > 0) {
                 throw new Error(`shell: a transport declares names in every mount half or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
             }
+            // A mount claims no protocol (§12.10). It is not an app: it receives no
+            // dispatch, so a frame naming one of these ids could never arrive, and a
+            // claim that can never be honored is a manifest that has misread the format
+            // rather than a line to ignore. Refused here, where the two facts — this is a
+            // mount, it claims ids — are both in hand.
+            if (isMount && (v.manifest.protocols?.length ?? 0) > 0) {
+                throw new Error(`shell: a transport claims no protocol ids; ${v.manifest.app} claims ${v.manifest.protocols!.join(", ")} — a mount receives no dispatch (§12.10)`);
+            }
             // Revocation before `admit`, not just inside installBundle. The predicate is
             // where an interactive shell puts its consent dialog (§12.4), so asking it
             // first would show a user the author and metadata of a bundle this host has
@@ -725,8 +739,8 @@ export function createShell(opts: CreateShellOptions & {
             // (§12.4: the mark records the highest version that actually loaded).
             const loaded = installBundle(host, v, platform.freshnessStore, isMount);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
-            // A transport is not an app: it binds no protocol ids and receives no inbound
-            // dispatch. It is stood up as the driver the rest of the shell consumes, and
+            // A transport is not an app: it claims no protocol ids (refused above) and
+            // receives no inbound dispatch. It is stood up as the driver the rest of the shell consumes, and
             // the slot is recorded only AFTER it stands — on a failed upgrade the node
             // keeps both the transport it had and the author key `revoke` needs to find
             // what that key landed.
@@ -738,12 +752,6 @@ export function createShell(opts: CreateShellOptions & {
                 platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
                 return loaded;
             }
-            // Installation is inert (§12.10): nothing here touches the bindings table.
-            // A freshly installed app serves no protocol until the operator points one at
-            // its app key (`bind`) — the app's identity, the wire protocol, and the local
-            // routing are three separate things, and the last is the operator's alone. An
-            // update lands on the same app key, so an existing binding survives it without
-            // any rule re-applying it: the table was never written by the load.
             // The app's one inbound entrypoint, resolved here and not per message.
             // `entryFor` closes over the slot, so the slot is built first and its entry
             // attached immediately — nothing can observe the placeholder between the two
@@ -751,6 +759,14 @@ export function createShell(opts: CreateShellOptions & {
             const slot: AppSlot = { loaded, realm: null, realmP: null, entry: () => null };
             slot.entry = entryFor(slot);
             apps.set(key, slot);
+            // The load admits the code AND claims the manifest's protocols (§12.10) — one
+            // act, because they were always one intent: nothing installs an app it does not
+            // mean to serve. The claim is the author's and signed, so there is no second
+            // operator step to forget, no id to retype into a typo whose only symptom is an
+            // empty body forever, and no "installed but unrouted" state to be surprised by.
+            // Re-projecting (rather than adding this app's ids) is what makes an update that
+            // DROPPED a protocol stop serving it.
+            rebuildRoutes();
             // An app's marks were already advanced inside installBundle — nothing can fail
             // between that return and here.
             return loaded;
@@ -810,6 +826,7 @@ export function createShell(opts: CreateShellOptions & {
                     slot.realm?.dispose();
                 }
                 apps.clear();
+                routes.clear();
                 transportSlot?.realm?.dispose();
                 transportSlot = null;
                 transportKey = null;

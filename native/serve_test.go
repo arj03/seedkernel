@@ -11,8 +11,8 @@ import (
 )
 
 // Serving (README §12.8, §12.10): a node answers a peer's request through the SHARED
-// dispatch — the protocol id off the wire is resolved through the bindings table to an
-// installed app, and that app answers. There is no native dispatch of its own, which is
+// dispatch — the protocol id off the wire is resolved to the installed app whose manifest
+// claims it, and that app answers. There is no native dispatch of its own, which is
 // what these tests pin: they drive the real boot path (boot → bootNode → loadBundle →
 // serve), so what they exercise is createShell's `dispatch`, byte for byte the same
 // function the Node and browser shells run.
@@ -94,14 +94,11 @@ func ask(t *testing.T, holderID, proto string, payload []byte) []byte {
 	return out
 }
 
-// bindProto points a wire protocol at an installed app (§12.10) — the operator's one
-// action. Install is inert: nothing in loadBundle bound a protocol, so a test that
-// wants a protocol answered has to say which app answers it.
-func bindProto(t *testing.T, proto, appKey string) {
-	t.Helper()
-	if _, err := callRealm("bind", 5*time.Second, qc.NewString(proto), qc.NewString(appKey)); err != nil {
-		t.Fatal("bind:", err)
-	}
+// loadedLine is the console line a successful load prints (§12.4, §12.10): the app, its
+// version, its app key, and the protocol ids the manifest claimed — the routing came with
+// the bundle, so the line reports it rather than the operator supplying it.
+func loadedLine(app string, version int, appKey string, serves string) string {
+	return fmt.Sprintf("%s v%d  key %s  serves %s", app, version, appKey, serves)
 }
 
 // serveNode boots a listening node under a policy admitting `authorPub`, and returns
@@ -114,7 +111,7 @@ func serveNode(t *testing.T, authorPub []byte) nodeStatus {
 
 // A guest app serves its request side from its own confined realm: the shell resolves
 // the protocol to the app, then calls the guest's synchronous `handle` (§12.8). This
-// wires the whole stack — a real socket, the shared Transport, the bindings table, the
+// wires the whole stack — a real socket, the shared Transport, the protocol routing, the
 // cap-bridge the shell built from the manifest's declared domains, and the realm — and
 // proves it against a storage-shaped app: a peer stores a value and fetches it back.
 func TestServeGuestApp(t *testing.T) {
@@ -122,12 +119,12 @@ func TestServeGuestApp(t *testing.T) {
 	st := serveNode(t, authorPub)
 	bundlePath, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
 	holderKey := appKeyFor(authorPub, "holderapp")
-	if status := loadBundle(bundlePath); status != "holderapp v1  key "+holderKey {
+	// The load is the whole of it (§12.10): the manifest claims `holderapp`, so the
+	// bundle that landed is already the destination for that protocol — there is no
+	// second call between installing and serving.
+	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
 		t.Fatalf("bundle load: %s", status)
 	}
-	// The operator's one action (§12.10): install bound nothing, so the protocol is
-	// pointed at the app explicitly.
-	bindProto(t, "holderapp", holderKey)
 	if _, err := callRealm("serve", 10*time.Second); err != nil {
 		t.Fatal("serve:", err)
 	}
@@ -164,22 +161,18 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// Two guest apps from one author under two app names — so they derive disjoint
 	// table names (§5.1). The holder guest reads fs; the echo guest forwards to its own
 	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
-	// shell handed the guest. Each protocol reaches its own app because the operator
-	// bound it there, not because the bundles claimed anything.
+	// shell handed the guest. Each protocol reaches its own app because each manifest
+	// claims its own id (§12.10) and the two claims cannot collide.
 	guestBundle, _ := writeBundle(t, author, authorPub, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
 	holderKey := appKeyFor(authorPub, "holderapp")
-	if status := loadBundle(guestBundle); status != "holderapp v1  key "+holderKey {
+	if status := loadBundle(guestBundle); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
 		t.Fatalf("guest bundle load: %s", status)
 	}
 	echoBundle, _ := writeBundle(t, author, authorPub, "echoapp", 1, echoGuestSource, nil)
 	echoKey := appKeyFor(authorPub, "echoapp")
-	if status := loadBundle(echoBundle); status != "echoapp v1  key "+echoKey {
+	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, echoKey, "echoapp") {
 		t.Fatalf("echo bundle load: %s", status)
 	}
-	// Install is inert (§12.10): the two bundles landed unbound, and the operator's
-	// explicit binds are the only reason these protocols have destinations.
-	bindProto(t, "holderapp", holderKey)
-	bindProto(t, "echoapp", echoKey)
 	if _, err := callRealm("serve", 10*time.Second); err != nil {
 		t.Fatal("serve:", err)
 	}
