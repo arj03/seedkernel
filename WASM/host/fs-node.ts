@@ -1,8 +1,8 @@
 // Node backend for the `fs.*` capability (exported as `seedkernel-wasm/fs-node`),
 // the storage twin of `net-node`. One flat file per key under a directory; no
-// nested paths. Migrated up from seedstore's old path-based FsOps — the raw
-// syscalls now live in the runtime, and the storage app layers content-addressing
-// and quota on top (the runtime split).
+// nested paths. The raw syscalls live in the runtime: this backend is the host
+// side of the `fs.*` seam, and the storage app layers content-addressing and
+// quota on top (the runtime split).
 
 import { mkdirSync } from "node:fs";
 // The seam is async (core/fs.ts), so this backend is genuinely async rather than sync

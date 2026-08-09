@@ -608,7 +608,12 @@ export function createShell(opts: CreateShellOptions & {
                 // that reads a prefix off a name, which is exactly what the name catalog
                 // exists to stop.
                 fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
-                transport: netHost ?? undefined,
+                // A getter, not a snapshot: the transport is mounted AFTER an app's
+                // realm may have been built (an app loads first, the transport mounts
+                // later), so a value captured at seam construction would leave that
+                // realm's net/send permanently unwired. Read at CALL time, through the
+                // same `netHost` indirection `peers` closes over.
+                get transport() { return netHost ?? undefined; },
                 rawNet: driver?.rawNet(),
                 // This realm's own table, wired for the same reason `fs` is: unconditionally,
                 // because `names` already refuses `timer/*` for a bundle that did not declare
