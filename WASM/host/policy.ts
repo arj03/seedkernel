@@ -2,17 +2,23 @@
 // the one install path. Admission is the single seam between verifyBundle and
 // installBundle (§12.4): governance is this file, mechanics is installBundle.
 //
-// **One predicate, not four gates.** Admission is a revocation check, a version floor,
-// and a per-class operator predicate composed into one `Admit` at shell construction and
-// evaluated in one call — so "the policy said yes but freshness said no" cannot happen:
-// there is one answer from one call. Everything a gate needs arrives as
-// `AdmissionContext`, so the predicate is a pure function of `(bundle, context)` — no
-// store, no I/O, no order to get wrong.
+// **One predicate, not a scatter of gates.** Admission is a revocation check, two
+// coherence rules about the claim itself, a version floor, and a per-class operator
+// predicate composed into one `Admit` at shell construction and evaluated in one call —
+// so "the policy said yes but freshness said no" cannot happen: there is one answer from
+// one call. Everything a gate needs arrives as `AdmissionContext`, so the predicate is a
+// pure function of `(bundle, context)` — no store, no I/O, no order to get wrong.
 //
-// The host's own two — `notRevoked` and `freshVersion` — are composed by the SHELL, not
-// by the operator. That matters: they are invariants rather than posture, so `admitAll`
-// must not be a way to lose them, and an OFFER-delivered bundle (§11) is exactly the
-// path that would.
+// That is why EVERY pure question about a bundle belongs here rather than beside the call
+// in the shell. A rule that refuses a bundle from outside the predicate is a second
+// decision point, and a second decision point is where "nothing has landed until the
+// predicate says yes" stops being a property of the type and starts being a property of
+// how carefully the load path was read.
+//
+// The host's own four — `notRevoked`, `wholePrivileges`, `mountClaimsNoProtocol` and
+// `freshVersion` — are composed by the SHELL, not by the operator. That matters: they are
+// invariants rather than posture, so `admitAll` must not be a way to lose them, and an
+// OFFER-delivered bundle (§11) is exactly the path that would.
 //
 // **Trust is per PRIVILEGE, and the privileges are the catalog's.** Admitting an
 // ordinary app risks that app; granting the mount risks the channel, which sees all
@@ -45,8 +51,8 @@
 // Deny-all stays the default: the absent predicate admits nothing.
 
 import { toHex } from "../core/util.js";
-import { PRIVILEGES, type Privilege } from "../core/domains.js";
-import type { VerifiedBundle } from "./bundle.js";
+import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, PRIVILEGES, type Privilege } from "../core/domains.js";
+import { grantGroups, privilegesOf, type VerifiedBundle } from "./bundle.js";
 
 /** Everything a gate needs, read ONCE by the shell and handed to the predicate —
  *  which is what makes the predicate pure and its order irrelevant. */
@@ -113,13 +119,49 @@ export const freshVersion: Admit = (v, ctx) => {
   return true;
 };
 
+/** Every half of a privilege, or none of it (§12.5). A bundle with no `mount:sockets`
+ *  name has no sockets and one with no `mount:report` name has nowhere to report, so a
+ *  partial claim could only stand as a transport that is not one — refused at the load
+ *  rather than at the first dial.
+ *
+ *  A gate rather than a check the shell runs beside the predicate, because it is the same
+ *  KIND of thing as the two above — a pure question about a verified bundle, answered
+ *  before anything lands — and because being a gate is what keeps it in front of the
+ *  operator's predicate on every target. The hole it closes needs that: a partial claim
+ *  reaches no privilege, so a bundle naming `link/open` alone would otherwise fall
+ *  through `byPrivilege` to the UNPRIVILEGED base and be admitted by the ordinary app
+ *  list. */
+export const wholePrivileges: Admit = (v) => {
+  const groups = grantGroups(v.manifest);
+  for (const priv of privilegesOf(v.manifest)) {
+    const missing = (GROUPS_BY_PRIVILEGE.get(priv) ?? []).filter((g) => !groups.includes(g));
+    if (missing.length > 0) {
+      throw new Error(`bundle: a bundle claims every half of a privilege or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
+    }
+  }
+  return true;
+};
+
+/** A mount claims no protocol ids (§12.10). It is not an app: it receives no dispatch, so
+ *  a frame naming one of these ids could never arrive, and a claim that can never be
+ *  honored is a manifest that has misread the format rather than a line to ignore. */
+export const mountClaimsNoProtocol: Admit = (v) => {
+  const claimed = v.manifest.protocols ?? [];
+  if (claimed.length > 0 && privilegesOf(v.manifest).includes(PRIVILEGE_MOUNT)) {
+    throw new Error(`bundle: a transport claims no protocol ids; ${v.manifest.app} claims ${claimed.join(", ")} — a mount receives no dispatch (§12.10)`);
+  }
+  return true;
+};
+
 /** The host's own half of admission, in the order it must run: revocation first (a
- *  written-off key never reaches a consent prompt), then the downgrade guard. The shell
- *  composes this AROUND the operator's predicate on every target, so no posture — not
- *  `admitAll`, not an interactive dialog that always says yes — can be a way to lose
- *  either one. Exported so a target assembling its own load path gets the same two, in
- *  the same order, from the same place. */
-export const hostGates: Admit = allOf(notRevoked, freshVersion);
+ *  written-off key never reaches a consent prompt), then the two coherence gates — which
+ *  are facts about the bundle alone, so a malformed claim is reported as itself rather
+ *  than as whatever host state it happens to also fall foul of — then the downgrade
+ *  guard. The shell composes this AROUND the operator's predicate on every target, so no
+ *  posture — not `admitAll`, not an interactive dialog that always says yes — can be a
+ *  way to lose any of them. Exported so a target assembling its own load path gets the
+ *  same gates, in the same order, from the same place. */
+export const hostGates: Admit = allOf(notRevoked, wholePrivileges, mountClaimsNoProtocol, freshVersion);
 
 /** A predicate that checks the manifest author's id against a closed set.
  *  `authors` strings are hex author ids, case-insensitive — an Ed25519 pubkey under

@@ -18,12 +18,12 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, grantGroups, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, privilegesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, privilegeOf, type Privilege } from "../core/domains.js";
+import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, type Privilege } from "../core/domains.js";
 import { fromHex, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/net.js";
@@ -157,8 +157,9 @@ export interface CreateShellOptions {
      *
      *  A file-backed author allowlist, a consent dialog, and "the bundle my operator
      *  handed me" are three constructors of this one type. The host's own gates —
-     *  revocation and the downgrade guard — are composed AROUND whatever is passed here
-     *  (`hostGates`), so no posture supplied by an operator can be a way to lose them. */
+     *  revocation, the two coherence rules, and the downgrade guard — are composed AROUND
+     *  whatever is passed here (`hostGates`), so no posture supplied by an operator can be
+     *  a way to lose them. */
     admit?: Admit;
     /** How long one net request may take before it settles as unreachable, in ms, for
      *  a caller that names no deadline of its own (§12.6). Omitted ⇒ the transport's
@@ -813,35 +814,23 @@ export function createShell(opts: CreateShellOptions & {
             // the whole scheme exists for: adding `link/open` puts `mount` in this set and
             // nothing takes it out, so the derivation is safe in the only direction it can
             // be pushed.
-            const groups = grantGroups(v.manifest);
-            const privileges: Privilege[] = [...new Set(groups.map(privilegeOf))];
-            // Every half of a privilege, or none of it. A bundle with no `mount:sockets`
-            // name has no sockets and one with no `mount:report` name has nowhere to
-            // report, so a partial claim could only stand as a transport that is not one —
-            // refused at the load rather than at the first dial.
-            for (const priv of privileges) {
-                const missing = (GROUPS_BY_PRIVILEGE.get(priv) ?? []).filter((g) => !groups.includes(g));
-                if (missing.length > 0) {
-                    throw new Error(`shell: a bundle claims every half of a privilege or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
-                }
-            }
+            const privileges: Privilege[] = privilegesOf(v.manifest);
             const isMount = privileges.includes(PRIVILEGE_MOUNT);
-            // A mount claims no protocol (§12.10). It is not an app: it receives no
-            // dispatch, so a frame naming one of these ids could never arrive, and a
-            // claim that can never be honored is a manifest that has misread the format
-            // rather than a line to ignore. Refused here, where the two facts — this is a
-            // mount, it claims ids — are both in hand.
-            if (isMount && (v.manifest.protocols?.length ?? 0) > 0) {
-                throw new Error(`shell: a transport claims no protocol ids; ${v.manifest.app} claims ${v.manifest.protocols!.join(", ")} — a mount receives no dispatch (§12.10)`);
-            }
             // ADMISSION — one predicate, one call, one answer (§12.5). Everything a gate
             // needs is read here, once, and handed in: the privileges this bundle
             // reaches, the persisted `(author, app)` high-water mark, and whether this
             // host has written the author key off. The predicate is a pure function of
             // `(bundle, context)`; the ordering constraints — revocation before the
             // consent dialog (a written-off key must never reach a prompt), the
-            // downgrade guard after the operator's yes but before anything landed — are
-            // the composition's (`allOf`, `byPrivilege`), stated once at construction.
+            // coherence gates before the operator is asked about a claim that is not
+            // well formed, the downgrade guard before anything landed — are the
+            // composition's (`allOf`, `byPrivilege`), stated once at construction.
+            //
+            // EVERY pure question about this bundle is in there, including the two
+            // coherence rules that used to sit out here as inline throws (a privilege is
+            // claimed in every half or none, a mount claims no protocol ids). Nothing
+            // decides admission beside the predicate — which is what makes "nothing has
+            // landed" hold for the whole decision rather than for most of it.
             const ctx: AdmissionContext = {
                 privileges,
                 highWater: platform.freshnessStore.get(v.author, v.manifest.app),

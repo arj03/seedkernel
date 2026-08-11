@@ -28,7 +28,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, type GrantGroup, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, privilegeOf, type GrantGroup, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -370,6 +370,17 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
 export function grantGroups(manifest: BundleManifest): GrantGroup[] {
     const groups = manifest.guest.requires.filter(isGrant).map((n) => AUTHORITY_CALLS[n]);
     return GRANT_GROUPS.filter((g) => groups.includes(g));
+}
+/** Which privileges (§12.5) a manifest reaches — `grantGroups` lifted to the vocabulary
+ *  an operator's policy is keyed on. Empty ⇒ an ordinary app.
+ *
+ *  ONE function, called by everything that asks the question: the admission gates that
+ *  refuse a partial claim (policy.ts `wholePrivileges`, `mountClaimsNoProtocol`) and the
+ *  shell that must know whether it is standing a transport (`isMount`). Two copies of
+ *  this derivation is the one drift that would matter — a bundle the gates read as a
+ *  mount and the shell installs as an app, or the reverse. */
+export function privilegesOf(manifest: BundleManifest): Privilege[] {
+    return [...new Set(grantGroups(manifest).map(privilegeOf))];
 }
 /** The fs keyspace prefix for one app (README §12.2).
  *
