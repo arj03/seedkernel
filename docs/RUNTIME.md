@@ -504,19 +504,21 @@ behaviour lives in
   the 1,024 unverified budget the bound is 8 MiB, still small, and it decides nothing about
   which suites are expressible.
 
-#### 12.6.2b One master seed, purpose-bound keys
+#### 12.6.2b One master seed, one identity
 
-A node stores **one** secret: a 32-byte master seed. Every signing keypair is derived from
-it under a distinct, versioned label (`core/subkeys.ts`), so no key signs for two purposes.
-Two exist today: `channel`, whose public half **is** the peer id and which signs the
-handshake; and `guest`, which backs every ordinary app's scoped signature. Both are reached
-through the one guest-seam `node/sign` name (§12.2), and *which* of them a call reaches is the
-host's decision from the asking bundle's slot — the transport occupant gets the channel key
-under `DOMAIN_channel ‖ network_key`, an app gets the guest key under `DOMAIN_guest ‖ scope`
-— never the guest's, and neither key enters a realm. The master signs
-nothing itself, and derivation is deterministic, so a node rebuilds every subkey at boot
-with nothing extra to persist. Labels are closed and literal, never built from runtime
-data. Why this is worth having on top of domain separation: [CHANNEL](CHANNEL.md) §7.
+A node stores **one** secret: a 32-byte master seed. Its signing keypair is derived from
+that seed under a distinct, versioned label (`core/subkeys.ts`) — `channel` — and that
+keypair's public half **is** the node's identity: the peer id, what `senderPk` carries, and
+what `node/identity` answers on every target. The master signs nothing itself, and
+derivation is deterministic, so a node rebuilds its key at boot with nothing extra to
+persist. Labels are closed and literal, never built from runtime data.
+
+That one key signs for both purposes, and *what a signature means* is the host's decision
+from the asking bundle's slot, not the key's: the transport occupant's `node/sign` binds
+`DOMAIN_channel ‖ network_key`, an ordinary app's binds `DOMAIN_guest ‖ author ‖ app`
+(§12.2). Both reach the one seam name, the host prefixes and never parses, no op signs raw
+bytes, and the key itself never enters a realm. Why purposes are separated this way rather
+than by a second keypair — and what that costs: [CHANNEL](CHANNEL.md) §7.
 
 #### 12.6.3 The contact secret, the network key, and `admitPeer`
 
@@ -612,9 +614,9 @@ seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
 Go's side of it is five primitives — `argv`, `readFile`, `writeFile`, `log`, `stdout` —
 plus `__fs.open`, which is how a data directory reaches the fs backend now that Go does
 not read `--dir` to find one. Even the `--key` file is read and minted in the shared
-flow: it holds the node's 32-byte master seed (§12.6.2b), and `deriveNodeKeys` produces
-the `channel` and `guest` subkeys from it, so both targets hold one secret on disk and no
-key signs for two purposes.
+flow: it holds the node's 32-byte master seed (§12.6.2b), and `deriveNodeKeys` produces the
+node's keypair from it, so both targets hold one secret on disk and derive the same peer id
+from the same seed.
 
 Because the wire and the bundles are shared, a Go node and a Node/Bun node interoperate directly in one cohort — `put` on either, `get` on the other, in both directions, against the same signed bundle and genesis (verified end-to-end for seed store by `WASM/scripts/loader-interop.sh`).
 

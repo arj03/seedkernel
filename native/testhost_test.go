@@ -167,8 +167,8 @@ func bootShell(tb testing.TB, dir, policyJSON string, listen *hostPort) nodeStat
 const testContactSecretHex = "0303030303030303030303030303030303030303030303030303030303030303"
 
 // testKeyHex mints a node identity master seed: 32 bytes of entropy, hex — the same
-// 64 hex chars --key holds. bootNode derives the channel and guest subkeys from it
-// inside the shared realm (deriveNodeKeys, core/subkeys.ts).
+// 64 hex chars --key holds. bootNode derives the node's keypair from it inside the
+// shared realm (deriveNodeKeys, core/subkeys.ts).
 func testKeyHex(tb testing.TB) string {
 	tb.Helper()
 	seed := make([]byte, 32)

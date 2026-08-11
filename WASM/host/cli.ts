@@ -51,7 +51,6 @@ export interface NodeSetup {
   dir: string;
   policyJson?: string;
   identity: Keypair;
-  guestIdentity: Keypair;
   contactSecret?: Uint8Array;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
@@ -154,12 +153,10 @@ function loadHex32(files: CliFiles, path: string, label: string): Uint8Array {
 }
 
 /** Load the node's MASTER SEED from `--key`, or mint one and persist it 0600, and
- *  derive every purpose-bound keypair from it (§12.9).
+ *  derive the node's keypair from it (§12.9).
  *
- *  One secret on disk, 32 bytes. The master signs nothing itself — it only derives — so
- *  the channel handshake and guest SIGN hold different keys and neither can produce a
- *  signature for the other's purpose. The node's peer id is the CHANNEL subkey's
- *  public half. */
+ *  One secret on disk, 32 bytes. The master signs nothing itself — it only derives. The
+ *  node's peer id is the derived channel keypair's public half. */
 function loadNodeKeys(host: CliHost, keyPath: string): NodeKeys {
   const existing = host.readFile(keyPath);
   if (existing !== null) return deriveNodeKeys(host.sodium, parseHex32(utf8.decode(existing), `--key ${keyPath}`));
@@ -203,7 +200,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     dir,
     policyJson,
     identity: keys.channel,
-    guestIdentity: keys.guest,
     contactSecret: contactSecretPath === undefined
       ? undefined
       : loadHex32(host, contactSecretPath, "--contact-secret"),

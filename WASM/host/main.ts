@@ -36,14 +36,9 @@ export interface ShellOptions {
     policyJson?: string;
     /** Directory backing the fs.* capability. */
     dir: string;
-    /** This node's node keypair (README §12.6) — the CHANNEL subkey, whose public half
-     *  is the peer id. */
+    /** This node's keypair (README §12.6) — the derived channel keypair, whose public
+     *  half is the peer id and the node's one identity (§12.9). */
     identity: Keypair;
-    /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`, used only by
-     *  the seam's SIGN op. Separate so guest signing structurally cannot produce a
-     *  channel handshake signature, whatever happens to the domain prefixes. Defaults to
-     *  `identity`, so an embedding host that supplies one keypair still works. */
-    guestIdentity?: Keypair;
     /** Optional deployment secret (§12.6.3). */
     contactSecret?: Uint8Array;
     listen?: {
@@ -155,7 +150,6 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     const core = createShell({
         platform: {
             sodium: sodium as unknown as ShellSodium, identity: opts.identity,
-            guestIdentity: opts.guestIdentity,
             table: new ModuleTable(), fs, freshnessStore: freshness,
             channels, listen: opts.listen, wsListen: opts.wsListen,
             contactSecret: opts.contactSecret, networkKey: opts.networkKey,

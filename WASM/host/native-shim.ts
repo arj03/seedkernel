@@ -482,9 +482,6 @@ function theShell() {
  *  positional signature drifting against a Go harness string is a silent break. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
-    /** The GUEST signing keypair (§12.9) — a sibling subkey of `identity`. Defaults to
-     *  `identity` so a test or embedding host that supplies one keypair still works. */
-    guestIdentity?: Keypair;
     contactSecret?: Uint8Array;
     listen?: {
         host: string;
@@ -509,7 +506,7 @@ async function makeTransportNode(cfg: {
 }): Promise<Shell> {
     const s = createShell({
         platform: {
-            sodium, identity: cfg.identity, guestIdentity: cfg.guestIdentity, table, fs,
+            sodium, identity: cfg.identity, table, fs,
             freshnessStore: new NativeFreshnessStore(storeDir),
             channels, listen: cfg.listen, wsListen: cfg.wsListen,
             contactSecret: cfg.contactSecret, networkKey: cfg.networkKey, createRealm,
@@ -547,16 +544,15 @@ async function makeTransportNode(cfg: {
  *  Go can print the real ports. */
 async function bootNode(cfgJson: string): Promise<Uint8Array> {
     const cfg = JSON.parse(cfgJson);
-    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Every
-    // purpose-bound keypair is derived from it HERE, in the shared subkey code — the
-    // exact derivation the JS CLI runs (host/main.ts loadNodeKeys) — so this target's
-    // channel and guest roles hold different keys too, instead of one raw keypair
-    // signing for both. Go holds the seed and nothing derived from it.
+    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). The
+    // node's keypair is derived from it HERE, in the shared subkey code — the exact
+    // derivation the JS CLI runs (host/cli.ts loadNodeKeys) — so this target's peer id is
+    // the same key the JS shell would compute from the same seed. Go holds the seed and
+    // nothing derived from it.
     const keys = deriveNodeKeys(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
     const s = await makeTransportNode({
         identity: keys.channel,
-        guestIdentity: keys.guest,
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
@@ -614,7 +610,6 @@ function nativeCliHost(): CliHost {
             setPolicy(cfg.policyJson ?? null);
             const stood = await makeTransportNode({
                 identity: cfg.identity,
-                guestIdentity: cfg.guestIdentity,
                 contactSecret: cfg.contactSecret,
                 listen: cfg.listen,
                 wsListen: cfg.wsListen,

@@ -42,11 +42,12 @@ import { type Fs } from "../core/fs.js";
  *  into the core and bought nothing: a hostile transport already holds everything the
  *  transport touches.
  *
- *  `key` is part of the scope because the admission point picks it too: an app signs with
- *  the guest subkey, the mounted transport with the node's channel key. `node/verify`
- *  takes the verifying key from its argument bytes, so only the `domain` and `scope`
- *  halves bind a verification — a guest can check a signature under its own bundle's
- *  namespace, never another's. */
+ *  `key` is part of the scope because the admission point supplies it too — the node's
+ *  one identity, whichever slot asks (core/subkeys.ts), so a signature a peer receives
+ *  verifies under the peer id the handshake already authenticated. `node/verify` takes the
+ *  verifying key from its argument bytes, so only the `domain` and `scope` halves bind a
+ *  verification — a guest can check a signature under its own bundle's namespace, never
+ *  another's. */
 export interface SignScope {
     /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the mounted transport. */
     domain: Uint8Array;

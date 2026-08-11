@@ -1,26 +1,35 @@
-// Purpose-separated signing keys, derived from one stored master seed.
+// The node's signing keypair, derived from the one stored master seed.
 //
-// A node holds ONE secret on disk: a 32-byte master seed. Every signing keypair it uses
-// is derived from that seed under a distinct label, so no key ever signs for two
-// purposes. The channel handshake signs with the channel subkey; guest SIGN (§12.2)
-// signs with the guest subkey; anything added later gets its own label.
+// A node holds ONE secret on disk: a 32-byte master seed. The seed itself signs nothing —
+// it only derives — and every keypair the node uses comes out of `deriveNodeKeys` under a
+// distinct, versioned label. Today there is exactly one such label, `channel`, and its
+// public half is the node's IDENTITY: the peer id, what the handshake signs with, what
+// `senderPk` carries on every dispatch, and what the guest seam's SIGN op signs with.
 //
-// WHY, given that every preimage is already domain-separated. Domain separation makes a
-// signature produced for one purpose fail verification for another — provided the prefix
-// is actually applied, on both the signing and verifying side, on every path, forever.
-// It is a property of the code, and a single omitted or mismatched prefix on a signing
-// path turns that signer into an oracle for every other purpose sharing the key. Separate
-// keys make cross-purpose forgery impossible rather than merely incorrect: the guest SIGN
-// op cannot emit a channel signature because it does not hold the channel key at all.
-// Belt and braces, and the braces are the cheap half.
+// WHY ONE KEY, given that purpose separation is otherwise good practice. There was a
+// second `guest` subkey here, so that guest SIGN structurally could not emit a channel
+// signature whatever happened to the domain prefixes. It could not survive contact with
+// what a signature is FOR: a signed record travels to other nodes, which know the author
+// only as a peer id — a channel public key — so a record signed by a sibling subkey names
+// an author no peer in the cohort has heard of. Reconciling the two would mean gossiping a
+// signed guest-pk↔channel-pk binding per peer, which is a new protocol element bought to
+// protect a split no node could actually deploy: both subkeys were derived at boot, from a
+// seed the same process holds, and a node without the guest key cannot sign at all.
 //
-// This is the practice the Noise spec asks for when it says a static key pair should not
-// be used outside the protocol it was generated for, and it is the same reasoning behind
-// libsodium's crypto_kdf: one long-term secret, many purpose-bound subkeys.
+// So cross-purpose forgery is prevented the way the manifest/channel/guest split is already
+// prevented everywhere else in the tree: every signature binds `DOMAIN_x ‖ scope ‖ msg`,
+// the host chooses the domain from the slot the asking bundle occupies, and no op ever
+// signs raw bytes (guest-seam.ts, `appSignScope` / `transportSignScope`). One key, one
+// identity namespace, the same meaning on every target.
+//
+// The derivation stays: it keeps the stored secret distinct from the key that signs, keeps
+// the label versioned so the peer id can be rotated without changing the key file format,
+// and leaves room for a purpose that is genuinely node-local. The label set is closed here;
+// a label is never constructed from runtime data, so two purposes cannot collide by
+// accident.
 //
 // The derivation is BLAKE2b-256 over `DOMAIN_subkey ‖ label ‖ master`, fed to
-// crypto_sign_seed_keypair. The label set is closed and versioned here; a label is never
-// constructed from runtime data, so two purposes cannot collide by accident.
+// crypto_sign_seed_keypair.
 
 import { DOMAIN_SUBKEY } from "./domains.js";
 import { concatBytes, enc } from "./util.js";
@@ -29,7 +38,6 @@ import { concatBytes, enc } from "./util.js";
  *  purpose means adding a constant here, which is the point: the set of things this
  *  node's seed can sign for is enumerable by reading one file. */
 export const SUBKEY_CHANNEL = enc.encode("seedkernel-subkey-channel-v1\0");
-export const SUBKEY_GUEST = enc.encode("seedkernel-subkey-guest-v1\0");
 
 /** The subset of TransportCrypto this module needs. Kept narrow so subkey derivation is
  *  testable without standing up a whole crypto backend. */
@@ -52,7 +60,7 @@ export interface Keypair {
 /** Derive a purpose-bound Ed25519 keypair from the node's master seed.
  *
  *  Deterministic: the same seed and label always give the same keypair, so a node
- *  rebuilds every subkey at boot from the one secret it stores and there is nothing extra
+ *  rebuilds its keys at boot from the one secret it stores and there is nothing extra
  *  to persist, back up or keep in sync. Internal to this file: the public surface is
  *  `deriveNodeKeys`, which is what a host calls with the label constants above. */
 function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Array): Keypair {
@@ -65,20 +73,16 @@ function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Arra
 
 /** Every keypair a node derives from its master seed.
  *
- *  `channel` is the node's NETWORK IDENTITY: its public half is the peer id, it is what
- *  the handshake signs with, and it is what `senderPk` carries on every dispatch. The
- *  master seed itself signs nothing — it only derives — so compromising any one subkey
- *  compromises that purpose and not the node. */
+ *  `channel` is the node's IDENTITY: its public half is the peer id, it is what the
+ *  handshake signs with, it is what `senderPk` carries on every dispatch, and it is what
+ *  an app's scoped `node/sign` signs with. A record is one record: whoever sees the
+ *  signature already knows the signer as a peer. */
 export interface NodeKeys {
-  master: Uint8Array;
   channel: Keypair;
-  guest: Keypair;
 }
 
 export function deriveNodeKeys(sodium: SubkeyCrypto, master: Uint8Array): NodeKeys {
   return {
-    master,
     channel: deriveSubkey(sodium, master, SUBKEY_CHANNEL),
-    guest: deriveSubkey(sodium, master, SUBKEY_GUEST),
   };
 }

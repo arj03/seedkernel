@@ -200,30 +200,45 @@ It is optional and empty by default. Revocation is key rotation — a node dropp
 rotates its contact secret, a network splitting rotates its network key — so the whitelist
 is a convenience for expressing membership without re-keying, not a revocation mechanism.
 
-## 7. Why purpose-bound keys, given domain separation
+## 7. Why one identity key, and not a key per purpose
 
-Every preimage in the system is already domain-separated, so deriving a separate key per
-purpose ([RUNTIME](RUNTIME.md) §12.6.2b) looks redundant. It is not, and the reason is about
-where each property lives.
+A node signs for two purposes with one key: the handshake, under `DOMAIN_channel ‖
+network_key`, and an app's scoped records, under `DOMAIN_guest ‖ author ‖ app`
+([RUNTIME](RUNTIME.md) §12.6.2b). Deriving a second keypair for the second purpose is the
+obvious hardening, and it is worth saying why it is not done.
 
-Domain separation is a property of the **code**. It holds provided the prefix is applied, on
-both the signing and the verifying side, on every path, forever. It is one refactor away
-from being wrong, and being wrong is silent: signatures still verify, just for more things
-than intended. A single omitted or mismatched prefix on a signing path turns that signer
-into an oracle for every other purpose sharing the key.
+The argument for it is real. Domain separation is a property of the **code**: it holds
+provided the prefix is applied, on both the signing and the verifying side, on every path,
+forever. Being wrong is silent — signatures still verify, just for more things than
+intended — and a single omitted prefix on a signing path turns that signer into an oracle
+for every other purpose sharing the key. That matters most where a signing oracle is
+deliberate, and `node/sign` is exactly that: it signs guest-supplied bytes on request,
+exposed to guest code. Key separation would be a property of the **keys**, and would
+survive the refactor that loses a prefix.
 
-Key separation is a property of the **keys**. The guest seam's `node/sign` name cannot emit a
-channel handshake signature because it does not hold the channel key, whatever happens to
-the prefixes.
+What defeats it is what a signature is **for**. A signed record leaves the node. Every peer
+that receives one knows its author only as a peer id — a channel public key, the thing the
+handshake authenticated and `senderPk` carries. A record signed by a sibling key names an
+author that appears in no peer's roster, so a cohort would have to gossip a signed
+guest-pk↔channel-pk binding per peer to resolve one to the other: a new protocol element,
+new state, and a new place for identity to disagree with itself.
 
-That distinction matters most where a signing oracle is deliberate, and `node/sign` is
-exactly that: it signs guest-supplied bytes on request, exposed to guest code. Domain
-separation is what makes it safe today; key separation is what keeps it safe after someone
-edits the signing path.
+That is a heavy price for a split no node can deploy. Both keys derive from one seed at
+boot, inside one process, so a compromise that reaches either reaches both — and a node
+handed only the channel key cannot serve `node/sign` at all, which is not an operating mode
+any app has. The property being bought is narrower than it looks: not identity separation,
+only resistance to one class of code bug.
 
-This is the practice Noise asks for when it says a static key pair should not be used
-outside the protocol it was generated for, and the reasoning behind libsodium's
-`crypto_kdf`: one long-term secret, many purpose-bound subkeys.
+So the purposes are kept apart the way every other pair of purposes here is. The host — not
+the guest, and not the signing code — chooses the domain and scope from the slot the asking
+bundle occupies, binds `domain ‖ scope ‖ msg`, and never parses `msg`. No op signs raw
+bytes, and neither slot can reach the other's prefix. One key, one identity namespace, the
+same meaning on every target.
+
+The stored secret is still not the signing key: a node holds a 32-byte master seed and
+derives from it under a closed, versioned label set (libsodium `crypto_kdf`'s shape), which
+keeps the key file format independent of the key and leaves room for a purpose that is
+genuinely node-local.
 
 ## 8. Prior art
 
@@ -238,7 +253,7 @@ grades exactly the property this document is about.
 | Network key seeding the transcript | Secret Handshake's network key, applied as a Noise prologue |
 | Identity deferred past `ee` | Noise's deferred patterns; avoids `IK`'s documented limitation |
 | Transcript-signature authentication | SIGMA |
-| Master seed with purpose-bound subkeys | libsodium `crypto_kdf`; Noise's static-key-reuse guidance |
+| Master seed with a derived, labelled signing key | libsodium `crypto_kdf` |
 | Evict-oldest half-open budgets | the accept-queue policy of loaded TCP servers |
 
 ### 8.1 Identity-hiding grades
@@ -309,15 +324,6 @@ goal and belongs in its own suite.
 
 **Impersonation after key compromise.** Seizing a node's master seed lets an attacker be
 that node. Only §3's deferral limits the *retroactive* damage.
-
-**Guest signature verification across nodes is unfinished.** §7 moves `node/sign` onto the
-guest subkey, so `node/identity` now returns that subkey's public half while `senderPk`
-carries the channel key. Nothing in the tree verifies a peer's guest signature today, but
-anything that wants to will need the guest subkey published authentically — the scoped
-`node/verify` name (§12.2) is the verifier it would check through, applying the same
-host-derived scope `node/sign` bound the signature to. The natural home
-is the handshake — msg3 and msg4 already carry a signed identity — but that is a §12.2
-decision about what guests are told, not a §12.6 one, and it is deliberately left open.
 
 ---
 

@@ -106,11 +106,12 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(/^[0-9a-f]{64}$/.test(seedHex), "the minted key file holds 64 hex characters");
   const keys = deriveNodeKeys(sodium, parseHex32(seedHex, "--key"));
   ok(host.lines[0] === `seedkernel-test ${toHex(keys.channel.publicKey)}`,
-    "the banner line reports the channel subkey as the peer id");
-  ok(toHex(keys.guest.publicKey) !== toHex(keys.channel.publicKey),
-    "the guest subkey differs from the channel subkey");
-  ok(host.stood.identity !== undefined && host.stood.guestIdentity !== undefined,
-    "both purpose-bound keypairs reach standUp");
+    "the banner line reports the derived key as the peer id");
+  // ONE identity: the key that reaches standUp — and so `node/identity`, `node/sign` and
+  // the handshake — is the same key the banner prints as the peer id. A node that signed
+  // a record with anything else would name an author no peer in its cohort has heard of.
+  ok(toHex(host.stood.identity.publicKey) === toHex(keys.channel.publicKey),
+    "the node's identity is the peer id, not a sibling key");
 }
 
 // Defaults: one --dir and one --key on every target. These differed before (./data

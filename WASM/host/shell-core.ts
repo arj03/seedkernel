@@ -104,12 +104,10 @@ export interface ModuleTableBackend extends BundleHost, ModuleLookup {
  *  `network` member to hand in — the driver IS the network. */
 export interface ShellPlatform {
     sodium: ShellSodium;
-    /** The CHANNEL keypair — its public half is this node's peer id. */
+    /** The node's keypair (§12.9) — its public half is this node's peer id, and the ONE
+     *  identity every target reports through `node/identity`. The handshake and the guest
+     *  seam's SIGN op both sign with it, under different domains and scopes. */
     identity: Keypair;
-    /** The GUEST signing keypair (§12.9), a sibling subkey. The seam's SIGN op uses
-     *  this and nothing else, so a guest can never elicit a channel signature. Defaults to
-     *  `identity` for hosts that supply a single keypair. */
-    guestIdentity?: Keypair;
     /** The module table this shell binds bundle modules into (§3). */
     table: ModuleTableBackend;
     fs?: Fs;
@@ -578,7 +576,7 @@ export function createShell(opts: CreateShellOptions & {
         return createGuestSeam({
             platform: {
                 sodium: platform.sodium,
-                identity: platform.guestIdentity ?? platform.identity,
+                identity: platform.identity,
                 peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
                 now: platform.now ?? (() => Date.now()),
             },
@@ -589,15 +587,16 @@ export function createShell(opts: CreateShellOptions & {
                 // vocabulary was checked at load (verifyManifest).
                 names: new Set(b.manifest.guest.requires),
                 // What SIGN signs under — and what VERIFY checks against — is chosen HERE,
-                // by the slot the bundle occupies, the one place that knows it (§12.2). The
-                // transport slot signs handshake transcripts under DOMAIN_channel with the
-                // node's channel key; every ordinary app signs under DOMAIN_guest with the
-                // guest subkey, in its own bundle's scope. The seam prefixes and never
-                // parses, so neither can produce the other's signature and no op signs raw
-                // bytes.
+                // by the slot the bundle occupies, the one place that knows it (§12.2). Both
+                // slots sign with the node's one key, and the slot picks what that signature
+                // MEANS: the transport signs handshake transcripts under DOMAIN_channel ‖
+                // networkKey, every ordinary app under DOMAIN_guest ‖ its own bundle's scope.
+                // The seam prefixes and never parses, so neither can produce the other's
+                // signature and no op signs raw bytes — which is what keeps the purposes
+                // apart now that one key serves both (core/subkeys.ts).
                 signScope: driver
                     ? transportSignScope(platform.identity, platform.networkKey)
-                    : appSignScope(platform.guestIdentity ?? platform.identity, b.author, b.manifest.app),
+                    : appSignScope(platform.identity, b.author, b.manifest.app),
                 // Scoped to this app key, so `fs` grants reach over this app's own keyspace
                 // and not the node's (fs.ts). Two admitted apps cannot read, enumerate or
                 // delete each other's data — the same structural ownership module names
