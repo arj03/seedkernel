@@ -20,7 +20,7 @@ const (
 	nameSign     = "node/sign"
 	nameVerify   = "node/verify"
 	nameIdentity = "node/identity"
-	nameNetPeers = "net/peers"
+	nameNodeRandom = "node/random"
 	nameFsGet    = "fs/get"
 	nameFsPut    = "fs/put"
 	nameClockNow = "clock/now"
@@ -43,7 +43,7 @@ func TestGuestSeamOps(t *testing.T) {
 		// test rebuilds the raw preimage from to prove node/verify applies it.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
-		__buildGuestSeam(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, [], __scope);
+		__buildGuestSeam(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, __scope);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -163,12 +163,11 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatalf("clock/now = %v, want nonzero u64", clk)
 	}
 
-	// Gate: a name outside the granted set is refused. net/peers rather than
-	// net/send because the gate has to be observed SYNCHRONOUSLY here — net/send is a
-	// real round trip, so a refusal comes back as a rejected promise rather than a
-	// thrown error.
-	if _, err := call(nameNetPeers, nil); err == nil {
-		t.Fatal("net/peers resolved despite not being a declared name")
+	// Gate: a name outside the granted set is refused. A SYNCHRONOUS name, so the refusal
+	// is a thrown error rather than a rejected promise — which is what a round-tripping
+	// name would give back and what a test cannot observe in the same breath.
+	if _, err := call(nameNodeRandom, []byte{0, 0, 0, 4}); err == nil {
+		t.Fatal("node/random resolved despite not being a declared name")
 	}
 	// And raw net is not merely undeclared here — it is the transport slot's, so no app
 	// seam is ever wired one.

@@ -57,7 +57,7 @@ const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type HostCall } from "./guest-seam.js";
-import { serializeCalls } from "./realm-queue.js";
+import { serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. It is DECLARED in guest-seam.ts, beside the names it carries:
@@ -156,13 +156,19 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
   let consumedMs = 0;
   let segmentStart = 0;
   let running = false;
-  // Installed unconditionally. QuickJS calls this periodically while guest code runs;
-  // it reads false whenever the guest is not running, so a parked initiator is never
-  // interrupted. `Infinity` makes the comparison never true, which is how the guard is
-  // disabled — by a value, not by the handler's absence.
-  ctx.runtime.setInterruptHandler(
-    () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
-  );
+  // Installed only when there is a budget to enforce. QuickJS calls the handler
+  // periodically while guest code runs, and here that call crosses out of wasm into JS —
+  // so a handler that can never return true is not a free `Infinity` comparison but a
+  // host callback every few thousand bytecodes, paid by every guest for a guard nobody
+  // armed. An unbounded realm is now unbounded by the handler's ABSENCE.
+  //
+  // While it is installed it reads `running`, so a parked initiator — the host awaiting
+  // the seam on the guest's behalf — is never interrupted.
+  if (Number.isFinite(budgetMs)) {
+    ctx.runtime.setInterruptHandler(
+      () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
+    );
+  }
   return {
     begin() { segmentStart = Date.now(); running = true; },
     end() { if (running) { consumedMs += Date.now() - segmentStart; running = false; } },
@@ -351,12 +357,29 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
-  /** One entrypoint invocation, assuming the queue has already given it the realm. */
-  const invoke = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
-    // Safe unconditionally because the queue guarantees nothing else is in flight: this
-    // is one invocation's own budget window, from here to the moment it settles. If two
-    // calls could overlap, this reset would be an escape hatch a guest's own traffic
-    // could open — a second call clearing an in-flight call's accumulated time.
+  /** Did the entrypoint that just ran hand its answer over to a later turn (the
+   *  preamble's `defer()`)? Read once, immediately after the synchronous segment, and
+   *  cleared by `__invoke` rather than here — so the flag describes exactly the
+   *  invocation that just ran. */
+  const wasDeferred = (): boolean => {
+    const flag = ctx.getProp(ctx.global, "__deferred");
+    try {
+      return ctx.dump(flag) === true;
+    } finally {
+      flag.dispose();
+    }
+  };
+
+  /** One entrypoint invocation, assuming the queue has already given it the realm.
+   *
+   *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
+   *  the moment the synchronous segment ends, which is before the answer exists. */
+  const invoke = (entry: string, payload: Uint8Array): Invocation => {
+    // Safe unconditionally because the queue guarantees nothing else is RUNNING: this is
+    // one invocation's own budget window. A deferred entrypoint has already ended its
+    // segment by the time the next one resets, so what it spends settling later is
+    // charged to whichever window is open — which is the honest accounting, since that
+    // is whose turn the guest code actually runs on.
     clock.reset();
     stageArg(ctx, payload);
     // evalCode runs the entrypoint synchronously up to its first await; the completion
@@ -381,27 +404,35 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // its object on the runtime's GC list, which aborts the module at runtime free.
       evalResult?.dispose();
     }
-    let rejectThis!: (err: Error) => void;
-    const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
-    pending.add(rejectThis);
-    let consumed = false;
-    try {
-      const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
-      consumed = true;
-      return takeBytes(ctx, ctx.unwrapResult(settled as never));
-    } finally {
-      pending.delete(rejectThis);
-      // An invocation that lost the race to failPending — a budget interrupt or
-      // dispose() — has no consumer for the settled result. If the guest promise
-      // still settles afterwards (a seam op resolving after the interrupt), its
-      // dup'd result handle would be orphaned, keeping the value on the runtime's
-      // GC list and aborting the module at runtime free. Release it when it lands.
-      // Safe by construction: `consumed` is set by the await continuation above,
-      // which always runs before this finally.
-      if (!consumed) {
-        void (settledNative as Promise<unknown>).then(disposeDisposableResult);
+    // Read before anything awaits, so no later invocation's `__invoke` can have cleared
+    // it. The realm is free from here for a deferred entrypoint.
+    const deferred = wasDeferred();
+    const result = (async () => {
+      let rejectThis!: (err: Error) => void;
+      const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
+      pending.add(rejectThis);
+      let consumed = false;
+      try {
+        const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
+        consumed = true;
+        return takeBytes(ctx, ctx.unwrapResult(settled as never));
+      } finally {
+        pending.delete(rejectThis);
+        // An invocation that lost the race to failPending — a budget interrupt or
+        // dispose() — has no consumer for the settled result. If the guest promise
+        // still settles afterwards (a seam op resolving after the interrupt), its
+        // dup'd result handle would be orphaned, keeping the value on the runtime's
+        // GC list and aborting the module at runtime free. Release it when it lands.
+        // Safe by construction: `consumed` is set by the await continuation above,
+        // which always runs before this finally.
+        if (!consumed) {
+          void (settledNative as Promise<unknown>).then(disposeDisposableResult);
+        }
       }
-    }
+    })();
+    // A deferred answer must not go unhandled while nothing is awaiting `released`:
+    // the caller holds `result` and its real error, so the release arm swallows.
+    return { result, released: deferred ? Promise.resolve() : result.catch(() => {}) };
   };
 
   return {

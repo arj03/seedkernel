@@ -151,7 +151,7 @@ func TestMlKemThroughCatalog(t *testing.T) {
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null, [], appSignScope(__id, __id.publicKey, "testapp"));
+		__buildGuestSeam([], __id, null, appSignScope(__id, __id.publicKey, "testapp"));
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}

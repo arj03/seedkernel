@@ -69,7 +69,7 @@ so the post-quantum suite will not change the address format (§11).
 ## 4. The caller names itself first
 
 The receiver learns who is calling before it says who it is. A caller that fails
-`admitPeer` is turned away having learned nothing — not even whether the identity it dialed
+the peer lint is turned away having learned nothing — not even whether the identity it dialed
 is live at that address.
 
 This is what the fourth message buys, and it is the one place this design leaves the
@@ -80,7 +80,7 @@ initiator's. Receiver-decides-first has no standard pattern.
 Someone must name themselves first; that is not solvable, only assignable. Because both
 early messages carry a seal keyed by the contact secret, whoever goes first is exposed only
 to a party already holding the credential. Assigning it to the caller is what lets the
-receiver run its whitelist before revealing anything.
+receiver run its peer lint before revealing anything.
 
 The cost is one round trip, once per connection, against a property that holds for every
 connection forever.
@@ -127,7 +127,7 @@ Constants and measured numbers: [RUNTIME](RUNTIME.md) §12.6.2 and
 
 ## 6. Why three secrets and not one
 
-A link is gated by a contact secret, a network key and an optional whitelist. What each
+A link is gated by a contact secret, a network key and an optional peer list. What each
 *does* is tabulated in [RUNTIME](RUNTIME.md) §12.6.3; this is why they are three things
 rather than one.
 
@@ -189,16 +189,26 @@ the transcript root means every signature *preimage* differs too, so a signature
 on one network is not even a well-formed candidate on another, and a cross-network handshake
 fails at the first message rather than somewhere later and more confusingly.
 
-### 6.3 Why the whitelist runs after verification
+### 6.3 Why the peer list runs after verification
 
 A filter on an unproven key that refuses visibly is a membership oracle: name any key, watch
-whether the response differs, and read the whitelist off a node without holding a single
-private key. On a whitelist that tracks a social graph, that is the graph. So `admitPeer`
-sees only identities whose signature has verified, and refuses by silence.
+whether the response differs, and read the list off a node without holding a single private
+key. On a list that tracks a social graph, that is the graph. So the check sees only
+identities whose signature has verified, and refuses by silence.
 
 It is optional and empty by default. Revocation is key rotation — a node dropping a peer
-rotates its contact secret, a network splitting rotates its network key — so the whitelist
-is a convenience for expressing membership without re-keying, not a revocation mechanism.
+rotates its contact secret, a network splitting rotates its network key — so the list is a
+convenience for expressing membership without re-keying, not a revocation mechanism.
+
+**It is a lint, and it is the occupant's.** The host used to hold the predicate and apply it
+to what the occupant reported, on the argument that a check a program applies to itself gates
+nothing against a hostile one. True — but the host was checking a key the *occupant supplied*,
+so it gated nothing against a hostile occupant either: one would simply supply a key that
+passes, or forge an attribution with no link at all. What the check actually catches is a
+buggy transport, or an honest one meeting a peer the operator did not list, and both are the
+occupant's business. So it ships as configuration at init. What holds against a hostile
+occupant is what always did, and it is not this: the occupant reaches no authority but
+`link/*`, and nothing it says about a peer widens that.
 
 ## 7. Why one identity key, and not a key per purpose
 
@@ -348,16 +358,17 @@ All but 13 are covered by `tests/transport-link.test.mjs` and `tests/transport-l
 which pin them against the shipped transport bundle — through the real host stack, over an
 instrumented in-process channel — rather than against a library object a test could hold.
 
-**Where 5 lives, and why it is easy to lose.** The whitelist is the *host's* — a predicate
-handed to the guest to apply to itself gates nothing against a hostile occupant of the slot —
-but the *order* is the guest's, and the invariant is entirely about order. The gate is asked
+**Where 5 lives, and why it is easy to lose.** The peer list is *configuration*, shipped to
+the occupant at init and applied by it — a LINT rather than a gate, since a host checking a
+key the occupant supplied gated nothing against a hostile occupant either. What matters is
+the *order*, and the invariant is entirely about order. The gate is asked
 at the first point the peer is known and before this end has revealed anything about itself:
 `onMsg3` when accepting, `onMsg4` when dialing. Asking it from `becomeAuthed()` instead
 would be one message too late on the accepting side, because that is reached only after
 msg4 — the receiver's identity and signature — is already on the wire. A concealed refusal
 is also silence rather than a close: closing at msg3 would answer the same question the
-ordering exists to leave unanswered. `transport/link-auth` carries a `conceal` flag for exactly
-that distinction.
+ordering exists to leave unanswered. The lint takes a `conceal` flag for exactly that
+distinction.
 
 ---
 

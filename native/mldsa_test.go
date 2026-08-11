@@ -41,7 +41,7 @@ type mldsaSigner struct {
 // here rather than beside the envelope's format constants in mldsa.go.
 const mldsaSkBytes = 4032
 
-func newMlDsaSigner(t *testing.T) *mldsaSigner {
+func newMlDsaSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
 	cm, err := rt.CompileModule(ctx, mldsaWasm)
 	if err != nil {
@@ -67,7 +67,7 @@ func newMlDsaSigner(t *testing.T) *mldsaSigner {
 }
 
 // keypair derives an ML-DSA-65 key set from a 32-byte seed.
-func (s *mldsaSigner) keypair(t *testing.T, seed []byte) (pk, sk []byte) {
+func (s *mldsaSigner) keypair(t testing.TB, seed []byte) (pk, sk []byte) {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,7 +82,7 @@ func (s *mldsaSigner) keypair(t *testing.T, seed []byte) (pk, sk []byte) {
 
 // signDetached signs with an empty FIPS 204 context — the runtime's only mode, since its
 // domain separation is the DOMAIN_manifest prefix inside the preimage (§16.1).
-func (s *mldsaSigner) signDetached(t *testing.T, msg, sk []byte) []byte {
+func (s *mldsaSigner) signDetached(t testing.TB, msg, sk []byte) []byte {
 	t.Helper()
 	// Hedging randomness: a fixed value is acceptable here and nowhere else — these
 	// signatures never leave the test binary, and a deterministic one makes a failure
@@ -93,7 +93,7 @@ func (s *mldsaSigner) signDetached(t *testing.T, msg, sk []byte) []byte {
 // signCtx is the full FIPS 204 external interface, context and hedging randomness
 // included. The ACVP vectors carry both, and a wrapper that can only be tested on the
 // subset matching one call site is a wrapper that has barely been tested.
-func (s *mldsaSigner) signCtx(t *testing.T, msg, sctx, rnd, sk []byte) []byte {
+func (s *mldsaSigner) signCtx(t testing.TB, msg, sctx, rnd, sk []byte) []byte {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -111,7 +111,7 @@ func (s *mldsaSigner) signCtx(t *testing.T, msg, sctx, rnd, sk []byte) []byte {
 // verifyCtx is the same for the verify side. The production wrapper fixes the context to
 // empty, so the vectors that carry one are driven at the export directly — the same
 // instance of the same module, exercised through a wider door.
-func (s *mldsaSigner) verifyCtx(t *testing.T, sig, msg, sctx, pk []byte) bool {
+func (s *mldsaSigner) verifyCtx(t testing.TB, sig, msg, sctx, pk []byte) bool {
 	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -126,7 +126,7 @@ func (s *mldsaSigner) verifyCtx(t *testing.T, sig, msg, sctx, pk []byte) bool {
 	return r[0] == 1
 }
 
-func (s *mldsaSigner) read(t *testing.T, off uint32, n int) []byte {
+func (s *mldsaSigner) read(t testing.TB, off uint32, n int) []byte {
 	t.Helper()
 	b, ok := s.mem.Read(off, uint32(n))
 	if !ok {

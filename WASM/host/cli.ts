@@ -224,7 +224,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       : undefined,
   });
   // The node's transport driver, or null when the policy admitted no transport bundle.
-  // Read once and held: nothing below this line mounts a second one, and every use is
+  // Read once and held: nothing below this line stands a second one up, and every use is
   // guarded on the null rather than on which class the object turned out to be.
   const net = shell.transport;
 

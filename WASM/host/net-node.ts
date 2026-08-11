@@ -4,7 +4,7 @@
 // else. The transport itself — the PeerLink handshake, link routing, the
 // request/response layer — runs in the transport bundle's guest program, driven
 // by the shared TransportHost (transport-host.ts), which the shell stands up when
-// the transport bundle is mounted. This file is the socket seam's host half: the
+// the transport bundle is loaded. This file is the socket seam's host half: the
 // factory the driver's DIAL actions and listeners go through, and the peer-spec
 // parsing for the CLI.
 //

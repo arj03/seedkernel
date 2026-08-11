@@ -12,6 +12,10 @@
 
 // ── byte helpers (no TextEncoder/TextDecoder in a zero-authority realm) ───────
 
+/** The empty answer, shared: an op that reports rather than asks, a request nobody
+ *  claimed, a settled-but-empty response. */
+const EMPTY = new Uint8Array(0);
+
 function concatBytes(parts) {
   let len = 0;
   for (const p of parts) len += p.length;

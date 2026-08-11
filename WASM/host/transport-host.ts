@@ -1,53 +1,48 @@
-// transport-host.ts — the host side of the transport bundle
-// (§12.6). The wire codec, the channel handshake, the authenticated
-// link router, the routing-core bookkeeping and the request/response layer run as
-// the transport bundle's zero-authority guest program; this file is the driver
-// that stands between that guest and the platform.
+// transport-host.ts — the SOCKET DRIVER, and nothing above it.
 //
-// **There is no second seam here.** Both directions use the mechanism that already
-// exists, rather than a bespoke byte ABI with a hand-maintained twin in the guest:
+// The wire codec, the channel handshake, the authenticated link router, the routing-core
+// bookkeeping, the request/response layer, the correlation table and the peer set all run
+// as the transport bundle's zero-authority guest program (§12.6). This file is what stands
+// between that guest and the platform's sockets: a link table, an address book, the
+// listeners, and the links a host-managed transport hands over. That is the whole of it.
 //
-//   guest → host ordinary `host.call` ops (guest-seam.ts). The RAW net capability
-//                  — `link/open, send, close, stat` over an opaque link id — and the
-//                  `transport` domain the slot reports its structured output through.
-//                  Adding one is an op, not an action id with a decoder on both sides.
-//                  Its deadlines are NOT among them: `timer/*` is an ordinary authority
-//                  any guest may declare, so the table a fired timer comes out of is the
-//                  shell's, per realm (shell-core.ts), not this driver's.
-//   host → guest ordinary entrypoint invocation (`realm.call(name, bytes)`),
-//                  exactly as an app's holder `handle` is invoked. A payload shape
-//                  per entrypoint rather than one tagged union, so there is no
-//                  unknown-tag case to desync on: an entrypoint this guest does not
-//                  register fails loud by name.
+// **There is no transport-shaped seam here, in either direction.**
 //
-// **One invariant makes that safe: no name re-enters the realm.** The occupant calls
-// out from inside a synchronous entrypoint, so a name that called straight back in
-// would re-enter a live guest frame. None does — a socket write does not deliver
-// during the write, an armed timer fires on a later turn, and `transport/deliver`
-// answers through the `respond` entrypoint rather than inline. That last one is not a
-// concession: it is also what keeps an asynchronous app handler possible.
+//   guest → host  the four `link/*` names (guest-seam.ts): a byte duplex behind an opaque
+//                 link id. The platform's whole contribution to the network. Its
+//                 deadlines are not among them — `timer/*` is an ordinary authority any
+//                 guest may declare, so a fired timer comes out of the shell's per-realm
+//                 table (shell-core.ts), not this driver's.
+//   host → guest  the SAME cross-realm call an app makes: the transport claims `_net`
+//                 (core/domains.ts) and this driver reaches it through the shell's
+//                 routing, with the caller id 32 zero bytes for "the host itself" where an
+//                 app's call carries the app's own. One shape, one attribution rule.
 //
-// The crypto surface the guest reaches is the seam's, and it names no algorithm
-// the host understands: the record layer and the ephemeral DH go
-// through `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and
-// the transcript signature is the ordinary node/sign name, which the seam scopes to
-// `DOMAIN_channel ‖ networkKey` because THIS bundle claims the transport slot. The
-// host prefixes and does not read the suffix, so no handshake shape is pinned into
-// the core and the node's key never enters the guest.
+// **The op name travels in the payload, and stays a NAME.** Collapsing twelve entrypoints
+// onto one `handle` would otherwise have bought a tagged union with a number this file and
+// the guest must agree on — the one thing the old per-entrypoint dispatch was right to
+// avoid. So the first field after the caller id is a length-prefixed name, and an op the
+// guest does not implement fails loud by name exactly as a missing entrypoint did.
 //
-// What the host holds: the channels (by the link id this file mints), the
-// promises of outbound requests (keyed by the corr the host assigns), the address book
-// for dialing, the flood caps (net-limits.ts — the module never declares the number
-// that bounds it, it only learns it at init), and the WHITELIST GATE, which is applied
-// to the attribution the guest reports rather than handed to the guest to apply to
-// itself (see `admits`).
+// **One invariant makes the whole arrangement safe: no call re-enters a live frame.** The
+// transport calls out from inside its `handle`, so a name that called straight back in would
+// re-enter it. None does — a socket write does not deliver during the write, an armed
+// timer fires on a later turn, and a cross-realm call runs its callee on a later turn by
+// construction (guest-seam.ts). The transport's own answers ride `defer()` rather than an
+// await for the same reason (realm-queue.ts).
+//
+// The crypto surface the guest reaches is the seam's, and it names no algorithm the host
+// understands: the record layer and the ephemeral DH go through
+// `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and the transcript
+// signature is the ordinary `node/sign` name, which the seam scopes to
+// `DOMAIN_channel ‖ networkKey` because THIS bundle reaches the `link` privilege. The host
+// prefixes and does not read the suffix, so no handshake shape is pinned into the core and
+// the node's key never enters the guest.
 
-import { toHex, fromHex, writeU32BE, errMessage, enc, dec } from "../core/util.js";
+import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
-import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
-import type { RawNet, TransportSink } from "./guest-seam.js";
-import type { SafeRealm } from "./safe-js.js";
-import type { Network, PeerId, RequestHandler , Endpoint } from "../core/net.js";
+import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
+import type { RawNet } from "./guest-seam.js";
 
 /** 32-byte lowercase hex. A manual scan rather than a regex literal, so it stays safe
  *  under the minifier (scripts/minify.mjs), which has no lexer to tell a regex from a
@@ -116,17 +111,17 @@ export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: 
   return { peerId, addr: { host, port, transport, contactSecret } };
 }
 
-/** Kinds of link, as `linkOpen` declares them: CORE is the routing core's own
+/** Kinds of link, as the `linkOpen` op declares them: CORE is the routing core's own
  *  (accepted through the channel factory, dial bookkeeping and the half-open limiter
  *  apply); OPEN is a host-managed transport — WebRTC, browser WS — that opened the
  *  socket itself and handed it over through `openLink()`. */
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
-// The link close-reason codes are the transport occupant's vocabulary — the host
-// only relays the number it reports through transport/link-down (guest-seam.ts) to
-// whoever handed the channel in, never interpreting it. The codes live with the
-// occupant (transport/src/ake.js, `REASON_*`) and with the tests that assert them
+// The link close-reason codes are the transport occupant's vocabulary — the host only
+// relays the number it reports through the `_host` link-down op (shell-core.ts) to
+// whoever handed the channel in, never interpreting it. The codes live with the occupant
+// (transport/src/ake.js, `REASON_*`) and with the tests that assert them
 // (tests/transport-harness.mjs).
 
 const EMPTY = new Uint8Array(0);
@@ -144,15 +139,16 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
 
 /** How long one request may take when its caller names no deadline (§12.6). Generous
  *  on purpose: it is the number that has to be right for a caller who did not think
- *  about it, which includes every app guest, since net/send carries no deadline of its
- *  own. A caller moving something large, or one that wants to fail fast, passes its own
- *  to `request` rather than moving this. */
+ *  about it, which includes every app guest. Shipped to the guest at init, because the
+ *  request path is now entirely the guest's — an app's send reaches it as a cross-realm
+ *  call carrying whatever deadline the app chose, or nothing, and "nothing" is resolved
+ *  against this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
-/** Entrypoint-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
- *  length-prefixed blob, in the fixed order the entrypoint declares. There is no tag
- *  byte — the entrypoint's NAME is the discriminator, and it is the realm's, not a
- *  number this file and the guest have to agree on. */
+/** Op-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
+ *  length-prefixed blob, in the fixed order the op declares. The op's NAME is the
+ *  discriminator and it is written by `toTransport` below, so nothing here is a number the
+ *  two sides have to agree on. */
 class Args {
   private readonly parts: Uint8Array[] = [];
   private len = 0;
@@ -180,9 +176,15 @@ class Args {
   }
 }
 
+/** How the driver reaches the transport: the shell's cross-realm call, already resolved to
+ *  whatever realm claims `_net` right now. `null` when nothing does — a node whose
+ *  transport bundle has been uninstalled, where a socket event has nowhere to go and
+ *  the honest answer is to drop it. */
+export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
+
 export interface TransportHostOptions {
   /** The CHANNEL keypair — its public half is this node's peer id. Never passed
- *  to the guest; SIGN is serviced host-side with it, scoped by the slot. */
+ *  to the guest; SIGN is serviced host-side with it, scoped by the privilege. */
   identity: { publicKey: Uint8Array; privateKey: Uint8Array };
   /** OPTIONAL network key: which network this node belongs to (isolation
  *  boundary, not a gate — §12.6). Absent ⇒ the public network. */
@@ -193,8 +195,7 @@ export interface TransportHostOptions {
   contactSecret?: Uint8Array;
   /** How long ONE request may take before it settles as unreachable, in ms, for a
  *  caller that names no deadline of its own (default `DEFAULT_REQUEST_DEADLINE_MS`).
- *  A deployment-wide fallback, not a policy: a caller that knows what it is sending
- *  passes its own to `request` (§12.6). Small in tests. */
+ *  A deployment-wide fallback, not a policy. */
   requestDeadlineMs?: number;
   /** Parallel connections per dialed peer (default 1). */
   connsPerPeer?: number;
@@ -207,12 +208,21 @@ export interface TransportHostOptions {
   maxHalfOpenUnverified?: number;
   maxHalfOpenPerSource?: number;
   maxHalfOpenVerified?: number;
-  /** Whitelist gate, called with a signature-verified peer key when a link
- *  authenticates and again on the cohort edge. Absent ⇒ admit all. */
-  admitPeer?: (pk: Uint8Array) => boolean;
-  /** Cohort edges (fired on a peer's FIRST authenticated link / LAST lost). */
-  onPeerUp?: (peerId: PeerId) => void;
-  onPeerDown?: (peerId: PeerId) => void;
+  /** The peers this node will talk to, as 32-byte channel keys. Shipped to the guest at
+ *  init and applied there.
+ *
+ *  **It is a lint, and it is named as one.** It used to be a host-side predicate run on
+ *  the attribution the transport reported, on the argument that a gate the occupant applies
+ *  to itself gates nothing against a hostile occupant. That argument does not survive
+ *  contact: the host was checking a key the occupant supplied, so a hostile occupant
+ *  simply supplied one that passes — or forged the attribution with no link at all. What
+ *  the check actually catches is a BUGGY transport, or an honest one meeting a peer the
+ *  operator did not list, and both are the transport's own business. So it ships as
+ *  configuration. What holds against a hostile occupant is what always did: it reaches no
+ *  authority but `link/*`, and nothing it says about a peer widens that.
+ *
+ *  Absent ⇒ admit every peer that completes the handshake. */
+  admitPeers?: Uint8Array[];
   /** The socket seam: dialing, listening, and the address book live here. Absent
  *  for a host-managed-transport-only node (browser edge), which opens links via
  *  openLink and whose link/open calls answer "no route". */
@@ -252,102 +262,73 @@ export interface OpenLinkOptions {
  *  both ends must share; settable only because the boundary is otherwise
  *  unreachable in a test (§12.6). */
   rekeyAfterFrames?: number;
-  /** Fired once this link's identity verified AND the whitelist admitted it. */
+  /** Fired once this link's identity verified AND the transport admitted it. */
   onAuth?: (peerId: PeerId) => void;
   /** Fired when the link tears down (any reason). */
   onClose?: (linkId: number, reason: number) => void;
 }
 
-/** The request/response face of the transport bundle — the shape shell-core's
- *  guest-seam wiring and the shell's `transport` field consume. */
-export interface HostTransport {
-  readonly peerId: PeerId;
-  request(to: PeerId, proto: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array>;
-  send(to: PeerId, proto: Uint8Array, payload: Uint8Array): void;
-  onRequest(handler: RequestHandler): void;
-  close(): void;
-}
-
-/** What survives replacing the transport bundle underneath a running node — and,
- *  more importantly, the statement of what does NOT.
+/** The host side of the node's network: sockets, addresses, listeners.
  *
- * **Live links cannot be handed over, and that is a property rather than a gap.**
- *  Session keys, direction counters and the link table live in the guest's own
- *  linear memory (§4.3), which is exactly what makes the occupant confineable: the
- *  host cannot read them out, by construction, and a seam that let it would be the
- *  hole the confinement exists to close. So an in-place upgrade is a **reconnect** —
- *  the outgoing driver closes its links, the incoming one redials from the address
- *  book. Peers see an ordinary disconnect, which the record layer's clean-close
- *  discipline already covers (§12.6).
+ *  **What is deliberately not here.** No request/response facade, no correlation table,
+ *  no peer set, no inbound dispatch sink, no `Network`/`Endpoint` pair — every one of
+ *  those was the host standing between two guests. An app's send is a call to `_net`;
+ *  the transport's reply is that call's return value; its own wire correlation never
+ *  leaves its heap. Nothing on this object is reached by an app, at all.
  *
- *  What is here is therefore only the *host's* half: the things the shell configured
- *  from outside the guest and would otherwise silently lose. Everything in this
- *  object was set by a host-side call, and every one of them is re-applied by
- *  `adopt` through that same call.
- *
- *  The bound ports come along for a reason worth stating: a node that asked for port
- *  0 got an ephemeral one, and its peers hold *that* number in their address books.
- *  Re-binding the originally requested config would move the node during an upgrade,
- *  which is a disconnect nobody asked for. */
-export interface TransportHandover {
-  /** The address book — who this node knows how to dial, and with which contact
- *  secret. Not identities it has *met*: an authenticated peer whose address was
- *  never configured is not redialable and is not meant to be. */
-  addrs: [PeerId, PeerAddr][];
-  /** The shell's inbound dispatch sink (`serve`). */
-  onRequest: RequestHandler | null;
-  peerHooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void };
-  /** Whether `start` had been called — an upgrade must not turn a node that was
- *  listening into one that is not, nor bind listeners on a node that never had any. */
-  listening: boolean;
-  port: number;
-  wsPort: number;
-}
-
-/** The host-side face of the transport bundle. Implements the Network shape the shell
- *  and its guest seam consume (net.ts's PeerId, Endpoint, RequestHandler), so callers
- *  changed only in construction: the driver is built by the shell when the transport
- *  bundle is admitted, not by each target.
- *
- *  Constructed BEFORE the realm and attached to it after, because the realm's
- *  guest seam needs this object: the guest's raw-net, timer and transport ops resolve
- *  here. `attach` is what sends the one config turn.
- */
-export class TransportHost implements Network, HostTransport {
+ *  **And no handover.** `handover()`/`adopt()` existed to carry host state across an
+ *  in-place transport upgrade. There is no longer any per-transport state on this object to
+ *  carry: the driver holds link ids and the address book, and both belong to the NODE
+ *  rather than to whichever bundle is currently the transport. So replacing a transport
+ *  is a later load winning a contested protocol id (shell-core `rebuildRoutes`) — a rule
+ *  the routing already had, applied to `_net` like any other claim. Live links still do
+ *  not survive it, and still cannot: the session keys are in the outgoing guest's private
+ *  memory (§4.3), which is what makes the occupant confineable. An upgrade is a
+ *  reconnect, and the incoming guest redials from this address book. */
+export class TransportHost {
   readonly peerId: PeerId;
   port = 0;
   wsPort = 0;
-  /** Frames delivered to the app side — a diagnostic counter. */
-  framesDelivered = 0;
-  /** Frames issued into the fabric — a diagnostic counter. */
-  framesSent = 0;
 
-  private realm: SafeRealm | null = null;
   private readonly opts: TransportHostOptions;
   private readonly channels = new Map<number, RawLink>;
   private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: number) => void }>;
-  private readonly pending = new Map<number, { resolve: (b: Uint8Array) => void; reject: (e: Error) => void }>;
   private readonly addrs = new Map<PeerId, PeerAddr>;
-  private readonly connected = new Set<PeerId>;
   private nextLinkId = 1;
-  private nextCorr = 1;
-  private reqHandler: RequestHandler | null = null;
-  private readyWaiter: { promise: Promise<void>; resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
+  private transport: TransportCall | null = null;
   private closed = false;
-  private listening = false;
 
   constructor(opts: TransportHostOptions) {
     this.opts = opts;
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Bind the guest realm and send the one config turn: who we are, which network,
- *  the budgets. The guest learns the host's flood cap here — the module never
- *  declares the number that bounds it. */
-  attach(realm: SafeRealm): void {
-    this.realm = realm;
+  /** Point the driver at the shell's routing and send the one config turn: who we are,
+   *  which network, the budgets, the peer list. The guest learns the host's flood cap
+   *  here — the module never declares the number that bounds it.
+   *
+   *  Called again whenever the claimant of `_net` changes, which is what an in-place
+   *  transport replacement is: the incoming guest is configured exactly as the first one
+   *  was, by the same call, because there is no second path for a replacement to take. */
+  attach(transport: TransportCall): void {
+    // A RE-attach means the previous occupant is gone, and its link state went with it:
+    // session keys and direction counters lived in its private memory (§4.3), which is
+    // what makes the occupant confineable. The sockets are still open and the far ends
+    // still believe in them, so they are torn down here rather than left as channels the
+    // incoming guest has never heard of. This is the reconnect an upgrade is; the
+    // incoming guest redials from the address book re-seeded below.
+    if (this.transport) {
+      for (const c of this.channels.values()) {
+        try { c.close(false); } catch { /* already gone */ }
+      }
+      this.channels.clear();
+      this.openLinks.clear();
+    }
+    this.transport = transport;
     const o = this.opts;
-    this.enter("init", new Args()
+    const admit = new Args();
+    for (const pk of o.admitPeers ?? []) admit.blob(pk);
+    this.toTransport("init", new Args()
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -357,80 +338,62 @@ export class TransportHost implements Network, HostTransport {
       .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
       .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
       .u32(MAX_HANDSHAKE_FRAME_BYTES)
+      .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
+      // Absent and empty are the same thing — "admit everyone" — said as a zero-length
+      // list rather than as a missing field, so the guest reads one shape.
+      .blob(admit.build())
       .build());
-  }
-
-  setPeerHooks(hooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void }): void {
-    this.opts.onPeerUp = hooks.onPeerUp;
-    this.opts.onPeerDown = hooks.onPeerDown;
+    // The incoming guest starts with an empty address book, so re-seed it. On a first
+    // attach there is nothing to send; on a replacement this is what lets it redial.
+    for (const [id, addr] of this.addrs) this.announceAddr(id, addr);
   }
 
   /** Whether `close` has run. Public because "the outgoing driver was actually shut
- *  down" is the thing an in-place upgrade has to be checkable on: a replaced driver
- *  that is merely dereferenced still holds its listener and its realm. */
+   *  down" is what a teardown has to be checkable on: a replaced driver that is merely
+   *  dereferenced still holds its listener. */
   get isClosed(): boolean { return this.closed; }
 
-  /** The host-side state to carry across an in-place transport upgrade — see
- *  `TransportHandover` for what is deliberately absent. Read before `close()`. */
-  handover(): TransportHandover {
-    return {
-      addrs: [...this.addrs],
-      onRequest: this.reqHandler,
-      peerHooks: { onPeerUp: this.opts.onPeerUp, onPeerDown: this.opts.onPeerDown },
-      listening: this.listening,
-      port: this.port,
-      wsPort: this.wsPort,
-    };
+  // ── reaching the transport ──────────────────────────────────────────────────
+
+  /** Call the transport by op name. The caller id is 32 zero bytes — "the host itself" —
+   *  where an app's call carries its own app key, so it reads one shape and can
+   *  tell the platform's events from an app's requests without a second seam.
+   *
+   *  Fire-and-forget by default, but not unordered: the realm serializes invocations in
+   *  acceptance order (realm-queue.ts), so bytes arriving on one link reach the occupant
+   *  in arrival order. An op that throws is a wedged transport whose links are moot, not
+   *  a reason to take the host down. */
+  private toTransport(op: string, args: Uint8Array): Promise<Uint8Array> | null {
+    if (this.closed || !this.transport) return null;
+    const name = enc.encode(op);
+    const payload = new Uint8Array(32 + 1 + name.length + args.length);
+    payload.set(ZERO32, 0);
+    payload[32] = name.length;
+    payload.set(name, 33);
+    payload.set(args, 33 + name.length);
+    return this.transport(payload);
   }
 
-  /** Re-apply a predecessor's host-side state. Called after `attach`, because every
- *  step below is an ordinary host-side call and `addPeerAddr` enters the guest.
- *
- *  The outgoing driver must already be closed: `start()` binds the listeners, and
- *  the port it is re-binding is the one the predecessor was holding. */
-  async adopt(s: TransportHandover): Promise<void> {
-    if (s.onRequest) this.onRequest(s.onRequest);
-    this.setPeerHooks(s.peerHooks);
-    if (s.listening) {
-      // Keep the node where its peers think it is (see TransportHandover). Mutating
-      // opts is how setPeerHooks already works — these are the host's own knobs, not
-      // anything the guest declared.
-      if (s.port && this.opts.listen) this.opts.listen = { ...this.opts.listen, port: s.port };
-      if (s.wsPort && this.opts.wsListen) this.opts.wsListen = { ...this.opts.wsListen, port: s.wsPort };
-      await this.start();
-    }
-    // Last, so a peer that is dialed immediately meets a driver that is already
-    // listening and already knows where to route what comes back.
-    for (const [id, addr] of s.addrs) this.addPeerAddr(id, addr);
+  /** `toTransport` for an op whose answer nobody is waiting on. */
+  private tell(op: string, args: Uint8Array): void {
+    const r = this.toTransport(op, args);
+    if (r) void r.catch((err: unknown) => { console.error(`[transport] error in ${op}: ${String(err)}`); });
   }
 
-  // ── entering the guest ──────────────────────────────────────────────────────
-
-  /** Invoke a guest entrypoint. The occupant answers by calling ops back out through
- *  the guest seam, so there is nothing to decode here — the return value is unused,
- *  and an entrypoint that throws is a wedged transport whose links are moot, not a
- *  reason to take the host down.
- *
- *  Fire-and-forget, but not unordered: the realm serializes invocations in the order
- *  they were accepted (realm-queue.ts), so frames arriving on one link reach the occupant
- *  in arrival order and one entrypoint completes before the next begins. */
-  private enter(entry: string, args: Uint8Array): void {
-    if (this.closed || !this.realm) return;
-    void this.realm.call(entry, args).catch((err: unknown) => {
-      console.error("[transport] guest error in " + entry + ": " + errMessage(err));
-    });
+  /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims
+   *  `_net` — a node with no transport bundle, which is a legitimate configuration and
+   *  so has to be an answer rather than a promise that never settles. */
+  private ask(op: string, args: Uint8Array): Promise<Uint8Array> {
+    const r = this.toTransport(op, args);
+    if (!r) return Promise.reject(new Error("transport: no bundle claims the network"));
+    return r;
   }
 
-  /** The peer whitelist. Absent ⇒ admit every peer that completes the handshake. */
-  private admits(pk: Uint8Array): boolean {
-    return this.opts.admitPeer ? this.opts.admitPeer(pk) : true;
-  }
-
-  // ── the capability backends the transport guest's seam is wired to ──────────
+  // ── the capability backend the transport guest's seam is wired to ───────────
 
   /** The RAW net capability, as this node implements it: an opaque link id over the
- *  platform's sockets. This is the whole of what the host contributes to the
- *  network, and it is wired to no seam but the transport slot's. */
+   *  platform's sockets. This is the whole of what the host contributes to the network,
+   *  and it is wired to no seam but the transport's. */
   rawNet(): RawNet {
     return {
       open: (dest) => {
@@ -459,86 +422,42 @@ export class TransportHost implements Network, HostTransport {
     };
   }
 
-  /** Where the mounted transport reports its structured output. Everything policy-shaped
- *  is applied HERE, on what the guest reports, rather than handed to the guest. */
-  sink(): TransportSink {
-    return {
-      deliver: (corr, noReply, from, proto, payload) => this.onDeliver(corr, noReply, from, proto, payload),
-      settle: (corr, ok, payload) => {
-        const p = this.pending.get(corr);
-        if (!p) return;
-        this.pending.delete(corr);
-        if (ok) p.resolve(payload.slice());
-        else p.reject(new Error(dec.decode(payload)));
-      },
-      linkAuth: (linkId, pk, conceal) => {
-        // The peer whitelist, host-side. It runs on the attribution the transport
-        // reports, which is the only place it cannot be skipped — a predicate handed to
-        // the guest to apply to itself gates nothing against a hostile occupant of the
-        // slot.
-        //
-        // A refusal does NOT close the channel when the guest asked us to conceal it.
-        // The accepting end asks at msg3, before it has sent msg4, so closing here would
-        // answer the one question the four-message ordering exists to leave unanswered:
-        // whether the identity the caller dialed lives at this address. Silence, and the
-        // guest's own handshake deadline, is the refusal (§12.6.2).
-        //
-        // Nothing is given up by not closing. Against a *hostile* occupant the close was
-        // never the guarantee it looked like — an occupant that ignores this verdict can
-        // equally decline to close any socket, and can forge `from` on delivery without a
-        // link at all. What actually holds the refusal is that we never fire `onAuth` and
-        // `peerEdge` re-checks `admits` before a peer enters `connected`, so a refused
-        // peer reaches no cohort edge and no `linkedPeers()` regardless.
-        if (!this.admits(pk)) {
-          if (!conceal) {
-            try { this.channels.get(linkId)?.close(false); } catch { /* already gone */ }
-          }
-          return false;
-        }
-        this.openLinks.get(linkId)?.onAuth?.(toHex(pk));
-        return true;
-      },
-      peerEdge: (up, pk) => {
-        const peer = toHex(pk);
-        if (up) {
-          if (!this.admits(pk)) return;
-          this.connected.add(peer);
-          this.opts.onPeerUp?.(peer);
-        } else if (this.connected.delete(peer)) {
-          // Only for a peer that was actually up: the down edge is the mirror of an
-          // up edge that fired, not of every link that ever closed.
-          this.opts.onPeerDown?.(peer);
-        }
-      },
-      ready: (ok) => this.onReady(ok),
-      linkDown: (linkId, reason) => {
-        const o = this.openLinks.get(linkId);
-        if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason); }
-      },
-    };
+  // ── what the shell hands back off `_host` ───────────────────────────────────
+
+  /** A link this driver handed over (`openLink`) authenticated as `pk`. Relayed to
+   *  whoever passed the channel in; the driver forms no opinion about the peer. */
+  linkAuthed(linkId: number, pk: Uint8Array): void {
+    this.openLinks.get(linkId)?.onAuth?.(toHex(pk));
+  }
+
+  /** A link this driver handed over tore down, with the occupant's reason code —
+   *  relayed, never interpreted. */
+  linkDown(linkId: number, reason: number): void {
+    const o = this.openLinks.get(linkId);
+    if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason); }
   }
 
   // ── channels ────────────────────────────────────────────────────────────────
 
-  /** Mint a link id for a channel and wire its events back into the guest. The
- *  callbacks fire on later turns (a socket does not deliver during the write that
- *  provoked it), which is what lets a channel be registered from inside an op. */
+  /** Mint a link id for a channel and wire its events into the transport. The callbacks
+   *  fire on later turns (a socket does not deliver during the write that provoked it),
+   *  which is what lets a channel be registered from inside an op. */
   private register(channel: RawLink): number {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
-      this.enter("linkBytes", new Args().u32(linkId).blob(bytes).build());
+      this.tell("linkBytes", new Args().u32(linkId).blob(bytes).build());
     });
     channel.onClose(() => {
       this.channels.delete(linkId);
-      this.enter("linkClosed", new Args().u32(linkId).build());
+      this.tell("linkClosed", new Args().u32(linkId).build());
     });
     return linkId;
   }
 
-  /** Tell the guest about a link the HOST opened: an accepted socket, or one a
- *  host-managed transport handed over. A dialed core link is not here — the guest
- *  opens those itself through `link/open` and already knows everything about them. */
+  /** Tell the transport about a link the HOST opened: an accepted socket, or one a
+   *  host-managed transport handed over. A dialed core link is not here — the guest
+   *  opens those itself through `link/open` and already knows everything about them. */
   private announce(
     linkId: number,
     spec: {
@@ -547,7 +466,7 @@ export class TransportHost implements Network, HostTransport {
       rekeyAfterFrames?: number;
     },
   ): void {
-    this.enter("linkOpen", new Args()
+    this.tell("linkOpen", new Args()
       .u32(linkId)
       .u8(spec.weDialed ? 1 : 0)
       .u8(spec.kind)
@@ -562,8 +481,8 @@ export class TransportHost implements Network, HostTransport {
   }
 
   /** Hand a host-owned channel to the transport (WebRTC / browser WS edges).
- *  The channel object stays the caller's; the link state machine runs in the
- *  guest, keyed by the returned link id. */
+   *  The channel object stays the caller's; the link state machine runs in the
+   *  guest, keyed by the returned link id. */
   openLink(opts: OpenLinkOptions): LinkHandle {
     const linkId = this.register(opts.channel);
     this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
@@ -582,19 +501,23 @@ export class TransportHost implements Network, HostTransport {
     });
     return {
       linkId,
-      send: (frame) => this.enter("linkSend", new Args().u32(linkId).blob(frame).build()),
-      close: () => { this.enter("linkClose", new Args().u32(linkId).build()); },
+      send: (frame) => this.tell("linkSend", new Args().u32(linkId).blob(frame).build()),
+      close: () => { this.tell("linkClose", new Args().u32(linkId).build()); },
     };
   }
 
-  // ── the routing core's host half: address book, dialing, listening ──────────
+  // ── the address book, dialing, listening ────────────────────────────────────
 
   addPeerAddr(peerId: PeerId, addr: PeerAddr): void {
     this.addrs.set(peerId, addr);
-    // The guest's dial needs the peer's contact secret (or the zero secret for
-    // an open peer) to build msg1; the host keeps the full address, which is what
-    // link/open resolves the peer key against.
-    this.enter("addr", new Args()
+    this.announceAddr(peerId, addr);
+  }
+
+  /** The guest's dial needs the peer's contact secret (or the zero secret for an open
+   *  peer) to build msg1; the host keeps the full address, which is what `link/open`
+   *  resolves the peer key against. */
+  private announceAddr(peerId: PeerId, addr: PeerAddr): void {
+    this.tell("addr", new Args()
       .blob(fromHex(peerId))
       .blob(addr.contactSecret ?? ZERO32)
       .build());
@@ -602,7 +525,6 @@ export class TransportHost implements Network, HostTransport {
 
   /** Bind the listeners (if any) through the channel factory. */
   async start(): Promise<void> {
-    this.listening = true;
     if (!this.opts.channels) return;
     const { port, wsPort } = await this.opts.channels.listen(
       this.opts.listen, this.opts.wsListen,
@@ -617,152 +539,45 @@ export class TransportHost implements Network, HostTransport {
     this.wsPort = wsPort;
   }
 
-  /** Dial every known peer address and resolve once each is authenticated (or
-   *  the guest's deadline passes). The dialing itself is the guest's — it counts
-   *  the shortfall to connsPerPeer and opens links through the raw capability.
-   *
-   *  Joining, not racing: a second `ready()` while one is in flight returns the
-   *  SAME pending promise rather than overwriting the waiter, so both callers
-   *  settle together. */
-  ready(timeoutMs = 5000): Promise<void> {
-    if (this.readyWaiter) return this.readyWaiter.promise;
-    let resolve!: () => void;
-    const promise = new Promise<void>((r) => { resolve = r; });
-    this.readyWaiter = {
-      promise,
-      resolve,
-      timer: setTimeout(() => { this.onReady(false); }, timeoutMs + 5000),
-    };
-    this.enter("ready", new Args().u32(timeoutMs).build());
-    return promise;
+  /** Dial every known peer address and resolve once each is authenticated (or the
+   *  guest's deadline passes). The dialing itself is the guest's — it counts the
+   *  shortfall to connsPerPeer and opens links through the raw capability — and so is
+   *  the waiting: the answer is this op's return value, which the guest hands back with
+   *  `defer()` when the last peer comes up. Nothing is held host-side, which is why
+   *  there is no waiter to join or overwrite. */
+  async ready(timeoutMs = 5000): Promise<void> {
+    await this.ask("ready", new Args().u32(timeoutMs).build());
   }
 
-  private onReady(_ok: boolean): void {
-    const w = this.readyWaiter;
-    if (!w) return;
-    this.readyWaiter = null;
-    clearTimeout(w.timer);
-    w.resolve();
-  }
-
-  /** The peers we currently hold at least one authenticated link to. */
-  linkedPeers(): PeerId[] { return [...this.connected]; }
-
-  // ── the request/response facade ─────────────────────────────────────────────
-
-  /** Send a typed request and await the typed response. The deadline clock runs in the
- *  guest (host-armed timers); this side holds the promise the guest settles with
- *  transport/settle.
- *
- *  `deadlineMs` is how long THIS exchange may take, and the caller supplies it because
- *  the caller is the only party that knows what it sent: a 200-byte control message and
- *  a 4 MB block deserve different answers, and nothing below this line can tell them
- *  apart. Omitted ⇒ the node's `requestDeadlineMs` default. Resolved here rather than
- *  in the guest, so the default lives in exactly one place. */
-  request(to: PeerId, proto: Uint8Array, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array> {
-    const corr = this.nextCorr++;
-    this.framesSent++;
-    return new Promise<Uint8Array>((resolve, reject) => {
-      this.pending.set(corr, { resolve, reject });
-      this.enter("request", new Args()
-        .u32(corr)
-        .u8(0)
-        .u32(deadlineMs ?? this.opts.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
-        .blob(fromHex(to))
-        .blob(proto)
-        .blob(payload)
-        .build());
-    });
-  }
-
-  /** Fire-and-forget: the receiver still runs its handler but skips the response
- *  frame (§12.6). No promise, no timeout — the message just goes out. */
-  send(to: PeerId, proto: Uint8Array, payload: Uint8Array): void {
-    this.framesSent++;
-    this.enter("request", new Args()
-      .u32(0) // noReply requests carry no meaningful correlation
-      .u8(1)
-      .u32(0) // ...and no deadline: nothing is waiting on it
-      .blob(fromHex(to))
-      .blob(proto)
-      .blob(payload)
-      .build());
-  }
-
-  onRequest(handler: RequestHandler): void { this.reqHandler = handler; }
-
-  /** An inbound request the guest attributed (transport/deliver): run the app-facing
- *  handler and hand its response back for framing.
- *
- *  The answer goes back through the `respond` entrypoint on a LATER turn, never as
- *  the call's return value, and that is deliberate twice over: it keeps the
- *  no-re-entrancy invariant (this runs inside the guest's own frame), and it is
- *  what lets `RequestHandler` return a Promise, which is the shape an app handler
- *  awaiting `fs` needs. */
-  private onDeliver(corr: number, noReply: boolean, from: Uint8Array, proto: Uint8Array, payload: Uint8Array): void {
-    this.framesDelivered++;
-    const handler = this.reqHandler;
-    const respond = (resp: Uint8Array | null): void => {
-      this.enter("respond", new Args()
-        .u32(corr)
-        .u8(noReply ? 1 : 0)
-        .blob(from)
-        // The handler is app code, so anything that is not bytes is an empty
-        // response rather than something to encode: a `length` read off a number or
-        // an ArrayBuffer would size the argument buffer to NaN and take the driver
-        // down over one badly-typed app.
-        .blob(resp instanceof Uint8Array ? resp : EMPTY)
-        .build());
-    };
-    const later = (resp: Uint8Array | null): void => { queueMicrotask(() => respond(resp)); };
-    if (!handler) { later(null); return; }
-    let r: Uint8Array | Promise<Uint8Array> | null;
-    try { r = handler(toHex(from), dec.decode(proto), payload); }
-    catch { r = null; }
-    if (r && typeof (r as Promise<Uint8Array>).then === "function") {
-      (r as Promise<Uint8Array>).then(respond, () => respond(null));
-    } else {
-      later(r as Uint8Array | null);
-    }
-  }
-
-  // ── the Network facade ──────────────────────────────────────────────────────
-
-  /** A single-identity fabric: it vends exactly one endpoint, its own. The send
- *  path routes through the guest's router; inbound content arrives through the
- *  transport sink (transport/deliver / transport/settle), never as raw frames — which is why
- *  `Endpoint` carries no `onFrame` sink. */
-  endpoint(id: PeerId): Endpoint {
-    if (id !== this.peerId) throw new Error("TransportHost is bound to one identity");
-    return {
-      send: (to: PeerId, frame: Uint8Array) => {
-        this.framesSent++;
-        this.enter("sendFrame", new Args().blob(fromHex(to)).blob(frame).build());
-      },
-      close: () => { this.close(); },
-    };
+  /** The peers we currently hold at least one authenticated link to. The set lives in
+   *  the guest — it is a fact about links, and links are the guest's — so this is a
+   *  question rather than a field. */
+  async linkedPeers(): Promise<PeerId[]> {
+    const bytes = await this.ask("peers", EMPTY);
+    const out: PeerId[] = [];
+    for (let off = 0; off + 32 <= bytes.length; off += 32) out.push(toHex(bytes.slice(off, off + 32)));
+    return out;
   }
 
   // ── lifecycle ───────────────────────────────────────────────────────────────
 
   /** Tear the driver down. Everything released here is the **host's** — the sockets and
- *  timers, the outbound promises — and **none of it goes through the occupant**. The host
- *  owns the descriptor for the life of the process (README §1), so a teardown that needed
- *  the occupant's cooperation to release one would be a teardown a wedged occupant could
- *  refuse; and an entrypoint invocation queues (§12.3) while the caller disposes the realm
- *  on return, so asking would not even be reliable. */
+   *  the listener — and **none of it goes through the occupant**. The host owns the
+   *  descriptor for the life of the process (README §1), so a teardown that needed the
+   *  occupant's cooperation to release one would be a teardown a wedged occupant could
+   *  refuse; and an invocation queues (§12.3) while the caller disposes the realm on
+   *  return, so asking would not even be reliable. */
   close(): void {
     if (this.closed) return;
     // First, so nothing below re-enters a realm the caller is about to dispose: the
     // channel closes fire `onClose`, which would otherwise queue a `linkClosed`.
     this.closed = true;
-    for (const p of this.pending.values()) p.reject(new Error("transport closed"));
-    this.pending.clear();
-    if (this.readyWaiter) { clearTimeout(this.readyWaiter.timer); this.readyWaiter.resolve(); this.readyWaiter = null; }
+    this.transport = null;
     for (const c of this.channels.values()) {
       try { c.close(false); } catch { /* already gone */ }
     }
     this.channels.clear();
+    this.openLinks.clear();
     this.opts.channels?.close();
   }
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -10,7 +12,7 @@ import (
 )
 
 // asyncnet: a confined guest *initiates* a real network round-trip. The
-// guest's only net surface is `await host.call("net/send", …)`; the engine has no
+// guest's only net surface is an await on the id the transport claims; the engine has no
 // Asyncify, so that call returns a callId-backed Promise instead of blocking. This
 // proves the cross-realm async seam end to end: the guest's await suspends, the host
 // realm's transport bundle dials a responder over a loopback socket, and when its promise
@@ -23,10 +25,18 @@ import (
 func TestAsyncNetInitiator(t *testing.T) {
 	guestSeamRealm(t)
 
-	// A (responder, listens) and B (the guest's node). The guest's seam is built
-	// over B's identity + transport, granting net/send only. A's onRequest echoes
-	// the payload so the round-trip result is checkable.
-	if _, err := qc.Eval("setup.js", qjs.Code(`
+	// A (responder, listens) and B (the guest's node). The guest's seam is built over B's
+	// identity, granting only the transport's reserved id and resolving it through B's own
+	// routing — the same shell method an app's seam gets in production. A runs the probe
+	// app, which echoes, so the round-trip result is checkable.
+	sender := testAuthor(t)
+	probeBlob, err := os.ReadFile(writeProbeBundle(t, sender, "probe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qc.Eval("setup.js", qjs.Code(fmt.Sprintf(`
+		globalThis.__probe = null;
+		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.idA = sodium.crypto_sign_keypair();
 		globalThis.idB = sodium.crypto_sign_keypair();
 		globalThis.aId = toHex(idA.publicKey);
@@ -34,22 +44,28 @@ func TestAsyncNetInitiator(t *testing.T) {
 		// A node without an admitted transport bundle has no network at all, so the
 		// policy has to name the artifact's own transport author before either node
 		// stands up. The id is read from the realm, never restated.
-		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
-		                           grants: { mount: [embeddedTransportAuthor] } }));
+		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
+		                           grants: { link: [embeddedTransportAuthor] } }));
 		globalThis.__setup = (async () => {
 		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
 		  globalThis.netA = a.transport;
 		  globalThis.netB = b.transport;
-		  netA.onRequest((from, proto, payload) => payload);
-		  __buildGuestSeam(["net/send"], idB, netB, [aId]);
+		  globalThis.__nodeA = a;
+		  globalThis.__nodeB = b;
+		  // The seam a confined guest on B runs against: _net resolves through B's own
+		  // routing, which is what an app's seam is wired with (shell-core crossRealmCall).
+		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => b.dispatch("0".repeat(64), id, payload) });
 		})();
-	`)); err != nil {
+	`, hex.EncodeToString(sender.id())))); err != nil {
 		t.Fatal("setup:", err)
+	}
+	if _, err := callRealm("loadProbe", 5*time.Second, qc.NewArrayBuffer(probeBlob)); err != nil {
+		t.Fatal("loadProbe:", err)
 	}
 
 	// Bind A's listener (sets netA.port), then point B at A.
-	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); return new Uint8Array(0); })()", 5*time.Second); err != nil {
+	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); await __nodeA.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(
@@ -58,9 +74,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 		t.Fatal("addPeerAddr:", err)
 	}
 
-	// The initiator guest: build a net/send frame to A (from APP config) and await
-	// the response. The await is the whole point — it suspends until the host realm's
-	// socket round-trip settles and the loop resolves the guest's promise.
+	// The initiator guest: build a `send` op for the transport (peer from APP config) and
+	// await the response. The await is the whole point — it suspends until the host
+	// realm's socket round-trip settles and the loop resolves the guest's promise.
 	const askGuestSource = `
 		function fromHex(h) {
 		  const out = new Uint8Array(h.length / 2);
@@ -68,14 +84,25 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  return out;
 		}
 		register("ask", async (msg) => {
-		  const peer = fromHex(APP.peer);            // A's 32-byte public key
-		  const proto = [0x74, 0x65, 0x73, 0x74];    // "test"
-		  const req = new Uint8Array(32 + 1 + proto.length + msg.length); // [peer 32][pidLen u8][proto][payload]
-		  req.set(peer, 0);
-		  req[32] = proto.length;
-		  req.set(proto, 33);
-		  req.set(msg, 33 + proto.length);
-		  const r = await host.call("net/send", req); // [ok u8][resp]
+		  const peer = fromHex(APP.peer);                       // A's 32-byte public key
+		  const proto = new TextEncoder().encode("probe");      // the app A claims
+		  // [opLen u8]["send"] then the op's args:
+		  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+		  const op = "send";
+		  const req = new Uint8Array(1 + op.length + 1 + 4 + 4 + 32 + 4 + proto.length + 4 + msg.length);
+		  req[0] = op.length;
+		  for (let i = 0; i < op.length; i++) req[1 + i] = op.charCodeAt(i);
+		  let off = 1 + op.length;
+		  const dv = new DataView(req.buffer);
+		  req[off++] = 0;                       // noReply
+		  dv.setUint32(off, 0); off += 4;       // deadline: the node's default
+		  dv.setUint32(off, 32); off += 4;
+		  req.set(peer, off); off += 32;
+		  dv.setUint32(off, proto.length); off += 4;
+		  req.set(proto, off); off += proto.length;
+		  dv.setUint32(off, msg.length); off += 4;
+		  req.set(msg, off);
+		  const r = await host.call("_net", req);               // [ok u8][resp]
 		  if (r[0] !== 1) throw new Error("net send failed");
 		  return r.slice(1);
 		});

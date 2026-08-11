@@ -161,9 +161,9 @@ await test("an outside flood CANNOT keep members out", async () => {
   const m = keep(await member(fabric, s, "10.9.9.9"));
   await m.driver.ready(4000);
   const evicted = flood.filter((d) => d.closed).length;
-  note(`under a saturating flood: member authenticated = ${m.driver.linkedPeers().length === 1}; ` +
+  note(`under a saturating flood: member authenticated = ${(await m.driver.linkedPeers()).length === 1}; ` +
        `${evicted} stranger(s) evicted`);
-  assert(m.driver.linkedPeers().includes(s.driver.peerId),
+  assert((await m.driver.linkedPeers()).includes(s.driver.peerId),
     "A MEMBER WAS DENIED SERVICE BY AN OUTSIDE FLOOD — the budgets are not separated");
   assert(evicted >= 1, "a saturated budget must EVICT to make room, not refuse the newcomer");
   assert(flood[0].closed, "eviction must take the OLDEST stranger first");
@@ -185,7 +185,7 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
     for (let j = 0; j < 4; j++) flood(); // attacker keeps pushing
     const m = keep(await member(fabric, s, `10.8.${i}.1`));
     try { await m.driver.ready(4000); } catch { /* counted as a failure below */ }
-    if (m.driver.linkedPeers().includes(s.driver.peerId)) authed++;
+    if ((await m.driver.linkedPeers()).includes(s.driver.peerId)) authed++;
   }
   note(`${authed}/${ROUNDS} members authenticated while ${ROUNDS * 4 + UNVER} flood connections churned`);
   assert(authed === ROUNDS, `${ROUNDS - authed} member(s) denied service under sustained flood`);
@@ -226,7 +226,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
   const m = keep(await member(fabric, s, "10.7.7.7"));
   await m.driver.ready(4000);
   note(`after ${VER * 3} credentialled stalls against a ${VER}-slot verified budget, member got in`);
-  assert(m.driver.linkedPeers().includes(s.driver.peerId),
+  assert((await m.driver.linkedPeers()).includes(s.driver.peerId),
     "A MEMBER WAS LOCKED OUT by a saturated verified budget");
 });
 

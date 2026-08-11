@@ -12,6 +12,14 @@
 //
 // Requires clang (>= 15, any build with the wasm32 target — `apt install clang lld`
 // suffices; no sysroot, no emsdk). Run `git submodule update --init` first.
+//
+// On Windows the compiler is expected to live in WSL rather than on the host, the same
+// arrangement `native/gorun.sh` uses for the Go toolchain: this is a C toolchain a
+// Windows checkout is unlikely to have, and installing one natively to build a
+// freestanding wasm32 object would be a second way to produce an artifact that must be
+// byte-identical everywhere (§12.4 — a bundle one node admits, every node must admit).
+// So the build shells out through `wsl`, with paths translated. Set CC to override and
+// use a native compiler instead.
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -20,6 +28,15 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const pq = resolve(root, "pq");
+
+/** `C:\dir\file` → `/mnt/c/dir/file`, wherever it appears inside an argument.
+ *
+ *  Per-occurrence rather than per-argument because a path is not always the whole
+ *  argument: `-I<path>` prefixes one and the config define wraps one in quotes the C
+ *  preprocessor needs (`-DMLD_CONFIG_FILE="…"`), so those quotes stop the match. */
+const toWslPath = (arg) =>
+  arg.replace(/([A-Za-z]):\\([^"]*)/g,
+    (_, drive, rest) => `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, "/")}`);
 
 /** @param {object} cfg
  *  @param {string} cfg.submodule   pq/<name> submodule dir (e.g. "mlkem-native")
@@ -39,7 +56,6 @@ export function buildPqWasm(cfg) {
     throw new Error(`pq/${cfg.submodule} is empty — run \`git submodule update --init --recursive\``);
   }
 
-  const cc = process.env.CC ?? "clang";
   const args = [
     "--target=wasm32",
     "-Os",
@@ -73,6 +89,18 @@ export function buildPqWasm(cfg) {
     resolve(pq, cfg.shim),
   ];
 
-  execFileSync(cc, args, { stdio: "inherit" });
+  // Through `wsl` on Windows unless CC names a native compiler. `bash -lc` with the
+  // command quoted here rather than `wsl clang …`: wsl.exe re-parses the command line
+  // Node builds, and the config define carries the quotes the preprocessor needs, so
+  // handing it one already-quoted string is the only way those survive intact.
+  const native = process.env.CC ?? (process.platform === "win32" ? null : "clang");
+  if (native) {
+    execFileSync(native, args, { stdio: "inherit" });
+  } else {
+    const cmd = ["clang", ...args.map(toWslPath)]
+      .map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
+      .join(" ");
+    execFileSync("wsl", ["bash", "-lc", cmd], { stdio: "inherit" });
+  }
   console.log(`wrote ${statSync(out).size} bytes -> ${cfg.out}`);
 }

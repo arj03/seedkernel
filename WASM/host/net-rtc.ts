@@ -25,7 +25,7 @@
 // inside RtcNetwork / relaySignaling, never at module scope, so importing this
 // module under Node (e.g. to unit-test RtcChannel) is safe.
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { type PeerId } from "../core/net.js";
+import { type PeerId } from "../core/socket-seam.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it. */
@@ -57,7 +57,7 @@ interface SignalMsg {
 export interface RtcNetworkOptions {
     /** The transport driver — the shell's `net` once the transport bundle is
      *  admitted. It holds the node identity, the network key, the contact secret
-     *  and the whitelist gate; this file only manages connections. */
+     *  and the peer lint; this file only manages connections. */
     driver: TransportHost;
     /** Resolve a peer's contact secret when dialing it. Signaling already names the
      *  peer, so it can carry the credential too. */
@@ -72,8 +72,8 @@ export interface RtcNetworkOptions {
      *  Referenced only inside ensurePeer(), never at module scope, so importing this
      *  module under Node without a factory stays safe. */
     peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
-    /** Optional peer whitelist, applied to SIGNALING messages. Absent (the default)
-     *  admits every peer to the rendezvous; the in-channel whitelist gate (the
+    /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
+     *  admits every peer to the rendezvous; the in-channel peer lint (the
      *  driver's, run on a signature-verified id) is separate and always on. */
     admitPeer?: (peerId: PeerId) => boolean;
     /** Called when a peer's link authenticates / drops. The storage demo uses these
@@ -271,8 +271,8 @@ export class RtcNetwork extends SingleIdentityNetwork {
             // Dialing gates on THEIR secret; accepting gates on ours (the driver's).
             contactSecret: weDialed ? this.opts.peerContactFor?.(peerId) : undefined,
             expectPeerId: peerId, // the transport pins the far key to who signaling said it is
-            onAuth: () => { e.authed = true; },
-            onClose: () => this.forget(peerId),
+            onAuth: () => { e.authed = true; this.peerUp(peerId); },
+            onClose: () => { this.peerDown(peerId); this.forget(peerId); },
         });
         e.link = handle;
     }
@@ -293,7 +293,7 @@ export class RtcNetwork extends SingleIdentityNetwork {
         if (msg.from === this.ownId || (msg.to && msg.to !== this.ownId))
             return;
         if (this.opts.admitPeer && !this.opts.admitPeer(msg.from))
-            return; // ignore non-whitelisted peers
+            return; // ignore peers outside the signaling allowlist
         try {
             if (msg.type === "hello")
                 await this.onHello(msg);

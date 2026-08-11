@@ -4,7 +4,8 @@
 
 # WASM artifacts built from this repo's source and copied in by
 # `npm run build:loader` (ws from assembly/, libsodium from the upstream npm
-# dist). qjs/qjs.wasm is NOT ignored — it's vendored upstream.
+# dist). qjs/qjs.wasm is NOT ignored — it is checked in, built from qjs/csrc/
+# by qjs/build-qjs.sh, so a clone needs no wasi-sdk to build the loader.
 /wasm/ws.wasm
 /wasm/libsodium.wasm
 /wasm/mldsa65.wasm
@@ -17,3 +18,7 @@
 
 # Local dev wrapper that runs the Go toolchain through WSL — machine-specific setup.
 /gorun.sh
+
+# The engine rebuild's work tree: a quickjs-ng checkout at the pinned commit plus
+# cmake's output (qjs/build-qjs.sh). Disposable — the built qjs.wasm is what we keep.
+/qjs/.build/

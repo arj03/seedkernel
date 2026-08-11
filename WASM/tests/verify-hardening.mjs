@@ -296,7 +296,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
   // The catalog calls `timer/*` an app authority (core/domains.ts), so the property under
-  // test is that an ORDINARY app gets one: no transport bundle is mounted anywhere below.
+  // test is that an ORDINARY app gets one: no transport bundle is loaded anywhere below.
   // The wiring used to come off the transport driver, which admitted such an app and then
   // failed it at its first `host.call` — a manifest the loader accepted naming a backend
   // nothing had wired.

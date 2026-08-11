@@ -1,7 +1,7 @@
 // The platform-neutral shell core — the §12.9 "move one level up". Everything that
 // standing a node up involves EXCEPT the parts that genuinely vary by target lives
 // here: the module table's owner, the guest-seam wiring, the preamble assembly, the
-// realm's lifecycle, the bundle load order, the transport slot, and the inbound
+// realm's lifecycle, the bundle load order, the socket driver, and the inbound
 // dispatch. A target supplies the platform seam — { sodium, identity, table, fs?,
 // freshnessStore, channels?, listen?, wsListen?, createRealm } — exactly like the
 // transport driver takes a ChannelFactory, and gets back a fully wired Shell.
@@ -18,16 +18,15 @@
 // only way code lands is via a signed bundle (§12.4), making the §3.1 claim structurally
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, privilegesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
+import { appKeyFor, appScopeFor, genesisHash, privilegesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
 import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, type Privilege } from "../core/domains.js";
-import { fromHex, writeU32BE, errMessage } from "../core/util.js";
+import { NET_PROTOCOL, PRIVILEGE_LINK, SHELL_PROTOCOL, type Privilege } from "../core/domains.js";
+import { dec, enc, fromHex, toHex, readU32BE, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
-import { type PeerId } from "../core/net.js";
-import { type ChannelFactory } from "../core/socket-seam.js";
+import { type ChannelFactory, type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
@@ -36,7 +35,7 @@ import type { Keypair } from "../core/subkeys.js";
 export type ShellSodium = BundleCrypto & SeamCrypto;
 
 /** The one reason a bundle load is refused without being an error worth reporting:
- *  the policy predicate said no (§12.4). The transport mount's installers treat this
+ *  the policy predicate said no (§12.4). The transport's installers treat this
  *  as "a node without a network — a deliberate configuration", not a failure, so
  *  the message is a shared constant rather than a string the caller re-matches. */
 export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
@@ -95,13 +94,12 @@ export interface ModuleTableBackend extends BundleHost, ModuleLookup {
  *  the `fs` cap on such a shell gets no backend wired at all, so its first `fs/*` call
  *  throws by name rather than resolving to a pretend store (§12.2). `createRealm` is
  *  REQUIRED: every app is a guest (§12.4), so a shell that cannot run a guest cannot
- *  host an app. `livePeers` feeds the net/peers name — the transport owns connectivity,
- *  the shell just passes the closure through to the guest seam.
+ *  host an app.
  *
  *  The transport itself is a signed bundle (§12.6): the platform supplies the SOCKET
  *  seam (`channels`, `listen`/`wsListen`, the network key and contact secret) and the
- *  shell stands the driver up when the transport bundle is mounted. There is no
- *  `network` member to hand in — the driver IS the network. */
+ *  shell stands the driver up when some bundle claims `_net`. There is no `network`
+ *  member to hand in — the bundle that claims that id IS the network. */
 export interface ShellPlatform {
     sodium: ShellSodium;
     /** The node's keypair (§12.9) — its public half is this node's peer id, and the ONE
@@ -114,7 +112,6 @@ export interface ShellPlatform {
     freshnessStore: FreshnessStore;
     createRealm: RealmFactory;
     now?: () => number;
-    livePeers?: () => PeerId[];
     /** OPTIONAL network key — which network this node belongs to. An isolation
      *  boundary, not a gate (§12.6); absent ⇒ the public network. Feeds both the
      *  transport guest's INIT and the CHANNEL_SIGN root check. */
@@ -139,16 +136,18 @@ export interface ShellPlatform {
     /** Parallel connections per dialed peer (default 1) — the transport's dial
      *  fan-out. */
     connsPerPeer?: number;
-    /** Whitelist gate for the transport slot: called with a signature-verified peer
-     *  key during the handshake and again before a link is routed. Absent ⇒ the
+    /** The peers this node will talk to, as 32-byte channel keys — shipped to the transport
+     *  at init and applied there. A LINT rather than a gate, and named as one: see
+     *  `TransportHostOptions.admitPeers` for why a predicate the host applied to what the
+     *  transport reported never gated anything against a hostile transport either. Absent ⇒ the
      *  node admits every peer that completes the handshake. */
-    admitPeer?: (pk: Uint8Array) => boolean;
+    admitPeers?: Uint8Array[];
 }
 
 export interface CreateShellOptions {
     /** The operator's admission predicate (§12.5) — ONE `Admit`, asked once per load,
      *  between verify and install. `ctx.privileges` says which privileges this bundle's
-     *  requires reach — nothing for an ordinary app, `mount` for the node's transport —
+     *  requires reach — nothing for an ordinary app, `link` for the node's transport —
      *  so a deployment that answers per capability composes
      *  `byPrivilege({ base, grants })`; `policyFromJson` already does.
      *  Absent ⇒ deny-all, nothing is admitted.
@@ -183,8 +182,23 @@ export interface CreateShellOptions {
      *  (§4.3), which a bundle declares in its signed manifest, how long this node is
      *  willing to spend on one message is a property of the deployment. */
     guestDeadlineMs?: number;
+    /** The SHELL's own protocols, answered ahead of the routing table (§12.10).
+     *
+     *  A shell may serve protocols of its own — seedchat's `_offer`, which carries a
+     *  bundle between two browsers before either has an app that could receive it — and
+     *  the reservation has to be an explicit seam because there is nowhere else left to
+     *  put it. An inbound frame reaches this shell as the transport's `_host` deliver op and
+     *  goes straight to `doDispatch`; a host that wanted first refusal used to get it by
+     *  wrapping the driver's `onRequest`, and that facade is gone (transport-host.ts).
+     *
+     *  `null` means "not mine" and falls through to the routing table, so a shell that
+     *  answers one id does not shadow the apps. Consulted on INBOUND frames only: a
+     *  co-resident app's cross-realm call carries an app key rather than a peer key, and
+     *  handing one to a callback whose argument is named `from: PeerId` would be the
+     *  attribution rules quietly disagreeing. An app addresses an app. */
+    answer?: (from: PeerId, proto: string, payload: Uint8Array) => Promise<Uint8Array> | null;
     /** Half-open budgets for the transport slot: concurrent links that have not
-     *  yet proven whitelist membership (unverified), per source address, and proven-
+     *  yet proven their contact credential (unverified), per source address, and proven-
      *  but-mid-handshake (verified). Defaults match the transport bundle's
      *  (1024 / 8 / 256); tests shrink them. Enforced inside the transport guest. */
     transportHalfOpen?: {
@@ -205,7 +219,7 @@ export interface Shell {
     /** Every protocol this node serves, as `[proto, appKey]` — what an operator's console
      *  line or a shell's UI lists. A snapshot, not the live map. */
     routes(): [string, string][];
-    /** The transport bundle's driver, or `null` until one is mounted (§12.6).
+    /** The transport bundle's driver, or `null` until one is loaded (§12.6).
      *
      *  ONE object, not one per face: `TransportHost implements Network, HostTransport`,
      *  so the endpoint vend, the request/response pair every app's `net` names reach,
@@ -221,8 +235,8 @@ export interface Shell {
     /** Load a signed bundle blob: verify the manifest, run the admission predicate,
      *  integrity-check + install the modules, and return the guest source. This is
      *  the §12.4 load order — the ONE install path, for apps and for the transport
-     *  alike. A bundle naming the mount-only names (§12.5) is governed by the
-     *  `mount` half of the policy and mounted as this shell's transport instead of
+     *  alike. A bundle naming the `link/*` names (§12.5) is governed by the
+     *  `link` half of the policy and stood up as this shell's transport instead of
      *  bound as an app; replacing a standing transport is a staged handover, where the
      *  incoming guest stands before the outgoing driver is closed and links reconnect
      *  under the new guest. */
@@ -258,8 +272,10 @@ export interface Shell {
      *  transport driver awaits — never raw bytes; there is no second, synchronous
      *  delivery shape. */
     dispatch(from: PeerId, proto: string, payload: Uint8Array): Promise<Uint8Array> | null;
-    /** Wire transport.onRequest to the shell's dispatch. After this, every
-     *  inbound frame resolves through the routing table to its app (§12.10). */
+    /** Pre-create every app's realm, so the first routed frame does not pay realm
+     *  construction. Not a switch: an inbound frame reaches the shell as the transport's
+     *  `_host` deliver op, so a node serves from the moment its transport bundle is
+     *  loaded (§12.10). Throws if there is no transport to serve over. */
     serve(): Promise<void>;
     close(): void;
 }
@@ -267,7 +283,7 @@ export interface Shell {
 /** The transport driver, or a diagnosis of why there is none.
  *
  *  A node without a transport bundle is a legitimate configuration (§12.6) — the
- *  policy simply granted `mount` to nobody — so `shell.transport` is nullable and
+ *  policy simply granted `link` to nobody — so `shell.transport` is nullable and
  *  every caller sees that in the type. This is for the callers that genuinely cannot
  *  proceed (a CLI dialing a peer): it turns the null into the sentence an operator
  *  can act on, naming the privilege and the halves a bundle must declare to hold it.
@@ -275,7 +291,7 @@ export interface Shell {
  *  `Network` shape and throws on use would be a transport that is not one. */
 export function requireTransport(shell: Pick<Shell, "transport">, what: string): TransportHost {
     if (shell.transport) return shell.transport;
-    throw new Error(`shell: ${what} — the transport bundle is not loaded (load one declaring the ${PRIVILEGE_MOUNT} names, ${(GROUPS_BY_PRIVILEGE.get(PRIVILEGE_MOUNT) ?? []).join(" + ")}, first)`);
+    throw new Error(`shell: ${what} — the transport bundle is not loaded (load one that reaches the "${PRIVILEGE_LINK}" privilege and claims ${NET_PROTOCOL}, first)`);
 }
 
 // Re-export the admission predicate constructors so a target that gates admission
@@ -293,6 +309,9 @@ export { ModuleTable } from "./module-table.js";
  *  guest, so every entry resolves to its realm's `handle` and therefore returns a
  *  Promise — there is no second, synchronous shape. */
 type AppEntry = (input: Uint8Array) => Promise<Uint8Array> | null;
+
+/** The answer to a `_host` op that reports rather than asks. */
+const EMPTY = new Uint8Array(0);
 
 /** A slot's realm, in the two shapes the code needs it in. `realm` is the SETTLED
  *  handle, and it is what teardown reads — disposing has to be synchronous, because
@@ -316,9 +335,12 @@ interface RealmHolder {
 
 interface AppSlot extends RealmHolder {
   entry: AppEntry;
+  /** Does this bundle reach the `link` privilege (§12.5)? Read off the manifest once,
+   *  at install, because it decides two things about the seam this slot is wired with:
+   *  whether sockets are in it, and what its signatures mean. Not a KIND of slot —
+   *  there is one slot type now, and the transport is an app that claims `_net`. */
+  isTransport: boolean;
 }
-
-type TransportSlot = RealmHolder;
 
 /** A realm's timer table: the platform's event loop, handed to a guest that has none.
  *
@@ -478,11 +500,11 @@ export function createShell(opts: CreateShellOptions & {
      *  materialized rather than scanned for because it is read once per inbound frame
      *  (§12.10: one lookup, one guest call). */
     const routes = new Map<string, string>();
-    let transportSlot: TransportSlot | null = null;
-    let transportKey: string | null = null;
-    /** The transport driver, standing once the transport bundle is mounted. The app
-     *  seams and the shell's `transport` field read this indirection, so the shell
-     *  can be assembled before any bundle loads. */
+    /** The socket driver, standing once some bundle claims `_net`. It outlives the
+     *  bundle: the driver holds link ids, the address book and the listeners, all of
+     *  which belong to the NODE rather than to whichever guest is currently the
+     *  transport — which is exactly why replacing a transport needs no handover. A
+     *  replacement re-`attach`es this same object to the new claimant. */
     let netHost: TransportHost | null = null;
     // The tail of every initiator `runGuest` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
@@ -544,11 +566,11 @@ export function createShell(opts: CreateShellOptions & {
      *  A failed construction clears the memo instead of caching the rejection, so a
      *  factory that failed on a transient (a heap the page could not spare yet) is
      *  retried on the next frame rather than making the app permanently dead. */
-    const ensureRealm = (slot: AppSlot | TransportSlot): Promise<SafeRealm> => {
+    const ensureRealm = (slot: AppSlot): Promise<SafeRealm> => {
         if (!slot.realmP) {
             slot.realmP = platform.createRealm({
                 source: guestFullSource(slot.loaded),
-                hostCall: seamFor(slot, null),
+                hostCall: seamFor(slot),
                 memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
                 deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
             }).then((r) => { slot.realm = r; return r; },
@@ -560,9 +582,9 @@ export function createShell(opts: CreateShellOptions & {
      *  as the three things that own it: what this NODE is (`platform`), what this REALM
      *  may reach (`grants`), and what this APP installed (`modules`).
      *
-     *  `driver` is passed ONLY for the mounted transport bundle, and is what puts the
+     *  `driver` is passed ONLY for the transport bundle, and is what puts the
      *  two grants no app holds into that realm's set: the raw net capability (sockets)
-     *  and the sink the mount reports its structured output through. Nothing else can
+     *  and the sink the transport reports its structured output through. Nothing else can
      *  reach a descriptor, at any point in the process's life, because nothing else is
      *  ever handed one (README §1, capability-by-non-wiring).
      *
@@ -570,14 +592,19 @@ export function createShell(opts: CreateShellOptions & {
      *  ordinary authority in the catalog (`timer/*` is `"app"`, core/domains.ts), so
      *  every realm gets its own table and the transport is simply the first guest that
      *  happened to want one. */
-    const seamFor = (slot: RealmHolder, driver: TransportHost | null) => {
+    const seamFor = (slot: AppSlot) => {
         const b = slot.loaded;
         const appKey = appKeyFor(b.author, b.manifest.app);
+        // The 32 bytes this realm is attributed by when it calls another: the app key,
+        // hashed. Fixed-width and opaque, the same shape as the sender key prepended to
+        // an inbound frame — which is the point, because a callee reads one field
+        // whether the caller was a peer or a co-resident app. Zero is the HOST's own
+        // (transport-host.ts), and no app key derives it.
+        const callerId = genesisHash(platform.sodium, enc.encode(appKey));
         return createGuestSeam({
             platform: {
                 sodium: platform.sodium,
                 identity: platform.identity,
-                peers: platform.livePeers ?? (() => netHost ? netHost.linkedPeers() : []),
                 now: platform.now ?? (() => Date.now()),
             },
             grants: {
@@ -594,7 +621,7 @@ export function createShell(opts: CreateShellOptions & {
                 // The seam prefixes and never parses, so neither can produce the other's
                 // signature and no op signs raw bytes — which is what keeps the purposes
                 // apart now that one key serves both (core/subkeys.ts).
-                signScope: driver
+                signScope: slot.isTransport
                     ? transportSignScope(platform.identity, platform.networkKey)
                     : appSignScope(platform.identity, b.author, b.manifest.app),
                 // Scoped to this app key, so `fs` grants reach over this app's own keyspace
@@ -608,18 +635,16 @@ export function createShell(opts: CreateShellOptions & {
                 // that reads a prefix off a name, which is exactly what the name catalog
                 // exists to stop.
                 fs: fs ? scopedFs(fs, appScopeFor(platform.sodium, b.author, b.manifest.app)) : undefined,
-                // A getter, not a snapshot: the transport is mounted AFTER an app's
-                // realm may have been built (an app loads first, the transport mounts
-                // later), so a value captured at seam construction would leave that
-                // realm's net/send permanently unwired. Read at CALL time, through the
-                // same `netHost` indirection `peers` closes over.
-                get transport() { return netHost ?? undefined; },
-                rawNet: driver?.rawNet(),
+                // The cross-realm call. Resolution happens at CALL time, not here: an app
+                // may be installed before the transport that answers its `_net`, and a
+                // later load may take the id over, so a claimant captured at seam
+                // construction would pin this realm to whoever was there first.
+                calls: { call: (id, payload) => crossRealmCall(slot, callerId, id, payload) },
+                rawNet: slot.isTransport ? netHost?.rawNet() : undefined,
                 // This realm's own table, wired for the same reason `fs` is: unconditionally,
                 // because `names` already refuses `timer/*` for a bundle that did not declare
                 // it, and a second test here would decide one grant in two places.
                 timers: slot.timers,
-                transportSink: driver?.sink(),
             },
             // Bound to THIS app's key, so a bare `host.call` name addresses its own module
             // map by logical name and has no way to name another app's (§12.2).
@@ -651,28 +676,122 @@ export function createShell(opts: CreateShellOptions & {
             ? slot.realm.call("handle", input)
             : ensureRealm(slot).then((r) => r.call("handle", input));
     };
-    /** Stand a transport driver up over an admitted transport bundle's realm.
-     *  The driver is the shell's Network: it answers the guest's DIAL actions
-     *  through the platform's socket seam, and its request/response face is what
-     *  every app's net/send reaches.
+    /** The ONE cross-realm call (§12.10): a guest naming a reserved id reaches the realm
+     *  that claims it, on a later turn, and gets back what that realm's `handle`
+     *  returned. `null` when nothing claims it, which the seam reports by name.
      *
-     *  It does NOT publish itself as `netHost` — the caller does, once it has decided
-     *  what to do with whatever was there before. That separation is what makes
-     *  replacing a standing occupant safe: this function can fail without the node
-     *  losing the transport it already had. */
-    const standTransport = async (slot: TransportSlot) => {
-        // The driver is built BEFORE the realm and attached after, because the realm's
-        // seam resolves the slot's ops here: the guest reaches sockets and the sink
-        // through the ordinary seam, so the object serving them has to exist first.
-        // (Its timers do not come from here — they are the slot's, like any guest's.)
-        // `attach` is what sends the one config turn.
-        const driver = new TransportHost({
+     *  The host's whole contribution is attribution and resolution. It prepends the
+     *  CALLER's 32-byte id, exactly as `doDispatch` prepends the authenticated sender's
+     *  key, so a callee reads one shape whether the caller was a peer or a co-resident
+     *  app — and the id is derived host-side from the admitted manifest, so it is no more
+     *  forgeable than the sender key is.
+     *
+     *  `_host` is the exception, and it is the §12.10 reservation working as designed:
+     *  the shell answers it rather than routing it. */
+    const crossRealmCall = (caller: AppSlot, callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const input = new Uint8Array(callerId.length + payload.length);
+        input.set(callerId, 0);
+        input.set(payload, callerId.length);
+        if (id === SHELL_PROTOCOL) return hostAnswer(caller, payload);
+        const slot = apps.get(routes.get(id) ?? "");
+        return slot ? slot.entry(input) : null;
+    };
+    /** The shell's own protocol (`_host`), answered ahead of dispatch. Three ops, and all
+     *  three are the same thing: the transport telling the host about something only the
+     *  transport can see, on the two edges where the host genuinely holds the other end.
+     *
+     *  Restricted to the realm that claims `_net`, and structurally rather than by a field
+     *  in the payload: `caller` is the slot whose seam this closure was built for, so
+     *  there is nothing here to spoof. An ordinary app that declared `_host` reaches this
+     *  and is refused by name — the same answer as a protocol nobody claims. */
+    const hostAnswer = (caller: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
+        if (routes.get(NET_PROTOCOL) !== appKeyFor(caller.loaded.author, caller.loaded.manifest.app)) {
+            return Promise.reject(new Error(`shell: ${SHELL_PROTOCOL} is the transport's, and this realm does not claim ${NET_PROTOCOL}`));
+        }
+        const nameLen = payload[0];
+        const op = dec.decode(payload.slice(1, 1 + nameLen));
+        const a = payload.slice(1 + nameLen);
+        switch (op) {
+            // An inbound request the transport attributed: route it to the app claiming the
+            // protocol and hand back its answer. This is `transport/deliver` and the
+            // `respond` entrypoint at once — the transport does not await it (it must not;
+            // realm-queue.ts) but resumes on the returned promise, which is the same
+            // later turn the old `respond` ran on.
+            //
+            // The shell's own protocols get first refusal (`opts.answer`), which is the
+            // §12.10 reservation as a seam rather than as a wrapper around a driver
+            // facade that no longer exists. `null` from the hook — and the absent hook —
+            // fall through to the routing table, so this is a shell answering an id of
+            // its own, never a shell shadowing the apps.
+            case "deliver": {
+                const from = toHex(a.slice(0, 32));
+                const protoLen = a[32];
+                const proto = dec.decode(a.slice(33, 33 + protoLen));
+                const body = a.slice(33 + protoLen);
+                return opts.answer?.(from, proto, body)
+                    ?? doDispatch(from, proto, body)
+                    ?? Promise.resolve(EMPTY);
+            }
+            // A link this driver handed over (openLink) authenticated, or tore down.
+            // Relayed to whoever passed the channel in; the shell forms no opinion.
+            case "link-auth":
+                netHost?.linkAuthed(readU32BE(a, 0), a.slice(4, 36));
+                return Promise.resolve(EMPTY);
+            case "link-down":
+                netHost?.linkDown(readU32BE(a, 0), a[4]);
+                return Promise.resolve(EMPTY);
+            default:
+                return Promise.reject(new Error(`shell: no ${SHELL_PROTOCOL} op '${op}'`));
+        }
+    };
+    /** Point the socket driver at whatever claims `_net` now, standing one up on first
+     *  use. Called after every routing rebuild, so it covers the first transport and every
+     *  replacement by the same path — there is no upgrade protocol, because there is
+     *  nothing to hand over: the driver holds link ids, addresses and listeners, and all
+     *  of those are the node's rather than the outgoing guest's.
+     *
+     *  A replacement is therefore `attach` again: the incoming guest gets the same config
+     *  turn the first one got and the same address book, and redials. Live links do not
+     *  survive and cannot — the session keys are in the outgoing guest's private memory
+     *  (§4.3), which is what makes the occupant confineable — so an upgrade is a
+     *  reconnect, which the record layer's clean-close discipline already covers (§12.6).
+     *
+     *  The driver is built lazily and torn down when the last claimant goes, so a node
+     *  that never admitted a transport bundle holds no socket at all.
+     *
+     *  **Re-attaching only when the CLAIMANT CHANGED is load-bearing, not an
+     *  optimization.** This runs after every routing rebuild — every install and every
+     *  uninstall — and `attach` on a driver that already has a transport tears every channel
+     *  down, because that is what a replacement means (the outgoing guest's session keys
+     *  went with it). Doing it unconditionally would make installing an ORDINARY app
+     *  disconnect the node: a browser accepting an offered chat app, or a shell loading
+     *  its storage bundle after linking its cohort, would silently lose every live link
+     *  and get no redial from a peer that never heard anything. The claim did not move,
+     *  so neither should the driver.
+     *
+     *  The identity compared is the SLOT, not its app key: re-installing the same
+     *  (author, app) — an in-place transport upgrade — builds a new slot with a new realm
+     *  under the same key, and that realm has never had the config turn. A key comparison
+     *  would skip exactly the case the re-attach exists for. */
+    let attachedTransport: AppSlot | null = null;
+    const retargetTransport = () => {
+        const key = routes.get(NET_PROTOCOL);
+        const slot = apps.get(key ?? "");
+        if (!slot) {
+            netHost?.close();
+            netHost = null;
+            attachedTransport = null;
+            return;
+        }
+        if (netHost && attachedTransport === slot) return;
+        attachedTransport = slot;
+        netHost ??= new TransportHost({
             identity: platform.identity,
             networkKey: platform.networkKey,
             contactSecret: platform.contactSecret,
             requestDeadlineMs: opts.requestDeadlineMs,
             connsPerPeer: platform.connsPerPeer,
-            admitPeer: platform.admitPeer,
+            admitPeers: platform.admitPeers,
             channels: platform.channels,
             listen: platform.listen,
             wsListen: platform.wsListen,
@@ -680,48 +799,12 @@ export function createShell(opts: CreateShellOptions & {
             maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
             maxHalfOpenVerified: opts.transportHalfOpen?.verified,
         });
-        // Not `ensureRealm`: this realm's seam is the only one wired to a driver, so it
-        // cannot be the one a lazy caller would have built. Both fields are set for the
-        // same reason they exist — `realm` so a handover can dispose it synchronously,
-        // `realmP` so nothing later mistakes an occupied slot for an empty one.
-        slot.realm = await platform.createRealm({
-            source: guestFullSource(slot.loaded),
-            hostCall: seamFor(slot, driver),
-            memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-            deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
+        // Through the routing rather than at the realm directly, so the driver follows a
+        // later claimant without being told about it.
+        netHost.attach((p) => {
+            const s = apps.get(routes.get(NET_PROTOCOL) ?? "");
+            return s ? s.entry(p) : null;
         });
-        slot.realmP = Promise.resolve(slot.realm);
-        driver.attach(slot.realm);
-        return driver;
-    };
-    /** Put an admitted transport bundle in the slot, replacing a standing occupant if
-     *  there is one (§12.6).
-     *
-     *  The ordering is the whole of it, and each step exists because the other order
-     *  is wrong:
-     *
-     *  1. Read the outgoing driver's host-side state **before** anything is torn down.
-     *  2. Build the incoming realm and driver **while the old one is still serving**, so
-     *     a guest that fails to compile leaves the node with the transport it had rather
-     *     than with neither.
-     *  3. Only then close the outgoing driver — which is what releases the listening
-     *     port the incoming one is about to re-bind — and dispose its realm.
-     *  4. Adopt: re-listen on the same port, re-wire the dispatch sink and peer hooks,
-     *     re-seed the address book, and redial.
-     *
-     *  Live links do not survive, and cannot: session state is in the outgoing guest's
-     *  private memory (see `TransportHandover`). An upgrade is a reconnect. */
-    const installTransport = async (slot: TransportSlot) => {
-        const outgoing = netHost;
-        const state = outgoing?.handover() ?? null;
-        const incoming = await standTransport(slot);
-        if (outgoing) {
-            outgoing.close();
-            disposeSlot(transportSlot);
-        }
-        netHost = incoming;
-        if (state)
-            await incoming.adopt(state);
     };
     /** Recompute the whole projection from the installed apps (§12.10). Called on every
      *  install and every uninstall, and never anything narrower — the alternatives are
@@ -743,18 +826,12 @@ export function createShell(opts: CreateShellOptions & {
         for (const [key, slot] of apps) {
             for (const proto of slot.loaded.manifest.protocols ?? []) routes.set(proto, key);
         }
+        // `_net` is a claim like any other, so the driver follows the same rule the rest
+        // of the routing does — including "the last load wins", which is the whole of an
+        // in-place transport replacement.
+        retargetTransport();
     };
     const doUninstall = (appKey: string) => {
-        // The transport slot is not an app, but it IS uninstallable: dropping it
-        // stops the node's net.
-        if (transportKey === appKey) {
-            netHost?.close();
-            netHost = null;
-            disposeSlot(transportSlot);
-            transportSlot = null;
-            transportKey = null;
-            return true;
-        }
         const slot = apps.get(appKey);
         const removed = host.removeApp(appKey);
         if (slot) {
@@ -793,7 +870,7 @@ export function createShell(opts: CreateShellOptions & {
         host,
         resolve: (proto) => routes.get(proto) ?? null,
         routes: () => [...routes],
-        // A getter, not a captured value: the slot is filled at mount and REPLACED by
+        // A getter, not a captured value: the slot is filled at load and REPLACED by
         // a handover (§12.6), so a caller reading this field always sees the driver
         // standing now rather than the one standing when it took the reference.
         get transport() { return netHost; },
@@ -810,11 +887,10 @@ export function createShell(opts: CreateShellOptions & {
             // must be right anyway, because they are what the seam actually wires.
             //
             // An author cannot shed a privilege by declaring one, which is the property
-            // the whole scheme exists for: adding `link/open` puts `mount` in this set and
+            // the whole scheme exists for: adding `link/open` puts `link` in this set and
             // nothing takes it out, so the derivation is safe in the only direction it can
             // be pushed.
             const privileges: Privilege[] = privilegesOf(v.manifest);
-            const isMount = privileges.includes(PRIVILEGE_MOUNT);
             // ADMISSION — one predicate, one call, one answer (§12.5). Everything a gate
             // needs is read here, once, and handed in: the privileges this bundle
             // reaches, the persisted `(author, app)` high-water mark, and whether this
@@ -827,7 +903,7 @@ export function createShell(opts: CreateShellOptions & {
             //
             // EVERY pure question about this bundle is in there, including the two
             // coherence rules that used to sit out here as inline throws (a privilege is
-            // claimed in every half or none, a mount claims no protocol ids). Nothing
+            // claimed in every half or none, a transport claims no protocol ids). Nothing
             // decides admission beside the predicate — which is what makes "nothing has
             // landed" hold for the whole decision rather than for most of it.
             const ctx: AdmissionContext = {
@@ -842,21 +918,12 @@ export function createShell(opts: CreateShellOptions & {
             // only after. A guest that fails to compile then raises nothing, and the node,
             // still running the transport it had, can roll back to the previous version
             // (§12.4: the mark records the highest version that actually loaded).
-            const loaded = installBundle(host, v, platform.freshnessStore, isMount);
+            // The transport's mark is deferred: its realm is built eagerly below, so unlike
+            // every other app its load can still fail after the modules bind, and a mark
+            // raised by a bundle that never ran would brick the rollback (bundle.ts).
+            const isTransport = privileges.includes(PRIVILEGE_LINK);
+            const loaded = installBundle(host, v, platform.freshnessStore, isTransport);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
-            // A transport is not an app: it claims no protocol ids (refused above) and
-            // receives no inbound dispatch. It is stood up as the driver the rest of the shell consumes, and
-            // the slot is recorded only AFTER it stands — on a failed upgrade the node
-            // keeps both the transport it had and the author key `revoke` needs to find
-            // what that key landed.
-            if (isMount) {
-                const slot: TransportSlot = newHolder(loaded);
-                await installTransport(slot);
-                transportSlot = slot;
-                transportKey = key;
-                platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
-                return loaded;
-            }
             // The app's one inbound entrypoint, resolved here and not per message.
             // `entryFor` closes over the slot, so the slot is built first and its entry
             // attached immediately — nothing can observe the placeholder between the two
@@ -864,7 +931,10 @@ export function createShell(opts: CreateShellOptions & {
             // Extended in place rather than spread into a new object: the holder's timer
             // table reads `slot.realm` off the object `newHolder` returned, so a copy
             // would leave every deadline firing into a slot that never gets a realm.
-            const slot: AppSlot = Object.assign(newHolder(loaded), { entry: (() => null) as AppEntry });
+            const slot: AppSlot = Object.assign(newHolder(loaded), {
+                entry: (() => null) as AppEntry,
+                isTransport,
+            });
             slot.entry = entryFor(slot);
             apps.set(key, slot);
             // The load admits the code AND claims the manifest's protocols (§12.10) — one
@@ -875,6 +945,20 @@ export function createShell(opts: CreateShellOptions & {
             // Re-projecting (rather than adding this app's ids) is what makes an update that
             // DROPPED a protocol stop serving it.
             rebuildRoutes();
+            // The transport's realm is built HERE rather than at its first message, because the
+            // node's network has to be up when this returns — `rebuildRoutes` has already
+            // pointed the driver at it and sent the config turn. A guest that will not
+            // compile therefore fails the LOAD, and the node keeps what it had: the slot
+            // is removed and its mark, deliberately deferred above, was never raised.
+            if (isTransport) {
+                try {
+                    await ensureRealm(slot);
+                } catch (err) {
+                    doUninstall(key);
+                    throw err;
+                }
+                platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
+            }
             // An app's marks were already advanced inside installBundle — nothing can fail
             // between that return and here.
             return loaded;
@@ -890,11 +974,6 @@ export function createShell(opts: CreateShellOptions & {
             // key that is actively publishing.
             platform.freshnessStore.revoke(fromHex(hex));
             const gone = [];
-            if (transportKey?.startsWith(hex + ":")) {
-                const key = transportKey;
-                doUninstall(key);
-                gone.push(key);
-            }
             for (const appKey of [...apps.keys()]) {
                 // Every table name of an app begins with its author (§5.1), so one prefix
                 // test finds every app this key ever landed — including ones this shell
@@ -916,15 +995,17 @@ export function createShell(opts: CreateShellOptions & {
             return call;
         },
         dispatch: doDispatch,
+        /** Pre-create every app's realm so the first routed frame does not pay realm
+         *  construction. There is no dispatch sink to wire any more: an inbound frame
+         *  reaches this shell as the transport's own `_host` deliver op, which `hostAnswer`
+         *  routes — so a node is serving from the moment a transport bundle is loaded,
+         *  and this is the warm-up rather than the switch. */
         async serve() {
             for (const slot of apps.values()) {
                 await ensureRealm(slot);
             }
             if (!netHost)
                 throw new Error("shell: the transport bundle is not loaded — serve() needs it");
-            netHost.onRequest((from, proto, payload) => {
-                return doDispatch(from, proto, payload);
-            });
         },
         close() {
             netHost?.close();
@@ -935,9 +1016,6 @@ export function createShell(opts: CreateShellOptions & {
                 }
                 apps.clear();
                 routes.clear();
-                disposeSlot(transportSlot);
-                transportSlot = null;
-                transportKey = null;
             };
             inFlight.then(dispose, dispose);
         },

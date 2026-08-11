@@ -28,8 +28,132 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
  *  where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
+export const { signManifest, packBundle, genesisHash, MANIFEST_FILE, GUEST_FILE } = await imp("build/host/bundle.js");
+export const { GUEST_ABI_VERSION, NET_PROTOCOL } = await imp("build/core/domains.js");
+export const { makeAuthor } = await imp("tests/testkit.mjs");
 
 export const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
+
+/** The protocol id the harness app claims. */
+export const PROTO = "harness/v1";
+
+/** The harness APP — a real signed bundle, because there is no host-side request facade
+ *  left to fake one with. An app reaches the network by calling the id the transport claims
+ *  (`_net`), and is reached by the id it claims itself, so a test that drives the
+ *  transport has to be an app. That is the point rather than the cost: what these tests
+ *  exercise is now the same path a deployment uses, end to end.
+ *
+ *  Three entrypoints, and a mode chosen at load through the manifest's `config`:
+ *    handle  — the inbound side. `echo` returns the payload; `hang` never answers, which
+ *              is what the deadline tests need; both record what arrived.
+ *    send    — one request out: `[noReply u8][deadline u32][to 32][protoLen u8][proto][payload]`.
+ *              Answers `[ok u8][response]`, straight through from `_net`.
+ *    op      — the transport's op wire, unwrapped: `[opLen u8][op][args]` handed to `_net`
+ *              verbatim. `send` builds that framing itself, which is the common case;
+ *              this is for the tests whose subject is WHICH ops an app may name at all,
+ *              and it deliberately writes no name of its own so a refusal is the transport's.
+ *    seen    — everything `handle` was given, as `[len u32][bytes]…`, for the tests that
+ *              assert on what the far end actually received. */
+const HARNESS_GUEST = `
+const seen = [];
+register("handle", (arg) => {
+  const p = arg.slice(32);
+  seen.push(p);
+  if (APP.mode === "hang") return new Promise(() => {});
+  // A GENERATOR request, for the reassembly tests: [0xff][len u32][mul u8] asks for
+  // len bytes where out[i] = (i * mul) & 255 — a response far larger than anything
+  // that fits in one segment, and checkable byte for byte.
+  if (p.length === 6 && p[0] === 255) {
+    const n = ((p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4]) >>> 0;
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = (i * p[5]) & 255;
+    return out;
+  }
+  return p;
+});
+register("send", (arg) => {
+  // The op name is the caller's to write: the transport reads [caller 32][opLen][op][args],
+  // and the host supplies only the 32 bytes of attribution.
+  const op = "send";
+  const out = new Uint8Array(1 + op.length + arg.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i);
+  out.set(arg, 1 + op.length);
+  return host.call(${JSON.stringify(NET_PROTOCOL)}, out);
+});
+register("op", (arg) => host.call(${JSON.stringify(NET_PROTOCOL)}, arg));
+register("seen", () => {
+  let n = 0;
+  for (const s of seen) n += 4 + s.length;
+  const out = new Uint8Array(n);
+  let off = 0;
+  for (const s of seen) {
+    out[off] = s.length >>> 24; out[off + 1] = (s.length >>> 16) & 255;
+    out[off + 2] = (s.length >>> 8) & 255; out[off + 3] = s.length & 255;
+    out.set(s, off + 4); off += 4 + s.length;
+  }
+  return out;
+});
+`;
+
+/** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
+export function harnessAppBlob(author, mode = "echo") {
+  const guest = new TextEncoder().encode(HARNESS_GUEST);
+  const manifest = {
+    app: "harness",
+    version: 1,
+    protocols: [PROTO],
+    modules: [],
+    guest: {
+      hash: Buffer.from(genesisHash(sodium, guest)).toString("hex"),
+      abi: GUEST_ABI_VERSION,
+      // The whole of what an app needs to talk to the network: the id the transport claims.
+      requires: [NET_PROTOCOL],
+      config: { mode },
+    },
+  };
+  return packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author, manifest),
+    [GUEST_FILE]: guest,
+  });
+}
+
+/** The app key the harness app binds under, for `runGuest`. */
+export function harnessAppKey(author) {
+  return `${Buffer.from(author.id).toString("hex")}:harness`;
+}
+
+/** The `send` op's argument bytes:
+ *  `[noReply u8][deadline u32][to blob][proto blob][payload blob]` (transport/src/core.js).
+ *  Written once here because three suites build it. */
+export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply = false } = {}) {
+  const p = new TextEncoder().encode(proto);
+  const out = new Uint8Array(1 + 4 + 4 + 32 + 4 + p.length + 4 + payload.length);
+  let off = 0;
+  out[off++] = noReply ? 1 : 0;
+  const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
+  u32(deadlineMs);
+  u32(32);
+  out.set(Buffer.from(to, "hex"), off); off += 32;
+  u32(p.length);
+  out.set(p, off); off += p.length;
+  u32(payload.length);
+  out.set(payload, off);
+  return out;
+}
+
+/** One request out of `shell`, through the harness app it loaded — the path a real
+ *  deployment uses, since there is no host-side request facade left. */
+export async function appRequest(shell, appKey, to, payload, opts) {
+  const r = await shell.runGuest("send", sendArgs(to, payload, opts), appKey);
+  if (r[0] !== 1) throw new Error("net: request failed");
+  return r.slice(1);
+}
+
+/** Ask a node's app for `len` generated bytes — the reassembly probe. */
+export function generatorRequest(len, mul) {
+  return Uint8Array.from([255, (len >>> 24) & 255, (len >>> 16) & 255, (len >>> 8) & 255, len & 255, mul]);
+}
 
 /** The author of the artifact-shipped transport bundle, read OUT of the artifact
  *  rather than restated. A fresh clone mints its own transport author, so anything
@@ -39,23 +163,28 @@ export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
 
-/** The policy every harness node runs under: the transport author, trusted to load and
- *  granted the mount, so a harness node can load an app bundle as well as its transport
- *  without a second key. */
-export function transportPolicy(authorHex) {
+/** The policy every harness node runs under: the transport author granted `link`, and
+ *  whoever else is named trusted to load an ordinary app. */
+export function transportPolicy(authorHex, appAuthors = []) {
   return policyFromJson(JSON.stringify({
-    authors: [authorHex],
-    grants: { mount: [authorHex] },
+    authors: [authorHex, ...appAuthors],
+    grants: { link: [authorHex] },
   }));
 }
 
-/** One transport host: a shell over a fresh identity + the transport bundle. The
- *  driver (shell.transport) is the node's network. Options pass through to the shell's
- *  platform (admitPeer for the peer whitelist, networkKey, contactSecret, channels)
- *  and to the shell's createShell opts (requestDeadlineMs, transportHalfOpen). */
+/** One transport host: a shell over a fresh identity + the transport bundle, and — unless
+ *  `app: false` — the harness app that drives it. Options pass through to the shell's
+ *  platform (admitPeers for the peer list, networkKey, contactSecret, channels) and to
+ *  createShell (requestDeadlineMs, transportHalfOpen).
+ *
+ *  The returned `request`/`sendNoReply`/`seen`/`peers` are what the tests use where they
+ *  used to reach into the driver. Each is one `runGuest` into the harness app, so the
+ *  bytes cross exactly the seam a real app's would. */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
-  const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor());
+  const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
+  const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
+  const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
   const shell = createShell({
     platform: {
       sodium: opts.sodium ?? sodium,
@@ -66,16 +195,72 @@ export async function makeTransportHost(opts = {}) {
       listen: opts.listen,
       networkKey: opts.networkKey,
       contactSecret: opts.contactSecret,
-      admitPeer: opts.admitPeer,
+      admitPeers: opts.admitPeers,
       connsPerPeer: opts.connsPerPeer,
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: policy,
+    answer: opts.answer,
     requestDeadlineMs: opts.requestDeadlineMs,
     transportHalfOpen: opts.transportHalfOpen,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
-  return { shell, driver: shell.transport, identity };
+  const node = { shell, driver: shell.transport, identity, appAuthor };
+  if (opts.app === false) return node;
+  const appKey = `${appAuthorHex}:harness`;
+  await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
+
+  const enc = new TextEncoder();
+  const call = (to, proto, payload, deadlineMs, noReply) => {
+    // The `send` op's own argument order (transport/src/core.js):
+    // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+    const p = enc.encode(proto);
+    const out = new Uint8Array(1 + 4 + 4 + 32 + 4 + p.length + 4 + payload.length);
+    let off = 0;
+    out[off++] = noReply ? 1 : 0;
+    const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
+    u32(deadlineMs ?? 0);
+    u32(32);
+    out.set(Buffer.from(to, "hex"), off); off += 32;
+    u32(p.length);
+    out.set(p, off); off += p.length;
+    u32(payload.length);
+    out.set(payload, off);
+    return shell.runGuest("send", out, appKey);
+  };
+  /** One request out, resolving with the response bytes — or rejecting, which is what
+   *  the `[0]` failure byte means (an unreachable peer, a deadline, a refusal). */
+  node.request = async (to, proto, payload, deadlineMs) => {
+    const r = await call(to, proto, payload, deadlineMs, false);
+    if (r[0] !== 1) throw new Error("net: request failed");
+    return r.slice(1);
+  };
+  node.sendNoReply = (to, proto, payload) => call(to, proto, payload, 0, true);
+  node.appKey = appKey;
+  /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller
+   *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the name,
+   *  which is the property those tests are pinning. */
+  node.op = (name, args = new Uint8Array(0)) => {
+    const n = enc.encode(name);
+    const out = new Uint8Array(1 + n.length + args.length);
+    out[0] = n.length;
+    out.set(n, 1);
+    out.set(args, 1 + n.length);
+    return shell.runGuest("op", out, appKey);
+  };
+  /** Everything this node's app was handed inbound. */
+  node.seen = async () => {
+    const b = await shell.runGuest("seen", new Uint8Array(0), appKey);
+    const out = [];
+    for (let off = 0; off + 4 <= b.length;) {
+      const n = ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0;
+      out.push(b.slice(off + 4, off + 4 + n));
+      off += 4 + n;
+    }
+    return out;
+  };
+  node.peers = () => shell.transport.linkedPeers();
+  return node;
 }
 
 /** Await a condition with a deadline — the tests' tick, bounded. */

@@ -52,7 +52,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	// Host realm: build the guest seam granting fs/put + fs/get (no net).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam(["fs/put", "fs/get"], __id, null, []);
+		__buildGuestSeam(["fs/put", "fs/get"], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -103,7 +103,7 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null, []);
+		__buildGuestSeam([], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -128,23 +128,22 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	}
 }
 
-// A guest that never yields is terminated by its execution budget (README §12.3, §16.1).
+// A guest that never yields is stopped by its execution budget (README §12.3, §16.1).
 //
-// This is the native half of safe-js.ts's interrupt handler, and it does NOT go through
-// QuickJS: New_QJS's maxExecutionTime argument is inert in the vendored qjs.wasm (a 1 ms
-// limit does not stop `for(;;){f()}`), so guest.go arms a wazero deadline instead. The
-// consequence asserted below is that the kill is fatal to the realm rather than a
-// catchable JS error — wazero closes the module, so the realm must refuse later calls
-// cleanly instead of panicking on a freed handle.
+// This is the native half of safe-js.ts's interrupt handler, and it is the SAME lever:
+// QuickJS's own, armed through the shim's QJS_SetDeadline (qjs.Runtime.Budget). So the
+// consequence asserted below is the one safe-js has — the overrun is a throw, the caller
+// gets an error, and the realm is still usable afterwards. A guest that spends its
+// allowance has failed one invocation, not destroyed the app.
 //
 // The trivial call first is the control: without it a realm that was simply broken would
-// pass the same test.
+// pass the same test. The trivial call AFTER is the point.
 func TestGuestRealmExecutionBudget(t *testing.T) {
 	guestSeamRealm(t)
 
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null, []);
+		__buildGuestSeam([], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -166,8 +165,9 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 		t.Fatalf("interrupted after %s, want near the 300ms budget", d)
 	}
 
-	if _, err := realmCall("ok", nil); err == nil {
-		t.Fatal("a realm terminated by its budget should refuse further calls")
+	out, err = realmCall("ok", nil)
+	if err != nil || len(out) != 1 || out[0] != 7 {
+		t.Fatalf("a realm that overran its budget must survive it: %v %v", out, err)
 	}
 }
 
@@ -183,13 +183,13 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 
-	// A stub transport is enough: net/send only needs a promise that settles on the
-	// loop, and using one keeps the kill (not a socket) as the only variable.
+	// A stub claimant is enough: a cross-realm call only needs a promise that settles on
+	// the loop, and using one keeps the kill (not a socket) as the only variable.
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam(["net/send"], __id,
-			{ request: async () => new Uint8Array([9]) }, [__peer]);
+		__buildGuestSeam(["_net"], __id,
+			{ call: async () => new Uint8Array([9]) });
 	`)); err != nil {
 		t.Fatal("setup:", err)
 	}
@@ -207,7 +207,7 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 		  req.set(peer, 0);
 		  req[32] = proto.length;
 		  req.set(proto, 33);
-		  await host.call("net/send", req);
+		  await host.call("_net", req);
 		  for (;;) {}                 // burn the budget in the CONTINUATION
 		});
 	`, 300)
@@ -237,7 +237,7 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam([], __id, null, []);
+		__buildGuestSeam([], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -268,8 +268,8 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam(["net/send"], __id,
-			{ request: () => new Promise(() => {}) }, [__peer]);
+		__buildGuestSeam(["_net"], __id,
+			{ call: () => new Promise(() => {}) });
 	`)); err != nil {
 		t.Fatal("setup:", err)
 	}
@@ -288,7 +288,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		  req.set(peer, 0);
 		  req[32] = proto.length;
 		  req.set(proto, 33);
-		  await host.call("net/send", req);
+		  await host.call("_net", req);
 		  return new Uint8Array([1]);
 		});
 	`, 0)

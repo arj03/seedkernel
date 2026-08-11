@@ -10,8 +10,8 @@
 // only ever need a small, synchronous slice of the API (objects, strings,
 // ArrayBuffers, function callbacks, eval, invoke), so this bridge mirrors exactly
 // that surface — and the exact call/free sequences fastschema used against this same
-// wasm — and nothing more. The qjs.wasm blob and its C sources are vendored under
-// this directory; see README.md.
+// wasm — and nothing more. The C shim is forked under csrc/ and the blob is built from
+// it by build-qjs.sh; see README.md.
 //
 // JSValue ABI: the wasm is built with NaN-boxed JSValues, so every QJS_* function
 // takes and returns a single i64 (uint64). A *Value is just a wrapper around that
@@ -49,8 +49,6 @@ type goFunc = func(*This) (*Value, error)
 // runtime/context handles. It is single-threaded: the loader drives the realm from
 // one goroutine (the main thread), so no locking around engine calls is needed.
 type Runtime struct {
-	// interruptible mirrors WithInterruptible; Budget is a no-op without it.
-	interruptible bool
 	ctx           context.Context
 	wrt           wazero.Runtime
 	mod           api.Module
@@ -92,8 +90,7 @@ func (r *registry) get(id uint64) goFunc {
 type Option func(*config)
 
 type config struct {
-	memoryLimit   uint64 // bytes; 0 = engine default (unbounded)
-	interruptible bool   // arm wazero's context-done check so Budget can stop a call
+	memoryLimit uint64 // bytes; 0 = engine default (unbounded)
 }
 
 // WithMemoryLimit caps the runtime's total heap. An allocation past the cap fails
@@ -104,45 +101,51 @@ func WithMemoryLimit(bytes uint64) Option {
 	return func(c *config) { c.memoryLimit = bytes }
 }
 
-// WithInterruptible makes Budget able to stop a running call on this runtime, by
-// enabling wazero's WithCloseOnContextDone.
+// Budget bounds the wall time of guest execution on this runtime until the returned
+// restore func runs. It arms QuickJS's own interrupt handler (QJS_SetDeadline in the
+// shim), which the interpreter consults once every ~10k bytecodes: past the deadline it
+// throws, so a spinning guest is stopped by the engine yielding rather than by anything
+// outside it.
 //
-// Opt-in rather than always-on because it is not free: wazero inserts a periodic
-// context check into compiled code, so every wasm call on the runtime pays for it. Only
-// a runtime hosting untrusted code needs it — a guest realm does, while the host realm
-// and the libsodium runtime run our own code and would pay for a lever nobody pulls.
-//
-// Budget on a runtime without this returns a no-op, so the two always travel together.
-func WithInterruptible() Option {
-	return func(c *config) { c.interruptible = true }
-}
-
-// Budget bounds the wall time of every engine call made through this runtime until the
-// returned restore func runs. It is the only working execution-time lever for a guest
-// realm: QuickJS's own maxExecutionTime is inert in this build (see New), so a spinning
-// guest is stopped by wazero terminating the call, not by the interpreter yielding.
-//
-// The termination is *fatal to the runtime*, not a catchable JS exception: wazero closes
-// the module, so every later call panics. Callers must treat a budget kill as the end of
-// the realm's life — guest.go marks the realm dead and refuses every later call on it.
-// That is the price of having any bound at all here, and it is a bound rather than a hope.
+// That makes the kill an ordinary catchable JS exception and leaves the runtime USABLE
+// afterwards — the caller sees an error from the call that overran, and the next call
+// works. The alternative this replaced (wazero's WithCloseOnContextDone terminating the
+// wasm call) had to close the module to stop it, which cost a termination check compiled
+// into every loop in the engine: measured at ~2.3x on a guest realm dispatch and ~2x on
+// every network round trip, for a bound that also destroyed the realm it enforced.
 //
 // A non-positive d leaves the runtime unbounded.
 func (r *Runtime) Budget(d time.Duration) func() {
-	// Without WithInterruptible the deadline could not stop a running call, and a
-	// caller that believed otherwise would be relying on a bound that does not exist.
-	// Refusing quietly here keeps that from being silent: guest.go always pairs them.
-	if d <= 0 || !r.interruptible {
+	if d <= 0 {
 		return func() {}
 	}
-	prev := r.ctx
-	ctx, cancel := context.WithTimeout(prev, d)
-	r.ctx = ctx
-	return func() { r.ctx = prev; cancel() }
+	// The module resolves the deadline against its own monotonic clock, so the host
+	// never has to share a clock origin with it — it passes a duration, not an instant.
+	r.call("QJS_SetDeadline", uint64(d.Nanoseconds()))
+	return func() {
+		if r.Alive() {
+			r.call("QJS_SetDeadline", 0)
+		}
+	}
 }
 
-// Alive reports whether the underlying module is still usable. False after a Budget
-// deadline fired, since wazero closes the module rather than unwinding one call.
+// TookInterrupt reports whether the Budget deadline fired since it was last asked, and
+// clears the flag.
+//
+// It is the only way to know. An interrupt throws into whatever guest frame was running,
+// and when that frame is a promise-reaction job the job loop consumes the exception — so
+// the call the host made (a pump) returns success, and a guest that ran out of budget is
+// indistinguishable from one that finished. Every entry into guest code has to ask.
+func (r *Runtime) TookInterrupt() bool {
+	if !r.Alive() {
+		return false
+	}
+	return r.call("QJS_TakeInterrupted") != 0
+}
+
+// Alive reports whether the underlying module is still usable — false only once the
+// runtime has been closed. A Budget overrun no longer ends it: the engine throws and
+// the runtime keeps running.
 func (r *Runtime) Alive() bool { return r.mod != nil && !r.mod.IsClosed() }
 
 // New instantiates a fresh QuickJS runtime + context.
@@ -171,17 +174,11 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	// A shared compilation cache makes the per-runtime CompileModule cheap when
 	// several runtimes are created (e.g. across tests); a CompiledModule is bound
 	// to the runtime that compiled it, so each runtime must compile its own.
-	// WithCloseOnContextDone is what makes Budget able to stop a running guest.
-	// QuickJS's own maxExecutionTime argument to New_QJS is inert in the vendored
-	// qjs.wasm — a 1 ms limit does not interrupt `for(;;){f()}` — so the only lever that
-	// actually reaches a spinning interpreter is wazero terminating the wasm call. It
-	// costs a periodic check in compiled code, so it is armed only where something
-	// untrusted runs (WithInterruptible), not on every runtime.
-	rt.interruptible = cfg.interruptible
+	//
+	// Nothing here arms an execution bound: the engine carries its own (Budget →
+	// QJS_SetDeadline → QuickJS's interrupt handler), so wazero needs no
+	// WithCloseOnContextDone and the compiled code pays no termination check.
 	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
-	if cfg.interruptible {
-		wcfg = wcfg.WithCloseOnContextDone(true)
-	}
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
 	if _, err := wasi.Instantiate(ctx, rt.wrt); err != nil {

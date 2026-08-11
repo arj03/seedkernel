@@ -11,16 +11,15 @@
 //    written once here; a subclass only wires its transport's events to
 //    open()/deliver()/fail() and says how to write bytes and tear the transport down.
 //
-// 2. The single-identity Network facade both RtcNetwork and WsNetwork present over
-//    the same TransportHost driver: the endpoint() identity guard, the framesDelivered
-//    mirror, and the linkedPeers() cohort query.
+// 2. The little that RtcNetwork and WsNetwork still share over the same TransportHost
+//    driver: this node's own id, the cohort query, and the peer-edge bookkeeping each
+//    of them used to get from the driver.
 //
 // Host code, not core: it defines no seam. `RawLink` — the shape it satisfies — is the
 // core seam (socket-seam.ts), and this is one convenience for the two host adapters
 // that implement it against a platform object. A target with its own message transport
 // is free to satisfy RawLink without ever touching this file.
-import { FRAMING } from "../core/socket-seam.js";
-import type { Endpoint, PeerId } from "../core/net.js";
+import { FRAMING, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost } from "./transport-host.js";
 
 export abstract class BufferedChannel {
@@ -136,27 +135,49 @@ export class MessageChannel extends BufferedChannel {
     protected stop(_graceful: boolean): void { this.t.close(); }
 }
 
-/** The driver-facade half of a host Network: RtcNetwork and WsNetwork are both a
- *  single-identity fabric over one TransportHost — they vend exactly their own
- *  endpoint, mirror the driver's framesDelivered diagnostic, and delegate the
- *  linkedPeers() cohort query. */
+/** What RtcNetwork and WsNetwork share over one TransportHost.
+ *
+ *  It is no longer a `Network` facade, because there is no `Network`: a fabric interface
+ *  the host implements would be describing an object nobody holds now that the transport
+ *  is a guest claiming `_net`. What is left is a dialer with an identity — and the peer
+ *  edges, which these two report themselves.
+ *
+ *  **The edges are kept HERE rather than asked of the driver**, and that is the honest
+ *  place for them: the driver hands these sockets over (`openLink`) and hears back per
+ *  link, so "this peer's first link came up" and "its last one went down" is a count
+ *  this class already has everything to keep. Asking the host to maintain a mirror of
+ *  the transport's peer set, and to push an edge across the seam whenever it changed, was
+ *  two copies of one fact. `linkedPeers()` is the transport's own answer, for a caller that
+ *  wants the whole set rather than the transitions. */
 export abstract class SingleIdentityNetwork {
     protected readonly driver: TransportHost;
     protected readonly ownId: PeerId;
+    private readonly hooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void };
+    /** Authenticated links held per peer — the count whose 0↔1 crossings are the edges. */
+    private readonly live = new Map<PeerId, number>();
     constructor(driver: TransportHost, hooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void }) {
         this.driver = driver;
         this.ownId = driver.peerId;
-        driver.setPeerHooks({ onPeerUp: hooks.onPeerUp, onPeerDown: hooks.onPeerDown });
+        this.hooks = hooks;
     }
-    /** Frames delivered to the app side — the driver's diagnostic mirror. */
-    get framesDelivered(): number { return this.driver.framesDelivered; }
-    /** A single-identity fabric: it vends exactly one endpoint, its own. */
-    endpoint(id: PeerId): Endpoint {
-        if (id !== this.ownId)
-            throw new Error(`${this.constructor.name} is bound to one identity`);
-        return this.driver.endpoint(id);
+    /** A link to `peerId` authenticated. Fires onPeerUp on the peer's first. */
+    protected peerUp(peerId: PeerId): void {
+        const n = this.live.get(peerId) ?? 0;
+        this.live.set(peerId, n + 1);
+        if (n === 0) this.hooks.onPeerUp?.(peerId);
     }
-    /** The peers we currently hold at least one authenticated link to (for UI / cohort). */
-    linkedPeers(): PeerId[] { return this.driver.linkedPeers(); }
+    /** A link to `peerId` went away. Fires onPeerDown on the peer's last, and only for a
+     *  peer that was actually up — the down edge is the mirror of an up edge that fired,
+     *  not of every link that ever closed. */
+    protected peerDown(peerId: PeerId): void {
+        const n = this.live.get(peerId) ?? 0;
+        if (n === 0) return;
+        if (n === 1) { this.live.delete(peerId); this.hooks.onPeerDown?.(peerId); }
+        else this.live.set(peerId, n - 1);
+    }
+    /** The peers the TRANSPORT currently holds at least one authenticated link to. A question
+     *  now rather than a field: the set lives in the transport guest, which is the only
+     *  thing that knows what a link is. */
+    linkedPeers(): Promise<PeerId[]> { return this.driver.linkedPeers(); }
     abstract close(): void;
 }

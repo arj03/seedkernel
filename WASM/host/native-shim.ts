@@ -68,8 +68,11 @@ declare const bridge: {
   /** Raw bytes on stdout — `--get` with no `--out` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
+  /** Invoke an entrypoint. Returns 1 when the guest handed its answer to a later turn
+   *  (the preamble's `defer()`), which frees the realm for the next invocation before
+   *  this one settles — realm-queue.ts's `Invocation.released`; 0 otherwise. */
   realmCall(realm: number, entry: string, payload: Uint8Array,
-            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): void;
+            onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): number;
   realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
   realmDispose(realm: number): void;
 };
@@ -388,7 +391,7 @@ const embeddedTransport = (() => {
     }
 })();
 /** Who signed the transport this artifact ships — hex, DERIVED from the blob rather
- *  than restated anywhere. This is the id an operator pins under `grants.mount` in a
+ *  than restated anywhere. This is the id an operator pins under `grants.link` in a
  *  policy file (§12.5), so a build with a different key needs a different entry and
  *  nothing has to be kept in step by hand. Empty if the artifact carries no transport. */
 const embeddedTransportAuthor = (() => {
@@ -439,9 +442,15 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         // the two targets from differing about when a second entrypoint may begin. Go
         // grows with primitives, never with logic.
         call: serializeCalls(
-            (entry: string, payload: Uint8Array) => new Promise((resolve, reject) => {
-                bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg)));
-            }),
+            (entry: string, payload: Uint8Array) => {
+                // The executor runs synchronously, so `deferred` carries Go's answer by
+                // the time the return statement reads it.
+                let deferred = false;
+                const result = new Promise<Uint8Array>((resolve, reject) => {
+                    deferred = bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg))) === 1;
+                });
+                return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
+            },
             () => (disposed ? new Error("guest realm disposed") : null),
         ),
         dispose: () => { disposed = true; bridge.realmDispose(realm); },
@@ -500,7 +509,7 @@ async function makeTransportNode(cfg: {
      *  threaded through. */
     guestDeadlineMs?: number;
     realmMemoryBytes?: number;
-    /** A transport bundle to mount instead of the artifact-shipped one (§12.6). */
+    /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
     transportBundle?: Uint8Array;
     config?: Record<string, string | number>;
 }): Promise<Shell> {
@@ -518,7 +527,7 @@ async function makeTransportNode(cfg: {
         config: cfg.config,
     });
     // The transport bundle IS the node's network: verify + govern under the policy's
-    // `mount` grant, install, and the shell stands the driver up. A policy that does not
+    // `link` grant, install, and the shell stands the driver up. A policy that does not
     // grant the transport author that privilege leaves the node without a network.
     const transport = cfg.transportBundle ?? embeddedTransport;
     if (transport) {
@@ -531,10 +540,10 @@ async function makeTransportNode(cfg: {
             }
             // A deliberate configuration — "this node does not speak to anyone" — but
             // one that is indistinguishable from a broken network unless it says so.
-            bridge.log('  no transport: the policy grants "mount" to no author of this bundle');
+            bridge.log('  no transport: the policy grants "link" to no author of this bundle');
         }
     }
-    // Conditional on there BEING a driver: a policy granting `mount` to nobody leaves
+    // Conditional on there BEING a driver: a policy granting `link` to nobody leaves
     // this node with no network, which is a configuration rather than a failure.
     await s.transport?.start();
     return s;
@@ -657,6 +666,11 @@ function guestDriver(): string {
 }
 const GUEST_DRIVER = `
 "use strict";
+// Returns 1 when the entrypoint handed its answer to a later turn (the preamble's
+// defer()), which is Go's signal that the realm is free for the next invocation even
+// though this one has not settled — realm-queue.ts's Invocation.released. Read after
+// __invoke has run its synchronous segment, and __invoke cleared the flag on entry, so
+// it describes exactly this invocation.
 globalThis.__start = function (id, entry, arg) {
   try {
     Promise.resolve(__invoke(entry, arg)).then(
@@ -665,6 +679,7 @@ globalThis.__start = function (id, entry, arg) {
   } catch (e) {
     __callFail(id, String(e && e.message || e));
   }
+  return globalThis.__deferred === true ? 1 : 0;
 };
 `;
 

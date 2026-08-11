@@ -15,12 +15,12 @@ Signing survives where it must — over the **bundle** that installs code (§12.
 | Component | Role |
 | --- | --- |
 | **Host** | The runtime: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — the install records and the module table (§3), the inbound dispatch (§12.10), and `loadBundle`, the single admin path that admits new code (§12.4). |
-| **Raw I/O** | Two capabilities of the same shape: `net` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
+| **Raw I/O** | Two capabilities of the same shape: `link` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
 | **Modules** | An app's *library*: pure-transform WASM modules (§4), reached by the guest by their bare name through `host.call` (§12.2). The host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no host seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. A module runs only when its app's guest calls it. |
 | **Guests** | Every app's logic (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(name, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Inbound delivery is an entrypoint invocation on the app's guest; everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here, and the modules are the library it drives by name. |
 | **Bundles** | The only way code arrives (§12.4): a manifest, a guest JS program, any number of WASM modules, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits the app — a policy decision, then one all-or-none bind. **The transport is one of these.** |
 
-There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names and is driven through named entrypoints, exactly as an app is.
+There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names, and it is reached — by the host and by every app — through the protocol id it claims, exactly as an app is.
 
 Every table entry is three orthogonal pieces: the **name** is the module's logical name inside its app, the **bytes** are the WASM instance held at that name, and the **author** is the signer of the bundle — half of the app key the entry sits under. The loader lands a whole bundle's modules at once under a deployer-supplied **policy** that decides who may install what (§12.5).
 
@@ -41,7 +41,7 @@ Four things follow, and together they are most of what the core is:
 - **One seam, name-addressed.** A guest reaches a primitive by name through the same `host.call` it uses for everything else: `host.call("crypto/blake2b-256", …)`, and the host holds the catalog: `crypto/x25519/dh`, `crypto/chacha20poly1305-ietf/seal`, `crypto/ml-kem-768/encaps`. A new algorithm is a catalog entry — no op number, no ABI rev, no manifest field. A host missing a name refuses the load *by name*.
 - **A pure transform is not a capability.** A function of bytes the guest already holds is computation it could have done itself — correct and fast rather than permitted. So the seam holds **primitives**, which are free, and **authorities**, which reach something no confined module can hold: the node key, the entropy source, the clock, a socket, the disk.
 - **Signing is domain separation, not parsing.** The node's Ed25519 key never leaves the host, so a module that needs a signature asks for one — and the host signs `DOMAIN ‖ scope ‖ opaque`, choosing the domain from which admission point the asking bundle came through, over a suffix it does not read.
-- **Raw net is the capability; structured net is what the transport provides.** The raw capability is an opaque link id with bytes in and out — the socket-side twin of `fs`. The transport bundle consumes that and *provides* the attributed peer, protocol id and correlation every app reaches, unchanged on the app's side.
+- **Raw net is the capability; structured net is what the transport provides.** The raw capability is an opaque link id with bytes in and out — the socket-side twin of `fs`. The transport bundle consumes that and *provides* the attributed peer, protocol id and correlation every app reaches. What it provides is not a second capability: the transport claims the reserved id `_net` (§12.10), and an app reaches the network with the same call the host uses to deliver an inbound frame.
 
 **Capability-by-non-wiring makes raw I/O core permanently, not just at boot.** A confined module holds no ambient authority by construction (§12.2), so it can never hold a file descriptor, at any point in the process's life, no matter what has already been installed. The host owns the socket forever.
 
@@ -49,16 +49,16 @@ What survives all of this is a socket seam with its flood limits, an entropy sou
 
 ## The transport is a bundle
 
-The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle mounted as the node's transport. It is a **guest**, not a WASM module, and the reason is structural: a §4 module is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
+The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle loaded as the node's transport. It is a **guest**, not a WASM module, and the reason is structural: a §4 module is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
 
 What this buys is that the **protocol** is replaceable without a fork: the handshake's messages, its transcript, the record framing and the dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime.
 
 Two properties make that safe:
 
-- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; granting the transport risks the channel, which sees all plaintext and holds the session keys — so policy is keyed on the *capability*: `authors` says who may load at all, `grants` names a privilege from the catalog and who may hold it (`grants: { "mount": [...] }`). There is no role field a bundle claims for itself, and no class the shell assigns: which privileges are in play is read off `guest.requires`, and requiring `link/open` puts `mount` in that set rather than taking it out, so an author trusted for apps gains nothing by asking (§12.5).
+- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; granting the transport risks the channel, which sees all plaintext and holds the session keys — so policy is keyed on the *capability*: `authors` says who may load at all, `grants` names a privilege from the catalog and who may hold it (`grants: { "link": [...] }`). There is no role field a bundle claims for itself, and no class the shell assigns: which privileges are in play is read off `guest.requires`, and requiring `link/open` puts `link` in that set rather than taking it out, so an author trusted for apps gains nothing by asking (§12.5). The privilege is named for exactly the four `link/*` names it gates — one thing, with no halves to claim and no coherence rule to enforce.
 - **The suite byte makes a mixed period a rollout rather than a corruption.** One suite per link, unknown ids close the connection, and the byte is covered by both signatures and read before verification (§12.6). An in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies.
 
-**It can be swapped under a running node.** A second transport bundle loads the ordinary way: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
+**It can be swapped under a running node, and that is a routing rule rather than a protocol.** The transport is an app that claims `_net`, so a second transport bundle wins that id the way a second chat app wins `chat-v1` (§12.10) — a later load takes it. There is nothing to hand over: the socket driver holds link ids, the address book and the listeners, all of which belong to the node rather than to whichever guest is currently the transport, so the incoming guest gets the same config turn the first one got and redials from the same address book — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
 
 **The first transport ships inside the host artifact, and that is the design rather than a stopgap.** A node has no network until it has a transport, so there is nothing to fetch the first one over except raw net to a peer it does not yet trust — which would open a metadata window before any channel exists to close it. What travels is the *next* transport: a replacement bundle can arrive over the transport already running, like any other bundle, since what admits it is the manifest signature and not the route it took. Upgrading the transport over the network is the point; bootstrapping it over the network is not a goal.
 
@@ -157,22 +157,22 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
 
-**Shared — compiled once, run by all three targets (2,183 LOC)**
+**Shared — compiled once, run by all three targets (2,055 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 570 |
-| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 416 |
-| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 347 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 375 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 557 |
+| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 291 |
+| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 368 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 380 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 177 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 298 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (8 files) | 282 |
 
 **Four reasons a row is shared.** The set is not homogeneous, and the differences are what decide whether anything could ever leave it:
 
 - **Trust root.** The bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
 - **Vocabulary.** The domain prefixes, manifest suite ids, primitive names and flood bounds in `core/`. A bundle is replaceable and the vocabulary it draws on is not (§14.1); a bundle defining the vocabulary its own signature is verified under is circular.
-- **A stable adapter.** The transport driver holds the link ids, the flood caps and the whitelist gate, and it is what keeps the app-facing `send` unchanged *across* a transport swap. Folding it into the thing being swapped is backwards.
+- **A stable adapter.** The transport driver holds the link ids, the listeners and the address book — the node's, not the occupant's — and it is what makes a transport swap a re-attach rather than a handover. Folding it into the thing being swapped is backwards.
 - **Reuse.** Protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule — a manifest's claim, one dispatch — on every target, not because agreement is load-bearing.
 
 **Wire framing is in none of them, and so it is not here.** Length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test — state machines over whole messages, which an endpoint can run — so they are the transport bundle's, over `ws.wasm` as one of *its* modules. What the host says about a link is which of those codecs applies (`FRAMING`, §12.1); what to do about it is entirely the bundle's. The browser needs none of it: a platform `WebSocket` and an `RTCDataChannel` arrive framed already and go to the driver as they are.
@@ -183,16 +183,16 @@ What differs per target is only the object that moves bytes — and wrapping it 
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,336 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (383), the Go binding, and `native-polyfills.ts` (93), the Web globals QuickJS lacks, both TypeScript and both riding in the shared bundle | 2,047 Go + 476 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,354 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (388), the Go binding, and `native-polyfills.ts` (93), the Web globals QuickJS lacks, both TypeScript and both riding in the shared bundle | 2,054 Go + 481 TS |
 
 **Signed content — not host code at all**
 
 | | Where | LOC |
 | --- | --- | --- |
-| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/src/*.js` + `ws.wasm` | 1,237 + 5 KB |
+| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/src/*.js` + `ws.wasm` | 1,282 + 5 KB |
 
-Each target therefore runs 2,183 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,055 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 

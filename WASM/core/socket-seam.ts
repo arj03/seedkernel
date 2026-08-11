@@ -79,6 +79,15 @@ export const FRAMING = {
 } as const;
 export type Framing = (typeof FRAMING)[keyof typeof FRAMING];
 
+/** WHO a peer is: its 32-byte channel public key, lowercase hex. The one identity the
+ *  address book is keyed on and the one every attributed frame names.
+ *
+ *  It lives here, with the addresses it keys, because that is all the host has left to
+ *  say about a peer. There is no `Network`/`Endpoint` pair any more — the transport is a
+ *  guest that claims `_net` (core/domains.ts), so a fabric interface the host implements
+ *  would be describing an object nobody holds. */
+export type PeerId = string;
+
 /** How a peer is reachable (README §12.6). The optional contact secret is THE
  *  PEER's, which is what makes an address a credential rather than merely a
  *  location. */
