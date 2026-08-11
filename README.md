@@ -60,7 +60,7 @@ Two properties make that safe:
 
 **It can be swapped under a running node.** A second transport bundle loads the ordinary way: the shell reads the outgoing driver's host-side state, stands the new realm up while the old one is still serving, then closes the old and hands over — same listening port, same node identity. Live links do not survive and are not meant to: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
 
-The bundle ships inside the host artifact, which closes the metadata window a first fetch would open. Fetching one over raw net — a node bootstrapping its transport from a peer it does not yet trust — is a separate feature and is not implemented.
+**The first transport ships inside the host artifact, and that is the design rather than a stopgap.** A node has no network until it has a transport, so there is nothing to fetch the first one over except raw net to a peer it does not yet trust — which would open a metadata window before any channel exists to close it. What travels is the *next* transport: a replacement bundle can arrive over the transport already running, like any other bundle, since what admits it is the manifest signature and not the route it took. Upgrading the transport over the network is the point; bootstrapping it over the network is not a goal.
 
 ## The shape of it
 
@@ -157,11 +157,11 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
 
-**Shared — compiled once, run by all three targets (2,215 LOC)**
+**Shared — compiled once, run by all three targets (2,191 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 594 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 570 |
 | Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 416 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 347 |
 | Shell and protocol routing (§12.10) | `host/shell-core.ts` | 376 |
@@ -192,7 +192,7 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | --- | --- | --- |
 | Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/src/*.js` + `ws.wasm` | 1,237 + 5 KB |
 
-Each target therefore runs 2,215 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
+Each target therefore runs 2,191 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
 
 Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
 
@@ -211,7 +211,7 @@ The fair follow-up to all these seams is whether confinement costs throughput. T
 
 The two migrations are on independent clocks and are scheduled on opposite principles.
 
-**The manifest suite has already moved,** because it is the one that can never get cheaper: a PQ verifier cannot be delivered as a bundle, since the classical verifier would be the thing admitting it. Suite `0x02` is **hybrid Ed25519 + ML-DSA-65** over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, and **both** signatures must verify — so a flaw in the young half fails closed (valid bundles rejected) rather than open. A hybrid author is a new identity, derived from the whole key set rather than the Ed25519 half (§12.4). The artifact ships hybrid from the first build: the transport bundle — the one signed bundle every deployment loads — is signed under `0x02` by `scripts/build-transport-bundle.mjs`, so the transport author a policy pins is already a key-set identity and no author is left to migrate when a break is credible.
+**The manifest suite has already moved,** because it is the one that can never get cheaper: a PQ verifier cannot be delivered as a bundle, since the classical verifier would be the thing admitting it. The one manifest suite, `0x02`, is **hybrid Ed25519 + ML-DSA-65** over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, and **both** signatures must verify — so a flaw in the young half fails closed (valid bundles rejected) rather than open. An author is a key-set identity, derived from both keys rather than the Ed25519 half (§12.4). The artifact ships hybrid from the first build: the transport bundle — the one signed bundle every deployment loads — is signed under `0x02` by `scripts/build-transport-bundle.mjs`. That is also why the Ed25519-only genesis suite `0x01` is **retired, not deprecated**: with every target verifying `0x02` and no deployed genesis authors, keeping it alive would have bought a second envelope, a second identity rule and a policy dial for a migration nobody is on. The byte stays reserved for a later suite (§14.1).
 
 **The channel suite can wait for a credible break,** because when one arrives the fix is a bundle rollout. Its primitive is already provisioned: `ml-kem-768/{keypair,encaps,decaps}` are in the catalog on all three targets, pinned to NIST's ACVP vectors. A KEM is the PQ stand-in for the DH step of the channel's key agreement: `encaps(pk)` wraps a fresh shared secret in a public key and `decaps(sk, ct)` unwraps it, where the current suite computes the same secret with `x25519/dh` over the two ephemerals. A `0x03` suite is expected to run both — msg1 gains the initiator's ML-KEM encapsulation key, msg2 the responder's ciphertext, and the KEM secret joins the DH secret in the key schedule — so the classical half stays load-bearing while the PQ half is young, and only the handshake widths change, never the record layer. That was the only part of a PQ channel that could not have been shipped as content — a bundle is replaceable, the vocabulary it draws on is not, so a core vocabulary is provisioned ahead of need or not at all (§14.1).
 

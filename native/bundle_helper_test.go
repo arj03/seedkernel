@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/tetratelabs/wazero"
+
 	"seedloader/qjs"
 )
 
@@ -46,8 +48,7 @@ var forwarderWasm []byte
 type manifestVocab struct {
 	Manifest string `json:"manifest"` // DOMAIN_MANIFEST, hex
 	Author   string `json:"author"`   // DOMAIN_MANIFEST_AUTHOR, hex
-	Genesis  int    `json:"genesis"`  // SUITE_MANIFEST_GENESIS
-	Hybrid   int    `json:"hybrid"`   // SUITE_MANIFEST_HYBRID_PQ
+	Suite    int    `json:"suite"`    // SUITE_MANIFEST_HYBRID_PQ, the one manifest suite
 	ABI      int    `json:"abi"`      // GUEST_ABI_VERSION
 }
 
@@ -60,8 +61,7 @@ func vocab() manifestVocab {
 		var v manifestVocab
 		out := realmString(`JSON.stringify({
 			manifest: toHex(DOMAIN_MANIFEST), author: toHex(DOMAIN_MANIFEST_AUTHOR),
-			genesis: SUITE_MANIFEST_GENESIS, hybrid: SUITE_MANIFEST_HYBRID_PQ,
-			abi: GUEST_ABI_VERSION })`)
+			suite: SUITE_MANIFEST_HYBRID_PQ, abi: GUEST_ABI_VERSION })`)
 		if err := json.Unmarshal([]byte(out), &v); err != nil {
 			panic("vocab: " + err.Error())
 		}
@@ -74,8 +74,7 @@ func vocab() manifestVocab {
 // prepends. Byte slices rather than strings because that is what the realm hands back.
 func domainManifest() []byte       { return hexBytes(vocab().Manifest) }
 func domainManifestAuthor() []byte { return hexBytes(vocab().Author) }
-func suiteManifestGenesis() byte   { return byte(vocab().Genesis) }
-func suiteManifestHybrid() byte    { return byte(vocab().Hybrid) }
+func manifestSuite() byte          { return byte(vocab().Suite) }
 func guestABIVersion() int         { return vocab().ABI }
 
 func hexBytes(s string) []byte {
@@ -86,15 +85,63 @@ func hexBytes(s string) []byte {
 	return b
 }
 
-// testAuthor mints a fresh Ed25519 author identity (32-byte public, seed‖pub private).
-// Fresh per test so bundle-freshness marks (keyed by author+app) never collide.
-func testAuthor(t *testing.T) (ed25519.PrivateKey, []byte) {
+// authorKeys is a whole author identity (§12.4): an Ed25519 half and an ML-DSA-65 half,
+// neither of which is the identity on its own. There is one manifest suite and it signs
+// with both, so there is no half-identity shape for a test to hold by mistake.
+type authorKeys struct {
+	edPriv ed25519.PrivateKey
+	edPub  []byte
+	mlPk   []byte
+	mlSk   []byte
+}
+
+// id is the 32-byte author id everything downstream is keyed by: policy entries, app
+// keys, freshness marks. Mirrors bundle.ts `hybridAuthorId` —
+// genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖ ml_dsa_pk) — derived here rather
+// than read back from the loader, since a test that asked the loader for the id would
+// agree with the loader by construction.
+func (a authorKeys) id() []byte {
+	pre := append(domainManifestAuthor(), manifestSuite())
+	pre = append(append(pre, a.edPub...), a.mlPk...)
+	return sd.genericHash(32, pre)
+}
+
+// testAuthor mints a fresh author identity. Fresh per test so bundle-freshness marks
+// (keyed by author+app) never collide. Requires a booted realm — the id is hashed with
+// the booted sodium — which every caller has.
+func testAuthor(t *testing.T) authorKeys {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return priv, pub
+	seed := make([]byte, 32)
+	if _, err := rand.Read(seed); err != nil {
+		t.Fatal(err)
+	}
+	mlPk, mlSk := testSigner(t).keypair(t, seed)
+	return authorKeys{edPriv: edPriv, edPub: edPub, mlPk: mlPk, mlSk: mlSk}
+}
+
+// testSigner is the ML-DSA-65 signing half the tests need and the shipped loader
+// deliberately does not have (mldsa.go binds verify only, §12.4).
+//
+// One instance per RUNTIME, not per author: it is a second instantiation of the same
+// artifact, so compiling it for every author would cost seconds across the suite — but a
+// boot tears its runtime down, and a module cached past that closes under the next test
+// with `exit_code(0)`. Keying the cache on the runtime that made it is what makes reuse
+// safe rather than merely fast.
+var (
+	signerCache   *mldsaSigner
+	signerCacheRt wazero.Runtime
+)
+
+func testSigner(t *testing.T) *mldsaSigner {
+	t.Helper()
+	if signerCache == nil || signerCacheRt != rt {
+		signerCache, signerCacheRt = newMlDsaSigner(t), rt
+	}
+	return signerCache
 }
 
 // packBundle serializes named files into the one bundle container (README §12.4):
@@ -155,9 +202,9 @@ const stubGuestSrc = "register('ping', () => new Uint8Array([1]));"
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
 // at the given (app, version). See writeBundle for the general form.
-func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int) (string, string) {
+func writeTestBundle(t *testing.T, a authorKeys, app string, version int) (string, string) {
 	t.Helper()
-	return writeBundle(t, priv, pub, app, version, "", nil)
+	return writeBundle(t, a, app, version, "", nil)
 }
 
 // writeBundle assembles a signed bundle FILE: one forwarder module plus the given guest,
@@ -166,27 +213,40 @@ func writeTestBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app stri
 // and the app key its modules will bind under; the module itself is "fwd", the logical
 // name from the manifest. Requires a booted realm (it hashes content with the booted
 // sodium). Mirrors the TS run.mjs testBundle.
-func writeBundle(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, version int, guestSrc string, requires []string) (string, string) {
+func writeBundle(t *testing.T, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
 		guestSrc = stubGuestSrc
 	}
-	return signBundleJSON(t, priv, pub, app, manifestJSON(t, app, version, guestSrc, requires), guestSrc)
+	return signBundleJSON(t, a, app, manifestJSON(t, app, version, guestSrc, requires), guestSrc)
 }
 
-// signBundleJSON wraps a finished manifest body in the suite-0x01 envelope and packs it.
-func signBundleJSON(t *testing.T, priv ed25519.PrivateKey, pub []byte, app string, mjson []byte, guestSrc string) (string, string) {
+// signBundleJSON wraps a finished manifest body in the manifest envelope and packs it.
+func signBundleJSON(t *testing.T, a authorKeys, app string, mjson []byte, guestSrc string) (string, string) {
 	t.Helper()
-	// Manifest envelope: [suite 1][author_pk 32][sig 64][json]. The Ed25519 detached sig is
-	// over DOMAIN_manifest ‖ suite ‖ json (§12.4): the domain prefix is signed but not
-	// stored, while the suite byte is signed *and* stored, so a verifier reads the byte
-	// that tells it the field widths and then checks a signature committing to that same
-	// byte (§14.1). The suite byte is the shell's SUITE_MANIFEST_GENESIS, asked of it.
-	preimage := append(append(domainManifest(), suiteManifestGenesis()), mjson...)
-	sig := ed25519.Sign(priv, preimage)
-	menv := append(append(append([]byte{suiteManifestGenesis()}, pub...), sig...), mjson...)
+	return writeBundleFile(t, app, manifestEnvelope(t, a, mjson), guestSrc), appKeyFor(a.id(), app)
+}
 
-	return writeBundleFile(t, app, menv, guestSrc), appKeyFor(pub, app)
+// manifestEnvelope signs a manifest body under the one manifest suite:
+//
+//	[suite 1][ed_pk 32][ml_dsa_pk 1952][ed_sig 64][ml_dsa_sig 3309][json]
+//
+// Both signatures are over DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ json, so each
+// commits to the other's key and the pair cannot be taken apart. The domain prefix is
+// signed but not stored, while the suite byte is signed *and* stored, so a verifier reads
+// the byte that tells it the field widths and then checks a signature committing to that
+// same byte (§14.1). The suite byte is the shell's, asked of it.
+//
+// A deliberate second implementation of the writer, in another language, fed to the
+// shared JS reader — a drift between the two shows up here rather than in a deployment.
+func manifestEnvelope(t *testing.T, a authorKeys, mjson []byte) []byte {
+	t.Helper()
+	pre := append(domainManifest(), manifestSuite())
+	pre = append(append(append(pre, a.edPub...), a.mlPk...), mjson...)
+
+	menv := append([]byte{manifestSuite()}, a.edPub...)
+	menv = append(append(menv, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
+	return append(append(menv, testSigner(t).signDetached(t, pre, a.mlSk)...), mjson...)
 }
 
 // claimManifest builds a manifest body claiming exactly the given protocol ids — the one

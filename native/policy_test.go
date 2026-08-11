@@ -9,11 +9,11 @@ import (
 // With the bundle author allow-listed, the closed policy still loads the bundle.
 func TestPolicyAllowsBundleAuthor(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+	author := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, appKey := writeTestBundle(t, author, authorPub, "testapp", 1)
+	bundlePath, appKey := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "testapp v1  key "+appKey) {
 		t.Fatalf("policy-allowed bundle: %s", status)
 	}
@@ -25,8 +25,8 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + strings.Repeat("ab", 32) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	author, authorPub := testAuthor(t)
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	author := testAuthor(t)
+	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("expected foreign-author rejection, got: %s", status)
 	}
@@ -44,8 +44,8 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 // loader reaches that decision and not a permissive default.
 func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	author, authorPub := testAuthor(t)
-	authorHex := hex.EncodeToString(authorPub)
+	author := testAuthor(t)
+	authorHex := hex.EncodeToString(author.id())
 
 	// On the plain author list and nothing else. The same load that lands this author's
 	// apps refuses their transport, and the refusal is admission — not a parse error, not
@@ -53,14 +53,14 @@ func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	linkBundle, _ := writeBundle(t, author, authorPub, "linkapp", 1, "", []string{"link/open", "transport/deliver"})
+	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link/open", "transport/deliver"})
 	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
 	}
 
 	// A partial claim is refused before any predicate — it cannot fall back to the
 	// unprivileged base, which is the hole a half-declared mount would otherwise open.
-	halfBundle, _ := writeBundle(t, author, authorPub, "halfapp", 1, "", []string{"link/open"})
+	halfBundle, _ := writeBundle(t, author, "halfapp", 1, "", []string{"link/open"})
 	if status := loadBundle(halfBundle); !strings.Contains(status, "every half of a privilege or none") {
 		t.Fatalf("a bundle naming link without any transport name must be refused as malformed: %s", status)
 	}
@@ -75,7 +75,7 @@ func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
 	if status := loadBundle(linkBundle); strings.Contains(status, "rejected by admission") {
 		t.Fatalf("a grants.mount entry must admit its author to the mount: %s", status)
 	}
-	appBundle, _ := writeTestBundle(t, author, authorPub, "ordinary", 1)
+	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)
 	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {
 		t.Fatalf("adding a grant must not disturb app admission: %s", status)
 	}
@@ -106,8 +106,8 @@ func TestPolicyMalformed(t *testing.T) {
 	// A rejected policy must not leave the realm wider than it started: the boot default
 	// is deny-all, so nothing installs (README §14). Before, a realm whose policy failed
 	// to parse kept a permissive default and loaded any signed bundle.
-	author, authorPub := testAuthor(t)
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	author := testAuthor(t)
+	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("after rejected policies the realm must stay deny-all: %s", status)
 	}
@@ -118,11 +118,11 @@ func TestPolicyMalformed(t *testing.T) {
 // shell has always done this (main.ts) — the native loader used to do the opposite.
 func TestNoPolicyDeniesInstalls(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	author, authorPub := testAuthor(t)
+	author := testAuthor(t)
 
 	// A signed bundle from an otherwise-valid author does not load. Bundles are the only
 	// way code arrives (§12.4), so the manifest-author gate is the whole install surface.
-	bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", 1)
+	bundlePath, _ := writeTestBundle(t, author, "testapp", 1)
 	if status := loadBundle(bundlePath); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("no --policy must deny a bundle install, got: %s", status)
 	}
@@ -134,20 +134,20 @@ func TestNoPolicyDeniesInstalls(t *testing.T) {
 // existed to refuse is unrepresentable, and both modules land.
 func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	authorA, authorAPub := testAuthor(t)
-	authorB, authorBPub := testAuthor(t)
+	authorA := testAuthor(t)
+	authorB := testAuthor(t)
 	// Both authors are allowed to install: this test is about the namespace, not the
 	// closed author set. A permissive policy is exactly the interesting case — even with
 	// nothing refusing anyone, neither author can reach the other's names.
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorAPub) + `","` + hex.EncodeToString(authorBPub) + `"]}`); err != nil {
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorA.id()) + `","` + hex.EncodeToString(authorB.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	keyA := appKeyFor(authorAPub, "ownedapp")
-	keyB := appKeyFor(authorBPub, "ownedapp")
+	keyA := appKeyFor(authorA.id(), "ownedapp")
+	keyB := appKeyFor(authorB.id(), "ownedapp")
 	if keyA == keyB {
 		t.Fatal("the same app name under two authors must derive distinct app keys")
 	}
-	bundleA, _ := writeTestBundle(t, authorA, authorAPub, "ownedapp", 1)
+	bundleA, _ := writeTestBundle(t, authorA, "ownedapp", 1)
 	if status := loadBundle(bundleA); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
 	}
@@ -155,7 +155,7 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 		t.Fatalf("author A's module is not bound under `%s`", keyA)
 	}
 	// B's bundle declares the same app name and installs too — beside A, never over it.
-	bundleB, _ := writeTestBundle(t, authorB, authorBPub, "ownedapp", 2)
+	bundleB, _ := writeTestBundle(t, authorB, "ownedapp", 2)
 	if status := loadBundle(bundleB); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}

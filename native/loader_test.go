@@ -54,11 +54,11 @@ func TestScratchRegion(t *testing.T) {
 // so echoing a payload back is the whole "the bundle-installed wasm runs" proof.
 func TestBundleModuleRuns(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+	author := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, appKey := writeTestBundle(t, author, authorPub, "runapp", 1)
+	bundlePath, appKey := writeTestBundle(t, author, "runapp", 1)
 	if status := loadBundle(bundlePath); !strings.HasPrefix(status, "runapp v1  key "+appKey) {
 		t.Fatalf("bundle load: %s", status)
 	}
@@ -76,17 +76,17 @@ func TestBundleModuleRuns(t *testing.T) {
 // path both targets run, so an unroutable claim is refused where the refusal can name it.
 func TestManifestClaimIsTheRouting(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	author, authorPub := testAuthor(t)
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(authorPub) + `"]}`); err != nil {
+	author := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	bundlePath, appKey := writeTestBundle(t, author, authorPub, "claimapp", 1)
+	bundlePath, appKey := writeTestBundle(t, author, "claimapp", 1)
 	if status := loadBundle(bundlePath); status != loadedLine("claimapp", 1, appKey, "claimapp") {
 		t.Fatalf("the load must claim what the manifest declares: %s", status)
 	}
 	// A space is not in the protocol charset (§12.10), so this bundle is refused whole —
 	// an id nothing could route is a manifest its author got wrong, not an entry to drop.
-	badPath, _ := signBundleJSON(t, author, authorPub, "badclaim", claimManifest(t, "badclaim", "bad id"), stubGuestSrc)
+	badPath, _ := signBundleJSON(t, author, "badclaim", claimManifest(t, "badclaim", "bad id"), stubGuestSrc)
 	if status := loadBundle(badPath); !strings.Contains(status, "malformed manifest") {
 		t.Fatalf("a malformed protocol id must be refused at the load: %s", status)
 	}

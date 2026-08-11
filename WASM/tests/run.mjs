@@ -10,7 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
 import { makeTransportHost } from "./transport-harness.mjs";
-import { testkit } from "./testkit.mjs";
+import { testkit, makeAuthor } from "./testkit.mjs";
 
 const {
   createModuleTable,
@@ -47,7 +47,7 @@ const { toHex, fromHex, concatBytes } = await imp("build/core/util.js");
 import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
-const { appKeyFor, genesisHash: bundleGenesisHash,
+const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId,
          signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
@@ -61,6 +61,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
+
+/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
+ *  the two derive — which is what an author *is*, since there is one suite and it signs
+ *  with both keys. Tests name `a.id` wherever the runtime names an author (policy pins,
+ *  app keys, freshness marks) and hand the whole object to `signManifest`, so no test
+ *  can accidentally pin half an identity. Shared with the other suites (testkit.mjs). */
+const testAuthor = () => makeAuthor(sodium);
 
 /** The admission context a bundle with no history lands under: an ordinary app, never
  *  loaded here before, from a key nobody has written off. The shell reads these off its
@@ -137,7 +144,7 @@ async function testFullLifecycle() {
 
   const { host } = await makeHost();
 
-  const { publicKey: pk } = generateKeyPair();
+  const { id: pk } = testAuthor();
   const chatKey = appKey(pk, "chat");
 
   // Install the chat module under its app's key, through the same path the bundle
@@ -166,19 +173,19 @@ async function testFullLifecycle() {
 async function testInstallRejectsUntrustedAuthor() {
   console.log("Test: installBundle rejects a manifest whose author is not in the policy");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const { host } = await makeHost();
 
   // A valid manifest signed by an untrusted author — the author is not in the policy.
   const manifest = { app: "demo", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
     guest: GUEST() };
-  const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+  const manifestEnv = signManifest(sodium, author, manifest);
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   // The predicate only trusts a DIFFERENT key.
-  const stranger = generateKeyPair();
-  const admit = authorAllowlist([toHex(stranger.publicKey)]);
+  const stranger = testAuthor();
+  const admit = authorAllowlist([toHex(stranger.id)]);
   let threw = false;
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "installBundle throws when the author is not in the policy");
@@ -189,23 +196,23 @@ async function testInstallRejectsUntrustedAuthor() {
 async function testManifestHashIsEnforced() {
   console.log("Test: verifyBundle enforces the manifest's module hash (§5.1)");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   // A manifest that declares the CORRECT hash — loadBundle should accept it.
   const manifest = { app: "demo", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
     guest: GUEST() };
-  const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+  const manifestEnv = signManifest(sodium, author, manifest);
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   // verifyBundle (now the single verify step) must accept a hash-matched module.
   const v = verifyBundle(sodium, blob);
-  assert(bytesEqual(v.author, author.publicKey), "matched hash verifies");
+  assert(bytesEqual(v.author, author.id), "matched hash verifies");
 
   // A manifest that declares a WRONG hash — verifyBundle must throw.
   const badManifest = { app: "demo", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(new Uint8Array([1, 2, 3]))) }],
     guest: GUEST() };
-  const badEnv = signManifest(sodium, author.privateKey, author.publicKey, badManifest);
+  const badEnv = signManifest(sodium, author, badManifest);
   const badBlob = packBundle({ [MANIFEST_FILE]: badEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
   let threw = false;
   try { verifyBundle(sodium, badBlob); } catch { threw = true; }
@@ -224,11 +231,11 @@ async function testDenyAllPolicyRejects() {
     "deny-all predicate returns false for any VerifiedBundle");
 
   const { host } = await makeHost();
-  const author = generateKeyPair();
+  const author = testAuthor();
   const manifest = { app: "demo", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
     guest: GUEST() };
-  const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+  const manifestEnv = signManifest(sodium, author, manifest);
   const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
 
   let threw = false;
@@ -243,7 +250,7 @@ async function testDenyAllPolicyRejects() {
 async function testBundleRefusesNonModule() {
   console.log("Test: a hash-correct file that isn't a valid module fails the whole bundle");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const { host } = await makeHost();
 
   // A well-formed manifest committing to two modules the author genuinely signed. One is
@@ -259,7 +266,7 @@ async function testBundleRefusesNonModule() {
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
     { name: "broken", hash: toHex(gHash(notAModule)) },
   ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, requires: [] } };
-  const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+  const manifestEnv = signManifest(sodium, author, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: manifestEnv,
     [moduleFile("fwd")]: forwarderBytes,
@@ -267,13 +274,13 @@ async function testBundleRefusesNonModule() {
     [GUEST_FILE]: guestBytes,
   });
 
-  const admit = authorAllowlist([toHex(author.publicKey)]);
+  const admit = authorAllowlist([toHex(author.id)]);
   let threw = false;
   try { await loadBundle(host, blob, admit); } catch { threw = true; }
   assert(threw, "a bundle with a non-instantiable module fails the whole load — nothing lands");
   // Neither module is bound — the install was atomic.
-  assert(!host.isBound(appKey(author.publicKey, "demo"), "fwd"), "the valid module is NOT bound (the load failed atomically)");
-  assert(!host.isBound(appKey(author.publicKey, "demo"), "broken"), "the non-module is not bound");
+  assert(!host.isBound(appKey(author.id, "demo"), "fwd"), "the valid module is NOT bound (the load failed atomically)");
+  assert(!host.isBound(appKey(author.id, "demo"), "broken"), "the non-module is not bound");
 
   console.log("  OK\n");
 }
@@ -289,8 +296,8 @@ async function testDerivedNamesKeepAuthorsApart() {
   // in two different maps rather than two strings that had to be made distinct.
   const { host } = await makeHost();
 
-  const { publicKey: aPk } = generateKeyPair();
-  const { publicKey: bPk } = generateKeyPair();
+  const { id: aPk } = testAuthor();
+  const { id: bPk } = testAuthor();
 
   // Both authors ship an app called "shared" with a module called "fwd".
   const aKey = appKey(aPk, "shared");
@@ -328,12 +335,12 @@ async function testManifestClaimIsTheRouting() {
   const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
-  const author = generateKeyPair();
-  const other = generateKeyPair();
+  const author = testAuthor();
+  const other = testAuthor();
   // One bundle shape, parameterised by who signs it, what it is called, which version it
   // is, and what it claims — every case below is a different point in that space.
   const blob = (signer, app, version, protocols) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, signer.privateKey, signer.publicKey, {
+    [MANIFEST_FILE]: signManifest(sodium, signer, {
       app, version, protocols,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST(),
@@ -349,7 +356,7 @@ async function testManifestClaimIsTheRouting() {
     admit: byPrivilege({ base: admitAll, grants: { mount: denyAll } }),
   });
   try {
-    const key = appKey(author.publicKey, "store");
+    const key = appKey(author.id, "store");
     await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
     assert(shell.host.isBound(key, "fwd"), "the bundle's modules are installed");
     assertEqual(shell.resolve("seedstore/v1"), key,
@@ -359,7 +366,7 @@ async function testManifestClaimIsTheRouting() {
 
     // An app that claims nothing serves nothing: the initiator-only shape (§12.8), and
     // the reason the field is optional rather than a required empty list.
-    const quiet = appKey(author.publicKey, "quiet");
+    const quiet = appKey(author.id, "quiet");
     await shell.loadBundleBlob(blob(author, "quiet", 1, undefined));
     assertEqual(shell.routes().length, 1, "a bundle claiming nothing adds no route");
 
@@ -372,7 +379,7 @@ async function testManifestClaimIsTheRouting() {
     // A second author's app claiming the same id takes it over — that is the §12.10
     // rebind, fused into the install the operator was always going to run. The displaced
     // app stays installed, and gets the protocol back when the newcomer leaves.
-    const rival = appKey(other.publicKey, "store");
+    const rival = appKey(other.id, "store");
     await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"]));
     assertEqual(shell.resolve("seedstore/v2"), rival, "the last app to claim an id serves it");
     assert(shell.host.isBound(key, "fwd"), "…and the displaced app is still installed, just idle");
@@ -392,7 +399,7 @@ async function testManifestClaimIsTheRouting() {
     for (const bad of [["bad id"], ["_offer"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
       let threw = false;
       try {
-        verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+        verifyManifest(sodium, signManifest(sodium, author,
           { app: "bad", version: 1, protocols: bad, modules: [], guest: GUEST() }));
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
@@ -410,8 +417,8 @@ async function testInstallerRemove() {
 
   // Two apps of one author, plus a SECOND author's app sharing the app name — the
   // case the app key exists to separate (§5.1).
-  const { publicKey: pk } = generateKeyPair();
-  const { publicKey: other } = generateKeyPair();
+  const { id: pk } = testAuthor();
+  const { id: other } = testAuthor();
   const chat = appKey(pk, "chat");
   const notes = appKey(pk, "notes");
   const theirs = appKey(other, "chat");
@@ -730,8 +737,8 @@ async function testPolicy() {
   console.log("Test: shell install policy — closed author sets gate bundle loads");
   const { parsePolicy } = await imp("build/host/policy.js");
 
-  const good = generateKeyPair();
-  const bad = generateKeyPair();
+  const good = testAuthor();
+  const bad = testAuthor();
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
@@ -740,7 +747,7 @@ async function testPolicy() {
     const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST({ requires: mount ? ["link/open", "transport/deliver"] : [] }) };
-    const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+    const manifestEnv = signManifest(sodium, author, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
     let landed = false;
@@ -749,17 +756,17 @@ async function testPolicy() {
   };
 
   // ── author allowlist ───────────────────────────────────────────────────
-  const okAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), good);
+  const okAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.id)] }), good);
   assert(okAuthor, "install by an allowed author is accepted");
 
-  const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.publicKey)] }), bad);
+  const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.id)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
   // ── the mount is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
   // The mount privilege carries raw links and channel-identity signing — the bundle that
   // holds the node's whole network — so the ordinary author list must NOT admit one, even
   // for an author it already trusts with apps. Only a `grants.mount` entry does.
-  const goodHex = toHex(good.publicKey);
+  const goodHex = toHex(good.id);
   const appOnly = JSON.stringify({ authors: [goodHex] });
   const withTransport = JSON.stringify({ authors: [goodHex], grants: { mount: [goodHex] } });
 
@@ -793,6 +800,12 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] })); } catch { threw = true; }
   assert(threw, "the superseded \"transportAuthors\" key fails the boot loudly rather than silently denying mounts");
+  // Same treatment for the retired suite dial (§12.4, §14.1): with one manifest suite the
+  // field decides nothing, and ignoring it would silently admit whatever a `[1]` was
+  // written to exclude.
+  threw = false;
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], manifestSuites: [2] })); } catch { threw = true; }
+  assert(threw, "the retired \"manifestSuites\" key is refused by name rather than ignored");
   // The privilege NAMES come from the catalog, so a typo is a refused boot rather than a
   // node that looks configured and holds nothing — the whole reason the key is a
   // capability rather than free-form text.
@@ -824,9 +837,9 @@ async function testRequiresPickThePrivileges() {
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const blobWithRequires = (requires) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, {
+    [MANIFEST_FILE]: signManifest(sodium, author, {
       app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST({ requires }),
@@ -873,7 +886,7 @@ async function testRequiresPickThePrivileges() {
       assert(err !== null && /rejected by admission/.test(err),
         "a permissive author list does not admit a bundle naming the mount names");
       assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
-      assert(shell.host.isBound(appKeyFor(author.publicKey, "mod"), "fwd"),
+      assert(shell.host.isBound(appKeyFor(author.id, "mod"), "fwd"),
         "a bundle reaching no privilege binds normally");
     } finally { shell.close(); }
   }
@@ -902,10 +915,10 @@ async function testRequiresPickThePrivileges() {
 async function testGuestAbi() {
   console.log("Test: a guest declares the host ABI it was written against");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const guestText = "register('ping', () => new Uint8Array([1]));";
   const guestBytes = new TextEncoder().encode(guestText);
-  const mk = (guest) => signManifest(sodium, author.privateKey, author.publicKey,
+  const mk = (guest) => signManifest(sodium, author,
     { app: "abi", version: 1, modules: [], guest });
   const hash = toHex(gHash(guestBytes));
 
@@ -931,7 +944,7 @@ async function testGuestAbi() {
   // against the retired module-only format produces, so the message has to say what
   // the rule is rather than "malformed manifest".
   let noGuest = "";
-  try { verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+  try { verifyManifest(sodium, signManifest(sodium, author,
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
@@ -963,10 +976,10 @@ async function testSlotFreshness() {
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { ModuleTable } = await imp("build/host/module-table.js");
 
-  const a = generateKeyPair();
-  const b = generateKeyPair();
+  const a = testAuthor();
+  const b = testAuthor();
   const blobFrom = (author, version) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey,
+    [MANIFEST_FILE]: signManifest(sodium, author,
       { app: "link", version, modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }], guest: GUEST() }),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
@@ -993,9 +1006,9 @@ async function testSlotFreshness() {
     const freshness = new FreshnessMarks();
     const host = new ModuleTable();
     await land(host, freshness, a, 5);
-    assertEqual(freshness.get(a.publicKey, "link"), 5, "landing a transport advances its (author, app) mark");
+    assertEqual(freshness.get(a.id, "link"), 5, "landing a transport advances its (author, app) mark");
     await land(host, freshness, b, 1);
-    assertEqual(freshness.get(b.publicKey, "link"), 1, "a second author's transport answers to its own lineage");
+    assertEqual(freshness.get(b.id, "link"), 1, "a second author's transport answers to its own lineage");
   }
 
   // Each author is still held to their own mark — dropping any floor
@@ -1029,13 +1042,13 @@ async function testShellBoot() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-shell-"));
   let shell;
   try {
     shell = await boot({
-      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir,
       identity, // dial-only: no listen/wsListen, so start() binds nothing
     });
@@ -1061,7 +1074,7 @@ async function testBundle() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-bundle-"));
   const bundlePath = pjoin(dir, "app.skb");
@@ -1074,7 +1087,7 @@ async function testBundle() {
     // declares no bind name at all. Neither the module nor the guest names a file: they
     // are `<name>.wasm` and `guest.js`.
     const { host: h } = await makeHost();
-    const testKey = appKey(author.publicKey, "test");
+    const testKey = appKey(author.id, "test");
     const guestText = "register('ping', () => new Uint8Array([1]));";
     const manifest = {
       app: "test", version: 1,
@@ -1087,14 +1100,14 @@ async function testBundle() {
       },
     };
     const writeBundle = (m) => wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, m),
+      [MANIFEST_FILE]: signManifest(sodium, author, m),
       [moduleFile("codec")]: forwarderBytes,
       [GUEST_FILE]: new TextEncoder().encode(guestText),
     }));
     writeBundle(manifest);
 
     // sign / verify / tamper
-    const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+    const env = signManifest(sodium, author, manifest);
     assert(verifyManifest(sodium, env) !== null, "a well-formed manifest verifies");
     const tampered = env.slice(); tampered[tampered.length - 1] ^= 1;
     assert(verifyManifest(sodium, tampered) === null, "a tampered manifest fails verification");
@@ -1102,7 +1115,7 @@ async function testBundle() {
     // A manifest whose module names collide is ambiguous (the name keys both the
     // container and the guest's module map), so it is refused even though it is
     // validly signed (§12.4).
-    const dupEnv = signManifest(sodium, author.privateKey, author.publicKey, {
+    const dupEnv = signManifest(sodium, author, {
       ...manifest,
       modules: [manifest.modules[0], { ...manifest.modules[0] }],
     });
@@ -1112,7 +1125,7 @@ async function testBundle() {
 
     // booted shell, policy allows the author → bundle loads + module installs
     shell = await boot({
-      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
@@ -1167,18 +1180,18 @@ async function testGuestBundleAndArchive() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-guest-"));
   const bundlePath = pjoin(dir, "demo.skb");
   let shell;
   try {
     const { host: h } = await makeHost();
-    const demoKey = appKey(author.publicKey, "demo");
+    const demoKey = appKey(author.id, "demo");
     // A manifest with NO `guest` field is refused: every app is a guest (§12.4).
     let noGuest = "";
     try {
-      verifyManifest(sodium, signManifest(sodium, author.privateKey, author.publicKey,
+      verifyManifest(sodium, signManifest(sodium, author,
         { app: "demo", version: 1, modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }] }));
     } catch (e) { noGuest = e.message; }
     assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
@@ -1188,7 +1201,7 @@ async function testGuestBundleAndArchive() {
       modules: [{ name: "demo", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST(),
     };
-    const manifestEnv = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+    const manifestEnv = signManifest(sodium, author, manifest);
     assert(verifyManifest(sodium, manifestEnv) !== null, "a manifest with a guest verifies");
 
     // Blob round-trip: a bundle IS one blob, and this is what an Offer carries over a
@@ -1208,7 +1221,7 @@ async function testGuestBundleAndArchive() {
     // The verify half on its own: no host, no policy, no freshness — the browser
     // shell's peek path. It authenticates and yields every verified byte.
     const v = verifyBundle(sodium, packed);
-    assert(bytesEqual(v.author, author.publicKey), "verifyBundle returns the signing author");
+    assert(bytesEqual(v.author, author.id), "verifyBundle returns the signing author");
     assertEqual(v.modules.length, 1, "verifyBundle yields the manifest's modules");
     assertEqual(v.guestSource, GUEST_TEXT, "verifyBundle yields the verified guest source");
     // Corrupting a module must fail integrity even though the manifest still verifies.
@@ -1235,7 +1248,7 @@ async function testGuestBundleAndArchive() {
     // Load the bundle through the shared §12.4 loader.
     wf(bundlePath, packed);
     shell = await boot({
-      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
@@ -1641,62 +1654,72 @@ async function testSafeRealmConcurrency() {
 
 // ─── Test: manifest suite byte — signed, so it cannot be edited in flight ────────
 //
-// The §12.4 envelope is `[suite 1][pk 32][sig 64][json]` and the suite byte is part of
-// the signed preimage `DOMAIN_manifest ‖ suite ‖ json`. That is what makes it safe to
-// read the byte *before* verifying: a verifier needs it to know the field widths, and
-// the signature it then checks commits to the same byte, so rewriting it only breaks the
-// manifest. Algorithm confusion between two suites is unrepresentable (§14.1).
+// The suite byte leads the §12.4 envelope and is part of the signed preimage
+// `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. That is what makes it safe to read
+// the byte *before* verifying: a verifier needs it to know the field widths, and the
+// signature it then checks commits to the same byte, so rewriting it only breaks the
+// manifest. Algorithm confusion with a later suite is unrepresentable (§14.1).
+//
+// There is ONE live suite (§12.4): `0x02`. `0x01`, the retired Ed25519-only genesis
+// suite, is refused here as exactly what it now is — a suite this host does not
+// implement — which is the property that keeps the retirement from being a downgrade
+// path an attacker can ask for.
 async function testManifestSuiteByte() {
   console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
   const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   // One module: this test is about the suite byte, not the module count.
   const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
-  const env = signManifest(sodium, author.privateKey, author.publicKey, manifest);
+  const env = signManifest(sodium, author, manifest);
 
-  // Layout: the suite byte leads, and the author key follows it (not at offset 0).
-  assertEqual(env[0], 0x01, "the envelope opens with the genesis manifest suite id");
-  assertEqual(toHex(env.slice(1, 33)), toHex(author.publicKey), "the author key follows the suite byte");
+  // Layout: the suite byte leads, and the author's Ed25519 key follows it (not at
+  // offset 0). The rest of the envelope is testHybridManifestSuite's subject.
+  assertEqual(env[0], 0x02, "the envelope opens with the one manifest suite id");
+  assertEqual(toHex(env.slice(1, 33)), toHex(author.ed.publicKey), "the Ed25519 key follows the suite byte");
 
-  // 1. Untouched, it verifies and returns the author + manifest.
+  // 1. Untouched, it verifies and returns the author id + manifest.
   {
     const v = verifyManifest(sodium, env);
     assert(v !== null, "an untouched manifest verifies");
-    assertEqual(toHex(v.author), toHex(author.publicKey), "the author key round-trips");
+    assertEqual(toHex(v.author), toHex(author.id), "the derived author id round-trips");
     assertEqual(v.manifest.app, "suite-probe", "the manifest round-trips");
   }
 
-  // 2. An unknown suite is refused as a legibility failure, with its own message —
-  //    not silently reported as a bad signature, which would misdirect an operator
-  //    whose real problem is a bundle built for a newer host.
-  {
-    const bad = env.slice(); bad[0] = 0x7f;
+  // 2. A suite this host does not implement is refused as a legibility failure, with its
+  //    own message — not silently reported as a bad signature, which would misdirect an
+  //    operator whose real problem is a bundle built for a host they are not running.
+  //    `0x01` is one such suite now, and it is refused by the same rule as `0x7f`: there
+  //    is no retired-suite special case to keep working.
+  for (const suite of [0x01, 0x7f]) {
+    const bad = env.slice(); bad[0] = suite;
     let msg = "";
     try { verifyManifest(sodium, bad); } catch (e) { msg = String(e.message); }
-    assert(msg.includes("unsupported manifest suite"), `unknown suite reports itself (got: ${msg || "no throw"})`);
-    assert(!msg.includes("signature"), "an unknown suite is not reported as a signature failure");
+    assert(msg.includes("unsupported manifest suite"),
+      `suite 0x${suite.toString(16)} reports itself (got: ${msg || "no throw"})`);
+    assert(!msg.includes("signature"), "an unimplemented suite is not reported as a signature failure");
   }
 
-  // 3. The load-bearing property: the suite byte is inside the signed preimage, so an
-  //    attacker who rewrites it to a suite the verifier DOES accept still fails — the
-  //    preimage no longer matches what was signed. (0x01 signed, re-presented as 0x01
-  //    after tampering the json proves the same binding from the other direction.)
+  // 3. A whole, validly-signed 0x01 envelope — the shape a bundle built against the
+  //    retired suite actually has — is refused the same way. The retirement is a property
+  //    of the verifier, not of the fact that nobody happens to hold such a bundle.
+  {
+    const json = new TextEncoder().encode(JSON.stringify(manifest));
+    const pre = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), Uint8Array.of(0x01), json]);
+    const sig = sodium.crypto_sign_detached(pre, author.ed.privateKey);
+    const legacyEnv = concatBytes([Uint8Array.of(0x01), author.ed.publicKey, sig, json]);
+    let msg = "";
+    try { verifyManifest(sodium, legacyEnv); } catch (e) { msg = String(e.message); }
+    assert(msg.includes("unsupported manifest suite 0x01"),
+      `a well-formed genesis-suite envelope is refused by suite (got: ${msg || "no throw"})`);
+  }
+
+  // 4. The load-bearing property: the suite byte is inside the signed preimage, so
+  //    tampering anywhere in the envelope breaks the signature rather than the parse.
   {
     const forged = env.slice();
-    forged[33] ^= 0x01; // flip a signature byte → must not verify
-    assert(verifyManifest(sodium, forged) === null, "a tampered signature does not verify");
-  }
-  {
-    // Re-sign under a preimage WITHOUT the suite byte (the pre-§14.1 construction) and
-    // present it as suite 0x01: the verifier computes the suite-bound preimage, so the
-    // legacy signature fails. A signature is bound to the suite it was made under.
-    const json = new TextEncoder().encode(JSON.stringify(manifest));
-    const legacyPre = concatBytes([new TextEncoder().encode("seedkernel-manifest-sig-v1\0"), json]);
-    const legacySig = sodium.crypto_sign_detached(legacyPre, author.privateKey);
-    const legacyEnv = concatBytes([Uint8Array.of(0x01), author.publicKey, legacySig, json]);
-    assert(verifyManifest(sodium, legacyEnv) === null,
-      "a signature made without the suite byte does not verify as suite 0x01");
+    forged[33] ^= 0x01; // flip a byte of the ML-DSA public key → must not verify
+    assert(verifyManifest(sodium, forged) === null, "a tampered envelope does not verify");
   }
 
   console.log("  OK\n");
@@ -1853,17 +1876,15 @@ async function testMlKemAcvpVectors() {
 
 async function testHybridManifestSuite() {
   console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
-  const { signManifest, signManifestHybrid, verifyManifest, hybridAuthorId,
+  const { signManifest, verifyManifest, hybridAuthorId,
           verifyBundle, packBundle, MANIFEST_FILE }
     = await imp("build/host/bundle.js");
-  const { generatePqKeyPair } = await imp("build/host/crypto-node.js");
 
-  const ed = generateKeyPair();
-  const pq = generatePqKeyPair();
-  const keys = { ed, mlDsa: pq };
-  // One module: this test is about the hybrid envelope, not the module count.
+  const keys = testAuthor();
+  const ed = keys.ed, pq = keys.mlDsa;
+  // One module: this test is about the envelope, not the module count.
   const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
-  const env = signManifestHybrid(sodium, keys, manifest);
+  const env = signManifest(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
   //    lead, so a verifier reads the whole key set before either signature.
@@ -1882,7 +1903,6 @@ async function testHybridManifestSuite() {
   {
     const v = verifyManifest(sodium, env);
     assert(v !== null, "an untouched hybrid manifest verifies");
-    assertEqual(v.suite, 0x02, "the verified result reports the suite it was signed under");
     assertEqual(toHex(v.author), toHex(hybridAuthorId(sodium, ed.publicKey, pq.publicKey)),
       "the author id is the derived key-set hash");
     assert(toHex(v.author) !== toHex(ed.publicKey), "the author id is not the Ed25519 key");
@@ -1936,75 +1956,27 @@ async function testHybridManifestSuite() {
     assert(!msg.includes("signature invalid"), "and does not report it as a bad signature");
   }
 
-  // 6. End to end: a hybrid-signed bundle loads, and its modules bind under names
-  //    derived from the DERIVED id — so nothing downstream of the verifier knows or
-  //    cares which suite signed. Same-content bundles under the two suites are two
-  //    different authors, which is the honest reading of a stronger statement.
+  // 6. End to end: a signed bundle loads, and its modules bind under names derived from
+  //    the DERIVED id — the key-set hash, never either key — so everything downstream of
+  //    the verifier (names, policy, freshness) is keyed by the one identity the format
+  //    produces.
   {
     const wasm = forwarderBytes;
     const m = { app: "pq-app", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }], guest: GUEST() };
     const blob = packBundle({
-      [MANIFEST_FILE]: signManifestHybrid(sodium, keys, m),
+      [MANIFEST_FILE]: signManifest(sodium, keys, m),
       [moduleFile("codec")]: wasm,
       [GUEST_FILE]: GUEST_BYTES,
     });
     const v = verifyBundle(sodium, blob);
-    assertEqual(v.suite, 0x02, "verifyBundle carries the suite through to the policy seam");
+    assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey),
+      "verifyBundle carries the signing key set through to the policy seam");
     const host = await createModuleTable();
     installBundle(host, v);
     const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
-    assert(host.isBound(derived, "codec"), "the module binds under the derived hybrid author id");
-
-    const edOnly = packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, ed.privateKey, ed.publicKey, m),
-      [moduleFile("codec")]: wasm,
-      [GUEST_FILE]: GUEST_BYTES,
-    });
-    assert(toHex(verifyBundle(sodium, edOnly).author) !== toHex(v.author),
-      "the same author's 0x01 and 0x02 identities are distinct");
-  }
-
-  console.log("  OK\n");
-}
-
-// ─── Test: policy may require a manifest suite (§12.5) ───────────────────────────
-//
-// The verifier accepts every suite it can check; which ones a deployment TRUSTS is a
-// separate, operator-owned question. Without it there is no way to finish a migration —
-// the classical suite would stay acceptable forever on every host that can still verify
-// it.
-async function testPolicyManifestSuite() {
-  console.log("Test: policy manifestSuites — a deployment can insist on PQ-signed manifests");
-  const { signManifest, signManifestHybrid, verifyBundle, packBundle, MANIFEST_FILE }
-    = await imp("build/host/bundle.js");
-  const { generatePqKeyPair } = await imp("build/host/crypto-node.js");
-
-  const ed = generateKeyPair();
-  const pq = generatePqKeyPair();
-  const wasm = forwarderBytes;
-  const m = { app: "suite-policy", version: 1, modules: [{ name: "codec", hash: toHex(gHash(wasm)) }], guest: GUEST() };
-  const pack = (envelope) => packBundle({ [MANIFEST_FILE]: envelope, [moduleFile("codec")]: wasm, [GUEST_FILE]: GUEST_BYTES });
-
-  const classical = verifyBundle(sodium, pack(signManifest(sodium, ed.privateKey, ed.publicKey, m)));
-  const hybrid = verifyBundle(sodium, pack(signManifestHybrid(sodium, { ed, mlDsa: pq }, m)));
-
-  const pqOnly = policyFromJson(JSON.stringify({
-    authors: [toHex(classical.author), toHex(hybrid.author)],
-    manifestSuites: [2],
-  }));
-  assert(await pqOnly(hybrid, APP_CTX) === true, "a hybrid-signed bundle is admitted");
-  assert(await pqOnly(classical, APP_CTX) === false, "an Ed25519-only bundle from a trusted author is refused");
-
-  // Absent, the field constrains nothing — an existing policy file keeps its meaning.
-  const anySuite = policyFromJson(JSON.stringify({ authors: [toHex(classical.author)] }));
-  assert(await anySuite(classical, APP_CTX) === true, "a policy without manifestSuites admits any suite");
-
-  // Strict parsing, like every other field: a typo fails the boot loudly.
-  for (const bad of [{ manifestSuites: 2 }, { manifestSuites: [] }, { manifestSuites: ["2"] }]) {
-    let threw = false;
-    try { policyFromJson(JSON.stringify({ authors: [toHex(classical.author)], ...bad })); }
-    catch { threw = true; }
-    assert(threw, `malformed manifestSuites is rejected: ${JSON.stringify(bad)}`);
+    assert(host.isBound(derived, "codec"), "the module binds under the derived author id");
+    assert(!host.isBound(appKey(ed.publicKey, "pq-app"), "codec"),
+      "…and never under the Ed25519 key alone");
   }
 
   console.log("  OK\n");
@@ -2026,7 +1998,7 @@ async function testBundleCorruptNewerRollback() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const identity = generateKeyPair();
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-rollback-"));
   const bundlePath = pjoin(dir, "rollback.skb");
@@ -2046,13 +2018,13 @@ async function testBundleCorruptNewerRollback() {
     // `wasm` is the module's actual bytes — passed corrupt below to model a
     // half-written upgrade whose manifest is nonetheless intact and signed.
     const writeBundle = (version, wasm = forwarderBytes) => wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
+      [MANIFEST_FILE]: signManifest(sodium, author, manifest(version)),
       [moduleFile("codec")]: wasm,
       [GUEST_FILE]: new TextEncoder().encode(guestText),
     }));
 
     shell = await boot({
-      policyJson: JSON.stringify({ authors: [toHex(author.publicKey)] }),
+      policyJson: JSON.stringify({ authors: [toHex(author.id)] }),
       dir: pjoin(dir, "_data"), identity,
     });
 
@@ -2095,9 +2067,9 @@ async function testAuthorRevocation() {
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const identity = generateKeyPair();
-  const authorHex = toHex(author.publicKey);
+  const authorHex = toHex(author.id);
   const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-revoke-"));
   const bundlePath = pjoin(dir, "app.skb");
   const dataDir = pjoin(dir, "_data");
@@ -2110,13 +2082,13 @@ async function testAuthorRevocation() {
       guest: GUEST(),
     });
     const writeBundle = (version) => wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest(version)),
+      [MANIFEST_FILE]: signManifest(sodium, author, manifest(version)),
       [moduleFile("codec")]: forwarderBytes,
       [GUEST_FILE]: GUEST_BYTES,
     }));
 
     shell = await boot({ policyJson, dir: dataDir, identity });
-    const victimKey = appKeyFor(author.publicKey, "victim");
+    const victimKey = appKeyFor(author.id, "victim");
 
     // 1. The author is trusted: v1 loads and binds.
     writeBundle(1);
@@ -2175,19 +2147,19 @@ async function testAuthorRevocation() {
 
     // 6. Recovery is a NEW key, not an un-revoke: it derives its own names (§5.1) and
     //    its own mark, so it is unaffected by the dead key's state.
-    const heir = generateKeyPair();
+    const heir = testAuthor();
     wf(bundlePath, packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, heir.privateKey, heir.publicKey, manifest(1)),
+      [MANIFEST_FILE]: signManifest(sodium, heir, manifest(1)),
       [moduleFile("codec")]: forwarderBytes,
       [GUEST_FILE]: GUEST_BYTES,
     }));
     shell.close();
     shell = await boot({
-      policyJson: JSON.stringify({ authors: [authorHex, toHex(heir.publicKey)] }),
+      policyJson: JSON.stringify({ authors: [authorHex, toHex(heir.id)] }),
       dir: dataDir, identity,
     });
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(appKeyFor(heir.publicKey, "victim"), "codec"),
+    assert(shell.host.isBound(appKeyFor(heir.id, "victim"), "codec"),
       "a replacement author key installs normally after the old one is written off");
   } finally {
     if (shell) shell.close();
@@ -2275,8 +2247,8 @@ async function testWrongTypedStoreIsRefused() {
 async function testAppNameLengthRefused() {
   console.log("Test: an over-long app name is refused at load, not at first use");
   const { verifyManifest, signManifest } = await imp("build/host/bundle.js");
-  const author = generateKeyPair();
-  const mk = (app, extra = {}) => signManifest(sodium, author.privateKey, author.publicKey,
+  const author = testAuthor();
+  const mk = (app, extra = {}) => signManifest(sodium, author,
     { app, version: 1, modules: [], guest: GUEST(), ...extra });
 
   // At the limit, everything works — 255 bytes is exactly what the scope can carry.
@@ -2308,17 +2280,17 @@ async function testPersistFailureRollsBack() {
     = await imp("build/host/bundle.js");
   const { ModuleTable } = await imp("build/host/module-table.js");
 
-  const author = generateKeyPair();
+  const author = testAuthor();
   const manifest = { app: "persist", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
     guest: GUEST() };
   const blob = packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author.privateKey, author.publicKey, manifest),
+    [MANIFEST_FILE]: signManifest(sodium, author, manifest),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
   const v = verifyBundle(sodium, blob);
-  const key = appKey(author.publicKey, "persist");
+  const key = appKey(author.id, "persist");
 
   // A store whose durable write always fails, as a full disk would.
   class BrokenStore extends FreshnessMarks {
@@ -2331,14 +2303,14 @@ async function testPersistFailureRollsBack() {
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
   assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
   assert(!host.isBound(key, "fwd"), "nothing was kept — the modules did not stay bound");
-  assertEqual(broken.get(author.publicKey, "persist"), -Infinity, "the in-memory mark was rolled back");
+  assertEqual(broken.get(author.id, "persist"), -Infinity, "the in-memory mark was rolled back");
 
   // A retry against a healthy store completes cleanly: the rollback is what makes
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
   installBundle(host, v, healthy);
   assert(host.isBound(key, "fwd"), "the retry lands");
-  assertEqual(healthy.get(author.publicKey, "persist"), 1, "…and persists its mark");
+  assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
   console.log("  OK\n");
 }
 
@@ -2405,7 +2377,6 @@ await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();
 await testHybridManifestSuite();
-await testPolicyManifestSuite();
 await testSafeRealmConcurrency();
 await testAuthorRevocation();
 await testPreRevocationStoreIsRefused();

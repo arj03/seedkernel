@@ -223,68 +223,19 @@ const (
 	offHybridMlSig = offHybridEdSig + ed25519.SignatureSize
 )
 
-// hybridAuthorID mirrors bundle.ts: genesisHash(DOMAIN_manifest_author ‖ suite ‖ ed_pk ‖
-// ml_dsa_pk). Derived here rather than read back from the loader — a test that asked the
-// loader for the id would agree with the loader by construction.
-func hybridAuthorID(edPub, mlPk []byte) []byte {
-	pre := append(domainManifestAuthor(), suiteManifestHybrid())
-	pre = append(append(pre, edPub...), mlPk...)
-	return sd.genericHash(32, pre)
-}
-
-// hybridEnvelope signs a manifest body under suite 0x02: both signatures over
-// DOMAIN_manifest ‖ suite ‖ ed_pk ‖ ml_dsa_pk ‖ json, so each commits to the other's key
-// and the pair cannot be taken apart. A deliberate second implementation of the writer,
-// in another language, fed to the shared JS reader — a drift between the two shows up
-// here rather than in a deployment.
-func hybridEnvelope(t *testing.T, s *mldsaSigner, a hybridKeys, mjson []byte) []byte {
-	t.Helper()
-	pre := append(domainManifest(), suiteManifestHybrid())
-	pre = append(append(append(pre, a.edPub...), a.mlPk...), mjson...)
-
-	menv := append([]byte{suiteManifestHybrid()}, a.edPub...)
-	menv = append(append(menv, a.mlPk...), ed25519.Sign(a.edPriv, pre)...)
-	return append(append(menv, s.signDetached(t, pre, a.mlSk)...), mjson...)
-}
-
-// hybridKeys is a whole hybrid author identity: an Ed25519 half and an ML-DSA-65 half,
-// neither of which is the identity on its own (§12.4).
-type hybridKeys struct {
-	edPriv ed25519.PrivateKey
-	edPub  []byte
-	mlPk   []byte
-	mlSk   []byte
-}
-
-func (a hybridKeys) id() []byte { return hybridAuthorID(a.edPub, a.mlPk) }
-
-func hybridAuthor(t *testing.T, s *mldsaSigner, seed byte) hybridKeys {
-	t.Helper()
-	edPriv, edPub := testAuthor(t)
-	mlSeed := make([]byte, 32)
-	for i := range mlSeed {
-		mlSeed[i] = seed
-	}
-	mlPk, mlSk := s.keypair(t, mlSeed)
-	return hybridKeys{edPriv: edPriv, edPub: edPub, mlPk: mlPk, mlSk: mlSk}
-}
-
-// writeHybridBundle is writeBundle under manifest suite 0x02.
-func writeHybridBundle(t *testing.T, s *mldsaSigner, a hybridKeys, app string, version int) (string, string) {
-	t.Helper()
-	menv := hybridEnvelope(t, s, a, manifestJSON(t, app, version, stubGuestSrc, nil))
-	return writeBundleFile(t, app, menv, stubGuestSrc), appKeyFor(a.id(), app)
-}
+// The author identity, the envelope writer and the bundle fixtures are the shared
+// harness's (bundle_helper_test.go): there is one manifest suite, so every bundle any
+// test writes is hybrid-signed and there is no second path for these tests to exercise.
+// What is left here is what is specific to the PQ half — that THIS target's embedded
+// artifact reaches the same verdicts as the JS one.
 
 // The whole point of the suite on this target: a hybrid-signed bundle loads, and its
-// module binds under the DERIVED author id — so nothing downstream of the verifier
-// (names, policy, freshness) knows or cares which suite signed.
+// module binds under the DERIVED author id — the key-set hash, never either key alone.
 func TestHybridManifestBundleLoads(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	s := newMlDsaSigner(t)
-	a := hybridAuthor(t, s, 1)
+	a := testAuthor(t)
 
-	path, key := writeHybridBundle(t, s, a, "pqapp", 1)
+	path, key := writeTestBundle(t, a, "pqapp", 1)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
@@ -310,8 +261,7 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 // operator's problem, recoverable) rather than admit forged ones.
 func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	s := newMlDsaSigner(t)
-	a := hybridAuthor(t, s, 2)
+	a := testAuthor(t)
 	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
@@ -328,7 +278,7 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 		// than only the one made under it.
 		{"the ML-DSA public key", offHybridMlPk},
 	} {
-		menv := hybridEnvelope(t, s, a, mjson)
+		menv := manifestEnvelope(t, a, mjson)
 		menv[tc.at] ^= 0x01
 		path := writeBundleFile(t, "pqtamper", menv, stubGuestSrc)
 		if status := loadBundle(path); !strings.Contains(status, "manifest signature invalid") {
@@ -337,28 +287,26 @@ func TestHybridManifestBothSignaturesRequired(t *testing.T) {
 	}
 }
 
-// Which suites a deployment ACCEPTS is separate from which it can CHECK, and it is
-// operator policy (§12.5). Without the dial there is no way to finish a migration — the
-// classical suite would stay acceptable forever on every host still able to verify it.
-func TestPolicyManifestSuitesOnNative(t *testing.T) {
+// The retired genesis suite, refused on this target too (§14.1). `0x01` bundles were
+// Ed25519-only; a host that still admitted one would be a downgrade an attacker can ask
+// for by writing a byte, so the loader answers "a suite I do not implement" — a
+// legibility failure, not a signature verdict.
+func TestGenesisManifestSuiteRefused(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
-	s := newMlDsaSigner(t)
-	a := hybridAuthor(t, s, 3)
-
-	hybridPath, _ := writeHybridBundle(t, s, a, "pqonly", 1)
-	classicalPath, _ := writeBundle(t, a.edPriv, a.edPub, "pqonly", 1, "", nil)
-
-	// Both identities are trusted, so the only thing left that can refuse the second
-	// bundle is the suite dial.
-	policy := `{"authors":["` + hex.EncodeToString(a.id()) + `","` + hex.EncodeToString(a.edPub) + `"],` +
-		`"manifestSuites":[2]}`
-	if err := applyPolicy(policy); err != nil {
+	a := testAuthor(t)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(a.id()) + `","` +
+		hex.EncodeToString(a.edPub) + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	if status := loadBundle(hybridPath); !strings.HasPrefix(status, "pqonly v1") {
-		t.Fatalf("manifestSuites=[2] must admit a hybrid bundle: %s", status)
-	}
-	if status := loadBundle(classicalPath); !strings.Contains(status, "rejected by admission") {
-		t.Fatalf("manifestSuites=[2] must refuse an Ed25519-only bundle: %s", status)
+
+	// A well-formed genesis envelope: [0x01][ed_pk 32][ed_sig 64][json], signed over
+	// DOMAIN_manifest ‖ 0x01 ‖ json exactly as the retired suite specified.
+	mjson := manifestJSON(t, "genesis", 1, stubGuestSrc, nil)
+	pre := append(append(domainManifest(), 0x01), mjson...)
+	menv := append(append(append([]byte{0x01}, a.edPub...), ed25519.Sign(a.edPriv, pre)...), mjson...)
+	path := writeBundleFile(t, "genesis", menv, stubGuestSrc)
+
+	if status := loadBundle(path); !strings.Contains(status, "unsupported manifest suite") {
+		t.Fatalf("a genesis-suite bundle must be refused by suite, got: %s", status)
 	}
 }

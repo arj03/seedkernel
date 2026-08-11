@@ -23,14 +23,14 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	// One author across every "boot": the mark is keyed by (author, app). The author is
 	// minted against the first realm's sodium, so boot once before writing bundles.
 	bootRealmIn(t, dataDir)
-	author, authorPub := testAuthor(t)
-	policyJSON := `{"authors":["` + hex.EncodeToString(authorPub) + `"]}`
+	author := testAuthor(t)
+	policyJSON := `{"authors":["` + hex.EncodeToString(author.id()) + `"]}`
 
 	// reboot stands up a fresh realm and node on the same data dir — the marks are
 	// in-realm state, so this is what forces the next load to re-read them from the file.
 	reboot := func() { bootShell(t, dataDir, policyJSON, nil) }
 	load := func(version int) string {
-		bundlePath, _ := writeTestBundle(t, author, authorPub, "testapp", version)
+		bundlePath, _ := writeTestBundle(t, author, "testapp", version)
 		return loadBundle(bundlePath)
 	}
 

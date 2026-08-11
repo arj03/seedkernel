@@ -9,10 +9,9 @@
 // The FORMAT here is application-neutral; seedstore fills in storage content
 // (its build-bundle script). A bundle is ONE blob — the container below — holding:
 //
-//   manifest.bundle    signed manifest envelope, per suite (§12.4, §14.1):
-//                        0x01  [suite(1)][edPk(32)][edSig(64)][utf8 json]
-//                        0x02  [suite(1)][edPk(32)][mlDsaPk(1952)]
-//                              [edSig(64)][mlDsaSig(3309)][utf8 json]
+//   manifest.bundle    the signed manifest envelope — one suite, `0x02` (§12.4, §14.1):
+//                        [suite(1)][edPk(32)][mlDsaPk(1952)]
+//                        [edSig(64)][mlDsaSig(3309)][utf8 json]
 //   <name>.wasm        each WASM module, named by its manifest `name`
 //   guest.js           the safe-js guest program, if the manifest declares one
 //
@@ -28,7 +27,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, SUITE_MANIFEST_GENESIS, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, privilegeOf, type GrantGroup, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, privilegeOf, type GrantGroup, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -158,31 +157,40 @@ export interface BundleManifest {
  *  (the native loader, README §12.9) can still run the shared loader below. */
 export interface ManifestVerifier {
     crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
-    /** The genesis hash, needed here — not just for content integrity — because a
-     *  multi-key suite derives its 32-byte author id by hashing its key set
+    /** The genesis hash, needed here — not just for content integrity — because the
+     *  suite derives its 32-byte author id by hashing the author's key set
      *  (`hybridAuthorId`). */
     crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
-    /** ML-DSA-65 verify (FIPS 204), the PQ half of suite `0x02` (§14.1).
+    /** ML-DSA-65 verify (FIPS 204), the PQ half of the manifest suite (§14.1).
      *
-     *  **Optional, and its absence is the feature detect.** A host that has not linked a
-     *  PQ verifier refuses `0x02` with its own error rather than reporting a bad
-     *  signature — the same distinction an unknown suite gets, for the same reason: "this
-     *  bundle wants a host I am not" is an operator's problem, not an attacker's doing.
-     *  All three targets supply it from the same mldsa65.wasm (`pq.ts`, and
-     *  native/mldsa.go through wazero), so the option exists for hosts outside this
-     *  tree that embed the loader without the PQ artifact — not as a gap in it. */
-    ml_dsa65_verify_detached?(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
+     *  **Required, because there is one suite and it is hybrid.** A host without a PQ
+     *  verifier cannot check any manifest at all, so this is not a capability the loader
+     *  degrades around — it is part of what being a host means. All three targets supply
+     *  it from the same mldsa65.wasm (`pq.ts`, and native/mldsa.go through wazero).
+     *  `verifyManifest` still checks for it at runtime, for the untyped caller that got
+     *  here with a partial libsodium: the answer is a refusal naming the missing
+     *  verifier, never a fall back to the Ed25519 half alone (§14.1). */
+    ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
 }
 
 /** The surface *signing* a manifest needs — the build-side of the format. */
 export interface ManifestCrypto extends ManifestVerifier {
     crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
-    /** Required only to sign suite `0x02`; `signManifestHybrid` throws without it. */
-    ml_dsa65_sign_detached?(message: Uint8Array, sk: Uint8Array): Uint8Array;
+    /** The PQ half of the signature; `signManifest` throws without it rather than emit an
+     *  envelope missing it. */
+    ml_dsa65_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
 }
 
-/** An author's key set under the hybrid suite (§12.4). Both keys are the author's
- *  identity — see `hybridAuthorId` for why neither alone is. */
+/** An author's key set (§12.4). Both keys are the author's identity — see
+ *  `hybridAuthorId` for why neither alone is.
+ *
+ *  **Why "hybrid" is still in the name when there is only one suite.** It names the
+ *  *construction* — two signature algorithms, both required — not a choice between this
+ *  key set and some other kind. The operations have no such qualifier (`signManifest`,
+ *  `verifyManifest`) because there is one way to sign and one to verify; the things that
+ *  keep it are the ones whose shape would genuinely differ under another suite: this key
+ *  set, `hybridAuthorId`, and `hybridAuthorKeysFromSeed`. That split is deliberate, not
+ *  a leftover of the retired `0x01` fork. */
 export interface HybridAuthorKeys {
     ed: {
         publicKey: Uint8Array;
@@ -194,25 +202,22 @@ export interface HybridAuthorKeys {
     };
 }
 
-/** The public half of whatever key set signed a manifest. `mlDsa` is present exactly
- *  when the suite is `0x02` — so "was this bundle PQ-signed?" is answered by reading a
- *  field, not by re-deriving anything. */
+/** The public half of the key set that signed a manifest. Both keys, always: one suite,
+ *  and it signs with both — so "was this bundle PQ-signed?" is not a question a caller
+ *  has to ask. */
 export interface ManifestAuthorKeys {
     ed: Uint8Array;
-    mlDsa?: Uint8Array;
+    mlDsa: Uint8Array;
 }
 
-/** What a verified envelope yields. `author` is 32 bytes under every suite — the
- *  Ed25519 key under `0x01`, the derived id under `0x02` (`hybridAuthorId`) — so every
- *  consumer downstream (names, policy, freshness, routing) is suite-agnostic and needs
- *  no change when a suite is added. `authorKeys` and `suite` are for the few callers
- *  that legitimately care *how* it was signed: a policy that requires PQ signing
- *  (§12.5), or a shell showing an operator what they are admitting. */
+/** What a verified envelope yields. `author` is the 32-byte derived key-set id
+ *  (`hybridAuthorId`) — one derivation, so every consumer downstream (names, policy,
+ *  freshness, routing) reads one kind of identity. `authorKeys` is for the caller that
+ *  legitimately cares *which keys* signed: a shell showing an operator what they are
+ *  being asked to admit. */
 export interface VerifiedManifest {
     author: Uint8Array;
     authorKeys: ManifestAuthorKeys;
-    /** The manifest suite id the envelope was signed under (`SUITE_MANIFEST_*`). */
-    suite: number;
     manifest: BundleManifest;
 }
 
@@ -284,15 +289,12 @@ export interface BundleHost {
 }
 
 export interface VerifiedBundle {
-    /** The manifest author's 32-byte id: the Ed25519 public key under suite `0x01`, the
-     *  key-set hash under `0x02` (`hybridAuthorId`). Every signature the suite requires
-     *  verified under it. */
+    /** The manifest author's 32-byte id: the hash over its key set (`hybridAuthorId`).
+     *  Both signatures verified under the keys it commits to. */
     author: Uint8Array;
-    /** The public key(s) that actually signed, and the suite they signed under — what a
-     *  policy inspects to insist on PQ signing (§12.5), and what a shell shows an
-     *  operator being asked to consent. */
+    /** The public keys that actually signed — what a shell shows an operator being asked
+     *  to consent. */
     authorKeys: ManifestAuthorKeys;
-    suite: number;
     manifest: BundleManifest;
     /** Every module's verified bytes, in manifest order. */
     modules: {
@@ -401,12 +403,11 @@ export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: strin
 const SUITE_LEN = 1;
 const PK_LEN = 32;
 const SIG_LEN = 64;
-const OFF_PK = SUITE_LEN, OFF_SIG = OFF_PK + PK_LEN, OFF_JSON = OFF_SIG + SIG_LEN;
-// Suite 0x02 widths (FIPS 204 ML-DSA-65). Duplicated from pq.ts *deliberately*: these
-// are the envelope's field widths, which are frozen by the format, where pq.ts's are
-// the primitive's. The loader must be able to parse a hybrid envelope on a host with no
-// PQ implementation linked at all — it refuses it, but it refuses it as an unsupported
-// suite rather than as a truncated blob.
+// ML-DSA-65 widths (FIPS 204). Duplicated from pq.ts *deliberately*: these are the
+// envelope's field widths, which are frozen by the format, where pq.ts's are the
+// primitive's. The loader must be able to parse an envelope on a host with no PQ
+// implementation linked at all — it refuses it, but it refuses it as a suite it cannot
+// check rather than as a truncated blob.
 const ML_DSA_PK_LEN = 1952;
 const ML_DSA_SIG_LEN = 3309;
 // [suite(1)][edPk(32)][mlDsaPk(1952)][edSig(64)][mlDsaSig(3309)][json]
@@ -414,11 +415,11 @@ const ML_DSA_SIG_LEN = 3309;
 // Both public keys precede both signatures, so the key material is one contiguous run
 // and so is the signature material — a later suite adding a third key extends each run
 // rather than interleaving a new pair, and the offsets stay readable.
-const H_OFF_ED_PK = SUITE_LEN;
-const H_OFF_ML_PK = H_OFF_ED_PK + PK_LEN;
-const H_OFF_ED_SIG = H_OFF_ML_PK + ML_DSA_PK_LEN;
-const H_OFF_ML_SIG = H_OFF_ED_SIG + SIG_LEN;
-const H_OFF_JSON = H_OFF_ML_SIG + ML_DSA_SIG_LEN;
+const OFF_ED_PK = SUITE_LEN;
+const OFF_ML_PK = OFF_ED_PK + PK_LEN;
+const OFF_ED_SIG = OFF_ML_PK + ML_DSA_PK_LEN;
+const OFF_ML_SIG = OFF_ED_SIG + SIG_LEN;
+const OFF_JSON = OFF_ML_SIG + ML_DSA_SIG_LEN;
 /** Module names double as filenames and as the guest's module keys, so they are held
  *  to an unambiguous charset. With the container keyed by name (never joined to a
  *  path) a traversal name could not escape anything, but a name that needs quoting or
@@ -448,29 +449,27 @@ const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
 export function encodeManifest(m: BundleManifest): Uint8Array {
     return enc.encode(JSON.stringify(m));
 }
-/** The signed preimage: `DOMAIN_manifest ‖ suite ‖ json`. The prefix is signed but not
- *  stored; the suite byte is signed *and* stored (envelope byte 0), which is the point —
- *  a verifier reads it to know the field widths, and the signature it then checks
- *  commits to the same byte, so an attacker who rewrites it only invalidates the
- *  manifest. Algorithm confusion between two suites is unrepresentable rather than
- *  merely unlikely (§14.1). */
-function manifestPreimage(suite: number, json: Uint8Array): Uint8Array {
-    return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(suite), json]);
-}
-/** The suite `0x02` preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, signed
- *  by **both** keys.
+/** The signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, signed by
+ *  **both** keys.
  *
- *  Each signature therefore commits to the *other* key, which is what makes the pair a
- *  pair rather than two signatures that happen to travel together. Without it an
- *  attacker holding one broken half could keep the sound half's key and signature and
- *  substitute its own for the broken one; the id would change (below), but the two
- *  signatures would each still be valid over what they signed. Binding the key set into
- *  both preimages makes that splice fail at verification rather than only at policy. */
-function hybridPreimage(suite: number, edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
-    return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(suite), edPk, mlDsaPk, json]);
+ *  The domain prefix is signed but not stored; the suite byte is signed *and* stored
+ *  (envelope byte 0), which is the point — a verifier reads it to know the field widths,
+ *  and the signature it then checks commits to the same byte, so an attacker who rewrites
+ *  it only invalidates the manifest. Algorithm confusion with a later suite is
+ *  unrepresentable rather than merely unlikely (§14.1).
+ *
+ *  Each signature also commits to the *other* key, which is what makes the pair a pair
+ *  rather than two signatures that happen to travel together. Without it an attacker
+ *  holding one broken half could keep the sound half's key and signature and substitute
+ *  its own for the broken one; the id would change (below), but the two signatures would
+ *  each still be valid over what they signed. Binding the key set into both preimages
+ *  makes that splice fail at verification rather than only at policy. */
+function manifestPreimage(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
+    return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, json]);
 }
-/** The author id under a multi-key suite: `genesisHash(DOMAIN_manifest_author ‖ suite ‖
- *  edPk ‖ mlDsaPk)`.
+/** The author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. One
+ *  suite, so this is the *only* way an author id comes to exist — nothing downstream has
+ *  to ask which rule produced the 32 bytes it holds.
  *
  *  **Why the id is not simply the Ed25519 key.** The author id is what policy admits
  *  (§12.5), what freshness is keyed by, and what leads every app key (§5.1) — so it
@@ -485,45 +484,72 @@ function hybridPreimage(suite: number, edPk: Uint8Array, mlDsaPk: Uint8Array, js
  *  `appKeyFor` parses a fixed-length author prefix, policy files list 64 hex characters,
  *  routing and freshness marks are keyed by it. A suite that widened the id would
  *  change all of that; hashing keeps every one of them untouched while the key material
- *  under it changes shape. The one cost is that an author migrating from `0x01` to
- *  `0x02` gets a *new* identity — new app keys, a fresh freshness lineage, a new
- *  policy entry. That is a real cost and it is the honest one: the new identity is a
- *  different (stronger) statement about who signed, so pretending it is the old one
- *  would be the bug. Operators run both entries during an overlap.
+ *  under it changes shape.
  *
  *  **The suite is fixed inside, not a parameter.** This derivation is `0x02`'s, and the
- *  suite byte is in the preimage so it cannot collide with another suite's id over the
+ *  suite byte is in the preimage so it cannot collide with a later suite's id over the
  *  same keys. A later multi-key suite writes its own function rather than passing a
  *  different byte to this one — its key set is a different shape, so there is nothing to
  *  share but the mistake of deriving two identities the same way. */
 export function hybridAuthorId(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]), null);
 }
-/** Sign a manifest → envelope `[suite(1)][authorPk(32)][sig(64)][utf8 json]`. */
-export function signManifest(sodium: ManifestCrypto, sk: Uint8Array, pk: Uint8Array, m: BundleManifest): Uint8Array {
-    const json = encodeManifest(m);
-    const suite = SUITE_MANIFEST_GENESIS;
-    const sig = sodium.crypto_sign_detached(manifestPreimage(suite, json), sk);
-    return concatBytes([Uint8Array.of(suite), pk, sig, json]);
+/** What deriving an author's key set needs: the two keygens and the hash between them. */
+export interface AuthorSeedCrypto {
+    crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
+    crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
+    ml_dsa65_keypair_from_seed(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
-/** Sign a manifest under the hybrid suite → envelope
+/** An author's whole key set from ONE 32-byte seed: the Ed25519 half from the seed
+ *  directly, the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)`.
+ *
+ *  **The other half of the identity rule, and it belongs here rather than in each build
+ *  script.** `hybridAuthorId` above says what an author id *is*; this says how an
+ *  operator's one stored key becomes the key set that id is taken over. Every publisher
+ *  needs it — the runtime's own transport bundle, seedstore's storage bundle, the chat
+ *  demo signing in the browser — and each one deriving it independently is a rule with no
+ *  owner: the copies agree until one does not, and the failure is a *changed author id*,
+ *  which is not a crash but a bundle that lands under a stranger's name and a policy pin
+ *  that matches nobody. No test catches that, because each copy agrees with itself.
+ *
+ *  **Why derived rather than a second stored key.** Two key files is two things to lose,
+ *  and losing either loses the identity as surely as losing both — the id is the hash
+ *  over the pair. One seed keeps "back up this file" true, and keeps a rebuild from that
+ *  file byte-identical in author id, which is what lets a publisher re-cut a bundle
+ *  without every operator re-pinning.
+ *
+ *  Takes the 32-byte SEED, not libsodium's 64-byte secret key: a caller holding the
+ *  latter passes `sk.slice(0, 32)`, since that key is `seed ‖ pk` and the seed is the
+ *  part that actually determines the identity. */
+export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Array): HybridAuthorKeys {
+    if (seed.length !== 32) {
+        throw new Error(`bundle: an author seed is 32 bytes, got ${seed.length}` +
+            " (holding libsodium's 64-byte secret key? pass sk.slice(0, 32))");
+    }
+    return {
+        ed: sodium.crypto_sign_seed_keypair(seed),
+        mlDsa: sodium.ml_dsa65_keypair_from_seed(
+            sodium.crypto_generichash(32, concatBytes([seed, AUTHOR_MLDSA_SEED_LABEL]), null)),
+    };
+}
+/** Sign a manifest → envelope
  *  `[0x02][edPk(32)][mlDsaPk(1952)][edSig(64)][mlDsaSig(3309)][utf8 json]`.
  *
  *  Both signatures are over the same preimage, so there is no ordering to get wrong and
- *  nothing a verifier must reconstruct in a particular sequence. Throws if the crypto
- *  has no ML-DSA signer — a build that cannot produce the PQ half must fail at the
- *  build, never quietly emit a `0x01` envelope the author believed was hybrid. */
-export function signManifestHybrid(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest): Uint8Array {
+ *  nothing a verifier must reconstruct in a particular sequence. Throws if the crypto has
+ *  no ML-DSA signer — a build that cannot produce the PQ half fails at the build, which
+ *  is the whole reason there is no second envelope to fall back to. */
+export function signManifest(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: BundleManifest): Uint8Array {
     if (!sodium.ml_dsa65_sign_detached) {
-        throw new Error("bundle: no ML-DSA-65 signer — cannot sign manifest suite 0x02");
+        throw new Error("bundle: no ML-DSA-65 signer — cannot sign a manifest");
     }
     const json = encodeManifest(m);
-    const suite = SUITE_MANIFEST_HYBRID_PQ;
-    const pre = hybridPreimage(suite, keys.ed.publicKey, keys.mlDsa.publicKey, json);
+    const pre = manifestPreimage(keys.ed.publicKey, keys.mlDsa.publicKey, json);
     const edSig = sodium.crypto_sign_detached(pre, keys.ed.privateKey);
     const mlSig = sodium.ml_dsa65_sign_detached(pre, keys.mlDsa.privateKey);
     return concatBytes([
-        Uint8Array.of(suite), keys.ed.publicKey, keys.mlDsa.publicKey, edSig, mlSig, json,
+        Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), keys.ed.publicKey, keys.mlDsa.publicKey,
+        edSig, mlSig, json,
     ]);
 }
 /** Structural check on a parsed manifest. Runs only *after* the signature
@@ -617,62 +643,49 @@ function isValidManifest(m: unknown): m is BundleManifest {
  *  if a signature is bad. Throws `bundle: malformed manifest` when the body is
  *  validly signed but is not parseable JSON of the expected shape — a signed-but-
  *  broken manifest is a fail-loud condition, not an untrusted input to drop — and
- *  throws on a suite this host cannot check at all (unknown id, or `0x02` with no
+ *  throws on a suite this host cannot check at all (any id but `0x02`, or `0x02` with no
  *  ML-DSA verifier linked), which is a legibility failure rather than a verdict. */
 export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): VerifiedManifest | null {
     if (env.length < SUITE_LEN)
         return null;
-    // Suite before offsets: another suite's key and signature are other widths, so
+    // Suite before offsets: a later suite's keys and signatures are other widths, so
     // parsing first would read its bytes at this suite's positions. Unlike a bad
     // signature this is not an authenticity verdict but a legibility one — "this bundle
     // wants a host I am not" — so it throws with its own message rather than returning
     // null, which would surface to the operator as `manifest signature invalid` and send
     // them hunting the wrong problem. Nothing secret is revealed by the distinction: the
-    // suite byte is attacker-chosen and public either way.
+    // suite byte is attacker-chosen and public either way. `0x01`, the retired
+    // Ed25519-only genesis suite, is refused here as exactly what it now is: a suite this
+    // host does not implement (§14.1).
     const suite = env[0];
-    let author;
-    let authorKeys;
-    let json;
-    if (suite === SUITE_MANIFEST_GENESIS) {
-        if (env.length < OFF_JSON)
-            return null;
-        author = env.slice(OFF_PK, OFF_SIG);
-        authorKeys = { ed: author };
-        const sig = env.slice(OFF_SIG, OFF_JSON);
-        json = env.slice(OFF_JSON);
-        if (!sodium.crypto_sign_verify_detached(sig, manifestPreimage(suite, json), author))
-            return null;
-    }
-    else if (suite === SUITE_MANIFEST_HYBRID_PQ) {
-        // A host with no PQ verifier linked in cannot form an opinion about this bundle, so
-        // it says so — the one thing it must not do is treat "I cannot check the PQ half"
-        // as "the PQ half is fine" and fall back to the Ed25519 signature alone, which is
-        // precisely the downgrade the suite exists to prevent (§14.1).
-        if (!sodium.ml_dsa65_verify_detached) {
-            throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
-        }
-        if (env.length < H_OFF_JSON)
-            return null;
-        const edPk = env.slice(H_OFF_ED_PK, H_OFF_ML_PK);
-        const mlPk = env.slice(H_OFF_ML_PK, H_OFF_ED_SIG);
-        const edSig = env.slice(H_OFF_ED_SIG, H_OFF_ML_SIG);
-        const mlSig = env.slice(H_OFF_ML_SIG, H_OFF_JSON);
-        json = env.slice(H_OFF_JSON);
-        const pre = hybridPreimage(suite, edPk, mlPk, json);
-        // BOTH, always. Not "either", which would be no stronger than the weaker half, and
-        // not "the PQ one where present", which would be a young algorithm carrying the
-        // whole weight. A break in either half rejects valid bundles (an operator's
-        // problem, recoverable) instead of admitting forged ones (unrecoverable).
-        if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk))
-            return null;
-        if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk))
-            return null;
-        author = hybridAuthorId(sodium, edPk, mlPk);
-        authorKeys = { ed: edPk, mlDsa: mlPk };
-    }
-    else {
+    if (suite !== SUITE_MANIFEST_HYBRID_PQ) {
         throw new Error(`bundle: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
     }
+    // A host with no PQ verifier linked in cannot form an opinion about this bundle, so
+    // it says so — the one thing it must not do is treat "I cannot check the PQ half"
+    // as "the PQ half is fine" and fall back to the Ed25519 signature alone, which is
+    // precisely the downgrade the suite exists to prevent (§14.1).
+    if (!sodium.ml_dsa65_verify_detached) {
+        throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
+    }
+    if (env.length < OFF_JSON)
+        return null;
+    const edPk = env.slice(OFF_ED_PK, OFF_ML_PK);
+    const mlPk = env.slice(OFF_ML_PK, OFF_ED_SIG);
+    const edSig = env.slice(OFF_ED_SIG, OFF_ML_SIG);
+    const mlSig = env.slice(OFF_ML_SIG, OFF_JSON);
+    const json = env.slice(OFF_JSON);
+    const pre = manifestPreimage(edPk, mlPk, json);
+    // BOTH, always. Not "either", which would be no stronger than the weaker half, and
+    // not "the PQ one where present", which would be a young algorithm carrying the
+    // whole weight. A break in either half rejects valid bundles (an operator's
+    // problem, recoverable) instead of admitting forged ones (unrecoverable).
+    if (!sodium.crypto_sign_verify_detached(edSig, pre, edPk))
+        return null;
+    if (!sodium.ml_dsa65_verify_detached(mlSig, pre, mlPk))
+        return null;
+    const author = hybridAuthorId(sodium, edPk, mlPk);
+    const authorKeys = { ed: edPk, mlDsa: mlPk };
     let parsed;
     try {
         parsed = JSON.parse(dec.decode(json));
@@ -726,7 +739,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
             throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
         }
     }
-    return { author, authorKeys, suite, manifest: parsed };
+    return { author, authorKeys, manifest: parsed };
 }
 /** True if `bytes` content hashes to the declared genesisHash hex (integrity). */
 export function contentMatches(bytes: Uint8Array, declaredHex: string, genesisHash: (b: Uint8Array) => Uint8Array): boolean {
@@ -962,7 +975,6 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     const result = {
         author: v.author,
         authorKeys: v.authorKeys,
-        suite: v.suite,
         manifest: v.manifest,
         modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
         guestSource: dec.decode(read(GUEST_FILE)),
@@ -1080,7 +1092,7 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
         }
     }
     return {
-        manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, suite: v.suite,
+        manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
         guestSource: v.guestSource,
     };
 }

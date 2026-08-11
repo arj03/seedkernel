@@ -8,8 +8,8 @@
 // practice.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync } from "node:fs";
-import { testkit } from "./testkit.mjs";
+import { readFileSync, existsSync } from "node:fs";
+import { testkit, makeAuthor } from "./testkit.mjs";
 // The same assembler the build signs through, imported rather than mirrored: these
 // bundles must be signed over the byte-for-byte guest production signs, and a second copy
 // of the part order here would quietly sign a different program (scripts/guest-source.mjs).
@@ -25,7 +25,7 @@ const { createShell } = await imp("build/host/shell-core.js");
 const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
-const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
+const { FreshnessMarks, signManifest, hybridAuthorId, hybridAuthorKeysFromSeed, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
@@ -38,21 +38,40 @@ const assert = ok;
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
-// The artifact is PQ-signed by default (§14.1): the id policy pins under `0x02` is a
-// key-set hash, so a regression to the genesis suite would change every pin silently.
-assert(transportVerified.suite === 0x02, "the shipped transport bundle is hybrid-signed (suite 0x02)");
-assert(transportVerified.authorKeys.mlDsa !== undefined, "…and carries the ML-DSA-65 public key");
+// The artifact is PQ-signed (§14.1) — there is one suite and it is hybrid, so the id
+// policy pins is a key-set hash and both keys are on the verified result.
+assert(transportVerified.authorKeys.mlDsa !== undefined,
+  "the shipped transport bundle carries the ML-DSA-65 public key of its signing key set");
+
+// The build script derives the author's key set from its seed with its OWN copy of that
+// derivation — it has to, since it runs before build/ exists (scripts/build-transport-
+// bundle.mjs) — so this pins the copy against `hybridAuthorKeysFromSeed`, the one every
+// other publisher calls. A drift between them does not fail any build: it silently
+// re-identifies this artifact's author and invalidates every operator's pinned id, which
+// is exactly the class of bug a comment saying "keep these identical" does not catch.
+// The seed is per-clone and gitignored; the build writes it, so it is here after one.
+{
+  const keyPath = join(root, "transport", "author.key");
+  if (existsSync(keyPath)) {
+    const seed = Uint8Array.from(Buffer.from(readFileSync(keyPath, "utf8").trim(), "hex"));
+    const keys = hybridAuthorKeysFromSeed(sodium, seed);
+    const derived = Buffer.from(
+      hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey)).toString("hex");
+    assert(derived === transportAuthor,
+      "the shared seed→key-set derivation reproduces the shipped bundle's author id");
+  }
+}
 
 // A SECOND transport, version 2, signed by a different author — the realistic upgrade
 // shape, and the one that exercises both admission gates at once: the `mount` grant
 // must list the new author, and the freshness floor (which v1 set to 1) must be
 // cleared by the new version. Same guest program, because what is under test is the
 // swap and not a different protocol.
-const upgradeKeys = (() => {
-  const kp = sodium.crypto_sign_keypair();
-  return { publicKey: kp.publicKey, privateKey: kp.privateKey };
-})();
-const upgradeAuthor = Buffer.from(upgradeKeys.publicKey).toString("hex");
+// A whole author identity (§12.4): both halves of the key set, and the derived id policy
+// actually pins — never either key alone (testkit.mjs).
+const upgrade = makeAuthor(sodium);
+const upgradeKeys = { ed: upgrade.ed, mlDsa: upgrade.mlDsa };
+const upgradeAuthor = Buffer.from(upgrade.id).toString("hex");
 
 // `guestSource` overrides the artifact's guest — the only caller that passes one hands in
 // a program that cannot compile, to fail the load at the point where the DRIVER stands
@@ -81,7 +100,7 @@ function transportBundleAt(version, keys, guestSource) {
       ],
     },
   };
-  const env = signManifest(sodium, keys.privateKey, keys.publicKey, manifest);
+  const env = signManifest(sodium, keys, manifest);
   return packBundle({ [MANIFEST_FILE]: env, "guest.js": guest, "ws.wasm": wsWasm });
 }
 

@@ -42,11 +42,10 @@
 //   admitAll         — "the bundle my operator handed me" (StorageNode posture)
 //   interactive      — the caller writes their own, e.g. a per-bundle consent dialog
 //
-// `manifestSuiteAllowlist` is an axis rather than a posture: which signature
-// suites (§12.4) an operator will accept, composed with any of the above through
-// `allOf`. It is policy and not verifier logic because "can this host check suite N"
-// and "will this deployment trust suite N" are different questions — a node finishing a
-// post-quantum migration answers yes to the first for 0x01 and no to the second.
+// There is no signature-suite axis here. With one manifest suite (§12.4, §14.1) "can
+// this host check how it was signed" and "will this deployment trust how it was signed"
+// have collapsed into the same question, and the verifier already answers it: an envelope
+// it cannot check is refused before a predicate ever sees it.
 //
 // Deny-all stays the default: the absent predicate admits nothing.
 
@@ -164,10 +163,9 @@ export const mountClaimsNoProtocol: Admit = (v) => {
 export const hostGates: Admit = allOf(notRevoked, wholePrivileges, mountClaimsNoProtocol, freshVersion);
 
 /** A predicate that checks the manifest author's id against a closed set.
- *  `authors` strings are hex author ids, case-insensitive — an Ed25519 pubkey under
- *  manifest suite `0x01`, the derived key-set id under the hybrid suite `0x02`
- *  (`hybridAuthorId`, §12.4). One 32-byte id either way, so an operator pins an
- *  identity here without knowing which suite produced it.
+ *  `authors` strings are hex author ids, case-insensitive — the derived key-set id
+ *  (`hybridAuthorId`, §12.4), which is what an author id is: one derivation, one shape,
+ *  32 bytes.
  *
  *  It says nothing about what it guards: the same constructor builds the list of authors
  *  who may load at all and the list of those who may hold a given privilege, and a policy
@@ -176,18 +174,6 @@ export const hostGates: Admit = allOf(notRevoked, wholePrivileges, mountClaimsNo
 export function authorAllowlist(authors: string[]): Admit {
   const set = new Set(authors.map((a) => a.toLowerCase()));
   return (v) => set.has(toHex(v.author));
-}
-
-/** A predicate restricting which manifest signature suites may land (§12.4, §14.1).
- *
- *  The verifier accepts every suite it can *check*; this is the separate question of
- *  which ones an operator is willing to *trust*, and it is policy because the answer is
- *  deployment-specific: a node that has finished migrating sets `[2]` and stops
- *  accepting Ed25519-only manifests, which is the only way the classical suite ever
- *  actually goes away. Absent, every supported suite is admitted. */
-export function manifestSuiteAllowlist(suites: number[]): Admit {
-  const set = new Set(suites);
-  return (v) => set.has(v.suite);
 }
 
 /** Trust keyed on CAPABILITY: `base` decides a bundle that reaches no privilege, and a
@@ -252,7 +238,7 @@ function authorList(value: unknown, name: string): string[] {
  *  Throws on malformed input — a typo fails the boot loudly rather than
  *  silently widening trust.
  *
- *      { "authors": ["<hex>"], "grants": { "mount": ["<hex>"] }, "manifestSuites": [2] }
+ *      { "authors": ["<hex>"], "grants": { "mount": ["<hex>"] } }
  *
  *  `authors` is who may load a bundle that reaches no privilege; each key of `grants` is
  *  a privilege from the catalog (`PRIVILEGES`) and lists who may hold THAT. An operator
@@ -287,6 +273,12 @@ export function parsePolicy(json: string): Admit {
   if (o.transportAuthors !== undefined) {
     throw new Error('policy: "transportAuthors" is gone — the transport is not a class, it is the "mount" privilege; write "grants": { "mount": [...] }');
   }
+  // Refused rather than ignored for the same reason: there is one manifest suite (§12.4,
+  // §14.1), so a file that still lists them is written against a runtime where the choice
+  // existed. Ignoring it would silently admit whatever a `[1]` meant to exclude.
+  if (o.manifestSuites !== undefined) {
+    throw new Error('policy: "manifestSuites" is gone — there is one manifest suite (0x02, hybrid Ed25519 + ML-DSA-65) and the verifier refuses anything else; drop the field');
+  }
   const appAuthors = o.authors === undefined ? undefined : authorList(o.authors, "authors");
   const grants: Partial<Record<Privilege, Admit>> = {};
   const granted: string[] = [];
@@ -308,22 +300,7 @@ export function parsePolicy(json: string): Admit {
   if (!appAuthors && granted.length === 0) {
     throw new Error('policy: provide "authors", "grants", or both');
   }
-  let base = appAuthors ? authorAllowlist(appAuthors) : denyAll;
-  // `manifestSuites` is optional and, like everything else here, strict.
-  // Absent ⇒ any suite the host can verify.
-  if (o.manifestSuites !== undefined) {
-    if (!Array.isArray(o.manifestSuites)
-      || o.manifestSuites.some((x) => typeof x !== "number" || !Number.isInteger(x))) {
-      throw new Error('policy: "manifestSuites" must be an array of integer suite ids');
-    }
-    const suites = o.manifestSuites as number[];
-    if (suites.length === 0) throw new Error('policy: "manifestSuites" must list at least one suite id');
-    // The suite axis cuts across every grant — it is about how a bundle was signed, not
-    // about what it reaches — so it ANDs into each.
-    const suiteOk = manifestSuiteAllowlist(suites);
-    base = allOf(base, suiteOk);
-    for (const name of granted) grants[name as Privilege] = allOf(grants[name as Privilege]!, suiteOk);
-  }
+  const base = appAuthors ? authorAllowlist(appAuthors) : denyAll;
   return byPrivilege({ base, grants });
 }
 

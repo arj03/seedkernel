@@ -39,6 +39,18 @@ export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
  *  domain so a derived seed can never coincide with any other hash this system computes,
  *  and so the label space stays private to subkeys.ts. */
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
+/** Author key-set derivation (§12.4): the label hashed with an author's Ed25519 seed to
+ *  get the ML-DSA-65 seed of the same identity, so **one stored key is the whole author**
+ *  and a rebuild from it is the same author id. See `hybridAuthorKeysFromSeed`
+ *  (bundle.ts), which is the one implementation every consumer should call.
+ *
+ *  **These bytes are frozen.** The author id is a hash over both public keys, so changing
+ *  this label re-derives the PQ half and therefore re-identifies *every* author built
+ *  from a seed — new app keys, a dead freshness lineage, and every pinned id in every
+ *  operator's policy file pointing at nobody. It is a KDF label rather than a signing
+ *  prefix, hence no trailing NUL: it is never a signature preimage, and the disjointness
+ *  rule above is about the prefixes that are. */
+export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 // ── The guest seam's version ────────────────────────────────────────────────────
 /** The guest ABI version — which shape of `host.call` a guest was written against
  *  (§12.2). A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
@@ -237,17 +249,22 @@ export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
 // clock. They are independent namespaces and always were; the channel half sat here only
 // as a leftover of the pre-bundle transport. See §14.1, and docs/PROTOCOL.md for the
 // channel suite ids themselves.
-/** Bundle manifest (§12.4): Ed25519 detached signature over `DOMAIN_manifest ‖ suite ‖ json`. */
-export const SUITE_MANIFEST_GENESIS = 0x01;
-/** Bundle manifest (§12.4): **hybrid** Ed25519 + ML-DSA-65 (FIPS 204). Both signatures
- *  are made over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json` and **both must
- *  verify** — the classical half stays load-bearing while the PQ half is young, so a
- *  flaw in ML-DSA fails *closed* (valid bundles rejected) rather than open (forged
- *  bundles admitted), and the bundle is no weaker than `0x01` against a classical
- *  attacker (§14.1).
+/** Bundle manifest (§12.4), and the ONLY manifest suite: **hybrid** Ed25519 + ML-DSA-65
+ *  (FIPS 204). Both signatures are made over `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖
+ *  json` and **both must verify** — the classical half stays load-bearing while the PQ
+ *  half is young, so a flaw in ML-DSA fails *closed* (valid bundles rejected) rather than
+ *  open (forged bundles admitted), and the bundle is no weaker than a classical-only one
+ *  against a classical attacker (§14.1).
  *
  *  This is the migration that can never get cheaper than a coordinated rebuild: a PQ
  *  verifier cannot be delivered as a bundle, because the classical verifier would be
  *  the thing admitting it. So it goes into the artifact *ahead* of need, unlike the
- *  channel suite, which is content and can wait for a credible break (§14.1). */
+ *  channel suite, which is content and can wait for a credible break (§14.1).
+ *
+ *  `0x01` was the Ed25519-only genesis suite and is **retired, not deprecated**: every
+ *  target ships the PQ verifier and every artifact is built hybrid, so a second live
+ *  value would have bought a second envelope branch, a second author-id derivation and a
+ *  policy dial to eventually turn it off — machinery whose entire purpose was migrating a
+ *  population that never existed. The byte is spent (§14.1): a later suite takes `0x03`,
+ *  and an envelope opening `0x01` is refused as the unknown suite it now is. */
 export const SUITE_MANIFEST_HYBRID_PQ = 0x02;

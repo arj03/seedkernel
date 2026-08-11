@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import _sodium from "libsodium-wrappers-sumo";
-import { testkit } from "./testkit.mjs";
+import { testkit, makeAuthor } from "./testkit.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
@@ -21,6 +21,15 @@ const { readMemoryLimits, checkModuleMemory } = await imp("build/core/wasm-limit
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
+// ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
+// is signed and verified with both halves of the author's key set (§12.4), so a bare
+// libsodium cannot sign one.
+const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
+withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
+/** A manifest author: both halves of the key set, plus the 32-byte id they derive —
+ *  which is the identity policy pins and app keys lead with (testkit.mjs). `ed` doubles
+ *  as a node identity where a block needs one. */
+const testAuthor = () => makeAuthor(sodium);
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
@@ -94,8 +103,8 @@ console.log("\n§12.2 — fs is scoped per app key");
 
 console.log("\n§12.4 — every app is a guest, modules are its library");
 {
-  const kp = sodium.crypto_sign_keypair();
-  const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp.privateKey, kp.publicKey, m));
+  const kp = testAuthor();
+  const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp, m));
   // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: this is the
   // manifest a bundle written against the retired module-only format produces, so its
   // author has to learn the rule, not read "malformed manifest".
@@ -221,7 +230,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // The regression that let safe-js's deadlineMs rot: a bound declared on every
   // interface between the operator and the realm, and passed by none of them. This
   // drives createShell with a stub realm factory and asserts the numbers arrive.
-  const kp = sodium.crypto_sign_keypair();
+  const kp = testAuthor();
   const guestSrc = 'register("handle", () => new Uint8Array([1]));';
   const guestBytes = new TextEncoder().encode(guestSrc);
   const manifest = {
@@ -229,14 +238,14 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires: [] },
   };
   const blob = packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, kp.privateKey, kp.publicKey, manifest),
+    [MANIFEST_FILE]: signManifest(sodium, kp, manifest),
     [GUEST_FILE]: guestBytes,
   });
 
   let seen = null;
   const shell = createShell({
     platform: {
-      sodium, identity: kp, table: new ModuleTable(), fs: new MemoryFs(),
+      sodium, identity: kp.ed, table: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen = o;
@@ -256,9 +265,9 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // §12.5 — uninstalling a GUEST-ONLY app reports success. An app is its modules and
   // its realm, and this bundle legitimately declares no modules at all, so a count of
   // dropped modules is the wrong answer to "was there anything here".
-  ok(shell.uninstall(appKeyFor(kp.publicKey, "probe")) === true,
+  ok(shell.uninstall(appKeyFor(kp.id, "probe")) === true,
     "uninstalling a guest-only app reports success, not 'nothing there'");
-  ok(shell.uninstall(appKeyFor(kp.publicKey, "probe")) === false,
+  ok(shell.uninstall(appKeyFor(kp.id, "probe")) === false,
     "uninstalling it twice reports nothing the second time");
   shell.close();
 
@@ -268,7 +277,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   let seen2 = null;
   const bare = createShell({
     platform: {
-      sodium, identity: kp, table: new ModuleTable(), fs: new MemoryFs(),
+      sodium, identity: kp.ed, table: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen2 = o;
@@ -291,7 +300,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   // The wiring used to come off the transport driver, which admitted such an app and then
   // failed it at its first `host.call` — a manifest the loader accepted naming a backend
   // nothing had wired.
-  const kp = sodium.crypto_sign_keypair();
+  const kp = testAuthor();
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
@@ -307,13 +316,13 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
       guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires },
     };
     return packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, kp.privateKey, kp.publicKey, manifest),
+      [MANIFEST_FILE]: signManifest(sodium, kp, manifest),
       [GUEST_FILE]: guestBytes,
     });
   };
   const newShell = () => createShell({
     platform: {
-      sodium, identity: kp, table: new ModuleTable(),
+      sodium, identity: kp.ed, table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
     },
     admit: admitAll,
@@ -354,7 +363,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const entries = [];
   const stub = createShell({
     platform: {
-      sodium, identity: kp, table: new ModuleTable(),
+      sodium, identity: kp.ed, table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
     },
@@ -364,7 +373,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   await stub.runGuest("arm", new Uint8Array());
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
-  ok(stub.uninstall(appKeyFor(kp.publicKey, "ticker")) === true, "the app uninstalls with a deadline still pending");
+  ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);
   stub.close();

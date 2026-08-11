@@ -16,6 +16,9 @@
 // `testkit({ verbose: false })` silences the per-check `ok:` lines — for a suite
 // that already reports a result per test and only wants the failures counted.
 
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 export function testkit({ verbose = true } = {}) {
   let pass = 0, fail = 0;
   const cleanups = [];
@@ -59,4 +62,33 @@ export function testkit({ verbose = true } = {}) {
     process.exit(fail === 0 ? 0 : 1);
   };
   return { assert, ok, throws, note, sleep, keep, test, summary };
+}
+
+// The author helper below reaches the loader's own derivations rather than restating
+// them — a test-side copy of an identity rule would agree with itself and with nothing
+// else. Resolved from this file's location so a test file's own root juggling is not
+// part of it; every suite runs after `npm run build`, so build/ is there.
+const { hybridAuthorId, hybridAuthorKeysFromSeed } = await import(
+  pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle.js")).href);
+
+/** A manifest author (seedkernel §12.4), for tests that sign one: the Ed25519 half, the
+ *  ML-DSA-65 half, and the 32-byte id the two derive. `signManifest` takes the whole
+ *  object, and everything the runtime keys by an author — a policy pin, an app key, a
+ *  freshness mark — takes `.id`, so no test can pin half an identity and no test file has
+ *  to remember which half is which.
+ *
+ *  Built through the SHIPPED seed→key-set derivation, so every suite that signs a bundle
+ *  exercises the rule real publishers use rather than a test-local imitation of it.
+ *
+ *  Takes the `sodium` the caller already has, because the test files reach the crypto
+ *  differently (`crypto-node`'s readied instance, or a bare libsodium with ML-DSA mixed
+ *  in) — and it must be the SAME instance the test verifies with, or the id is hashed by
+ *  one implementation and checked by another. Requires ML-DSA-65 to be mixed in already
+ *  (`withMlDsa65`); without it a manifest cannot be signed at all.
+ *
+ *  Fresh keys per call: bundle freshness is keyed by `(author, app)`, so tests sharing an
+ *  author would inherit each other's high-water marks. */
+export function makeAuthor(sodium) {
+  const keys = hybridAuthorKeysFromSeed(sodium, sodium.randombytes_buf(32));
+  return { ...keys, id: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey) };
 }

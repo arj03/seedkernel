@@ -166,9 +166,15 @@ async function main() {
     return concat(parts);
   };
 
-  // The author's key set under suite 0x02: the Ed25519 key from the seed, and the
-  // ML-DSA-65 key derived from the SAME seed, so one key file holds the whole
-  // identity and a rebuild with the same key is the same author (§12.4).
+  // The author's key set: the Ed25519 key from the seed, and the ML-DSA-65 key derived
+  // from the SAME seed, so one key file holds the whole identity and a rebuild with the
+  // same key is the same author (§12.4).
+  //
+  // This mirrors `hybridAuthorKeysFromSeed` (host/bundle.ts), which is the one
+  // implementation every OTHER publisher calls — and it is a mirror only because this
+  // script must run before build:host on a clean checkout, so there is no build/ to
+  // import from. Keep the two byte-identical: a drift here does not fail, it silently
+  // re-identifies this artifact's author and invalidates every operator's pin.
   const kp = sodium.crypto_sign_seed_keypair(seed);
   const pqSeed = sodium.crypto_generichash(32, concat([seed, PQ_SEED_LABEL]));
   const mldsa = makeMlDsa(readFileSync(join(root, "browser", "mldsa65.wasm")));
