@@ -94,7 +94,7 @@ const POLYFILLS = `
   //
   // Everything here goes to STDERR, through the bridge rather than the WASI fd — which
   // is also why the fd stays disconnected. Stdout is the operator's channel: it carries
-  // \`bridge.log\`'s lines and, for --get with no --out, the app's raw response bytes, and
+  // \`bridge.log\`'s lines and, for --op with no --out, the app's raw response bytes, and
   // a diagnostic interleaved into that corrupts a piped response.
   //
   // Guarded on the bridge, so this replaces console only in the HOST realm. A confined

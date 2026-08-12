@@ -562,23 +562,25 @@ list is not one.
 
 ### 12.8 The shell
 
-`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — the module table, the bundle loader under its admission policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `runGuest`, `serve`). The CLI over it is `host/cli.ts`:
+`boot(opts)` (`host/main.ts`, `./shell`) assembles all of the above — the module table, the bundle loader under its admission policy, the fs/net capability backends, the node identity — and returns a `Shell` (`loadBundle`, `invoke`, `dispatch`, `serve`). The CLI over it is `host/cli.ts`:
 
 ```sh
 node build/host/main-node.js --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
      --bundle ./app-bundle [--transport ./transport.skb] [--peers <pk>@host:port,…] \
      [--contact-secret ./contact.hex] [--app-config ./app.json] \
-     [--revoke <hex,…>] [--uninstall <appKey,…>] [--request-deadline <ms>] \
-     [--put file] [--get hex[:hex…] --out file] \
-     [--guest-timeout <ms>] [--guest-memory <MiB>]
+      [--revoke <hex,…>] [--uninstall <appKey,…>] [--request-deadline <ms>] \
+      [--op name  < argument > response] \
+      [--guest-timeout <ms>] [--guest-memory <MiB>]
 ```
 
 **The CLI is shared code, not a per-target wrapper.** `runCli` (`host/cli.ts`) owns the flag set, the defaults (`--dir ./data`, `--key ./seedkernel.key`), the deny-all reading of an absent `--policy` (§14), the order — remedies, then the bundle, then the one-shots, then serve (§12.5) — and every line printed. A target supplies a `CliHost`: files, one console line, raw stdout, entropy, and "stand a node up on this platform". That is five members, none of which decides anything, and it is the whole difference between running a node on Node and running one from the native binary (§12.9). Argument *tokenizing* is not the point of sharing it — a dozen lines that fail loudly — the flag set and the sequence are, because a decision made twice is one that eventually gets made differently. Unknown flags are refused rather than ignored, which is the failure that used to be silent: a mistyped `--polcy` produced a deny-all node that boots, serves, installs nothing, and looks exactly like a policy doing its job.
 
 `--transport` supplies a signed transport bundle from disk instead of the artifact the build embeds (`TRANSPORT_BUNDLE_B64`) — a node with its own pinned transport author, or a newer protocol than the binary ships (§12.6). `--contact-secret` names a *file* holding 64 hex characters (§12.6.3), never the secret itself: an argument is visible in `ps` output and shell history.
 
-A serving node that has loaded a bundle runs the app's *initiator* side on demand (`runGuest` → `realm.call`) **and** serves its *request* side from the **same** confined realm (`serve` routes the transport's inbound requests to the guest's `handle` entrypoint through the same `realm.call`). Both may `await`; the realm serializes them (§12.3), and the driver answers an inbound request through the `respond` entrypoint on a later turn, never inline — which is what lets an app's inbound handling be asynchronous at all. The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§12.9). seed store's WASM README has a complete storage walkthrough.
+**`--op` names an op the CLI does not know, and that is the whole of its app-facing surface.** One flag rather than one per operation, because an op is a name travelling in `handle`'s payload (§12.2) and the runtime passes it through unread: a storage `put` and a chat `render` are reachable the same way, and neither is spelled anywhere in the kernel. **stdin is the argument and stdout is the response** — `handle`'s ABI exactly, bytes in and bytes out — so nothing here decodes, formats, or knows an app's argument shape. Neither a flag per operation nor a *choice* of argument flag can avoid knowing it, since which one an operator needs is decided by the app; composing bytes is the shell's job. `log` therefore goes to **stderr** on both targets, since an operator line landing in the middle of a response would corrupt a redirect. The op targets the app `--bundle` just loaded, addressed by the key that load returned — not by "the only app", which a node with a network cannot mean, since its transport is an ordinary app too (§12.10).
+
+A serving node that has loaded a bundle serves the app's *request* side from its confined realm: an inbound frame reaches the guest's **one** entrypoint, `handle`, with the authenticated sender prepended (`dispatch` → `realm.call`), and the host drives the app's local logic through the **same** `handle` by a loopback — `invoke(op, payload)` writes the host's own caller id (32 zero bytes) and the op envelope, and the op travels in the payload. An app therefore has one op vocabulary rather than two: a peer's frame and the host's loopback both arrive as `handle([caller 32][body …])`, and a guest registers `handle` and `timer` — nothing else is ever invoked. **The envelope is the ABI's, not each app's:** the preamble ships `callerOf(arg)` → `{fromHost, caller, body}` and `readOp`/`writeOp` over `[opLen u8][op][args]`, mirrored host-side by `opCall`/`opHeader`/`readOp` (`host/guest-seam.ts`), so the shape that replaced the second entrypoint namespace has one definition rather than one per program. The op is a **name**, never a tag byte — collapsing many entrypoints onto one call must not smuggle in a number two sides have to agree on — and the shell passes it through without reading it. Both directions may `await`; the realm serializes them (§12.3), and the driver resumes on the promise the app's `handle` returned rather than answering inline — which is what lets an app's inbound handling be asynchronous at all. The shell is application-neutral — it can host any signed app — and for a self-contained non-browser deployment the Go/native target ships it as a single binary (§12.9). seed store's WASM README has a complete storage walkthrough.
 
 ### 12.9 The Go/native shell — the primary non-browser deployment
 
@@ -615,7 +617,7 @@ Go-native primitives back the capability seams: `os` for the §12.1 fs backend, 
 seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
      --listen 0.0.0.0:7000 [--ws-listen 0.0.0.0:7001] \
      --bundle ./app-bundle [--peers <pk>@host:port,…] \
-     [--put file] [--get hex[:hex…] --out file]
+     [--op name  < argument > response]
 ```
 
 Go's side of it is five primitives — `argv`, `readFile`, `writeFile`, `log`, `stdout` —

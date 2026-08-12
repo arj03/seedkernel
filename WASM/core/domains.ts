@@ -76,7 +76,7 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  and preamble into every page that verifies a bundle, including pages that only
  *  inspect one and never build a seam at all. guest-seam.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
-export const GUEST_ABI_VERSION = 4;
+export const GUEST_ABI_VERSION = 5;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
  *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (guest-seam.ts)
  *  is total over this list: a host that has that file has every name in it, so a partial

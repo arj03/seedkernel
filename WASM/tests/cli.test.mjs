@@ -74,6 +74,9 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
     writeFile(path, bytes) { written.set(path, bytes); },
     log(line) { lines.push(line); },
     stdout(bytes) { host.out = bytes; },
+    /** `--op`'s argument. Nothing in these cases pipes one in, which is the same answer
+     *  a real target gives for a terminal stdin: this op takes no argument. */
+    stdin: () => new Uint8Array(0),
     sodium,
     async standUp(cfg) {
       host.stood = cfg;
@@ -81,7 +84,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
         revoke: () => [],
         uninstall: () => false,
         loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
-        runGuest: async () => new Uint8Array(0),
+        invoke: async () => new Uint8Array(0),
         serve: async () => {},
         close: () => { host.closed = true; },
         // The node's transport driver — the one field the flow reads its ports and its

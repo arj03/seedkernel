@@ -276,7 +276,7 @@ func realmCall(entry string, payload []byte) ([]byte, error) {
 
 // TestCallRealmReleasesStagedArgs covers the argument staging: callRealm lands each
 // argument on a __aN global for the duration of the call and must release it when the
-// call returns — otherwise a one-shot op (a --put of a large file, an uninstall after
+// call returns — otherwise a one-shot op (an --op put of a large file, an uninstall after
 // which nothing else runs) leaves its payload rooted on the global object for the
 // process's life.
 func TestCallRealmReleasesStagedArgs(t *testing.T) {

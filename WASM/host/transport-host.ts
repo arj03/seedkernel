@@ -42,7 +42,7 @@
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
-import type { RawNet } from "./guest-seam.js";
+import { opHeader, type RawNet } from "./guest-seam.js";
 
 /** 32-byte lowercase hex. A manual scan rather than a regex literal, so it stays safe
  *  under the minifier (scripts/minify.mjs), which has no lexer to tell a regex from a
@@ -147,22 +147,22 @@ export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
 /** `[caller 32][nameLen u8][name utf8]` for one op, built once and shared.
  *
- *  The op set is fixed and tiny — nine names, all string literals in this file — while
- *  this header is rebuilt on the INBOUND FRAME PATH: once per socket read, per link. A
- *  `TextEncoder` run and a fresh allocation there price a constant, so the constant is
- *  computed once. Shared safely because nothing mutates a header: `Args` only ever pushes
- *  it into a parts list that `build()` copies OUT of.
+ *  The LAYOUT is the seam's (`opHeader`, guest-seam.ts) — the same bytes the guest
+ *  preamble's `readOp` reads back — and what this adds is the memo. The op set is fixed
+ *  and tiny (nine names, all string literals in this file) while the header is rebuilt on
+ *  the INBOUND FRAME PATH: once per socket read, per link. A `TextEncoder` run and a
+ *  fresh allocation there price a constant, so the constant is computed once. Shared
+ *  safely because nothing mutates a header: `Args` only ever pushes it into a parts list
+ *  that `build()` copies OUT of.
  *
- *  The leading 32 bytes stay zero — the caller id for "the host itself", where an app's
- *  cross-realm call carries its own app key (shell-core.ts). */
+ *  The leading 32 bytes stay zero — the caller id for "the host itself", which is
+ *  `opHeader`'s default, where an app's cross-realm call carries its own app key
+ *  (shell-core.ts). */
 const OP_HEADERS = new Map<string, Uint8Array>();
-function opHeader(op: string): Uint8Array {
+function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
   if (h === undefined) {
-    const name = enc.encode(op);
-    h = new Uint8Array(32 + 1 + name.length);
-    h[32] = name.length;
-    h.set(name, 33);
+    h = opHeader(op);
     OP_HEADERS.set(op, h);
   }
   return h;
@@ -184,7 +184,7 @@ class Args {
    *  `linkBytes` is a copy of the frame itself on every socket read. */
   constructor(op = "") {
     this.op = op;
-    if (op !== "") this.raw(opHeader(op));
+    if (op !== "") this.raw(hostOpHeader(op));
   }
   u8(v: number): this {
     const b = new Uint8Array(1);

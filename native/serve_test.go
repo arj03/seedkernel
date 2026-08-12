@@ -72,14 +72,16 @@ globalThis.__requester = null;
 // the id the transport claims, so there is nothing host-side to call instead.
 globalThis.loadIntoRequester = (bytes) => __requesterShell.loadBundleBlob(new Uint8Array(bytes));
 globalThis.ask = async (appKey, sendArgs) => {
-  const r = await __requesterShell.runGuest("send", new Uint8Array(sendArgs), appKey);
+  // The op is a NAME the shell frames (invoke, shell-core.ts) — the probe app's own
+  // local vocabulary, which the shell passes through without reading.
+  const r = await __requesterShell.invoke("send", new Uint8Array(sendArgs), appKey);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 };
 `
 
 // requesterAppKey is the app key the probe bundle binds under on the requester — the
-// handle `ask` addresses it by, since a request is a runGuest into an app.
+// app `ask` invokes, since a request is a local loopback into an app.
 var requesterAppKey string
 
 // startRequester boots the second node, loads the probe app into it, and returns its

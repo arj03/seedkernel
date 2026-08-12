@@ -19,7 +19,7 @@
 // true instead of true-by-convention.
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, genesisHash, privilegesOf, verifyBundle, installBundle, type BundleCrypto, type BundleHost, type FreshnessStore, type LoadedBundle, type VerifiedBundle } from "./bundle.js";
-import { createGuestSeam, appSignScope, transportSignScope, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, appSignScope, transportSignScope, opCall, readOp, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -259,11 +259,26 @@ export interface Shell {
      *  edits to the policy allowlist. Recovery is a new author key, which derives new
      *  names and a fresh mark (§5.1) — not an un-revoke. */
     revoke(authorHex: string): string[];
-    /** Run one of a loaded bundle's guest entrypoints through a generic
-     *  guest seam over the host's primitives. `appKey` defaults to the
-     *  only loaded app; throws when more than one is loaded and no key is
-     *  given. */
-    runGuest(entry: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
+    /** Invoke a loaded app's one entrypoint, `handle`, as the HOST itself: the shell
+     *  writes `[caller 32][opLen u8][op][payload]` — the host's caller id (32 zero
+     *  bytes, the same "host itself" id a guest reads with `callerOf`) followed by the
+     *  op envelope — and hands it to the guest.
+     *
+     *  The op travels IN the payload, so an app has one op vocabulary whether a peer
+     *  called it (`dispatch`) or the host did: there is no second, per-entrypoint
+     *  namespace. It is a NAME rather than a tag byte and the shell never reads it —
+     *  passing an app's own vocabulary through untouched is the point — but the shell
+     *  does own the FRAMING, because the guest half of it ships in the preamble
+     *  (`readOp`, guest-seam.ts) and a format written on one side of a seam and
+     *  open-coded on the other is a format with two definitions.
+     *
+     *  `appKey` defaults to the only loaded app — the transport not counted, since it is
+     *  reached through its driver and never through here — and throws when more than one
+     *  is loaded and no key is given. Addressed by app key rather than by protocol id
+     *  because a protocol claim is legitimately absent — an initiator-only app claims
+     *  nothing (bundle.ts) — and routing the loopback would force such an app to expose
+     *  an inbound surface merely to be locally drivable. */
+    invoke(op: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
      *  `senderPk ‖ payload`. Null when no installed app claims the protocol.
@@ -305,10 +320,12 @@ export { ModuleTable } from "./module-table.js";
  *  re-implementing the module table, guest-seam wiring, preamble assembly, realm
  *  creation, and transport routing. */
 /** An app's ONE inbound entrypoint (§12.10): the authenticated `senderPk ‖ payload`
- *  in, the response bytes out, or null for "this app answers nothing". Every app is a
- *  guest, so every entry resolves to its realm's `handle` and therefore returns a
- *  Promise — there is no second, synchronous shape. */
-type AppEntry = (input: Uint8Array) => Promise<Uint8Array> | null;
+ *  in, the response bytes out. Every app is a guest, so every entry resolves to its
+ *  realm's `handle` and therefore returns a Promise — there is no second, synchronous
+ *  shape, and no "this app answers nothing" case either: a slot that exists has a realm
+ *  to reach, and "nobody claims this id" is the absence of a SLOT, answered by the two
+ *  callers that resolve one (`doDispatch`, `crossRealmCall`). */
+type AppEntry = (input: Uint8Array) => Promise<Uint8Array>;
 
 /** The answer to a `_host` op that reports rather than asks. */
 const EMPTY = new Uint8Array(0);
@@ -506,19 +523,28 @@ export function createShell(opts: CreateShellOptions & {
      *  transport — which is exactly why replacing a transport needs no handover. A
      *  replacement re-`attach`es this same object to the new claimant. */
     let netHost: TransportHost | null = null;
-    // The tail of every initiator `runGuest` call. close() defers realm disposal onto
+    // The tail of every initiator `invoke` call. close() defers realm disposal onto
     // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
     // is never resumed into a freed realm — a QuickJS use-after-free (§2.1).
     let inFlight = Promise.resolve();
     /** The one app that was loaded, when exactly one is installed. Throws when zero
      *  or multiple apps are present, so callers that omit an explicit appKey get a
      *  clear error rather than silent ambiguity. */
+    /** The one app a bare `invoke` means, or an error naming what is ambiguous.
+     *
+     *  It counts APPS, not slots: the transport occupies a slot like any other app —
+     *  that is the point of §12.10 — but it is never what a host loopback addresses,
+     *  because the host reaches it through the driver it stands (`netHost`) rather than
+     *  through `invoke`. Counting slots would make the default unusable on every node
+     *  that has a network, which is every node not deliberately offline: loading one
+     *  ordinary bundle would already be "multiple apps loaded". */
     const onlyApp = () => {
-        if (apps.size === 0)
+        const loaded = [...apps.values()].filter((s) => !s.isTransport);
+        if (loaded.length === 0)
             throw new Error("shell: load a bundle first (loadBundleBlob)");
-        if (apps.size > 1)
+        if (loaded.length > 1)
             throw new Error("shell: multiple apps loaded — supply appKey");
-        return [...apps.values()][0];
+        return loaded[0];
     };
     /** An empty slot for `loaded`, with its timer table already pointed at the realm
      *  the slot does not have yet.
@@ -556,7 +582,7 @@ export function createShell(opts: CreateShellOptions & {
     };
     /** The confined realm for `slot`, created lazily on first use through the
      *  platform's factory. Both roles share it and both reach it the same way — the
-     *  initiator (`runGuest`) and the holder (`dispatch`) each `realm.call`, and the
+     *  initiator (`invoke`) and the holder (`dispatch`) each call `handle`, and the
      *  realm serializes them, so one runs to completion before the next begins. Lazy
      *  because the JS factory pulls in a heavy engine, and because a node may serve for
      *  a long time before its first guest call.
@@ -708,15 +734,15 @@ export function createShell(opts: CreateShellOptions & {
         if (routes.get(NET_PROTOCOL) !== appKeyFor(caller.loaded.author, caller.loaded.manifest.app)) {
             return Promise.reject(new Error(`shell: ${SHELL_PROTOCOL} is the transport's, and this realm does not claim ${NET_PROTOCOL}`));
         }
-        const nameLen = payload[0];
-        const op = dec.decode(payload.slice(1, 1 + nameLen));
-        const a = payload.slice(1 + nameLen);
+        // The same envelope every call in this system carries, read with the same
+        // function the guest half writes with (`writeOp`, guest-seam.ts).
+        const { op, args: a } = readOp(payload);
         switch (op) {
             // An inbound request the transport attributed: route it to the app claiming the
-            // protocol and hand back its answer. This is `transport/deliver` and the
-            // `respond` entrypoint at once — the transport does not await it (it must not;
-            // realm-queue.ts) but resumes on the returned promise, which is the same
-            // later turn the old `respond` ran on.
+            // protocol and hand back its answer. Delivery and the reply are ONE call — the
+            // transport does not await it (it must not; realm-queue.ts) but resumes on the
+            // returned promise, on a later turn, which is what an asynchronous app handler
+            // needs and what a second reply entrypoint would only have simulated.
             //
             // The shell's own protocols get first refusal (`opts.answer`), which is the
             // §12.10 reservation as a seam rather than as a wrapper around a driver
@@ -851,10 +877,9 @@ export function createShell(opts: CreateShellOptions & {
      *
      *  There is no branch on how the app is implemented — every app presents the same
      *  `senderPk ‖ payload` shape and the same single entry, resolved at install
-     *  (`entryFor`). The answer is the realm's — a Promise, which the driver already
-     *  expects from `RequestHandler` and answers through the `respond` entrypoint on a
-     *  later turn rather than inline (transport-host.ts) — the seam an asynchronous
-     *  holder needs, since `fs` is async (core/fs.ts). */
+     *  (`entryFor`). The answer is the realm's — a Promise the transport resumes on, on a
+     *  later turn rather than inline (transport-host.ts) — the seam an asynchronous holder
+     *  needs, since `fs` is async (core/fs.ts). */
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
         const key = routes.get(proto);
         const slot = key ? apps.get(key) : undefined;
@@ -932,7 +957,9 @@ export function createShell(opts: CreateShellOptions & {
             // table reads `slot.realm` off the object `newHolder` returned, so a copy
             // would leave every deadline firing into a slot that never gets a realm.
             const slot: AppSlot = Object.assign(newHolder(loaded), {
-                entry: (() => null) as AppEntry,
+                // A placeholder that would be a bug if it ever ran, and says so — it is
+                // replaced on the very next statement, with no yield in between.
+                entry: (() => { throw new Error("shell: entry read before it was wired"); }) as AppEntry,
                 isTransport,
             });
             slot.entry = entryFor(slot);
@@ -985,12 +1012,17 @@ export function createShell(opts: CreateShellOptions & {
             }
             return gone;
         },
-        async runGuest(entry, payload, appKey) {
+        async invoke(op, payload, appKey) {
             const slot = appKey ? apps.get(appKey) : onlyApp();
             if (!slot)
                 throw new Error(`shell: no app '${appKey}' loaded`);
-            const r = await ensureRealm(slot);
-            const call = r.call(entry, payload);
+            // The loopback: the host calls the app's ONE entrypoint with the host's own
+            // caller id (32 zero bytes), exactly as a remote frame carries its peer's key —
+            // one shape, one attribution rule, so the app reads one `handle` either way.
+            // The envelope is written by the seam that defines it (`opCall`), not here and
+            // not by the caller: an op is a NAME the shell passes through without reading,
+            // which is the whole of what the shell knows about an app's vocabulary.
+            const call = slot.entry(opCall(op, payload));
             inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
             return call;
         },

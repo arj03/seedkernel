@@ -96,7 +96,7 @@
   },
   "dependencies": {
     "libsodium-wrappers-sumo": "0.8.4",
-    "quickjs-emscripten": "^0.32.0",
+    "quickjs-emscripten-core": "^0.32.0",
     "werift": "^0.23.0"
   },
   "devDependencies": {

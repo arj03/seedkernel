@@ -68,7 +68,8 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  await b.loadBundleBlob(__probe);
 		  b.transport.addPeerAddr(aId, { host: "127.0.0.1", port: a.transport.%s, transport: "%s" });
 		  // The send op's own argument order (transport/src/core.js):
-		  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME and
+		  // the caller id are the shell's framing (invoke), never written here.
 		  const proto = new TextEncoder().encode("probe");
 		  const payload = new Uint8Array([10, 20, 30]);
 		  const args = new Uint8Array(1 + 4 + 4 + 32 + 4 + proto.length + 4 + payload.length);
@@ -81,7 +82,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  args.set(proto, off); off += proto.length;
 		  dv.setUint32(off, payload.length); off += 4;
 		  args.set(payload, off);
-		  const r = await b.runGuest("send", args, %q);
+		  const r = await b.invoke("send", args, %q);
 		  if (r[0] !== 1) throw new Error("net: request failed");
 		  return r.slice(1);
 		};

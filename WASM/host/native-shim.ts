@@ -58,15 +58,18 @@ declare const bridge: {
   /** Write a whole file atomically (temp + rename). `mode` is a POSIX permission bit
    *  set, or 0 to leave the platform default. */
   writeFile(path: string, bytes: Uint8Array, mode: number): void;
-  /** One console line on the real stdout. QuickJS's own `console.log` writes to a WASI
-   *  stdout wazero leaves disconnected, so operator output cannot go through it. */
+  /** One operator line on stderr. QuickJS's own `console.log` writes to a WASI stdout
+   *  wazero leaves disconnected, so operator output cannot go through it — and stdout is
+   *  the DATA channel (`stdout` below), which an operator line would corrupt. */
   log(line: string): void;
   /** One diagnostic line on stderr — where every `console.*` in this realm goes
    *  (host/native-polyfills.ts), so that a diagnostic can never land in the middle of
    *  the operator's stdout. */
   logErr(line: string): void;
-  /** Raw bytes on stdout — `--get` with no `--out` writes the app's response verbatim. */
+  /** Raw bytes on stdout — `--op` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
+  /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
+  stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
   /** Invoke an entrypoint. Returns 1 when the guest handed its answer to a later turn
    *  (the preamble's `defer()`), which frees the realm for the next invocation before
@@ -610,6 +613,7 @@ function nativeCliHost(): CliHost {
         writeFile(path, bytes, mode) { bridge.writeFile(path, bytes, mode ?? 0); },
         log(line) { bridge.log(line); },
         stdout(bytes) { bridge.stdout(bytes); },
+        stdin() { return new Uint8Array(bridge.stdin()); },
         sodium,
         async standUp(cfg: NodeSetup) {
             // Where this node's disk is, and who may install on it — both before the

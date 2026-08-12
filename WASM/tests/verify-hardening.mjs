@@ -257,7 +257,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     realmMemoryBytes: 7 * 1024 * 1024,
   });
   await shell.loadBundleBlob(blob);
-  await shell.runGuest("handle", new Uint8Array());
+  await shell.invoke("probe", new Uint8Array());
   ok(seen !== null, "the shell created a realm for the loaded guest");
   ok(seen && seen.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen && seen.deadlineMs})`);
   ok(seen && seen.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
@@ -287,7 +287,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     admit: admitAll,
   });
   await bare.loadBundleBlob(blob);
-  await bare.runGuest("handle", new Uint8Array());
+  await bare.invoke("probe", new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
@@ -304,10 +304,18 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    register("arm", (p) => { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); });
-    register("clear", (p) => { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); });
+    // One entrypoint: handle reads [caller 32][opLen u8][op][args] through the preamble's
+    // own callerOf/readOp, and the ops are this app's local vocabulary — arm [id][ms],
+    // clear [id], fired. timer is the kernel's deadline callback and is reached by the
+    // shell, never by invoke.
+    register("handle", (arg) => {
+      const { op, args: p } = readOp(callerOf(arg).body);
+      if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
+      if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
+      if (op === "fired") return new Uint8Array(fired);
+      return new Uint8Array(0);
+    });
     register("timer", (a) => { fired.push(a[3]); return new Uint8Array(0); });
-    register("fired", () => new Uint8Array(fired));
   `;
   const guestBytes = new TextEncoder().encode(guestSrc);
   const mkBlob = (requires) => {
@@ -330,19 +338,19 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 
   const shell = newShell();
   await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await shell.runGuest("arm", new Uint8Array([7, 5]));       // id 7, in 5ms
+  await shell.invoke("arm", new Uint8Array([7, 5]));    // arm: id 7, in 5ms
   await sleep(80);
-  const fired = await shell.runGuest("fired", new Uint8Array());
+  const fired = await shell.invoke("fired", new Uint8Array());
   ok(fired.length === 1 && fired[0] === 7,
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
   // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
   // it back: the id is the GUEST's throughout, so the host keeps no second name for it.
-  await shell.runGuest("arm", new Uint8Array([9, 5]));
-  await shell.runGuest("arm", new Uint8Array([9, 5]));
-  await shell.runGuest("clear", new Uint8Array([9]));
+  await shell.invoke("arm", new Uint8Array([9, 5]));
+  await shell.invoke("arm", new Uint8Array([9, 5]));
+  await shell.invoke("clear", new Uint8Array([9]));
   await sleep(80);
-  const after = await shell.runGuest("fired", new Uint8Array());
+  const after = await shell.invoke("fired", new Uint8Array());
   ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
   shell.close();
 
@@ -351,7 +359,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const ungated = newShell();
   await ungated.loadBundleBlob(mkBlob([]));
   let refused = false;
-  try { await ungated.runGuest("arm", new Uint8Array([1, 1])); } catch { refused = true; }
+  try { await ungated.invoke("arm", new Uint8Array([1, 1])); } catch { refused = true; }
   ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
   ungated.close();
 
@@ -370,7 +378,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
     admit: admitAll,
   });
   await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await stub.runGuest("arm", new Uint8Array());
+  await stub.invoke("arm", new Uint8Array([0, 0]));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
   ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");

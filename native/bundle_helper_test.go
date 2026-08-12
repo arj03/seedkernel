@@ -382,18 +382,20 @@ func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, gues
 // what these tests drive is the path a deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given (minus the 32-byte
-// sender key the shell prepends), and `send` is one request out, its argument bytes
-// exactly the `send` op's own (transport/src/core.js) behind the op name this side
-// writes.
+// sender key the shell prepends) and, for a local loopback (the host's 32 zero-byte
+// caller id), the `send` op is one request out — its argument bytes exactly the `send`
+// op's own (transport/src/core.js) behind the op name this side writes. The envelope is
+// read and written with the preamble's own callerOf/readOp/writeOp (guest-seam.ts), so
+// this probe carries the same call shape a real app does.
 const probeGuestSource = `
-	register("handle", (arg) => arg.slice(32));
-	register("send", (arg) => {
-	  const op = "send";
-	  const out = new Uint8Array(1 + op.length + arg.length);
-	  out[0] = op.length;
-	  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i);
-	  out.set(arg, 1 + op.length);
-	  return host.call("_net", out);
+	register("handle", (arg) => {
+	  const { fromHost, body } = callerOf(arg);
+	  if (fromHost) {
+	    const { op, args } = readOp(body);
+	    if (op === "send") return host.call("_net", writeOp("send", args));
+	    return new Uint8Array(0);
+	  }
+	  return body;
 	});
 `
 

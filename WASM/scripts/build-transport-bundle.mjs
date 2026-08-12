@@ -34,7 +34,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers-sumo";
-import { readGuestSource } from "./guest-source.mjs";
+import { readGuestSource, readGuestAbi } from "./guest-source.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -198,7 +198,10 @@ async function main() {
     protocols: ["_net"],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
-      abi: 4,
+      // Read off the seam this program is compiled against, never retyped: a bundle
+      // whose declared ABI and actual ABI can differ is one that loads and then
+      // misreads its own arguments (the failure `guest.abi` exists to make loud).
+      abi: readGuestAbi(),
       // EXACTLY the authorities this program holds — and, since the list is grants only,
       // exactly what an operator is agreeing to when they grant it `link`. `node/sign` +
       // `node/verify` (scoped signing and its verification twin) and `node/random`
@@ -214,7 +217,7 @@ async function main() {
       // Its ws.wasm and its crypto are absent because neither is a grant and neither can
       // be missing — a bare `host.call` name reaches modules that arrived in this same
       // signed bundle, and the primitive catalog is total on any host that has a guest
-      // seam at all. What this program needs of them is `abi: 4` above (§12.1).
+      // seam at all. What this program needs of them is the `abi` above (§12.1).
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",

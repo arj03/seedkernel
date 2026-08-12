@@ -30,7 +30,7 @@ const { ModuleTable } = await imp("build/host/module-table.js");
 const { GUEST_ABI_VERSION, NET_PROTOCOL } = await imp("build/core/domains.js");
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
-const { harnessAppBlob, PROTO } = await imp("tests/transport-harness.mjs");
+const { harnessAppBlob, appRequest } = await imp("tests/transport-harness.mjs");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
@@ -116,21 +116,7 @@ const appKey = `${appAuthorHex}:harness`;
 
 /** One request out of `shell`, through its app, to `to` — the path a deployment uses. */
 async function request(shell, to, payload) {
-  const p = new TextEncoder().encode(PROTO);
-  const out = new Uint8Array(1 + 4 + 4 + 32 + 4 + p.length + 4 + payload.length);
-  let off = 0;
-  out[off++] = 0;
-  const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
-  u32(0);
-  u32(32);
-  out.set(Buffer.from(to, "hex"), off); off += 32;
-  u32(p.length);
-  out.set(p, off); off += p.length;
-  u32(payload.length);
-  out.set(payload, off);
-  const r = await shell.runGuest("send", out, appKey);
-  if (r[0] !== 1) throw new Error("net: request failed");
-  return r.slice(1);
+  return appRequest(shell, appKey, to, payload);
 }
 
 async function makeNode(channels, listen) {

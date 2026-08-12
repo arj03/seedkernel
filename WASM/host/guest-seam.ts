@@ -343,10 +343,24 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
         },
     };
 }
-/** The guest-side ABI preamble: `host.call(name, bytes)` over the single seam, plus
- *  `register`/`__invoke` for entrypoint dispatch. Pure JS — it names no authority, so
- *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
- *  shape to call through.
+/** The guest-side ABI preamble: `host.call(name, bytes)` over the single seam,
+ *  `register`/`__invoke` for entrypoint dispatch, and the call envelope those
+ *  invocations carry (`callerOf`, `readOp`, `writeOp`). Pure JS — it names no
+ *  authority, so evaluating it in a zero-authority realm grants nothing; it only gives
+ *  the guest a shape to call through.
+ *
+ *  `register` is a generic mechanism, not an open vocabulary. The SHELL invokes exactly
+ *  two names — `handle` (an app's one inbound/op entrypoint, reached by `dispatch` and
+ *  by the host's own `invoke` loopback, the op travelling in the payload) and `timer`
+ *  (a fired deadline). A guest that registers anything else is writing an entrypoint
+ *  nothing will ever call; its local ops belong in `handle`'s payload, so an app has one
+ *  op vocabulary instead of a per-entrypoint one.
+ *
+ *  Which is why the ENVELOPE is here too. A fixed entrypoint vocabulary only moves the
+ *  vocabulary problem if the shape that replaced it is left for each app to invent: the
+ *  op name, the caller prefix and the host's zero id are one contract, so they are
+ *  written once — here, next to the `register` they are the argument of, and mirrored by
+ *  `opCall`/`opHeader` below for the host side of the same bytes.
  *
  *  ONE definition for every target: a bundle
  *  ships a single `guest.js` that runs byte-identical on the node/browser host (safe-js.ts)
@@ -419,6 +433,52 @@ globalThis.host = {
 };
 globalThis.__entries = Object.create(null);
 globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
+// ── the call envelope (§12.2) ───────────────────────────────────────────────
+//
+// One entrypoint means one argument shape, and these are it — declared HERE, in the
+// preamble, because the shape is a contract between the runtime and signed content
+// rather than an app's private convention. Before this, every app re-derived the same
+// three lines (an 'is the caller all zeros' scan, a length-prefixed name read, the
+// same written backwards for a cross-realm call), and they drifted: one program read
+// the op as a name and another as a byte its host had to agree on.
+//
+//   handle(arg)  =  [caller 32][body …]
+//
+// 'callerOf' splits that, and 'fromHost' is the one distinction the HOST makes for the
+// guest: the id is the host's to write, so 32 zero bytes means the host itself (no app
+// key derives it, shell-core.ts) and anything else is a peer's key or a co-resident
+// app's. What is IN the body is the app's business — a peer's frame is whatever the
+// app's protocol says, and only a call from the host or from another realm carries the
+// op envelope below.
+globalThis.callerOf = (arg) => {
+  const caller = arg.subarray(0, 32);
+  let fromHost = true;
+  for (let i = 0; i < 32; i++) { if (caller[i] !== 0) { fromHost = false; break; } }
+  return { fromHost, caller, body: arg.subarray(32) };
+};
+// [opLen u8][op ascii][args …] — the op envelope, read. The discriminator is a NAME,
+// never a tag byte: collapsing many entrypoints onto one call must not smuggle in a
+// number two sides have to agree on, and an op a program does not implement then fails
+// loud by name. Malformed framing throws rather than reading a truncated name, which a
+// caller would see as an unimplemented op.
+globalThis.readOp = (body) => {
+  const n = body.length > 0 ? body[0] : -1;
+  if (n < 0 || body.length < 1 + n) throw new Error("guest: malformed op envelope");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
+  return { op, args: body.subarray(1 + n) };
+};
+// The same, written — for a guest calling ANOTHER realm ('host.call("_net", …)'),
+// where the host prepends the caller id and the envelope is the guest's to write.
+// ASCII by construction: an op name is a literal in guest source, and charCodeAt keeps
+// this free of a TextEncoder no fresh realm is guaranteed to have.
+globalThis.writeOp = (op, args) => {
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(args, 1 + op.length);
+  return out;
+};
 // Set by defer() and read by the host once the invocation's synchronous segment ends —
 // see the note on defer below. Cleared per invocation, never by the guest.
 globalThis.__deferred = false;
@@ -451,13 +511,59 @@ globalThis.__invoke = (name, argBuf) => {
   // Cleared HERE rather than by the host, so the flag describes exactly this
   // invocation and a guest cannot leave it set for the next one.
   globalThis.__deferred = false;
-  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
-  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
-  // __norm normalizes both to an ArrayBuffer.
+  // A synchronous entrypoint (a holder's 'handle' answering from memory) returns bytes
+  // directly; an async entrypoint (a 'handle' that awaits the network) returns a guest
+  // promise the host settles. __norm normalizes both to an ArrayBuffer.
   const out = fn(new Uint8Array(argBuf));
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
+// ── the call envelope, host side ────────────────────────────────────────────
+//
+// The mirror of `callerOf`/`readOp` in the preamble above, and deliberately in the same
+// file: these two functions and those three write and read the SAME bytes, so a change
+// to the layout is one edit rather than a search for everyone who open-coded it. Before
+// they existed the layout was hand-written at five call sites across three repositories
+// — the CLI, the transport driver, a storage node, a browser shell and a guest building
+// a cross-realm call — and one of them had drifted to an op BYTE.
+/** The host's own caller id: 32 zero bytes, "the host itself". No app key derives it
+ *  (an app's id is a hash of its key, shell-core.ts) and no peer key is it, so a guest
+ *  reading `callerOf(arg).fromHost` is reading an unforgeable fact. */
+export const HOST_CALLER_ID = new Uint8Array(32);
+/** `[caller 32][opLen u8][op]` — the header of one call, without its arguments. For a
+ *  caller that concatenates its own fields behind it and would otherwise copy the whole
+ *  payload a second time to put a header in front (transport-host.ts `Args`, which
+ *  builds this once per op and reuses it on the inbound frame path). */
+export function opHeader(op: string, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
+    const name = enc.encode(op);
+    // ASCII, because the guest reads it back with charCodeAt (no fresh realm is
+    // guaranteed a TextDecoder) and because a length in BYTES that a guest counts in
+    // UTF-16 code units is a framing bug waiting for its first non-ASCII op.
+    if (name.length !== op.length || name.length > 255)
+        throw new Error(`guest-seam: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
+    const out = new Uint8Array(caller.length + 1 + name.length);
+    out.set(caller, 0);
+    out[caller.length] = name.length;
+    out.set(name, caller.length + 1);
+    return out;
+}
+/** `[caller 32][opLen u8][op][args]` — one whole call, as an app's `handle` reads it
+ *  (`callerOf` then `readOp`). The default caller is the host's own id, which is what
+ *  `Shell.invoke` writes; the transport driver passes its own. */
+export function opCall(op: string, args: Uint8Array, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
+    const head = opHeader(op, caller);
+    return concatBytes([head, args]);
+}
+/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`,
+ *  for the shell reading a guest's cross-realm call to its own `_host` id. Same bytes,
+ *  same failure: malformed framing throws rather than yielding a truncated name that
+ *  the caller would then see reported as an unimplemented op. */
+export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
+    const n = payload.length > 0 ? payload[0] : -1;
+    if (n < 0 || payload.length < 1 + n)
+        throw new Error("guest-seam: malformed op envelope");
+    return { op: dec.decode(payload.subarray(1, 1 + n)), args: payload.subarray(1 + n) };
+}
 /** The authority catalog — declared in core/domains.ts and re-exported so a reader of the
  *  seam finds it beside the names it governs. A bundle's signed manifest declares the
  *  authorities its guest holds (its `requires`), the loader checks them against this table

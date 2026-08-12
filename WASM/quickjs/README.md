@@ -22,12 +22,17 @@ removes.
   `--pre-js` files and `EXPORTED_RUNTIME_METHODS` list).
 - **`dist/`** — the built artifact, checked in so a clone runs without emsdk:
   - `emscripten-module.wasm` + `emscripten-module.mjs` — the engine and its
-    MODULARIZE glue (node ESM, `EXPORT_NAME=QuickJSRaw`).
+    MODULARIZE glue (ESM, `EXPORT_NAME=QuickJSRaw`). Built for
+    `ENVIRONMENT=web,node`: the browser apps vendor this same `dist/` and load
+    it off a static server, and one glue that picks its loader at runtime beats
+    a second `.browser.mjs` to keep in sync.
   - `ffi.mjs` — the cwrap bindings, generated from `csrc/interface.c`
     (the vendored copy IS the ABI contract the build's export list is drawn
     from).
   - `variant.mjs` — the quickjs-emscripten "variant" object that wires
-    `ffi.mjs` + the glue into `newQuickJSWASMModule`.
+    `ffi.mjs` + the glue into `newQuickJSWASMModuleFromVariant`. Reached as the
+    package export `seedkernel-wasm/quickjs`, which is the specifier
+    `safe-js.ts` names on every target.
 
 ## Rebuilding
 
@@ -51,3 +56,9 @@ quickjs-ng 0.12.1; nothing on npm ships 0.16.1. The native loader already
 built its own 0.16.1 blob (`native/qjs/`), so the node side is the
 odd-one-out only because its engine came from npm. This artifact is that
 same owning-the-blob pattern applied to the emscripten build.
+
+What stays from npm is `quickjs-emscripten-core`, the JS API layer over the
+`QTS_*` ABI (`csrc/interface.c` is that ABI's other half, forked from the same
+release). The `quickjs-emscripten` umbrella is deliberately **not** a
+dependency: its added value is bundling default variants, which it does with
+static imports of four Bellard-flavoured engines this realm never runs.

@@ -196,7 +196,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         async loadBundle(file) {
             return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
         },
-        runGuest: core.runGuest,
+        invoke: core.invoke,
         dispatch: core.dispatch,
         serve: core.serve,
         close() { core.close(); channels.close(); },

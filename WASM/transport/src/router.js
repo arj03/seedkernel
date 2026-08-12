@@ -261,8 +261,8 @@ class ReqRes {
       const payload = frame.slice(6 + idLen);
       // Dispatched with `.then`, never awaited: the answer comes back through THIS
       // realm's queue, so a frame that awaited it would be holding the queue against
-      // its own reply (realm-queue.ts). The continuation runs on a later turn, which
-      // is exactly where the old `respond` entrypoint ran.
+      // its own reply (realm-queue.ts). The continuation runs on a later turn, which is
+      // where an answer to an inbound request belongs.
       hostDeliver(fromHex(from), proto, payload).then(
         (resp) => this.respond(corr, noReply, from, resp),
         // A protocol nobody claims, or an app whose handler threw: the request is

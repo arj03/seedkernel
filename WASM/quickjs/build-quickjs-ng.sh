@@ -2,6 +2,15 @@
 # Rebuilds dist/emscripten-module.{wasm,mjs} — the emscripten quickjs-ng 0.16.1
 # engine the node/WASM loader runs its confined realms on (safe-js.ts).
 #
+# ONE glue for both targets (`ENVIRONMENT=web,node`): the browser apps vendor
+# this same dist/ and load it from a static server, so a node-only glue —
+# which reads the .wasm through `require("node:fs")` at module scope — would
+# make safe-js.js unimportable in a browser. Emscripten guards each
+# environment's loader behind a runtime `ENVIRONMENT_IS_*` test, so the browser
+# never evaluates the `node:` imports and fetches the .wasm beside this module
+# instead. A separate .browser.mjs (what the @jitl packages ship) would be a
+# second glue over the same engine, i.e. a second thing to keep in sync.
+#
 # The blob is ours: csrc/ carries the QTS_* shim (forked from
 # quickjs-emscripten v0.32.0's c/interface.c — the same ABI the npm @jitl
 # variants use, so the JS API layer is the unchanged quickjs-emscripten-core
@@ -93,7 +102,7 @@ emcc \
   -s EXPORTED_RUNTIME_METHODS=@"$here/exportedRuntimeMethods.json" \
   -Oz -flto --closure 1 -s FILESYSTEM=0 \
   --pre-js "$here/templates/pre-extension.js" --pre-js "$here/templates/pre-wasmMemory.js" \
-  -s ENVIRONMENT=node \
+  -s ENVIRONMENT=web,node \
   -s EXPORTED_FUNCTIONS=@"$work/symbols.json" \
   -o "$dist/emscripten-module.mjs" \
   "$here/csrc/interface.c" "$work/quickjs-amalgam.c"

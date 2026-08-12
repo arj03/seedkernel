@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -420,14 +421,17 @@ func exposeBridge(qc *qjs.Context) {
 	}))
 	b.SetPropertyStr("log", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// The realm's own console.log writes to a WASI stdout wazero leaves
-		// disconnected, so operator output has to come back out through here.
-		fmt.Println(argString(t, 0))
+		// disconnected, so operator output has to come back out through here — and it
+		// goes to STDERR, because stdout is the data channel: `--op` writes an app's raw
+		// response bytes there, and an operator line landing in the middle of them would
+		// corrupt a redirect. The Node target says the same thing with console.error.
+		fmt.Fprintln(os.Stderr, argString(t, 0))
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("logErr", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// Diagnostics — every `console.*` in the host realm (host/native-polyfills.ts).
 		// Stderr rather than stdout on purpose: stdout is the operator's channel, and
-		// `--get` with no `--out` writes an app's raw response bytes there, which a
+		// `--op` with no `--out` writes an app's raw response bytes there, which a
 		// diagnostic line interleaved into it would corrupt.
 		fmt.Fprintln(os.Stderr, argString(t, 0))
 		return t.Context().NewUndefined(), nil
@@ -439,6 +443,17 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		os.Stdout.Write(bytes)
 		return t.Context().NewUndefined(), nil
+	}))
+	b.SetPropertyStr("stdin", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		// `--op`'s argument, read whole. Reached only when an op actually runs (cli.ts
+		// calls this lazily), so a node that boots and serves never waits on a stdin
+		// nobody is going to write to. A read error is the same answer as an empty pipe:
+		// this op takes no argument.
+		bytes, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			bytes = nil
+		}
+		return bytesAB(t, bytes), nil
 	}))
 
 	installRealmBridge(qc, b) // the confined realm (§12.3) — guest.go
@@ -471,7 +486,7 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 	defer func() {
 		// Release the staged arguments: SetPropertyStr took their references, and a
 		// slot is only re-set by the NEXT callRealm — so a process that never calls
-		// again (every one-shot --put/--get, and any op after which no other op
+		// again (the one-shot --op, and any op after which no other op
 		// follows) would leave every payload rooted on the global object for its
 		// life. Overwriting the slot with undefined drops the property's value; a
 		// fresh call sets the slots again anyway.
@@ -520,14 +535,14 @@ func main() {
 		return
 	}
 	// runMain resolves once the node is up, the remedies are applied, the bundle is
-	// loaded and any --put/--get has run. Anything the operator got wrong — a bad flag,
+	// loaded and any --op has run. Anything the operator got wrong — a bad flag,
 	// an unreadable file, a bundle that will not load — arrives here as an error, and is
 	// fatal for the reason it always was: a script driving the loader must see it rather
 	// than watch a node come up as a silent bundle-less relay.
 	//
 	// No watchdog (timeout 0): the steps that can genuinely hang carry their own
 	// deadlines — a net request settles as unreachable, `ready()` resolves on its own
-	// timer — and an outer cap would only add a way to fail a `--put` that was merely
+	// timer — and an outer cap would only add a way to fail an `--op` that was merely
 	// slow. This is also what the Node shell does, which is the point: an operation
 	// bounded on one target and unbounded on the other is a difference nobody chose.
 	out, err := callRealm("runMain", 0)

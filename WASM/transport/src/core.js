@@ -349,12 +349,6 @@ function findLink(linkId) {
 const NOTHING = new Uint8Array(0);
 const ZERO32 = new Uint8Array(32);
 
-/** Is this the host's own caller id (32 zero bytes)? No app key derives it. */
-function fromHost(caller) {
-  for (let i = 0; i < 32; i++) if (caller[i] !== 0) return false;
-  return true;
-}
-
 const ops = Object.create(null);
 function entry(name, fn) { ops[name] = fn; }
 
@@ -364,10 +358,12 @@ function entry(name, fn) { ops[name] = fn; }
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
 register("handle", (argBytes) => {
-  const caller = argBytes.subarray(0, 32);
-  const opLen = argBytes[32];
-  const op = utf8Decode(argBytes.subarray(33, 33 + opLen));
-  const r = new Reader(argBytes.subarray(33 + opLen));
+  // The envelope is the guest ABI's, read with the preamble's own two functions
+  // (guest-seam.ts) rather than open-coded here: this program and the host write and
+  // read the same bytes, so they are described in one place.
+  const { fromHost, caller, body } = callerOf(argBytes);
+  const { op, args } = readOp(body);
+  const r = new Reader(args);
   const fn = ops[op];
   if (!fn) throw new Error("transport: no op '" + op + "'");
   // The platform's events are the host's alone. An app that could spell `init` could
@@ -379,7 +375,7 @@ register("handle", (argBytes) => {
   // questions about the app's own traffic rather than levers on the platform — `peers`
   // reads the authenticated set, which is what an app placing replicas has to know. The
   // rest stay the host's.
-  if (!APP_OPS[op] && !fromHost(caller)) throw new Error("transport: '" + op + "' is the host's, not an app's");
+  if (!APP_OPS[op] && !fromHost) throw new Error("transport: '" + op + "' is the host's, not an app's");
   try {
     return fn(r, caller) || NOTHING;
   } finally {

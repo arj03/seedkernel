@@ -128,7 +128,7 @@ export interface BundleManifest {
      *  only symptom is a node that boots clean and answers an empty body forever.
      *
      *  Optional, and an absent list is not a degenerate app: a bundle the shell only ever
-     *  drives as the *initiator* (§12.8 — the `--put`/`--get` one-shots) receives no
+     *  drives as the *initiator* (§12.8 — the `--op` one-shot) receives no
      *  frames and claims nothing. Empty and absent mean the same thing.
      *
      *  A claim is not authority. It routes frames a peer already chose to send to this

@@ -41,41 +41,39 @@ const benchProto = "netbench"
 // reached by the id it claims itself, so the thing being benchmarked has to be an app.
 // That is the point rather than the cost — this is the path a deployment uses.
 //
-//	handle — A's answering side, keyed on the first payload byte: type 7 is FETCH-shaped
-//	         (a fixed 64 KB block), type 9 is UPLOAD-shaped (a 1-byte ack folding in the
-//	         length and last byte, so the bench can prove the payload arrived whole), and
-//	         anything else echoes — the control-plane round trip.
-//	send   — B's requesting side: the transport's `send` op behind the op name this side
-//	         writes, its argument bytes built by the loops below.
+//	handle — one entrypoint, both ends. A remote peer's frame is keyed on the first
+//	         payload byte: type 7 is FETCH-shaped (a fixed 64 KB block), type 9 is
+//	         UPLOAD-shaped (a 1-byte ack folding in the length and last byte, so the
+//	         bench can prove the payload arrived whole), and anything else echoes — the
+//	         control-plane round trip. A local loopback (the host's zero caller id) carries
+//	         an op NAME: `send` is the transport's send op behind the name this side writes,
+//	         `echo` is the bare realm hop.
 const netBenchGuestSource = `
 	const block64k = new Uint8Array(65536); block64k.fill(0x5a);
 	register("handle", (arg) => {
-	  const p = arg.slice(32);
+	  const { fromHost, body: p } = callerOf(arg);
+	  if (fromHost) {
+	    const { op, args } = readOp(p);
+	    if (op === "send") return host.call("_net", writeOp("send", args));
+	    return args;
+	  }
 	  if (p.length > 0 && p[0] === 7) return block64k;
 	  if (p.length > 0 && p[0] === 9) return new Uint8Array([(p.slice(1).length ^ p[p.length - 1]) & 255]);
 	  return p;
-	});
-	register("send", (arg) => {
-	  const op = "send";
-	  const out = new Uint8Array(1 + op.length + arg.length);
-	  out[0] = op.length;
-	  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i);
-	  out.set(arg, 1 + op.length);
-	  return host.call("_net", out);
 	});
 `
 
 // netBenchHarness wires two nodes in one realm: A listens and answers, B requests. Both
 // load the SAME signed app — one guest serves both ends — so the bundle is built once,
 // in Go, and handed in as hex. benchPingN/benchFetchN/benchUploadN issue n sequential
-// requests over the one link, each as a `runGuest("send", …)` into B's app.
+// requests over the one link, each as an `invoke` of the `send` op into B's app.
 //
 // The nodes are stood up by makeTransportNode — the factory bootNode uses — and the
 // policy has to admit the artifact's own transport author (for `link`) and the bench
 // app's author (for the app) before either node has a network at all: the shared bench
 // realm boots deny-all (ensureBooted).
 //
-// The four %q holes, in order: the app bundle hex, the app key runGuest addresses, the
+// The four %q holes, in order: the app bundle hex, the app key invoke addresses, the
 // app author's hex id, and the protocol id B sends under.
 const netBenchHarness = `
 	globalThis.idA = sodium.crypto_sign_keypair();
@@ -114,7 +112,7 @@ const netBenchHarness = `
 	  // One request out of B, answered by A's app. The [ok u8][response] answer shape is
 	  // the transport's; a 0 means unreachable, a deadline, or a refusal.
 	  const req = async (args) => {
-	    const r = await b.runGuest("send", args, __appKey);
+	    const r = await b.invoke("send", args, __appKey);
 	    if (r[0] !== 1) throw new Error("net: request failed");
 	    return r.slice(1);
 	  };
@@ -131,8 +129,8 @@ const netBenchHarness = `
 	  // Two of these sit inside every round trip above (the sender's app and the
 	  // receiver's), so it is what says whether a round-trip number is the wire or the
 	  // guest boundary.
-	  const localArg = new Uint8Array(35);
-	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.runGuest("handle", localArg, __appKey); return new Uint8Array(0); };
+	  const localArg = new Uint8Array(34);
+	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.invoke("echo", localArg, __appKey); return new Uint8Array(0); };
 	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 	})();
 `

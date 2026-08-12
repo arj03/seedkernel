@@ -18,7 +18,7 @@ import (
 // error. host/native-polyfills.ts replaces console over `bridge.logErr`.
 //
 // Asserted on stderr rather than on the bridge function, because *which* stream it lands
-// on is the property: stdout carries the operator's lines and `--get`'s raw response
+// on is the property: stdout carries the operator's lines and `--op`'s raw response
 // bytes, and a diagnostic mixed into those corrupts a piped response.
 func TestHostConsoleReachesStderr(t *testing.T) {
 	bootRealm(t)

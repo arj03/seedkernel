@@ -31,13 +31,19 @@
 // (realm-queue.ts). One `quickjs.wasm` build serves both roles. An app builds its own
 // guest confinement on top of this generic primitive (README §12.3).
 
+// `quickjs-emscripten-core` — the JS API layer alone, NOT the `quickjs-emscripten`
+// umbrella. The umbrella's whole added value is bundling default engine variants, and
+// it does so with STATIC imports of all four Bellard-flavoured `@jitl/quickjs-wasmfile-*`
+// packages; this realm supplies its own variant (below), so the umbrella would only pull
+// four engines nothing runs into every consumer's module graph — a browser app vendoring
+// this file had to map all four to a decoy just to make the graph resolve.
 import {
-  newQuickJSWASMModule,
+  newQuickJSWASMModuleFromVariant,
   type QuickJSWASMModule,
   type QuickJSRuntime,
   type QuickJSContext,
   type QuickJSHandle,
-} from "quickjs-emscripten";
+} from "quickjs-emscripten-core";
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
 // ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -48,11 +54,12 @@ import { errMessage } from "../core/util.js";
 //
 // The engine is the in-repo build (quickjs/): the same quickjs-ng v0.16.1 the native
 // loader compiles, emscripten-built from `csrc/interface.c` by
-// quickjs/build-quickjs-ng.sh. The variant module is ESM; cast to the factory's
-// own parameter type to bridge the typing gap.
+// quickjs/build-quickjs-ng.sh — whose glue serves node AND the browser, so this file
+// imports the same way on both targets. The variant module is ESM; cast to the
+// factory's own parameter type to bridge the typing gap.
 import ngVariantMod from "seedkernel-wasm/quickjs";
 const ngVariant = ngVariantMod as unknown as NonNullable<
-  Parameters<typeof newQuickJSWASMModule>[0]
+  Parameters<typeof newQuickJSWASMModuleFromVariant>[0]
 >;
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
@@ -117,7 +124,7 @@ export interface SafeRealm {
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
 function getModule(): Promise<QuickJSWASMModule> {
-  return (modulePromise ??= newQuickJSWASMModule(ngVariant));
+  return (modulePromise ??= newQuickJSWASMModuleFromVariant(ngVariant));
 }
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {

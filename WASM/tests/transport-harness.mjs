@@ -43,21 +43,46 @@ export const PROTO = "harness/v1";
  *  transport has to be an app. That is the point rather than the cost: what these tests
  *  exercise is now the same path a deployment uses, end to end.
  *
- *  Three entrypoints, and a mode chosen at load through the manifest's `config`:
- *    handle  — the inbound side. `echo` returns the payload; `hang` never answers, which
- *              is what the deadline tests need; both record what arrived.
- *    send    — one request out: `[noReply u8][deadline u32][to 32][protoLen u8][proto][payload]`.
+ *  ONE entrypoint, and a mode chosen at load through the manifest's `config`:
+ *    handle — reached by `dispatch` (a remote peer's frame, the payload echoed) and by
+ *             the host's own `invoke` loopback (the 32 zero-byte caller id, the op
+ *             envelope in the payload). The local ops are:
+ *       send — one request out: `[noReply u8][deadline u32][to 32][protoLen u8][proto][payload]`.
  *              Answers `[ok u8][response]`, straight through from `_net`.
- *    op      — the transport's op wire, unwrapped: `[opLen u8][op][args]` handed to `_net`
- *              verbatim. `send` builds that framing itself, which is the common case;
- *              this is for the tests whose subject is WHICH ops an app may name at all,
- *              and it deliberately writes no name of its own so a refusal is the transport's.
- *    seen    — everything `handle` was given, as `[len u32][bytes]…`, for the tests that
- *              assert on what the far end actually received. */
+ *       op   — the transport's op wire, unwrapped: an already-framed `[opLen u8][op][args]`
+ *              handed to `_net` verbatim. `send` writes that framing itself, which is the
+ *              common case; this is for the tests whose subject is WHICH ops an app may
+ *              name at all, and it deliberately writes no name of its own so a refusal is
+ *              the transport's.
+ *       seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`, for the
+ *              tests that assert on what the far end actually received. */
 const HARNESS_GUEST = `
 const seen = [];
 register("handle", (arg) => {
-  const p = arg.slice(32);
+  // The preamble's own envelope readers (guest-seam.ts) — one shape for the host's
+  // loopback and the transport's ops alike, so this harness reads what a real app reads.
+  const { fromHost, body: p } = callerOf(arg);
+  // A LOCAL call from the host (caller = 32 zero bytes): the op NAME picks the local op,
+  // the same one-vocabulary shape the transport's own handle reads.
+  if (fromHost) {
+    const { op, args } = readOp(p);
+    if (op === "send") return host.call(${JSON.stringify(NET_PROTOCOL)}, writeOp("send", args));
+    if (op === "op") return host.call(${JSON.stringify(NET_PROTOCOL)}, args);
+    if (op === "seen") {
+      let n = 0;
+      for (const s of seen) n += 4 + s.length;
+      const out = new Uint8Array(n);
+      let off = 0;
+      for (const s of seen) {
+        out[off] = s.length >>> 24; out[off + 1] = (s.length >>> 16) & 255;
+        out[off + 2] = (s.length >>> 8) & 255; out[off + 3] = s.length & 255;
+        out.set(s, off + 4); off += 4 + s.length;
+      }
+      return out;
+    }
+    return new Uint8Array(0);
+  }
+  // A remote peer's frame: record it, then echo it (or hang, or generate).
   seen.push(p);
   if (APP.mode === "hang") return new Promise(() => {});
   // A GENERATOR request, for the reassembly tests: [0xff][len u32][mul u8] asks for
@@ -71,30 +96,16 @@ register("handle", (arg) => {
   }
   return p;
 });
-register("send", (arg) => {
-  // The op name is the caller's to write: the transport reads [caller 32][opLen][op][args],
-  // and the host supplies only the 32 bytes of attribution.
-  const op = "send";
-  const out = new Uint8Array(1 + op.length + arg.length);
-  out[0] = op.length;
-  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i);
-  out.set(arg, 1 + op.length);
-  return host.call(${JSON.stringify(NET_PROTOCOL)}, out);
-});
-register("op", (arg) => host.call(${JSON.stringify(NET_PROTOCOL)}, arg));
-register("seen", () => {
-  let n = 0;
-  for (const s of seen) n += 4 + s.length;
-  const out = new Uint8Array(n);
-  let off = 0;
-  for (const s of seen) {
-    out[off] = s.length >>> 24; out[off + 1] = (s.length >>> 16) & 255;
-    out[off + 2] = (s.length >>> 8) & 255; out[off + 3] = s.length & 255;
-    out.set(s, off + 4); off += 4 + s.length;
-  }
-  return out;
-});
 `;
+
+/** The harness app's local op names — the one op vocabulary its `handle` reads. */
+const OP = { SEND: "send", RAW: "op", SEEN: "seen" };
+
+/** One local op into the harness app: `shell.invoke` loops back through `handle`, writing
+ *  the host's caller id and the op envelope; the NAME is the app's own vocabulary. */
+function invoke(shell, appKey, op, args = new Uint8Array(0)) {
+  return shell.invoke(op, args, appKey);
+}
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
 export function harnessAppBlob(author, mode = "echo") {
@@ -118,7 +129,7 @@ export function harnessAppBlob(author, mode = "echo") {
   });
 }
 
-/** The app key the harness app binds under, for `runGuest`. */
+/** The app key the harness app binds under, for `invoke`. */
 export function harnessAppKey(author) {
   return `${Buffer.from(author.id).toString("hex")}:harness`;
 }
@@ -145,7 +156,7 @@ export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply =
 /** One request out of `shell`, through the harness app it loaded — the path a real
  *  deployment uses, since there is no host-side request facade left. */
 export async function appRequest(shell, appKey, to, payload, opts) {
-  const r = await shell.runGuest("send", sendArgs(to, payload, opts), appKey);
+  const r = await invoke(shell, appKey, OP.SEND, sendArgs(to, payload, opts));
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 }
@@ -178,7 +189,7 @@ export function transportPolicy(authorHex, appAuthors = []) {
  *  createShell (requestDeadlineMs, transportHalfOpen).
  *
  *  The returned `request`/`sendNoReply`/`seen`/`peers` are what the tests use where they
- *  used to reach into the driver. Each is one `runGuest` into the harness app, so the
+ *  used to reach into the driver. Each is one `invoke` into the harness app, so the
  *  bytes cross exactly the seam a real app's would. */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
@@ -226,7 +237,7 @@ export async function makeTransportHost(opts = {}) {
     out.set(p, off); off += p.length;
     u32(payload.length);
     out.set(payload, off);
-    return shell.runGuest("send", out, appKey);
+    return invoke(shell, appKey, OP.SEND, out);
   };
   /** One request out, resolving with the response bytes — or rejecting, which is what
    *  the `[0]` failure byte means (an unreachable peer, a deadline, a refusal). */
@@ -246,11 +257,11 @@ export async function makeTransportHost(opts = {}) {
     out[0] = n.length;
     out.set(n, 1);
     out.set(args, 1 + n.length);
-    return shell.runGuest("op", out, appKey);
+    return invoke(shell, appKey, OP.RAW, out);
   };
   /** Everything this node's app was handed inbound. */
   node.seen = async () => {
-    const b = await shell.runGuest("seen", new Uint8Array(0), appKey);
+    const b = await invoke(shell, appKey, OP.SEEN);
     const out = [];
     for (let off = 0; off + 4 <= b.length;) {
       const n = ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0;

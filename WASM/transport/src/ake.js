@@ -297,23 +297,19 @@ function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId],
  *  stall clock to the deadline alone. */
 function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** Call the shell's own protocol by op name: `[nameLen u8][name][args]`. The host
+/** Call the shell's own protocol by op name — the preamble's `writeOp` (guest-seam.ts)
+ *  frames it, the same envelope every other call in this system carries. The host
  *  prepends OUR id on the way in, so there is nothing here to identify ourselves with. */
 function hostCall(op, tail) {
-  const name = utf8Encode(op);
-  const head = new Uint8Array(1 + name.length);
-  head[0] = name.length;
-  head.set(name, 1);
-  return host.call(N_HOST, concatBytes([head, tail]));
+  return host.call(N_HOST, writeOp(op, tail));
 }
 
 /** Hand an inbound request to whichever app claims its protocol id, and resolve with
  *  that app's answer. NOT awaited by any caller inside this realm — see the note above.
  *
- *  This is the whole of what used to be transport/deliver plus a `respond` entrypoint:
- *  the answer is the app's own `handle` return value, on a later turn, which is exactly
- *  the shape an asynchronous app handler needs and exactly what the old two-call dance
- *  was simulating. */
+ *  Delivery and the reply are ONE call: the answer is the app's own `handle` return
+ *  value, on a later turn, which is exactly the shape an asynchronous app handler needs
+ *  and what a separate reply entrypoint would only have simulated. */
 function hostDeliver(fromBytes, proto, payload) {
   const head = new Uint8Array(1 + proto.length);
   head[0] = proto.length;
