@@ -1,0 +1,2 @@
+# Build scratch — the artifact (dist/) is checked in, this is not.
+.build/

@@ -68,6 +68,10 @@
       "types": "./build/host/bundle.d.ts",
       "default": "./build/host/bundle.js"
     },
+    "./quickjs": {
+      "types": "./quickjs/dist/variant.d.mts",
+      "default": "./quickjs/dist/variant.mjs"
+    },
     "./libsodium": "./browser/libsodium-wrappers.mjs",
     "./libsodium-core": "./browser/libsodium-core.mjs",
     "./libsodium.wasm": "./browser/libsodium.wasm"
@@ -91,8 +95,6 @@
     "build:transport-bundle": "node scripts/build-transport-bundle.mjs"
   },
   "dependencies": {
-    "@jitl/quickjs-ng-wasmfile-release-asyncify": "^0.32.0",
-    "@jitl/quickjs-ng-wasmfile-release-sync": "^0.32.0",
     "libsodium-wrappers-sumo": "0.8.4",
     "quickjs-emscripten": "^0.32.0",
     "werift": "^0.23.0"

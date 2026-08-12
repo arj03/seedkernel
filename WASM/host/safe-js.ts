@@ -46,11 +46,12 @@ import { errMessage } from "../core/util.js";
 // (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed — net is
 // a real Promise resolved by the host, not an Asyncify stack unwind.
 //
-// This variant package is CJS, so under `nodenext` TypeScript types its default export as
-// the module namespace, whereas the runtime default import is the variant object itself
-// (verified). Cast to the factory's own parameter type to bridge that interop gap.
-import ngReleaseSyncMod from "@jitl/quickjs-ng-wasmfile-release-sync";
-const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
+// The engine is the in-repo build (quickjs/): the same quickjs-ng v0.16.1 the native
+// loader compiles, emscripten-built from `csrc/interface.c` by
+// quickjs/build-quickjs-ng.sh. The variant module is ESM; cast to the factory's
+// own parameter type to bridge the typing gap.
+import ngVariantMod from "seedkernel-wasm/quickjs";
+const ngVariant = ngVariantMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModule>[0]
 >;
 
@@ -116,7 +117,7 @@ export interface SafeRealm {
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
 function getModule(): Promise<QuickJSWASMModule> {
-  return (modulePromise ??= newQuickJSWASMModule(ngReleaseSync));
+  return (modulePromise ??= newQuickJSWASMModule(ngVariant));
 }
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
@@ -248,6 +249,18 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // control itself.
   const runtime = newRuntime(mod);
   const ctx: QuickJSContext = runtime.newContext();
+  // Contexts quickjs-emscripten creates without a contextPointer (the phantom in
+  // `pumpJobs` below). Tracked from after the realm's own context is created, so
+  // that one is not one of them.
+  const phantoms = new Set<QuickJSContext>();
+  {
+    const newContext = runtime.newContext.bind(runtime);
+    runtime.newContext = (options?: Parameters<typeof newContext>[0]) => {
+      const c = newContext(options);
+      if (options?.contextPointer === undefined) phantoms.add(c);
+      return c;
+    };
+  }
   const clock = configureRealm(ctx, opts);
   let disposed = false;
 
@@ -260,6 +273,17 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // module at dispose() time via QuickJS's `list_empty(&rt->gc_obj_list)` assertion.
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
+    // quickjs-emscripten's executePendingJobs can create a context nothing will
+    // dispose: when the wasm heap grows mid-call, its ctxPtrOut view detaches,
+    // ctxPtr reads undefined, and the `?? newContext({contextPointer})` fallback
+    // fires. Such a context keeps GC objects alive, aborting the module at
+    // runtime free — so release it here, after the call is done with it.
+    for (const phantom of phantoms) {
+      if (phantom.alive) {
+        try { phantom.dispose(); } catch { /* already gone */ }
+      }
+    }
+    phantoms.clear();
     if (!res.error) return;
     let msg = "guest job failed";
     try {
