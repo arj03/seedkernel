@@ -385,7 +385,7 @@ func (el *eventLoop) ensureSettle(c *qjs.Context) {
 // every registered context) until it settles: kind 0 (fulfilled, with the resolved
 // Uint8Array/ArrayBuffer bytes) or kind 1 (rejected, with the error string). timeout
 // bounds the wait as a safety net. c may be the host realm (a serve op) or a guest realm
-// (runGuest) — either way the whole loop is driven, so a guest awaiting net is resumed by
+// (an invoke) — either way the whole loop is driven, so a guest awaiting net is resumed by
 // the host realm's socket I/O.
 //
 // It is NOT re-entrant: el.onSettle is a single shared slot, and the defer below

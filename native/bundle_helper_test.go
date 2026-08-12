@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
+	"strings"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -109,7 +110,7 @@ func (a authorKeys) id() []byte {
 // testAuthor mints a fresh author identity. Fresh per test so bundle-freshness marks
 // (keyed by author+app) never collide. Requires a booted realm — the id is hashed with
 // the booted sodium — which every caller has.
-func testAuthor(t *testing.T) authorKeys {
+func testAuthor(t testing.TB) authorKeys {
 	t.Helper()
 	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -136,7 +137,7 @@ var (
 	signerCacheRt wazero.Runtime
 )
 
-func testSigner(t *testing.T) *mldsaSigner {
+func testSigner(t testing.TB) *mldsaSigner {
 	t.Helper()
 	if signerCache == nil || signerCacheRt != rt {
 		signerCache, signerCacheRt = newMlDsaSigner(t), rt
@@ -202,7 +203,7 @@ const stubGuestSrc = "register('ping', () => new Uint8Array([1]));"
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
 // at the given (app, version). See writeBundle for the general form.
-func writeTestBundle(t *testing.T, a authorKeys, app string, version int) (string, string) {
+func writeTestBundle(t testing.TB, a authorKeys, app string, version int) (string, string) {
 	t.Helper()
 	return writeBundle(t, a, app, version, "", nil)
 }
@@ -213,7 +214,7 @@ func writeTestBundle(t *testing.T, a authorKeys, app string, version int) (strin
 // and the app key its modules will bind under; the module itself is "fwd", the logical
 // name from the manifest. Requires a booted realm (it hashes content with the booted
 // sodium). Mirrors the TS run.mjs testBundle.
-func writeBundle(t *testing.T, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
+func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
 		guestSrc = stubGuestSrc
@@ -222,7 +223,7 @@ func writeBundle(t *testing.T, a authorKeys, app string, version int, guestSrc s
 }
 
 // signBundleJSON wraps a finished manifest body in the manifest envelope and packs it.
-func signBundleJSON(t *testing.T, a authorKeys, app string, mjson []byte, guestSrc string) (string, string) {
+func signBundleJSON(t testing.TB, a authorKeys, app string, mjson []byte, guestSrc string) (string, string) {
 	t.Helper()
 	return writeBundleFile(t, app, manifestEnvelope(t, a, mjson), guestSrc), appKeyFor(a.id(), app)
 }
@@ -239,7 +240,7 @@ func signBundleJSON(t *testing.T, a authorKeys, app string, mjson []byte, guestS
 //
 // A deliberate second implementation of the writer, in another language, fed to the
 // shared JS reader — a drift between the two shows up here rather than in a deployment.
-func manifestEnvelope(t *testing.T, a authorKeys, mjson []byte) []byte {
+func manifestEnvelope(t testing.TB, a authorKeys, mjson []byte) []byte {
 	t.Helper()
 	pre := append(domainManifest(), manifestSuite())
 	pre = append(append(append(pre, a.edPub...), a.mlPk...), mjson...)
@@ -252,7 +253,7 @@ func manifestEnvelope(t *testing.T, a authorKeys, mjson []byte) []byte {
 // claimManifest builds a manifest body claiming exactly the given protocol ids — the one
 // field the ordinary fixture derives, spelled out, so a test can feed the loader an id the
 // format refuses (§12.10). Everything else matches manifestJSON.
-func claimManifest(t *testing.T, app string, protocols ...string) []byte {
+func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	t.Helper()
 	mjson, err := json.Marshal(map[string]any{
 		"app":       app,
@@ -273,13 +274,13 @@ func claimManifest(t *testing.T, app string, protocols ...string) []byte {
 	return mjson
 }
 
-// appProtocols is the fixture's claim: the app's own name, or nothing at all when the
-// requires name a mount half (§12.5) — those bundles are transports, and a transport
-// claiming a protocol id is refused at the load (§12.10).
+// appProtocols is the fixture's claim: the app's own name, or the reserved net id when
+// the requires reach the `link` privilege (§12.5) — a transport is an app that claims
+// `_net`, and it is the only bundle allowed to spell a `_`-led id (§12.10).
 func appProtocols(app string, requires []string) []string {
 	for _, r := range requires {
-		if r == "link/open" || r == "transport/deliver" {
-			return nil
+		if strings.HasPrefix(r, "link/") {
+			return []string{"_net"}
 		}
 	}
 	return []string{app}
@@ -290,7 +291,7 @@ func appProtocols(app string, requires []string) []string {
 // guest's authority is the `requires` list, which may be empty. The bytes are the signed
 // bytes; there is no canonicalisation step, so the verifier parses exactly what it
 // checked (§12.4).
-func manifestJSON(t *testing.T, app string, version int, guestSrc string, requires []string) []byte {
+func manifestJSON(t testing.TB, app string, version int, guestSrc string, requires []string) []byte {
 	t.Helper()
 
 	type mod struct {
@@ -316,10 +317,10 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, requir
 		App: app,
 		// The protocol this fixture claims (§12.10), which is its app name: the load
 		// itself is what routes, so a test that wants a protocol answered says so in the
-		// manifest and never through a second call. A MOUNT-shaped fixture claims none —
-		// a transport receives no dispatch, and the shell refuses a claim from one — so
-		// the field is derived from the same `requires` that decide the privileges,
-		// keeping the two facts one fact here as they are in the loader.
+		// manifest and never through a second call. A TRANSPORT-shaped fixture claims the
+		// reserved `_net` — a transport is an app that claims the id, and the shell refuses
+		// the claim to anyone else — so the field is derived from the same `requires` that
+		// decide the privileges, keeping the two facts one fact here as they are in the loader.
 		Protocols: appProtocols(app, requires),
 		Version:   version,
 		Modules: []mod{{
@@ -341,21 +342,84 @@ func manifestJSON(t *testing.T, app string, version int, guestSrc string, requir
 	return mjson
 }
 
-// writeBundleFile packs a finished manifest envelope, the forwarder module and the guest
-// into the container and writes it to a fresh temp dir. Suite-agnostic on purpose: the
-// envelope is opaque bytes to the container, which is the property that lets a new
-// signature suite land without the packing format moving (§12.4).
-func writeBundleFile(t *testing.T, app string, menv []byte, guestSrc string) string {
-	t.Helper()
+// bundleBytes packs a finished manifest envelope, the forwarder module and the guest into
+// the container. Suite-agnostic on purpose: the envelope is opaque bytes to the container,
+// which is the property that lets a new signature suite land without the packing format
+// moving (§12.4).
+func bundleBytes(menv []byte, guestSrc string) []byte {
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
-	files := [][2]any{
+	return packBundle([][2]any{
 		{"manifest.bundle", menv},
 		{"fwd.wasm", forwarderWasm},
 		{"guest.js", []byte(guestSrc)},
-	}
+	})
+}
+
+// writeBundleFile is bundleBytes on disk, in a fresh temp dir — what the tests that go in
+// through `cliLoadBundle` (a path) need. The benches take the bytes instead: they hand the
+// blob to a shell they already hold, so a file would only be a detour.
+func writeBundleFile(t testing.TB, app string, menv []byte, guestSrc string) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), app+".skb")
-	if err := os.WriteFile(path, packBundle(files), 0o644); err != nil {
+	if err := os.WriteFile(path, bundleBytes(menv, guestSrc), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return path
+}
+
+// signedBundleBytes is writeBundle's twin for a caller that wants the blob rather than a
+// path: the same manifest, the same envelope, packed and handed back.
+func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) []byte {
+	t.Helper()
+	return bundleBytes(manifestEnvelope(t, a, manifestJSON(t, app, version, guestSrc, requires)), guestSrc)
+}
+
+// ── the probe app: how a native test puts a request on the wire ───────────────
+//
+// There is no host-side request facade any more. An app reaches the network by calling
+// the id the transport claims (`_net`, §12.10) and is reached by the id it claims itself, so
+// a test that sends a request has to BE an app — which is the point rather than the cost:
+// what these tests drive is the path a deployment uses, end to end.
+//
+// One guest serves both ends. `handle` echoes what it was given (minus the 32-byte
+// sender key the shell prepends) and, for a local loopback (the host's 32 zero-byte
+// caller id), the `send` op is one request out — its argument bytes exactly the `send`
+// op's own (transport/src/core.js) behind the op name this side writes. The envelope is
+// read and written with the preamble's own callerOf/readOp/writeOp (guest-seam.ts), so
+// this probe carries the same call shape a real app does.
+const probeGuestSource = `
+	register("handle", (arg) => {
+	  const { fromHost, body } = callerOf(arg);
+	  if (fromHost) {
+	    const { op, args } = readOp(body);
+	    if (op === "send") return host.call("_net", writeOp("send", args));
+	    return new Uint8Array(0);
+	  }
+	  return body;
+	});
+`
+
+// probeSendArgs encodes the `send` op's arguments:
+// [noReply u8][deadline u32][to blob][proto blob][payload blob].
+func probeSendArgs(toHexID, proto string, payload []byte) []byte {
+	to, err := hex.DecodeString(toHexID)
+	if err != nil {
+		panic("probeSendArgs: " + err.Error())
+	}
+	out := []byte{0}
+	out = binary.BigEndian.AppendUint32(out, 0) // deadline: the node's default
+	out = binary.BigEndian.AppendUint32(out, uint32(len(to)))
+	out = append(out, to...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(proto)))
+	out = append(out, proto...)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(payload)))
+	return append(out, payload...)
+}
+
+// writeProbeBundle signs the probe app under `author`, claiming `app` as its protocol id
+// and declaring the one grant it needs: the transport's id.
+func writeProbeBundle(t testing.TB, author authorKeys, app string) string {
+	t.Helper()
+	path, _ := writeBundle(t, author, app, 1, probeGuestSource, []string{"_net"})
 	return path
 }

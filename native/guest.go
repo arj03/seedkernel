@@ -10,9 +10,9 @@
 // knows what a name means or which domains an app may reach; that is the guest seam's,
 // and the manifest's, business.
 //
-// The async seam: a sync name (the primitive catalog, clock, module, the raw-link and
-// transport names) returns its bytes immediately. A round-tripping name — net/send and
-// every fs/* — returns null from the seam, and the guest preamble hands the guest a
+// The async seam: a sync name (the primitive catalog, clock, module and the raw-link
+// names) returns its bytes immediately. A round-tripping name — every fs/* and every
+// cross-realm call — returns null from the seam, and the guest preamble hands the guest a
 // real Promise it `await`s; when the shim's promise settles it calls bridge.realmSettle
 // and this file resolves the parked guest Promise. The shared loop (loop.go) then pumps
 // the guest realm so the awaiting entrypoint resumes. There is no blocking and no
@@ -120,8 +120,11 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if err != nil {
 			return nil, err
 		}
-		g.call(t.Args()[1].String(), payload, t.Args()[3], t.Args()[4])
-		return nil, nil
+		deferred := 0
+		if g.call(t.Args()[1].String(), payload, t.Args()[3], t.Args()[4]) {
+			deferred = 1
+		}
+		return t.Context().NewInt64(int64(deferred)), nil
 	}))
 	b.SetPropertyStr("realmSettle", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a realm that has since been disposed is a no-op: the
@@ -160,14 +163,10 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 // `hostCall`, a host-realm function the shell built for this app.
 func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
 	hostQc := loop.c
-	// Interruptibility is paired with the budget: armed only when there is one to
-	// enforce, so a realm explicitly run unbounded (deadlineMs: Infinity) does not pay
-	// wazero's per-call context check for a lever nothing will pull.
-	ropts := []qjs.Option{qjs.WithMemoryLimit(memoryLimit)}
-	if budget > 0 {
-		ropts = append(ropts, qjs.WithInterruptible())
-	}
-	rt, err := qjs.New(ropts...)
+	// The execution bound needs nothing at construction: it lives in the engine
+	// (qjs.Budget arms QuickJS's interrupt handler), so a realm run unbounded costs
+	// exactly what a bounded one does.
+	rt, err := qjs.New(qjs.WithMemoryLimit(memoryLimit))
 	if err != nil {
 		return nil, err
 	}
@@ -322,11 +321,16 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 // call invokes an entrypoint as the *initiator*: it may await net, so there is no
 // result to return — onDone/onFail (host-realm functions settling the shim's Promise)
 // are called when the entrypoint's own promise settles, which the shared loop drives.
-func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Value) {
+//
+// It reports one thing synchronously: whether the entrypoint DEFERRED its answer (the
+// preamble's defer()), which tells the shim's queue the realm is free again even though
+// nothing has settled. __start reads the flag after the entrypoint's synchronous segment
+// and returns it; everything here does is carry it back.
+func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Value) bool {
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
 		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
-		return
+		return false
 	}
 	g.callSeq++
 	id := g.callSeq
@@ -338,7 +342,9 @@ func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Valu
 	})
 	entryV.Free()
 	argV.Free()
+	deferred := false
 	if res != nil {
+		deferred = res.Int64() == 1
 		res.Free()
 	}
 	// __start catches everything the entrypoint throws, so an error here is the realm
@@ -348,37 +354,29 @@ func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Valu
 			defer c.free()
 			g.reportCall(c.onFail, g.hostQc.NewString(err.Error()))
 		}
+		return false
 	}
+	return deferred
 }
 
 // within runs one entry into the realm under the execution budget.
 //
-// It opens a clock segment, arms wazero's deadline for whatever budget is left, and
-// converts a budget kill into an error. The kill arrives as a panic from qjs's call
-// path (wazero returns an error, which qjs.Runtime.call panics on) and is fatal to the
-// module, so the realm is marked dead here rather than pretending it can be reused.
+// It opens a clock segment and arms the engine's deadline for whatever budget is left.
+// An overrun comes back as an ordinary error — QuickJS's interrupt handler throws
+// (qjs.Runtime.Budget), the throw unwinds the guest frame like any other, and the
+// entrypoint's own promise rejects — so nothing here has to end the realm to stop it.
+// That is the same shape safe-js.ts has on the JS target, from the same lever.
+//
+// A segment that begins with the allowance already spent is armed at the floor rather
+// than refused outright: the engine then interrupts it at its first check, which routes
+// the failure through the guest's own promises instead of past them.
 func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err error) {
 	remaining := time.Duration(0)
 	if g.budget > 0 {
 		if remaining = g.budget - g.consumed; remaining <= 0 {
-			// Cumulative exhaustion across segments: the module is still alive, but the
-			// guest has spent its allowance and its in-flight work cannot be unwound
-			// from here, so the realm ends. Distinct from the wazero kill below only in
-			// how it was reached.
-			return nil, g.markDead(errors.New("guest realm terminated: execution budget exceeded"))
+			remaining = time.Nanosecond
 		}
 	}
-	defer func() {
-		if rec := recover(); rec != nil {
-			// Distinguish a budget kill from any other engine panic by asking the module
-			// rather than by matching on the message: a closed module IS the kill.
-			if !g.rt.Alive() {
-				err = g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
-				return
-			}
-			panic(rec)
-		}
-	}()
 	restore := g.rt.Budget(remaining)
 	start := time.Now()
 	defer func() {
@@ -386,12 +384,31 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 		restore()
 	}()
 	v, err = fn()
-	// A kill reaches us two ways and both must end the realm the same way: qjs's call
-	// helpers panic on a wazero error, which the recover above catches, but any path
-	// that *returns* the error instead (Context.Pump does) would otherwise slip past
-	// with the realm silently dead and its callers never settled. Ask the module.
-	if err != nil && !g.rt.Alive() {
-		return nil, g.markDead(fmt.Errorf("guest realm terminated: execution budget of %s exceeded", g.budget))
+	// Only a segment that armed a deadline can have been interrupted by one, and asking
+	// is itself an engine call — an unbounded realm must not pay for an answer that is
+	// fixed in advance.
+	if remaining <= 0 || !g.rt.TookInterrupt() {
+		return v, err
+	}
+	// The engine stopped the guest mid-frame. Two things follow, and both matter.
+	//
+	// The invocation is OVER, whatever its own promises do next. The throw rejects the
+	// entrypoint's promise, but delivering that rejection is more queued guest work, and
+	// the budget it would have to run in is the one just exhausted — so the report path
+	// would be interrupted exactly like the code that overran it, and the caller would
+	// wait out its timeout on a call the engine had already stopped. Settling here is
+	// what closes that gap; it is the same duty markDead used to discharge, without
+	// having to end the realm to discharge it.
+	//
+	// `consumed` is deliberately NOT reset. It stays blown for the rest of this
+	// invocation, so any jobs the interrupted frame left behind are interrupted at their
+	// first check instead of buying another full budget each time the loop pumps. The
+	// next top-level entrypoint starts a fresh clock (see call), which is the whole of
+	// the accounting — same as safe-js.ts's ExecClock.
+	budgetErr := fmt.Errorf("guest realm: execution budget of %s exceeded", g.budget)
+	g.settleAll(budgetErr.Error())
+	if err == nil {
+		err = budgetErr
 	}
 	return v, err
 }
@@ -440,13 +457,25 @@ func (g *guestRealm) settleAll(msg string) {
 // segment before the await and nothing after it.
 //
 // A dead realm is skipped rather than pumped; markDead has already settled its callers.
+//
+// A pump that FAILS wakes the loop, and that is load-bearing for the execution budget.
+// The interrupt lands in whatever job was running — typically the continuation after an
+// await — and unwinds it as a throw, which rejects the entrypoint's promise. Delivering
+// that rejection to the caller is itself more queued work (the guest's `.then`, then
+// __callFail), and this round has already drained. Nothing else is coming: a guest
+// spinning on its own generates no I/O, so without a nudge the loop blocks and the
+// caller waits out its whole timeout for a call the engine already stopped — the hang
+// this budget exists to prevent, one step further along. Self-limiting: a pump that
+// drains cleanly wakes nobody.
 func (g *guestRealm) pump() {
 	if g.rt == nil || g.dead || !g.rt.Alive() {
 		return
 	}
-	_, _ = g.within(func() (*qjs.Value, error) {
+	if _, err := g.within(func() (*qjs.Value, error) {
 		return nil, g.qc.Pump()
-	})
+	}); err != nil {
+		g.loop.wake()
+	}
 }
 
 // checkAlive refuses a realm a budget kill already terminated. Callers must ask BEFORE

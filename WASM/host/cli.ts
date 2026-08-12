@@ -14,7 +14,7 @@
 //
 // The platform record is deliberately small: files, a log line, raw stdout, entropy,
 // and "stand a node up on this platform". Everything else the flow needs it computes.
-import { toHex, fromHex, concatBytes, errMessage } from "../core/util.js";
+import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { appKeyFor, type LoadedBundle } from "./bundle.js";
 import { parseHostPort, parsePeerSpec } from "./transport-host.js";
@@ -32,7 +32,7 @@ export const DEFAULT_KEY = "./seedkernel.key";
  *  node whose policy is doing its job. The allowlist makes the typo say so. */
 const FLAGS = new Set([
   "policy", "dir", "key", "listen", "ws-listen", "peers", "contact-secret",
-  "bundle", "put", "get", "out", "app-config", "revoke", "uninstall",
+  "bundle", "op", "app-config", "revoke", "uninstall",
   "request-deadline", "guest-timeout", "guest-memory", "transport",
 ]);
 
@@ -72,9 +72,16 @@ export interface CliHost extends CliFiles {
   /** One console line. `console.log` on Node; a Go stdout write natively, where
    *  QuickJS's own `console` writes to a discarded WASI stdout. */
   log(line: string): void;
-  /** Raw bytes to stdout — `--get` with no `--out` writes the app's response
-   *  verbatim, so this cannot go through `log`. */
+  /** Raw bytes to stdout — `--op` writes the app's response verbatim, so this cannot go
+   *  through `log`, and `log` must not go to stdout either (both targets send it to
+   *  stderr: a diagnostic interleaved into a response corrupts it). */
   stdout(bytes: Uint8Array): void;
+  /** Raw bytes from stdin — `--op`'s argument, verbatim. Empty when nothing is piped in,
+   *  which is how an op that takes no argument is spelled.
+   *
+   *  A function rather than a field so it is read only when an op actually runs: a node
+   *  that boots and serves must not block on a stdin nobody is going to write to. */
+  stdin(): Uint8Array;
   /** Entropy + the subkey derivation's crypto (§12.9). */
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
   /** Assemble a node on this platform: the platform seam, `createShell`, and the
@@ -224,7 +231,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       : undefined,
   });
   // The node's transport driver, or null when the policy admitted no transport bundle.
-  // Read once and held: nothing below this line mounts a second one, and every use is
+  // Read once and held: nothing below this line stands a second one up, and every use is
   // guarded on the null rather than on which class the object turned out to be.
   const net = shell.transport;
 
@@ -281,26 +288,24 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     }
     host.log("  bundle " + loadedLine(loaded));
 
-    // One-shot client ops through the loaded guest — "the shell runs the app" as the
-    // *initiator* (§12.8). The shell stays application-neutral: arguments cross as raw
-    // bytes (a file for --put, hex tokens joined by ':' for --get) and responses come
-    // back as raw bytes, so it prints hex or writes them verbatim and never decodes.
-    if (args.has("put")) {
-      const r = await shell.runGuest("put", mustRead(host, args.get("put")!, "--put"));
-      host.log(`  PUT ok: ${r.length} B response`);
-      host.log(`    ${toHex(r)}`);
-    }
-    if (args.has("get")) {
-      const data = await shell.runGuest("get", concatBytes(args.get("get")!.split(":").map(fromHex)));
-      const outPath = args.get("out");
-      if (outPath !== undefined) {
-        // An ordinary output file, explicitly: the atomic write's temp is created 0600,
-        // so leaving the mode off would hand the operator a result only they can read.
-        host.writeFile(outPath, data, 0o644);
-        host.log(`  GET ok: ${data.length} B → ${outPath}`);
-      } else {
-        host.stdout(data);
-      }
+    // ONE one-shot op through the loaded guest — "the shell runs the app" as the
+    // *initiator* (§12.8), and the whole of what this CLI knows about running one:
+    // bytes in, bytes out, under a name it never reads.
+    //
+    // That is `handle`'s ABI and nothing more (§12.2): **stdin is the argument, stdout is
+    // the response**, and the name is passed through unread. Nothing here decodes,
+    // formats, or knows an app's argument shape — a flag per operation cannot avoid
+    // knowing it, and neither can a CHOICE of argument flag, since which one an operator
+    // needs is decided by the app. Composing bytes is the shell's job, so a chat app's
+    // `render` is as reachable as a store's `put` with nothing added here for either.
+    //
+    // Addressed to the app THIS flow just loaded, by the key its own load returned,
+    // rather than left to `invoke`'s "the only app" default. The default cannot serve
+    // here: a node with a network has the transport loaded too — an ordinary app that
+    // claims `_net` (§12.10) — so "the only one" is not something `--bundle` can mean.
+    const op = args.get("op");
+    if (op !== undefined) {
+      host.stdout(await shell.invoke(op, host.stdin(), appKeyFor(loaded.author, loaded.manifest.app)));
     }
   }
 

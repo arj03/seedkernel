@@ -76,7 +76,7 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  and preamble into every page that verifies a bundle, including pages that only
  *  inspect one and never build a seam at all. guest-seam.ts re-exports it, so a
  *  reader of the seam still finds the number next to the names. */
-export const GUEST_ABI_VERSION = 3;
+export const GUEST_ABI_VERSION = 5;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
  *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (guest-seam.ts)
  *  is total over this list: a host that has that file has every name in it, so a partial
@@ -116,43 +116,48 @@ export const PRIMITIVE_NAMES = [
 export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
 /** The authorities: every name that reaches something no confined guest can hold — the
  *  node key (`node/sign` is scoped, never raw), the entropy source, a socket, the disk,
- *  the platform's clock and event loop. This IS the manifest vocabulary: `guest.requires`
- *  names a subset of these keys and nothing else, so the list an operator reads is the
- *  list of what the bundle can reach.
+ *  the platform's clock and event loop. Together with the reserved ids below they are the
+ *  manifest vocabulary: `guest.requires` names a subset of the two and nothing else, so
+ *  the list an operator reads is the list of what the bundle can reach.
  *
  *  `crypto/*` and a bundle's own module names are not here, and that absence is the whole
- *  gate rule: a name is a grant iff it is a key of this table (`isGrant`), so the
- *  dispatcher never parses a name to decide (§12.1). They are also, for the same reason,
- *  not declarable — a manifest naming one is refused. Neither can be absent from a host
- *  (`cryptoCatalog` is total; a bundle's modules arrive with it), so requiring them would
- *  be a requirement on something that cannot fail, and it would bury the three or four
- *  names that carry the bundle's actual authority under a dozen that carry none.
+ *  gate rule: a name is a grant iff it is a key of this table or a reserved id
+ *  (`isGrant`), so the dispatcher never parses a name to decide *whether it is granted*
+ *  (§12.1). They are also, for the same reason, not declarable — a manifest naming one is
+ *  refused. Neither can be absent from a host (`cryptoCatalog` is total; a bundle's
+ *  modules arrive with it), so requiring them would be a requirement on something that
+ *  cannot fail, and it would bury the three or four names that carry the bundle's actual
+ *  authority under a dozen that carry none.
  *
- *  **Every key here must contain a `/`.** A guest calls its own modules through the same
- *  `host.call` by their bare logical name, and a manifest holds module names to
- *  `[A-Za-z0-9_-]` (bundle.ts) — so the two halves of the catalog are disjoint by charset
- *  and the dispatch tells them apart by the name alone. `crypto/*` gets the slash from its
- *  template literal; this table is hand-written, so guest-seam.ts checks it at
- *  construction. A bare authority added here would shadow every app's module of that name.
+ *  **Every key here must contain a `/`, and no module name may lead with `_`.** Those two
+ *  charset rules are what let ONE `host.call` carry three kinds of name and be told apart
+ *  by the name alone: a `/` is the host's own, a leading `_` is a reserved id reaching
+ *  another realm, and anything else is one of the asking bundle's own modules. A manifest
+ *  holds module names to `[A-Za-z0-9_-]` minus a leading `_` (bundle.ts), so all three are
+ *  disjoint by construction. `crypto/*` gets its slash from its template literal; this
+ *  table is hand-written, so guest-seam.ts checks it at construction — a bare authority
+ *  added here would shadow every app's module of that name.
  *
- *  Each name carries what it is granted *for*, in the form `"<privilege>:<half>"`.
- *  `"app"` is the unprivileged case — an ordinary authority any bundle may ask for,
- *  needing no operator grant beyond the right to load at all. Anything else names a
- *  PRIVILEGE an operator grants per author (`PRIVILEGES`, policy.ts) and which half of
- *  it the name supplies. Today there is one: `mount`, the node's transport, where
- *  `mount:sockets` is what it consumes (the platform's whole contribution to the
- *  network, behind opaque link ids) and `mount:report` is what it provides back (the
- *  attributed peer, protocol id and correlation every app's `net` names reach). A
- *  bundle reaching a privilege must name every half of it or none: one with sockets
- *  and nowhere to report could only stand as a transport that is not one, so a partial
- *  claim is refused at the load rather than at the first dial. `timer/*` is
- *  deliberately `"app"` — an ordinary authority, and the transport happening to want
- *  one is not a reason to make it a privilege.
+ *  Each name carries what it is granted *for*, and a privileged name's PREFIX is that
+ *  privilege — `link/*` is granted under `link`, and a name's value is never a word for
+ *  the kind of bundle that wants it. `"app"` is the unprivileged case — an ordinary
+ *  authority any bundle may ask for, needing no operator grant beyond the right to load
+ *  at all. Anything else names a PRIVILEGE an operator grants per author (`PRIVILEGES`,
+ *  policy.ts). Today there is one: `link`, a byte duplex behind opaque link ids, which is
+ *  the platform's whole contribution to the network and nothing else. `timer/*` is
+ *  deliberately `"app"`: an ordinary authority, and the transport happening to want one
+ *  is not a reason to make it a privilege.
+ *
+ *  **A privilege is one thing, not a pair of halves.** What the transport PROVIDES back
+ *  is not an authority at all — it is an ordinary cross-realm call to the id it claims
+ *  (`NET_PROTOCOL`), reached by the same mechanism an app is reached by. So there is
+ *  nothing to claim in halves, nothing to check is claimed in full, and no second
+ *  vocabulary: a name's value is a privilege or it is `"app"`.
  *
  *  The table IS what says which privileges a bundle reaches; there is no role field,
  *  because the requires already carry the fact and the signature already covers them.
- *  Adding a privileged name under a NEW prefix adds a privilege, and with it the
- *  policy key an operator grants it under — no second vocabulary, no third class.
+ *  Adding a privileged name under a new value adds a privilege, and with it the policy
+ *  key an operator grants it under — no second vocabulary, no third class.
  *
  *  The one-file rule: the seam's dispatch table is TYPED against `CapabilityName`
  *  (a key here without a handler is a compile error) and walked against its own key
@@ -163,8 +168,6 @@ export const AUTHORITY_CALLS = {
     "node/verify": "app",
     "node/identity": "app",
     "node/random": "app",
-    "net/send": "app",
-    "net/peers": "app",
     "fs/get": "app",
     "fs/put": "app",
     "fs/list": "app",
@@ -174,59 +177,77 @@ export const AUTHORITY_CALLS = {
     "clock/now": "app",
     "timer/arm": "app",
     "timer/clear": "app",
-    "link/open": "mount:sockets",
-    "link/send": "mount:sockets",
-    "link/close": "mount:sockets",
-    "link/stat": "mount:sockets",
-    "transport/deliver": "mount:report",
-    "transport/settle": "mount:report",
-    "transport/link-auth": "mount:report",
-    "transport/peer-edge": "mount:report",
-    "transport/ready": "mount:report",
-    "transport/link-down": "mount:report",
+    "link/open": "link",
+    "link/send": "link",
+    "link/close": "link",
+    "link/stat": "link",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
-/** Whether a name is a *grant* — the one question the seam's gate asks, and the one
- *  the manifest does not answer. `crypto/*` and a bundle's own module names are false
- *  here by being absent from `AUTHORITY_CALLS` rather than by a parse of their prefix: a
- *  primitive is a function of its arguments and a module is the asking bundle's own, so
- *  neither reaches anything a guest does not already hold (§12.1). */
-export function isGrant(name: string): name is CapabilityName {
+/** Whether a name is one of the host's own authorities — membership in the table above,
+ *  never a parse of the name's text. This is the question the seam's dispatch asks (is
+ *  there a handler for this?) and the one `privilegesOf` reads a value through.
+ *
+ *  `crypto/*` and a bundle's own module names are false here by being absent rather than
+ *  by their prefix: a primitive is a function of its arguments and a module is the asking
+ *  bundle's own, so neither reaches anything a guest does not already hold (§12.1). */
+export function isAuthority(name: string): name is CapabilityName {
     return Object.prototype.hasOwnProperty.call(AUTHORITY_CALLS, name);
 }
-/** A grant group (§12.5): the catalog value of a name that is not plain `"app"`, in the
- *  form `"<privilege>:<half>"`. Derived from the table so there is no second list to keep
- *  in step with the names — `grantGroups` (bundle.ts) reads a manifest's `requires`
- *  straight through it, and is the ONE derivation every admission path asks. */
-export type GrantGroup = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
-export const GRANT_GROUPS: readonly GrantGroup[] = [
-    ...new Set(Object.values(AUTHORITY_CALLS).filter((g): g is GrantGroup => g !== "app")),
-];
 /** A PRIVILEGE — the unit an operator grants and a policy file is keyed on (policy.ts).
  *
- *  It is the group's prefix, and it is derived rather than declared for the same reason
- *  the groups are: the catalog is where a name's authority is written down, so the set of
- *  things an operator must say yes to is a function of that table and cannot fall behind
- *  it. Add a privileged name under a new prefix and its policy key exists; there is
- *  nowhere to forget to add it.
- *
- *  This is the one place a catalog VALUE is parsed. The rule the rest of the runtime
- *  keeps — never read a name's authority off the name's own text — is untouched: the
- *  values are this file's own, written here beside the split that reads them, where a
- *  malformed one is visible in the same screen. */
-export type Privilege = GrantGroup extends `${infer P}:${string}` ? P : never;
-export function privilegeOf(group: GrantGroup): Privilege {
-    return group.slice(0, group.indexOf(":")) as Privilege;
+ *  Derived from the catalog rather than declared beside it: the table is where a name's
+ *  authority is written down, so the set of things an operator must say yes to is a
+ *  function of that table and cannot fall behind it. Add a privileged name under a new
+ *  value and its policy key exists; there is nowhere to forget to add it. */
+export type Privilege = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
+export const PRIVILEGES: readonly Privilege[] = [
+    ...new Set(Object.values(AUTHORITY_CALLS).filter((p): p is Privilege => p !== "app")),
+];
+/** Raw links — the privilege the node's transport is built out of (§12.6). Named because
+ *  the shell wires the socket driver to whatever holds it — the one privilege whose grant
+ *  also stands a host-side object up — not because admission treats it specially: to the
+ *  policy it is one key among `PRIVILEGES`. */
+export const PRIVILEGE_LINK = "link" satisfies Privilege;
+// ── Reserved protocol ids: the cross-realm call ─────────────────────────────────
+//
+// A guest reaches another realm the same way an inbound frame does — by a protocol id,
+// resolved through the routing the manifests already define (§12.10). Only a RESERVED
+// id is callable, and the format already reserves them: a claim is held to an
+// alphanumeric first character (bundle.ts), so a `_`-led id is one no ordinary app can
+// spell. That is the whole of the rule, and it was already half-written.
+//
+// Two consequences worth stating, because they are what make the call safe rather than
+// merely short. A guest→guest call never runs the callee inside the caller's frame —
+// the callee is invoked on a later turn and the caller's promise is settled with what it
+// returns, exactly as `fs/*` settles. And a callable id is a GRANT: it is declared in
+// the manifest's `requires` like any authority, so the call graph an operator can read
+// off the bundles is the call graph, and it stays acyclic because no id reaches back.
+/** A reserved id — one the runtime answers or routes ahead of ordinary dispatch, and one
+ *  no bundle's `protocols` may spell unless it holds the privilege that owns it. The test
+ *  is the first character, which is also the charset rule (§12.10). */
+export function isReservedProtocol(name: string): boolean {
+    return name.charCodeAt(0) === 0x5f; // "_"
 }
-export const PRIVILEGES: readonly Privilege[] = [...new Set(GRANT_GROUPS.map(privilegeOf))];
-/** Which halves each privilege is made of — what a bundle reaching it must name in full. */
-export const GROUPS_BY_PRIVILEGE: ReadonlyMap<Privilege, readonly GrantGroup[]> = new Map(
-    PRIVILEGES.map((p) => [p, GRANT_GROUPS.filter((g) => privilegeOf(g) === p)] as const),
-);
-/** The node's transport (§12.6). Named because the shell wires a DRIVER to whatever
- *  occupies it — the one privilege whose grant also stands a host-side object up — not
- *  because admission treats it specially: to the policy it is one key among `PRIVILEGES`. */
-export const PRIVILEGE_MOUNT = "mount" satisfies Privilege;
+/** The id the transport claims, and the one every app's outbound network call names. It
+ *  is an ordinary protocol claim — the transport is reached by the same call the host uses
+ *  to dispatch an inbound frame, with the caller's app key prepended exactly as the
+ *  sender's key is prepended inbound. */
+export const NET_PROTOCOL = "_net";
+/** The id the SHELL answers itself, ahead of dispatch — the transport's way back to the host
+ *  for the two things that are genuinely pushes: a peer's cohort edge, and the teardown
+ *  of a link the host handed over. Reserved for the same reason `_net` is, and answered
+ *  by the shell rather than routed, which is exactly what §12.10 sets `_`-led ids aside
+ *  for. */
+export const SHELL_PROTOCOL = "_host";
+/** Whether a name is a *grant* — the one question the seam's gate asks, and exactly what
+ *  a manifest may declare in `guest.requires`. Two kinds, because there are two kinds of
+ *  thing a guest cannot reach on its own: an authority the host owns, and a reserved id
+ *  that reaches another realm. Everything else — `crypto/*`, the bundle's own modules —
+ *  is false here and is not declarable, because neither can be absent from a host and a
+ *  requirement on what cannot fail states nothing (§12.1). */
+export function isGrant(name: string): boolean {
+    return isAuthority(name) || isReservedProtocol(name);
+}
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

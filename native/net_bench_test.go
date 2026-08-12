@@ -23,6 +23,7 @@ package main
 //	go test -run x -bench BenchmarkNet -benchmem ./...
 
 import (
+	"encoding/hex"
 	"fmt"
 	"testing"
 	"time"
@@ -30,46 +31,114 @@ import (
 	"seedloader/qjs"
 )
 
-// netBenchHarness wires two nodes in one realm: A listens and answers (type 7 → a fixed
-// 64 KB block for the FETCH bench; anything else → an echo of payload), B is
-// the requester. benchPingN/benchFetchN issue n sequential requests over the one link.
+// benchProto is the protocol id the bench app claims, and the id B addresses A by. An
+// ordinary id, deliberately: `_`-led ids are the runtime's reservation and no ordinary
+// bundle may spell one (§12.10).
+const benchProto = "netbench"
+
+// netBenchGuestSource is the bench APP — both ends of it. There is no host-side request
+// facade: an app reaches the network by calling the id the transport claims (`_net`) and is
+// reached by the id it claims itself, so the thing being benchmarked has to be an app.
+// That is the point rather than the cost — this is the path a deployment uses.
+//
+//	handle — one entrypoint, both ends. A remote peer's frame is keyed on the first
+//	         payload byte: type 7 is FETCH-shaped (a fixed 64 KB block), type 9 is
+//	         UPLOAD-shaped (a 1-byte ack folding in the length and last byte, so the
+//	         bench can prove the payload arrived whole), and anything else echoes — the
+//	         control-plane round trip. A local loopback (the host's zero caller id) carries
+//	         an op NAME: `send` is the transport's send op behind the name this side writes,
+//	         `echo` is the bare realm hop.
+const netBenchGuestSource = `
+	const block64k = new Uint8Array(65536); block64k.fill(0x5a);
+	register("handle", (arg) => {
+	  const { fromHost, body: p } = callerOf(arg);
+	  if (fromHost) {
+	    const { op, args } = readOp(p);
+	    if (op === "send") return host.call("_net", writeOp("send", args));
+	    return args;
+	  }
+	  if (p.length > 0 && p[0] === 7) return block64k;
+	  if (p.length > 0 && p[0] === 9) return new Uint8Array([(p.slice(1).length ^ p[p.length - 1]) & 255]);
+	  return p;
+	});
+`
+
+// netBenchHarness wires two nodes in one realm: A listens and answers, B requests. Both
+// load the SAME signed app — one guest serves both ends — so the bundle is built once,
+// in Go, and handed in as hex. benchPingN/benchFetchN/benchUploadN issue n sequential
+// requests over the one link, each as an `invoke` of the `send` op into B's app.
+//
 // The nodes are stood up by makeTransportNode — the factory bootNode uses — and the
-// policy has to admit the artifact's own transport author before either has a network
-// at all (the shared bench realm boots deny-all, ensureBooted).
+// policy has to admit the artifact's own transport author (for `link`) and the bench
+// app's author (for the app) before either node has a network at all: the shared bench
+// realm boots deny-all (ensureBooted).
+//
+// The four %q holes, in order: the app bundle hex, the app key invoke addresses, the
+// app author's hex id, and the protocol id B sends under.
 const netBenchHarness = `
 	globalThis.idA = sodium.crypto_sign_keypair();
 	globalThis.idB = sodium.crypto_sign_keypair();
 	globalThis.aId = toHex(idA.publicKey);
 	globalThis.bId = toHex(idB.publicKey);
-	setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
-	                           grants: { mount: [embeddedTransportAuthor] } }));
+	globalThis.__appBlob = fromHex(%q);
+	globalThis.__appKey = %q;
+	setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
+	                           grants: { link: [embeddedTransportAuthor] } }));
 	globalThis.__netSetup = (async () => {
 	  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 	  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
 	  globalThis.netA = a.transport;
 	  globalThis.netB = b.transport;
+	  // A claims the protocol so inbound frames route to its guest; B holds the same app
+	  // because the request goes out THROUGH it.
+	  await a.loadBundleBlob(__appBlob);
+	  await b.loadBundleBlob(__appBlob);
 
-	  const block64k = new Uint8Array(65536); block64k.fill(0x5a);
-	  netA.onRequest((from, proto, payload) => {
-	    if (payload.length > 0 && payload[0] === 7) return block64k;     // FETCH-shaped: bulk response (type=7 in payload[0])
-	    if (payload.length > 0 && payload[0] === 9) return new Uint8Array([(payload.slice(1).length ^ payload[payload.length - 1]) & 255]); // UPLOAD-shaped: 1-byte ack folding in length + last byte
-	    return payload;                                                   // control-plane: echo
-	  });
+	  // The transport's 'send' op argument order (transport/src/core.js):
+	  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
+	  const proto = new TextEncoder().encode(%q);
+	  const to = fromHex(aId);
+	  const sendArgs = (payload) => {
+	    const out = new Uint8Array(1 + 4 + 4 + to.length + 4 + proto.length + 4 + payload.length);
+	    let off = 0;
+	    out[off++] = 0;
+	    const u32 = (v) => { out[off] = v >>> 24; out[off + 1] = (v >>> 16) & 255; out[off + 2] = (v >>> 8) & 255; out[off + 3] = v & 255; off += 4; };
+	    u32(0);                                  // deadline: the node's default
+	    u32(to.length); out.set(to, off); off += to.length;
+	    u32(proto.length); out.set(proto, off); off += proto.length;
+	    u32(payload.length); out.set(payload, off);
+	    return out;
+	  };
+	  // One request out of B, answered by A's app. The [ok u8][response] answer shape is
+	  // the transport's; a 0 means unreachable, a deadline, or a refusal.
+	  const req = async (args) => {
+	    const r = await b.invoke("send", args, __appKey);
+	    if (r[0] !== 1) throw new Error("net: request failed");
+	    return r.slice(1);
+	  };
 
-	  globalThis.__ping = new Uint8Array([10, 20, 30]);
-	  globalThis.__fid = new Uint8Array([7, ...new Array(31).fill(0)]);      // type=7 fetch id (type byte inside payload)
-	  globalThis.__big = new Uint8Array(1 << 20); __big.fill(0x5a);          // 1 MiB upload payload (a STORE group)
-	  globalThis.__big9 = new Uint8Array(1 + __big.length); __big9[0] = 9; __big9.set(__big, 1); // type=9 upload (type byte inside payload)
-	  globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await netB.request(aId, new TextEncoder().encode("_test"), __ping); return new Uint8Array(0); };
-	  globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await netB.request(aId, new TextEncoder().encode("_test"), __fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
-	  globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await netB.request(aId, new TextEncoder().encode("_test"), __big9); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
+	  const ping = sendArgs(new Uint8Array([10, 20, 30]));
+	  const fid = sendArgs(new Uint8Array([7, ...new Array(31).fill(0)]));      // type=7 fetch id
+	  const big = new Uint8Array(1 << 20); big.fill(0x5a);                      // 1 MiB upload payload (a STORE group)
+	  const big9 = new Uint8Array(1 + big.length); big9[0] = 9; big9.set(big, 1); // type=9 upload
+	  const upload = sendArgs(big9);
+	  globalThis.benchPingN = async (n) => { for (let i = 0; i < n; i++) await req(ping); return new Uint8Array(0); };
+	  globalThis.benchFetchN = async (n) => { let acc = 0; for (let i = 0; i < n; i++) { const r = await req(fid); acc ^= r[0]; } return new Uint8Array([acc & 255]); };
+	  globalThis.benchUploadN = async (n) => { const want = ((1 << 20) ^ 0x5a) & 255; for (let i = 0; i < n; i++) { const r = await req(upload); if (r[0] !== want) throw new Error("upload ack " + r[0] + " != " + want); } return new Uint8Array(0); };
+	  // The realm hop ALONE: one invocation of the app's guest, no socket in the path.
+	  // Two of these sit inside every round trip above (the sender's app and the
+	  // receiver's), so it is what says whether a round-trip number is the wire or the
+	  // guest boundary.
+	  const localArg = new Uint8Array(34);
+	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.invoke("echo", localArg, __appKey); return new Uint8Array(0); };
 	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 	})();
 `
 
 // setupNetBench stands up the harness in the shared benchmark realm: A's listeners are
-// bound inside __netSetup (makeTransportNode awaits start()), and B is pointed at A's
-// bound port. The returned loop drives benchPingN/benchFetchN/benchUploadN.
+// bound inside __netSetup (makeTransportNode awaits start()), both nodes load the bench
+// app, and B is pointed at A's bound port. The returned loop drives
+// benchPingN/benchFetchN/benchUploadN.
 func setupNetBench(b *testing.B) *eventLoop {
 	ensureBooted(b)
 	// Once per REALM, not once per call. The realm is shared across benchmarks
@@ -82,14 +151,24 @@ func setupNetBench(b *testing.B) *eventLoop {
 		b.Fatal("harness probe:", err)
 	}
 	if v.String() != "function" {
-		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(netBenchHarness)); err != nil {
+		// The app is signed HERE, by the Go-side writer, for the same reason the tests'
+		// probe app is: the realm holds no signing key and the loader deliberately cannot
+		// sign (mldsa.go binds verify only, §12.4).
+		author := testAuthor(b)
+		blob := signedBundleBytes(b, author, benchProto, 1, netBenchGuestSource, []string{"_net"})
+		src := fmt.Sprintf(netBenchHarness,
+			hex.EncodeToString(blob),
+			appKeyFor(author.id(), benchProto),
+			hex.EncodeToString(author.id()),
+			benchProto)
+		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(src)); err != nil {
 			b.Fatal("harness:", err)
 		}
 		if kind, _, msg, err := el.await(`__netSetup`, 8*time.Second); err != nil || kind != 0 {
 			b.Fatalf("__netSetup: kind=%d msg=%q err=%v", kind, msg, err)
 		}
 	}
-	return el // already wired: listeners bound, peer addressed
+	return el // already wired: listeners bound, app loaded, peer addressed
 }
 
 // benchAwait drives one JS request loop to completion and fails the bench if it rejects
@@ -104,6 +183,20 @@ func benchAwait(b *testing.B, el *eventLoop, expr string) {
 	if kind != 0 {
 		b.Fatalf("%s rejected: %s", expr, msg)
 	}
+}
+
+// BenchmarkGuestDispatch times ONE guest entrypoint invocation with no socket in the
+// path — the Go↔QuickJS boundary, the per-realm FIFO queue (§12.3) and the guest's own
+// `handle`, and nothing else. Every network round trip above crosses two of these (the
+// sending app's realm on the way out, the receiving app's on the way in), so this is the
+// floor a round-trip number is measured against: it says whether a regression is the
+// wire, the record layer, or the guest boundary.
+func BenchmarkGuestDispatch(b *testing.B) {
+	el := setupNetBench(b)
+	benchAwait(b, el, "benchLocalN(1)") // warmup: the realm is built lazily
+	b.ResetTimer()
+	benchAwait(b, el, fmt.Sprintf("benchLocalN(%d)", b.N))
+	b.StopTimer()
 }
 
 func BenchmarkNetRoundTrip(b *testing.B) {

@@ -27,7 +27,7 @@
 // separate mechanism: it is a bundle whose manifest `version` is higher, which
 // freshness requires and the same-author rule (§12.5) admits.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, GRANT_GROUPS, isGrant, privilegeOf, type GrantGroup, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, PRIVILEGE_LINK, isAuthority, isGrant, isReservedProtocol, NET_PROTOCOL, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -128,7 +128,7 @@ export interface BundleManifest {
      *  only symptom is a node that boots clean and answers an empty body forever.
      *
      *  Optional, and an absent list is not a degenerate app: a bundle the shell only ever
-     *  drives as the *initiator* (§12.8 — the `--put`/`--get` one-shots) receives no
+     *  drives as the *initiator* (§12.8 — the `--op` one-shot) receives no
      *  frames and claims nothing. Empty and absent mean the same thing.
      *
      *  A claim is not authority. It routes frames a peer already chose to send to this
@@ -139,9 +139,12 @@ export interface BundleManifest {
      *  resumes if the newcomer is uninstalled (shell-core `rebuildRoutes`). That is the
      *  §12.10 rebind, fused into the one act that was always going to precede it.
      *
-     *  Mount bundles (§12.5) declare NONE: a transport is not an app, receives no
-     *  dispatch, and a protocol pointed at it could never arrive — refused at the load
-     *  (shell-core), where the refusal can say so. */
+     *  The TRANSPORT claims exactly one: the reserved `_net` (§12.10), which is how it is
+     *  reached and the only thing that makes it reachable. It is not a special case in
+     *  the routing — the last claimant of an id wins here as anywhere, which is what an
+     *  in-place transport replacement now is — only in who may spell it, since the
+     *  charset reserves `_`-led ids and `verifyManifest` grants the exception to a bundle
+     *  holding `link`. */
     protocols?: string[];
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
@@ -354,35 +357,27 @@ export function appKeyFor(author: Uint8Array, app: string): string {
 export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
 }
-/** Which grant groups (§12.5) a manifest's `requires` covers — the `"<privilege>:<half>"`
- *  groups of the authorities it names, read straight off the catalog (`AUTHORITY_CALLS`),
- *  never off a prefix parsed out of a name. Empty ⇒ the bundle reaches no privilege and
- *  is an ordinary app.
+/** Which privileges (§12.5) a manifest's `requires` reach — the catalog VALUES of the
+ *  authorities it names (`AUTHORITY_CALLS`), read straight off the table and never off a
+ *  prefix parsed out of a name. Empty ⇒ the bundle reaches no privilege and is an
+ *  ordinary app.
  *
  *  The ONE derivation admission asks, and the reason there is no `role` field: what a
  *  bundle may do is read off the names it requires, never off a claim about what it is.
- *  The shell turns these into the privileges the operator's policy is keyed on
- *  (`privilegeOf`) and checks each is claimed in full — two questions, one derivation
- *  from the catalog, so neither can drift from the other or from the vocabulary. The
- *  same argument that keeps the catalog in domains.ts and out of guest-seam.ts.
+ *  There is nothing between the name and the privilege — no group, no half, no second
+ *  vocabulary — because a privilege is one thing (core/domains.ts): a name's value is a
+ *  privilege or it is `"app"`.
+ *
+ *  Reserved ids in `requires` contribute none. Calling `_net` is how an app reaches the
+ *  network, and an app reaching the network is the unprivileged case — what the operator
+ *  is asked about is who may BE the network, which is `link/*`.
  *
  *  Not folded into `verifyManifest`: this is not a well-formedness question. A manifest
  *  naming `link/open` is well-formed; whether this node's operator grants that is
  *  policy, so the decision belongs where the policy is in hand (shell-core). */
-export function grantGroups(manifest: BundleManifest): GrantGroup[] {
-    const groups = manifest.guest.requires.filter(isGrant).map((n) => AUTHORITY_CALLS[n]);
-    return GRANT_GROUPS.filter((g) => groups.includes(g));
-}
-/** Which privileges (§12.5) a manifest reaches — `grantGroups` lifted to the vocabulary
- *  an operator's policy is keyed on. Empty ⇒ an ordinary app.
- *
- *  ONE function, called by everything that asks the question: the admission gates that
- *  refuse a partial claim (policy.ts `wholePrivileges`, `mountClaimsNoProtocol`) and the
- *  shell that must know whether it is standing a transport (`isMount`). Two copies of
- *  this derivation is the one drift that would matter — a bundle the gates read as a
- *  mount and the shell installs as an app, or the reverse. */
 export function privilegesOf(manifest: BundleManifest): Privilege[] {
-    return [...new Set(grantGroups(manifest).map(privilegeOf))];
+    const reached = manifest.guest.requires.filter(isAuthority).map((n) => AUTHORITY_CALLS[n]);
+    return PRIVILEGES.filter((p) => reached.includes(p));
 }
 /** The fs keyspace prefix for one app (README §12.2).
  *
@@ -424,19 +419,25 @@ const OFF_JSON = OFF_ML_SIG + ML_DSA_SIG_LEN;
  *  to an unambiguous charset. With the container keyed by name (never joined to a
  *  path) a traversal name could not escape anything, but a name that needs quoting or
  *  normalizing to be used as either is a name the format should not accept at all. */
-const NAME_RE = /^[A-Za-z0-9_-]+$/;
+/** Module names double as filenames and as the guest's module keys, so they are held to
+ *  an unambiguous charset — and, since ONE `host.call` carries three kinds of name, to a
+ *  first character that cannot be either of the other two. A `/` would spell a host
+ *  authority; a leading `_` would spell a reserved protocol id reaching another realm
+ *  (core/domains.ts). Both are excluded here, which is what lets the seam's dispatch tell
+ *  the three apart by the name alone (§12.2). */
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 /** A protocol id's charset (§12.10). These travel on the wire and are what a receiving
  *  host routes by, so they are held to something unambiguous: an alphanumeric first
  *  character, then alphanumerics and `._/-`, at most 64 bytes — which covers the ids in
  *  use (`seedstore/v1`, `chat-v1`) and rejects the whitespace, control and lookalike
- *  characters an operator reading a console line could not tell apart.
- *
- *  The leading-alphanumeric rule is load-bearing rather than cosmetic: a shell may answer
- *  protocols of its own ahead of dispatch, and it spells them with a leading `_` (`_offer`,
- *  §12.10). Refusing that first character here means a bundle cannot spell one — the
- *  reservation is a property of the format instead of a list every shell must remember to
- *  check. */
+ *  characters an operator reading a console line could not tell apart. */
 const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
+/** A RESERVED protocol id: the same charset behind a leading `_`. These are the runtime's
+ *  own — `_net`, which the transport claims, and `_host`, which the shell answers — and they
+ *  are the only ids a guest may CALL (core/domains.ts). Claiming one is a privilege, not a
+ *  charset question, so this only says what the shape is; `isValidManifest` below decides
+ *  who may spell it. */
+const RESERVED_PROTO_RE = /^_[A-Za-z0-9._/-]{1,63}$/;
 // Domain-separation prefix for the manifest signature (README §12.4, §16.1):
 // `"seedkernel-manifest-sig-v1\0"` — from the one domain family (domains.ts, §16.1).
 // Prepended to the manifest JSON before signing/verifying, never stored in the
@@ -589,7 +590,9 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         const claimed = new Set();
         for (const p of o.protocols) {
-            if (typeof p !== "string" || !PROTO_RE.test(p))
+            // Both shapes are well FORMED here; who may claim the reserved one is a
+            // privilege question, answered by name in verifyManifest below.
+            if (typeof p !== "string" || !(PROTO_RE.test(p) || RESERVED_PROTO_RE.test(p)))
                 return false;
             if (claimed.has(p))
                 return false;
@@ -722,11 +725,21 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // format and should be told so.
     //
     // This is a WELL-FORMEDNESS check, and the only one requires get here: `link/open`
-    // and `transport/deliver` are in the vocabulary and a manifest naming them is
-    // well-formed, but they are the transport mount's alone (§12.5). Which admission
-    // point will have it is not a property of the manifest, so that decision is the
-    // shell's, over `grantGroups`.
+    // is in the vocabulary and a manifest naming it is well-formed, but it is the
+    // transport's alone (§12.5). Which admission point will have it is not a
+    // property of the manifest, so that decision is the shell's, over `privilegesOf`.
     for (const r of parsed.guest.requires) {
+        // A reserved id is a grant over another REALM rather than over a host authority,
+        // so it is not in the catalog and there is no near-miss list to offer — only its
+        // shape can be wrong. Whether anything actually claims it is a question about the
+        // NODE, not the manifest, and it is answered at the call (guest-seam.ts): an app
+        // may legitimately be installed before the transport that answers its `_net`.
+        if (isReservedProtocol(r)) {
+            if (!RESERVED_PROTO_RE.test(r)) {
+                throw new Error(`bundle: "${r}" is not a well-formed reserved id (manifest guest.requires; "_" then alphanumerics and ._/-, at most 64 bytes)`);
+            }
+            continue;
+        }
         if (!isGrant(r)) {
             // The authorities sharing the rejected name's prefix, not the whole list: a
             // misspelled `fs/exists` is answered by the six `fs/` names, and a bare `fs`
@@ -737,6 +750,21 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
                 ? `this host grants: ${near.join(", ")}`
                 : `no authority under "${prefix}" exists — a pure name (crypto/*, or one of this bundle's own modules) is not a grant and is not declared`;
             throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
+        }
+    }
+    // A RESERVED id may be claimed only by a bundle that holds the privilege it belongs
+    // to — today that is `_net`, claimable by whatever reaches `link` (§12.10). This is
+    // the whole of what used to be a transport-shaped special case in admission: there is no
+    // rule that a transport claims nothing, because a transport claims exactly one thing,
+    // and no rule that an app claims no reserved id, because the charset says so and this
+    // says who the exception is for. `_host` is the SHELL's and is claimable by nobody —
+    // it is not routed, it is answered.
+    const reserved = (parsed.protocols ?? []).filter(isReservedProtocol);
+    if (reserved.length > 0) {
+        const links = privilegesOf(parsed).includes(PRIVILEGE_LINK);
+        const bad = reserved.filter((p) => !(links && p === NET_PROTOCOL));
+        if (bad.length > 0) {
+            throw new Error(`bundle: "${bad.join(", ")}" is reserved (§12.10) — ${NET_PROTOCOL} is claimable only by a bundle that reaches "${PRIVILEGE_LINK}", and no bundle claims any other reserved id`);
         }
     }
     return { author, authorKeys, manifest: parsed };
@@ -1011,14 +1039,16 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  Trusting the author means trusting everything the author signed.
  *
  *  `deferMark` is for the one load whose "actually loaded" boundary is NOT this
- *  function's: the transport mount is only loaded once its driver STANDS, which happens
- *  after this returns (shell-core `loadBundleBlob` → `installTransport`). A realm
- *  built from the guest source can fail there, and the node then keeps the transport
- *  it had — so advancing the mark inside would raise the (author, app) mark before that
- *  was known, bricking a rollback to the last good version
- *  (the exact outcome `freshVersion` exists to prevent). The caller
- *  passes `deferMark` for the transport mount and advances at the point the load is
- *  complete (§12.4: "the mark must record the highest version that actually loaded"). */
+ *  function's. Every app's realm is built lazily, so a guest that cannot compile is
+ *  discovered at its first message and its bundle did land. The TRANSPORT is the exception,
+ *  and not by fiat: the node's network has to be up when the load returns — the driver
+ *  configures it in the same breath — so the shell builds that realm eagerly and the
+ *  load fails if it will not compile. Advancing the mark inside would then raise the
+ *  (author, app) mark for a bundle that never executed a line, leaving the node serving
+ *  the transport it has and unable to reinstall any version it can reach: rollback
+ *  bricked by a failed upgrade, which is the exact outcome `freshVersion` exists to
+ *  prevent. The caller passes `deferMark` there and advances once the realm stands
+ *  (§12.4: the mark records the highest version that actually loaded). */
 export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): LoadedBundle {
     // The `version` is an enforced monotonic integer (verifyManifest shape-checked it);
     // whether THIS one may land was already answered by the admission predicate, which
@@ -1060,7 +1090,7 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // the freshness file. The mark must record the highest version
     // that actually loaded (README §12.4). Integrity was verified by verifyBundle before
     // this function was called, so the freshness advance is always behind a successful
-    // verify — and, with `deferMark`, behind the driver standing as well.
+    // verify — and, with `deferMark`, behind the realm standing as well.
     if (freshness && !deferMark) {
         // A persist that FAILS is a failed load, not a silent success: the modules have
         // landed but the mark did not, so the downgrade gate is off for this pair on the

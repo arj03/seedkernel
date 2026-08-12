@@ -13,7 +13,7 @@
 // Platform-neutral: the WebSocket global is touched only inside a dial (or an
 // injected factory), so importing this module where WebSocket is absent is safe.
 
-import type { Network, PeerId } from "../core/net.js";
+import type { PeerId } from "../core/socket-seam.js";
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { parsePeerRef, type TransportHost, type LinkHandle } from "./transport-host.js";
 
@@ -44,7 +44,7 @@ export class WsChannel extends MessageChannel {
 export interface WsNetworkOptions {
   /** The transport driver — the shell's `net` once the transport bundle is
    *  admitted. It holds the node identity, the network key, the contact secret
-   *  and the peer whitelist; this file only opens sockets. */
+   *  and the peer lint; this file only opens sockets. */
   driver: TransportHost;
   /** Open a WebSocket to `url`. Defaults to the platform global, which is what a
    *  browser tab (and Node ≥22 / Bun) provide. Referenced only here, so importing
@@ -62,7 +62,7 @@ export interface WsNetworkOptions {
   connsPerPeer?: number;
 }
 
-export class WsNetwork extends SingleIdentityNetwork implements Network {
+export class WsNetwork extends SingleIdentityNetwork {
   private readonly mkWs: (url: string) => WsLike;
   private readonly conns: number;
   private readonly dialing = new Map<PeerId, LinkHandle[]>(); // every link we have dialed to a peer
@@ -102,7 +102,8 @@ export class WsNetwork extends SingleIdentityNetwork implements Network {
         // not ours. Passing our own here would seal msg1 under a secret the peer
         // has never seen, so every dial to a gated peer would draw silence.
         contactSecret,
-        onClose: () => this.forget(peerId, handle),
+        onAuth: () => this.peerUp(peerId),
+        onClose: () => { this.peerDown(peerId); this.forget(peerId, handle); },
       });
       arr.push(handle);
     }
@@ -117,7 +118,7 @@ export class WsNetwork extends SingleIdentityNetwork implements Network {
     for (const l of pending) l.close();
   }
 
-  // A link died (or was declined by the whitelist): remove it from the outbound
+  // A link died (or was declined by the peer lint): remove it from the outbound
   // `dialing` pool. The router bookkeeping is the guest's.
   private forget(peerId: PeerId, handle: LinkHandle): void {
     const dl = this.dialing.get(peerId);

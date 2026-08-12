@@ -3,7 +3,7 @@
 // record layer, ex net-link.ts), the authenticated link router (ex link-router.ts),
 // the link bookkeeping (ex net-route.ts NodeNetworkCore) and the request/response
 // layer (ex net.ts) — as the zero-authority JS program of a signed bundle claiming
-// the shell's explicit transport mount.
+// the shell's explicit transport slot.
 //
 // The program is split across transport/src/{util,ake,framing,router,core}.js —
 // pure helpers, the AKE and record layer, the wire framers, the routers, and the
@@ -48,30 +48,30 @@
 //                     the host's, never this program's.
 //       "node/random" [n u32 BE] -> n random bytes            (nonces, ephemeral secrets)
 //
-//     `link` — the platform's whole contribution to the network: bytes over an opaque
-//     link id, opened and closed. `timer` — deadlines, because a zero-authority realm
-//     has no setTimeout. `transport` — where this program reports its structured
-//     OUTPUT (an attributed peer, a protocol id, a correlation), which every app then
-//     reaches through the ordinary `net` domain. Its own ws.wasm is NOT here: a bare
-//     name is a primitive — the bundle's own code, ungated like `crypto` (§12.1) — so
-//     no grant is needed to name it.
+//     `link/*` — the platform's whole contribution to the network: bytes over an opaque
+//     link id, opened and closed. `timer/*` — deadlines, because a zero-authority realm
+//     has no setTimeout. `_host` — the shell's own reserved id, for the two edges where
+//     the host holds the other end. Its own ws.wasm is NOT here: a bare name is a
+//     primitive — the bundle's own code, ungated like `crypto` (§12.1) — so no grant is
+//     needed to name it.
 //
-//     The whitelist gate is deliberately NOT ours to apply. It is host policy over the
-//     attribution this program reports (transport/link-auth answers with the verdict,
-//     and the host has already closed the channel on a refusal); a gate this program
-//     applied to itself would be one a hostile transport would simply skip.
+//     There is no `transport` domain and no `net` domain. What this program provides
+//     back is not a host name at all: the manifest claims the reserved id `_net`
+//     (§12.10), and an app reaching the network CALLS that id, exactly as an inbound
+//     frame reaches an app by the id it claims. The host's whole part is attribution —
+//     it prepends the caller's key — and resolution.
 //
-//   - entrypoints, invoked synchronously by name — `linkBytes`, `timer`, `request`
-//     and the rest below. This is the SAME mechanism an app's holder `handle` is
-//     invoked through: there is no second host↔module ABI, no event tag space, and
-//     an entrypoint this program does not register fails loud by name rather than
-//     desyncing a decoder.
+//   - one entrypoint, `handle`, invoked exactly as an app's is. The op travels as a
+//     length-prefixed NAME in the payload rather than a tag byte, so there is still no
+//     number two sides must agree on and an op this program does not implement fails
+//     loud by name rather than desyncing a decoder. (`timer` is the second entrypoint,
+//     and it is every guest's, not this program's.)
 //
 // The node key stays out of this module in the strongest sense: there is no call
 // that signs arbitrary bytes — node/sign is scoped by the point the host admitted this
 // bundle into, so a compromised transport can neither forge app signatures nor
 // sign for another network. Its verification twin is equally scope-bound: node/verify
-// answers only under this mount's own scope, so this program checks a peer's
+// answers only under this transport's own scope, so this program checks a peer's
 // transcript signature without holding the domain tag it was made under.
 //
 // Channels are host handles keyed by a link id the HOST minted — the module table
@@ -109,13 +109,16 @@ const N_LINK_STAT = "link/stat";
 const N_TIMER_ARM = "timer/arm";
 const N_TIMER_CLEAR = "timer/clear";
 
-// What this program PROVIDES back — the structured face the platform does not have.
-const N_DELIVER = "transport/deliver";
-const N_SETTLE = "transport/settle";
-const N_LINK_AUTH = "transport/link-auth";
-const N_PEER_EDGE = "transport/peer-edge";
-const N_READY = "transport/ready";
-const N_LINK_DOWN = "transport/link-down";
+// The SHELL's own reserved id (§12.10) — the one thing this program calls that is not a
+// host authority. It is a cross-realm call like any other: the shell answers it rather
+// than routing it, and it carries only the two edges where the host genuinely holds the
+// other end (an inbound request, which reaches the app claiming the protocol; and the
+// fate of a link the host handed us through openLink).
+//
+// What this program PROVIDES back is NOT here, because it is not something it calls: the
+// transport claims `_net`, and an app reaching the network calls that. The answer is what
+// `handle` returns.
+const N_HOST = "_host";
 
 // The primitives this program asks for by name, through the `crypto/` prefix — the
 // full names as the manifest's `guest.requires` declares them, so a host that cannot
@@ -269,9 +272,13 @@ function channelSign(root, th, id) {
 //
 // The one rule the arrangement rests on is the host's: NO OP RE-ENTERS THIS REALM.
 // A socket write does not deliver during the write, a fired timer arrives on its own
-// turn, and an inbound request is answered through the `respond` entrypoint rather
-// than as transport/deliver's return value — so nothing below can call back into a frame
-// that is still on the stack.
+// turn, and a cross-realm call runs its callee on a LATER turn by construction — so
+// nothing below can call back into a frame that is still on the stack.
+//
+// The corollary, and the reason this program never uses `await`: an answer that arrives
+// through this realm cannot be awaited from inside it, because the invocation carrying it
+// would queue behind the frame doing the awaiting (realm-queue.ts). So an inbound request
+// is dispatched with `.then`, not awaited, and an app's send is answered with `defer()`.
 
 /** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
 function netLinkOpen(destBytes) {
@@ -290,25 +297,49 @@ function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId],
  *  stall clock to the deadline alone. */
 function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-function netDeliver(corr, noReply, fromBytes, proto, payload) {
+/** Call the shell's own protocol by op name — the preamble's `writeOp` (guest-seam.ts)
+ *  frames it, the same envelope every other call in this system carries. The host
+ *  prepends OUR id on the way in, so there is nothing here to identify ourselves with. */
+function hostCall(op, tail) {
+  return host.call(N_HOST, writeOp(op, tail));
+}
+
+/** Hand an inbound request to whichever app claims its protocol id, and resolve with
+ *  that app's answer. NOT awaited by any caller inside this realm — see the note above.
+ *
+ *  Delivery and the reply are ONE call: the answer is the app's own `handle` return
+ *  value, on a later turn, which is exactly the shape an asynchronous app handler needs
+ *  and what a separate reply entrypoint would only have simulated. */
+function hostDeliver(fromBytes, proto, payload) {
   const head = new Uint8Array(1 + proto.length);
   head[0] = proto.length;
   head.set(proto, 1);
-  host.call(N_DELIVER, args([corr], [noReply ? 1 : 0], concatBytes([fromBytes, head, payload])));
+  return hostCall("deliver", concatBytes([fromBytes, head, payload]));
 }
-function netSettle(corr, ok, payload) { host.call(N_SETTLE, args([corr], [ok ? 1 : 0], payload)); }
-/** Ask the host's WHITELIST whether this peer may link. Asked at the FIRST point the
- *  peer is known and — critically — before this end has revealed anything about
- *  itself: msg3 when accepting, msg4 when dialing. `conceal` tells the host a refusal
- *  must be silent, which is true exactly when we have not yet sent our identity.
- *  The gate is the host's because a predicate we applied to ourselves would gate
- *  nothing; the ORDER is ours, and it is what keeps a refusal from being an oracle. */
-function netLinkAuth(linkId, peerBytes, conceal) {
-  return host.call(N_LINK_AUTH, args([linkId], [conceal ? 1 : 0], peerBytes))[0] === 1;
+/** A link the HOST handed us (openLink) authenticated, or tore down. Relayed so whoever
+ *  passed the channel in learns its fate; a core link the guest dialed or accepted is
+ *  nobody's business but ours. */
+function hostLinkAuth(linkId, peerBytes) { hostCall("link-auth", args([linkId], [], peerBytes)); }
+function hostLinkDown(linkId, reason) { hostCall("link-down", args([linkId], [reason])); }
+
+/** The peer LINT (§12.6): is this peer on the operator's list? Asked at the FIRST point
+ *  the peer is known and — critically — before this end has revealed anything about
+ *  itself: msg3 when accepting, msg4 when dialing. `conceal` says a refusal must be
+ *  silent, which is true exactly when we have not yet sent our identity, and it is what
+ *  keeps a refusal from being an oracle (§12.6.2).
+ *
+ *  **It is a lint and it lives here, which is a correction rather than a relaxation.**
+ *  The host used to hold it, on the argument that a predicate we applied to ourselves
+ *  would gate nothing against a hostile occupant of this slot. True — but the host was
+ *  checking a key WE supplied, so it gated nothing against a hostile occupant either: one
+ *  would simply supply a key that passes, or forge an attribution with no link at all.
+ *  What the check actually catches is a buggy transport or an unlisted peer, and both are
+ *  ours. What holds against a hostile transport is unchanged and was always the real answer:
+ *  it reaches no authority but `link/*`. */
+function admits(peerBytes) {
+  if (admitPeers === null) return true;
+  return admitPeers.has(toHex(peerBytes));
 }
-function netPeerEdge(up, peerBytes) { host.call(N_PEER_EDGE, args([], [up ? 1 : 0], peerBytes)); }
-function netReady(ok) { host.call(N_READY, args([], [ok ? 1 : 0])); }
-function netLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
 // ── timers ────────────────────────────────────────────────────────────────────
 
@@ -641,14 +672,14 @@ class Link {
     const idI = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
-    // The whitelist gate runs HERE — after decryption and signature, never on a claimed
+    // The peer lint runs HERE — after decryption and signature, never on a claimed
     // key, and before msg4 puts our identity and signature on the wire. A refusal is
     // silence, so being turned away is indistinguishable from a msg3 that simply never
     // arrived, and the caller learns nothing about who lives at this address. Nothing
     // about us has gone out yet, and that is the whole point of the second round trip
     // (§12.6.2, CHANNEL §10 invariant 5). Asking at becomeAuthed() instead would be one
     // message too late.
-    if (!netLinkAuth(this.linkId, idI, true)) { this.stall(); return; }
+    if (!admits(idI)) { this.stall(); return; }
     this.peerPubkey = idI; this.peerId = peerId;
 
     const h3 = this.h(this.th, w3);
@@ -669,9 +700,9 @@ class Link {
     // A mismatch here is a local fault, not a probe to hide from — we already
     // revealed ourselves at msg3 — so it aborts rather than stalls.
     if (this.expectPeerId && peerId !== toHex(this.expectPeerId)) { this.abort(); return; }
-    // Our own whitelist gate, on the end that dialed. Not concealed: we named ourselves at
+    // The peer lint, on the end that dialed. Not concealed: we named ourselves at
     // msg3, so there is nothing left to hide from this peer and an abort is honest.
-    if (!netLinkAuth(this.linkId, idR, false)) { this.abort(true); return; }
+    if (!admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
     this.th = this.h(this.th, w4);
     try { this.deriveConcealedSession(); } catch { this.abort(); return; }

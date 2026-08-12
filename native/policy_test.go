@@ -32,17 +32,17 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
-// The mount names carry a PRIVILEGE an operator grants separately (§12.5): the transport
+// The `link/*` names carry a PRIVILEGE an operator grants separately (§12.5): the transport
 // sees all plaintext and holds the session keys, so "I trust this author's apps" must not
 // answer "may this author be my transport". There is no self-description in the manifest
 // — the bundle format has no role field — so `guest.requires` alone decides which
 // privileges are in play, and the derivation only ever runs the strict way: naming
-// `link/open` and `transport/deliver` puts `mount` in the set, never takes it out.
+// any `link/*` name puts `link` in the set, never takes it out.
 //
 // Driven through the native loader because the policy file is an operator-facing surface
 // on this target — `--policy` is parsed by the shared JS, and this is what proves the
 // loader reaches that decision and not a permissive default.
-func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
+func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)
 	authorHex := hex.EncodeToString(author.id())
@@ -53,27 +53,23 @@ func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link/open", "transport/deliver"})
+	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link/open"})
 	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
 	}
 
-	// A partial claim is refused before any predicate — it cannot fall back to the
-	// unprivileged base, which is the hole a half-declared mount would otherwise open.
-	halfBundle, _ := writeBundle(t, author, "halfapp", 1, "", []string{"link/open"})
-	if status := loadBundle(halfBundle); !strings.Contains(status, "every half of a privilege or none") {
-		t.Fatalf("a bundle naming link without any transport name must be refused as malformed: %s", status)
-	}
+	// A privilege is ONE thing, so there is no partial claim to refuse and nothing that
+	// could fall through to the unprivileged base: a single `link/*` name is the whole
+	// claim, which is what the one-name bundle above already proves.
 
 	// Granting the privilege gets the same blob PAST admission, where it then fails on its
 	// own merits — this fixture's stub guest is not a transport. A different failure, from
-	// a policy edit and nothing else. The node keeps the transport it had:
-	// installTransport builds the incoming driver before closing the outgoing one.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"mount":["` + authorHex + `"]}}`); err != nil {
+	// a policy edit and nothing else.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	if status := loadBundle(linkBundle); strings.Contains(status, "rejected by admission") {
-		t.Fatalf("a grants.mount entry must admit its author to the mount: %s", status)
+		t.Fatalf("a grants.link entry must admit its author to the transport: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)
 	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {
@@ -87,7 +83,8 @@ func TestPolicyMountIsASeparatelyGrantedPrivilege(t *testing.T) {
 	for _, bad := range []string{
 		`{"authors":["` + authorHex + `"],"roles":{"transport":["` + authorHex + `"]}}`,
 		`{"authors":["` + authorHex + `"],"transportAuthors":["` + authorHex + `"]}`,
-		`{"authors":["` + authorHex + `"],"grants":{"mounts":["` + authorHex + `"]}}`,
+		`{"authors":["` + authorHex + `"],"grants":{"mount":["` + authorHex + `"]}}`,
+		`{"authors":["` + authorHex + `"],"grants":{"links":["` + authorHex + `"]}}`,
 	} {
 		if err := applyPolicy(bad); err == nil {
 			t.Fatalf("applyPolicy(%s) must fail loudly", bad)

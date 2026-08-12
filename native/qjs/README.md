@@ -15,15 +15,25 @@ wazero version and shedding unused complexity, not MiB.
 
 ## Vendored asset
 
-- **`qjs.wasm`** — the prebuilt engine: quickjs-ng wrapped by a small C shim that
-  exposes the flat `QJS_*` C ABI with NaN-boxed JSValues (so every export
-  takes/returns a single `i64`). Copied verbatim from
-  `github.com/fastschema/qjs@v0.0.6` (MIT). ~1 MiB; embedded via `//go:embed` and
-  driven over wazero — the Go build never compiles C.
+- **`csrc/`** — the C shim that exposes the flat `QJS_*` ABI with NaN-boxed JSValues
+  (so every export takes/returns a single `i64`). Forked from
+  `github.com/fastschema/qjs@v0.0.6` (MIT, `csrc/LICENSE.fastschema`) and **ours now**:
+  it carries the execution deadline the guest realm's budget is built on
+  (`QJS_SetDeadline` / `QJS_TakeInterrupted`, `csrc/qjs.c`), which upstream ships
+  commented out — its `New_QJS` accepts a `max_execution_time` and ignores it.
+- **`qjs.wasm`** — that shim linked against quickjs-ng, checked in (~1.3 MiB) and
+  embedded via `//go:embed`, so a clone builds the loader with nothing but Go.
 
-To rebuild the blob, go to the upstream tag: it builds the shim against quickjs-ng
-(a git submodule there) with wasi-sdk. We vendor only the finished `qjs.wasm`, not
-the C sources — the `QJS_*` surface the Go bridge depends on is documented below.
+`./build-qjs.sh` rebuilds it: fetches quickjs-ng at the commit pinned in the script,
+compiles `csrc/` against it with wasi-sdk, and installs the result over `qjs.wasm`.
+The engine is fetched rather than vendored — it is ~2 MB of C we do not modify, and a
+pinned SHA says as much as a copy. Rebuilding is not part of the Go build, and a
+change to `csrc/` is not live until you run it; `go test ./...` from `native/` drives
+every export the bridge uses and is the check that it worked.
+
+The JS platform's engine — `WASM/quickjs/` — is the emscripten build of the **same**
+quickjs-ng pin (v0.16.1, same SHA), so both targets run one engine version; move the
+pin in both build scripts together.
 
 Upstream: https://github.com/fastschema/qjs (MIT) · https://github.com/quickjs-ng/quickjs (MIT)
 
@@ -36,6 +46,12 @@ Upstream: https://github.com/fastschema/qjs (MIT) · https://github.com/quickjs-
   a plain `uint64`.
 - "Packed pointer" returns (`QJS_ToCString`, `QJS_GetArrayBuffer`) point at an
   8-byte cell holding `(addr<<32 | size)`.
+- `QJS_SetDeadline(ns)` arms the interrupt handler for `ns` from now, `0` disarms; the
+  module resolves it against its own monotonic clock, so the host passes a duration and
+  never has to share a clock origin. `QJS_TakeInterrupted()` reports whether the
+  deadline has fired since it was last asked, and clears the flag — the only way to
+  know, since an interrupt that lands in a promise-reaction job has its exception
+  consumed by the job loop rather than returned to whoever pumped it.
 
 ## Scope
 

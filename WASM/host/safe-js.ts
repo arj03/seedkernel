@@ -31,13 +31,19 @@
 // (realm-queue.ts). One `quickjs.wasm` build serves both roles. An app builds its own
 // guest confinement on top of this generic primitive (README §12.3).
 
+// `quickjs-emscripten-core` — the JS API layer alone, NOT the `quickjs-emscripten`
+// umbrella. The umbrella's whole added value is bundling default engine variants, and
+// it does so with STATIC imports of all four Bellard-flavoured `@jitl/quickjs-wasmfile-*`
+// packages; this realm supplies its own variant (below), so the umbrella would only pull
+// four engines nothing runs into every consumer's module graph — a browser app vendoring
+// this file had to map all four to a decoy just to make the graph resolve.
 import {
-  newQuickJSWASMModule,
+  newQuickJSWASMModuleFromVariant,
   type QuickJSWASMModule,
   type QuickJSRuntime,
   type QuickJSContext,
   type QuickJSHandle,
-} from "quickjs-emscripten";
+} from "quickjs-emscripten-core";
 // The shared §12.3 defaults — one copy on every target, so a guest meets the same
 // ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -46,18 +52,20 @@ import { errMessage } from "../core/util.js";
 // (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed — net is
 // a real Promise resolved by the host, not an Asyncify stack unwind.
 //
-// This variant package is CJS, so under `nodenext` TypeScript types its default export as
-// the module namespace, whereas the runtime default import is the variant object itself
-// (verified). Cast to the factory's own parameter type to bridge that interop gap.
-import ngReleaseSyncMod from "@jitl/quickjs-ng-wasmfile-release-sync";
-const ngReleaseSync = ngReleaseSyncMod as unknown as NonNullable<
-  Parameters<typeof newQuickJSWASMModule>[0]
+// The engine is the in-repo build (quickjs/): the same quickjs-ng v0.16.1 the native
+// loader compiles, emscripten-built from `csrc/interface.c` by
+// quickjs/build-quickjs-ng.sh — whose glue serves node AND the browser, so this file
+// imports the same way on both targets. The variant module is ESM; cast to the
+// factory's own parameter type to bridge the typing gap.
+import ngVariantMod from "seedkernel-wasm/quickjs";
+const ngVariant = ngVariantMod as unknown as NonNullable<
+  Parameters<typeof newQuickJSWASMModuleFromVariant>[0]
 >;
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
 import { guestPreamble, type HostCall } from "./guest-seam.js";
-import { serializeCalls } from "./realm-queue.js";
+import { serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
  *  caller standing one up. It is DECLARED in guest-seam.ts, beside the names it carries:
@@ -116,7 +124,7 @@ export interface SafeRealm {
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The QuickJS WASM module is loaded once and shared by all realms. */
 function getModule(): Promise<QuickJSWASMModule> {
-  return (modulePromise ??= newQuickJSWASMModule(ngReleaseSync));
+  return (modulePromise ??= newQuickJSWASMModuleFromVariant(ngVariant));
 }
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
@@ -156,13 +164,19 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
   let consumedMs = 0;
   let segmentStart = 0;
   let running = false;
-  // Installed unconditionally. QuickJS calls this periodically while guest code runs;
-  // it reads false whenever the guest is not running, so a parked initiator is never
-  // interrupted. `Infinity` makes the comparison never true, which is how the guard is
-  // disabled — by a value, not by the handler's absence.
-  ctx.runtime.setInterruptHandler(
-    () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
-  );
+  // Installed only when there is a budget to enforce. QuickJS calls the handler
+  // periodically while guest code runs, and here that call crosses out of wasm into JS —
+  // so a handler that can never return true is not a free `Infinity` comparison but a
+  // host callback every few thousand bytecodes, paid by every guest for a guard nobody
+  // armed. An unbounded realm is now unbounded by the handler's ABSENCE.
+  //
+  // While it is installed it reads `running`, so a parked initiator — the host awaiting
+  // the seam on the guest's behalf — is never interrupted.
+  if (Number.isFinite(budgetMs)) {
+    ctx.runtime.setInterruptHandler(
+      () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
+    );
+  }
   return {
     begin() { segmentStart = Date.now(); running = true; },
     end() { if (running) { consumedMs += Date.now() - segmentStart; running = false; } },
@@ -242,6 +256,27 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // control itself.
   const runtime = newRuntime(mod);
   const ctx: QuickJSContext = runtime.newContext();
+  // Contexts quickjs-emscripten creates from a contextPointer that READ as undefined —
+  // the phantom in `pumpJobs` below. Tracked from after the realm's own context is
+  // created, so that one is not one of them.
+  //
+  // The test is `options` present with `contextPointer` undefined, not `options?.` — and
+  // the difference is the whole precision of this hook. The phantom arises from
+  // `?? newContext({ contextPointer: ctxPtr })` with `ctxPtr` undefined, so it always
+  // arrives WITH an options object. A call passing no options at all is a different
+  // caller entirely: `getSystemContext()` builds one that way and CACHES it on the
+  // runtime, so treating it as a phantom would dispose a context the runtime still hands
+  // out. Nothing here calls it today; the guard costs one comparison and means a future
+  // `computeMemoryUsage()` cannot turn this into a use-after-free.
+  const phantoms = new Set<QuickJSContext>();
+  {
+    const newContext = runtime.newContext.bind(runtime);
+    runtime.newContext = (options?: Parameters<typeof newContext>[0]) => {
+      const c = newContext(options);
+      if (options !== undefined && options.contextPointer === undefined) phantoms.add(c);
+      return c;
+    };
+  }
   const clock = configureRealm(ctx, opts);
   let disposed = false;
 
@@ -254,20 +289,42 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // module at dispose() time via QuickJS's `list_empty(&rt->gc_obj_list)` assertion.
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
-    if (!res.error) return;
-    let msg = "guest job failed";
     try {
-      const d = ctx.dump(res.error) as { message?: unknown; name?: unknown };
-      msg = d && typeof d === "object" && d.message !== undefined
-        ? `${d.name ?? "Error"}: ${String(d.message)}`
-        : String(d);
-    } catch {
-      // Reading the error can itself fail on an interrupted context; the handle still
-      // has to go back, which is what the finally below is for.
+      if (!res.error) return;
+      let msg = "guest job failed";
+      try {
+        const d = ctx.dump(res.error) as { message?: unknown; name?: unknown };
+        msg = d && typeof d === "object" && d.message !== undefined
+          ? `${d.name ?? "Error"}: ${String(d.message)}`
+          : String(d);
+      } catch {
+        // Reading the error can itself fail on an interrupted context; the handle still
+        // has to go back, which is what the finally below is for.
+      } finally {
+        res.error.dispose();
+      }
+      throw new Error(msg);
     } finally {
-      res.error.dispose();
+      // quickjs-emscripten's executePendingJobs can create a context nothing will
+      // dispose: when the wasm heap grows mid-call, its ctxPtrOut view detaches,
+      // ctxPtr reads undefined, and the `?? newContext({contextPointer})` fallback
+      // fires. Such a context keeps GC objects alive, aborting the module at
+      // runtime free — so release it here, after the call is done with it.
+      //
+      // **After the error handle, not before**, which is why this is a `finally` around
+      // the block above rather than the first thing in the function. When a job throws in
+      // the same call that grew the heap, BOTH happen — and `res.error` is a handle the
+      // phantom minted (`context.getMemory(...).heapValueHandle(valuePtr)`), so its
+      // `dispose()` reaches through that context. Freeing the context first turns the
+      // release above into a throw on a dead Lifetime, which loses the guest's real error
+      // AND leaks the very handle this exists to return.
+      for (const phantom of phantoms) {
+        if (phantom.alive) {
+          try { phantom.dispose(); } catch { /* already gone */ }
+        }
+      }
+      phantoms.clear();
     }
-    throw new Error(msg);
   };
 
   // Rejectors for initiator calls currently awaiting a guest promise (README §12.3).
@@ -351,12 +408,29 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
-  /** One entrypoint invocation, assuming the queue has already given it the realm. */
-  const invoke = async (entry: string, payload: Uint8Array): Promise<Uint8Array> => {
-    // Safe unconditionally because the queue guarantees nothing else is in flight: this
-    // is one invocation's own budget window, from here to the moment it settles. If two
-    // calls could overlap, this reset would be an escape hatch a guest's own traffic
-    // could open — a second call clearing an in-flight call's accumulated time.
+  /** Did the entrypoint that just ran hand its answer over to a later turn (the
+   *  preamble's `defer()`)? Read once, immediately after the synchronous segment, and
+   *  cleared by `__invoke` rather than here — so the flag describes exactly the
+   *  invocation that just ran. */
+  const wasDeferred = (): boolean => {
+    const flag = ctx.getProp(ctx.global, "__deferred");
+    try {
+      return ctx.dump(flag) === true;
+    } finally {
+      flag.dispose();
+    }
+  };
+
+  /** One entrypoint invocation, assuming the queue has already given it the realm.
+   *
+   *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
+   *  the moment the synchronous segment ends, which is before the answer exists. */
+  const invoke = (entry: string, payload: Uint8Array): Invocation => {
+    // Safe unconditionally because the queue guarantees nothing else is RUNNING: this is
+    // one invocation's own budget window. A deferred entrypoint has already ended its
+    // segment by the time the next one resets, so what it spends settling later is
+    // charged to whichever window is open — which is the honest accounting, since that
+    // is whose turn the guest code actually runs on.
     clock.reset();
     stageArg(ctx, payload);
     // evalCode runs the entrypoint synchronously up to its first await; the completion
@@ -381,27 +455,35 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // its object on the runtime's GC list, which aborts the module at runtime free.
       evalResult?.dispose();
     }
-    let rejectThis!: (err: Error) => void;
-    const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
-    pending.add(rejectThis);
-    let consumed = false;
-    try {
-      const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
-      consumed = true;
-      return takeBytes(ctx, ctx.unwrapResult(settled as never));
-    } finally {
-      pending.delete(rejectThis);
-      // An invocation that lost the race to failPending — a budget interrupt or
-      // dispose() — has no consumer for the settled result. If the guest promise
-      // still settles afterwards (a seam op resolving after the interrupt), its
-      // dup'd result handle would be orphaned, keeping the value on the runtime's
-      // GC list and aborting the module at runtime free. Release it when it lands.
-      // Safe by construction: `consumed` is set by the await continuation above,
-      // which always runs before this finally.
-      if (!consumed) {
-        void (settledNative as Promise<unknown>).then(disposeDisposableResult);
+    // Read before anything awaits, so no later invocation's `__invoke` can have cleared
+    // it. The realm is free from here for a deferred entrypoint.
+    const deferred = wasDeferred();
+    const result = (async () => {
+      let rejectThis!: (err: Error) => void;
+      const failed = new Promise<never>((_, reject) => { rejectThis = reject; });
+      pending.add(rejectThis);
+      let consumed = false;
+      try {
+        const settled = await Promise.race([settledNative as Promise<unknown>, failed]);
+        consumed = true;
+        return takeBytes(ctx, ctx.unwrapResult(settled as never));
+      } finally {
+        pending.delete(rejectThis);
+        // An invocation that lost the race to failPending — a budget interrupt or
+        // dispose() — has no consumer for the settled result. If the guest promise
+        // still settles afterwards (a seam op resolving after the interrupt), its
+        // dup'd result handle would be orphaned, keeping the value on the runtime's
+        // GC list and aborting the module at runtime free. Release it when it lands.
+        // Safe by construction: `consumed` is set by the await continuation above,
+        // which always runs before this finally.
+        if (!consumed) {
+          void (settledNative as Promise<unknown>).then(disposeDisposableResult);
+        }
       }
-    }
+    })();
+    // A deferred answer must not go unhandled while nothing is awaiting `released`:
+    // the caller holds `result` and its real error, so the release arm swallows.
+    return { result, released: deferred ? Promise.resolve() : result.catch(() => {}) };
   };
 
   return {

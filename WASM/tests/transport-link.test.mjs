@@ -21,7 +21,7 @@
 // Each test names the property it pins, so a failure says which guarantee broke.
 
 import {
-  makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until,
+  makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until, PROTO,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -143,9 +143,8 @@ console.log("\nTransport link hardening (§12.6.1) + concealed handshake (§12.6
 
 await test("baseline: two ends authenticate and exchange frames", async (keep) => {
   const st = keep(await upPair());
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest((_from, _p, payload) => payload);
-  const resp = await st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1, 2, 3]));
+  const proto = PROTO;
+  const resp = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1, 2, 3]));
   assert(resp.length === 3 && resp[2] === 3, `frames not delivered: ${resp.length}`);
   assert(st.a.peer === st.B.driver.peerId, "the dialer must attribute the link to the peer it dialed");
   assert(st.b.peer === st.A.driver.peerId, "the acceptor must attribute the link to the caller");
@@ -156,15 +155,13 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   // and the short one must settle on its own schedule. This is what the old silence
   // clock could not do: it re-armed on ANY frame from the peer, so a request's lifetime
   // depended on unrelated traffic, and every request on a node shared one window.
-  const st = keep(await upPair());
-  const proto = new TextEncoder().encode("_t");
+  const st = keep(await upPair(undefined, undefined, { mode: "hang" }));
+  const proto = PROTO;
   // A holder that never answers: the deadline is the only thing that can settle these.
-  st.B.driver.onRequest(() => new Promise(() => {}));
-
   const t0 = Date.now();
-  const short = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 150)
+  const short = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 150)
     .then(() => "resolved", () => Date.now() - t0);
-  const long = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([2]), 5000)
+  const long = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([2]), 5000)
     .then(() => "resolved", () => Date.now() - t0);
 
   const shortMs = await short;
@@ -185,17 +182,15 @@ await test("the deadline is a STALL clock: a request still draining out is not l
   // moving perfectly. The clock was armed when the request was QUEUED, so it timed our
   // own upload and blamed the holders for our backlog.
   const chans = wirePair();
-  const st = keep(await linked(chans));
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest(() => new Promise(() => {}));   // never answers: only the clock can settle it
-
+  const st = keep(await linked(chans, {}, { mode: "hang" }));
+  const proto = PROTO;
   // A backpressured socket holding 40 KB of this request, draining 4 KB at a time —
   // slower than the 100 ms deadline, so a queue-time clock would fire ~9 times over.
   chans[0].backlog = 40_000;
   const drain = setInterval(() => { chans[0].backlog = Math.max(0, chans[0].backlog - 4_000); }, 40);
 
   const t0 = Date.now();
-  const settled = st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+  const settled = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
     .then(() => "resolved", () => Date.now() - t0);
 
   // While it drains, the request must survive well past its own deadline.
@@ -219,13 +214,11 @@ await test("a stalled link still settles on the deadline", async (keep) => {
   // "bytes are queued" may excuse it. Same 100 ms, same never-answering peer, but
   // nothing drains.
   const chans = wirePair();
-  const st = keep(await linked(chans));
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest(() => new Promise(() => {}));
-
+  const st = keep(await linked(chans, {}, { mode: "hang" }));
+  const proto = PROTO;
   chans[0].backlog = 40_000;                            // frozen: no drain interval
   const t0 = Date.now();
-  const ms = await st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+  const ms = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
     .then(() => "resolved", () => Date.now() - t0);
   assert(typeof ms === "number", "a stalled request must reject");
   assert(ms < 1500, `a frozen backlog must settle on the deadline, not wait forever (took ${ms}ms)`);
@@ -266,9 +259,8 @@ await test("CONCEALMENT: a responder says NOTHING to a caller without the contac
 
 await test("CONCEALMENT: neither identity appears in cleartext on the wire", async (keep) => {
   const st = keep(await upPair());
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest((_f, _p, p) => p);
-  await st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([9]));
+  const proto = PROTO;
+  await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([9]));
   const wire = [...st.chans[0].sent, ...st.chans[1].sent].join("");
   for (const [name, id] of [["initiator", st.A.driver.peerId], ["responder", st.B.driver.peerId]]) {
     assert(!wire.includes(id), `${name} identity key found in cleartext on the wire`);
@@ -340,14 +332,13 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
   const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
   await until(() => st.a.authed && st.b.authed, 4000, "handshake");
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest((_f, _p, p) => p);
+  const proto = PROTO;
   // Above the pre-auth cap, so the dribble must be measured against the RAISED
   // cap (the FRAME CAP tests pin the raise itself).
   const payload = new Uint8Array(48 * 1024).fill(0x5a);
   armed = true; // from here on, drop A's real delivery — it is re-fed manually below
   const before = chans[0].sent.length;
-  const respP = st.A.driver.request(st.B.driver.peerId, proto, payload, 8000);
+  const respP = st.A.request(st.B.driver.peerId, proto, payload, 8000);
   await until(() => chans[0].sent.length > before, 3000, "A's wire message");
   const wire = Uint8Array.from(Buffer.from(chans[0].sent[chans[0].sent.length - 1], "hex"));
   // Re-feed the exact bytes one at a time, yielding between pushes so each slice
@@ -361,25 +352,18 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
     `a byte-dribbled frame must deliver intact (got ${resp.length} bytes)`);
 });
 
-await test("READY: a second ready() joins the first instead of stranding it", async (keep) => {
-  // ready() used to overwrite the waiter on a second call: the first caller's
-  // promise was resolved by the second caller's timer — or never, if the second
-  // call resolved first. Both callers must settle together, whatever the order.
-  const { TransportHost } = await import("../build/host/transport-host.js");
-  const { generateKeyPair: mkKey } = await import("./transport-harness.mjs");
-  const identity = mkKey();
-  const host = new TransportHost({ identity });
-  // A stub realm that answers the ready entrypoint immediately, so the test does
-  // not wait out the host's timeout backstop.
-  host.attach({
-    call: async (entry) => { if (entry === "ready") host.sink().ready(true); return new Uint8Array(); },
-    dispose() {},
-  });
+await test("READY: a second ready() does not strand the first", async (keep) => {
+  // A single waiter slot let the second call overwrite the first, leaving the first
+  // caller's promise to be settled by the second's timer — or never. The slot is now a
+  // list, and it lives in the transport guest rather than the driver: with the answer
+  // being the `ready` op's own return value, each caller holds its own deferred and the
+  // stranding is a property of that list, which is exactly where the test can see it.
+  const st = keep(await upPair());
   const [r1, r2] = await Promise.all([
-    host.ready(50).then(() => "ok", () => "failed"),
-    host.ready(50).then(() => "ok", () => "failed"),
+    st.A.driver.ready(50).then(() => "ok", () => "failed"),
+    st.A.driver.ready(50).then(() => "ok", () => "failed"),
   ]);
-  assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle together (got ${r1}/${r2})`);
+  assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle (got ${r1}/${r2})`);
 });
 
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {
@@ -499,10 +483,9 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
 
 await test("rekey: the ratchet keeps frames flowing across an epoch boundary", async (keep) => {
   const st = keep(await upPair(undefined, {}, {}, { rekeyAfterFrames: 4 }));
-  const proto = new TextEncoder().encode("_t");
-  st.B.driver.onRequest((_f, _p, p) => p);
+  const proto = PROTO;
   for (let i = 0; i < 14; i++) {
-    const r = await st.A.driver.request(st.B.driver.peerId, proto, Uint8Array.from([i]));
+    const r = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([i]));
     assert(r[0] === i, `frame ${i} came back as ${r[0]} — ordering broke across a ratchet`);
   }
   assert(!st.a.closed && !st.b.closed, "link must survive rekeying");
@@ -532,13 +515,14 @@ await test("goodbye: a cut connection reads as truncated", async (keep) => {
 
 await test("goodbye is not delivered to the application as a frame", async (keep) => {
   const st = keep(await upPair());
-  const proto = new TextEncoder().encode("_t");
-  const seen = [];
-  st.B.driver.onRequest((_f, _p, p) => { seen.push(Buffer.from(p).toString()); return p; });
-  await st.A.driver.request(st.B.driver.peerId, proto, new TextEncoder().encode("real"));
+  const proto = PROTO;
+  await st.A.request(st.B.driver.peerId, proto, new TextEncoder().encode("real"));
   st.aLink.close();
   await until(() => st.b.closed, 3000, "the close to land");
   await settle(100);
+  // What the far APP was handed, asked of the app itself — there is no host-side sink
+  // to record it in any more.
+  const seen = (await st.B.seen()).map((b) => Buffer.from(b).toString());
   assert(seen.length === 1 && seen[0] === "real", `goodbye leaked into the app: ${JSON.stringify(seen)}`);
 });
 
@@ -625,7 +609,10 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   // identity and signature on the wire. The gate now runs in the guest's onMsg3, before
   // msg4 is built, and a concealed refusal is silence rather than a close.
   const chans = wirePair();
-  const st = keep(await linked(chans, {}, { admitPeer: () => false }));
+  // An empty-but-present list: the receiver admits nobody. The lint is the transport's own
+  // now (transport/src `admits`), shipped as config at init rather than asked of the
+  // host per link — see the note there for why the host was never gating this anyway.
+  const st = keep(await linked(chans, {}, { admitPeers: [new Uint8Array(32).fill(1)] }));
   await settle();
   assert(!st.b.authed, "a refused caller must not be authenticated by the receiver");
   // One message back (msg2, an ephemeral and a contact proof), then silence. The
@@ -651,11 +638,72 @@ await test("a decrypt failure does not advance the receive counter", async (keep
     },
   }));
   armed = true;
-  const seen = [];
-  st.B.driver.onRequest((_f, _p, p) => { seen.push(p); return p; });
   st.aLink.send(new TextEncoder().encode("tampered"));
   await until(() => st.b.closed, 3000, "a forged record must close the link");
-  assert(seen.length === 0, "a forged record must not be delivered");
+  assert((await st.B.seen()).length === 0, "a forged record must not be delivered");
+});
+
+// ── §12.10: the shell answers protocols of its own, ahead of the routing table ────
+//
+// An inbound frame reaches the shell as the transport's `_host` deliver op and goes straight
+// to the routing table, so a host that serves an id of its own — seedchat's `_offer`,
+// which carries a bundle between two browsers before either has an app that could
+// receive it — needs an explicit seam. `createShell({ answer })` is it. These pin both
+// halves of the contract: the hook wins the ids it claims, and `null` from it is
+// genuinely a fall-through rather than an empty answer.
+
+await test("ANSWER HOOK: the shell answers its own protocol ahead of dispatch", async (keep) => {
+  const seen = [];
+  const st = keep(await upPair(undefined, undefined, {
+    answer: (from, proto, payload) => {
+      if (proto !== "_offer") return null;
+      seen.push({ from, payload });
+      return Promise.resolve(Uint8Array.from([0xaa, payload.length]));
+    },
+  }));
+  const resp = await st.A.request(st.B.driver.peerId, "_offer", Uint8Array.from([1, 2, 3]));
+  assert(resp.length === 2 && resp[0] === 0xaa && resp[1] === 3,
+    `the shell's own answer must reach the caller, got ${[...resp]}`);
+  assert(seen.length === 1, "the hook must be consulted exactly once per inbound frame");
+  assert(seen[0].from === st.A.driver.peerId,
+    "the hook must be handed the AUTHENTICATED sender, as dispatch is");
+  // The app never saw it: an id the shell claims is answered by the shell, not routed.
+  const inbound = await st.B.seen();
+  assert(inbound.length === 0, "a frame the shell answered must not also reach the app");
+});
+
+await test("ANSWER HOOK: null falls through to the routing table", async (keep) => {
+  let asked = 0;
+  const st = keep(await upPair(undefined, undefined, {
+    answer: (_from, proto) => { asked++; return proto === "_offer" ? Promise.resolve(new Uint8Array(0)) : null; },
+  }));
+  // The harness app claims PROTO, and the hook declines it — so the app answers, exactly
+  // as it would on a shell with no hook at all. A hook is first refusal, not a shadow.
+  const resp = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([7, 8]));
+  assert(resp.length === 2 && resp[1] === 8, `the app must still answer its own id, got ${[...resp]}`);
+  assert(asked === 1, "the hook is consulted for every inbound frame, including ones it declines");
+  assert((await st.B.seen()).length === 1, "…and the declined frame reached the app");
+});
+
+// ── the transport guest's caller boundary ────────────────────────────────────
+// The platform events (`init`, `linkBytes`, …) are the host's alone; `send` and `peers`
+// are an app's to name, because both are questions about the app's own traffic. An app
+// that could spell `init` could re-key the node, so the line matters in both directions.
+
+await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event", async (keep) => {
+  const st = keep(await upPair());
+  await until(async () => (await st.B.peers()).length > 0, 4000, "B's link to A");
+  // `peers` through the APP's seam — a cross-realm call carrying the app's key, not the
+  // host's 32 zero bytes. This is the path seedstore's guest takes to place replicas.
+  const raw = await st.B.op("peers");
+  assert(raw.length === 32 && hexOf(raw) === st.A.driver.peerId,
+    "an app asking `peers` must get the authenticated set back");
+  // `init` through the same seam must be refused by NAME, not silently ignored.
+  let refused = "";
+  try { await st.B.op("init", new Uint8Array(64)); }
+  catch (e) { refused = String(e); }
+  assert(refused.includes("the host's, not an app's"),
+    `an app naming a platform event must be refused, got ${refused || "no error"}`);
 });
 
 await test("default caps are sane", async () => {

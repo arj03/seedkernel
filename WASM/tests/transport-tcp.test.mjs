@@ -30,14 +30,21 @@ const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
 const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
+// The app that drives the transport: a request is an app calling the id the transport
+// claims, so a test that sends one has to be an app (tests/transport-harness.mjs).
+const { harnessAppBlob, harnessAppKey, appRequest, generatorRequest } = await imp("tests/transport-harness.mjs");
+const { makeAuthor } = await imp("tests/testkit.mjs");
+const appAuthor = makeAuthor(sodium);
+const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
+const appKey = harnessAppKey(appAuthor);
 
 const HOST = "127.0.0.1";
 
 async function makeNode(ws = false) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
-    authors: [transportAuthor],
-    grants: { mount: [transportAuthor] },
+    authors: [transportAuthor, appAuthorHex],
+    grants: { link: [transportAuthor] },
   }));
   const shell = createShell({
     platform: {
@@ -53,6 +60,7 @@ async function makeNode(ws = false) {
     requestDeadlineMs: 2000,
   });
   await shell.loadBundleBlob(transportBlob);
+  await shell.loadBundleBlob(harnessAppBlob(appAuthor));
   return shell;
 }
 
@@ -70,32 +78,22 @@ await aNet.start();
 await bNet.start();
 assert(aNet.port > 0 && bNet.port > 0, "both nodes bound real TCP listeners");
 
-// Echo, plus one handler that answers with a payload far larger than the pre-auth cap
-// (8 KiB) — it can only cross once the guest has raised its own cap on authentication,
-// and it is certain to arrive as several TCP segments.
+// Both nodes run the echo app, which also answers a GENERATOR request with a payload
+// far larger than the pre-auth cap (8 KiB) — it can only cross once the guest has raised
+// its own cap on authentication, and it is certain to arrive as several TCP segments.
 const BIG = 512 * 1024;
-aNet.onRequest((from, proto, payload) => payload);
-bNet.onRequest((from, proto, payload) => {
-  if (payload.length === 1 && payload[0] === 0xff) {
-    const out = new Uint8Array(BIG);
-    for (let i = 0; i < BIG; i++) out[i] = i & 0xff;
-    return out;
-  }
-  return payload;
-});
 
 aNet.addPeerAddr(b.transport.peerId, { host: HOST, port: bNet.port, transport: "tcp" });
 await aNet.ready(4000);
-assert(aNet.linkedPeers().includes(b.transport.peerId), "the AKE completed over a real socket");
+assert((await aNet.linkedPeers()).includes(b.transport.peerId), "the AKE completed over a real socket");
 
-const proto = new TextEncoder().encode("_tcp");
-const small = await aNet.request(b.transport.peerId, proto, new Uint8Array([1, 2, 3, 4]));
+const small = await appRequest(a, appKey, b.transport.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(small.length === 4 && small[3] === 4, "a small request round-trips through the guest's framer");
 
 // The reassembly case: a response guaranteed to span many segments, checked byte for
 // byte. A framer that mishandled a partial length prefix or a split body would either
 // hang here or deliver a corrupted message rather than merely a short one.
-const big = await aNet.request(b.transport.peerId, proto, new Uint8Array([0xff]));
+const big = await appRequest(a, appKey, b.transport.peerId, generatorRequest(BIG, 1));
 assert(big.length === BIG, `a ${BIG}-byte response reassembled from many TCP segments`);
 let intact = true;
 for (let i = 0; i < BIG; i++) if (big[i] !== (i & 0xff)) { intact = false; break; }
@@ -124,26 +122,17 @@ await cNet.start();
 await dNet.start();
 assert(dNet.wsPort > 0, "the WS listener bound");
 
-dNet.onRequest((from, proto, payload) => {
-  if (payload.length === 1 && payload[0] === 0xff) {
-    const out = new Uint8Array(BIG);
-    for (let i = 0; i < BIG; i++) out[i] = (i * 7) & 0xff;
-    return out;
-  }
-  return payload;
-});
-
 // `transport: "ws"` is the whole difference: the host dials the same kind of TCP
 // socket and declares a different codec on it.
 cNet.addPeerAddr(d.transport.peerId, { host: HOST, port: dNet.wsPort, transport: "ws" });
 await cNet.ready(4000);
-assert(cNet.linkedPeers().includes(d.transport.peerId), "the AKE completed through the WS upgrade");
+assert((await cNet.linkedPeers()).includes(d.transport.peerId), "the AKE completed through the WS upgrade");
 
-const wsSmall = await cNet.request(d.transport.peerId, proto, new Uint8Array([5, 6, 7]));
+const wsSmall = await appRequest(c, appKey, d.transport.peerId, new Uint8Array([5, 6, 7]));
 assert(wsSmall.length === 3 && wsSmall[2] === 7, "a small request round-trips as masked WS frames");
 
 // Large enough to force 64-bit WS length headers and multi-segment reassembly at once.
-const wsBig = await cNet.request(d.transport.peerId, proto, new Uint8Array([0xff]));
+const wsBig = await appRequest(c, appKey, d.transport.peerId, generatorRequest(BIG, 7));
 assert(wsBig.length === BIG, `a ${BIG}-byte response crossed as WS frames`);
 let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }

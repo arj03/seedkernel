@@ -34,3 +34,18 @@ export function guestSourcePaths() {
 export function readGuestSource() {
   return Buffer.concat(guestSourcePaths().map((p) => readFileSync(p)));
 }
+
+/** The seam version this program is written against, read out of `core/domains.ts`.
+ *
+ *  From the SOURCE rather than from `build/`, because the bundle is assembled before
+ *  tsc runs — the generated `host/transport-bundle.ts` is one of tsc's inputs — so the
+ *  compiled constant does not exist yet at this point in the build. A regex over one
+ *  `export const` line is the whole of the dependency, and it throws rather than
+ *  defaulting: a bundle declaring an ABI its guest was not written against is exactly
+ *  the silent failure `guest.abi` exists to make loud (§12.4). */
+export function readGuestAbi() {
+  const src = readFileSync(join(wasmDir, "core", "domains.ts"), "utf8");
+  const m = /^export const GUEST_ABI_VERSION = (\d+);$/m.exec(src);
+  if (!m) throw new Error("guest-source: could not read GUEST_ABI_VERSION from core/domains.ts");
+  return Number(m[1]);
+}

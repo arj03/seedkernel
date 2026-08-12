@@ -111,7 +111,7 @@ func loadBundle(path string) string {
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
 // withTransportAuthor adds the artifact's own transport author to a policy's authors and
-// grants it the mount. A node whose policy does not admit a transport bundle has no
+// grants it `link`. A node whose policy does not admit a transport bundle has no
 // network at all — which is also what a deliberate deny-all looks like, so the two
 // must not be confused by accident in a test.
 func withTransportAuthor(tb testing.TB, policyJSON string) string {
@@ -128,7 +128,7 @@ func withTransportAuthor(tb testing.TB, policyJSON string) string {
 	}
 	authors, _ := p["authors"].([]any)
 	p["authors"] = append(authors, author)
-	p["grants"] = map[string]any{"mount": []string{author}}
+	p["grants"] = map[string]any{"link": []string{author}}
 	out, err := json.Marshal(p)
 	if err != nil {
 		tb.Fatal("policy json:", err)
@@ -197,10 +197,10 @@ func applyPolicy(policyJSON string) error {
 // lives in a _test file and not in the shipped glue.
 const testGuestSeamJS = `
 "use strict";
-globalThis.__buildGuestSeam = function (names, identity, transport, peers, scope) {
+globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
   globalThis.__guestSeam = createGuestSeam({
     // Per NODE.
-    platform: { sodium, identity, peers: () => peers || [], now: () => Date.now() },
+    platform: { sodium, identity, now: () => Date.now() },
     // Per REALM: the granted names straight through — a call resolves iff the name
     // itself is one of these (or crypto/*, or one of the bundle's own modules — never
     // grants) — plus the backends behind them.
@@ -208,7 +208,10 @@ globalThis.__buildGuestSeam = function (names, identity, transport, peers, scope
       names,
       signScope: scope || undefined,
       fs,
-      transport: transport || { request: () => Promise.reject(new Error("test: net not wired")) },
+      // The routing a reserved (_-led) name resolves through: the shell's, in
+      // production. Absent here means nothing claims any id, which the seam reports
+      // by name rather than leaving the caller pending.
+      calls: calls || { call: () => null },
     },
     // Per APP: no app behind this harness, so a bare name reaches nothing. Nothing to
     // scope either — the seam is wired against ONE app's module map, so "a guest
@@ -273,7 +276,7 @@ func realmCall(entry string, payload []byte) ([]byte, error) {
 
 // TestCallRealmReleasesStagedArgs covers the argument staging: callRealm lands each
 // argument on a __aN global for the duration of the call and must release it when the
-// call returns — otherwise a one-shot op (a --put of a large file, an uninstall after
+// call returns — otherwise a one-shot op (an --op put of a large file, an uninstall after
 // which nothing else runs) leaves its payload rooted on the global object for the
 // process's life.
 func TestCallRealmReleasesStagedArgs(t *testing.T) {

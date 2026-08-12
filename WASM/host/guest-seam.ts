@@ -7,10 +7,11 @@
 //
 // It is a pure function of three things, and the split is the ownership:
 //
-//   platform — per NODE:  crypto (sumo), the node identity, the peer set, the clock.
+//   platform — per NODE:  crypto (sumo), the node identity, the clock.
 //   grants   — per REALM: exactly what this realm may reach — the names its manifest
 //              declared, the scope its signatures are bound to, and the backends behind
-//              the gated names (fs, transport, sockets, timers, the transport sink).
+//              the gated names (fs, sockets, timers, and the routing a `_`-led id
+//              resolves through).
 //              Nothing is reachable that is not wired here, which is the whole of §1's
 //              capability-by-non-wiring: a realm holding no `rawNet` cannot acquire one.
 //   modules  — per APP:   this bundle's own WASM modules, by their logical names.
@@ -24,9 +25,8 @@
 // from host primitives it already holds (README §12.2). A host-side caller that holds
 // the same primitives wires the identical seam, so output orchestrated through the
 // confined guest is byte-compatible with a host-side reference path.
-import { toHex, fromHex, concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, type PrimitiveName, type CapabilityName } from "../core/domains.js";
-import { type PeerId } from "../core/net.js";
+import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
+import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 
 /** What `node/sign` signs under — and what `node/verify` checks against — derived by
@@ -49,10 +49,10 @@ import { type Fs } from "../core/fs.js";
  *  verification — a guest can check a signature under its own bundle's namespace, never
  *  another's. */
 export interface SignScope {
-    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the mounted transport. */
+    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the transport. */
     domain: Uint8Array;
     /** Scope bytes under the domain: `author ‖ app` for an app, the network key for the
-     *  mounted transport. */
+     *  transport. */
     scope: Uint8Array;
     /** The keypair that signs. */
     key: {
@@ -83,12 +83,21 @@ export interface SeamCrypto {
     ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): Uint8Array | null;
 }
 
-/** The request/response transport the net/send name drives. The mounted transport's driver
- *  (`TransportHost`) satisfies it. A confined guest fans out itself with `Promise.all`
- *  over `net/send`, so the seam needs only single-peer request/response — no
- *  host-side scatter-gather. */
-export interface RequestTransport {
-    request(to: PeerId, proto: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
+/** Reach another realm by a RESERVED protocol id (`_`-led, core/domains.ts) — the one
+ *  cross-realm call, and the same mechanism the host uses to dispatch an inbound frame.
+ *
+ *  There is no transport-shaped interface here and no `net` domain, because the network
+ *  is not a host service: it is a bundle that claims `_net`, reached exactly as an app
+ *  claiming `chat-v1` is reached. What the caller sends is opaque to the host, and what
+ *  it gets back is whatever the callee's `handle` returned. The host's whole contribution
+ *  is attribution — it prepends the CALLER's app key, as it prepends the sender's key
+ *  inbound — and resolution: which realm claims this id right now.
+ *
+ *  `null` when nothing claims the id, which the seam turns into a refusal by name rather
+ *  than a promise that never settles. The shell satisfies this (`shell-core.ts`), and it
+ *  answers `_host` itself rather than routing it (§12.10). */
+export interface SeamCalls {
+    call(id: string, payload: Uint8Array): Promise<Uint8Array> | null;
 }
 
 /** The RAW net capability (README §12.1) — the socket-side twin of `Fs`, and the whole
@@ -99,7 +108,7 @@ export interface RequestTransport {
  *  machines over whole messages, which the endpoints can implement and therefore do
  *  (the transport bundle). What has no substitute is moving the bytes.
  *
- *  **Nothing here may re-enter the guest realm.** The mounted transport calls these from
+ *  **Nothing here may re-enter the guest realm.** The transport calls these from
  *  inside an entrypoint, so anything that would call back into the realm has to reach it
  *  on a later turn — which every implementation does anyway, because a socket does not
  *  deliver during the write that provoked it. */
@@ -137,40 +146,6 @@ export interface HostTimers {
     clear(id: number): void;
 }
 
-/** What the transport slot's occupant hands back — the structured face the platform does
- *  not have and every app consumes (§12.6).
- *
- *  This is the provision half of the split: the mounted transport reads raw bytes off links
- *  and reports *attributed* traffic here, where the host binds it to the promises apps
- *  are awaiting and to the protocol routing that reaches inbound requests. Like `RawNet`,
- *  no method may re-enter the realm synchronously — `deliver` in particular answers
- *  through the `respond` entrypoint on a later turn, which is also what keeps an
- *  asynchronous app handler possible. */
-export interface TransportSink {
-    /** An inbound request from `from`, already attributed by the mounted transport. */
-    deliver(corr: number, noReply: boolean, from: Uint8Array, proto: Uint8Array, payload: Uint8Array): void;
-    /** Settle an app's outbound request: `ok` ⇒ `payload` is the response, otherwise it is
-     *  a utf8 failure message. */
-    settle(corr: number, ok: boolean, payload: Uint8Array): void;
-    /** A link authenticated as `pk`. Returns false when the WHITELIST refuses the peer. The
-     *  predicate lives here and is not handed to the slot to apply to itself, because a
-     *  predicate the occupant applies to itself gates nothing against a hostile one.
-     *
-     *  `conceal` says a refusal must be SILENT. The accepting end asks at msg3 — after it
-     *  has verified the caller and before it has said anything about itself — so an
-     *  immediate close there is exactly the oracle the four-message ordering exists to
-     *  remove (§12.6.2, CHANNEL §10 invariant 5). The dialing end asks at msg4, having
-     *  already named itself at msg3, and so has nothing left to conceal. */
-    linkAuth(linkId: number, pk: Uint8Array, conceal: boolean): boolean;
-    /** A peer's first link came up (`up`) or its last one went down. */
-    peerEdge(up: boolean, pk: Uint8Array): void;
-    /** The answer to a `ready` entrypoint call. */
-    ready(ok: boolean): void;
-    /** A link the host handed over (`openLink`) tore down, with the occupant's reason
-     *  code — relayed to whoever passed the channel in, never interpreted. */
-    linkDown(linkId: number, reason: number): void;
-}
-
 /** Per-NODE facts every realm on this host shares. Nothing here is a grant — a realm
  *  holds these because it is running on this node at all — so nothing here is gated. */
 export interface SeamPlatform {
@@ -181,8 +156,6 @@ export interface SeamPlatform {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
-    /** The peers this node can reach (its cohort / connected set). */
-    peers: () => PeerId[];
     /** Wall clock (ms). Defaults to Date.now. */
     now?: () => number;
 }
@@ -213,24 +186,18 @@ export interface SeamGrants {
     /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
      *  (`scopedFs`). Optional: a node that only initiates never reads it. */
     fs?: Fs;
-    /** The request/response transport the net/send name drives. `TransportHost` satisfies
-     *  it. A confined guest fans out itself with `Promise.all` over `net/send`, so the
-     *  seam needs only single-peer request/response — no host-side scatter-gather.
-     *
-     *  Optional ONLY for a bundle that never declares the `net` domain — the transport
-     *  bundle itself (whose net/send would loop back into itself) is that caller.
-     *  net/send without a transport throws rather than resolving to nothing. */
-    transport?: RequestTransport;
-    /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for the bundle
-     *  claiming the transport slot: a confined module holds no ambient authority by
+    /** The RAW net capability — sockets behind opaque link ids. Wired ONLY for a bundle
+     *  that reaches the `link` privilege: a confined module holds no ambient authority by
      *  construction, so nothing else can ever reach a descriptor no matter what has already
      *  been installed (README §1, capability-by-non-wiring). */
     rawNet?: RawNet;
     /** The platform's event loop, for a guest that declares `timer`. */
     timers?: HostTimers;
-    /** Where the transport slot's occupant reports its structured output. Wired with
-     *  `rawNet` and for the same bundle. */
-    transportSink?: TransportSink;
+    /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
+     *  realm, because reaching one is a grant like any other and the gate above is what
+     *  decides who holds it — a realm declaring no reserved id can utter none, whatever is
+     *  wired. Absent only for a host-side caller with no routing to resolve against. */
+    calls?: SeamCalls;
 }
 
 /** Per-APP: this bundle's OWN WASM modules, by the logical names its manifest declared.
@@ -376,10 +343,24 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
         },
     };
 }
-/** The guest-side ABI preamble: `host.call(name, bytes)` over the single seam, plus
- *  `register`/`__invoke` for entrypoint dispatch. Pure JS — it names no authority, so
- *  evaluating it in a zero-authority realm grants nothing; it only gives the guest a
- *  shape to call through.
+/** The guest-side ABI preamble: `host.call(name, bytes)` over the single seam,
+ *  `register`/`__invoke` for entrypoint dispatch, and the call envelope those
+ *  invocations carry (`callerOf`, `readOp`, `writeOp`). Pure JS — it names no
+ *  authority, so evaluating it in a zero-authority realm grants nothing; it only gives
+ *  the guest a shape to call through.
+ *
+ *  `register` is a generic mechanism, not an open vocabulary. The SHELL invokes exactly
+ *  two names — `handle` (an app's one inbound/op entrypoint, reached by `dispatch` and
+ *  by the host's own `invoke` loopback, the op travelling in the payload) and `timer`
+ *  (a fired deadline). A guest that registers anything else is writing an entrypoint
+ *  nothing will ever call; its local ops belong in `handle`'s payload, so an app has one
+ *  op vocabulary instead of a per-entrypoint one.
+ *
+ *  Which is why the ENVELOPE is here too. A fixed entrypoint vocabulary only moves the
+ *  vocabulary problem if the shape that replaced it is left for each app to invent: the
+ *  op name, the caller prefix and the host's zero id are one contract, so they are
+ *  written once — here, next to the `register` they are the argument of, and mirrored by
+ *  `opCall`/`opHeader` below for the host side of the same bytes.
  *
  *  ONE definition for every target: a bundle
  *  ships a single `guest.js` that runs byte-identical on the node/browser host (safe-js.ts)
@@ -392,17 +373,19 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
  *    __host_call(name: string, callId, payload: ArrayBuffer) -> ArrayBuffer | null
  *
  *  Returning bytes completes a **sync** name (the primitive catalog, clock, the bundle's
- *  own modules, the raw-link and transport names) inline. Returning `null` means the host started an
- *  **async** name under `callId` — `net/send` and every `fs/*` — and the guest parks a
- *  Promise here, which the host later settles with `__netResolve(callId, bytes)` or
- *  `__netReject(callId, msg)`. `null` is RESERVED for that — a sync name that ever returned
- *  null/undefined would be read as async and leave a Promise pending forever.
+ *  own modules, the raw-link names) inline. Returning `null` means the host started an
+ *  **async** name under `callId` — every `fs/*`, and every `_`-led cross-realm call — and
+ *  the guest parks a Promise here, which the host later settles with
+ *  `__netResolve(callId, bytes)` or `__netReject(callId, msg)`. `null` is RESERVED for
+ *  that — a sync name that ever returned null/undefined would be read as async and leave
+ *  a Promise pending forever.
  *
  *  The async half is deliberately plain ECMAScript rather than a host-created deferred:
  *  the guest builds its own Promise, so the seam needs no promise primitive from the
  *  embedding engine. That is what lets one preamble serve both a host holding
  *  quickjs-emscripten's `newPromise()` and one driving quickjs-ng over wazero, which has
- *  no such primitive. */
+ *  no such primitive. `defer()` is the same idea pointed the other way — the guest builds
+ *  the promise its own ENTRYPOINT answers with — and needs nothing of the engine either. */
 export function guestPreamble(): string {
     return GUEST_PREAMBLE;
 }
@@ -450,6 +433,71 @@ globalThis.host = {
 };
 globalThis.__entries = Object.create(null);
 globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
+// ── the call envelope (§12.2) ───────────────────────────────────────────────
+//
+// One entrypoint means one argument shape, and these are it — declared HERE, in the
+// preamble, because the shape is a contract between the runtime and signed content
+// rather than an app's private convention. Before this, every app re-derived the same
+// three lines (an 'is the caller all zeros' scan, a length-prefixed name read, the
+// same written backwards for a cross-realm call), and they drifted: one program read
+// the op as a name and another as a byte its host had to agree on.
+//
+//   handle(arg)  =  [caller 32][body …]
+//
+// 'callerOf' splits that, and 'fromHost' is the one distinction the HOST makes for the
+// guest: the id is the host's to write, so 32 zero bytes means the host itself (no app
+// key derives it, shell-core.ts) and anything else is a peer's key or a co-resident
+// app's. What is IN the body is the app's business — a peer's frame is whatever the
+// app's protocol says, and only a call from the host or from another realm carries the
+// op envelope below.
+globalThis.callerOf = (arg) => {
+  const caller = arg.subarray(0, 32);
+  let fromHost = true;
+  for (let i = 0; i < 32; i++) { if (caller[i] !== 0) { fromHost = false; break; } }
+  return { fromHost, caller, body: arg.subarray(32) };
+};
+// [opLen u8][op ascii][args …] — the op envelope, read. The discriminator is a NAME,
+// never a tag byte: collapsing many entrypoints onto one call must not smuggle in a
+// number two sides have to agree on, and an op a program does not implement then fails
+// loud by name. Malformed framing throws rather than reading a truncated name, which a
+// caller would see as an unimplemented op.
+globalThis.readOp = (body) => {
+  const n = body.length > 0 ? body[0] : -1;
+  if (n < 0 || body.length < 1 + n) throw new Error("guest: malformed op envelope");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
+  return { op, args: body.subarray(1 + n) };
+};
+// The same, written — for a guest calling ANOTHER realm ('host.call("_net", …)'),
+// where the host prepends the caller id and the envelope is the guest's to write.
+// ASCII by construction: an op name is a literal in guest source, and charCodeAt keeps
+// this free of a TextEncoder no fresh realm is guaranteed to have.
+globalThis.writeOp = (op, args) => {
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(args, 1 + op.length);
+  return out;
+};
+// Set by defer() and read by the host once the invocation's synchronous segment ends —
+// see the note on defer below. Cleared per invocation, never by the guest.
+globalThis.__deferred = false;
+// Answer on a LATER TURN, without holding the realm. Returns { promise, settle, fail }:
+// the entrypoint returns the promise, and whatever runs next in this realm settles it.
+//
+// It exists for the one guest that cannot await its own answer: the transport reaches
+// its reply by reading bytes off a link, and reading those bytes is another invocation
+// of this same realm. Awaiting inside the frame would hold the queue against the very
+// event that settles it. A guest using this is asserting that it never parks — its
+// entrypoints run to completion and its outstanding answers are plain promise objects,
+// so a second invocation entering meanwhile cannot observe a half-updated frame,
+// because there is no frame left to be half-updated.
+globalThis.defer = () => {
+  let settle, fail;
+  const promise = new Promise((res, rej) => { settle = res; fail = rej; });
+  globalThis.__deferred = true;
+  return { promise, settle, fail };
+};
 function __norm(out) {
   if (out instanceof ArrayBuffer) return out;
   if (out instanceof Uint8Array) {
@@ -460,13 +508,62 @@ function __norm(out) {
 globalThis.__invoke = (name, argBuf) => {
   const fn = globalThis.__entries[name];
   if (typeof fn !== "function") throw new Error("guest: no entrypoint '" + name + "'");
-  // A synchronous entrypoint (the holder 'handle') returns bytes directly; an async
-  // entrypoint (an initiator 'put'/'get') returns a guest promise the host settles.
-  // __norm normalizes both to an ArrayBuffer.
+  // Cleared HERE rather than by the host, so the flag describes exactly this
+  // invocation and a guest cannot leave it set for the next one.
+  globalThis.__deferred = false;
+  // A synchronous entrypoint (a holder's 'handle' answering from memory) returns bytes
+  // directly; an async entrypoint (a 'handle' that awaits the network) returns a guest
+  // promise the host settles. __norm normalizes both to an ArrayBuffer.
   const out = fn(new Uint8Array(argBuf));
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
+// ── the call envelope, host side ────────────────────────────────────────────
+//
+// The mirror of `callerOf`/`readOp` in the preamble above, and deliberately in the same
+// file: these two functions and those three write and read the SAME bytes, so a change
+// to the layout is one edit rather than a search for everyone who open-coded it. Before
+// they existed the layout was hand-written at five call sites across three repositories
+// — the CLI, the transport driver, a storage node, a browser shell and a guest building
+// a cross-realm call — and one of them had drifted to an op BYTE.
+/** The host's own caller id: 32 zero bytes, "the host itself". No app key derives it
+ *  (an app's id is a hash of its key, shell-core.ts) and no peer key is it, so a guest
+ *  reading `callerOf(arg).fromHost` is reading an unforgeable fact. */
+export const HOST_CALLER_ID = new Uint8Array(32);
+/** `[caller 32][opLen u8][op]` — the header of one call, without its arguments. For a
+ *  caller that concatenates its own fields behind it and would otherwise copy the whole
+ *  payload a second time to put a header in front (transport-host.ts `Args`, which
+ *  builds this once per op and reuses it on the inbound frame path). */
+export function opHeader(op: string, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
+    const name = enc.encode(op);
+    // ASCII, because the guest reads it back with charCodeAt (no fresh realm is
+    // guaranteed a TextDecoder) and because a length in BYTES that a guest counts in
+    // UTF-16 code units is a framing bug waiting for its first non-ASCII op.
+    if (name.length !== op.length || name.length > 255)
+        throw new Error(`guest-seam: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
+    const out = new Uint8Array(caller.length + 1 + name.length);
+    out.set(caller, 0);
+    out[caller.length] = name.length;
+    out.set(name, caller.length + 1);
+    return out;
+}
+/** `[caller 32][opLen u8][op][args]` — one whole call, as an app's `handle` reads it
+ *  (`callerOf` then `readOp`). The default caller is the host's own id, which is what
+ *  `Shell.invoke` writes; the transport driver passes its own. */
+export function opCall(op: string, args: Uint8Array, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
+    const head = opHeader(op, caller);
+    return concatBytes([head, args]);
+}
+/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`,
+ *  for the shell reading a guest's cross-realm call to its own `_host` id. Same bytes,
+ *  same failure: malformed framing throws rather than yielding a truncated name that
+ *  the caller would then see reported as an unimplemented op. */
+export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
+    const n = payload.length > 0 ? payload[0] : -1;
+    if (n < 0 || payload.length < 1 + n)
+        throw new Error("guest-seam: malformed op envelope");
+    return { op: dec.decode(payload.subarray(1, 1 + n)), args: payload.subarray(1 + n) };
+}
 /** The authority catalog — declared in core/domains.ts and re-exported so a reader of the
  *  seam finds it beside the names it governs. A bundle's signed manifest declares the
  *  authorities its guest holds (its `requires`), the loader checks them against this table
@@ -474,21 +571,24 @@ globalThis.__invoke = (name, argBuf) => {
  *  enforces (`grants.names`). Fine-grained and human-auditable: "this app reaches
  *  `node/sign` + `fs/get`", not a prefix that grows every op ever added under it.
  *
- *  **Only authorities are grants; `crypto/*` and a bundle's own modules are not.**
- *  `node/sign` is a signing oracle under the node identity, `node/identity` hands out
- *  the node's public key, `node/random` reaches the OS entropy source — each a grant
- *  over something the host owns. The `crypto/` primitives are functions of their
- *  arguments, so a guest holding them computes only what it could have computed with
- *  code of its own, and a manifest that had to ask before hashing a byte string
- *  would be describing an authority that does not exist. A bare name — one of the asking
- *  bundle's own modules — is exempt for the same reason: that code was installed and
- *  verified with the guest, so calling it reaches nothing the guest does not already
- *  hold, and its scope (one app's map) is the shape, not a grant.
+ *  **Grants are the authorities plus the reserved ids; `crypto/*` and a bundle's own
+ *  modules are not.** `node/sign` is a signing oracle under the node identity,
+ *  `node/identity` hands out the node's public key, `node/random` reaches the OS entropy
+ *  source, `link/*` reaches a socket — each a grant over something the host owns. A `_`-led
+ *  id is a grant over something another REALM owns, which is why it is declared in the same
+ *  list: `_net` in a manifest's requires says "this app talks to the network", and it is
+ *  the only place that says so. The `crypto/` primitives are functions of their arguments,
+ *  so a guest holding them computes only what it could have computed with code of its own,
+ *  and a manifest that had to ask before hashing a byte string would be describing an
+ *  authority that does not exist. A bare name — one of the asking bundle's own modules — is
+ *  exempt for the same reason: that code was installed and verified with the guest, so
+ *  calling it reaches nothing the guest does not already hold, and its scope (one app's
+ *  map) is the shape, not a grant.
  *
- *  Neither exemption is a parse of the name: the gate asks `isGrant`, which is
- *  membership in this table, so a name is an authority exactly by being one the host owns
- *  something for — and the manifest never mentions the rest of the seam at all. */
-export { AUTHORITY_CALLS, GRANT_GROUPS, PRIVILEGES } from "../core/domains.js";
+ *  Neither exemption is a parse of the name for AUTHORITY: the gate asks `isGrant`, which
+ *  is membership in this table or the one-character reservation the format already
+ *  enforces — so the manifest never mentions the rest of the seam at all. */
+export { AUTHORITY_CALLS, PRIVILEGES, NET_PROTOCOL, SHELL_PROTOCOL } from "../core/domains.js";
 /** The host-derived scope the node/sign name binds every guest signature to (README §12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest's `(author, app)`.
  *  Never guest-supplied — a guest can only sign within its own bundle's namespace,
@@ -573,9 +673,10 @@ function u64be(value: number): Uint8Array {
  *  The `crypto/*` entries (the primitive catalog, keys typed `crypto/${PrimitiveName}`)
  *  reach nothing a guest does not already hold, so they are ungated by a rule; every
  *  other name is an authority, gated by EXACT membership in the manifest's declared
- *  requires. Two nets (§12.1): `net/*` is the transport slot's structured OUTPUT,
- *  `link/*` is the platform's raw contribution; the slot holds both, an app holds
- *  only `net`. */
+ *  requires. `link/*` is the platform's whole contribution to the network — a byte duplex
+ *  behind opaque link ids — and it is the transport's alone; what the transport PROVIDES
+ *  back is not in this table at all, because it is not a host service but a realm an app
+ *  reaches by the id it claims (`NET_PROTOCOL`). */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
     const { sodium, identity } = platform;
     const now = platform.now ?? (() => Date.now());
@@ -593,11 +694,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         if (!grants.timers)
             throw new Error("guest-seam: timer.* used but no timer backend wired");
         return grants.timers;
-    };
-    const sink = () => {
-        if (!grants.transportSink)
-            throw new Error("guest-seam: the transport names are the mounted transport's, and this realm is not it");
-        return grants.transportSink;
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` (and "constructor", "valueOf", …) with
@@ -655,23 +751,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
                 throw new Error("guest-seam: node/random size over cap");
             return sodium.randombytes_buf(n);
         },
-        // ── net: net/send is the only async name — a real round trip → a Promise ──
-        "net/send": (payload) => {
-            if (!grants.transport)
-                throw new Error("guest-seam: net/send used but no transport is wired (the transport bundle itself must not declare net)");
-            const peer = toHex(payload.slice(0, 32));
-            const pidLen = payload[32];
-            const proto = payload.slice(33, 33 + pidLen);
-            const off = 33 + pidLen;
-            return grants.transport.request(peer, proto, payload.slice(off)).then((resp) => concatBytes([ONE, resp]), () => ZERO);
-        },
-        // net/peers — -> [count u32][pk 32 …]
-        "net/peers": () => {
-            const peers = platform.peers();
-            const head = new Uint8Array(4);
-            writeU32BE(head, 0, peers.length);
-            return concatBytes([head, ...peers.map(fromHex)]);
-        },
         // ── fs: raw bytes under an opaque key. Every one of these round-trips, so
         // each returns a Promise and the guest reads it with `await` — the seam is
         // what is async, not the backend (§12.1). ──────────────────────────────────
@@ -709,10 +788,10 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         //
         // The WHOLE of what the platform contributes to the network (§12.1): a link
         // id the host mints and the guest never interprets, bytes in and bytes out.
-        // No peer, no protocol id, no correlation — those are the transport slot's
-        // OUTPUT (transport/* below), which an app reaches through the ordinary `net`
-        // domain. Inbound bytes arrive the other way, as ordinary entrypoint
-        // invocations on the mounted transport's guest.
+        // No peer, no protocol id, no correlation — those are the transport's own, and an
+        // app reaches them by calling the id the transport claims, not by a name here.
+        // Inbound bytes arrive the other way, as ordinary invocations of the transport's
+        // `handle`.
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);
@@ -746,34 +825,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         },
         "timer/clear": (payload) => {
             timers().clear(readU32BE(payload, 0));
-            return NONE;
-        },
-        // ── what the transport slot PROVIDES back: the structured face (attributed
-        // peer, protocol id, correlation) an app reaches through the `net` domain ──
-        "transport/deliver": (payload) => {
-            const corr = readU32BE(payload, 0);
-            const noReply = payload[4] === 1;
-            const from = payload.slice(5, 37);
-            const pidLen = payload[37];
-            const proto = payload.slice(38, 38 + pidLen);
-            sink().deliver(corr, noReply, from, proto, payload.slice(38 + pidLen));
-            return NONE;
-        },
-        "transport/settle": (payload) => {
-            sink().settle(readU32BE(payload, 0), payload[4] === 1, payload.slice(5));
-            return NONE;
-        },
-        "transport/link-auth": (payload) => sink().linkAuth(readU32BE(payload, 0), payload.slice(5, 37), payload[4] === 1) ? ONE : ZERO,
-        "transport/peer-edge": (payload) => {
-            sink().peerEdge(payload[0] === 1, payload.slice(1, 33));
-            return NONE;
-        },
-        "transport/ready": (payload) => {
-            sink().ready(payload[0] === 1);
-            return NONE;
-        },
-        "transport/link-down": (payload) => {
-            sink().linkDown(readU32BE(payload, 0), payload[4]);
             return NONE;
         },
     } satisfies Record<HandlerKey, SeamHandler>);
@@ -842,7 +893,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         if (allowed && isGrant(name) && !allowed.has(name)) {
             throw new Error("guest-seam: " + name + " not declared by the bundle manifest requires");
         }
-        // ONE catalog, two sources of names, told apart by the name itself (§12.2). A
+        // ONE catalog, three sources of names, told apart by the name itself (§12.2). A
         // `/` says a host name: the table lookup IS the dispatch, and an unknown name
         // (or a primitive this host does not carry) reads `undefined` and is refused.
         if (name.includes("/")) {
@@ -850,6 +901,20 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
             if (!fn)
                 throw new Error("guest-seam: no such name " + name);
             return fn(payload);
+        }
+        // A leading `_` says a RESERVED protocol id: another realm, reached by the same
+        // call the host dispatches an inbound frame with (core/domains.ts). Gated above
+        // like any authority — it is in `requires` — and refused by name when nothing
+        // claims it, rather than parked on a promise no one will ever settle. The answer
+        // is whatever the callee's `handle` returned, on a later turn: the callee never
+        // runs inside this guest's frame, which is what keeps the call graph a graph.
+        if (isReservedProtocol(name)) {
+            if (!grants.calls)
+                throw new Error("guest-seam: " + name + " is a cross-realm call and this seam has no routing wired");
+            const answer = grants.calls.call(name, payload);
+            if (!answer)
+                throw new Error("guest-seam: no realm claims " + name);
+            return answer;
         }
         // A bare name is one of THIS bundle's own modules, by the logical name from its
         // manifest (README §5.1) — which is the name it is bound under inside this app's

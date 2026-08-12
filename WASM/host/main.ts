@@ -26,7 +26,7 @@ import { createShell, ModuleTable, isAdmissionRejected, type RealmFactory, type 
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
-import { type PeerId } from "../core/net.js";
+import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
 
 export interface ShellOptions {
@@ -57,12 +57,9 @@ export interface ShellOptions {
     channels?: ChannelFactory;
     /** The signed transport bundle blob. Defaults to the one shipped in the
      *  artifact (transport-bundle.ts); the operator's policy must grant its author the
-     *  `mount` privilege (never the plain `authors` list). A shell without an
+     *  `link` privilege (never the plain `authors` list). A shell without an
      *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
-    /** Live connected peers for the net/peers name. The transport owns
-     *  connectivity; this closure feeds it into the guest seam. */
-    livePeers?: () => PeerId[];
     /** Default per-request deadline in ms — how long one net request may take before
      *  it settles as unreachable, for a caller that names none of its own (§12.6). */
     requestDeadlineMs?: number;
@@ -153,7 +150,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
             table: new ModuleTable(), fs, freshnessStore: freshness,
             channels, listen: opts.listen, wsListen: opts.wsListen,
             contactSecret: opts.contactSecret, networkKey: opts.networkKey,
-            createRealm, livePeers: opts.livePeers,
+            createRealm,
         },
         admit: policy,
         requestDeadlineMs: opts.requestDeadlineMs,
@@ -163,7 +160,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
     });
     // ── Load the transport bundle: the node's network (§12.6) ───────────────────
     // The ONE install path, like any other bundle: verify, govern under policy, install,
-    // and — because it requires the mount names — stand the driver up. A policy that
+    // and — because it requires the `link/*` names — stand the driver up. A policy that
     // does not admit the transport author leaves the node without a network, which is a
     // deliberate configuration ("this node does not speak to anyone"), not an error.
     if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {
@@ -172,7 +169,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         }
         catch (err) {
             if (isAdmissionRejected(err)) {
-                console.warn('  no transport: the policy grants "mount" to no author of this bundle');
+                console.warn('  no transport: the policy grants "link" to no author of this bundle');
             }
             else {
                 throw err;
@@ -180,7 +177,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         }
     }
     // Standing the driver's own listeners up is the last step, and it is conditional
-    // on there BEING a driver: a policy that grants `mount` to nobody leaves a node
+    // on there BEING a driver: a policy that grants `link` to nobody leaves a node
     // with no network at all, which is a configuration rather than a failure.
     await core.transport?.start();
     // ── Node wrapper: add file-backed loadBundle ───────────────────────────────
@@ -199,7 +196,7 @@ export async function boot(opts: ShellOptions): Promise<Shell> {
         async loadBundle(file) {
             return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
         },
-        runGuest: core.runGuest,
+        invoke: core.invoke,
         dispatch: core.dispatch,
         serve: core.serve,
         close() { core.close(); channels.close(); },

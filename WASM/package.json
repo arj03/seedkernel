@@ -8,10 +8,6 @@
       "types": "./build/host/crypto-node.d.ts",
       "default": "./build/host/crypto-node.js"
     },
-    "./net": {
-      "types": "./build/core/net.d.ts",
-      "default": "./build/core/net.js"
-    },
     "./net-node": {
       "types": "./build/host/net-node.d.ts",
       "default": "./build/host/net-node.js"
@@ -72,6 +68,10 @@
       "types": "./build/host/bundle.d.ts",
       "default": "./build/host/bundle.js"
     },
+    "./quickjs": {
+      "types": "./quickjs/dist/variant.d.mts",
+      "default": "./quickjs/dist/variant.mjs"
+    },
     "./libsodium": "./browser/libsodium-wrappers.mjs",
     "./libsodium-core": "./browser/libsodium-core.mjs",
     "./libsodium.wasm": "./browser/libsodium.wasm"
@@ -80,7 +80,7 @@
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
     "build:host": "tsc -p . && tsc -p tsconfig.check.json",
     "build:host:min": "node scripts/minify.mjs",
-    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"runMain,cliLoadBundle,openStore,bootNode,setPolicy,serve,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,transportSignScope,UNRESTRICTED_NAMES,toHex,fromHex,freshnessPathFor,TRANSPORT_BUNDLE_B64,makeTransportNode,embeddedTransportAuthor,fs,sodium,deriveNodeKeys,guestDriver,nativePolyfills,appKeyFor,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,SUITE_MANIFEST_HYBRID_PQ,GUEST_ABI_VERSION\" build/host/native-polyfills.js build/core/util.js build/core/domains.js build/core/wasm-limits.js build/core/net-limits.js build/core/fs.js build/core/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/core/net.js build/core/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/host/cli.js build/host/native-shim.js",
+    "build:loader-bundles": "node scripts/bundle-loader.mjs ../native/host-shell.gen.js \"runMain,cliLoadBundle,openStore,bootNode,setPolicy,serve,createRealm,guestPreamble,createGuestSeam,guestSignScope,appSignScope,transportSignScope,UNRESTRICTED_NAMES,toHex,fromHex,freshnessPathFor,TRANSPORT_BUNDLE_B64,makeTransportNode,embeddedTransportAuthor,fs,sodium,deriveNodeKeys,guestDriver,nativePolyfills,appKeyFor,DOMAIN_MANIFEST,DOMAIN_MANIFEST_AUTHOR,SUITE_MANIFEST_HYBRID_PQ,GUEST_ABI_VERSION\" build/host/native-polyfills.js build/core/util.js build/core/domains.js build/core/wasm-limits.js build/core/net-limits.js build/core/fs.js build/core/subkeys.js build/host/bundle.js build/host/policy.js build/host/guest-seam.js build/host/realm-queue.js build/core/socket-seam.js build/host/transport-host.js build/host/transport-bundle.js build/host/shell-core.js build/host/cli.js build/host/native-shim.js",
     "build:loader-wasm": "npm run build:ws && npm run build:browser-sodium && npm run build:pq && node scripts/copy-loader-wasm.mjs",
     "build:loader": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:loader-bundles && npm run build:loader-wasm",
     "build:browser-sodium": "node scripts/build-libsodium.mjs",
@@ -95,10 +95,8 @@
     "build:transport-bundle": "node scripts/build-transport-bundle.mjs"
   },
   "dependencies": {
-    "@jitl/quickjs-ng-wasmfile-release-asyncify": "^0.32.0",
-    "@jitl/quickjs-ng-wasmfile-release-sync": "^0.32.0",
     "libsodium-wrappers-sumo": "0.8.4",
-    "quickjs-emscripten": "^0.32.0",
+    "quickjs-emscripten-core": "^0.32.0",
     "werift": "^0.23.0"
   },
   "devDependencies": {

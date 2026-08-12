@@ -73,7 +73,7 @@ const testAuthor = () => makeAuthor(sodium);
  *  loaded here before, from a key nobody has written off. The shell reads these off its
  *  freshness store; a test composing the load by hand states them. */
 const APP_CTX = { privileges: [], highWater: -Infinity, revoked: false };
-const MOUNT_CTX = { ...APP_CTX, privileges: ["mount"] };
+const LINK_CTX = { ...APP_CTX, privileges: ["link"] };
 
 /** Inline compose of `verifyBundle` → `admit` → `installBundle` for the four
  *  policy + integrity tests that own their own ModuleTable without a shell. */
@@ -353,7 +353,7 @@ async function testManifestClaimIsTheRouting() {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit: byPrivilege({ base: admitAll, grants: { mount: denyAll } }),
+    admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
   });
   try {
     const key = appKey(author.id, "store");
@@ -394,15 +394,25 @@ async function testManifestClaimIsTheRouting() {
     assertEqual(shell.routes().length, 0, "…leaving no route behind");
 
     // The format's half of the rule: an id that is not routable is a manifest its author
-    // got wrong, refused whole at verify rather than dropped quietly. `_offer`-shaped ids
-    // are the shell's own (§12.10) and a bundle cannot spell one.
-    for (const bad of [["bad id"], ["_offer"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
+    // got wrong, refused whole at verify rather than dropped quietly.
+    for (const bad of [["bad id"], ["dup", "dup"], ["a".repeat(65)], [""], [7]]) {
       let threw = false;
       try {
         verifyManifest(sodium, signManifest(sodium, author,
           { app: "bad", version: 1, protocols: bad, modules: [], guest: GUEST() }));
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
+    }
+    // A `_`-led id is well FORMED — the transport claims one — but claiming it is a
+    // privilege, so an ordinary app naming it is refused by name rather than as a
+    // syntax error (§12.10, bundle.ts `verifyManifest`).
+    for (const reserved of [["_net"], ["_host"], ["_offer"]]) {
+      let msg = "";
+      try {
+        verifyManifest(sodium, signManifest(sodium, author,
+          { app: "bad", version: 1, protocols: reserved, modules: [], guest: GUEST() }));
+      } catch (e) { msg = String(e); }
+      assert(/is reserved/.test(msg), `an app claiming ${JSON.stringify(reserved)} is refused: ${msg}`);
     }
   } finally { shell.close(); }
   console.log("  OK\n");
@@ -593,9 +603,10 @@ async function testGuestSeam() {
   const id = generateKeyPair();
   const otherKey = generateKeyPair();
   const fs = new MemoryFs();
-  // A transport host for the net ops: its peer id is the identity's, and a request
-  // to itself drops at the guest's own-frame guard, so net/send drains.
-  const { driver: transport } = await makeTransportHost({ identity: id, requestDeadlineMs: 200 });
+  // The routing a `_`-led name resolves through — the shell's job in production, a stub
+  // here so the seam is tested for what it does: gate the name, then hand the payload to
+  // whatever claims the id. `_net` is claimed; `_nobody` is not.
+  const calls = { call: (idName) => (idName === "_net" ? Promise.resolve(U(9, 9)) : null) };
 
   // A module reachable by name, to exercise the catalog's app-module half. The forwarder fixture
   // echoes its input, admitted the one way code arrives (§12.4).
@@ -608,8 +619,8 @@ async function testGuestSeam() {
   const signScope = appSignScope(id, id.publicKey, "testapp");
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const seam = createGuestSeam({
-    platform: { sodium, identity: id, peers: () => [toHex(id.publicKey)] },
-    grants: { names: UNRESTRICTED_NAMES, signScope, fs, transport },
+    platform: { sodium, identity: id },
+    grants: { names: UNRESTRICTED_NAMES, signScope, fs, calls },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
@@ -706,16 +717,16 @@ async function testGuestSeam() {
     // `guest.abi` versions, which is why it is declared and checked rather than assumed.
     assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
     assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise (fs round-trips)");
-    assert(seam("net/peers", U()) instanceof Uint8Array, "net/peers is synchronous");
-    const protoEnc = new TextEncoder().encode("_test");
-    const sendFrame = concatBytes([id.publicKey, U(protoEnc.length), protoEnc, U(7)]);
-    const sendResult = seam("net/send", sendFrame);
-    assert(sendResult instanceof Promise, "net/send returns a Promise (a real round trip)");
-    await sendResult.catch(() => {}); // drain (no live peer) so it doesn't dangle
 
-    // net/peers
-    const peers = await seam("net/peers", U());
-    assertEqual(new DataView(peers.buffer, peers.byteOffset).getUint32(0, false), 1, "net/peers counts the cohort");
+    // The CROSS-REALM call: a `_`-led name is another realm, reached on a later turn, so
+    // it is a Promise like fs. There is no `net` domain — the network is a bundle that
+    // claims `_net`, and this seam's routing answers it (§12.10).
+    const crossed = seam("_net", U(1, 2, 3));
+    assert(crossed instanceof Promise, "a reserved id returns a Promise (the callee runs on a later turn)");
+    assertEqual([...await crossed], [9, 9], "…and resolves with what the callee's handle returned");
+    let unclaimed = false;
+    try { await seam("_nobody", U()); } catch { unclaimed = true; }
+    assert(unclaimed, "a reserved id no realm claims is refused by name, not left pending");
 
     // A bare name reaches this app's module by its LOGICAL name — the same `host.call`
     // shape as every other name, with no second framing (§12.2), and the app key is the
@@ -724,9 +735,7 @@ async function testGuestSeam() {
     let noSuch = false;
     try { await seam("nosuchmodule", U(1)); } catch { noSuch = true; }
     assert(noSuch, "a bare name this app never installed is refused, like any unknown name");
-  } finally {
-    transport.close();
-  }
+  } finally { /* nothing host-side to tear down: the seam holds no transport */ }
 
   console.log("  OK\n");
 }
@@ -742,16 +751,16 @@ async function testPolicy() {
 
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
-  const tryLoad = async (policyJson, author, mount) => {
+  const tryLoad = async (policyJson, author, links) => {
     const host = new ModuleTable();
     const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST({ requires: mount ? ["link/open", "transport/deliver"] : [] }) };
+      guest: GUEST({ requires: links ? ["link/open"] : [] }) };
     const manifestEnv = signManifest(sodium, author, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
     let landed = false;
-    try { await loadBundle(host, blob, admit, mount ? MOUNT_CTX : APP_CTX); landed = true; } catch { /* author not in policy */ }
+    try { await loadBundle(host, blob, admit, links ? LINK_CTX : APP_CTX); landed = true; } catch { /* author not in policy */ }
     return landed;
   };
 
@@ -762,27 +771,27 @@ async function testPolicy() {
   const badAuthor = await tryLoad(JSON.stringify({ authors: [toHex(good.id)] }), bad);
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
-  // ── the mount is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
-  // The mount privilege carries raw links and channel-identity signing — the bundle that
+  // ── the transport is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
+  // The `link` privilege carries raw links and channel-identity signing — the bundle that
   // holds the node's whole network — so the ordinary author list must NOT admit one, even
-  // for an author it already trusts with apps. Only a `grants.mount` entry does.
+  // for an author it already trusts with apps. Only a `grants.link` entry does.
   const goodHex = toHex(good.id);
   const appOnly = JSON.stringify({ authors: [goodHex] });
-  const withTransport = JSON.stringify({ authors: [goodHex], grants: { mount: [goodHex] } });
+  const withTransport = JSON.stringify({ authors: [goodHex], grants: { link: [goodHex] } });
 
-  const mountDenied = await tryLoad(appOnly, good, true);
-  assert(!mountDenied, "an author trusted for apps does NOT thereby hold the mount");
-  const mountAllowed = await tryLoad(withTransport, good, true);
-  assert(mountAllowed, "a grants.mount entry admits that author to the transport mount");
-  const strangerMount = await tryLoad(withTransport, bad, true);
-  assert(!strangerMount, "an author outside the mount grant is refused it");
+  const linkDenied = await tryLoad(appOnly, good, true);
+  assert(!linkDenied, "an author trusted for apps does NOT thereby hold `link`");
+  const linkAllowed = await tryLoad(withTransport, good, true);
+  assert(linkAllowed, "a grants.link entry admits that author to the transport");
+  const strangerLink = await tryLoad(withTransport, bad, true);
+  assert(!strangerLink, "an author outside the `link` grant is refused it");
   const appStillOk = await tryLoad(withTransport, good, false);
   assert(appStillOk, "adding a grant does not disturb ordinary app admission");
 
   // The two answers are independent: a grant alone admits no unprivileged bundle.
-  const transportOnly = JSON.stringify({ grants: { mount: [goodHex] } });
+  const transportOnly = JSON.stringify({ grants: { link: [goodHex] } });
   const appUnderTransportList = await tryLoad(transportOnly, good, false);
-  assert(!appUnderTransportList, "a mount grant is not a licence to load — `authors` still decides that");
+  assert(!appUnderTransportList, "a `link` grant is not a licence to load — `authors` still decides that");
 
   // ── parse validation ───────────────────────────────────────────────────
   let threw = false;
@@ -792,14 +801,21 @@ async function testPolicy() {
   try { parsePolicy(JSON.stringify({ authors: [] })); } catch { threw = true; }
   assert(threw, "an empty author set is rejected");
   threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { mount: [] } })); } catch { threw = true; }
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { link: [] } })); } catch { threw = true; }
   assert(threw, "an empty grant list is rejected (omit the key to grant none)");
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "the legacy \"roles\" key fails the boot loudly rather than silently denying mounts");
+  assert(threw, "the legacy \"roles\" key fails the boot loudly rather than silently denying the transport");
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] })); } catch { threw = true; }
-  assert(threw, "the superseded \"transportAuthors\" key fails the boot loudly rather than silently denying mounts");
+  assert(threw, "the superseded \"transportAuthors\" key fails the boot loudly rather than silently denying the transport");
+  // The privilege was called `mount` — a word for the slot rather than for the authorities
+  // it gates. A file still saying so is refused with the name that replaced it, for the
+  // same reason the two keys above are: silently ignoring it leaves a node with no network.
+  let mountErr = "";
+  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { mount: [goodHex] } })); }
+  catch (e) { mountErr = e.message; }
+  assert(mountErr.includes('"link"'), "the superseded \"mount\" grant names `link` as its replacement");
   // Same treatment for the retired suite dial (§12.4, §14.1): with one manifest suite the
   // field decides nothing, and ignoring it would silently admit whatever a `[1]` was
   // written to exclude.
@@ -810,7 +826,7 @@ async function testPolicy() {
   // node that looks configured and holds nothing — the whole reason the key is a
   // capability rather than free-form text.
   threw = false;
-  try { parsePolicy(JSON.stringify({ grants: { mounts: [goodHex] } })); } catch { threw = true; }
+  try { parsePolicy(JSON.stringify({ grants: { links: [goodHex] } })); } catch { threw = true; }
   assert(threw, "a grant naming no privilege this host has is refused by name");
   threw = false;
   try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
@@ -823,7 +839,7 @@ async function testPolicy() {
 //
 // There is one install path and no `role` field, so what a bundle must be granted is read
 // off `guest.requires` alone. The property that has to hold is that the derivation cannot
-// be pushed the wrong way: naming a mount name puts `mount` in the set and nothing takes
+// be pushed the wrong way: naming a `link/*` name puts `link` in the set and nothing takes
 // it out — so the MOST permissive `authors` list this codebase can express (`admitAll`)
 // still buys an author no sockets. If that fails, "an app author cannot acquire socket
 // access" is a convention rather than a property, and every policy test above is a lock
@@ -842,6 +858,9 @@ async function testRequiresPickThePrivileges() {
     [MANIFEST_FILE]: signManifest(sodium, author, {
       app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      // The transport claims the reserved id it is reached by (§12.10); an ordinary app
+      // claims nothing here.
+      ...(requires.some((r) => r.startsWith("link/")) ? { protocols: ["_net"] } : {}),
       guest: GUEST({ requires }),
     }),
     [moduleFile("fwd")]: forwarderBytes,
@@ -850,12 +869,12 @@ async function testRequiresPickThePrivileges() {
   // ONE predicate, with the capability set as an argument to it (`byPrivilege`) rather
   // than as a choice between predicates the runtime holds — which is what the shell asks
   // once.
-  const mkTestShell = (base, mount) => mkShell({
+  const mkTestShell = (base, link) => mkShell({
     platform: {
       sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
-    admit: byPrivilege({ base, grants: { mount } }),
+    admit: byPrivilege({ base, grants: { link } }),
   });
   const load = async (shell, requires) => {
     try { await shell.loadBundleBlob(blobWithRequires(requires)); return null; }
@@ -863,7 +882,7 @@ async function testRequiresPickThePrivileges() {
   };
 
   // 1. Which predicate was ASKED, counted rather than inferred from the outcome — the
-  //    outcome of a mount also depends on whether the driver stands, which this fixture's
+  //    outcome of a transport also depends on whether the driver stands, which this fixture's
   //    stub guest cannot do.
   {
     let appAsked = 0, transportAsked = 0;
@@ -872,8 +891,8 @@ async function testRequiresPickThePrivileges() {
       await load(shell, ["fs/get", "clock/now"]);
       assert(appAsked === 1 && transportAsked === 0, "a bundle reaching no privilege is governed by the base predicate");
       appAsked = transportAsked = 0;
-      await load(shell, ["link/open", "transport/deliver"]);
-      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the mount names is governed by the mount grant alone");
+      await load(shell, ["link/open"]);
+      assert(transportAsked === 1 && appAsked === 0, "a bundle naming the `link/*` names is governed by the `link` grant alone");
     } finally { shell.close(); }
   }
 
@@ -882,30 +901,30 @@ async function testRequiresPickThePrivileges() {
   {
     const shell = mkTestShell(admitAll, denyAll);
     try {
-      const err = await load(shell, ["link/open", "transport/deliver"]);
+      const err = await load(shell, ["link/open"]);
       assert(err !== null && /rejected by admission/.test(err),
-        "a permissive author list does not admit a bundle naming the mount names");
+        "a permissive author list does not admit a bundle naming the `link/*` names");
       assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
       assert(shell.host.isBound(appKeyFor(author.id, "mod"), "fwd"),
         "a bundle reaching no privilege binds normally");
     } finally { shell.close(); }
   }
 
-  // 3. Every half of a privilege or none, refused before any predicate: a bundle naming
-  //    `link/open` without any `transport/*` name has sockets and nowhere to report, so it
-  //    could only stand as a transport that is not one. It must not fall back to the
-  //    unprivileged base either — that is the exact hole a partial claim would open.
+  // 3. A privilege is ONE thing, so there are no halves to claim and no partial claim
+  //    to refuse: ANY `link/*` name puts `link` in the set, and a bundle naming one
+  //    beside ordinary app authorities is governed by the `link` grant, never by the base.
+  //    That is what closes the hole the old two-half scheme needed a coherence gate for —
+  //    a bundle could reach sockets while falling through to the unprivileged list.
   {
-    let asked = 0;
-    const shell = mkTestShell(() => { asked++; return true; }, () => { asked++; return true; });
-    try {
-      for (const requires of [["link/open"], ["transport/deliver"], ["fs/get", "link/open"]]) {
-        const err = await load(shell, requires);
-        assert(err !== null && /every half of a privilege or none/.test(err),
-          `a partial mount claim ${JSON.stringify(requires)} is refused as malformed`);
-      }
-      assert(asked === 0, "a partial mount claim never reaches a predicate at all");
-    } finally { shell.close(); }
+    for (const requires of [["link/stat"], ["fs/get", "link/open"]]) {
+      let appAsked = 0, linkAsked = 0;
+      const shell = mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
+      try {
+        await load(shell, requires);
+        assert(linkAsked === 1 && appAsked === 0,
+          `${JSON.stringify(requires)} reaches the \`link\` grant, not the base`);
+      } finally { shell.close(); }
+    }
   }
   console.log("  OK\n");
 }
@@ -968,10 +987,10 @@ async function testGuestAbi() {
   console.log("  OK\n");
 }
 
-// ─── Test: the mounted transport's freshness (§12.4) ───────────────────
+// ─── Test: the transport's freshness (§12.4) ───────────────────
 
 async function testSlotFreshness() {
-  console.log("Test: the mounted transport carries the ordinary (author, app) freshness mark");
+  console.log("Test: the transport carries the ordinary (author, app) freshness mark");
 
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { ModuleTable } = await imp("build/host/module-table.js");
@@ -991,14 +1010,14 @@ async function testSlotFreshness() {
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
     await hostGates(v, {
-      privileges: ["mount"],
+      privileges: ["link"],
       highWater: freshness.get(v.author, v.manifest.app),
       revoked: freshness.isRevoked(v.author),
     });
     installBundle(host, v, freshness);
   };
 
-  // Versions are an author's own lineage, mount or no mount. A's v5 landing does NOT bind
+  // Versions are an author's own lineage, transport or not. A's v5 landing does NOT bind
   // B to number above it: a floor keyed to the transport would put two independent authors on
   // one shared version line with no owner, and would only pay where an attacker chooses
   // which signed bundle arrives — which nothing delivering a bundle allows (§12.4).

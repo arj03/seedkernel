@@ -37,10 +37,9 @@ class Router {
   // Install a freshly-authenticated link: the double-connect tie-break and the up edge
   // on a peer's first link. Returns false — the link closed — when it lost the tie-break.
   //
-  // The whitelist gate is NOT here. It is the host's policy, and a gate this program is
-  // asked to apply to itself is one a hostile occupant of this slot simply skips; the
-  // driver enforces it on the attribution this program reports (LINK_AUTH / PEER_UP),
-  // where it cannot be bypassed.
+  // The peer lint is not here either — it ran at msg3/msg4 (`admits`, ake.js), which is
+  // the only place it can run without becoming an oracle. By the time a link reaches
+  // here it has already been admitted.
   promote(peerId, link) {
     const pool = this.links.get(peerId) || [];
     const wasEmpty = pool.length === 0;
@@ -96,10 +95,15 @@ class Router {
 
 // ── the request/response layer (ex net.ts Transport) ──────────────────────────
 
-// The event-driven twin of net.ts's Promise-based Transport: the HOST holds the
-// promises (keyed by the corr it assigned) and this layer holds the wire state —
-// correlation, the response binding, one deadline per request — driven by host timer
-// events. `to`/`from` are hex peer ids; proto is opaque bytes.
+// Correlation, the response binding, one deadline per request — and, since the corr
+// left the host, THE PROMISE TOO. An app's send arrives as an ordinary invocation of
+// `handle`, which answers with `defer()`: this layer holds the deferred, matches the
+// response frame to it by a corr that is now entirely its own, and settles it. Nothing
+// about a request is visible outside this heap.
+//
+// The corr is therefore a wire value only — it never crosses the seam in either
+// direction — which is what let the host's `pending`/`nextCorr` tables go. `to`/`from`
+// are hex peer ids; proto is opaque bytes.
 //
 // The deadline arrives WITH each request rather than being inferred here, and that is
 // the whole of the timing policy. This layer cannot tell a 200-byte control message
@@ -135,9 +139,22 @@ class Router {
 // transmission.
 class ReqRes {
   constructor() {
-    this.pending = new Map();   // corr → {to}
+    this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
     this.timers = new Map();    // corr → timerId
     this.sent = new Map();      // peerId → bytes handed to its links, ever
+    this.nextCorr = 1;
+  }
+
+  /** Settle an outstanding request and drop its bookkeeping. `ok` false ⇒ `payload` is
+   *  a utf8 failure message, which becomes the rejection the calling app sees. */
+  finish(corr, ok, payload) {
+    const p = this.pending.get(corr);
+    if (!p) return;
+    this.pending.delete(corr);
+    const t = this.timers.get(corr);
+    if (t) { clearTimer(t); this.timers.delete(corr); }
+    if (ok) p.d.settle(concatBytes([Uint8Array.from([1]), payload]));
+    else p.d.settle(Uint8Array.from([0]));
   }
 
   /** Count bytes on their way to a peer — the numerator of the progress measure. */
@@ -175,8 +192,7 @@ class ReqRes {
         this.timers.set(corr, armTimer(deadlineMs, tick));
         return;
       }
-      this.pending.delete(corr);
-      netSettle(corr, false, utf8Encode("net.send: timeout to " + to.slice(0, 8)));
+      this.finish(corr, false, EMPTY);
     };
     this.timers.set(corr, armTimer(deadlineMs, tick));
   }
@@ -185,12 +201,20 @@ class ReqRes {
     this.sendFrame = sendFrame;
   }
 
-  request(corr, to, proto, payload, noReply, deadlineMs) {
+  /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
+   *  returned (null for a noReply send, which nothing is waiting on); `deadlineMs` is
+   *  the caller's, already resolved against the node's default at init.
+   *
+   *  The corr is minted HERE. It used to be the host's, because the host held the
+   *  promise; now that the promise is here too, the correlation never leaves this heap
+   *  and there is nothing to keep in step. */
+  request(d, to, proto, payload, noReply, deadlineMs) {
+    const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
-      // A noReply send carries corr 0 and never resolves — the host keeps no
-      // promise for it, so nothing here is parked on its behalf.
-      this.pending.set(corr, { to });
+      // A noReply send carries corr 0 and never resolves — nothing is parked on its
+      // behalf, here or anywhere.
+      this.pending.set(corr, { to, d });
     }
     // Count the frame BEFORE it is handed over, so the first stall check cannot read a
     // `flushed` that already includes bytes this request has not yet contributed.
@@ -226,10 +250,7 @@ class ReqRes {
       // res = [1][corr u32][payload]
       const p = this.pending.get(corr);
       if (!p || p.to !== from) return; // response bound to the peer it went to
-      this.pending.delete(corr);
-      const t = this.timers.get(corr);
-      if (t) { clearTimer(t); this.timers.delete(corr); }
-      netSettle(corr, true, frame.slice(5));
+      this.finish(corr, true, frame.slice(5));
       return;
     }
     if ((kind & 1) === 0) {
@@ -238,15 +259,25 @@ class ReqRes {
       if (frame.length < 6 + idLen) return;
       const proto = frame.slice(6, 6 + idLen);
       const payload = frame.slice(6 + idLen);
-      netDeliver(corr, noReply, fromHex(from), proto, payload);
+      // Dispatched with `.then`, never awaited: the answer comes back through THIS
+      // realm's queue, so a frame that awaited it would be holding the queue against
+      // its own reply (realm-queue.ts). The continuation runs on a later turn, which is
+      // where an answer to an inbound request belongs.
+      hostDeliver(fromHex(from), proto, payload).then(
+        (resp) => this.respond(corr, noReply, from, resp),
+        // A protocol nobody claims, or an app whose handler threw: the request is
+        // answered with an empty body rather than discarded, so a caller learns
+        // "nothing is there" now instead of waiting out its whole deadline (§12.10).
+        () => this.respond(corr, noReply, from, EMPTY),
+      );
     }
   }
 
-  // The response to a DELIVER'd request, addressed back to `from`. noReply runs
-  // the host's handler but skips the wire response.
+  // The response to a delivered request, addressed back to `from`. noReply ran the
+  // app's handler but skips the wire response.
   respond(corr, noReply, from, payload) {
     if (noReply) return;
-    const body = payload || new Uint8Array(0);
+    const body = payload || EMPTY;
     const frame = new Uint8Array(5 + body.length);
     frame[0] = 1; // KIND_RES
     writeU32BE(frame, 1, corr);
@@ -257,6 +288,9 @@ class ReqRes {
   close() {
     for (const t of this.timers.values()) clearTimer(t);
     this.timers.clear();
+    // Settle rather than drop: every one of these is an app parked on a `_net` call,
+    // and a realm going away must not leave it waiting forever.
+    for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
     this.pending.clear();
   }
 }

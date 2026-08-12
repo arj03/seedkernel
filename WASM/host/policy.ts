@@ -2,9 +2,9 @@
 // the one install path. Admission is the single seam between verifyBundle and
 // installBundle (§12.4): governance is this file, mechanics is installBundle.
 //
-// **One predicate, not a scatter of gates.** Admission is a revocation check, two
-// coherence rules about the claim itself, a version floor, and a per-class operator
-// predicate composed into one `Admit` at shell construction and evaluated in one call —
+// **One predicate, not a scatter of gates.** Admission is a revocation check, a version
+// floor, and a per-capability operator predicate composed into one `Admit` at shell
+// construction and evaluated in one call —
 // so "the policy said yes but freshness said no" cannot happen: there is one answer from
 // one call. Everything a gate needs arrives as `AdmissionContext`, so the predicate is a
 // pure function of `(bundle, context)` — no store, no I/O, no order to get wrong.
@@ -15,13 +15,13 @@
 // predicate says yes" stops being a property of the type and starts being a property of
 // how carefully the load path was read.
 //
-// The host's own four — `notRevoked`, `wholePrivileges`, `mountClaimsNoProtocol` and
-// `freshVersion` — are composed by the SHELL, not by the operator. That matters: they are
-// invariants rather than posture, so `admitAll` must not be a way to lose them, and an
-// OFFER-delivered bundle (§11) is exactly the path that would.
+// The host's own two — `notRevoked` and `freshVersion` — are composed by the SHELL, not
+// by the operator. That matters: they are invariants rather than posture, so `admitAll`
+// must not be a way to lose them, and an OFFER-delivered bundle (§11) is exactly the path
+// that would.
 //
 // **Trust is per PRIVILEGE, and the privileges are the catalog's.** Admitting an
-// ordinary app risks that app; granting the mount risks the channel, which sees all
+// ordinary app risks that app; granting `link` risks the channel, which sees all
 // plaintext and holds the session keys (§12.4). "I trust this author's chat app" is not
 // "I trust this author to be my transport", so those are separate answers — but the
 // thing an operator says yes to is the CAPABILITY, not a name for the kind of bundle
@@ -32,8 +32,8 @@
 //
 // **What a bundle reaches is not decided here.** There is no `role` field in a manifest
 // and no class the shell assigns: the shell reads the privileges off `guest.requires`
-// (`grantGroups`, over the catalog) and hands them in as `ctx.privileges`. That runs
-// only the strict way — naming `link/open` puts `mount` in the set, and nothing takes
+// (`privilegesOf`, over the catalog) and hands them in as `ctx.privileges`. That runs
+// only the strict way — naming `link/open` puts `link` in the set, and nothing takes
 // one out — so an author cannot shed a grant by editing a manifest, and a permissive
 // `authors` list is a bad configuration rather than a path to sockets.
 //
@@ -50,8 +50,8 @@
 // Deny-all stays the default: the absent predicate admits nothing.
 
 import { toHex } from "../core/util.js";
-import { GROUPS_BY_PRIVILEGE, PRIVILEGE_MOUNT, PRIVILEGES, type Privilege } from "../core/domains.js";
-import { grantGroups, privilegesOf, type VerifiedBundle } from "./bundle.js";
+import { PRIVILEGES, type Privilege } from "../core/domains.js";
+import { type VerifiedBundle } from "./bundle.js";
 
 /** Everything a gate needs, read ONCE by the shell and handed to the predicate —
  *  which is what makes the predicate pure and its order irrelevant. */
@@ -80,7 +80,7 @@ export const denyAll: Admit = () => false;
  *  trust decision." A StorageNode loads exactly the one bundle it was configured
  *  with; the choice of bundle already settled admission.
  *
- *  Safe for the mount too, and for the same reason it is safe for apps: the operator
+ *  Safe for the transport too, and for the same reason it is safe for apps: the operator
  *  naming one blob is a decision about that blob. The distinction `authorAllowlist`
  *  draws exists because an allowlist admits bundles the operator has never seen; this
  *  admits exactly the ones they chose.
@@ -105,9 +105,9 @@ export const notRevoked: Admit = (v, ctx) => {
 /** Refuse a load below the persisted `(author, app)` high-water mark as a downgrade
  *  (README §12.4). Equal versions reload — an ordinary reboot re-reads the same bundle.
  *
- *  The mounted transport is checked no differently: versions are an author's own
- *  lineage, so the mount carries the ordinary `(author, app)` mark and nothing second
- *  keyed to the slot. A floor keyed to the slot would bind every author of the mount to
+ *  The transport is checked no differently: versions are an author's own
+ *  lineage, so it carries the ordinary `(author, app)` mark and nothing second
+ *  keyed to the slot. A floor keyed to the slot would bind every author of the transport to
  *  one shared version line — B could not replace A's v5 without numbering above it, a
  *  sequence with no owner — and would buy protection only where an attacker chooses
  *  which signed bundle arrives. Nothing delivers a bundle but the operator (§12.4). */
@@ -118,49 +118,22 @@ export const freshVersion: Admit = (v, ctx) => {
   return true;
 };
 
-/** Every half of a privilege, or none of it (§12.5). A bundle with no `mount:sockets`
- *  name has no sockets and one with no `mount:report` name has nowhere to report, so a
- *  partial claim could only stand as a transport that is not one — refused at the load
- *  rather than at the first dial.
- *
- *  A gate rather than a check the shell runs beside the predicate, because it is the same
- *  KIND of thing as the two above — a pure question about a verified bundle, answered
- *  before anything lands — and because being a gate is what keeps it in front of the
- *  operator's predicate on every target. The hole it closes needs that: a partial claim
- *  reaches no privilege, so a bundle naming `link/open` alone would otherwise fall
- *  through `byPrivilege` to the UNPRIVILEGED base and be admitted by the ordinary app
- *  list. */
-export const wholePrivileges: Admit = (v) => {
-  const groups = grantGroups(v.manifest);
-  for (const priv of privilegesOf(v.manifest)) {
-    const missing = (GROUPS_BY_PRIVILEGE.get(priv) ?? []).filter((g) => !groups.includes(g));
-    if (missing.length > 0) {
-      throw new Error(`bundle: a bundle claims every half of a privilege or none; ${v.manifest.app} declares ${groups.join(", ")} but nothing for ${missing.join(", ")} (§12.5)`);
-    }
-  }
-  return true;
-};
-
-/** A mount claims no protocol ids (§12.10). It is not an app: it receives no dispatch, so
- *  a frame naming one of these ids could never arrive, and a claim that can never be
- *  honored is a manifest that has misread the format rather than a line to ignore. */
-export const mountClaimsNoProtocol: Admit = (v) => {
-  const claimed = v.manifest.protocols ?? [];
-  if (claimed.length > 0 && privilegesOf(v.manifest).includes(PRIVILEGE_MOUNT)) {
-    throw new Error(`bundle: a transport claims no protocol ids; ${v.manifest.app} claims ${claimed.join(", ")} — a mount receives no dispatch (§12.10)`);
-  }
-  return true;
-};
-
 /** The host's own half of admission, in the order it must run: revocation first (a
- *  written-off key never reaches a consent prompt), then the two coherence gates — which
- *  are facts about the bundle alone, so a malformed claim is reported as itself rather
- *  than as whatever host state it happens to also fall foul of — then the downgrade
- *  guard. The shell composes this AROUND the operator's predicate on every target, so no
- *  posture — not `admitAll`, not an interactive dialog that always says yes — can be a
- *  way to lose any of them. Exported so a target assembling its own load path gets the
- *  same gates, in the same order, from the same place. */
-export const hostGates: Admit = allOf(notRevoked, wholePrivileges, mountClaimsNoProtocol, freshVersion);
+ *  written-off key never reaches a consent prompt), then the downgrade guard. The shell
+ *  composes this AROUND the operator's predicate on every target, so no posture — not
+ *  `admitAll`, not an interactive dialog that always says yes — can be a way to lose
+ *  either. Exported so a target assembling its own load path gets the same gates, in the
+ *  same order, from the same place.
+ *
+ *  **Two coherence gates used to live here and are gone, because what they policed is
+ *  gone.** `wholePrivileges` existed to refuse a privilege claimed in half; a privilege
+ *  is now one thing (core/domains.ts), so there is no half to claim and nothing that
+ *  could fall through `byPrivilege` to the unprivileged base. `transportClaimsNoProtocol`
+ *  existed because a transport was not an app and could receive no dispatch; it is now
+ *  reached by exactly the claim it makes, so the rule inverted into "who may claim a
+ *  reserved id", which is a fact about the manifest and lives in `verifyManifest` with
+ *  the other well-formedness rules (bundle.ts). Neither was deleted by relaxing it. */
+export const hostGates: Admit = allOf(notRevoked, freshVersion);
 
 /** A predicate that checks the manifest author's id against a closed set.
  *  `authors` strings are hex author ids, case-insensitive — the derived key-set id
@@ -238,7 +211,7 @@ function authorList(value: unknown, name: string): string[] {
  *  Throws on malformed input — a typo fails the boot loudly rather than
  *  silently widening trust.
  *
- *      { "authors": ["<hex>"], "grants": { "mount": ["<hex>"] } }
+ *      { "authors": ["<hex>"], "grants": { "link": ["<hex>"] } }
  *
  *  `authors` is who may load a bundle that reaches no privilege; each key of `grants` is
  *  a privilege from the catalog (`PRIVILEGES`) and lists who may hold THAT. An operator
@@ -268,10 +241,10 @@ export function parsePolicy(json: string): Admit {
   // failure mode a transport misconfiguration must never have, since "no transport" is
   // also a legitimate configuration and would look identical.
   if (o.roles !== undefined) {
-    throw new Error('policy: "roles" is gone — a bundle declares no role; grant the capability instead, as "grants": { "mount": [...] }');
+    throw new Error('policy: "roles" is gone — a bundle declares no role; grant the capability instead, as "grants": { "link": [...] }');
   }
   if (o.transportAuthors !== undefined) {
-    throw new Error('policy: "transportAuthors" is gone — the transport is not a class, it is the "mount" privilege; write "grants": { "mount": [...] }');
+    throw new Error('policy: "transportAuthors" is gone — the transport is not a class, it is the "link" privilege; write "grants": { "link": [...] }');
   }
   // Refused rather than ignored for the same reason: there is one manifest suite (§12.4,
   // §14.1), so a file that still lists them is written against a runtime where the choice
@@ -288,7 +261,14 @@ export function parsePolicy(json: string): Admit {
     }
     for (const [name, value] of Object.entries(o.grants as Record<string, unknown>)) {
       if (!(PRIVILEGES as readonly string[]).includes(name)) {
-        throw new Error(`policy: "${name}" is not a privilege this host grants (grants: ${PRIVILEGES.join(", ")})`);
+        // Named for the same reason the two fields above are: a privilege is the PREFIX
+        // of the authorities it gates (`link/*`), never a word for the slot the host
+        // fills with whoever holds it, and a file still saying "mount" was written
+        // against the older vocabulary rather than misspelled.
+        const hint = name === "mount"
+          ? ' — the privilege is the authorities it gates, so it is "link" ("link/open", "link/send", …); write "grants": { "link": [...] }'
+          : "";
+        throw new Error(`policy: "${name}" is not a privilege this host grants (grants: ${PRIVILEGES.join(", ")})${hint}`);
       }
       grants[name as Privilege] = authorAllowlist(authorList(value, `grants.${name}`));
       granted.push(name);
