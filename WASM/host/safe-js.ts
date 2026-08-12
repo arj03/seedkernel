@@ -249,15 +249,24 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // control itself.
   const runtime = newRuntime(mod);
   const ctx: QuickJSContext = runtime.newContext();
-  // Contexts quickjs-emscripten creates without a contextPointer (the phantom in
-  // `pumpJobs` below). Tracked from after the realm's own context is created, so
-  // that one is not one of them.
+  // Contexts quickjs-emscripten creates from a contextPointer that READ as undefined —
+  // the phantom in `pumpJobs` below. Tracked from after the realm's own context is
+  // created, so that one is not one of them.
+  //
+  // The test is `options` present with `contextPointer` undefined, not `options?.` — and
+  // the difference is the whole precision of this hook. The phantom arises from
+  // `?? newContext({ contextPointer: ctxPtr })` with `ctxPtr` undefined, so it always
+  // arrives WITH an options object. A call passing no options at all is a different
+  // caller entirely: `getSystemContext()` builds one that way and CACHES it on the
+  // runtime, so treating it as a phantom would dispose a context the runtime still hands
+  // out. Nothing here calls it today; the guard costs one comparison and means a future
+  // `computeMemoryUsage()` cannot turn this into a use-after-free.
   const phantoms = new Set<QuickJSContext>();
   {
     const newContext = runtime.newContext.bind(runtime);
     runtime.newContext = (options?: Parameters<typeof newContext>[0]) => {
       const c = newContext(options);
-      if (options?.contextPointer === undefined) phantoms.add(c);
+      if (options !== undefined && options.contextPointer === undefined) phantoms.add(c);
       return c;
     };
   }
@@ -273,31 +282,42 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // module at dispose() time via QuickJS's `list_empty(&rt->gc_obj_list)` assertion.
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
-    // quickjs-emscripten's executePendingJobs can create a context nothing will
-    // dispose: when the wasm heap grows mid-call, its ctxPtrOut view detaches,
-    // ctxPtr reads undefined, and the `?? newContext({contextPointer})` fallback
-    // fires. Such a context keeps GC objects alive, aborting the module at
-    // runtime free — so release it here, after the call is done with it.
-    for (const phantom of phantoms) {
-      if (phantom.alive) {
-        try { phantom.dispose(); } catch { /* already gone */ }
-      }
-    }
-    phantoms.clear();
-    if (!res.error) return;
-    let msg = "guest job failed";
     try {
-      const d = ctx.dump(res.error) as { message?: unknown; name?: unknown };
-      msg = d && typeof d === "object" && d.message !== undefined
-        ? `${d.name ?? "Error"}: ${String(d.message)}`
-        : String(d);
-    } catch {
-      // Reading the error can itself fail on an interrupted context; the handle still
-      // has to go back, which is what the finally below is for.
+      if (!res.error) return;
+      let msg = "guest job failed";
+      try {
+        const d = ctx.dump(res.error) as { message?: unknown; name?: unknown };
+        msg = d && typeof d === "object" && d.message !== undefined
+          ? `${d.name ?? "Error"}: ${String(d.message)}`
+          : String(d);
+      } catch {
+        // Reading the error can itself fail on an interrupted context; the handle still
+        // has to go back, which is what the finally below is for.
+      } finally {
+        res.error.dispose();
+      }
+      throw new Error(msg);
     } finally {
-      res.error.dispose();
+      // quickjs-emscripten's executePendingJobs can create a context nothing will
+      // dispose: when the wasm heap grows mid-call, its ctxPtrOut view detaches,
+      // ctxPtr reads undefined, and the `?? newContext({contextPointer})` fallback
+      // fires. Such a context keeps GC objects alive, aborting the module at
+      // runtime free — so release it here, after the call is done with it.
+      //
+      // **After the error handle, not before**, which is why this is a `finally` around
+      // the block above rather than the first thing in the function. When a job throws in
+      // the same call that grew the heap, BOTH happen — and `res.error` is a handle the
+      // phantom minted (`context.getMemory(...).heapValueHandle(valuePtr)`), so its
+      // `dispose()` reaches through that context. Freeing the context first turns the
+      // release above into a throw on a dead Lifetime, which loses the guest's real error
+      // AND leaks the very handle this exists to return.
+      for (const phantom of phantoms) {
+        if (phantom.alive) {
+          try { phantom.dispose(); } catch { /* already gone */ }
+        }
+      }
+      phantoms.clear();
     }
-    throw new Error(msg);
   };
 
   // Rejectors for initiator calls currently awaiting a guest promise (README §12.3).

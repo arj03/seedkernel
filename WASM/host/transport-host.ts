@@ -145,13 +145,47 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  against this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
+/** `[caller 32][nameLen u8][name utf8]` for one op, built once and shared.
+ *
+ *  The op set is fixed and tiny — nine names, all string literals in this file — while
+ *  this header is rebuilt on the INBOUND FRAME PATH: once per socket read, per link. A
+ *  `TextEncoder` run and a fresh allocation there price a constant, so the constant is
+ *  computed once. Shared safely because nothing mutates a header: `Args` only ever pushes
+ *  it into a parts list that `build()` copies OUT of.
+ *
+ *  The leading 32 bytes stay zero — the caller id for "the host itself", where an app's
+ *  cross-realm call carries its own app key (shell-core.ts). */
+const OP_HEADERS = new Map<string, Uint8Array>();
+function opHeader(op: string): Uint8Array {
+  let h = OP_HEADERS.get(op);
+  if (h === undefined) {
+    const name = enc.encode(op);
+    h = new Uint8Array(32 + 1 + name.length);
+    h[32] = name.length;
+    h.set(name, 33);
+    OP_HEADERS.set(op, h);
+  }
+  return h;
+}
+
 /** Op-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
  *  length-prefixed blob, in the fixed order the op declares. The op's NAME is the
- *  discriminator and it is written by `toTransport` below, so nothing here is a number the
- *  two sides have to agree on. */
+ *  discriminator and it is the FIRST thing encoded, so nothing here is a number the two
+ *  sides have to agree on. */
 class Args {
+  /** The op this payload is for, or `""` for a nested list that is somebody's blob.
+   *  Read back for diagnostics — a failed op reports by name (`tell`). */
+  readonly op: string;
   private readonly parts: Uint8Array[] = [];
   private len = 0;
+  /** Naming the op here rather than at the send is what lets `build()` emit the WHOLE
+   *  cross-realm call in one pass. The alternative — build the fields, then copy them
+   *  again behind a header — costs a second full copy of every payload, which on
+   *  `linkBytes` is a copy of the frame itself on every socket read. */
+  constructor(op = "") {
+    this.op = op;
+    if (op !== "") this.raw(opHeader(op));
+  }
   u8(v: number): this {
     const b = new Uint8Array(1);
     b[0] = v;
@@ -328,7 +362,7 @@ export class TransportHost {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    this.toTransport("init", new Args()
+    this.toTransport(new Args("init")
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -341,8 +375,7 @@ export class TransportHost {
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
       // Absent and empty are the same thing — "admit everyone" — said as a zero-length
       // list rather than as a missing field, so the guest reads one shape.
-      .blob(admit.build())
-      .build());
+      .blob(admit.build()));
     // The incoming guest starts with an empty address book, so re-seed it. On a first
     // attach there is nothing to send; on a replacement this is what lets it redial.
     for (const [id, addr] of this.addrs) this.announceAddr(id, addr);
@@ -355,36 +388,32 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
 
-  /** Call the transport by op name. The caller id is 32 zero bytes — "the host itself" —
-   *  where an app's call carries its own app key, so it reads one shape and can
-   *  tell the platform's events from an app's requests without a second seam.
+  /** Call the transport. The op name and the 32-byte caller id — zeros, "the host
+   *  itself", where an app's call carries its own app key — are already the head of
+   *  `args`, so the payload the guest reads is exactly what `build()` returns and no byte
+   *  is copied twice. One shape either way: the occupant tells the platform's events from
+   *  an app's requests by those 32 bytes and needs no second seam.
    *
    *  Fire-and-forget by default, but not unordered: the realm serializes invocations in
    *  acceptance order (realm-queue.ts), so bytes arriving on one link reach the occupant
    *  in arrival order. An op that throws is a wedged transport whose links are moot, not
    *  a reason to take the host down. */
-  private toTransport(op: string, args: Uint8Array): Promise<Uint8Array> | null {
+  private toTransport(args: Args): Promise<Uint8Array> | null {
     if (this.closed || !this.transport) return null;
-    const name = enc.encode(op);
-    const payload = new Uint8Array(32 + 1 + name.length + args.length);
-    payload.set(ZERO32, 0);
-    payload[32] = name.length;
-    payload.set(name, 33);
-    payload.set(args, 33 + name.length);
-    return this.transport(payload);
+    return this.transport(args.build());
   }
 
   /** `toTransport` for an op whose answer nobody is waiting on. */
-  private tell(op: string, args: Uint8Array): void {
-    const r = this.toTransport(op, args);
-    if (r) void r.catch((err: unknown) => { console.error(`[transport] error in ${op}: ${String(err)}`); });
+  private tell(args: Args): void {
+    const r = this.toTransport(args);
+    if (r) void r.catch((err: unknown) => { console.error(`[transport] error in ${args.op}: ${String(err)}`); });
   }
 
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims
    *  `_net` — a node with no transport bundle, which is a legitimate configuration and
    *  so has to be an answer rather than a promise that never settles. */
-  private ask(op: string, args: Uint8Array): Promise<Uint8Array> {
-    const r = this.toTransport(op, args);
+  private ask(args: Args): Promise<Uint8Array> {
+    const r = this.toTransport(args);
     if (!r) return Promise.reject(new Error("transport: no bundle claims the network"));
     return r;
   }
@@ -446,11 +475,11 @@ export class TransportHost {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
-      this.tell("linkBytes", new Args().u32(linkId).blob(bytes).build());
+      this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => {
       this.channels.delete(linkId);
-      this.tell("linkClosed", new Args().u32(linkId).build());
+      this.tell(new Args("linkClosed").u32(linkId));
     });
     return linkId;
   }
@@ -466,7 +495,7 @@ export class TransportHost {
       rekeyAfterFrames?: number;
     },
   ): void {
-    this.tell("linkOpen", new Args()
+    this.tell(new Args("linkOpen")
       .u32(linkId)
       .u8(spec.weDialed ? 1 : 0)
       .u8(spec.kind)
@@ -476,8 +505,7 @@ export class TransportHost {
       .u32(spec.rekeyAfterFrames ?? 0)
       .blob(spec.expectPeerId ?? EMPTY)
       .blob(spec.dialSecret ?? EMPTY)
-      .blob(enc.encode(spec.source ?? ""))
-      .build());
+      .blob(enc.encode(spec.source ?? "")));
   }
 
   /** Hand a host-owned channel to the transport (WebRTC / browser WS edges).
@@ -501,8 +529,8 @@ export class TransportHost {
     });
     return {
       linkId,
-      send: (frame) => this.tell("linkSend", new Args().u32(linkId).blob(frame).build()),
-      close: () => { this.tell("linkClose", new Args().u32(linkId).build()); },
+      send: (frame) => this.tell(new Args("linkSend").u32(linkId).blob(frame)),
+      close: () => { this.tell(new Args("linkClose").u32(linkId)); },
     };
   }
 
@@ -517,10 +545,9 @@ export class TransportHost {
    *  peer) to build msg1; the host keeps the full address, which is what `link/open`
    *  resolves the peer key against. */
   private announceAddr(peerId: PeerId, addr: PeerAddr): void {
-    this.tell("addr", new Args()
+    this.tell(new Args("addr")
       .blob(fromHex(peerId))
-      .blob(addr.contactSecret ?? ZERO32)
-      .build());
+      .blob(addr.contactSecret ?? ZERO32));
   }
 
   /** Bind the listeners (if any) through the channel factory. */
@@ -546,14 +573,14 @@ export class TransportHost {
    *  `defer()` when the last peer comes up. Nothing is held host-side, which is why
    *  there is no waiter to join or overwrite. */
   async ready(timeoutMs = 5000): Promise<void> {
-    await this.ask("ready", new Args().u32(timeoutMs).build());
+    await this.ask(new Args("ready").u32(timeoutMs));
   }
 
   /** The peers we currently hold at least one authenticated link to. The set lives in
    *  the guest — it is a fact about links, and links are the guest's — so this is a
    *  question rather than a field. */
   async linkedPeers(): Promise<PeerId[]> {
-    const bytes = await this.ask("peers", EMPTY);
+    const bytes = await this.ask(new Args("peers"));
     const out: PeerId[] = [];
     for (let off = 0; off + 32 <= bytes.length; off += 32) out.push(toHex(bytes.slice(off, off + 32)));
     return out;
