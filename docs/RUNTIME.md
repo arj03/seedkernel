@@ -320,7 +320,7 @@ All three are the SAME type — one seam, not three mechanisms layered on top of
 
 **Which privileges a bundle must be granted is read off `guest.requires`, and nothing else.** There is no `role` field — the privileges are exactly the ones its declared names carry in the catalog (§12.2), which the manifest signature already covers and the verifier has already checked, so restating them as a self-description would only be a second place for the same fact to live. It stays one install path (`loadBundleBlob`, §12.4) because the derivation is safe in the only direction it can be pushed: adding `link/open` to a manifest puts `link` in the set, never takes it out. An author already trusted for apps therefore gains nothing by adding `link/*` names — they move themselves under a grant they do not hold. There is no partial claim to worry about: a privilege is one thing, so a single `link/*` name is the whole of it and nothing that reaches the privilege can fall through to the unprivileged base. `admitAll` is the exception and stays permissive everywhere: it is one blob an operator named, and naming a blob is a decision about that blob whatever it declares.
 
-The policy file (when present) is `--policy <allowed-keys.json>` (`host/policy.ts`), parsed strictly — a malformed file fails the boot loudly rather than silently widening trust:
+The policy file (when present) is `--policy <allowed-keys.json>` (`host/policy.ts`), parsed strictly — a malformed file, or one carrying a key the host does not know, fails the boot loudly rather than silently widening trust or quietly deciding nothing:
 
 ```json
 {

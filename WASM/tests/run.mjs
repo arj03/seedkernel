@@ -803,25 +803,11 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { link: [] } })); } catch { threw = true; }
   assert(threw, "an empty grant list is rejected (omit the key to grant none)");
+  // A key the host does not know is refused at the top level too, not just under `grants`:
+  // ignoring it is how a mistyped file boots looking configured and silently holds nothing.
   threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], roles: { transport: [goodHex] } })); } catch { threw = true; }
-  assert(threw, "the legacy \"roles\" key fails the boot loudly rather than silently denying the transport");
-  threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], transportAuthors: [goodHex] })); } catch { threw = true; }
-  assert(threw, "the superseded \"transportAuthors\" key fails the boot loudly rather than silently denying the transport");
-  // The privilege was called `mount` — a word for the slot rather than for the authorities
-  // it gates. A file still saying so is refused with the name that replaced it, for the
-  // same reason the two keys above are: silently ignoring it leaves a node with no network.
-  let mountErr = "";
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], grants: { mount: [goodHex] } })); }
-  catch (e) { mountErr = e.message; }
-  assert(mountErr.includes('"link"'), "the superseded \"mount\" grant names `link` as its replacement");
-  // Same treatment for the retired suite dial (§12.4, §14.1): with one manifest suite the
-  // field decides nothing, and ignoring it would silently admit whatever a `[1]` was
-  // written to exclude.
-  threw = false;
-  try { parsePolicy(JSON.stringify({ authors: [goodHex], manifestSuites: [2] })); } catch { threw = true; }
-  assert(threw, "the retired \"manifestSuites\" key is refused by name rather than ignored");
+  try { parsePolicy(JSON.stringify({ authorss: [goodHex], grants: { link: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "a mistyped top-level key is refused rather than ignored");
   // The privilege NAMES come from the catalog, so a typo is a refused boot rather than a
   // node that looks configured and holds nothing — the whole reason the key is a
   // capability rather than free-form text.
@@ -1041,14 +1027,14 @@ async function testSlotFreshness() {
     assert(refused, "an author's own stale transport is still refused as a downgrade");
   }
 
-  // The store holds marks and revocations only. A file written by a host that also kept
-  // per-slot floors still loads — an unrecognized key is ignored, not refused — and is
+  // The store holds marks and revocations only. A file carrying an unrecognized key —
+  // one a newer version added, say — still loads (it is ignored, not refused) and is
   // rewritten without it.
   {
-    const legacy = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, roles: { transport: 4 }, revoked: [] }));
+    const legacy = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, futureKey: { anything: 1 }, revoked: [] }));
     const round = JSON.parse(legacy.serialize());
-    assertEqual(round.marks["aa:app"], 2, "a store carrying slot floors still loads its marks");
-    assert(round.roles === undefined, "…and is rewritten with no slot floors");
+    assertEqual(round.marks["aa:app"], 2, "a store carrying an unknown key still loads its marks");
+    assert(round.futureKey === undefined, "…and is rewritten without it");
   }
 
   console.log("  OK\n");
@@ -2248,9 +2234,9 @@ async function testWrongTypedStoreIsRefused() {
   }
 
   // The well-formed shapes still load — including a file carrying an unrecognized
-  // key (legacy slot floors), which is ignored rather than refused.
+  // key (one a newer version added), which is ignored rather than refused.
   const good = new FreshnessMarks(JSON.stringify({
-    marks: { ["aa".repeat(32) + ":app"]: 2 }, revoked: ["bb".repeat(32)], roles: { transport: 4 },
+    marks: { ["aa".repeat(32) + ":app"]: 2 }, revoked: ["bb".repeat(32)], futureKey: { anything: 1 },
   }));
   assert(good.get(new Uint8Array(32).fill(0xaa), "app") === 2, "a well-formed store still loads its marks");
   assert(good.isRevoked(new Uint8Array(32).fill(0xbb)), "…and its revocations");

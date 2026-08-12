@@ -225,9 +225,11 @@ function authorList(value: unknown, name: string): string[] {
  *  object where an operator sees them at once, while none of it is anywhere a bundle
  *  author can reach.
  *
- *  An unknown key under `grants` is refused rather than ignored, and that is the whole
- *  value of naming privileges from the catalog: a misspelled grant is the failure mode
- *  where a node comes up looking configured and silently holds nothing. */
+ *  An unknown key is refused rather than ignored — at the top level and under `grants`
+ *  alike — and that is the whole value of naming privileges from the catalog: a
+ *  misspelled key is the failure mode where a node comes up looking configured and
+ *  silently holds nothing, which is indistinguishable from the node that was configured
+ *  to hold nothing on purpose. */
 export function parsePolicy(json: string): Admit {
   let raw: unknown;
   try { raw = JSON.parse(json); }
@@ -236,21 +238,10 @@ export function parsePolicy(json: string): Admit {
     throw new Error("policy: expected a JSON object");
   }
   const o = raw as Record<string, unknown>;
-  // Superseded vocabularies, refused BY NAME rather than ignored. Either would otherwise
-  // parse into an app-only policy and leave the node silently without a network — the one
-  // failure mode a transport misconfiguration must never have, since "no transport" is
-  // also a legitimate configuration and would look identical.
-  if (o.roles !== undefined) {
-    throw new Error('policy: "roles" is gone — a bundle declares no role; grant the capability instead, as "grants": { "link": [...] }');
-  }
-  if (o.transportAuthors !== undefined) {
-    throw new Error('policy: "transportAuthors" is gone — the transport is not a class, it is the "link" privilege; write "grants": { "link": [...] }');
-  }
-  // Refused rather than ignored for the same reason: there is one manifest suite (§12.4,
-  // §14.1), so a file that still lists them is written against a runtime where the choice
-  // existed. Ignoring it would silently admit whatever a `[1]` meant to exclude.
-  if (o.manifestSuites !== undefined) {
-    throw new Error('policy: "manifestSuites" is gone — there is one manifest suite (0x02, hybrid Ed25519 + ML-DSA-65) and the verifier refuses anything else; drop the field');
+  for (const key of Object.keys(o)) {
+    if (key !== "authors" && key !== "grants") {
+      throw new Error(`policy: "${key}" is not a policy key (the file is "authors", "grants", or both)`);
+    }
   }
   const appAuthors = o.authors === undefined ? undefined : authorList(o.authors, "authors");
   const grants: Partial<Record<Privilege, Admit>> = {};
@@ -261,14 +252,9 @@ export function parsePolicy(json: string): Admit {
     }
     for (const [name, value] of Object.entries(o.grants as Record<string, unknown>)) {
       if (!(PRIVILEGES as readonly string[]).includes(name)) {
-        // Named for the same reason the two fields above are: a privilege is the PREFIX
-        // of the authorities it gates (`link/*`), never a word for the slot the host
-        // fills with whoever holds it, and a file still saying "mount" was written
-        // against the older vocabulary rather than misspelled.
-        const hint = name === "mount"
-          ? ' — the privilege is the authorities it gates, so it is "link" ("link/open", "link/send", …); write "grants": { "link": [...] }'
-          : "";
-        throw new Error(`policy: "${name}" is not a privilege this host grants (grants: ${PRIVILEGES.join(", ")})${hint}`);
+        // A privilege is the PREFIX of the authorities it gates (`link/*`), never a
+        // word for the kind of bundle that wants it.
+        throw new Error(`policy: "${name}" is not a privilege this host grants (grants: ${PRIVILEGES.join(", ")})`);
       }
       grants[name as Privilege] = authorAllowlist(authorList(value, `grants.${name}`));
       granted.push(name);

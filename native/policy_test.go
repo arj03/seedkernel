@@ -76,15 +76,13 @@ func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 		t.Fatalf("adding a grant must not disturb app admission: %s", status)
 	}
 
-	// The superseded policy vocabularies are gone and say so at the boot: a file carrying
-	// either fails loudly rather than parsing into an app-only policy that silently leaves
-	// the node without a network. A grant naming no privilege this host has fails the same
-	// way, which is what naming grants from the catalog buys.
+	// A key the host does not know fails the boot — at the top level and under `grants`
+	// alike, which is the whole reason grants are named from the catalog: a misspelled
+	// key is a node that looks configured and holds nothing.
 	for _, bad := range []string{
-		`{"authors":["` + authorHex + `"],"roles":{"transport":["` + authorHex + `"]}}`,
-		`{"authors":["` + authorHex + `"],"transportAuthors":["` + authorHex + `"]}`,
-		`{"authors":["` + authorHex + `"],"grants":{"mount":["` + authorHex + `"]}}`,
 		`{"authors":["` + authorHex + `"],"grants":{"links":["` + authorHex + `"]}}`,
+		`{"authors":["` + authorHex + `"],"grants":{"socket":["` + authorHex + `"]}}`,
+		`{"authorss":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`,
 	} {
 		if err := applyPolicy(bad); err == nil {
 			t.Fatalf("applyPolicy(%s) must fail loudly", bad)
