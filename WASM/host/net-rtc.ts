@@ -10,6 +10,11 @@
 // openLink(), and everything above is the bundle's, identical to the TCP path
 // with only the bottom swapped.
 //
+// The seam is raw I/O only: connections, signaling and data channels. Anything a
+// peer connection can carry *besides* bytes — live audio/video, say — belongs to
+// the app, which subclasses RtcNetwork and works against the PeerEntry `pc` (that
+// is what seedchat's call feature does). Media never enters the runtime.
+//
 // Identity: the transport runs its HELLO/AUTH challenge *inside* the channel,
 // proving each end holds the channel private key for the pubkey it claims. It is
 // continuous channel binding rather than a one-shot SDP-fingerprint assertion at
@@ -28,15 +33,17 @@ import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { type PeerId } from "../core/socket-seam.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
-/** One peer connection and everything the negotiation state machine hangs off it. */
-interface PeerEntry {
+/** One peer connection and everything the negotiation state machine hangs off it.
+ *  Exported because it is the seam an app subclass works against: this file is
+ *  raw I/O only, so anything above bytes (an app publishing live media over the
+ *  same connections, say) subclasses RtcNetwork and reaches the `pc` here. */
+export interface PeerEntry {
   pc: RTCPeerConnection;
   link: LinkHandle | null;
   authed: boolean;
   polite: boolean;
   makingOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
-  callSenders: RTCRtpSender[] | null;
 }
 
 
@@ -80,11 +87,6 @@ export interface RtcNetworkOptions {
      *  to mirror the live mesh into a StorageNode's cohort (addPeer/removePeer). */
     onPeerUp?: (peerId: PeerId) => void;
     onPeerDown?: (peerId: PeerId) => void;
-    /** A remote media track arrived from a peer. Audio/video calls ride the same
-     *  RTCPeerConnection as the data channel, so an app that wants live media (the
-     *  chat demo's call feature) supplies this and attaches the track to a per-peer
-     *  tile; an app that only moves bytes omits it and never negotiates media. */
-    onTrack?: (peerId: PeerId, track: MediaStreamTrack) => void;
 }
 
 // ── RawLink over one RTCDataChannel ────────────────────────────────────────
@@ -104,9 +106,6 @@ export class RtcNetwork extends SingleIdentityNetwork {
     opts;
     readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-auth)
     private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
-    // Local media tracks to publish to every peer (now and as new ones connect).
-    // Empty unless the app started a call via addLocalTrack().
-    private readonly localTracks: { track: MediaStreamTrack; stream: MediaStream }[] = [];
     constructor(opts: RtcNetworkOptions) {
         super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
         this.opts = opts;
@@ -122,63 +121,6 @@ export class RtcNetwork extends SingleIdentityNetwork {
      *  Call once after registering the sink (or constructing a StorageNode/Transport
      *  over this network). */
     join(): void { this.opts.signaling.send({ type: "hello", from: this.ownId }); }
-    // ── live media (audio/video) ──────────────────────────────────────────────────
-    // Calls ride the same RTCPeerConnections as the data channel. addTrack triggers
-    // negotiationneeded, and the offer it produces flows through the same perfect-
-    // negotiation path the data channel uses — no separate signaling.
-    /** Publish a local track to every connected peer, and to any peer that connects
-     *  later (the track set is remembered until removeLocalTracks()). Idempotent per
-     *  (peer, track), so adding audio then video is two safe calls. */
-    addLocalTrack(track: MediaStreamTrack, stream: MediaStream): void {
-        this.localTracks.push({ track, stream });
-        for (const e of this.peers.values())
-            this.addLocalTracksTo(e);
-    }
-    /** Stop publishing media (hang up): remove every track we added and forget the
-     *  set, so future peers get no media. Renegotiation happens automatically. */
-    removeLocalTracks(): void {
-        this.localTracks.length = 0;
-        for (const e of this.peers.values()) {
-            if (!e.callSenders)
-                continue;
-            for (const sender of e.callSenders) {
-                try {
-                    e.pc.removeTrack(sender);
-                }
-                catch { /* already gone */ }
-            }
-            e.callSenders = null;
-        }
-    }
-    // Add any not-yet-published local tracks to one connected peer. Skips peers that
-    // are not yet "connected" (a track added mid-handshake fights perfect negotiation);
-    // the connectionstatechange handler calls back here when they reach "connected".
-    addLocalTracksTo(e: PeerEntry) {
-        if (this.localTracks.length === 0 || e.pc.connectionState !== "connected")
-            return;
-        if (!e.callSenders)
-            e.callSenders = [];
-        for (const { track, stream } of this.localTracks) {
-            if (e.callSenders.some((s: RTCRtpSender) => s.track === track))
-                continue; // already on this pc
-            try {
-                e.callSenders.push(e.pc.addTrack(track, stream));
-            }
-            catch { /* ignore */ }
-        }
-    }
-    /** Kick an ICE restart on every peer. Call on a network-change event (the browser
-     *  going online, an interface flip) so recovery starts at once instead of waiting
-     *  out ICE keepalive timeouts. Each restart's offer rides the signaling channel —
-     *  so the relay must still be reachable for this to complete. */
-    restartAllIce(): void {
-        for (const e of this.peers.values()) {
-            try {
-                e.pc.restartIce();
-            }
-            catch { /* ignore */ }
-        }
-    }
     /** Tear down every connection and the signaling channel. The transport's links
      *  die with their channels. */
     close(): void {
@@ -202,12 +144,12 @@ export class RtcNetwork extends SingleIdentityNetwork {
         for (const e of this.peers.values()) if (!e.authed) unauthed++;
         return unauthed < MAX_UNAUTHED_PEERS;
     }
-    ensurePeer(peerId: PeerId) {
+    ensurePeer(peerId: PeerId): PeerEntry {
         const existing = this.peers.get(peerId);
         if (existing)
             return existing;
         const pc = this.makePc(this.opts.rtcConfig);
-        const e = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] as RTCIceCandidateInit[], callSenders: null };
+        const e: PeerEntry = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] };
         this.peers.set(peerId, e);
         pc.addEventListener("icecandidate", (ev) => {
             if (ev.candidate)
@@ -228,17 +170,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
         });
         // The polite side receives the channel the impolite side opened.
         pc.addEventListener("datachannel", (ev) => this.bindLink(peerId, e, ev.channel, /*weDialed*/ false));
-        // A remote track means the peer is sending us media; hand it to the app.
-        pc.addEventListener("track", (ev) => this.opts.onTrack?.(peerId, ev.track));
         pc.addEventListener("connectionstatechange", () => {
             const s = pc.connectionState;
-            if (s === "connected") {
-                // Publish any in-progress call tracks to a peer that just finished its
-                // handshake. Doing it here (not at ensurePeer time) keeps clear of the
-                // perfect-negotiation window — the renegotiation offer rides cleanly.
-                this.addLocalTracksTo(e);
-            }
-            else if (s === "disconnected") {
+            if (s === "disconnected") {
                 // A transient path failure (network blip, NAT rebind). restartIce()
                 // schedules negotiationneeded with fresh ICE credentials; the existing
                 // handler ships the offer over signaling and the link recovers without
