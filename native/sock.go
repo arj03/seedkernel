@@ -119,7 +119,11 @@ func (n *netHost) retain() error {
 	n.fnDeliver = g.GetPropertyStr("__netDeliver")
 	n.fnClosed = g.GetPropertyStr("__netClosed")
 	n.fnAccept = g.GetPropertyStr("__netAccept")
-	if n.fnDeliver == nil || n.fnClosed == nil || n.fnAccept == nil {
+	// IsUndefined, not nil: a missing property is a *Value wrapping JS_UNDEFINED, and
+	// GetPropertyStr never returns Go nil (qjs/value.go). A nil check here would compile,
+	// never fire, and turn this named boot-time error into QuickJS's "not a function" at
+	// the first frame.
+	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
 		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
 	}
 	return nil

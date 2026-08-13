@@ -257,11 +257,23 @@ function boxKeypair() {
  *  said here — and signs the opaque suffix with the node's channel key, which never
  *  enters this program. There is no call that signs raw bytes, and the prefix is what
  *  makes a transcript signature unusable as app data (and vice versa). The peer side
- *  of the same transcript is checked with node/verify under the identical prefix. */
+ *  of the same transcript is checked with node/verify under the identical prefix.
+ *
+ *  `node/sign` answers with a signature or THROWS — a bundle that does not reach the
+ *  authority, or reaches it without a slot-derived scope, gets an exception and no
+ *  return value (guest-seam.ts). So the `{ok}` shape here is a real status and not a
+ *  formality: the throw is caught and reported, which is what lets the caller abort the
+ *  link on a local fault instead of unwinding out of a frame-delivery callback and
+ *  leaving the socket open until it times out. The `{ok}` idiom matches `scalarmult`
+ *  and `openZero` — every fallible host call in this file answers the same way. */
 function channelSign(root, th, id) {
   const out = new Uint8Array(96);
   out.set(root, 0); out.set(th, 32); out.set(id, 64);
-  return { ok: true, sig: host.call(N_SIGN, out) };
+  try {
+    return { ok: true, sig: host.call(N_SIGN, out) };
+  } catch {
+    return { ok: false, sig: null };
+  }
 }
 
 // ── calling out: the ops, each one argument-encoded and issued immediately ────
@@ -597,10 +609,16 @@ class Link {
   }
 
   signIdentity(th) {
-    // The node key never enters this module: the host signs
-    // `root ‖ th ‖ id` with the channel key after checking both (CHANNEL_SIGN).
+    // The node key never enters this module: the host signs `root ‖ th ‖ id` with the
+    // channel key. It does NOT check those bytes — they are the opaque suffix, and the
+    // host reads none of it (guest-seam.ts). What the host contributes is the prefix it
+    // chose from this bundle's slot, `DOMAIN_channel ‖ networkKey`, which is why the
+    // network binding survives a transport that lies about its own root.
     const r = channelSign(this.root, th, ownPk);
-    if (!r.ok) { this.abort(); return null; } // the host refused the preimage — local fault
+    // The seam refused the call — no `node/sign` grant, or no slot-derived scope. That
+    // is our own misconfiguration, never anything the peer did, so it aborts (a stall
+    // would tell a caller that this address went quiet, which is a different fact).
+    if (!r.ok) { this.abort(); return null; }
     return { id: ownPk, sig: r.sig };
   }
 

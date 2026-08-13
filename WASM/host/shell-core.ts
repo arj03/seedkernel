@@ -113,8 +113,15 @@ export interface ShellPlatform {
     createRealm: RealmFactory;
     now?: () => number;
     /** OPTIONAL network key — which network this node belongs to. An isolation
-     *  boundary, not a gate (§12.6); absent ⇒ the public network. Feeds both the
-     *  transport guest's INIT and the CHANNEL_SIGN root check. */
+     *  boundary, not a gate (§12.6); absent ⇒ the public network. Feeds the transport
+     *  guest's INIT and the transport slot's sign scope (`transportSignScope`).
+     *
+     *  The scope is the load-bearing one. The guest derives its own session root from
+     *  its own copy of this key and the host never checks that root — `node/sign`
+     *  prefixes and does not parse (guest-seam.ts) — so the scope is the ONLY binding of
+     *  a channel signature to this node's network that the slot occupant cannot choose.
+     *  Drop it from the preimage and a confined transport on one network can mint
+     *  transcripts another network's verifier accepts. */
     networkKey?: Uint8Array;
     /** OPTIONAL contact secret for THIS node — 32 bytes of full entropy, published
      *  with our address; the gate a caller must produce before msg1 opens. Absent ⇒

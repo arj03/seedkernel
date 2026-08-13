@@ -306,7 +306,9 @@ func hostGuestPreamble(hostQc *qjs.Context) string {
 // driver plumbing a guest runs on is the shared TS, never a Go string that could drift.
 func hostFnString(hostQc *qjs.Context, name string) string {
 	fn := hostQc.Global().GetPropertyStr(name)
-	if fn == nil {
+	// IsUndefined, not nil — GetPropertyStr wraps a missing property as JS_UNDEFINED and
+	// never returns Go nil (qjs/value.go), so a nil check would never fire.
+	if fn.IsUndefined() {
 		panic("hostFnString: " + name + " not defined (host/native-shim.ts)")
 	}
 	v, err := hostQc.Invoke(fn, hostQc.NewUndefined())
