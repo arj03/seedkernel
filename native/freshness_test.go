@@ -78,3 +78,44 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 		t.Fatalf("v3 after the second reboot: expected a downgrade refusal (mark is 4), got: %s", status)
 	}
 }
+
+// A mark the disk refuses is a FAILED load on this target too. The native store used to
+// catch its write error and only log it, which turned the shared rollback (bundle.ts
+// installBundle) off for the whole binary: the load reported success while the mark it
+// depends on was never written, so the next boot re-opened the downgrade gate for that
+// (author, app) with nothing anywhere saying why. The write seam is Go's, so this is the
+// only place the behaviour can be checked (README §12.4).
+func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
+	parent := t.TempDir()
+	dataDir := filepath.Join(parent, "data")
+	bootRealmIn(t, dataDir)
+	author := testAuthor(t)
+	policyJSON := `{"authors":["` + hex.EncodeToString(author.id()) + `"]}`
+	bootShell(t, dataDir, policyJSON, nil)
+
+	// A directory standing where the mark file goes. Every write ends in a rename onto
+	// that path, which the kernel refuses whatever the process's privileges — a full or
+	// read-only disk without needing either.
+	markPath := evalString(t, "freshnessPathFor("+jsonString(dataDir)+")")
+	os.Remove(markPath) // the boot may already have written one
+	if err := os.MkdirAll(markPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	bundlePath, _ := writeTestBundle(t, author, "testapp", 4)
+	status := loadBundle(bundlePath)
+	if !strings.Contains(status, "could not be persisted") {
+		t.Fatalf("a load whose mark cannot be written must fail loudly, got: %s", status)
+	}
+
+	// And it kept nothing: the in-memory mark was rolled back, so the store never
+	// silently ran ahead of the disk. A LOWER version landing now is the proof — after a
+	// swallowed error the mark would sit at 4 and refuse this as a downgrade.
+	if err := os.Remove(markPath); err != nil {
+		t.Fatal(err)
+	}
+	older, _ := writeTestBundle(t, author, "testapp", 2)
+	if status := loadBundle(older); !strings.HasPrefix(status, "testapp v2") {
+		t.Fatalf("the failed load must leave no mark behind, got: %s", status)
+	}
+}

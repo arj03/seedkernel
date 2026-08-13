@@ -43,7 +43,7 @@ const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
 const { NodeFs } = await imp("build/host/fs-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
-const { toHex, fromHex, concatBytes } = await imp("build/core/util.js");
+const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/core/util.js");
 import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
@@ -2353,6 +2353,74 @@ async function testFailedRevokePersistRollsBack() {
   console.log("  OK\n");
 }
 
+// ─── Test: an in-place upgrade releases the version it replaces ──────────────
+//
+// Finding guard: re-installing the same (author, app) replaced the map entry and
+// left the outgoing slot whole — its realm never disposed and its armed deadlines
+// never cancelled. A timer's callback reads the slot's realm, so the superseded
+// guest went on running `timer` turns (and re-arming more) after the operator had
+// replaced it, holding ~1.2 MB of engine per upgrade along with them. An upgrade is
+// a teardown of what it displaces: same rule as uninstall (§12.4).
+async function testInPlaceUpgradeReleasesTheOldSlot() {
+  console.log("Test: an in-place upgrade disposes the realm and deadlines it replaces");
+  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
+
+  const author = testAuthor();
+  const key = appKey(author.id, "upgrade");
+  const blob = (version) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author, {
+      app: "upgrade", version,
+      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      guest: GUEST({ requires: ["timer/arm"] }),
+    }),
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+
+  // Each realm records what it was asked to run and whether it was released. Every
+  // one arms a 5ms deadline on construction, which is the guest's half: a deadline
+  // exists only because a guest asked for one, and it re-enters THAT guest's realm.
+  const realms = [];
+  const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
+  const shell = mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async (o) => {
+        const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+        realms.push(r);
+        await o.hostCall("timer/arm", arm(1, 5));
+        return r;
+      },
+    },
+    admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
+  });
+  try {
+    await shell.loadBundleBlob(blob(1));
+    // An ordinary app's realm is lazy, so it takes a call to stand one up — which is
+    // also what gives the outgoing guest something to lose.
+    await shell.invoke("ping", new Uint8Array(), key);
+    assertEqual(realms.length, 1, "the first call stands the app's realm up");
+
+    await shell.loadBundleBlob(blob(2));
+    assert(realms[0].disposed, "the upgrade disposed the realm it replaced");
+    await shell.invoke("ping", new Uint8Array(), key);
+    assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
+    assert(!realms[1].disposed, "…which is the one left standing");
+
+    // Past the 5ms deadline both realms armed. Only the standing one may hear it: a
+    // `timer` turn in realms[0] is the superseded guest still executing.
+    await new Promise((r) => setTimeout(r, 60));
+    assert(!realms[0].calls.includes("timer"),
+      `the replaced guest ran no timer turn after the upgrade (ran: ${realms[0].calls.join(",")})`);
+    assert(realms[1].calls.includes("timer"), "…while the standing guest's own deadline still fires");
+  } finally {
+    shell.close();
+  }
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
@@ -2389,5 +2457,6 @@ await testWrongTypedStoreIsRefused();
 await testAppNameLengthRefused();
 await testPersistFailureRollsBack();
 await testFailedRevokePersistRollsBack();
+await testInPlaceUpgradeReleasesTheOldSlot();
 
 summary("Results");

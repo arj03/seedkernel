@@ -119,7 +119,7 @@ async function request(shell, to, payload) {
   return appRequest(shell, appKey, to, payload);
 }
 
-async function makeNode(channels, listen) {
+async function makeNode(channels, listen, freshnessStore = new FreshnessMarks()) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, upgradeAuthor, appAuthorHex],
@@ -129,7 +129,7 @@ async function makeNode(channels, listen) {
     platform: {
       sodium, identity,
       table: new ModuleTable(),
-      freshnessStore: new FreshnessMarks(),
+      freshnessStore,
       channels, listen,
       createRealm: async (o) => createSafeRealm(o),
     },
@@ -225,6 +225,43 @@ try { await a.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what loaded");
 assert(a.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds the transport id again");
+
+// ── A mark that cannot be written is a failed transport load ─────────────────────
+//
+// The transport's mark is DEFERRED to the shell (bundle.ts `deferMark`), so it is raised
+// after the realm stands rather than inside installBundle — which is also outside the
+// rollback installBundle does for every other app. A write that fails there used to
+// throw raw: the caller was told the load failed while the node was already serving the
+// new guest, and the disk mark stayed at the version it had, so the next boot re-admitted
+// the bundle this one replaced. A failed persist keeps nothing, here as everywhere (§12.4).
+console.log("  a transport mark that cannot be persisted fails the load…");
+{
+  let broken = false;
+  class FlakyStore extends FreshnessMarks {
+    persist(json) { if (broken) throw new Error("disk full"); super.persist(json); }
+  }
+  const store = new FlakyStore();
+  const c = await makeNode(fabric.view(), undefined, store);
+  assert(c.resolve(NET_PROTOCOL) !== null, "the node stands its transport up normally");
+
+  broken = true;
+  let msg = "";
+  try { await c.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch (e) { msg = e.message; }
+  assert(msg.includes("could not be persisted"), `a transport whose mark cannot be written fails the load (got: ${msg})`);
+  assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
+  assert(c.resolve(NET_PROTOCOL)?.startsWith(transportAuthor),
+    "nothing of the failed load was kept — the claim went back to the transport that was standing, " +
+    "rather than the uncommitted bundle serving on");
+
+  // The mark was rolled back, so the retry is a fresh advance and not a no-op against a
+  // store that never got the first one.
+  broken = false;
+  let reloaded = true;
+  try { await c.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch { reloaded = false; }
+  assert(reloaded, "the retry against a healthy store lands");
+  assert(store.get(upgrade.id, "transport") === 2, "…and the mark it persists is the one the failed load rolled back");
+  c.close();
+}
 
 a.close();
 b.close();

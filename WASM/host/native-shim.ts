@@ -355,13 +355,15 @@ class NativeFreshnessStore extends FreshnessMarks {
         this.path = path;
     }
     persist(json: string) {
-        // Logged, not fatal: the in-memory mark still guards the running process, and
-        // only the NEXT boot would be unprotected — which the operator must see.
         if (this.path === null) return;
+        // Fatal, and deliberately so: `FreshnessMarks` treats a throw from here as the
+        // signal that the write did not land, and that is what rolls a revocation back
+        // (so the retry is not a silent no-op) and un-binds a load whose mark could not
+        // be raised. Swallowing the error would report both as successes while the next
+        // boot re-admits the revoked author and re-opens the downgrade gate.
         // 0600: the marks are a node's own downgrade guard, not something a co-tenant
         // reads. (The freshness file predates this seam at exactly this mode.)
-        try { bridge.writeFile(this.path, utf8.encode(json), 0o600); }
-        catch (err) { bridge.log(`seedkernel: could not persist freshness marks to ${this.path}: ${errMessage(err)}`); }
+        bridge.writeFile(this.path, utf8.encode(json), 0o600);
     }
 }
 /** Say which codec a Go socket carries. The bytes are Go's; the boundaries are the

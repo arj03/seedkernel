@@ -963,6 +963,13 @@ export function createShell(opts: CreateShellOptions & {
                 isTransport,
             });
             slot.entry = entryFor(slot);
+            // Re-installing the same (author, app) — an in-place upgrade — replaces the
+            // map entry, and the slot it replaces is a teardown like any other: its realm
+            // and its armed deadlines belong to a version that is no longer routed. Left
+            // alive, its `RealmTimers` keep firing into the OLD realm (the holder's
+            // callbacks read `slot.realm`, which is still there), so a superseded guest
+            // goes on running `timer` turns and re-arming more of them.
+            disposeSlot(apps.get(key));
             apps.set(key, slot);
             // The load admits the code AND claims the manifest's protocols (§12.10) — one
             // act, because they were always one intent: nothing installs an app it does not
@@ -984,7 +991,24 @@ export function createShell(opts: CreateShellOptions & {
                     doUninstall(key);
                     throw err;
                 }
-                platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
+                // Same rule as the mark `installBundle` writes for an app: a persist that
+                // FAILS is a failed load. The mark was deferred to here, so nothing has
+                // written it yet — roll the in-memory advance back and take the transport
+                // out, or the caller is told the load failed while the node serves the
+                // uncommitted bundle and the next boot re-admits the version it replaced.
+                const prev = platform.freshnessStore.get(loaded.author, loaded.manifest.app);
+                try {
+                    platform.freshnessStore.set(loaded.author, loaded.manifest.app, v.manifest.version);
+                }
+                catch (e) {
+                    platform.freshnessStore.resetMark?.(loaded.author, loaded.manifest.app, prev);
+                    doUninstall(key);
+                    throw new Error(
+                        `shell: the transport load succeeded but the freshness mark could not be persisted — nothing of it was kept: ${errMessage(e)}. ` +
+                        "Fix the store and re-run the load.",
+                        { cause: e },
+                    );
+                }
             }
             // An app's marks were already advanced inside installBundle — nothing can fail
             // between that return and here.
