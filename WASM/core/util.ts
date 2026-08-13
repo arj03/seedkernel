@@ -20,6 +20,21 @@ export function fromHex(hex: string): Uint8Array {
   return out;
 }
 
+/** Whether a string is 32 bytes as lowercase hex — the shape of every key and secret
+ *  an operator types. Worth checking because `fromHex` maps a non-hex pair to 0, so an
+ *  unvalidated decode turns a typo into a different-but-plausible 32 bytes.
+ *
+ *  A manual scan rather than a regex literal, so it stays safe under the minifier
+ *  (scripts/minify.mjs), which has no lexer to tell a regex from a division. */
+export function isHex64(s: string): boolean {
+  if (s.length !== 64) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false; // 0-9 / a-f
+  }
+  return true;
+}
+
 export function concatBytes(parts: Uint8Array[]): Uint8Array {
   let total = 0;
   for (const p of parts) total += p.length;

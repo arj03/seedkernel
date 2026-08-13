@@ -10,7 +10,7 @@
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
 import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
 import { parseWsPeer } from "../build/host/net-ws.js";
-import { parsePeerSpec } from "../build/host/transport-host.js";
+import { parsePeerSpec } from "../build/host/net-node.js";
 import { testkit } from "./testkit.mjs";
 
 const { test, assert, summary } = testkit();

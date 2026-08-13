@@ -231,8 +231,8 @@ export interface GuestSeamDeps {
 /** What the seam IS — the host half of `host.call`, and what `createGuestSeam` below
  *  returns. `name` addresses a host capability by its opaque name; `payload` and the
  *  return are opaque bytes, exactly like the table's `callModule(name, payload) -> bytes`.
- *  A sync name returns bytes directly; a round-tripping one — `net/send` and every
- *  `fs/*` — returns a Promise the guest awaits (§12.2).
+ *  A sync name returns bytes directly; a round-tripping one — every `fs/*`, and every
+ *  cross-realm `_`-prefixed id — returns a Promise the guest awaits (§12.2).
  *
  *  It is declared HERE, beside the names it can carry, rather than in the realm that
  *  runs against it: a realm factory (safe-js.ts, native-shim.ts) is a *consumer* of the
@@ -275,7 +275,7 @@ const HANDLER_KEYS: readonly string[] = [
     ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
 ];
 /** One catalog entry's implementation: argument bytes in, response bytes out (or a
- *  Promise of them, for the round-tripping `net/send` and `fs/*` names). */
+ *  Promise of them, for the round-tripping `fs/*` names). */
 type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 /** The primitive half of the catalog (§12.1): a flat name→transform map. Every entry
  *  is a pure function of its argument bytes — no host key, no entropy, no state — so
@@ -406,14 +406,14 @@ globalThis.__netReject = (callId, msg) => {
   p.reject(new Error(msg));
 };
 globalThis.host = {
-  // A sync name resolves to its bytes directly; a net or fs name returns a real Promise,
-  // so a guest's 'await host.call(...)' covers both (awaiting a plain value is a no-op)
-  // and a fan-out is just 'await Promise.all(peers.map(p => host.call("net/send", ...)))'.
-  // The name is the seam: a guest asks for a capability by NAME — "fs/get",
-  // "net/send", "crypto/blake2b-256" — never by a number. A name with no "/" is one of
-  // the bundle's OWN modules, called by the logical name its manifest declared ("ws",
-  // "codec"): one call shape over host primitives, host authorities and app modules,
-  // because a module name cannot spell a host name (§12.2).
+  // A sync name resolves to its bytes directly; an fs name or a cross-realm call returns
+  // a real Promise, so a guest's 'await host.call(...)' covers both (awaiting a plain
+  // value is a no-op) and a fan-out is just 'await Promise.all(keys.map(k =>
+  // host.call("fs/get", k)))'. The name is the seam: a guest asks for a capability by
+  // NAME — "fs/get", "link/send", "crypto/blake2b-256" — never by a number. A name
+  // with no "/" is one of the bundle's OWN modules, called by the logical name its
+  // manifest declared ("ws", "codec"): one call shape over host primitives, host
+  // authorities and app modules, because a module name cannot spell a host name (§12.2).
   //
   // The payload is normalized to a plain ArrayBuffer — never a view — because that is the
   // narrower of the two hosts' readers: the native loader reads a view or a buffer alike,
@@ -855,9 +855,9 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     return handlers;
 }
 /** Wire the one `host.call` implementation a realm runs against. Most names resolve
- *  *synchronously* (returns bytes); the ones that genuinely round-trip — `net/send` and
- *  every `fs/*` — return a Promise the guest `await`s. Which side of that line a name
- *  sits on is the ABI (§12.2), which is what `guest.abi` versions.
+ *  *synchronously* (returns bytes); the ones that genuinely round-trip — every `fs/*`,
+ *  and a cross-realm call — return a Promise the guest `await`s. Which side of that
+ *  line a name sits on is the ABI (§12.2), which is what `guest.abi` versions.
  *
  *  One seam serves both roles. The **holder** path awaits like the initiator does — it
  *  answers from local fs, and fs is not answerable in the same turn on a target whose

@@ -10,9 +10,9 @@
 //
 // Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
 // `host.call(name, bytes)` resolves a **sync name** (the primitive catalog, clock,
-// module, the raw-link and transport names) to its bytes immediately, and a
-// **round-tripping name** — `net/send` and every `fs/*` — to a real Promise the guest
-// `await`s. The guest builds that Promise itself (the shared preamble parks it under a
+// timers, the raw-link names, a bundle's own modules) to its bytes immediately, and a
+// **round-tripping name** — every `fs/*`, and a cross-realm call — to a real Promise
+// the guest `await`s. It builds that Promise itself (the shared preamble parks it under a
 // `callId`); this host returns `null` to say "started async", then settles it with
 // `__netResolve`/`__netReject` and pumps `executePendingJobs()` so the awaiting
 // continuation runs. Deliberately NOT

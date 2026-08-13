@@ -15,7 +15,8 @@
 
 import type { PeerId } from "../core/socket-seam.js";
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { parsePeerRef, type TransportHost, type LinkHandle } from "./transport-host.js";
+import { parsePeerRef } from "./cli.js";
+import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
  *  this module type-checks without committing to a DOM lib and accepts any
@@ -134,7 +135,7 @@ export class WsNetwork extends SingleIdentityNetwork {
  *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
  *  ws:// scheme; pass wss:// explicitly for TLS.
  *
- *  Who the peer is comes from `parsePeerRef` (transport-host.ts) — the one place that
+ *  Who the peer is comes from `parsePeerRef` (cli.ts) — the one place that
  *  grammar is written. This edge's own address form is a URL rather than a host:port,
  *  which is the only reason a second entry point exists. */
 export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {

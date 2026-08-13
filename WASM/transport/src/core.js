@@ -370,8 +370,7 @@ register("handle", (argBytes) => {
   // re-key the node; one that could spell `linkBytes` could inject a frame on any link.
   // The caller id is the host's to write, so this is a real boundary and not a hint.
   //
-  // Two ops are an APP's to name, and they are the two that were app-facing names before
-  // this bundle existed: `send` (was `net/send`) and `peers` (was `net/peers`). Both are
+  // Two ops are an APP's to name: `send` and `peers`. Both are
   // questions about the app's own traffic rather than levers on the platform — `peers`
   // reads the authenticated set, which is what an app placing replicas has to know. The
   // rest stay the host's.
@@ -478,8 +477,7 @@ register("timer", (argBytes) => {
 });
 
 /** THE app-facing op — one of the two an app may name (`APP_OPS`). `[noReply u8][deadlineMs u32]
- *  [to blob][proto blob][payload blob]` in, `[ok u8][response]` out — the same answer
- *  shape the retired `net/send` name had, because it is the same question.
+ *  [to blob][proto blob][payload blob]` in, `[ok u8][response]` out.
  *
  *  `deadlineMs` 0 means the caller named none and takes the node's default. Resolving it
  *  here rather than host-side is not a move of policy: the default is a CONFIG value the
@@ -525,8 +523,7 @@ entry("ready", (r) => {
  *  in the same turn — it is a read of this heap, not a question about the wire.
  *
  *  An app's to name as well as the host's (`APP_OPS`): "who am I linked to" is what an
- *  app placing replicas across a cohort has to know, and it was an app-facing name
- *  (`net/peers`) before the transport became a bundle. */
+ *  app placing replicas across a cohort has to know. */
 entry("peers", () => {
   const out = [];
   for (const p of connected) out.push(fromHex(p));

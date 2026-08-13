@@ -89,12 +89,19 @@ function args(u32s, u8s, tail) {
 
 // ── inbound argument decoding ─────────────────────────────────────────────────
 
-// Each entrypoint declares its own fixed field order: u32 BE fields, then u8
-// fields, then length-prefixed blobs (`[len u32 BE][bytes]`, an empty blob being
-// length 0). There is no tag byte and no shared union — the entrypoint's NAME is
-// the discriminator, and it is the realm's, so there is no tag space to keep in
-// step and no unknown-tag case a decoder could desync on. The host twin is
-// transport-host.ts's `Args`.
+// Each op declares its own fixed field order — u32 BE, u8, and length-prefixed
+// blobs (`[len u32 BE][bytes]`, an empty blob being length 0) in whatever order
+// that op named them. There is no tag byte and no shared union: the op's NAME
+// leads the payload (`readOp`, after the 32-byte caller id) and is the whole
+// discriminator, so there is no tag space to keep in step and no unknown-tag case a
+// decoder could desync on.
+//
+// The host twin is transport-host.ts's `Args`, and the pair is deliberately not
+// factored into one shared source: this is a DECODER and that is an ENCODER, so
+// there is no common body to extract — only the three field shapes above, which
+// both sides state in about ten lines each. What keeps them honest is that a
+// mismatch is not subtle: a field written and not read (or read in the wrong
+// order) desyncs the whole payload, and every op-level test fails at once.
 function Reader(b) {
   this.b = b;
   this.off = 0;

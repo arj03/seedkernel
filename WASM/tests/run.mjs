@@ -589,13 +589,12 @@ async function testFsKeyRule() {
   console.log("  OK\n");
 }
 
-// ─── Test: guest-side net fan-out over net/send (Promise.all) ────────────
+// ─── Test: guest-side fan-out over the cross-realm call (Promise.all) ────────────
 //
-// Fan-out is no longer a host op: with real promises at the seam, a confined guest
-// scatters a DISTINCT request per peer itself with Promise.all over net/send and
-// gathers the responses. This is what NET_SEND_MANY used to do host-side. We drive
-// it through the seam's single-peer net/send name, concurrently, from an async
-// safe-js realm — proving the round trips genuinely overlap in one realm.
+// Fan-out is not a host op: with real promises at the seam, a confined guest scatters a
+// DISTINCT request per peer itself with Promise.all over `_net` and gathers the
+// responses. We drive it through the seam's single-peer cross-realm call, concurrently,
+// from an async safe-js realm — proving the round trips genuinely overlap in one realm.
 
 async function testGuestSeam() {
   console.log("Test: guest seam — generic primitive capabilities, no app vocabulary (step 7)");

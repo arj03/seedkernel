@@ -5,8 +5,7 @@
 // request/response layer — runs in the transport bundle's guest program, driven
 // by the shared TransportHost (transport-host.ts), which the shell stands up when
 // the transport bundle is loaded. This file is the socket seam's host half: the
-// factory the driver's DIAL actions and listeners go through, and the peer-spec
-// parsing for the CLI.
+// factory the driver's DIAL actions and listeners go through, and nothing else.
 //
 // WebSocket exists only because browsers cannot speak raw TCP, so it is handled as
 // a wire codec *over a raw TCP listener*: this file binds the listener and says which
@@ -18,7 +17,11 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
 
 
-export { parsePeerSpec } from "./transport-host.js";
+// The peer-spec grammar is the operator's (cli.ts), re-exported here because this is
+// the entry point a TCP consumer already imports — `./net-node` is where a caller with
+// a `pk[.secret]@host:port` string in hand looks for the parser.
+export { parsePeerSpec, parsePeerRef, parseHostPort } from "./cli.js";
+export { isHex64 } from "../core/util.js";
 // ── An unframed RawLink over a node:net socket ────────────────────────────────
 // Raw bytes in and out, no boundaries: node↔node TCP is handed to the transport
 // bundle exactly like this, and a WS link is the same socket with a different codec

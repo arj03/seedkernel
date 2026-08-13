@@ -82,7 +82,7 @@ export interface BundleGuest {
      *  who meant the old one. There is nothing to infer here, so the format asks. */
     abi: number;
     /** EXACTLY the authorities this guest is granted (`AUTHORITY_CALLS`, core/domains.ts):
-     *  `node/sign`, `fs/get`, `net/send`, … — each name enforced at the seam by exact
+     *  `node/sign`, `fs/get`, `link/send`, … — each name enforced at the seam by exact
      *  match, so a guest reaches what its bundle declared and nothing beside it. Required
      *  whenever a guest exists; an empty array is a guest with no authority at all, which
      *  is the common case and reads as one.

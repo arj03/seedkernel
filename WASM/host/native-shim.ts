@@ -19,7 +19,7 @@
 // in a hand-written second assembly is a compile error.
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
-import { runCli, loadedLine, type CliHost, type NodeSetup } from "./cli.js";
+import { runCli, loadedLine, parsePeerSpec, type CliHost, type NodeSetup } from "./cli.js";
 import {
   createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
@@ -29,7 +29,6 @@ import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
-import { parsePeerSpec } from "./transport-host.js";
 import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
 import { isAdmissionRejected } from "./shell-core.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —

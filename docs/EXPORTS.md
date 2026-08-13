@@ -12,7 +12,7 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 | `./transport-host` | ✓ | |
 | `./transport-bundle` | ✓ | ✓ |
 | `./fs`, `./fs-memory`, `./fs-node` | ✓ | |
-| `./net`, `./net-node`, `./net-ws` | ✓ | |
+| `./net-node`, `./net-ws` | ✓ | |
 | `./net-rtc` | ✓ (browser **and** console) | ✓ |
 | `./net-rtc-node` | ✓ | |
 | `./pq` | ✓ | ✓ |

@@ -44,73 +44,6 @@ import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.j
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { opHeader, type RawNet } from "./guest-seam.js";
 
-/** 32-byte lowercase hex. A manual scan rather than a regex literal, so it stays safe
- *  under the minifier (scripts/minify.mjs), which has no lexer to tell a regex from a
- *  division. */
-export function isHex64(s: string): boolean {
-  if (s.length !== 64) return false;
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102))) return false; // 0-9 / a-f
-  }
-  return true;
-}
-
-/** The credential half of a peer spec — `pk[.secret]` — plus whatever followed the `@`.
- *
- *  `pk` names WHO lives there and keys the address book; the optional `.secret` is THAT
- *  PEER's contact secret, which is what makes an address a credential rather than merely
- *  a location. They do different jobs: the pk is routing, the secret is the gate our
- *  opening message must be sealed under.
- *
- *  **The grammar is written once.** Where a peer LIVES differs by transport — a
- *  `host:port` to dial, a whole `ws://` URL for the browser edge — but who they are does
- *  not. `location` comes back unparsed, so each caller reads its own address form out of
- *  it and nothing else is duplicated.
- *
- *  Host code, with the driver that consumes what it produces: every check here is a
- *  syntax check, so nothing about admission or trust would change if a target hand-rolled
- *  its own parser and never called this. */
-export function parsePeerRef(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; location: string } {
-  const at = spec.indexOf("@");
-  if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@location): ${spec}`);
-  const idPart = spec.slice(0, at).trim().toLowerCase();
-  const dot = idPart.indexOf(".");
-  const peerId = dot < 0 ? idPart : idPart.slice(0, dot);
-  if (!isHex64(peerId)) throw new Error(`bad peer pubkey hex (want 32 bytes): ${spec}`);
-  let contactSecret: Uint8Array | undefined;
-  if (dot >= 0) {
-    const hex = idPart.slice(dot + 1);
-    if (!isHex64(hex)) throw new Error(`bad peer contact secret hex (want 32 bytes): ${spec}`);
-    contactSecret = fromHex(hex);
-  }
-  return { peerId, contactSecret, location: spec.slice(at + 1).trim() };
-}
-
-/** Split a `host:port` address. The strict form (the default) is a peer dial
- *  address: an explicit host and a port in 1..65535. `defaultHost` fills an empty
- *  host (a bare `:port`), and `allowEphemeral` permits port 0 (ask the OS) — the
- *  two relaxations the operator's `--listen`/`--ws-listen` forms need. */
-export function parseHostPort(s: string, opts: { defaultHost?: string; allowEphemeral?: boolean } = {}): { host: string; port: number } {
-  const colon = s.lastIndexOf(":");
-  if (colon < 0) throw new Error(`expected host:port, got ${s}`);
-  const host = s.slice(0, colon) || (opts.defaultHost ?? "");
-  const port = Number(s.slice(colon + 1));
-  // Bounded, not merely positive: a port outside the 16-bit range names nothing, and
-  // learning that at connect time makes a typo look like an unreachable peer.
-  if (!Number.isInteger(port) || port < (opts.allowEphemeral ? 0 : 1) || port > 65535) throw new Error(`bad port in ${s}`);
-  if (!host) throw new Error(`bad host in ${s}`);
-  return { host, port };
-}
-
-/** Parse a `pk[.secret]@host:port` peer spec into the peer id + the address to dial:
- *  the socket-seam form (`PeerAddr`), for a target that opens its own TCP/WS sockets. */
-export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
-  const { peerId, contactSecret, location } = parsePeerRef(spec);
-  const { host, port } = parseHostPort(location);
-  return { peerId, addr: { host, port, transport, contactSecret } };
-}
-
 /** Kinds of link, as the `linkOpen` op declares them: CORE is the routing core's own
  *  (accepted through the channel factory, dial bookkeeping and the half-open limiter
  *  apply); OPEN is a host-managed transport — WebRTC, browser WS — that opened the
@@ -171,7 +104,12 @@ function hostOpHeader(op: string): Uint8Array {
 /** Op-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
  *  length-prefixed blob, in the fixed order the op declares. The op's NAME is the
  *  discriminator and it is the FIRST thing encoded, so nothing here is a number the two
- *  sides have to agree on. */
+ *  sides have to agree on.
+ *
+ *  The guest twin is `Reader` (transport/src/util.js) — an encoder and a decoder over the
+ *  same three field shapes, not one body written twice, so there is nothing to factor
+ *  out. A field written and not read (or read out of order) desyncs the payload rather
+ *  than degrading quietly, which is what makes the pair testable at all. */
 class Args {
   /** The op this payload is for, or `""` for a nested list that is somebody's blob.
    *  Read back for diagnostics — a failed op reports by name (`tell`). */
