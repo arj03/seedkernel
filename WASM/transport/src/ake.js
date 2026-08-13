@@ -242,6 +242,10 @@ function scalarmult(sk, pk) {
   const out = new Uint8Array(64);
   out.set(sk, 0); out.set(pk, 32);
   const r = host.call(P_DH, out);
+  // The argument buffer held a COPY of the private scalar. Erasing the key on the
+  // link (Link.clearEphemeral) is worth nothing if the call that used it leaves a
+  // second copy on the heap for a memory-image attacker to find.
+  out.fill(0);
   return r[0] === 1 ? { ok: true, x: r.subarray(1) } : { ok: false, x: null };
 }
 /** An ephemeral X25519 pair: entropy from the host (an authority), the public half
@@ -815,8 +819,42 @@ class Link {
     const kR2I = this.kdf([this.ee], this.th, LABEL_R2I);
     this.sendKey = this.weDialed ? kI2R : kR2I;
     this.recvKey = this.weDialed ? kR2I : kI2R;
-    this.ee.fill(0);
-    this.ee = null;
+    // The session exists, so every input that produced it is now dead weight that can
+    // only ever be used to RE-derive it — the point at which forward secrecy is either
+    // real or a claim. See clearEphemeral.
+    this.clearEphemeral();
+  }
+
+  /** Erase the handshake's private material: the X25519 ephemeral SECRET, the shared
+   *  point it produced, and our nonce.
+   *
+   *  Forward secrecy is the whole reason the handshake is ephemeral, and it is a
+   *  property of what is IN MEMORY, not of what is on the wire: an attacker who reads
+   *  this process — a core dump, a swapped page, a co-resident read of the heap — and
+   *  finds the ephemeral secret recomputes `ee` against the peer's public ephemeral
+   *  (which is on the wire in clear), re-runs the same KDF over the transcript, and
+   *  decrypts every record the link ever carried. Keeping the secret alive for the
+   *  lifetime of the link would make the ephemeral key exactly as valuable as a
+   *  long-term one, for as long as the link lasts.
+   *
+   *  Called at BOTH ends of the handshake's life: the moment the session keys exist
+   *  (the earliest point nothing needs these again — the common case), and again at
+   *  teardown, which is what covers a link that DIED mid-handshake and is precisely
+   *  when the material is otherwise still live. `myEph` is dropped, not just zeroed:
+   *  the wipe would otherwise leave a keypair whose secret is all zeroes, which
+   *  `ensureKeys` would treat as a key it had already generated.
+   *
+   *  The wipes are what this module can do; it cannot promise the engine kept no copy
+   *  (a GC that moved the buffer). What it can promise is that no live reference holds
+   *  the plaintext key, which is the difference between "recoverable" and "recoverable
+   *  only from a collected page". */
+  clearEphemeral() {
+    if (this.myEph) {
+      this.myEph.privateKey.fill(0); // the secret half only — the public one was on the wire
+      this.myEph = null;
+    }
+    if (this.myNonce) { this.myNonce.fill(0); this.myNonce = null; }
+    if (this.ee) { this.ee.fill(0); this.ee = null; }
   }
 
   // A 12-byte nonce from the implicit (epoch, counter) pair — never transmitted.
@@ -886,8 +924,10 @@ class Link {
     if (this.recvKey) this.recvKey.fill(0);
     this.sendKey = null;
     this.recvKey = null;
-    if (this.ee) this.ee.fill(0);
-    this.ee = null;
+    // The handshake's own material, for the link that never got as far as a session:
+    // a link torn down mid-handshake is exactly the case where the ephemeral secret and
+    // the nonce are still live (clearEphemeral).
+    this.clearEphemeral();
   }
 
   releaseSlot() {
