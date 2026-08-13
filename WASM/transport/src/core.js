@@ -33,7 +33,11 @@ let maxFrameBytes = 2 * 1024 * 1024;
 // byte duplex and we are the ones imposing boundaries on it. The number is still the
 // host's: whoever owns the resource declares the bound, whoever parses applies it.
 let maxHandshakeFrameBytes = 8 * 1024;
-let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256;
+let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256, maxAuthed = 256;
+// How long an AUTHENTICATED link may carry no traffic in either direction before it is
+// retired, learned at init from the same place as the budgets above — the socket is the
+// host's, so how long an idle one may be held is the host's number too. 0 disables it.
+let linkIdleTimeoutMs = 0;
 
 // The one router and the one request/response layer per host instance.
 let router = null;
@@ -50,68 +54,88 @@ const deferQueue = [];
 // Host-managed (openLink) links by id — the pre-auth ones are in no pool.
 const openLinks = new Map();
 
-// The half-open limiter (ex net-link.ts HalfOpenLimiter). The budgets come from
-// EVT_INIT — a module does not declare the numbers that bound it either.
-class HalfOpenLimiter {
-  constructor(maxUnverified, maxPerSource, maxVerified) {
-    this.maxUnverified = maxUnverified;
+// The link limiter (ex net-link.ts HalfOpenLimiter). The budgets come from EVT_INIT — a
+// module does not declare the numbers that bound it either.
+//
+// THREE tiers, not two, and the third is what makes it a link budget rather than a
+// half-open one: a slot is acquired when a socket is accepted, moves to `verified` when a
+// msg1 opens under the contact secret, and moves again to `authed` when the peer's
+// identity is proved and admitted — where it is HELD for the link's whole life. It used
+// to be released at that point, which bounded only how many peers could be *getting in*
+// at once: past the door, anyone who could complete a handshake could open links without
+// limit, each holding a framer, session keys, timers and buffers.
+//
+// Each tier evicts its own stalest occupant when full, so a newcomer that has proved more
+// than the incumbents is never refused at the door — the property `transport-load` pins.
+// Per-source is deliberately not evictable and now spans all three tiers: one address
+// gets `maxPerSource` links, not `maxPerSource` handshakes and then as many as it likes.
+class LinkLimiter {
+  constructor(maxUnverified, maxPerSource, maxVerified, maxAuthed) {
     this.maxPerSource = maxPerSource;
-    this.maxVerified = maxVerified;
-    this.unverifiedCount = 0;
-    this.verifiedCount = 0;
+    this.max = { unverified: maxUnverified, verified: maxVerified, authed: maxAuthed };
+    this.count = { unverified: 0, verified: 0, authed: 0 };
+    // One book per tier; insertion order is the eviction policy.
+    this.books = { unverified: new Map(), verified: new Map(), authed: new Map() };
     this.nextId = 0;
     this.perSource = new Map();
-    this.waiting = new Map();    // insertion order is the eviction policy
-    this.promoting = new Map();
   }
 
   acquire(source, evict) {
     if (source !== undefined && (this.perSource.get(source) || 0) >= this.maxPerSource) return null;
-    if (this.unverifiedCount >= this.maxUnverified) {
-      const oldest = this.waiting.keys().next();
-      if (oldest.done) return null;
-      const victim = this.waiting.get(oldest.value);
-      this.waiting.delete(oldest.value);
-      this.forget(victim);
-      try { victim.evict(); } catch { /* already gone */ }
-    }
+    if (!this.makeRoom("unverified")) return null;
     const slot = { source, tier: "unverified", released: false, evict, limiter: this };
     if (source !== undefined) this.perSource.set(source, (this.perSource.get(source) || 0) + 1);
-    this.unverifiedCount++;
-    this.waiting.set(this.nextId++, slot);
+    this.count.unverified++;
+    this.books.unverified.set(this.nextId++, slot);
     return slot;
   }
 
-  promote(slot) {
-    if (slot.released || slot.tier === "verified") return true;
-    if (this.verifiedCount >= this.maxVerified) {
-      const oldest = this.promoting.keys().next();
-      if (oldest.done) return false;
-      const victim = this.promoting.get(oldest.value);
-      this.promoting.delete(oldest.value);
-      this.forget(victim);
-      try { victim.evict(); } catch { /* already gone */ }
-    }
-    for (const [id, s] of this.waiting) if (s === slot) { this.waiting.delete(id); break; }
-    if (this.unverifiedCount > 0) this.unverifiedCount--;
-    this.verifiedCount++;
-    slot.tier = "verified";
-    this.promoting.set(this.nextId++, slot);
+  /** A msg1 opened under the contact secret: off the contended budget, before the
+   *  expensive work. */
+  promote(slot) { return this.move(slot, "verified"); }
+
+  /** The identity is proved and admitted. The slot stays until the link dies. */
+  hold(slot) { return this.move(slot, "authed"); }
+
+  move(slot, tier) {
+    if (slot.released || slot.tier === tier) return true;
+    if (!this.makeRoom(tier)) return false;
+    this.unbook(slot);
+    if (this.count[slot.tier] > 0) this.count[slot.tier]--;
+    slot.tier = tier;
+    this.count[tier]++;
+    this.books[tier].set(this.nextId++, slot);
+    return true;
+  }
+
+  /** Make one slot's worth of room in a tier, evicting its stalest occupant if it is
+   *  full. False only when the tier's budget is zero — nothing to evict and no room. */
+  makeRoom(tier) {
+    if (this.count[tier] < this.max[tier]) return true;
+    const oldest = this.books[tier].keys().next();
+    if (oldest.done) return false;
+    const victim = this.books[tier].get(oldest.value);
+    this.books[tier].delete(oldest.value);
+    this.forget(victim);
+    try { victim.evict(); } catch { /* already gone */ }
     return true;
   }
 
   release(slot) {
     if (slot.released) return;
-    const book = slot.tier === "verified" ? this.promoting : this.waiting;
-    for (const [id, s] of book) if (s === slot) { book.delete(id); break; }
+    this.unbook(slot);
     this.forget(slot);
+  }
+
+  unbook(slot) {
+    const book = this.books[slot.tier];
+    for (const [id, s] of book) if (s === slot) { book.delete(id); break; }
   }
 
   forget(slot) {
     if (slot.released) return;
     slot.released = true;
-    if (slot.tier === "verified") { if (this.verifiedCount > 0) this.verifiedCount--; }
-    else if (this.unverifiedCount > 0) this.unverifiedCount--;
+    if (this.count[slot.tier] > 0) this.count[slot.tier]--;
     if (slot.source === undefined) return;
     const n = this.perSource.get(slot.source);
     if (n === undefined) return;
@@ -127,7 +151,7 @@ class Core {
     this.inbound = new Set();    // accepted, pre-auth
     this.addrs = new Map();      // peerId → 32B contact secret (or null = open)
     this.readyWaiters = [];      // [{check, d, timer}] — one per in-flight ready()
-    this.halfOpen = new HalfOpenLimiter(maxUnverified, maxPerSource, maxVerified);
+    this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
   static push(m, peerId, link) {
@@ -283,7 +307,9 @@ function init(cfg) {
   maxUnverified = cfg.maxUnverified;
   maxPerSource = cfg.maxPerSource;
   maxVerified = cfg.maxVerified;
+  maxAuthed = cfg.maxAuthed;
   requestDeadlineMs = cfg.requestDeadlineMs;
+  linkIdleTimeoutMs = cfg.linkIdleTimeoutMs;
   // An empty list means "admit everyone", said as a zero-length blob rather than a
   // missing field — one shape to read.
   admitPeers = cfg.admitPeers.length > 0 ? new Set(cfg.admitPeers) : null;
@@ -393,10 +419,11 @@ entry("init", (r) => {
   const cfg = {
     ownPk: r.blob(), networkKey: r.blob(), contactSecret: r.blob(),
     connsPerPeer: r.u32(),
-    maxUnverified: r.u32(), maxPerSource: r.u32(), maxVerified: r.u32(),
+    maxUnverified: r.u32(), maxPerSource: r.u32(), maxVerified: r.u32(), maxAuthed: r.u32(),
     maxFrameBytes: r.u32(),
     maxHandshakeFrameBytes: r.u32(),
     requestDeadlineMs: r.u32(),
+    linkIdleTimeoutMs: r.u32(),
     admitPeers: [],
   };
   const list = new Reader(r.blob());
@@ -430,7 +457,7 @@ entry("linkOpen", (r) => {
   };
   if (kind === LINK_CORE) {
     // Only an accept spends half-open budget; a dial is our own decision to make.
-    spec.limiter = weDialed ? null : core.halfOpen;
+    spec.limiter = weDialed ? null : core.limiter;
     spec.dialedPeerId = weDialed ? toHex(expectPeerId) : null;
     core.openLink(spec);
     return;
@@ -494,9 +521,25 @@ register("timer", (argBytes) => {
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
   const deadlineMs = r.u32() || requestDeadlineMs;
+  // `blob` is a VIEW of the caller's argument bytes; `.slice()` below is the first copy.
   const to = r.blob();
-  const proto = r.blob().slice();
-  const payload = r.blob().slice();
+  const protoIn = r.blob();
+  const payloadIn = r.blob();
+  // Measured BEFORE anything is copied, which is the whole point of doing it here. What
+  // follows hexes `to`, slices both bodies, and builds a request frame out of them —
+  // three copies of the caller's argument — and only then would the record layer drop the
+  // frame for being over the cap. A co-resident app naming a 50 MiB payload would take
+  // this realm down before the frame it was refused for was ever built.
+  //
+  // A caller error, so it is LOUD: the app's `_net` call rejects by name. The silent drop
+  // in Link.send is for a frame we chose to build, not for one an app asked for.
+  if (to.length !== PK_LEN) throw new Error("transport: send needs a 32-byte peer id");
+  if (protoIn.length > 0xff) throw new Error("transport: protocol id too long");
+  if (REQ_HEAD_LEN + protoIn.length + payloadIn.length > maxFrameBytes - TAG_LEN) {
+    throw new Error("transport: send over the frame cap");
+  }
+  const proto = protoIn.slice();
+  const payload = payloadIn.slice();
   if (noReply) {
     reqres.request(null, toHex(to), proto, payload, true, 0);
     return Uint8Array.from([1]);

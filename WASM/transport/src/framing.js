@@ -20,19 +20,55 @@
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
 // A link message may arrive in arbitrary slices, and the slices can be arbitrarily
-// small. The old arrangement joined every new slice onto one buffer, which made a
-// peer that dribbles a full-size frame one byte at a time cost a quadratic number of
-// copies — a CPU-exhaustion budget no frame-size cap controls. The parser instead
-// keeps the slices it was handed and copies only when a whole message is complete:
-// once per frame, bounded by the cap that already governs the frame.
+// small. Two failure modes bound the design, and either naive parser walks into one:
+//
+//   join every slice onto one buffer — a peer that dribbles a full-size frame one byte
+//     at a time costs a quadratic number of copies, a CPU-exhaustion budget no
+//     frame-size cap controls.
+//   keep every slice as it arrived — the same dribble costs one view, and one pinned
+//     chunk buffer, PER BYTE: a 2 MiB frame held as ~2M views is two orders of magnitude
+//     over the cap that was supposed to bound it, times the half-open budget. That is a
+//     memory hole, and trading the copying one for it is no trade at all.
+//
+// So slices are kept, but a SMALL one is appended into a growable tail buffer whose
+// capacity doubles. Every byte then moves a constant number of times (amortized O(1),
+// as against the quadratic join), and the live slice count is bounded by
+// bytes/MERGE_BELOW rather than by however many segments the peer chose to send — so
+// the frame cap is once again the only thing that has to bound this buffer.
+const MERGE_BELOW = 8 * 1024;
+
 class ByteParts {
   constructor() {
     this.parts = [];   // inbound slices, not yet parsed
     this.head = 0;     // index of the first live slice
     this.length = 0;   // live bytes across all slices
+    this.tail = -1;    // index of the growable accumulator in `parts`, or -1 for none
   }
   push(chunk) {
-    if (chunk.length > 0) { this.parts.push(chunk); this.length += chunk.length; }
+    if (chunk.length === 0) return;
+    this.length += chunk.length;
+    // A slice big enough to carry its own overhead is kept exactly as it arrived, and
+    // ends the current accumulator — no copy at all on the path that matters.
+    if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
+    if (this.tail < 0) {
+      const buf = new Uint8Array(MERGE_BELOW);
+      buf.set(chunk, 0);
+      this.tail = this.parts.length;
+      this.parts.push(buf.subarray(0, chunk.length));
+      return;
+    }
+    const cur = this.parts[this.tail];
+    if (chunk.length <= cur.buffer.byteLength - cur.byteOffset - cur.length) {
+      const grown = new Uint8Array(cur.buffer, cur.byteOffset, cur.length + chunk.length);
+      grown.set(chunk, cur.length);
+      this.parts[this.tail] = grown;
+      return;
+    }
+    const want = cur.length + chunk.length;
+    const buf = new Uint8Array(want * 2); // doubling is what makes the copying amortized
+    buf.set(cur, 0);
+    buf.set(chunk, cur.length);
+    this.parts[this.tail] = buf.subarray(0, want);
   }
   /** Copy up to `n` bytes from the front without consuming them. */
   peek(n) {
@@ -53,14 +89,19 @@ class ByteParts {
     while (off < n) {
       const p = this.parts[this.head];
       const need = n - off;
-      if (p.length <= need) { out.set(p, off); off += p.length; this.head++; }
+      if (p.length <= need) { out.set(p, off); off += p.length; this.parts[this.head] = null; this.head++; }
       else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = n; }
     }
     this.length -= n;
-    // Drop the consumed slices once they outnumber the live ones — a long dribble
-    // must not grow the array without bound.
+    // The accumulator stops accumulating the moment it is consumed from: its start has
+    // moved, so the capacity behind it is no longer ours to append into. The next small
+    // slice opens a fresh one.
+    if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
+    // Drop the consumed slices once they outnumber the live ones — a long exchange must
+    // not grow the array without bound.
     if (this.head >= 8 && this.head * 2 >= this.parts.length) {
       this.parts = this.parts.slice(this.head);
+      if (this.tail >= 0) this.tail -= this.head;
       this.head = 0;
     }
     return out;

@@ -204,15 +204,21 @@ export interface CreateShellOptions {
      *  handing one to a callback whose argument is named `from: PeerId` would be the
      *  attribution rules quietly disagreeing. An app addresses an app. */
     answer?: (from: PeerId, proto: string, payload: Uint8Array) => Promise<Uint8Array> | null;
-    /** Half-open budgets for the transport slot: concurrent links that have not
-     *  yet proven their contact credential (unverified), per source address, and proven-
-     *  but-mid-handshake (verified). Defaults match the transport bundle's
-     *  (1024 / 8 / 256); tests shrink them. Enforced inside the transport guest. */
+    /** Link budgets for the transport slot: concurrent links that have not yet proven
+     *  their contact credential (unverified), per source address, proven-but-mid-handshake
+     *  (verified), and AUTHENTICATED (authed — the budget past the door, without which a
+     *  peer that completes handshakes holds links without limit). Defaults match the
+     *  transport bundle's (1024 / 8 / 256 / 256); tests shrink them. Enforced inside the
+     *  transport guest. */
     transportHalfOpen?: {
         unverified?: number;
         perSource?: number;
         verified?: number;
+        authed?: number;
     };
+    /** How long an authenticated link may carry no traffic before the transport retires
+     *  it (ms; 0 disables). Defaults to `DEFAULT_LINK_IDLE_TIMEOUT_MS`. */
+    linkIdleTimeoutMs?: number;
 }
 
 export interface Shell {
@@ -831,6 +837,8 @@ export function createShell(opts: CreateShellOptions & {
             maxHalfOpenUnverified: opts.transportHalfOpen?.unverified,
             maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
             maxHalfOpenVerified: opts.transportHalfOpen?.verified,
+            maxAuthedLinks: opts.transportHalfOpen?.authed,
+            linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
         });
         // Through the routing rather than at the realm directly, so the driver follows a
         // later claimant without being told about it.

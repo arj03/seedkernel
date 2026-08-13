@@ -95,6 +95,11 @@ class Router {
 
 // ── the request/response layer (ex net.ts Transport) ──────────────────────────
 
+/** A request frame's own head: `[kind u8][corr u32][protoLen u8]`. Named because the
+ *  `send` op measures a caller's arguments against the frame cap before copying them,
+ *  and what a request adds to a payload is this layer's business to say. */
+const REQ_HEAD_LEN = 1 + 4 + 1;
+
 // Correlation, the response binding, one deadline per request — and, since the corr
 // left the host, THE PROMISE TOO. An app's send arrives as an ordinary invocation of
 // `handle`, which answers with `defer()`: this layer holds the deferred, matches the
@@ -225,7 +230,7 @@ class ReqRes {
   }
 
   buildReq(corr, noReply, proto, payload) {
-    const frame = new Uint8Array(1 + 4 + 1 + proto.length + payload.length);
+    const frame = new Uint8Array(REQ_HEAD_LEN + proto.length + payload.length);
     frame[0] = noReply ? 0x80 : 0; // KIND_REQ | FLAG_NO_REPLY
     writeU32BE(frame, 1, corr);
     frame[5] = proto.length;

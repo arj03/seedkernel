@@ -410,6 +410,8 @@ class Link {
     this.aborted = false;
     this.slot = null;
     this.deadline = null;
+    this.idle = null;         // the post-auth idle clock (armIdle)
+    this.sawTraffic = false;  // ...and whether anything crossed since it last ticked
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -466,6 +468,31 @@ class Link {
     if (this.deadline !== null) { clearTimer(this.deadline); this.deadline = null; }
   }
 
+  /** The post-auth idle clock — the deadline the handshake one hands over to. An
+   *  authenticated link carrying no traffic in either direction is holding a socket, a
+   *  slot and a session for nothing, and a peer that opens links and then goes quiet is
+   *  the cheapest way to spend our budget. It is retired with the authenticated goodbye,
+   *  because it is our own deliberate shutdown and not a fault, and the address book
+   *  redials the moment anything is sent to that peer again.
+   *
+   *  Two ticks rather than a timestamp: a zero-authority realm has no clock, only
+   *  deadlines it arms, so "idle" is "a whole window passed with nothing seen". The
+   *  effective window is therefore between one and two `linkIdleTimeoutMs`. */
+  armIdle() {
+    if (linkIdleTimeoutMs <= 0) return;
+    this.sawTraffic = false;
+    this.idle = armTimer(linkIdleTimeoutMs, () => {
+      this.idle = null;
+      if (this.closed || !this.authed) return;
+      if (!this.sawTraffic) { this.close(); return; }
+      this.armIdle();
+    });
+  }
+
+  clearIdle() {
+    if (this.idle !== null) { clearTimer(this.idle); this.idle = null; }
+  }
+
   // Queue (pre-auth) or send (post-auth, as an AEAD record) a frame.
   send(frame) {
     if (this.closed) return;
@@ -478,6 +505,7 @@ class Link {
     if (frame.length === 0) return;
     if (this.authed) {
       if (this.sendEpoch >= REJECT_AFTER_EPOCHS) { this.close(); return; }
+      this.sawTraffic = true;
       this.wire(this.seal(frame));
       return;
     }
@@ -542,7 +570,17 @@ class Link {
    *  slice on an unframed one. An over-cap declaration is a protocol violation, so it
    *  is a defensive abort — no goodbye record, nothing said. */
   onWire(bytes) {
-    if (!this.framer) { this.onMessage(bytes); return; }
+    if (!this.framer) {
+      // A platform-framed link (a browser WebSocket, an RTCDataChannel) arrives with
+      // message boundaries already on it, so there is no reassembly buffer of OURS to
+      // bound — but the message is memory this realm holds either way, and the two-stage
+      // cap is about how much a peer may make us hold, not about who did the framing.
+      // Without this a browser-network peer sends one huge message and takes the realm
+      // down; the platform's own boundaries are not a bound.
+      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return; }
+      this.onMessage(bytes);
+      return;
+    }
     if (!this.framer.push(bytes, (m) => this.onMessage(m))) this.abort(true);
   }
 
@@ -566,10 +604,17 @@ class Link {
 
   becomeAuthed() {
     this.authed = true;
-    this.releaseSlot();
+    // The slot is NOT released here — it moves to the authed tier and is held until this
+    // link dies. Releasing it made the budget a bound on how many peers could be GETTING
+    // IN at once and nothing more: past the door, anyone able to complete a handshake
+    // could open links without limit, each with its own framer, keys, timers and
+    // buffers. A tier with no room at all (a zero budget) is a link we cannot keep.
+    if (this.slot && !this.slot.limiter.hold(this.slot)) { this.abort(); return; }
     this.clearDeadline();
-    // A known, admitted identity may send full-size frames; a stranger may not. On a
-    // platform-framed link there is no reassembly buffer of ours to bound.
+    this.armIdle();
+    // A known, admitted identity may send full-size frames; a stranger may not. A
+    // platform-framed link has no framer to raise — `authed` is what raises its cap, in
+    // onWire, and it was set above.
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
@@ -764,10 +809,15 @@ class Link {
   // or injection either way and the link goes down. This is the one receive path that
   // speaks: concealment is owed to strangers, and this peer proved who it is.
   onRecord(body) {
-    if (!this.recvKey || body.length < TAG_LEN) { this.abort(true); return; }
+    // A record is a frame plus its tag, and `send` refuses to build one over the cap — so
+    // a body above it is a peer's, and over-cap is a protocol violation like any other.
+    // Framed links have already been measured; this is the platform-framed one's floor,
+    // stated where the record layer can see it.
+    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
     if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
     const r = aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
     if (!r.ok) { this.abort(true); return; }
+    this.sawTraffic = true;
     // Advance only on success — a failed decrypt must never move the counter.
     if (++this.recvCtr >= this.rekeyAfter) {
       this.recvKey = this.ratchet(this.recvKey);
@@ -790,6 +840,7 @@ class Link {
 
   teardown() {
     this.clearDeadline();
+    this.clearIdle();
     this.releaseSlot();
     this.queue.length = 0;
     this.queuedBytes = 0;

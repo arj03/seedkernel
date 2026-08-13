@@ -364,7 +364,7 @@ The *guest's* §12.2 requires are **not** gated by this file — they come from 
 
 **Everything in this section is the transport bundle's guest program** (`transport/src/*.js`, §1) — the handshake, the record layer, the link router and the request/response frame codec — not host code. It reaches sockets through the `link/*` names and is reached through the reserved id it claims (§12.10), and the host side of that is one driver, `host/transport-host.ts`, which owns the channels by the link id it mints, the address book and the listeners, and knows no protocol. It holds no correlation table, no peer set and no request facade: those were the host standing between two guests, and they now live in the one heap that can see a link. Its deadlines are not its own: `timer/*` is an ordinary authority, so the transport arms them through the same per-realm timer table any app reaches (§12.3). What follows is therefore *content*: replaceable by a second signed bundle loaded the ordinary way (§12.4, §12.5), which is the property the rest of §12.6 exists to make safe.
 
-A real socket carries no trustworthy "from" field, so before a connection delivers frames the bundle runs a mutual challenge/response proving each end holds the private key for the pubkey it claims — the same binding applied to each WebRTC data channel (§11, §12.7). The channel is transport-agnostic over anything that delivers whole messages, and where the platform delivers none the bundle imposes them itself (§12.1): a length prefix over raw TCP node↔node, RFC 6455 over the same socket browser↔node, or a WebRTC `RTCDataChannel` peer↔peer as it comes (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Each framer checks its cap against the declared length **before** the body is buffered, so a peer cannot make a node allocate more than one frame. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). Every codec caps identically.
+A real socket carries no trustworthy "from" field, so before a connection delivers frames the bundle runs a mutual challenge/response proving each end holds the private key for the pubkey it claims — the same binding applied to each WebRTC data channel (§11, §12.7). The channel is transport-agnostic over anything that delivers whole messages, and where the platform delivers none the bundle imposes them itself (§12.1): a length prefix over raw TCP node↔node, RFC 6455 over the same socket browser↔node, or a WebRTC `RTCDataChannel` peer↔peer as it comes (`host/net-rtc.ts`, §12.7) — same handshake, same frame plane, only the bottom byte-pipe swaps. Each framer checks its cap against the declared length **before** the body is buffered, so a peer cannot make a node allocate more than one frame; a platform-framed link has no declaration to check, so the delivered message is measured against the same cap on arrival. That cap is `MAX_HANDSHAKE_FRAME_BYTES` until the link authenticates and `MAX_FRAME_BYTES` after (§12.6.2). Every codec caps identically, and the boundaries a platform supplied are not a bound.
 
 Four handshake messages, then records. **A message is a bare body — there is no type
 byte.**
@@ -481,19 +481,25 @@ behaviour lives in
 - **No cryptography before proof.** An accepting link generates its ephemeral keypair only
   once a msg1 opens; verifying msg1 is a hash and a Poly1305 check. A stranger costs a
   socket, a timer and no asymmetric operations.
-- **Two budgets.** `MAX_HALF_OPEN_UNVERIFIED` (1024) for callers that have not yet produced
-  the contact secret, `MAX_HALF_OPEN_VERIFIED` (256) for those that have. A link is promoted
-  between them the moment its msg1 opens.
-- **Both budgets evict the oldest; neither refuses the newest.** Refusing lets a saturating
+- **Three budgets.** `MAX_HALF_OPEN_UNVERIFIED` (1024) for callers that have not yet produced
+  the contact secret, `MAX_HALF_OPEN_VERIFIED` (256) for those that have, and
+  `MAX_AUTHED_LINKS` (256) for links that completed the handshake. A link moves up a tier
+  the moment its msg1 opens, and again when its identity is proved and admitted — where its
+  slot is **held for the link's life**. Releasing it there would bound only who was getting
+  in: past the door, anyone able to complete a handshake could hold links without limit.
+- **Every budget evicts the oldest; none refuses the newest.** Refusing lets a saturating
   flood turn arriving peers away *at the door*, before they can prove anything — promotion
   cannot rescue a connection that was never accepted. This applies to the verified tier
   too: otherwise anyone holding the contact secret could saturate it and lock members out.
 - **`MAX_HALF_OPEN_PER_SOURCE` (8) is not evictable.** One address at its own limit is
   refused outright, never allowed to push a different address out, so saturating the
-  unverified budget needs 128 distinct sources.
-- **Two deadlines.** `UNVERIFIED_TIMEOUT_MS` (2 s) until msg1 opens, `HANDSHAKE_TIMEOUT_MS`
-  (10 s) for the rest. Observing the longer one requires the contact secret, so the split
-  leaks nothing.
+  unverified budget needs 128 distinct sources. It spans all three tiers, so one address
+  gets eight *links*, not eight handshakes and then as many links as it likes.
+- **Three deadlines.** `UNVERIFIED_TIMEOUT_MS` (2 s) until msg1 opens, `HANDSHAKE_TIMEOUT_MS`
+  (10 s) for the rest, and `LINK_IDLE_TIMEOUT_MS` (5 min) after that — an authenticated link
+  carrying no traffic in either direction is retired with the authenticated goodbye, and the
+  address book redials on the next send. Observing the second requires the contact secret, so
+  the split leaks nothing.
 - **`MAX_HANDSHAKE_FRAME_BYTES` (8 KiB) caps inbound reassembly pre-auth**, raised to
   `MAX_FRAME_BYTES` by the bundle's own framer on authentication — both numbers stay the
   host's (`core/net-limits.ts`), learned at init, and what the occupant chooses is only

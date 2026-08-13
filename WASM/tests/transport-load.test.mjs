@@ -230,6 +230,29 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     "A MEMBER WAS LOCKED OUT by a saturated verified budget");
 });
 
+await test("the budget bounds links PAST the handshake, not just into it", async () => {
+  // The tiers above bound who is getting IN. The slot used to be released the moment a
+  // link authenticated, which meant anyone who could complete a handshake — every
+  // admitted peer, and on an open node every stranger — could then hold links without
+  // limit, each with its own framer, session keys, timers and buffers. The slot is now
+  // held for the link's life, in a third tier that evicts its stalest occupant like the
+  // other two: newcomers still get in, but the total stays bounded.
+  const AUTHED = 3;
+  const fabric = new LoopbackChannels();
+  const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
+  let everSaw = 0;
+  for (let i = 0; i < AUTHED * 3; i++) {
+    const m = keep(await member(fabric, s, `10.10.${i}.1`));
+    try { await m.driver.ready(4000); } catch { /* counted below */ }
+    if ((await m.driver.linkedPeers()).includes(s.driver.peerId)) everSaw++;
+    await sleep(30);
+  }
+  const held = (await s.driver.linkedPeers()).length;
+  note(`${AUTHED * 3} members authenticated against a ${AUTHED}-slot authed budget; ${held} link(s) held, ${everSaw} got in`);
+  assert(everSaw === AUTHED * 3, `${AUTHED * 3 - everSaw} member(s) refused at the door — the authed tier must evict, not refuse`);
+  assert(held <= AUTHED, `${held} authenticated links held against a budget of ${AUTHED}`);
+});
+
 await test("the per-source cap still bites under flood", async () => {
   // Per-source is deliberately NOT evictable: one address at its own limit must be
   // refused outright, never allowed to push a different address out.

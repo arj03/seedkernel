@@ -69,6 +69,13 @@ const ZERO32 = new Uint8Array(32);
 export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
 export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
 export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
+/** ...and the budget past the door: how many links a node holds AUTHENTICATED at once.
+ *  The half-open tiers bound who is getting in; without this one, anybody who can
+ *  complete a handshake — every admitted peer, and every stranger on an open node — can
+ *  open links without limit, each holding a framer, session keys, timers and buffers.
+ *  Same size as the verified tier: a link that has proved an identity is not entitled to
+ *  more of the node than one that is proving one. */
+export const DEFAULT_MAX_AUTHED_LINKS = 256;
 
 /** How long one request may take when its caller names no deadline (§12.6). Generous
  *  on purpose: it is the number that has to be right for a caller who did not think
@@ -77,6 +84,14 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  call carrying whatever deadline the app chose, or nothing, and "nothing" is resolved
  *  against this. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
+
+/** How long an AUTHENTICATED link may carry no traffic in either direction before the
+ *  guest retires it (with the authenticated goodbye — the address book redials on the
+ *  next send). The other half of the authed-link budget: a cap alone would let a peer
+ *  fill it and sit there, and the handshake deadlines stop applying the moment a link
+ *  authenticates. Generous, because it is not a liveness probe: nothing legitimate is
+ *  harmed by a reconnect after five silent minutes, and nothing hostile survives one. */
+export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 
 /** `[caller 32][nameLen u8][name utf8]` for one op, built once and shared.
  *
@@ -180,6 +195,11 @@ export interface TransportHostOptions {
   maxHalfOpenUnverified?: number;
   maxHalfOpenPerSource?: number;
   maxHalfOpenVerified?: number;
+  /** Concurrent AUTHENTICATED links, and how long one may sit idle before the guest
+ *  retires it (ms; 0 disables the clock). The budget past the handshake — see
+ *  `DEFAULT_MAX_AUTHED_LINKS`. */
+  maxAuthedLinks?: number;
+  linkIdleTimeoutMs?: number;
   /** The peers this node will talk to, as 32-byte channel keys. Shipped to the guest at
  *  init and applied there.
  *
@@ -308,9 +328,11 @@ export class TransportHost {
       .u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED)
       .u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE)
       .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
+      .u32(o.maxAuthedLinks ?? DEFAULT_MAX_AUTHED_LINKS)
       .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
       .u32(MAX_HANDSHAKE_FRAME_BYTES)
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
+      .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
       // Absent and empty are the same thing — "admit everyone" — said as a zero-length
       // list rather than as a missing field, so the guest reads one shape.
       .blob(admit.build()));

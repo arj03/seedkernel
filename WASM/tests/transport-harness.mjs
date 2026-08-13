@@ -186,7 +186,7 @@ export function transportPolicy(authorHex, appAuthors = []) {
 /** One transport host: a shell over a fresh identity + the transport bundle, and — unless
  *  `app: false` — the harness app that drives it. Options pass through to the shell's
  *  platform (admitPeers for the peer list, networkKey, contactSecret, channels) and to
- *  createShell (requestDeadlineMs, transportHalfOpen).
+ *  createShell (requestDeadlineMs, transportHalfOpen, linkIdleTimeoutMs).
  *
  *  The returned `request`/`sendNoReply`/`seen`/`peers` are what the tests use where they
  *  used to reach into the driver. Each is one `invoke` into the harness app, so the
@@ -214,6 +214,7 @@ export async function makeTransportHost(opts = {}) {
     answer: opts.answer,
     requestDeadlineMs: opts.requestDeadlineMs,
     transportHalfOpen: opts.transportHalfOpen,
+    linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
   const node = { shell, driver: shell.transport, identity, appAuthor };

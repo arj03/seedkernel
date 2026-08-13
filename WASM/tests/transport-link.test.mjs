@@ -325,9 +325,12 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
   // The framer used to join every inbound slice onto one buffer, so a peer that
   // dribbles a full-size frame one byte at a time forced a quadratic number of
   // copies — a CPU-exhaustion budget no frame-size cap controls (the cap bounds
-  // the buffer, not the copying). The parser now keeps the slices it was handed
-  // and copies once per complete frame. This pins the behaviour the refactor has
-  // to preserve: arbitrary slice boundaries in, exactly one message out.
+  // the buffer, not the copying). Keeping every slice instead traded that for a
+  // memory hole (one view and one pinned chunk per byte, ~50× the cap on a dribble),
+  // so small slices are now merged into a doubling tail buffer: amortized copying,
+  // and a slice count bounded by the bytes rather than by the segments. This pins the
+  // behaviour all of that has to preserve: arbitrary slice boundaries in, exactly one
+  // message out.
   let armed = false;
   const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
@@ -350,6 +353,81 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
   const resp = await respP;
   assert(resp.length === payload.length && resp[0] === 0x5a && resp[resp.length - 1] === 0x5a,
     `a byte-dribbled frame must deliver intact (got ${resp.length} bytes)`);
+});
+
+await test("REASSEMBLY: slices that straddle the merge threshold reassemble too", async (keep) => {
+  // The merge rule has three paths — a small slice into a fresh accumulator, into one
+  // with room, and into one that has to grow — plus a large slice, which is kept as it
+  // arrived and ends the accumulator. A dribble exercises one of them. This feeds slice
+  // sizes that cross the threshold in both directions, repeatedly, so a boundary error
+  // in the accumulator shows up as a message that never completes or completes wrong.
+  let armed = false;
+  const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
+  const st = keep(await linked(chans));
+  await until(() => st.a.authed && st.b.authed, 4000, "handshake");
+  const payload = new Uint8Array(96 * 1024);
+  for (let i = 0; i < payload.length; i++) payload[i] = (i * 7) & 255;
+  armed = true;
+  const before = chans[0].sent.length;
+  const respP = st.A.request(st.B.driver.peerId, PROTO, payload, 8000);
+  await until(() => chans[0].sent.length > before, 3000, "A's wire message");
+  const wire = Uint8Array.from(Buffer.from(chans[0].sent[chans[0].sent.length - 1], "hex"));
+  const sizes = [1, 3, 8191, 1, 8192, 2, 40_000, 1, 5000];
+  for (let off = 0, i = 0; off < wire.length; i++) {
+    const n = Math.min(sizes[i % sizes.length], wire.length - off);
+    chans[1].msg(wire.subarray(off, off + n));
+    off += n;
+    await Promise.resolve();
+  }
+  const resp = await respP;
+  let same = resp.length === payload.length;
+  for (let i = 0; same && i < resp.length; i++) same = resp[i] === payload[i];
+  assert(same, `mixed-size slices must reassemble byte for byte (got ${resp.length} bytes)`);
+});
+
+await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied", async (keep) => {
+  // `send` used to hex the destination and slice both bodies straight out of the
+  // caller's arguments, then build a request frame from them — three copies — and only
+  // then have the record layer drop the frame for being over the cap. A co-resident app
+  // naming a 50 MiB payload took the transport realm down before the frame it would have
+  // been refused for existed. The refusal is now the first thing `send` does, and it is
+  // loud: the app's own `_net` call rejects by name rather than silently going nowhere.
+  const st = keep(await upPair());
+  let refused = "";
+  try { await st.A.request(st.B.driver.peerId, PROTO, new Uint8Array(3 * 1024 * 1024)); }
+  catch (e) { refused = String(e); }
+  assert(refused.includes("over the frame cap"), `an over-cap send must be refused, got ${refused || "no error"}`);
+  // ...and a malformed destination, which is what the hex conversion would have run on.
+  let badTo = "";
+  const args = new Uint8Array(1 + 4 + 4 + 4 + 4 + 4); // noReply, deadline, to(0), proto(0), payload(0)
+  try { await st.A.op("send", args); } catch (e) { badTo = String(e); }
+  assert(badTo.includes("32-byte peer id"), `a malformed peer id must be refused, got ${badTo || "no error"}`);
+  assert(!st.a.closed && !st.b.closed, "a refused send must not disturb the link");
+});
+
+await test("IDLE: an authenticated link carrying no traffic is retired", async (keep) => {
+  // The handshake deadlines stop applying the moment a link authenticates, and the
+  // half-open budget used to be released at the same point — so an authenticated link
+  // that went quiet was held forever, with its framer, session keys, timers and buffers.
+  // It is now retired on an idle clock, and with the authenticated goodbye, because it
+  // is our own deliberate shutdown: the far end reads a clean close, not a truncation.
+  const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 60 }, { linkIdleTimeoutMs: 60 }));
+  await until(() => st.a.closed, 4000, "the idle clock to retire a silent link");
+  assert(st.a.reason === CLOSE_REASON.LOCAL || st.a.reason === CLOSE_REASON.CLEAN,
+    `an idle retirement is a deliberate close, got reason ${st.a.reason}`);
+});
+
+await test("IDLE: traffic keeps a link alive across the clock", async (keep) => {
+  // The other half: the clock must measure silence, not age. A link exchanging frames
+  // across several windows must survive them all — an idle timeout that retired a busy
+  // link would be worse than none.
+  const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 80 }, { linkIdleTimeoutMs: 80 }));
+  for (let i = 0; i < 8; i++) {
+    const r = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([i]));
+    assert(r[0] === i, `frame ${i} did not come back — the link died under its idle clock`);
+    await settle(40);
+  }
+  assert(!st.a.closed && !st.b.closed, "a link with traffic on it must not be retired");
 });
 
 await test("READY: a second ready() does not strand the first", async (keep) => {
@@ -709,7 +787,12 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
 await test("default caps are sane", async () => {
   const {
     DEFAULT_MAX_HALF_OPEN_UNVERIFIED, DEFAULT_MAX_HALF_OPEN_PER_SOURCE, DEFAULT_MAX_HALF_OPEN_VERIFIED,
+    DEFAULT_MAX_AUTHED_LINKS, DEFAULT_LINK_IDLE_TIMEOUT_MS,
   } = await import("../build/host/transport-host.js");
+  assert(DEFAULT_MAX_AUTHED_LINKS > 0 && DEFAULT_MAX_AUTHED_LINKS <= 4096,
+    "the authenticated-link budget should be a real bound");
+  assert(DEFAULT_LINK_IDLE_TIMEOUT_MS >= 60_000,
+    "the idle clock must be generous enough that a quiet-but-live link is not churned");
   assert(DEFAULT_MAX_HALF_OPEN_UNVERIFIED > 0 && DEFAULT_MAX_HALF_OPEN_UNVERIFIED <= 8192,
     "unverified cap should be a real bound");
   assert(DEFAULT_MAX_HALF_OPEN_VERIFIED > 0 && DEFAULT_MAX_HALF_OPEN_VERIFIED <= 4096,
