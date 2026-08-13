@@ -473,10 +473,14 @@ entry("linkOpen", (r) => {
       hostLinkAuth(linkId, fromHex(peerId));
     },
     onFrame: (peerId, frame) => router.deliver(peerId, frame),
-    onClose: () => {
+    // `l`, not the `link` binding below: a Link that tears itself down in its own
+    // constructor (a refused limiter slot, a failed timer arm) notifies from the
+    // deferred flush, and `link` is a `const` that was never initialized — closing over
+    // it would raise a ReferenceError instead of telling the host its socket is down.
+    onClose: (l) => {
       openLinks.delete(linkId);
-      router.remove(link);
-      hostLinkDown(linkId, reasonCode(link));
+      router.remove(l);
+      hostLinkDown(linkId, reasonCode(l));
     },
   }));
   openLinks.set(linkId, link);

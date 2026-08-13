@@ -14,13 +14,34 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"seedloader/qjs"
 )
+
+// maxLiveChannels caps how many sockets this host holds at once, inbound and outbound
+// together. Accepting is the one thing here that happens without anyone asking: the
+// loop takes whatever the kernel hands it, and each accepted socket costs two
+// goroutines, a 64 KiB read buffer and a map entry BEFORE the transport guest has
+// looked at it. The guest's own link budgets (transport-host.ts: 1024 unverified + 256
+// verified + 256 authed) are the policy and stay the policy — this sits an order of
+// magnitude above their sum so that in normal operation it never fires. What it bounds
+// is the window those budgets cannot: a flood arriving faster than the loop goroutine
+// drains its posted accepts, and the case of a guest that has stopped refusing at all.
+// Over the cap the socket is closed immediately, before any of it is spent.
+// A var, not a const, only so a test can shrink it: nothing in the process writes it.
+var maxLiveChannels = 4096
+
+// acceptErrBackoff paces the accept loop after a non-fatal error. EMFILE (the process
+// out of descriptors) makes Accept fail immediately and repeatedly; returning on it
+// would kill serving for good over a transient condition, and retrying flat out would
+// spin a core. The loop pauses instead and carries on once descriptors free up.
+const acceptErrBackoff = 20 * time.Millisecond
 
 type netHost struct {
 	el  *eventLoop
@@ -142,6 +163,21 @@ func (n *netHost) alloc() int64 {
 	return n.nextID
 }
 
+// allocInbound is alloc for a socket nobody asked for: it refuses once the host already
+// holds maxLiveChannels. The count is read under the same lock that hands out the id,
+// so the only slack is between here and the caller's insert — at most one connection
+// per accept goroutine (one per bound listener), which is why the cap sits far above
+// the guest's link budgets rather than exactly on them.
+func (n *netHost) allocInbound() (int64, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.chans) >= maxLiveChannels {
+		return 0, false
+	}
+	n.nextID++
+	return n.nextID, true
+}
+
 // dial opens an outbound byte duplex. It connects in the background and
 // buffers pre-connect sends, so JS can wrap the id and PeerLink can sendHello() (or
 // the WS client can write its upgrade request) immediately; the JS channel is
@@ -165,7 +201,10 @@ func (n *netHost) listen(host string, port int) (int, error) {
 	// autotuning, pinning a high-RTT PUT into a holder near a 64 KiB window (~2.5 MB/s
 	// at 26 ms RTT). Defaults autotune to tcp_rmem[2] (~6 MB) and fill the link (see
 	// the note above dialTCP in net.go).
-	var lc net.ListenConfig
+	// KeepAlive is set explicitly (not left to Go's default) so an accepted socket whose
+	// peer vanishes without a FIN is reclaimed rather than held until the process exits
+	// — see the note on tcpKeepAlive in net.go.
+	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
 	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return 0, err
@@ -178,9 +217,22 @@ func (n *netHost) listen(host string, port int) (int, error) {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return // listener closed (closeListeners) or fatal accept error — exit the goroutine
+				if errors.Is(err, net.ErrClosed) {
+					return // listener closed (closeListeners) — release the goroutine
+				}
+				// Anything else is this process's condition, not the listener's end: a
+				// descriptor exhaustion, a socket the kernel reset between SYN and accept.
+				// Pause and keep serving (acceptErrBackoff) rather than retiring the port.
+				time.Sleep(acceptErrBackoff)
+				continue
 			}
-			id := n.alloc()
+			// The ceiling (maxLiveChannels), applied before a single goroutine or buffer
+			// is spent on the socket: over it, the connection is dropped on the floor.
+			id, ok := n.allocInbound()
+			if !ok {
+				conn.Close()
+				continue
+			}
 			ch, start := n.wrapInbound(id, conn)
 			n.mu.Lock()
 			n.chans[id] = ch

@@ -355,10 +355,19 @@ function admits(peerBytes) {
 
 // ── timers ────────────────────────────────────────────────────────────────────
 
+// `timer/arm` is the host's table and the host's cap (DEFAULT_MAX_LIVE_TIMERS), so a
+// realm that has spent it gets a THROW here rather than a return code. The entry is
+// dropped again before the throw escapes: a caller that retries must not accumulate
+// callbacks for deadlines the host never armed and will never fire back.
 function armTimer(ms, fn) {
   const id = nextTimerId++;
   timers.set(id, fn);
-  host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], []));
+  try {
+    host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], []));
+  } catch (e) {
+    timers.delete(id);
+    throw e;
+  }
   return id;
 }
 function clearTimer(id) {
@@ -430,11 +439,7 @@ class Link {
     if (spec.limiter) {
       this.slot = spec.limiter.acquire(this.source, () => this.abort());
       if (!this.slot) {
-        this.closed = true;
-        deferQueue.push(() => {
-          try { netLinkClose(this.linkId, false); } catch { /* already gone */ }
-          this.finish();
-        });
+        this.deferTeardown();
         return;
       }
     }
@@ -442,13 +447,46 @@ class Link {
     // Only a dialer speaks unprompted; an accepting link says nothing until a
     // msg1 opens under the contact secret — and a responder generates no key
     // material before that proof (net-link.ts §12.6.2).
-    if (this.weDialed) {
-      this.ensureKeys();
-      this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
-      this.sendMsg1();
-    } else {
-      this.armDeadline(this.handshakeTimeoutMs || UNVERIFIED_TIMEOUT_MS);
+    //
+    // Everything from here on can THROW: `armDeadline` crosses to the host, and
+    // `timer/arm` refuses once the realm's live-timer table is full — a cap a
+    // CO-RESIDENT app can reach on its own, so this is not a self-inflicted failure
+    // the link can be blamed for. A throw escaping the constructor would leave the
+    // slot acquired and the host channel open with no Link ever built to close
+    // either, which is the whole resource an accepted connection costs: an app
+    // sitting on the timer cap would make every new inbound connection a permanent
+    // leak. So the same deferred teardown the refused slot takes.
+    try {
+      if (this.weDialed) {
+        this.ensureKeys();
+        this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
+        this.sendMsg1();
+      } else {
+        this.armDeadline(this.handshakeTimeoutMs || UNVERIFIED_TIMEOUT_MS);
+      }
+    } catch {
+      // The slot first and on its own: it is the resource with a hard cap, releasing it
+      // touches nothing outside this module, and the rest of the tidying (clearing a
+      // deadline that DID arm before a later step threw) crosses to the host again and
+      // so may fail again. A failure to tidy must not cost the slot — nor the close and
+      // the notify below, which are the two things that must happen.
+      this.releaseSlot();
+      try { this.teardown(); } catch { /* the host has evidently lost the timer anyway */ }
+      this.deferTeardown();
     }
+  }
+
+  /** Close the host channel and notify, but AFTER the current event — the caller's
+   *  bookkeeping (core.openLink's pools, entry("openLink")'s `openLinks`) runs once
+   *  the constructor returns, so a synchronous onClose would undo what it has not yet
+   *  done (the queueMicrotask of net-link.ts, here a post-event flush). */
+  deferTeardown() {
+    this.closed = true;
+    this.closedLocally = true;
+    deferQueue.push(() => {
+      try { netLinkClose(this.linkId, false); } catch { /* already gone */ }
+      this.finish();
+    });
   }
 
   ensureKeys() {

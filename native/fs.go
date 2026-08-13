@@ -20,20 +20,66 @@ import (
 // Windows device names are one rule shared by every target — `isSafeFsKey` in
 // WASM/core/fs.ts, applied over this backend by `validatedFs` before a key reaches Go.
 // It lives there because it is a consensus predicate: which keys a node admits decides
-// which blocks it stores and advertises, and a second copy here is exactly how a Go
-// node and a Bun node would come to disagree about their contents. This file used to
-// carry that copy, under a comment saying the two had to match.
+// which blocks it stores and advertises, and a rule INVENTED here is exactly how a Go
+// node and a Bun node would come to disagree about their contents.
 //
-// What stays is containment, which is this backend's own business: a key becomes a
-// filename verbatim under f.dir, so anything that could name something outside it is
-// refused whatever admitted it. Defence in depth, not the rule being relied on.
-// The empty key is refused first and explicitly: filepath.Join(dir, "") is the DATA
-// DIRECTORY itself, so an unchecked "" would make delete("") an os.Remove of the store.
-// '\n' is in the set for a serialization reason that is this layer's alone: list()
-// joins keys with '\n' and the shim splits on it, so a '\n' in a key would corrupt
-// this backend's own list() output even though the shared charset also forbids it.
+// What this is, is the backstop: a key becomes a filename verbatim under f.dir, so the
+// backend refuses anything it could not represent whatever admitted it. It is therefore
+// the SAME predicate, transcribed — not a laxer approximation of it. A backstop weaker
+// than the rule it stands behind protects against nothing: the previous one passed
+// "CON", "NUL.txt" and any Unicode, so a regression in `validatedFs` would have let a
+// Windows build's fs.get("CON") open the console device and hang the single event loop
+// on a read that never returns. Transcribing it costs a charset loop and a name set,
+// and the risk of the copy drifting is bounded by the direction of the check: this
+// side may only ever be as strict or stricter, so a drift refuses a key the shared
+// rule admits (a visible, local failure) rather than admitting one it refuses (a
+// silent divergence in what the node stores).
+//
+// The empty key is covered by the charset (`+`, one character minimum) and matters
+// here for a reason of this layer's own: filepath.Join(dir, "") is the DATA DIRECTORY
+// itself, so an unchecked "" would make delete("") an os.Remove of the store.
+// The charset's exclusion of '\n' also carries this backend's serialization: list()
+// joins keys with '\n' and the shim splits on it.
 func fsKeySafe(k string) bool {
-	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, "/\\\n") && !strings.ContainsRune(k, 0)
+	if k == "" || k == "." || k == ".." {
+		return false
+	}
+	// The `SAFE_CHARS` charset, byte-wise: every legal character is ASCII, so a byte
+	// outside the set — including every byte of a multi-byte rune — refuses the key,
+	// exactly as the shared regex refuses a non-ASCII code point.
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		ok := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
+			c == '.' || c == '_' || c == '-'
+		if !ok {
+			return false
+		}
+	}
+	return !reservedDeviceName(k)
+}
+
+// reservedDeviceNames are the names Windows resolves to a DEVICE before the request
+// ever reaches a filesystem. Refused on every OS, not only Windows, because the key
+// space must not depend on where a node runs — the same argument that puts the rule in
+// shared JS in the first place (core/fs.ts RESERVED_DEVICE_NAMES).
+var reservedDeviceNames = func() map[string]bool {
+	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
+	for i := '0'; i <= '9'; i++ { // COM0/LPT0 are reserved on current Windows too
+		m["COM"+string(i)] = true
+		m["LPT"+string(i)] = true
+	}
+	return m
+}()
+
+// reservedDeviceName mirrors core/fs.ts isReservedDeviceName: Windows ignores the
+// extension, so the stem before the FIRST '.' decides it — "NUL.txt" is still NUL.
+// ToUpper is applied to a string the charset above has already proved ASCII.
+func reservedDeviceName(k string) bool {
+	stem := k
+	if d := strings.IndexByte(k, '.'); d >= 0 {
+		stem = k[:d]
+	}
+	return reservedDeviceNames[strings.ToUpper(stem)]
 }
 
 // fsTmpPrefix marks the scratch files put() writes before renaming onto a key. It

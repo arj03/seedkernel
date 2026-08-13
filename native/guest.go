@@ -528,11 +528,22 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
 		res.Free()
 	}
 	if err != nil {
-		// The continuation itself failed — typically the budget kill. markDead has
-		// already settled the pending calls when that is why; this covers any other
-		// engine failure so a caller is never left waiting on a realm that cannot reply.
-		if !g.dead {
-			g.markDead(fmt.Errorf("guest realm failed delivering a net result: %w", err))
+		// The continuation itself failed. What must happen is that nobody is left waiting
+		// on a reply that is not coming (settleAll) — NOT that the realm ends.
+		//
+		// Ending it would contradict the budget's own semantics one layer down: an overrun
+		// here comes back as an ordinary error because the interrupt throws inside the
+		// guest and `within` has already settled the callers, deliberately leaving the
+		// realm usable for the next entrypoint (see within). Everything else that reaches
+		// this line is an exception out of the guest's `__netResolve` — guest code, and a
+		// guest that overwrites its own resolver breaks its own in-flight calls. Killing
+		// the realm would turn that into a permanent brick, unreachable until the whole
+		// bundle is reloaded, for a fault contained to one guest's continuation.
+		//
+		// A realm the engine genuinely ended is a different fact, and checkAlive reports
+		// it: `dead` from here on, settled by markDead, refused at the next entry.
+		if g.checkAlive() == nil {
+			g.settleAll(fmt.Sprintf("guest realm failed delivering a net result: %v", err))
 		}
 	}
 }

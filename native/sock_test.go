@@ -185,6 +185,79 @@ func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	}
 }
 
+// TestSockChannelSilentPeerTimesOut pins the pre-auth bound (silentReadTimeout): a
+// connection that opens and never sends a byte is failed and reclaimed on its own,
+// without the transport guest ever having to notice it — the slowloris shape, which
+// costs the attacker a SYN and costs this side two goroutines and a 64 KiB buffer.
+func TestSockChannelSilentPeerTimesOut(t *testing.T) {
+	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
+	silentReadTimeout = 50 * time.Millisecond
+
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	onClosed := make(chan struct{}, 1)
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
+	go c.readLoop()
+	waitOn(t, onClosed, "a connection that never spoke must be reclaimed")
+}
+
+// TestSockChannelSpokenForSurvives is the other half of the same rule: the deadline is
+// cleared by the FIRST byte, so a link that has spoken is never killed for going quiet
+// afterwards. How long an established link may idle is the transport's policy (its own
+// idle clock), and a blind second clock here would cut established links behind it.
+func TestSockChannelSpokenForSurvives(t *testing.T) {
+	defer func(d time.Duration) { silentReadTimeout = d }(silentReadTimeout)
+	silentReadTimeout = 50 * time.Millisecond
+
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	in := make(chan struct{}, 1)
+	onClosed := make(chan struct{}, 1)
+	c := newInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} })
+	go c.readLoop()
+
+	if _, err := c2.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	waitOn(t, in, "the first frame must be delivered")
+	time.Sleep(5 * silentReadTimeout) // long past the deadline the first read cleared
+	select {
+	case <-onClosed:
+		t.Fatal("a link that had spoken was killed for idling")
+	default:
+	}
+	c.close()
+}
+
+// TestNetHostAcceptCeiling pins the accept bound (maxLiveChannels): past the ceiling an
+// inbound socket is closed on the spot, without an id, a channel or a goroutine — and
+// the listener keeps serving, so the node recovers as live channels drain rather than
+// going deaf.
+func TestNetHostAcceptCeiling(t *testing.T) {
+	defer func(m int) { maxLiveChannels = m }(maxLiveChannels)
+	maxLiveChannels = 2
+
+	n := &netHost{chans: map[int64]rawChannel{}}
+	for i := 0; i < maxLiveChannels; i++ {
+		id, ok := n.allocInbound()
+		if !ok {
+			t.Fatalf("connection %d refused under the ceiling", i)
+		}
+		n.chans[id] = nil // a live channel, as the accept loop registers it
+	}
+	if _, ok := n.allocInbound(); ok {
+		t.Fatal("a connection over the ceiling was admitted")
+	}
+	// One drains (a peer hung up, a link closed): the next connection is admitted again.
+	for id := range n.chans {
+		delete(n.chans, id)
+		break
+	}
+	if _, ok := n.allocInbound(); !ok {
+		t.Fatal("the ceiling did not release as channels drained")
+	}
+}
+
 // TestSockChannelCloseFailRace hammers the close/fail split from many goroutines:
 // the dead flag must settle the channel once — at most one onClose, no panic, no
 // hang — no matter how the races interleave.

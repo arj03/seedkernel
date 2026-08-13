@@ -252,6 +252,22 @@ func (s *libsodium) call(name string, args ...uint64) int32 {
 	return int32(uint32(r[0]))
 }
 
+// mustCall is call for a PRODUCING op whose failure is an invariant violation — a key
+// or nonce of the wrong length, an arena that could not hold the output. libsodium
+// signals that with -1 and leaves the output buffer UNTOUCHED, and the arena is reused
+// across ops: reading it anyway hands the caller whatever the previous op left there,
+// which has been a secret key or a plaintext. So a producing op either succeeds or
+// stops here; it never returns bytes it did not compute. Panic rather than an error
+// return because every caller of these passes lengths this process itself derived
+// (`sodium_init`, `malloc` and `genericHash` fail the same way) — an op that CAN fail on
+// its inputs, like crypto_scalarmult or the ed→curve conversions, checks the code
+// itself and answers ok=false.
+func (s *libsodium) mustCall(name string, args ...uint64) {
+	if r := s.call(name, args...); r != 0 {
+		panic(fmt.Sprintf("libsodium: %s returned %d (output not written)", name, r))
+	}
+}
+
 // 64-bit length args are legalized to (lo, hi) i32 pairs in this build; our buffers
 // are far under 4 GiB, so hi is always 0.
 func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
@@ -285,7 +301,7 @@ func (s *libsodium) streamXor(msg, nonce, key []byte) []byte {
 	in, np, kp := s.takeIn(msg), s.takeIn(nonce), s.takeIn(key)
 	out := s.take(len(msg))
 	lo, hi := lenArgs(len(msg))
-	s.call("crypto_stream_xchacha20_xor", uint64(out), uint64(in), lo, hi, uint64(np), uint64(kp))
+	s.mustCall("crypto_stream_xchacha20_xor", uint64(out), uint64(in), lo, hi, uint64(np), uint64(kp))
 	return s.read(out, len(msg))
 }
 
@@ -295,7 +311,7 @@ func (s *libsodium) signDetached(msg, sk []byte) []byte {
 	s.arenaReset(alignUp(len(msg)) + alignUp(len(sk)) + alignUp(64))
 	in, skp, sig := s.takeIn(msg), s.takeIn(sk), s.take(64)
 	lo, hi := lenArgs(len(msg))
-	s.call("crypto_sign_detached", uint64(sig), 0 /*siglen_p=NULL*/, uint64(in), lo, hi, uint64(skp))
+	s.mustCall("crypto_sign_detached", uint64(sig), 0 /*siglen_p=NULL*/, uint64(in), lo, hi, uint64(skp))
 	return s.read(sig, 64)
 }
 
@@ -318,7 +334,7 @@ func (s *libsodium) signKeypair() (pk, sk []byte) {
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(32) + alignUp(64))
 	pkp, skp := s.take(32), s.take(64)
-	s.call("crypto_sign_keypair", uint64(pkp), uint64(skp))
+	s.mustCall("crypto_sign_keypair", uint64(pkp), uint64(skp))
 	return s.read(pkp, 32), s.read(skp, 64)
 }
 
@@ -327,26 +343,36 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(32) + alignUp(64) + alignUp(len(seed)))
 	pkp, skp, sp := s.take(32), s.take(64), s.takeIn(seed)
-	s.call("crypto_sign_seed_keypair", uint64(pkp), uint64(skp), uint64(sp))
+	s.mustCall("crypto_sign_seed_keypair", uint64(pkp), uint64(skp), uint64(sp))
 	return s.read(pkp, 32), s.read(skp, 64)
 }
 
-func (s *libsodium) edPkToCurve(edPk []byte) []byte {
+// edPkToCurve converts an Ed25519 public key to its X25519 counterpart. ok=false rather
+// than a panic on -1: the input is somebody ELSE's key, and libsodium refuses one that
+// is not a canonical point — a data-dependent failure a caller must be able to handle,
+// not an invariant of ours. The 32 output bytes are only read when it succeeded (the
+// arena otherwise still holds the previous op's).
+func (s *libsodium) edPkToCurve(edPk []byte) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(len(edPk)) + alignUp(32))
 	in, out := s.takeIn(edPk), s.take(32)
-	s.call("crypto_sign_ed25519_pk_to_curve25519", uint64(out), uint64(in))
-	return s.read(out, 32)
+	if s.call("crypto_sign_ed25519_pk_to_curve25519", uint64(out), uint64(in)) != 0 {
+		return nil, false
+	}
+	return s.read(out, 32), true
 }
 
-func (s *libsodium) edSkToCurve(edSk []byte) []byte {
+// edSkToCurve is the secret-key half; same contract (see edPkToCurve).
+func (s *libsodium) edSkToCurve(edSk []byte) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.arenaReset(alignUp(len(edSk)) + alignUp(32))
 	in, out := s.takeIn(edSk), s.take(32)
-	s.call("crypto_sign_ed25519_sk_to_curve25519", uint64(out), uint64(in))
-	return s.read(out, 32)
+	if s.call("crypto_sign_ed25519_sk_to_curve25519", uint64(out), uint64(in)) != 0 {
+		return nil, false
+	}
+	return s.read(out, 32), true
 }
 
 func (s *libsodium) boxSeal(msg, curvePk []byte) []byte {
@@ -355,7 +381,7 @@ func (s *libsodium) boxSeal(msg, curvePk []byte) []byte {
 	s.arenaReset(alignUp(len(msg)) + alignUp(len(curvePk)) + alignUp(len(msg)+sealBytes))
 	in, pkp, out := s.takeIn(msg), s.takeIn(curvePk), s.take(len(msg)+sealBytes)
 	lo, hi := lenArgs(len(msg))
-	s.call("crypto_box_seal", uint64(out), uint64(in), lo, hi, uint64(pkp))
+	s.mustCall("crypto_box_seal", uint64(out), uint64(in), lo, hi, uint64(pkp))
 	return s.read(out, len(msg)+sealBytes)
 }
 

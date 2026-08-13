@@ -33,6 +33,32 @@ const sendQueueLimit = 4 << 20
 // regardless — so closing a channel to a wedged peer can't pin its writer forever.
 const closeGrace = 5 * time.Second
 
+// tcpKeepAlive is how long a connection may be idle before the kernel probes it. Set
+// explicitly on both the dial and the listen path rather than left to Go's default,
+// because it is the only thing that reclaims a socket whose peer VANISHED — a NAT
+// rebinding, a yanked cable, a killed VM sends no FIN, so without probes the read
+// blocks forever and the channel's goroutines, its 64 KiB read buffer and its slot in
+// n.chans are held until the process exits. It bounds an ABSENT peer only; a present
+// but silent one is silentReadTimeout's business.
+const tcpKeepAlive = 30 * time.Second
+
+// silentReadTimeout bounds a connection that has never delivered a BYTE. Accepting a
+// socket costs two goroutines, a 64 KiB read buffer and a channel id before anything
+// about the far end has been proved, and the cheapest attack on that is to connect and
+// then say nothing at all: no handshake starts, so none of the transport guest's
+// deadlines (which arm on a link the guest was told about) is what fails first, and
+// keepalive probes are answered by a peer that is present and merely mute.
+//
+// A var, not a const, only so a test can shrink it: nothing in the process writes it.
+//
+// It is armed before the first read and CLEARED by it — deliberately not an idle
+// deadline. Once bytes flow, whether a quiet link may be held is a decision with a
+// number attached (linkIdleTimeoutMs, transport-host.ts) and an owner (the transport
+// guest, which knows whether the link is authenticated); a second, blinder clock down
+// here would kill established links behind that policy's back. Generous, because it
+// stands between "connected" and "spoke once": a real peer's HELLO follows its SYN.
+var silentReadTimeout = 30 * time.Second
+
 // Socket buffers are deliberately left at kernel defaults — do NOT set SO_RCVBUF/
 // SO_SNDBUF here. An explicit value is silently clamped to net.core.{r,w}mem_max
 // (208 KiB on stock Linux) and, worse, LOCKS the buffer, disabling the kernel's
@@ -46,7 +72,7 @@ const closeGrace = 5 * time.Second
 // and negotiates a window scale sized for tcp_rmem[2], so a high-RTT bulk
 // transfer is not window-limited.
 func dialTCP(addr string) (net.Conn, error) {
-	d := net.Dialer{Timeout: 5 * time.Second}
+	d := net.Dialer{Timeout: 5 * time.Second, KeepAlive: tcpKeepAlive}
 	return d.DialContext(context.Background(), "tcp", addr)
 }
 
@@ -267,13 +293,23 @@ func (c *sockChannel) writeMsg(bytes []byte) {
 func (c *sockChannel) readLoop() {
 	chunk := make([]byte, 64<<10)
 	conn := c.conn // set strictly before the read loop starts
+	// The silent-connection deadline (see silentReadTimeout): armed for the first read
+	// and dropped by it, so it bounds a peer that never speaks without ever bounding one
+	// that has. SetReadDeadline is only refused by a conn already closed underneath us,
+	// which the next Read reports anyway.
+	conn.SetReadDeadline(time.Now().Add(silentReadTimeout))
+	spoke := false
 	for {
 		n, err := conn.Read(chunk)
 		if n > 0 {
+			if !spoke {
+				spoke = true
+				conn.SetReadDeadline(time.Time{}) // said something: the guest's link deadlines own it now
+			}
 			c.onMsg(append([]byte(nil), chunk[:n]...))
 		}
 		if err != nil {
-			c.fail()
+			c.fail() // including the deadline: a socket that opened and never spoke
 			return
 		}
 	}

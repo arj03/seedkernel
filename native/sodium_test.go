@@ -163,7 +163,11 @@ func TestSodiumSealedBox(t *testing.T) {
 	if len(pk) != 32 || len(sk) != 64 {
 		t.Fatalf("keypair sizes: pk=%d sk=%d", len(pk), len(sk))
 	}
-	cpk, csk := s.edPkToCurve(pk), s.edSkToCurve(sk)
+	cpk, okPk := s.edPkToCurve(pk)
+	csk, okSk := s.edSkToCurve(sk)
+	if !okPk || !okSk {
+		t.Fatalf("ed→curve conversion refused a fresh keypair: pk=%v sk=%v", okPk, okSk)
+	}
 
 	msg := []byte("a sealed secret for the holder")
 	ct := s.boxSeal(msg, cpk)
@@ -178,7 +182,9 @@ func TestSodiumSealedBox(t *testing.T) {
 		t.Fatalf("seal_open: ok=%v pt=%q", ok, pt)
 	}
 	pk2, sk2 := s.signKeypair()
-	if _, ok := s.boxSealOpen(ct, s.edPkToCurve(pk2), s.edSkToCurve(sk2)); ok {
+	cpk2, _ := s.edPkToCurve(pk2)
+	csk2, _ := s.edSkToCurve(sk2)
+	if _, ok := s.boxSealOpen(ct, cpk2, csk2); ok {
 		t.Fatal("seal_open succeeded under the wrong keypair")
 	}
 }
