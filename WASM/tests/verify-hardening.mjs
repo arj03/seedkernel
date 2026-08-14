@@ -38,6 +38,9 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
+/** Await a promise and assert it rejects — the async form of `throws`, which is what a
+ *  bind that stands up workers now needs (bindAll is async). */
+const rejects = async (p, msg) => { let threw = false; try { await p; } catch { threw = true; } ok(threw, msg); };
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
@@ -54,18 +57,18 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
   const host = new ModuleTable();
-  host.bindAll("aa:app", [{ name: "ok", wasm: withMax }]);
+  await host.bindAll("aa:app", [{ name: "ok", wasm: withMax }]);
   ok(host.isBound("aa:app", "ok"), "ModuleTable binds a bounded module");
-  throws(() => host.bindAll("aa:app", [{ name: "bad", wasm: noMax }]),
+  await rejects(host.bindAll("aa:app", [{ name: "bad", wasm: noMax }]),
     "ModuleTable refuses an unbounded module at install");
   const tiny = new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 });
-  throws(() => tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
+  await rejects(tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was, rather than with its first module landed. Atomicity is the
   // host's guarantee, so it holds without the caller doing anything to earn it.
   const atomic = new ModuleTable();
-  throws(() => atomic.bindAll("aa:app", [
+  await rejects(atomic.bindAll("aa:app", [
     { name: "first", wasm: withMax },
     { name: "second", wasm: noMax },
   ]), "a bundle with one bad module is refused whole");
@@ -134,19 +137,20 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   // seam was wired with — so it resolves under an empty requires set, exactly like
   // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
   const chat = new ModuleTable();
-  chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
-  chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
+  await chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
+  await chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
   const scoped = createGuestSeam({
     ...base,
     grants: { ...base.grants, names: [] },
     modules: {
-      call: (n, p) => chat.callModule("aa:chat", n, p),
+      call: (n, p, deadlineMs) => chat.callModule("aa:chat", n, p, deadlineMs),
       has: (n) => chat.isBound("aa:chat", n),
     },
   });
   // The forwarder echoes its input, so a resolved module answers with the body; a name
   // this app never installed is refused like any other unknown name in the catalog.
-  ok(scoped("codec", new Uint8Array([7, 7, 7])).length === 3, "a module of this app resolves and runs");
+  // A module call is async since ABI 6 (it round-trips through the module's worker).
+  ok((await scoped("codec", new Uint8Array([7, 7, 7]))).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
     "another app's module name reaches nothing through this seam");
 }

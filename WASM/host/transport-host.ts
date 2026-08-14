@@ -320,7 +320,10 @@ export class TransportHost {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    this.toTransport(new Args("init")
+    // The config turn answers the same way every other op does: a rejected one is a
+    // transport that failed to stand — logged, never a reason to take the host down —
+    // so it goes through the same `tell` as the ops that follow it.
+    this.tell(new Args("init")
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -363,10 +366,17 @@ export class TransportHost {
     return this.transport(args.build());
   }
 
-  /** `toTransport` for an op whose answer nobody is waiting on. */
+  /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged
+   *  and dropped, with ONE exception: a realm that was disposed out from under the op
+   *  is a teardown or an in-place replacement (§12.6), which is this driver's own doing
+   *  and not something an operator can act on. Reporting it would print an error line
+   *  for every ordinary shutdown. */
   private tell(args: Args): void {
     const r = this.toTransport(args);
-    if (r) void r.catch((err: unknown) => { console.error(`[transport] error in ${args.op}: ${String(err)}`); });
+    if (r) void r.catch((err: unknown) => {
+      if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+      console.error(`[transport] error in ${args.op}: ${String(err)}`);
+    });
   }
 
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims

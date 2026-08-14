@@ -3,10 +3,14 @@ package main
 // module_bound_test.go — the §4.3 lever, functionally: the module table's runtime is
 // armed with wazero's WithCloseOnContextDone when SEEDKERNEL_MODULE_DEADLINE_MS is set,
 // and callModule runs under that deadline (main.go). A module that never returns is the
-// one case the bound exists for (SECURITY §14.1) — the call is synchronous, so without
-// the bound a wedged module holds the thread forever. This test proves the bound
-// actually fires, that the closed module is evicted (the guest realm's markDead, per
-// module), and that a reinstall recovers the app.
+// one case the bound exists for (SECURITY §14.1): the wasm call holds the thread it runs
+// on, and only the deadline ends it. This test proves the bound actually fires, that the
+// closed module is evicted (the guest realm's markDead, per module), and that a reinstall
+// recovers the app.
+//
+// There are two wedges, because there are two places a module can refuse to return:
+// its `handle` (the call, below) and its START section (the bind — instantiation runs
+// it, so `TestModuleBindBound` is what says the deadline covers that too).
 //
 // The wedge is a minimal hand-assembled module whose handle is an infinite loop; it
 // declares the §4.1 exports like any installed module. WAT:
@@ -22,18 +26,21 @@ package main
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
 
-// wedgeWasmBytes()Bytes assembles the infinite-loop module above, byte by byte (no wabt in
-// the toolchain). Section sizes are computed here rather than hand-counted so the
-// layout cannot drift from the WAT.
+// sec size-prefixes one wasm section. Sizes are computed rather than hand-counted so a
+// layout cannot drift from the WAT it is transcribed from.
+func sec(id byte, content ...byte) []byte {
+	out := []byte{id, byte(len(content))}
+	return append(out, content...)
+}
+
+// wedgeWasmBytes assembles the infinite-loop module above, byte by byte (no wabt in
+// the toolchain).
 func wedgeWasmBytes() []byte {
-	sec := func(id byte, content ...byte) []byte {
-		out := []byte{id, byte(len(content))}
-		return append(out, content...)
-	}
 	// type (i32)->i32
 	typ := sec(1, 1, 0x60, 0x01, 0x7f, 0x01, 0x7f)
 	fn := sec(3, 1, 0x00)                          // func 0 has type 0
@@ -63,6 +70,64 @@ func wedgeWasmBytes() []byte {
 	out = append(out, mem...)
 	out = append(out, gbl...)
 	out = append(out, exp...)
+	out = append(out, code...)
+	return out
+}
+
+// wedgeStartWasmBytes is the same module with the loop moved into a START section: its
+// `handle` returns immediately, and it is INSTANTIATION that never finishes. WAT:
+//
+//	(module
+//	  (memory (export "memory") 2)
+//	  (global (export "scratch") i32 (i32.const 16))
+//	  (global (export "scratchSize") i32 (i32.const 4096))
+//	  (func (export "handle") (param i32) (result i32) i32.const 0)
+//	  (func $init (loop (br 0)))   ;; never returns
+//	  (start $init))
+//
+// This is the one wedge a call-time deadline cannot reach — the module never becomes
+// callable — so it is what says the bound also covers the bind (main.go
+// instantiateWasm).
+func wedgeStartWasmBytes() []byte {
+	typ := sec(1, 2,
+		0x60, 0x01, 0x7f, 0x01, 0x7f, // type 0: (i32) -> i32   — handle
+		0x60, 0x00, 0x00) //             type 1: () -> ()       — the start function
+	fn := sec(3, 2, 0x00, 0x01)                    // func 0: type 0, func 1: type 1
+	mem := sec(5, 1, 0x00, 0x02)                   // memory: one, min 2 pages
+	gbl := sec(6, 2, 0x7f, 0x00, 0x41, 0x10, 0x0b, // globals: scratch = 16,
+		0x7f, 0x00, 0x41, 0x80, 0x20, 0x0b) //          scratchSize = 4096
+	exp := sec(7,
+		4,                                              // exports:
+		0x06, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, //   memory
+		0x07, 's', 'c', 'r', 'a', 't', 'c', 'h', 0x03, 0x00, //   scratch
+		0x0b, 's', 'c', 'r', 'a', 't', 'c', 'h', 'S', 'i', 'z', 'e', 0x03, 0x01, //   scratchSize
+		0x06, 'h', 'a', 'n', 'd', 'l', 'e', 0x00, 0x00) //   handle
+	start := sec(8, 0x01) // start = func 1
+	handleBody := []byte{
+		0x00,       // no locals
+		0x41, 0x00, // i32.const 0 — the callable half is trivial
+		0x0b, // end func
+	}
+	initBody := []byte{
+		0x00,       // no locals
+		0x03, 0x40, // loop (void)
+		0x0c, 0x00, // br 0 — forever, during instantiation
+		0x0b, // end loop
+		0x0b, // end func
+	}
+	codeContent := []byte{2}
+	codeContent = append(codeContent, byte(len(handleBody)))
+	codeContent = append(codeContent, handleBody...)
+	codeContent = append(codeContent, byte(len(initBody)))
+	codeContent = append(codeContent, initBody...)
+	code := sec(10, codeContent...)
+	out := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00} // magic + version
+	out = append(out, typ...)
+	out = append(out, fn...)
+	out = append(out, mem...)
+	out = append(out, gbl...)
+	out = append(out, exp...)
+	out = append(out, start...)
 	out = append(out, code...)
 	return out
 }
@@ -168,5 +233,46 @@ func TestModuleCallBoundArmsOnlyWhenConfigured(t *testing.T) {
 	}
 	if called, closed := probe(t); called || !closed {
 		t.Fatalf("armed runtime: call ok=%v closed=%v, want ok=false closed=true (the done ctx must end the call)", called, closed)
+	}
+}
+
+// TestModuleBindBound: the bind is bounded too. A module whose START section never
+// returns is wedged before it is ever callable, so the call-time deadline has nothing
+// to fire on — instantiation itself must run under the bound (main.go
+// instantiateWasm), or an install is the hole the whole lever was closing. The JS
+// table bounds its worker load for the same reason (module-table.ts).
+func TestModuleBindBound(t *testing.T) {
+	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "50")
+	bootRealm(t)
+	key := appKeyFor(bytes.Repeat([]byte{0x5d}, 32), "startwedge")
+
+	start := time.Now()
+	err := bindAll(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("bindAll accepted a module whose start section never returns")
+	}
+	// It must be the DEADLINE that refused it, not validation: a compile-time refusal
+	// would pass this test while leaving the wedge wide open. The error comes from
+	// instantiation, and it took about as long as the bound.
+	if !strings.Contains(err.Error(), "instantiate") {
+		t.Fatalf("bind refused with %v, want an instantiate failure (the bound, not a validation error)", err)
+	}
+	if elapsed < 40*time.Millisecond || elapsed > 5*time.Second {
+		t.Fatalf("the bind was refused after %s, want ~50 ms: that is not the bound firing", elapsed)
+	}
+	// All-or-none (§3.1): a refused bind leaves the table exactly as it was.
+	if apps[key] != nil {
+		t.Fatal("a refused bind left the app on the table")
+	}
+
+	// The host is unharmed — the runtime that killed the wedge still binds and runs an
+	// ordinary module.
+	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		t.Fatalf("bindAll refused a healthy module after the wedge: %v", err)
+	}
+	msg := []byte("still alive")
+	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
+		t.Fatalf("healthy module echo = %q, want %q", r, msg)
 	}
 }

@@ -281,8 +281,12 @@ export interface BundleHost {
      *
      *  Throws on any structural failure (not valid wasm, missing exports, scratch out of
      *  bounds, invalid scratchSize) **with the table untouched**: nothing is bound unless
-     *  everything validated, and whatever was built before the failure is released. */
-    bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void;
+     *  everything validated, and whatever was built before the failure is released.
+     *
+     *  May be async — the JS targets stand each module up in its own worker, so the bind
+     *  returns once every worker has loaded (§4.3); a host whose instances materialize
+     *  synchronously (the native table, over Go's bridge) returns void. */
+    bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void | Promise<void>;
     /** Unbind an app's whole module set, returning how many modules went. Optional, and
      *  wanted for ONE reason: the load that bound its modules and then could not persist
      *  its freshness mark must not leave those modules reachable while it reports failure
@@ -1049,7 +1053,7 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *  bricked by a failed upgrade, which is the exact outcome `freshVersion` exists to
  *  prevent. The caller passes `deferMark` there and advances once the realm stands
  *  (§12.4: the mark records the highest version that actually loaded). */
-export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): LoadedBundle {
+export async function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): Promise<LoadedBundle> {
     // The `version` is an enforced monotonic integer (verifyManifest shape-checked it);
     // whether THIS one may land was already answered by the admission predicate, which
     // read this same store's mark and revocation set as `AdmissionContext` (policy.ts
@@ -1073,7 +1077,7 @@ export function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: F
     // an equal-version reload just re-installs, and a higher-version bundle from the same
     // author replaces the same app's map because the same key derives it.
     try {
-        host.bindAll(appKeyFor(v.author, v.manifest.app),
+        await host.bindAll(appKeyFor(v.author, v.manifest.app),
             v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
     }
     catch (e) {

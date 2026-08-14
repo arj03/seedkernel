@@ -69,9 +69,14 @@ export type RealmFactory = (opts: {
  *  reach installed modules, WITHOUT installWasmModule AND WITHOUT
  *  removeApp. The bind is the bundle loader's job (§12.4); the unbind
  *  is the shell's uninstall method (§12.5). Neither install nor remove is a
- *  public host method. */
+ *  public host method.
+ *
+ *  `callModule` is async: since ABI 6 a module call round-trips (the JS targets
+ *  run a module in its own worker, so its answer crosses an isolate), and it carries
+ *  a deadline — `deadlineMs`, defaulting to the host's own — under which the call is
+ *  killed and respawned rather than holding the node's thread (§4.3). */
 export interface ModuleLookup {
-    callModule(appKey: string, module: string, payload: Uint8Array): Uint8Array | null;
+    callModule(appKey: string, module: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null>;
     isBound(appKey: string, module: string): boolean;
 }
 
@@ -686,9 +691,12 @@ export function createShell(opts: CreateShellOptions & {
                 timers: slot.timers,
             },
             // Bound to THIS app's key, so a bare `host.call` name addresses its own module
-            // map by logical name and has no way to name another app's (§12.2).
+            // map by logical name and has no way to name another app's (§12.2). The
+            // deadline the guest realm computed for the call passes through here: it is
+            // the calling guest's remaining execution segment (§4.3), and a module call
+            // runs under it rather than under a fresh dial of its own.
             modules: {
-                call: (name, p) => host.callModule(appKey, name, p),
+                call: (name, p, deadlineMs) => host.callModule(appKey, name, p, deadlineMs),
                 has: (name) => host.isBound(appKey, name),
             },
         });
@@ -962,7 +970,7 @@ export function createShell(opts: CreateShellOptions & {
             // every other app its load can still fail after the modules bind, and a mark
             // raised by a bundle that never ran would brick the rollback (bundle.ts).
             const isTransport = privileges.includes(PRIVILEGE_LINK);
-            const loaded = installBundle(host, v, platform.freshnessStore, isTransport);
+            const loaded = await installBundle(host, v, platform.freshnessStore, isTransport);
             const key = appKeyFor(loaded.author, loaded.manifest.app);
             // The app's one inbound entrypoint, resolved here and not per message.
             // `entryFor` closes over the slot, so the slot is built first and its entry
@@ -1082,8 +1090,14 @@ export function createShell(opts: CreateShellOptions & {
             netHost?.close();
             netHost = null;
             const dispose = () => {
-                for (const slot of apps.values()) {
-                    disposeSlot(slot);
+                for (const key of [...apps.keys()]) {
+                    // The module table's instances are owned per app — on the JS targets
+                    // that means the module WORKERS, which only removeApp terminates. A
+                    // closed shell must release them rather than leave them standing: the
+                    // table is the platform's, and a shell that is torn down is not coming
+                    // back (§12.5).
+                    host.removeApp(key);
+                    disposeSlot(apps.get(key));
                 }
                 apps.clear();
                 routes.clear();

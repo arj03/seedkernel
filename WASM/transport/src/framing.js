@@ -174,11 +174,17 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
 /** Run this bundle's own ws.wasm — an ordinary `host.call`, like every other name this
- *  program uses. An empty answer is the module's failure signal (§4). */
+ *  program uses. An empty answer is the module's failure signal (§4).
+ *
+ *  Since ABI 6 a module call is ASYNC — the module runs in its own worker on the JS
+ *  targets, so its answer crosses an isolate — and this function returns a Promise.
+ *  The Promise wrapper is also what keeps this bundle honest on a host whose module
+ *  calls are still synchronous: `Promise.resolve` normalizes both shapes. */
 function wsCall(req) {
-  const out = host.call(N_WS, req);
-  if (out.length === 0) throw new Error("ws: module error");
-  return out;
+  return Promise.resolve(host.call(N_WS, req)).then((out) => {
+    if (!out || out.length === 0) throw new Error("ws: module error");
+    return out;
+  });
 }
 
 class WsFramer {
@@ -194,14 +200,37 @@ class WsFramer {
     this.fragOpcode = -1;
     this.frags = [];
     this.fragBytes = 0;
+    // Outbound order: every wire write is a link in this chain, so an async module
+    // call can never let a later frame overtake an earlier one — the record layer
+    // above relies on the byte order.
+    this.writes = Promise.resolve();
+    // Inbound order, for the same reason: push() awaits module calls, and the host
+    // hands over a chunk per socket read without waiting for the previous one to be
+    // parsed. Two chunks in one turn must not run two parsers over one buffer — the
+    // record layer above counts nonces, so a message delivered out of order is a
+    // decrypt failure and a dead link.
+    this.reads = Promise.resolve();
     if (this.client) {
-      const r = wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
-      this.key = utf8Decode(r);
-      this.expectAccept = utf8Decode(wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
-      this.put(utf8Encode(
-        "GET / HTTP/1.1\r\nHost: " + authority + "\r\n" +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        "Sec-WebSocket-Key: " + this.key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+      // The upgrade head needs two module calls (the base64 of the key, then the
+      // accept it derives) — computed on a later turn and put the moment it is
+      // ready, ahead of anything queued behind it. `prepared` is what upgrade()
+      // awaits before reading the reply, and it REJECTS there if the module could not
+      // produce a key: a client that never wrote its GET has no handshake to read a
+      // reply to, and must abort rather than wait out the idle clock. The bare catch
+      // below is only so a link torn down before anyone awaits it does not report an
+      // unhandled rejection into the realm — it does not swallow the one above.
+      this.prepared = (async () => {
+        const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
+        this.key = utf8Decode(r);
+        this.expectAccept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
+        this.put(utf8Encode(
+          "GET / HTTP/1.1\r\nHost: " + authority + "\r\n" +
+          "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+          "Sec-WebSocket-Key: " + this.key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"));
+      })();
+      this.prepared.catch(() => {});
+    } else {
+      this.prepared = Promise.resolve();
     }
   }
 
@@ -220,36 +249,67 @@ class WsFramer {
     return wsCall(req);
   }
 
+  /** Append one write to the wire chain: frame the message, then put it — in order,
+   *  when its module call answers. A failure drops the frame: the link is dying (or
+   *  dead) anyway, and the peer's read side or the idle clock notices. */
+  enqueue(opcode, payload) {
+    this.writes = this.writes.then(() => this.frame(opcode, payload)).then((f) => { this.put(f); }).catch(() => {});
+  }
+
   send(msg) {
     // The transport emits its HELLO the moment the link exists — before the upgrade
     // has finished — so frames queue until the channel opens.
     if (!this.open) { this.queue.push(msg); return; }
-    this.put(this.frame(WS_OP_BINARY, msg));
+    this.enqueue(WS_OP_BINARY, msg);
   }
 
   /** The close frame rides the same byte stream as the end-of-stream record just
    *  written, so it cannot overtake it — which is the ordering that record depends on. */
   goodbye() {
-    if (this.open) { try { this.put(this.frame(WS_OP_CLOSE, WS_CLOSE_NORMAL)); } catch { /* gone */ } }
+    if (this.open) this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL);
   }
 
+  /** Wait for every pending write. close() uses this so the EOS record and the close
+   *  frame land on the wire before the host channel closes. */
+  flush() { return this.writes; }
+
+  /** One chunk in, in arrival order. The parse itself is `read` below; this is the
+   *  chain that keeps two of them from running at once. A chunk that arrives after a
+   *  refusal is still parsed — the link is closing on that refusal, and `closed` gates
+   *  what a late delivery could reach.
+   *
+   *  Two parses over one buffer would be wrong in two ways that are easy to miss because
+   *  a third component hides the first: `frames()` TAKES a frame before awaiting its
+   *  decode, so a second parser reads the frame after it — and only the module table's
+   *  own FIFO (one call in flight per module) puts the two decodes back in order. The
+   *  cap has no such luck: `raiseCap()` lands when msg4 is DELIVERED, so a second parser
+   *  measuring the frame that rode the same segment measures it against the pre-auth cap
+   *  and refuses a legitimate link. Order here is this file's to guarantee, not another
+   *  component's to happen to provide. */
   push(chunk, deliver) {
+    const done = this.reads.then(() => this.read(chunk, deliver));
+    this.reads = done.catch(() => {});
+    return done;
+  }
+
+  async read(chunk, deliver) {
     this.parts.push(chunk);
     if (!this.open) {
       let consumed;
-      try { consumed = this.upgrade(); } catch { return false; }
+      try { consumed = await this.upgrade(); } catch { return false; }
       if (consumed < 0) return this.parts.length <= MAX_WS_HANDSHAKE;
       this.parts.take(consumed);
       this.open = true;
-      for (const m of this.queue) this.put(this.frame(WS_OP_BINARY, m));
+      for (const m of this.queue) this.enqueue(WS_OP_BINARY, m);
       this.queue = [];
     }
-    try { return this.frames(deliver); } catch { return false; }
+    try { return await this.frames(deliver); } catch { return false; }
   }
 
   /** Read (client) or answer (server) the opening handshake. Returns the bytes
    *  consumed, or -1 when the head is not complete yet. Throws on a refusal. */
-  upgrade() {
+  async upgrade() {
+    await this.prepared;
     const sep = this.parts.findHeadEnd();
     if (sep < 0) return -1;
     const head = utf8Decode(this.parts.peek(sep));
@@ -263,7 +323,7 @@ class WsFramer {
     }
     const key = headerValue(head, "sec-websocket-key");
     if (!key) throw new Error("ws: missing Sec-WebSocket-Key");
-    const accept = utf8Decode(wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), utf8Encode(key)])));
+    const accept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), utf8Encode(key)])));
     this.put(utf8Encode(
       "HTTP/1.1 101 Switching Protocols\r\n" +
       "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
@@ -274,7 +334,7 @@ class WsFramer {
   /** Parse whatever frames are complete. Delivery is per frame rather than per chunk:
    *  delivering msg4 raises the cap, and an application frame riding the same TCP
    *  segment must be measured against the raised cap, not the pre-auth one. */
-  frames(deliver) {
+  async frames(deliver) {
     for (;;) {
       const total = this.frameLength();
       if (total < 0) return true;
@@ -285,7 +345,7 @@ class WsFramer {
       req[0] = WS_OP_DECODE_ONE;
       req[1] = this.client ? 0 : 1; // a server expects masked frames, a client unmasked
       req.set(whole, 2);
-      const r = wsCall(req);
+      const r = await wsCall(req);
       // The module saw exactly one whole frame; anything but "frame" (1) is a protocol
       // violation — bad mask direction, a fragmented control frame, a bad length.
       if (r[0] !== 1) return false;
@@ -301,7 +361,7 @@ class WsFramer {
           const msg = concatBytes(this.frags);
           const first = this.fragOpcode;
           this.fragOpcode = -1; this.frags = []; this.fragBytes = 0;
-          if (!this.dispatch(first, msg, deliver)) return false;
+          if (!(await this.dispatch(first, msg, deliver))) return false;
         }
       } else if (!fin) {
         // The first fragment of a data message (the module refuses fragmented control).
@@ -313,14 +373,14 @@ class WsFramer {
         // A data frame may not preempt an in-flight fragmented message; control frames
         // interleave freely (RFC 6455 §5.4).
         if (opcode < 0x8 && this.fragOpcode >= 0) return false;
-        if (!this.dispatch(opcode, payload, deliver)) return false;
+        if (!(await this.dispatch(opcode, payload, deliver))) return false;
       }
     }
   }
 
-  dispatch(opcode, payload, deliver) {
+  async dispatch(opcode, payload, deliver) {
     if (opcode === WS_OP_BINARY) deliver(payload);
-    else if (opcode === WS_OP_PING) this.put(this.frame(WS_OP_PONG, payload));
+    else if (opcode === WS_OP_PING) this.enqueue(WS_OP_PONG, payload);
     else if (opcode === WS_OP_CLOSE) return false;
     return true;
   }

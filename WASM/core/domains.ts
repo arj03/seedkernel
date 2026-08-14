@@ -75,8 +75,16 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  guest seam to check a manifest field. That edge would drag the whole name catalog
  *  and preamble into every page that verifies a bundle, including pages that only
  *  inspect one and never build a seam at all. guest-seam.ts re-exports it, so a
- *  reader of the seam still finds the number next to the names. */
-export const GUEST_ABI_VERSION = 5;
+ *  reader of the seam still finds the number next to the names.
+ *
+ *  **At 6 a bare name — one of the asking bundle's own modules — is on the async side
+ *  of the catalog**: a module call round-trips so it can be bounded, running on the JS
+ *  targets in its own worker under the calling guest's remaining execution segment and
+ *  terminable when it burns it (PROTOCOL §4.3). 5 is refused by the loader rather than
+ *  tolerated, like the retired manifest suite 0x01: a guest written against it reads
+ *  `host.call("codec", …)` synchronously and would get a Promise where it expects
+ *  bytes, which is precisely the silent failure the ABI exists to prevent. */
+export const GUEST_ABI_VERSION = 6;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half
  *  of the seam, and **not** something a manifest declares. `cryptoCatalog` (guest-seam.ts)
  *  is total over this list: a host that has that file has every name in it, so a partial

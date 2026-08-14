@@ -138,6 +138,20 @@ let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }
 assert(wsIntact, "every byte survived WS framing + reassembly");
 
+// Many requests in flight at once — the pipelining case, which is what puts several
+// chunks on the socket in one turn. Decoding a WS frame is a module call, so a push
+// parks, and the host hands over the next chunk without waiting for it: what keeps the
+// two parses from running over one reassembly buffer is the framer's read chain
+// (framing.js `push`). Each answer must be the one its own request asked for.
+const burst = await Promise.all(
+  Array.from({ length: 12 }, (_, i) => appRequest(c, appKey, d.transport.peerId, generatorRequest(1024 + i, 11 + i))));
+let burstIntact = burst.length === 12;
+burst.forEach((resp, i) => {
+  if (resp.length !== 1024 + i) { burstIntact = false; return; }
+  for (let j = 0; j < resp.length; j++) if (resp[j] !== ((j * (11 + i)) & 0xff)) { burstIntact = false; return; }
+});
+assert(burstIntact, "12 concurrent requests each got their OWN answer back, in one piece");
+
 await cNet.close();
 await dNet.close();
 

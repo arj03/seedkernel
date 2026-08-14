@@ -155,6 +155,12 @@ interface ExecClock {
   end(): void;
   /** Start a fresh budget — one entrypoint invocation. */
   reset(): void;
+  /** The guest's remaining execution segment, in ms — what a call out of this realm is
+   *  charged against (§4.3). Read at the moment the call is made: a module call carries
+   *  it as its deadline, so a module runs under the budget of the segment that called it
+   *  — "charged to the calling guest's budget" enforced rather than aspirational —
+   *  instead of getting a fresh dial of its own. Infinity for an unbounded realm. */
+  remaining(): number;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
@@ -181,6 +187,10 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
     begin() { segmentStart = Date.now(); running = true; },
     end() { if (running) { consumedMs += Date.now() - segmentStart; running = false; } },
     reset() { consumedMs = 0; },
+    remaining() {
+      if (!running || !Number.isFinite(budgetMs)) return Infinity;
+      return Math.max(0, budgetMs - consumedMs - (Date.now() - segmentStart));
+    },
   };
 }
 
@@ -381,7 +391,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle));
+    // The third argument is host plumbing, not ABI: the realm's remaining execution
+    // segment, which a module call runs under (§4.3). Computed at the moment of the
+    // call, while the segment is live.
+    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), clock.remaining());
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
       // Sync name — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));

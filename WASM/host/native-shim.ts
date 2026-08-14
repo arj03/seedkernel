@@ -319,9 +319,14 @@ const table: ModuleTableBackend = {
     // default crosses with it: it is the shared host's number (core/wasm-limits.ts),
     // so Go's table never owns a copy of the default the JS table enforces.
     bindAll(appKey, mods) { bridge.bindAll(appKey, mods, DEFAULT_SCRATCH_SIZE); },
-    callModule(appKey, module, payload) {
+    // The seam shape is uniform across targets: a module call is a promise since ABI 6,
+    // and its bound comes from the calling guest's remaining segment. On THIS target the
+    // bridge call still runs synchronously inside the caller's frame (Go's wazero call
+    // with the host's own deadline, main.go `SEEDKERNEL_MODULE_DEADLINE_MS`), so the
+    // passed deadline is deliberately ignored — Go's bound is the deployed one.
+    callModule(appKey, module, payload, _deadlineMs) {
         const r = bridge.callModule(appKey, module, payload);
-        return r === null ? null : new Uint8Array(r);
+        return Promise.resolve(r === null ? null : new Uint8Array(r));
     },
     isBound(appKey, module) { return bridge.isBound(appKey, module); },
     removeApp(appKey) { return bridge.removeApp(appKey); },

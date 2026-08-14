@@ -573,8 +573,16 @@ class Link {
       } catch { /* the channel is already gone */ }
     }
     this.teardown();
-    try { netLinkClose(this.linkId, saidGoodbye); } catch { /* already gone */ }
-    this.finish();
+    // The two goodbye records above are QUEUED, not yet on the wire: the module calls
+    // framing them answer on a later turn, and the close frame must land after the EOS
+    // record. Close the host channel only once the framer's last write has — the
+    // `graceful` close then flushes nothing that has not been written, and the peer
+    // reads one clean shutdown instead of a truncation.
+    const flushed = (this.framer && this.framer.flush ? this.framer.flush() : Promise.resolve()).catch(() => {});
+    void flushed.then(() => {
+      try { netLinkClose(this.linkId, saidGoodbye); } catch { /* already gone */ }
+      this.finish();
+    });
   }
 
   // Every failure path uses abort(), never close(): only close() emits the
@@ -610,7 +618,14 @@ class Link {
 
   /** Inbound bytes from the host: a whole message on a framed link, an arbitrary
    *  slice on an unframed one. An over-cap declaration is a protocol violation, so it
-   *  is a defensive abort — no goodbye record, nothing said. */
+   *  is a defensive abort — no goodbye record, nothing said.
+   *
+   *  A framed link's push is async (its decode runs in the bundle's ws module, whose
+   *  answer crosses an isolate since ABI 6), so the abort decision lands on a later
+   *  turn — and the host does not wait for it before handing over the next chunk. What
+   *  keeps delivery in the order the record layer's counter requires is the framer's
+   *  own read chain (framing.js, `push`), which parses one chunk at a time; `closed`
+   *  gates what a delivery arriving after an abort can still reach. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (a browser WebSocket, an RTCDataChannel) arrives with
@@ -623,7 +638,13 @@ class Link {
       this.onMessage(bytes);
       return;
     }
-    if (!this.framer.push(bytes, (m) => this.onMessage(m))) this.abort(true);
+    // The push is a Promise on a framed link (its decode runs in the bundle's ws
+    // module, whose answer crosses an isolate since ABI 6) and a plain boolean on a
+    // length-framed one — Promise.resolve normalizes both.
+    void Promise.resolve(this.framer.push(bytes, (m) => this.onMessage(m))).then(
+      (ok) => { if (!ok) this.abort(true); },
+      () => { this.abort(true); },
+    );
   }
 
   /** Route one whole link message. A message is a bare body, and which one it is

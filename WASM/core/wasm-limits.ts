@@ -3,15 +3,16 @@
 // (the realm heap cap and the module memory ceiling — see DEFAULT_REALM_MEMORY_BYTES)
 // and the §4.1 scratch default every host's table must agree on.
 //
-// §4.3 leaves two residuals over what an installed module may CONSUME, and this file
-// closes the memory one. It cannot be closed *after* instantiation — `new
-// WebAssembly.Instance` allocates the declared initial memory before any export runs, so
-// a module declaring 4 GiB has already taken the host down by the time module-table.ts's
-// scratch validation sees it. The bound has to be read off the bytes first, which is what
-// this file is for. (The compute residual is the other one, and it is narrower than it
-// reads: a module call is synchronous, so its time is charged to the calling guest's
-// execution budget — what is missing is the ability to INTERRUPT a call that never
-// returns, since the JS platform's WebAssembly offers no fuel or timeout. §12.3.)
+// §4.3 bounds two things an installed module may CONSUME; this file bounds the memory.
+// It cannot be bounded *after* instantiation — `new WebAssembly.Instance` allocates the
+// declared initial memory before any export runs, so a module declaring 4 GiB has already
+// taken the host down by the time module-table.ts's scratch validation sees it. The bound
+// has to be read off the bytes first, which is what this file is for. (Compute is the
+// other, and it is bounded at each target's engine rather than here: a call carries the
+// calling guest's remaining execution segment (§12.3) as its deadline, landed by killing
+// the module's worker on the JS targets (module-table.ts) and by wazero's
+// `WithCloseOnContextDone` on the native one, behind a flag — native/main.go,
+// `SEEDKERNEL_MODULE_DEADLINE_MS`.)
 //
 // The JS WebAssembly API exposes no memory limits on a compiled `Module`, so this walks
 // the binary's section headers and reads the limits directly. It is a *bounds read*, not

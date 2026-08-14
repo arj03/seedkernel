@@ -184,11 +184,11 @@ func callModule(appKey, module string, payload []byte) []byte {
 		}
 		return nil
 	}
-	// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
-	// length is a failure. A 0-length result is a valid EMPTY response, not a
+	// handle returns output_len ≥ 0 (README §4): only a trap (handled above) or a
+	// negative length is a failure. A 0-length result is a valid EMPTY response, not a
 	// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
 	// from "no module / trap" (nil).
-	if err != nil || len(r) == 0 {
+	if len(r) == 0 {
 		return nil
 	}
 	outLen := int32(r[0])
@@ -242,7 +242,18 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
 	modSeq++
-	m, err := rt.InstantiateModule(ctx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
+	// Under the same bound as a call, for the same reason: instantiation RUNS the
+	// module's start section, so a module whose initializer never returns wedges the
+	// host at BIND — the one place the call-time deadline cannot reach. The JS table
+	// bounds its load for exactly this (module-table.ts), and an armed runtime is what
+	// lets the deadline land here too. Cancelled the moment instantiation returns,
+	// like the call path: the context bounds this invocation, not the module's life.
+	instCtx, cancel := ctx, func() {}
+	if moduleCallDeadline > 0 {
+		instCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
+	}
+	m, err := rt.InstantiateModule(instCtx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
+	cancel()
 	if err != nil {
 		_ = cm.Close(ctx)
 		return nil, fmt.Errorf("instantiate: %w", err)

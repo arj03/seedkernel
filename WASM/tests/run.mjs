@@ -125,8 +125,9 @@ withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem76
 
 // Install one verified module as the whole of `appKey`'s module set. Bundles are the only
 // way code arrives (§12.4); there is no wire install envelope. Throws on structural failure.
-function installMod(host, appKey, module, wasm) {
-  host.bindAll(appKey, [{ name: module, wasm }]);
+// Async: a bind stands each module up in its own worker and returns when it has loaded.
+async function installMod(host, appKey, module, wasm) {
+  await host.bindAll(appKey, [{ name: module, wasm }]);
 }
 
 // The §5.1 app key a bundle's modules land under, `"<author hex>:<app>"` — the real
@@ -148,9 +149,8 @@ async function testFullLifecycle() {
 
   // Install the chat module under its app's key, through the same path the bundle
   // loader uses. It is a pure transform (the forwarder fixture echoes its input).
-  installMod(host, chatKey, "chat", forwarderBytes);
+  await installMod(host, chatKey, "chat", forwarderBytes);
   assert(host.isBound(chatKey, "chat"), "chat module installed");
-
   // There is no install record to consult: the author is IN the app key (§5.1), so the
   // table itself says who authored what it holds — without parsing a module name out of
   // anything, because the module is a key one level down.
@@ -161,7 +161,7 @@ async function testFullLifecycle() {
   // guest seam by its bare name (§12.2), against the app key its seam holds; here the host
   // calls it directly.
   const text = new TextEncoder().encode("hello from author");
-  const resp = host.callModule(chatKey, "chat", text);
+  const resp = await host.callModule(chatKey, "chat", text);
   assert(resp !== null && bytesEqual(resp, text), "module echoed its input");
 
   console.log("  OK\n");
@@ -306,14 +306,14 @@ async function testDerivedNamesKeepAuthorsApart() {
   assert(bKey.startsWith(toHex(bPk) + ":"), "B's key leads with B's key");
 
   // Both install. Neither displaces the other — they coexist.
-  installMod(host, aKey, "fwd", forwarderBytes);
-  installMod(host, bKey, "fwd", forwarderBytes);
+  await installMod(host, aKey, "fwd", forwarderBytes);
+  await installMod(host, bKey, "fwd", forwarderBytes);
   assert(host.isBound(aKey, "fwd"), "A's app is bound");
   assert(host.isBound(bKey, "fwd"), "B's app is bound — it did not have to contend for a name");
 
   // A re-install by the SAME author lands on the SAME entry: an update, in place, with no
   // ownership rule consulted anywhere.
-  installMod(host, aKey, "fwd", forwarderBytes);
+  await installMod(host, aKey, "fwd", forwarderBytes);
   assert(host.isBound(aKey, "fwd"), "A's re-install still occupies the entry");
   assertEqual(appKey(aPk, "shared"), aKey, "the same key derives the same app key");
 
@@ -432,9 +432,9 @@ async function testInstallerRemove() {
   const notes = appKey(pk, "notes");
   const theirs = appKey(other, "chat");
 
-  host.bindAll(chat, [{ name: "text", wasm: forwarderBytes }, { name: "media", wasm: forwarderBytes }]);
-  installMod(host, notes, "text", forwarderBytes);
-  installMod(host, theirs, "text", forwarderBytes);
+  await host.bindAll(chat, [{ name: "text", wasm: forwarderBytes }, { name: "media", wasm: forwarderBytes }]);
+  await installMod(host, notes, "text", forwarderBytes);
+  await installMod(host, theirs, "text", forwarderBytes);
   assert(host.isBound(chat, "text") && host.isBound(chat, "media"), "the app's two modules installed");
   assert(host.isBound(notes, "text") && host.isBound(theirs, "text"), "the other two apps installed");
 
@@ -450,7 +450,7 @@ async function testInstallerRemove() {
   // for — the key can only be derived by the author whose public key is half of it — so
   // there is no stale ownership to misattribute onto new bytes and no tombstone.
   assertEqual(host.removeApp(chat), 0, "a second call removes nothing");
-  installMod(host, chat, "text", forwarderBytes);
+  await installMod(host, chat, "text", forwarderBytes);
   assert(host.isBound(chat, "text"), "reinstall after remove succeeds");
 
   console.log("  OK\n");
@@ -610,7 +610,7 @@ async function testGuestSeam() {
   // echoes its input, admitted the one way code arrives (§12.4).
   const { host } = await makeHost();
   const testKey = appKey(id.publicKey, "testapp");
-  installMod(host, testKey, "echo", forwarderBytes);
+  await installMod(host, testKey, "echo", forwarderBytes);
 
   // A host-derived signing scope binds the guest's node/sign name to a bundle
   // namespace (README §12.2); a real node derives it from the manifest's (author, app).
@@ -998,7 +998,7 @@ async function testSlotFreshness() {
       highWater: freshness.get(v.author, v.manifest.app),
       revoked: freshness.isRevoked(v.author),
     });
-    installBundle(host, v, freshness);
+    await installBundle(host, v, freshness);
   };
 
   // Versions are an author's own lineage, transport or not. A's v5 landing does NOT bind
@@ -1609,23 +1609,185 @@ async function testCallModuleGuards() {
   // An unbound module resolves to nothing — null, distinct from an empty response. So
   // does a module under an app that was never installed at all: the outer miss and the
   // inner miss are the same answer, because neither is a thing that exists.
-  assert(host.callModule(guards, "missing", new Uint8Array([1])) === null,
+  assert(await host.callModule(guards, "missing", new Uint8Array([1])) === null,
     "callModule returns null for an unbound module");
-  assert(host.callModule(appKey(pk, "nope"), "echo", new Uint8Array([1])) === null,
+  assert(await host.callModule(appKey(pk, "nope"), "echo", new Uint8Array([1])) === null,
     "callModule returns null for an app that installed nothing");
 
   // An installed module is reached by name. A confined guest reaches the same module
   // through the guest seam by its bare name (§12.2).
-  installMod(host, guards, "echo", forwarderBytes);
-  const r = host.callModule(guards, "echo", new Uint8Array([5]));
+  await installMod(host, guards, "echo", forwarderBytes);
+  const r = await host.callModule(guards, "echo", new Uint8Array([5]));
   assertEqual([...r], [5], "callModule reaches an installed module");
 
   // A 0-length response is a valid EMPTY answer, NOT the null of an unbound name — the
   // two are distinct at this seam, so a caller can tell "module ran, said nothing" from
   // "nothing there". The forwarder echoes, so an empty input produces an empty response.
-  const empty = host.callModule(guards, "echo", EMPTY);
+  const empty = await host.callModule(guards, "echo", EMPTY);
   assert(empty !== null && empty.length === 0,
     "an empty response is an empty array, distinct from null");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: a module call is bounded — the §4.3 compute residual, closed ──────────
+//
+// The JS platform's WebAssembly exposes no fuel or timeout, and a module call used to
+// run synchronously in the host thread — so a module that never returned wedged the
+// node: nothing could interrupt it, and a restart re-triggered it from the same inbound
+// frame. That is what the worker-per-module table exists to close. These checks hold
+// the residual up to the light: a spinning module answers EMPTY at its deadline, the
+// host thread is alive the whole time, and a fresh instance serves the next call.
+async function testModuleCallBound() {
+  console.log("Test: a spinning module is killed at its deadline and respawned (§4.3)");
+
+  const { ModuleTable } = await imp("build/host/module-table.js");
+  const { SPIN_WASM } = await import("./fixtures/spin-wasm.mjs");
+  const { publicKey: pk } = generateKeyPair();
+  const spinKey = appKey(pk, "spin");
+
+  // The default table bound is generous; a bounded host is the deployment's number. The
+  // call's OWN deadline is what a guest's call carries — the guest's remaining segment.
+  const host = new ModuleTable({ deadlineMs: 60_000 });
+  await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  assert(host.isBound(spinKey, "spin"), "the spinning module binds (its memory is bounded at admission)");
+
+  // The host thread is never blocked: timers keep firing while the module spins in its
+  // worker. This is the whole point — the old table ran the call in this thread, so a
+  // spinner wedged EVERYTHING, transport included.
+  let heartbeats = 0;
+  const beats = setInterval(() => heartbeats++, 25);
+
+  const t0 = Date.now();
+  // A 120 ms bound. Null at the table — exactly what a trap produces — which the guest
+  // seam reads as empty BYTES, so nothing downstream changes.
+  const r = await host.callModule(spinKey, "spin", new Uint8Array([1]), 120);
+  const spent = Date.now() - t0;
+  clearInterval(beats);
+
+  assert(r === null, "the spin answers like a trap — null at the table, empty bytes at the seam");
+  assert(spent >= 100 && spent < 3000, `it is killed near its bound, not eventually (${spent}ms)`);
+  assert(heartbeats > 0, "the host thread was alive the whole time the module spun");
+
+  // A fresh instance now serves the next call: the kill terminated the old worker and a
+  // respawn stands a new one in, statics gone. The echo fixture proves the path works
+  // after a kill rather than assuming it.
+  await host.bindAll(spinKey, [{ name: "spin", wasm: forwarderBytes }]);
+  const echo = await host.callModule(spinKey, "spin", new Uint8Array([9]), 1000);
+  assertEqual([...echo], [9], "a module called again after a kill-and-respawn still runs");
+
+  // Two calls to the SAME module cannot run at once: the table keeps one in flight per
+  // module (§3, "one transform at a time"), so a spinner burns one core for one bound.
+  const host2 = new ModuleTable();
+  await host2.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  const t1 = Date.now();
+  const [a, b] = await Promise.all([
+    host2.callModule(spinKey, "spin", new Uint8Array(), 80),
+    host2.callModule(spinKey, "spin", new Uint8Array(), 80),
+  ]);
+  const serial = Date.now() - t1;
+  assert(a === null && b === null,
+    "both spins answered like traps, at their own deadlines");
+  assert(serial >= 140 && serial < 5000, `the two calls ran one after the other (${serial}ms)`);
+  // …and the module still answers after two kills in a row, on ONE worker. The respawn
+  // a kill starts and the respawn the queued call would start are the same load
+  // (`ModuleTable.respawn`): two loads there would leave a worker nobody holds — idle,
+  // but never terminated, one leaked thread per kill. That leak is not observable from
+  // the process (an unref'd worker is absent from `getActiveResourcesInfo`), so what is
+  // asserted here is the behaviour it rides on: the ref keeps exactly one live worker
+  // across the kills, so the next call lands.
+  await host2.bindAll(spinKey, [{ name: "spin", wasm: forwarderBytes }]);
+  const after = await host2.callModule(spinKey, "spin", new Uint8Array([3]), 1000);
+  assertEqual([...after], [3], "the module answers on its one respawned worker after two kills");
+  host2.removeApp(spinKey);
+
+  // An unbounded call is an operator's explicit opt-out: Infinity disables the bound,
+  // and the worker then spins until the app is dropped — the host stays responsive, and
+  // dropping the app settles the in-flight call as empty rather than stranding it.
+  const host3 = new ModuleTable({ deadlineMs: Infinity });
+  await host3.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  let beats3 = 0;
+  const beats3Timer = setInterval(() => beats3++, 25);
+  const forever = host3.callModule(spinKey, "spin", new Uint8Array(), Infinity);
+  await sleep(60);
+  clearInterval(beats3Timer);
+  assert(beats3 > 0, "host alive with an unbounded spin in flight");
+  host3.removeApp(spinKey);
+  const dropped = await forever;
+  assert(dropped === null, "removing the app settles the in-flight spin as a trap would");
+
+  console.log("  OK\n");
+}
+
+// ─── Test: the guest's module call runs under the guest's own budget ─────────────
+//
+// "Charged to the calling guest's budget" (§4.3) made literal: the realm computes the
+// caller's remaining execution segment at the moment of the call and hands it to the
+// module as the call's deadline. A guest that has already spent most of its budget gets
+// a module call killed far sooner than the deployment's default bound.
+async function testModuleCallChargedToGuestBudget() {
+  console.log("Test: a module call is charged to the calling guest's remaining segment (§4.3)");
+
+  const { ModuleTable } = await imp("build/host/module-table.js");
+  const { SPIN_WASM } = await import("./fixtures/spin-wasm.mjs");
+  const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
+  const { createSafeRealm } = await imp("build/host/safe-js.js");
+  const id = generateKeyPair();
+
+  const host = new ModuleTable({ deadlineMs: 60_000 });
+  const spinKey = appKey(id.publicKey, "app");
+  await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
+  const seam = createGuestSeam({
+    platform: { sodium, identity: id },
+    grants: { names: UNRESTRICTED_NAMES },
+    modules: {
+      call: (n, p, deadlineMs) => host.callModule(spinKey, n, p, deadlineMs),
+      has: (n) => host.isBound(spinKey, n),
+    },
+  });
+  // The realm's budget is 5 s, but the guest burns most of it before calling the module:
+  // the call must then be killed near what remains, not at the table's 60 s.
+  const realm = await createSafeRealm({
+    source: `register("go", async () => {
+      const t0 = Date.now();
+      while (Date.now() - t0 < 4900) { /* burn the segment */ }
+      return await host.call("spin", new Uint8Array());
+    });`,
+    hostCall: seam,
+    deadlineMs: 5000,
+  });
+  const t0 = Date.now();
+  const out = await realm.call("go", new Uint8Array());
+  const spent = Date.now() - t0;
+  realm.dispose();
+  assert(out !== null && out.length === 0, "the module answered empty at the guest's deadline");
+  // The burn is ~4.9s, so the whole call is ~5s; the module itself died at the ~100ms
+  // that remained, NOT at the table's 60s default — a broken deadline flow would hang
+  // this call for a minute instead.
+  assert(spent >= 4800 && spent < 8000,
+    `the call died with the guest's remaining budget, not the table's (${spent}ms)`);
+
+  console.log("  OK\n");
+}
+
+// ─── Test: guest ABI 5 is refused — module calls moved across the sync/async line ─
+async function testAbiFiveRefused() {
+  console.log("Test: guest ABI 5 is refused at load — bare module names are async since ABI 6");
+
+  const author = testAuthor();
+  const manifest = { app: "legacy", version: 1,
+    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+    guest: { hash: "aa", abi: 5, requires: [] } };
+  const env = signManifest(sodium, author, manifest);
+  const blob = packBundle({
+    [MANIFEST_FILE]: env,
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  let msg = "";
+  try { verifyBundle(sodium, blob); } catch (e) { msg = e.message; }
+  assert(msg.includes("guest ABI 5 is not implemented"), `ABI 5 is refused by name (got: ${msg || "no throw"})`);
+  assert(msg.includes("6"), "the refusal names the supported ABI");
 
   console.log("  OK\n");
 }
@@ -1975,7 +2137,7 @@ async function testHybridManifestSuite() {
     assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey),
       "verifyBundle carries the signing key set through to the policy seam");
     const host = await createModuleTable();
-    installBundle(host, v);
+    await installBundle(host, v);
     const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
     assert(host.isBound(derived, "codec"), "the module binds under the derived author id");
     assert(!host.isBound(appKey(ed.publicKey, "pq-app"), "codec"),
@@ -2302,7 +2464,7 @@ async function testPersistFailureRollsBack() {
   const host = new ModuleTable();
   const broken = new BrokenStore();
   let msg = "";
-  try { installBundle(host, v, broken); } catch (e) { msg = e.message; }
+  try { await installBundle(host, v, broken); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
   assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
   assert(!host.isBound(key, "fwd"), "nothing was kept — the modules did not stay bound");
@@ -2311,7 +2473,7 @@ async function testPersistFailureRollsBack() {
   // A retry against a healthy store completes cleanly: the rollback is what makes
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
-  installBundle(host, v, healthy);
+  await installBundle(host, v, healthy);
   assert(host.isBound(key, "fwd"), "the retry lands");
   assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
   console.log("  OK\n");
@@ -2378,8 +2540,11 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   });
 
   // Each realm records what it was asked to run and whether it was released. Every
-  // one arms a 5ms deadline on construction, which is the guest's half: a deadline
+  // one arms a 200ms deadline on construction, which is the guest's half: a deadline
   // exists only because a guest asked for one, and it re-enters THAT guest's realm.
+  // (Not 5ms: the upgrade now loads the replacing bundle's modules in workers, which
+  // outlasts a 5ms timer — and a deadline firing inside the install window is a
+  // legitimate turn of the guest that armed it, not a leak.)
   const realms = [];
   const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
   const shell = mkShell({
@@ -2388,7 +2553,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       createRealm: async (o) => {
         const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
         realms.push(r);
-        await o.hostCall("timer/arm", arm(1, 5));
+        await o.hostCall("timer/arm", arm(1, 200));
         return r;
       },
     },
@@ -2407,9 +2572,9 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
     assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
     assert(!realms[1].disposed, "…which is the one left standing");
 
-    // Past the 5ms deadline both realms armed. Only the standing one may hear it: a
+    // Past the 200ms deadline both realms armed. Only the standing one may hear it: a
     // `timer` turn in realms[0] is the superseded guest still executing.
-    await new Promise((r) => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 350));
     assert(!realms[0].calls.includes("timer"),
       `the replaced guest ran no timer turn after the upgrade (ran: ${realms[0].calls.join(",")})`);
     assert(realms[1].calls.includes("timer"), "…while the standing guest's own deadline still fires");
@@ -2444,6 +2609,9 @@ await testSafeJs();
 await testRealmSerialization();
 await testSeamGating();
 await testCallModuleGuards();
+await testModuleCallBound();
+await testModuleCallChargedToGuestBudget();
+await testAbiFiveRefused();
 await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();

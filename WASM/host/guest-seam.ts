@@ -211,8 +211,16 @@ export interface SeamGrants {
 export interface SeamModules {
     /** Reach one of this app's modules. A guest calls it through the SAME `host.call` as
      *  everything else, by the bare logical name (§12.2); the dispatch knows a bare name
-     *  is one of these because no host name is bare. */
-    call: (name: string, payload: Uint8Array) => Uint8Array | null;
+     *  is one of these because no host name is bare.
+     *
+     *  Since ABI 6 a module call is ASYNC — the JS targets run a module in its own
+     *  worker, and a call crosses an isolate — so this returns a Promise on every
+     *  target. `deadlineMs` is the call's bound: a guest's call carries the calling
+     *  guest's REMAINING execution segment (§4.3 — "charged to the calling guest's
+     *  budget" made literal), computed by the realm at the moment of the call and passed
+     *  through the host-side seam. It is host plumbing, never something the guest
+     *  supplies. */
+    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<Uint8Array | null> | null;
     /** Whether this app declares a module by that name. It exists to keep ONE error
      *  surface over the unified catalog: an unknown name is refused whichever half it
      *  would have come from. It cannot be read off `call`, whose `null` also means a trap
@@ -231,14 +239,17 @@ export interface GuestSeamDeps {
 /** What the seam IS — the host half of `host.call`, and what `createGuestSeam` below
  *  returns. `name` addresses a host capability by its opaque name; `payload` and the
  *  return are opaque bytes, exactly like the table's `callModule(name, payload) -> bytes`.
- *  A sync name returns bytes directly; a round-tripping one — every `fs/*`, and every
- *  cross-realm `_`-prefixed id — returns a Promise the guest awaits (§12.2).
+ *  A sync name returns bytes directly; a round-tripping one — every `fs/*`, every
+ *  cross-realm `_`-prefixed id, and since ABI 6 every bare module name — returns a
+ *  Promise the guest awaits (§12.2). `deadlineMs` is HOST plumbing, not ABI: the realm
+ *  passes the calling guest's remaining execution segment through it so a module call
+ *  is charged to the guest's own budget (§4.3); a guest never sees or supplies it.
  *
  *  It is declared HERE, beside the names it can carry, rather than in the realm that
  *  runs against it: a realm factory (safe-js.ts, native-shim.ts) is a *consumer* of the
  *  seam, and the signature of what this file produces is not a consumer's to own. Both
  *  factories import it from here, so the dependency runs one way. */
-export type HostCall = (name: string, payload: Uint8Array) => Promise<Uint8Array> | Uint8Array;
+export type HostCall = (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> | Uint8Array;
 
 /** The version of the seam defined below — re-exported so a reader of the seam finds it
  *  beside them, and so `seedkernel-wasm/guest-seam` is the import a bundle builder
@@ -372,13 +383,14 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
  *
  *    __host_call(name: string, callId, payload: ArrayBuffer) -> ArrayBuffer | null
  *
- *  Returning bytes completes a **sync** name (the primitive catalog, clock, the bundle's
- *  own modules, the raw-link names) inline. Returning `null` means the host started an
- *  **async** name under `callId` — every `fs/*`, and every `_`-led cross-realm call — and
- *  the guest parks a Promise here, which the host later settles with
- *  `__netResolve(callId, bytes)` or `__netReject(callId, msg)`. `null` is RESERVED for
- *  that — a sync name that ever returned null/undefined would be read as async and leave
- *  a Promise pending forever.
+ *  Returning bytes completes a **sync** name (the primitive catalog, clock, the raw-link
+ *  names) inline. Returning `null` means the host started an **async** name under
+ *  `callId` — every `fs/*`, every `_`-led cross-realm call, and since ABI 6 every
+ *  bare module name (a module runs in its own worker on the JS targets, so its answer
+ *  crosses an isolate) — and the guest parks a Promise here, which the host later
+ *  settles with `__netResolve(callId, bytes)` or `__netReject(callId, msg)`. `null` is
+ *  RESERVED for that — a sync name that ever returned null/undefined would be read as
+ *  async and leave a Promise pending forever.
  *
  *  The async half is deliberately plain ECMAScript rather than a host-created deferred:
  *  the guest builds its own Promise, so the seam needs no promise primitive from the
@@ -881,7 +893,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // null means "the caller named the sentinel" — never "the caller forgot".
     const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
     const handlers = hostCatalog(platform, grants);
-    return (name, payload) => {
+    return (name, payload, deadlineMs) => {
         // The gate covers authorities, and a granted authority is an EXACT-name check:
         // the name itself must be one of the manifest's declared requires — an
         // undeclared `node/identity` is refused even beside a declared `node/sign`.
@@ -930,6 +942,19 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // bytes, which is also what a module returning nothing says.
         if (!modules.has(name))
             throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
-        return modules.call(name, payload) ?? NONE;
+        // Since ABI 6 a module call round-trips (the JS targets run the module in its
+        // own worker, so the answer arrives on a later turn) — and it is charged to the
+        // calling guest's remaining execution segment, which the realm passed through
+        // `deadlineMs` and the worker call runs under (§4.3). The failure shape is
+        // unchanged: a module that runs and fails — a trap, a deadline kill — answers
+        // EMPTY, exactly as it always has, and only a name that was never installed is a
+        // refusal. `null` is reserved for "async, promise parked" in the preamble, so a
+        // module result is normalized to empty BYTES on both sides of the await; a
+        // promise never resolves to null.
+        const r = modules.call(name, payload, deadlineMs);
+        if (r !== null && typeof (r as Promise<Uint8Array | null>).then === "function") {
+            return (r as Promise<Uint8Array | null>).then((b) => b ?? NONE);
+        }
+        return (r as Uint8Array | null) ?? NONE;
     };
 }
