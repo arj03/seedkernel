@@ -59,14 +59,16 @@ type boundModule struct {
 // WithCloseOnContextDone so a call that burns past the bound is interrupted at the
 // next loop back-edge and the module closed, instead of holding the thread forever.
 //
-// Default 0 — the lever behind a flag. Arming it measures 2.6–4.8x on the paths
-// modules sit on (RS encode 2.8x, RS decode 4.8x, XChaCha20 2.6x, Ed25519 verify
-// 1.65x — SECURITY §14.1), because the termination check is compiled into every loop
-// of every module on the runtime, including the trusted ones sharing it (libsodium,
-// ML-DSA, ML-KEM). That missed the single-digit-% target the docs set, so the bound
-// is opt-in: SEEDKERNEL_MODULE_DEADLINE_MS (ms) arms it, 0/unset leaves it off, and
-// an off bound also unarms the runtime — no deployment pays the checks for a lever
-// nothing will pull. A bound would ideally mirror the shared guest budget
+// Default 0 — the lever behind a flag. Arming it measures 1.12–1.45x on the paths
+// modules sit on (RS encode 1.24x, RS decode 1.45x, XChaCha20 1.12x, Ed25519 verify
+// 1.24x — module_bound_bench_test.go, SECURITY §14.1), because a termination check is
+// compiled into every loop of every module on the runtime. On STOCK wazero the same
+// paths cost 3.0–5.5x: its check is an unconditional exit from native code into Go per
+// back-edge, where the loader's patched wazero (the go.mod replace) tests the module's
+// Closed word inline and exits only when it is set. The bound stays opt-in while that
+// patch is out of tree: SEEDKERNEL_MODULE_DEADLINE_MS (ms) arms it, 0/unset leaves it
+// off, and an off bound also unarms the runtime — no deployment pays the checks for a
+// lever nothing will pull. A bound would ideally mirror the shared guest budget
 // (core/wasm-limits.ts DEFAULT_GUEST_DEADLINE_MS), since a module call is charged to
 // the calling guest's segment (§12.3) and cannot legitimately outlive it.
 const defaultModuleCallDeadline = 0
@@ -79,9 +81,10 @@ var (
 	rt wazero.Runtime
 	// rtCore is the TCB's own runtime: libsodium, ML-DSA, ML-KEM and their host
 	// imports, deliberately NOT armed. They are trusted code — a wedged libsodium is
-	// a host bug, not a confinement breach — and the termination check costs 2.6–4.8x
-	// on the paths they sit on, so arming them would bill the bound to the crypto
-	// every node runs rather than to the untrusted modules the lever must stop. Same
+	// a host bug, not a confinement breach — and the termination check still costs
+	// 1.1–1.5x on the paths they sit on (defaultModuleCallDeadline above), so arming
+	// them would bill the bound to the crypto every node runs rather than to the
+	// untrusted modules the lever must stop. Same
 	// rule the guest realm follows: arm where untrusted code runs, nowhere else.
 	rtCore wazero.Runtime
 	qc     *qjs.Context
@@ -328,7 +331,7 @@ func boot() error {
 	}
 	// WithCloseOnContextDone arms the termination check compiled into every loop of
 	// every module on this runtime — which is why the TCB's own modules run on rtCore
-	// (unarmed) below: the checks are the measured cost of the lever (2.6–4.8x on the
+	// (unarmed) below: the checks are the measured cost of the lever (1.1–1.5x on the
 	// paths modules sit on, SECURITY §14.1), and a deployment with no bound should
 	// not pay them anywhere.
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
