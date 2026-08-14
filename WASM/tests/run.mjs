@@ -9,7 +9,6 @@ import { performance } from "node:perf_hooks";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
-import { makeTransportHost } from "./transport-harness.mjs";
 import { testkit, makeAuthor } from "./testkit.mjs";
 
 const {

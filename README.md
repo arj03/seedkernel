@@ -201,8 +201,8 @@ The Go platform is the larger of the two only because it has no npm: it embeds i
 
 The fair follow-up to all these seams is whether confinement costs throughput. The proof that it does not is [seed store](https://github.com/arj03/seedstore): a complete storage layer including client-side encryption, Reed–Solomon erasure coding, content addressing, repair shipped as two WASM modules and a confined guest. Its measured numbers are the answer:
 
-- **The full write path — encrypt, hash every block, RS-encode — runs at ~210 MB/s on one thread** (100 MB, RS(10,6), 64 KB blocks, Node 20), balanced across its three pieces: xchacha20 at ~545 MB/s, BLAKE2b block-ids at ~1.1 GB/s, SIMD RS encode at ~670 MB/s. Those are the codec's own computations and they dominate — the runtime's seam between guest and module is not where the time goes.
-- **A read with every block present is ~3 GB/s** — the code is systematic, so a full read is a concatenation with no GF(2⁸) work at all; only a missing block pays a decode, at ~625 MB/s.
+- **The full write path — encrypt, hash every block, RS-encode — runs at ~230 MB/s on one thread** (100 MB, RS(10,6), 64 KB blocks, Node 20.11, a Ryzen 7 PRO 7840U), balanced across its three pieces: xchacha20 at ~440 MB/s, BLAKE2b block-ids at ~960 MB/s, SIMD RS encode at ~1.1 GB/s. Those are the codec's own computations and they dominate — the runtime's seam between guest and module is not where the time goes.
+- **A read with every block present is ~2.4 GB/s** — the code is systematic, so a full read is a concatenation with no GF(2⁸) work at all; only a missing block pays a decode, at ~1.0 GB/s.
 - **End to end, the link bounds throughput, not the runtime:** ~11 MB/s PUT and ~17 MB/s GET over a 10 ms-RTT, WebRTC-capped link with windowed round trips, and ~13 MB/s browser-to-browser — all through the same signed transport bundle every app gets.
 - **The whole layer ships as ~15 KB of WASM plus ~8 KB of gzipped guest JS**, reusing the libsodium the runtime already loads rather than bundling a second copy of a crypto library. The numbers reproduce with `node tests/bench.mjs` in the seedstore repo.
 
