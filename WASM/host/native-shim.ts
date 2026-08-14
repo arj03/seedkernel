@@ -436,6 +436,12 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // Assigned before any guest code can call back: bridge.createRealm evaluates the
     // guest, whose top-level can only reach sync names (a Promise it could not await).
     let realm: number;
+    // No `CallBudget` crosses here: this realm's segment lives in the engine (guest.go
+    // arms QuickJS's deadline, qjs.Runtime.Budget), not in JS, so there is nothing on
+    // this side to read a remainder from or to bill a module's burn back to. The module
+    // bound this target enforces is its own — Go's `SEEDKERNEL_MODULE_DEADLINE_MS`, armed
+    // on the table's runtime (native/main.go) — which is why the seam takes the budget as
+    // optional rather than requiring a number no target could always supply.
     const nativeCall: NativeHostCall = (name, payload, callId) => {
         const r = hostCall(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")

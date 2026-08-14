@@ -1767,6 +1767,33 @@ async function testModuleCallChargedToGuestBudget() {
   assert(spent >= 4800 && spent < 8000,
     `the call died with the guest's remaining budget, not the table's (${spent}ms)`);
 
+  // The other half of "charged": what a module BURNS is billed back to the segment that
+  // called it, and a segment with nothing left refuses the next call. The guest is parked
+  // while the module runs, so the realm's clock is closed and its own spend advances by
+  // microseconds per turn — without the charge every turn draws a fresh full budget, and
+  // without the refusal the charge alone cannot end it either, since QuickJS's interrupt
+  // is consulted per bytecode and this guest executes almost none between parks. Both
+  // together: the burn spends the budget, and the turn after it runs out throws.
+  const looper = await createSafeRealm({
+    source: `register("go", async () => {
+      for (;;) await host.call("spin", new Uint8Array());
+    });`,
+    hostCall: seam,
+    deadlineMs: 1000,
+  });
+  const t1 = Date.now();
+  let killed = "";
+  try { await looper.call("go", new Uint8Array()); }
+  catch (e) { killed = e.message; }
+  const looped = Date.now() - t1;
+  looper.dispose();
+  assert(killed.includes("budget exhausted"),
+    `a guest looping on a spinning module is refused, not endless (ran ${looped}ms, got: ${killed || "no throw"})`);
+  // ~1 s of module burn spends the 1 s budget, and the next turn throws. The upper bound
+  // is what fails if either half is dropped — without them this loop never ends.
+  assert(looped >= 900 && looped < 6000,
+    `the guest died once the module burn added up to its budget (${looped}ms)`);
+
   console.log("  OK\n");
 }
 

@@ -236,20 +236,39 @@ export interface GuestSeamDeps {
     modules: SeamModules;
 }
 
+/** The calling guest's execution segment (§12.3), as the seam sees it — HOST plumbing,
+ *  never ABI: a guest neither supplies nor observes it. It is one concept read and
+ *  written, which is what makes §4.3's "a module call is charged to the calling guest's
+ *  budget" literal rather than accounted-for-in-principle:
+ *
+ *    - `remainingMs` is what a module call runs UNDER — its deadline, so a module cannot
+ *      outlive the guest that asked for it;
+ *    - `charge` is what a module call costs the guest AFTERWARDS, because the module
+ *      burns its time while the guest is parked and the realm's clock is closed. Without
+ *      it a deadline bounds one call and nothing bounds their sequence.
+ *
+ *  Only calls that BURN the guest's CPU are charged. A parked `fs/*` or `_net` call is
+ *  waiting, not burning, and the realm's run-time budget exists precisely so that an
+ *  initiator waiting on the network is not killed for it. */
+export interface CallBudget {
+    /** Milliseconds left in the calling guest's segment; `Infinity` when unbudgeted. */
+    remainingMs: number;
+    /** Bill `ms` of host-side CPU to that segment. */
+    charge(ms: number): void;
+}
+
 /** What the seam IS — the host half of `host.call`, and what `createGuestSeam` below
  *  returns. `name` addresses a host capability by its opaque name; `payload` and the
  *  return are opaque bytes, exactly like the table's `callModule(name, payload) -> bytes`.
  *  A sync name returns bytes directly; a round-tripping one — every `fs/*`, every
- *  cross-realm `_`-prefixed id, and since ABI 6 every bare module name — returns a
- *  Promise the guest awaits (§12.2). `deadlineMs` is HOST plumbing, not ABI: the realm
- *  passes the calling guest's remaining execution segment through it so a module call
- *  is charged to the guest's own budget (§4.3); a guest never sees or supplies it.
+ *  cross-realm `_`-prefixed id, and every bare module name — returns a Promise the guest
+ *  awaits (§12.2). `budget` is the caller's segment (above), supplied by the realm.
  *
  *  It is declared HERE, beside the names it can carry, rather than in the realm that
  *  runs against it: a realm factory (safe-js.ts, native-shim.ts) is a *consumer* of the
  *  seam, and the signature of what this file produces is not a consumer's to own. Both
  *  factories import it from here, so the dependency runs one way. */
-export type HostCall = (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<Uint8Array> | Uint8Array;
+export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array> | Uint8Array;
 
 /** The version of the seam defined below — re-exported so a reader of the seam finds it
  *  beside them, and so `seedkernel-wasm/guest-seam` is the import a bundle builder
@@ -893,7 +912,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // null means "the caller named the sentinel" — never "the caller forgot".
     const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
     const handlers = hostCatalog(platform, grants);
-    return (name, payload, deadlineMs) => {
+    return (name, payload, budget) => {
         // The gate covers authorities, and a granted authority is an EXACT-name check:
         // the name itself must be one of the manifest's declared requires — an
         // undeclared `node/identity` is refused even beside a declared `node/sign`.
@@ -942,18 +961,38 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // bytes, which is also what a module returning nothing says.
         if (!modules.has(name))
             throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
-        // Since ABI 6 a module call round-trips (the JS targets run the module in its
-        // own worker, so the answer arrives on a later turn) — and it is charged to the
-        // calling guest's remaining execution segment, which the realm passed through
-        // `deadlineMs` and the worker call runs under (§4.3). The failure shape is
-        // unchanged: a module that runs and fails — a trap, a deadline kill — answers
-        // EMPTY, exactly as it always has, and only a name that was never installed is a
+        // A module call round-trips (the JS targets run the module in its own worker, so
+        // the answer arrives on a later turn) and is the one name charged to the caller's
+        // segment on BOTH sides (§4.3): it runs under what the guest has left, and what it
+        // burns is billed back when it settles, so a sequence of calls depletes the budget
+        // the way one long call does. The guest is parked meanwhile, so no clock of the
+        // realm's is running to catch it — this is that clock.
+        //
+        // The failure shape is unchanged: a module that runs and fails — a trap, a
+        // deadline kill — answers EMPTY, and only a name that was never installed is a
         // refusal. `null` is reserved for "async, promise parked" in the preamble, so a
         // module result is normalized to empty BYTES on both sides of the await; a
         // promise never resolves to null.
-        const r = modules.call(name, payload, deadlineMs);
+        // A caller with nothing left does not get another one. The charge above is what
+        // spends the segment, but spending it is not enough on its own to END the guest:
+        // the realm's budget lands through QuickJS's interrupt handler, which is consulted
+        // per bytecode executed, and a guest whose whole turn is `await host.call(…)`
+        // executes a handful of bytecodes between parks — it can outlive its budget almost
+        // indefinitely while burning a core in the module. Refusing here is the interrupt
+        // the guest cannot dodge: the throw lands on its own `await`, so the entrypoint
+        // fails on the turn after the budget runs out (§4.3).
+        if (budget !== undefined && budget.remainingMs <= 0)
+            throw new Error("guest-seam: execution budget exhausted before " + name);
+        const started = Date.now();
+        const r = modules.call(name, payload, budget?.remainingMs);
         if (r !== null && typeof (r as Promise<Uint8Array | null>).then === "function") {
-            return (r as Promise<Uint8Array | null>).then((b) => b ?? NONE);
+            return (r as Promise<Uint8Array | null>).then((b) => {
+                // Only the parked path is charged. A host whose modules answer
+                // synchronously ran inside the guest's OWN open segment, which the realm's
+                // clock already counted — billing it again would charge it twice.
+                budget?.charge(Date.now() - started);
+                return b ?? NONE;
+            });
         }
         return (r as Uint8Array | null) ?? NONE;
     };

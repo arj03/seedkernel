@@ -64,7 +64,7 @@ const ngVariant = ngVariantMod as unknown as NonNullable<
 
 // The guest-side ABI, shared with the native loader. See `guestPreamble` for the
 // `__host_call` / `__netResolve` contract this file implements.
-import { guestPreamble, type HostCall } from "./guest-seam.js";
+import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
 import { serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
@@ -158,9 +158,19 @@ interface ExecClock {
   /** The guest's remaining execution segment, in ms — what a call out of this realm is
    *  charged against (§4.3). Read at the moment the call is made: a module call carries
    *  it as its deadline, so a module runs under the budget of the segment that called it
-   *  — "charged to the calling guest's budget" enforced rather than aspirational —
    *  instead of getting a fresh dial of its own. Infinity for an unbounded realm. */
   remaining(): number;
+  /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module
+   *  call, whose time is the guest's by §4.3 but is burned while the guest is parked and
+   *  the segment closed. Without it the deadline alone bounds one call and nothing bounds
+   *  the sequence: a guest looping `await host.call("spinner")` advances its own clock by
+   *  microseconds per turn, so every call draws a fresh full budget and the guest holds a
+   *  core indefinitely. Charged time depletes the same `consumedMs` the interrupt handler
+   *  reads, so the guest is killed on its next tick once the total exceeds the budget.
+   *  A parked `fs/*` or `_net` call is NOT charged: that is waiting, not burning, and
+   *  charging it would kill exactly the initiator the run-time/wall-clock split exists
+   *  to protect. */
+  charge(ms: number): void;
 }
 
 /** Heap cap, and the execution-time guard the clock above drives. */
@@ -191,6 +201,7 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
       if (!running || !Number.isFinite(budgetMs)) return Infinity;
       return Math.max(0, budgetMs - consumedMs - (Date.now() - segmentStart));
     },
+    charge(ms) { if (ms > 0) consumedMs += ms; },
   };
 }
 
@@ -391,10 +402,13 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    // The third argument is host plumbing, not ABI: the realm's remaining execution
-    // segment, which a module call runs under (§4.3). Computed at the moment of the
-    // call, while the segment is live.
-    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), clock.remaining());
+    // The third argument is host plumbing, not ABI (guest-seam.ts `CallBudget`): this
+    // guest's execution segment, both halves of it. `remainingMs` is read HERE, while the
+    // segment is live, and is what a module call runs under; `charge` is how the seam
+    // bills a module's burn back once it settles, since the segment is closed by then and
+    // nothing else would ever notice the time (§4.3).
+    const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
+    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), budget);
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
       // Sync name — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
