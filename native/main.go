@@ -54,11 +54,38 @@ type boundModule struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
+// moduleCallDeadline bounds one module invocation (PROTOCOL §4.3, SECURITY §14.1):
+// callModule runs under it, and the module table's runtime is armed with wazero's
+// WithCloseOnContextDone so a call that burns past the bound is interrupted at the
+// next loop back-edge and the module closed, instead of holding the thread forever.
+//
+// Default 0 — the lever behind a flag. Arming it measures 2.6–4.8x on the paths
+// modules sit on (RS encode 2.8x, RS decode 4.8x, XChaCha20 2.6x, Ed25519 verify
+// 1.65x — SECURITY §14.1), because the termination check is compiled into every loop
+// of every module on the runtime, including the trusted ones sharing it (libsodium,
+// ML-DSA, ML-KEM). That missed the single-digit-% target the docs set, so the bound
+// is opt-in: SEEDKERNEL_MODULE_DEADLINE_MS (ms) arms it, 0/unset leaves it off, and
+// an off bound also unarms the runtime — no deployment pays the checks for a lever
+// nothing will pull. A bound would ideally mirror the shared guest budget
+// (core/wasm-limits.ts DEFAULT_GUEST_DEADLINE_MS), since a module call is charged to
+// the calling guest's segment (§12.3) and cannot legitimately outlive it.
+const defaultModuleCallDeadline = 0
+
 var (
 	ctx = context.Background()
-	rt  wazero.Runtime
-	qc  *qjs.Context
-	qrt *qjs.Runtime
+	// rt is the module table's runtime: every installed app module and the env shims
+	// they import. This is the runtime the module-call bound arms (boot), because the
+	// modules it holds are the untrusted code the bound exists for.
+	rt wazero.Runtime
+	// rtCore is the TCB's own runtime: libsodium, ML-DSA, ML-KEM and their host
+	// imports, deliberately NOT armed. They are trusted code — a wedged libsodium is
+	// a host bug, not a confinement breach — and the termination check costs 2.6–4.8x
+	// on the paths they sit on, so arming them would bill the bound to the crypto
+	// every node runs rather than to the untrusted modules the lever must stop. Same
+	// rule the guest realm follows: arm where untrusted code runs, nowhere else.
+	rtCore wazero.Runtime
+	qc     *qjs.Context
+	qrt    *qjs.Runtime
 	// el is the Go-owned JS event loop driving the host realm and every confined
 	// realm attached to it (loop.go). One per boot.
 	el *eventLoop
@@ -71,6 +98,10 @@ var (
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
+	// moduleCallDeadline is defaultModuleCallDeadline, adjusted from the environment
+	// at boot (moduleDeadlineFromEnv). Read at boot because the runtime's arming
+	// decision is made there; callModule consumes the settled value.
+	moduleCallDeadline time.Duration = defaultModuleCallDeadline
 )
 
 // The §4.1 scratch default (how much I/O space a module reserves at `scratch` when it
@@ -133,7 +164,26 @@ func callModule(appKey, module string, payload []byte) []byte {
 	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
 		return nil
 	}
-	r, err := w.fn.Call(ctx, uint64(len(payload)))
+	// §4.3: the runtime is armed with WithCloseOnContextDone, so a deadline on the
+	// call is what gives the module-bound teeth — a module that never returns is
+	// interrupted at its next loop back-edge rather than holding the thread forever.
+	callCtx, cancel := ctx, func() {}
+	if moduleCallDeadline > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
+	}
+	r, err := w.fn.Call(callCtx, uint64(len(payload)))
+	cancel()
+	if err != nil {
+		// A trap leaves the module alive and a later call retries; a context-done
+		// termination CLOSED it (the same fact guest.go asks of its realm, one level
+		// down). Evict the wedged module so the app stops silently answering empty
+		// and a reinstall recovers it — the guest realm's markDead, per module.
+		if w.mod.IsClosed() {
+			closeModule(w)
+			delete(apps[appKey], module)
+		}
+		return nil
+	}
 	// handle returns output_len ≥ 0 (README §4): only a trap (err) or a negative
 	// length is a failure. A 0-length result is a valid EMPTY response, not a
 	// failure — return a non-nil slice for it so a caller can distinguish "empty OK"
@@ -234,6 +284,22 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
+// moduleDeadlineFromEnv resolves the module-call bound from the environment, if set.
+// Native-only configuration (GOMAXPROCS is read the same way): the JS targets expose
+// no mechanism at all (PROTOCOL §4.3), so there is no shared number or CLI flag for
+// it. Read at boot; 0 means no bound (and no arming — the checks are the cost).
+func moduleDeadlineFromEnv() (time.Duration, error) {
+	v := os.Getenv("SEEDKERNEL_MODULE_DEADLINE_MS")
+	if v == "" {
+		return defaultModuleCallDeadline, nil
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 0 {
+		return 0, fmt.Errorf("SEEDKERNEL_MODULE_DEADLINE_MS=%q is not a non-negative millisecond count", v)
+	}
+	return time.Duration(ms) * time.Millisecond, nil
+}
+
 // boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
 // event loop, the platform primitives (sodium, the fs backend, TCP sockets, the
 // byte-level `bridge` below), and then the ONE shared bundle. After this the realm
@@ -245,15 +311,29 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 // releases the previous one's engines rather than stranding them.
 func boot() error {
 	shutdown()
-	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
-	sd = bootSodium(rt) // crypto primitive; the realm's bundle verification routes to it
+	var err error
+	if moduleCallDeadline, err = moduleDeadlineFromEnv(); err != nil {
+		return err
+	}
+	// WithCloseOnContextDone arms the termination check compiled into every loop of
+	// every module on this runtime — which is why the TCB's own modules run on rtCore
+	// (unarmed) below: the checks are the measured cost of the lever (2.6–4.8x on the
+	// paths modules sit on, SECURITY §14.1), and a deployment with no bound should
+	// not pay them anywhere.
+	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
+		WithCloseOnContextDone(moduleCallDeadline > 0))
+	// The TCB's own modules never need the bound and never pay for it: they are
+	// compiled-in trusted code on their own runtime, and a deployer who arms the
+	// bound pays the checks only where untrusted code runs.
+	rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
+	sd = bootSodium(rtCore) // crypto primitive; the realm's bundle verification routes to it
 	// ML-DSA-65 for manifest suite 0x02 (§12.4) — the same wasm the browser and Node
 	// use, so this target's answer to "is this bundle authentic" cannot differ from
 	// theirs (mldsa.go).
-	md = bootMlDsa(rt)
+	md = bootMlDsa(rtCore)
 	// ML-KEM-768 for the primitive catalog (§14.1) — provisioned ahead of any caller,
 	// because a primitive is the one thing a bundle cannot deliver (mlkem.go).
-	mk = bootMlKem(rt)
+	mk = bootMlKem(rtCore)
 	// Every installed module is a pure transform (README §4): the only host imports it
 	// takes are its language runtime's shims — for AssemblyScript the three below, which
 	// are exactly the set the JS host resolves (WASM/host/module-table.ts). Resolving a
@@ -276,7 +356,6 @@ func boot() error {
 		return fmt.Errorf("module imports: %w", err)
 	}
 
-	var err error
 	if qrt, err = qjs.New(); err != nil {
 		return fmt.Errorf("qjs.New: %w", err)
 	}
@@ -319,6 +398,10 @@ func shutdown() {
 	if rt != nil {
 		_ = rt.Close(ctx)
 		rt = nil
+	}
+	if rtCore != nil {
+		_ = rtCore.Close(ctx)
+		rtCore = nil
 	}
 	apps = map[string]map[string]*boundModule{}
 }
