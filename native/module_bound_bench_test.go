@@ -15,8 +15,9 @@ package main
 // `unarmed` is a stock runtime (what an unbounded deployment runs), `armed` is the same
 // wasm on a runtime with the bound armed. The ratio between them is the number
 // SECURITY §14.1 quotes, and the one to re-measure after any wazero bump — the loader
-// runs a patched wazero whose back-edge check is inline rather than an exit into Go
-// (see the go.mod replace), and that patch is exactly what this bench keeps honest.
+// runs a patched wazero whose back-edge check is inline rather than an exit into Go,
+// keeping only a rare unconditional exit as the loop's GC safepoint (see the go.mod
+// replace), and that patch is exactly what this bench keeps honest.
 
 import (
 	"bytes"
