@@ -59,17 +59,26 @@ type boundModule struct {
 // WithCloseOnContextDone so a call that burns past the bound is interrupted at the
 // next loop back-edge and the module closed, instead of holding the thread forever.
 //
-// Default 0 — the lever behind a flag. Arming it measures 2.6–4.8x on the paths
-// modules sit on (RS encode 2.8x, RS decode 4.8x, XChaCha20 2.6x, Ed25519 verify
-// 1.65x — SECURITY §14.1), because the termination check is compiled into every loop
-// of every module on the runtime, including the trusted ones sharing it (libsodium,
-// ML-DSA, ML-KEM). That missed the single-digit-% target the docs set, so the bound
-// is opt-in: SEEDKERNEL_MODULE_DEADLINE_MS (ms) arms it, 0/unset leaves it off, and
-// an off bound also unarms the runtime — no deployment pays the checks for a lever
-// nothing will pull. A bound would ideally mirror the shared guest budget
-// (core/wasm-limits.ts DEFAULT_GUEST_DEADLINE_MS), since a module call is charged to
-// the calling guest's segment (§12.3) and cannot legitimately outlive it.
-const defaultModuleCallDeadline = 0
+// Armed by default, and the number is the shared guest budget (core/wasm-limits.ts
+// DEFAULT_GUEST_DEADLINE_MS): a module call is charged to the calling guest's segment
+// (§12.3) and cannot legitimately outlive it, so a module bound looser than the guest
+// bound would be one the guest budget already made unreachable.
+//
+// Arming costs ~1.1–1.2x on the paths modules sit on (RS encode 1.21x, RS decode 1.15x,
+// XChaCha20 1.07x, Ed25519 verify 1.12x — module_bound_bench_test.go, SECURITY §14.1),
+// because a termination check is compiled into every loop of every module on the runtime.
+// On STOCK wazero the same paths cost 2.1–3.1x: its check is an unconditional exit from
+// native code into Go per back-edge, where the loader's patched wazero (the go.mod
+// replace) tests the module's Closed word inline and exits only when it is set — keeping
+// a rare unconditional exit (every 256 back-edges) purely as the loop's GC safepoint.
+// That is what took the bound from a price a deployment had to opt into to one it can
+// simply pay, which is the only reason a default is defensible here: the JS targets have
+// always been armed (module-table.ts), so an unarmed native target was the odd one out.
+//
+// SEEDKERNEL_MODULE_DEADLINE_MS (ms) overrides it; 0 means no bound, and an unbound
+// runtime is also left unarmed, so a deployment that turns the lever off stops paying
+// the checks rather than paying for a bound it disabled.
+const defaultModuleCallDeadline = 5 * time.Second
 
 var (
 	ctx = context.Background()
@@ -79,9 +88,11 @@ var (
 	rt wazero.Runtime
 	// rtCore is the TCB's own runtime: libsodium, ML-DSA, ML-KEM and their host
 	// imports, deliberately NOT armed. They are trusted code — a wedged libsodium is
-	// a host bug, not a confinement breach — and the termination check costs 2.6–4.8x
-	// on the paths they sit on, so arming them would bill the bound to the crypto
-	// every node runs rather than to the untrusted modules the lever must stop. Same
+	// a host bug, not a confinement breach — and the termination check still costs
+	// 1.07–1.12x on the paths they sit on (defaultModuleCallDeadline above), so arming
+	// them would bill the bound to the crypto every node runs rather than to the
+	// untrusted modules the lever must stop. That split is what makes the default
+	// affordable: it is charged to app modules, not to the TCB. Same
 	// rule the guest realm follows: arm where untrusted code runs, nowhere else.
 	rtCore wazero.Runtime
 	qc     *qjs.Context
@@ -295,10 +306,12 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
-// moduleDeadlineFromEnv resolves the module-call bound from the environment, if set.
-// Native-only configuration (GOMAXPROCS is read the same way): the JS targets expose
-// no mechanism at all (PROTOCOL §4.3), so there is no shared number or CLI flag for
-// it. Read at boot; 0 means no bound (and no arming — the checks are the cost).
+// moduleDeadlineFromEnv resolves the module-call bound from the environment, falling
+// back to the armed default. Native-only configuration (GOMAXPROCS is read the same
+// way): the JS targets reach the same bound through their own lever and take their
+// number from the guest's segment (PROTOCOL §4.3), so there is no shared knob or CLI
+// flag for this one. Read at boot; 0 means no bound (and no arming — the checks are
+// the cost), which is the way to turn the default off.
 func moduleDeadlineFromEnv() (time.Duration, error) {
 	v := os.Getenv("SEEDKERNEL_MODULE_DEADLINE_MS")
 	if v == "" {
@@ -328,9 +341,9 @@ func boot() error {
 	}
 	// WithCloseOnContextDone arms the termination check compiled into every loop of
 	// every module on this runtime — which is why the TCB's own modules run on rtCore
-	// (unarmed) below: the checks are the measured cost of the lever (2.6–4.8x on the
-	// paths modules sit on, SECURITY §14.1), and a deployment with no bound should
-	// not pay them anywhere.
+	// (unarmed) below: the checks are the measured cost of the lever (~1.1–1.2x on the
+	// paths modules sit on, SECURITY §14.1), and a deployment that turned the bound
+	// off should not pay them anywhere.
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
 		WithCloseOnContextDone(moduleCallDeadline > 0))
 	// The TCB's own modules never need the bound and never pay for it: they are
