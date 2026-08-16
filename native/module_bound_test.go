@@ -1,8 +1,8 @@
 package main
 
 // module_bound_test.go — the §4.3 lever, functionally: the module table's runtime is
-// armed with wazero's WithCloseOnContextDone when SEEDKERNEL_MODULE_DEADLINE_MS is set,
-// and callModule runs under that deadline (main.go). A module that never returns is the
+// armed with wazero's WithCloseOnContextDone unless SEEDKERNEL_MODULE_DEADLINE_MS turns
+// the bound off, and callModule runs under that deadline (main.go). A module that never returns is the
 // one case the bound exists for (SECURITY §14.1): the wasm call holds the thread it runs
 // on, and only the deadline ends it. This test proves the bound actually fires, that the
 // closed module is evicted (the guest realm's markDead, per module), and that a reinstall
@@ -133,9 +133,9 @@ func wedgeStartWasmBytes() []byte {
 }
 
 func TestModuleCallBound(t *testing.T) {
-	// The bound is behind a flag (off by default — SECURITY §14.1 records why); arm
-	// it for this test. 50 ms is generous headroom over a real transform and tiny
-	// next to the guest budget the bound mirrors.
+	// The bound is armed by default at the guest budget; tighten it to 50 ms here so
+	// the wedge is caught in test time rather than in five seconds. Still generous
+	// headroom over a real transform.
 	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "50")
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0x5e}, 32), "wedgeapp")
@@ -189,21 +189,22 @@ func TestModuleCallBound(t *testing.T) {
 	}
 }
 
-// TestModuleCallBoundArmsOnlyWhenConfigured proves the bound is off by default and
-// that arming it changes the CALL, not just the config. Both are asked of wazero
-// behaviorally, with an already-canceled context — which an armed runtime honors at
-// call entry by closing the module (call_engine.go's ctx.Done select), and an
-// unarmed one ignores entirely:
+// TestModuleCallBoundArmedByDefault proves the bound is ON with no configuration at
+// all, and that SEEDKERNEL_MODULE_DEADLINE_MS=0 is a real off switch rather than a
+// value the parser shrugs at. Both are asked of wazero behaviorally, with an
+// already-canceled context — which an armed runtime honors at call entry by closing
+// the module (call_engine.go's ctx.Done select), and an unarmed one ignores entirely:
 //
-//   - default boot (no env): the call runs normally and the module stays open — the
-//     "no bound, no checks" baseline the flag decision preserves;
-//   - after SEEDKERNEL_MODULE_DEADLINE_MS: the same call fails and the module is
-//     closed — the lever, at its cheapest (entry check, no wedge needed).
+//   - default boot (no env): the call fails and the module is closed — the lever, at
+//     its cheapest (entry check, no wedge needed), with nobody having asked for it;
+//   - with the deadline set to 0: the same call runs normally and the module stays
+//     open — the escape hatch, and with it the "no bound, no checks" baseline, since
+//     an unbound runtime is left unarmed rather than paying for a disabled lever.
 //
 // A wedge would also prove it, but a goroutine stuck in wasm forever poisons the
 // test process (the runtime's close under an executing call hangs the next boot), so
 // the infinite-loop module stays in the armed test, where the bound ends it.
-func TestModuleCallBoundArmsOnlyWhenConfigured(t *testing.T) {
+func TestModuleCallBoundArmedByDefault(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()
 		key := appKeyFor(bytes.Repeat([]byte{0x5c}, 32), "probeapp")
@@ -218,21 +219,21 @@ func TestModuleCallBoundArmsOnlyWhenConfigured(t *testing.T) {
 		return err == nil, w.mod.IsClosed()
 	}
 
-	bootRealm(t) // no env: the flag is off by default
-	if moduleCallDeadline != 0 {
-		t.Fatalf("default boot resolved a deadline of %s, want 0 (off by default)", moduleCallDeadline)
-	}
-	if called, closed := probe(t); !called || closed {
-		t.Fatalf("unarmed runtime: call ok=%v closed=%v, want ok=true closed=false (the ctx must be ignored)", called, closed)
-	}
-
-	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "5000")
-	bootRealm(t) // re-boot reads the env: the runtime arms
-	if moduleCallDeadline <= 0 {
-		t.Fatal("armed boot resolved no deadline")
+	bootRealm(t) // no env: the bound is armed by default
+	if moduleCallDeadline != defaultModuleCallDeadline || moduleCallDeadline <= 0 {
+		t.Fatalf("default boot resolved a deadline of %s, want %s (armed by default)", moduleCallDeadline, defaultModuleCallDeadline)
 	}
 	if called, closed := probe(t); called || !closed {
 		t.Fatalf("armed runtime: call ok=%v closed=%v, want ok=false closed=true (the done ctx must end the call)", called, closed)
+	}
+
+	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "0")
+	bootRealm(t) // re-boot reads the env: the runtime unarms
+	if moduleCallDeadline != 0 {
+		t.Fatalf("deadline 0 resolved %s, want 0 (the off switch)", moduleCallDeadline)
+	}
+	if called, closed := probe(t); !called || closed {
+		t.Fatalf("unarmed runtime: call ok=%v closed=%v, want ok=true closed=false (the ctx must be ignored)", called, closed)
 	}
 }
 

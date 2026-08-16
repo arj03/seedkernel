@@ -11,8 +11,9 @@
 // other, and it is bounded at each target's engine rather than here: a call carries the
 // calling guest's remaining execution segment (§12.3) as its deadline, landed by killing
 // the module's worker on the JS targets (module-table.ts) and by wazero's
-// `WithCloseOnContextDone` on the native one, behind a flag — native/main.go,
-// `SEEDKERNEL_MODULE_DEADLINE_MS`.)
+// `WithCloseOnContextDone` on the native one — armed by default on both, the native
+// side defaulting to DEFAULT_GUEST_DEADLINE_MS below and retunable through
+// native/main.go's `SEEDKERNEL_MODULE_DEADLINE_MS`.)
 //
 // The JS WebAssembly API exposes no memory limits on a compiled `Module`, so this walks
 // the binary's section headers and reads the limits directly. It is a *bounds read*, not

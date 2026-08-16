@@ -1,7 +1,7 @@
 package main
 
-// module_bound_bench_test.go — what the §4.3 module-call bound COSTS, which is the whole
-// reason it is a flag (SECURITY §14.1). Arming a wazero runtime with
+// module_bound_bench_test.go — what the §4.3 module-call bound COSTS, which is what
+// decided it should be a default (SECURITY §14.1). Arming a wazero runtime with
 // WithCloseOnContextDone compiles a termination check into every loop of every module on
 // it, and this file prices that check on real module-shaped wasm: libsodium's XChaCha20
 // and Ed25519 (the TCB's own crypto, for comparison against the numbers in
@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -174,3 +175,49 @@ func benchBoundRS(b *testing.B, decode bool) {
 
 func BenchmarkBoundRSEncode(b *testing.B) { benchBoundRS(b, false) }
 func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
+
+// BenchmarkBoundCallOverhead prices the OTHER half of the default (main.go
+// defaultModuleCallDeadline): the per-call `context.WithTimeout` that a bound deadline
+// makes callModule build, where an unbound one took a no-op branch. The benchmarks
+// above measure the compiled checks, which are billed per back-edge and so are
+// invisible on a call that barely loops; this one measures what every call pays no
+// matter how little it does, on the smallest real module there is (the forwarder,
+// which copies its input back) and a 32-byte payload — the shape of a control frame,
+// where a fixed cost has nothing to hide behind.
+//
+// Both arms run against ONE boot, so the runtime is armed in both and only the context
+// differs. That is deliberate: it isolates the context, which is the part the loader
+// controls. wazero spawns a watchdog goroutine and channel per call whenever the
+// runtime is armed, whatever context it is handed (internal/wasm module_instance.go
+// CloseModuleOnCanceledOrTimeout), so that cost is in both arms and is not what this
+// measures. Measured ~345 ns → ~950 ns, 6 → 11 allocs: a fixed ~600 ns that a bound
+// deployment pays per call, against ~30 µs for the hop the JS targets pay per call for
+// the same bound, and against ~400 µs for the RS calls it actually sits in front of.
+// If a genuinely chatty module ever lands, the fix is to stop rebuilding the timeout
+// per call rather than to give the bound up.
+func BenchmarkBoundCallOverhead(b *testing.B) {
+	bootRealm(b)
+	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")
+	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		b.Fatalf("bindAll refused: %v", err)
+	}
+	payload := bytes.Repeat([]byte{0x7e}, 32)
+	saved := moduleCallDeadline
+	b.Cleanup(func() { moduleCallDeadline = saved })
+
+	for _, c := range []struct {
+		name     string
+		deadline time.Duration
+	}{{"noCallDeadline", 0}, {"callDeadline", defaultModuleCallDeadline}} {
+		b.Run(c.name, func(b *testing.B) {
+			moduleCallDeadline = c.deadline
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if r := callModule(key, "fwd", payload); len(r) != len(payload) {
+					b.Fatalf("forwarder returned %d B, want %d", len(r), len(payload))
+				}
+			}
+		})
+	}
+}
