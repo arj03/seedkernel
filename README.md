@@ -2,13 +2,17 @@
 
 *Every app is a confined JS guest over a library of pure-transform WASM modules; code arrives only as a signed bundle, and untrusted code runs sandboxed anywhere from a browser tab to a single native binary.*
 
-## 1. Vision
+## What runs today
 
-A minimal runtime: a **host** admits signed **bundles**, and every bundle is an app with exactly one shape — a confined JS **guest** (the app's logic) plus, optionally, any number of pure-transform WASM **modules** that serve as the app's library. The guest is the only thing an inbound frame reaches: the host resolves the protocol to an app, invokes the guest's one `handle` entrypoint, and the guest drives its own modules by name when it needs a transform. Authorization, capability gating and application logic are layers that compose around that seam without the host knowing what any of them mean, so the system bootstraps from one trusted policy — the authors it will install, or none — into arbitrarily complex behaviour.
+- **Three targets, one implementation.** Seedkernel runs in the browser, on Node/Bun or as a single native binary. A large part of the implementation is shared between all platforms including a transport bundle and crypto blobs. Nothing about the protocol is written twice.
+- **The native node is one 7.5 MB file.** A cgo-free Go cross-compiled binary embedding its own QuickJS, its own wasm engine. It is a tenth of what a Bun binary alone costs (~70 MB). The bulk is the wasm compiler backend and the Go runtime; the protocol's own footprint is tens of KB ([RUNTIME §10.2, §12.9](docs/RUNTIME.md)).
+- **Bundles are run in a trusted sandbox on every target.** A module imports no runtime seam at all, so there is no I/O to gate; a guest reaches exactly the names its signed manifest declares. The sandbox overhead is quite minimal, on the order of 1.07–1.21x slower ([SECURITY §14](docs/SECURITY.md)).
+- **Confinement costs no throughput.** A real storage layer over this seam encrypts, hashes and RS-encodes at ~270 MB/s on one thread and reads back at ~2.8 GB/s; end to end the link bounds it, not the runtime ([the overhead, measured](#the-overhead-measured)).
+- **Code really does arrive only as a bundle.** Even the transport is one so that it can be upgraded. The chat demo installs its whole UI and logic at runtime. Lastly [seed store](https://github.com/arj03/seedstore) as an example of real high performance storage layer.
 
-**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be one routing lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle.
+## 1. The model
 
-Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
+A minimal runtime: a **host** admits signed **bundles**, and every bundle is an app with exactly one shape — a confined JS **guest** (the app's logic) plus, optionally, any number of pure-transform WASM **modules** that serve as the app's library. The guest is the only thing an inbound frame reaches: the host resolves the protocol to an app, invokes the guest's one `handle` entrypoint, and the guest drives its own modules by name when it needs a transform.
 
 **The whole runtime is five components.** Everything after this table is detail:
 
@@ -20,11 +24,15 @@ Signing survives where it must — over the **bundle** that installs code (§12.
 | **Host** | The runtime: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — the install records and the module table (§3), the inbound dispatch (§12.10), and `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Raw I/O** | Two capabilities of the same shape: `link` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete/stat over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
 
+**Authorization, capability gating and application logic are none of them.** They are layers that compose around the guest seam without the host knowing what any of them mean, so a node bootstraps from one trusted policy — the authors it will install, or none — into arbitrarily complex behaviour.
+
+**The dispatch path stays small because attribution happens below it.** By the time a frame reaches an app it has already been attributed to a peer's key, so there is no envelope to parse, no per-message signature to verify, no signer state to carry across a call and no size cap to enforce. Delivery gets to be one routing lookup and one guest call *because* a layer beneath it did that work. But being beneath the app is not the same as being in the trusted base: the layer that attributes frames is an ordinary signed bundle. Signing survives where it must — over the **bundle** that installs code (§12.4), which authenticates its author across any number of relays and any number of hostile hops.
+
 There are no special cases and exactly one way to do everything: one app shape (every app is a guest, §12.4), one install path (signed bundles, §12.4), one guest seam (`host.call` out, entrypoint invocation in, §12.2), one post-handshake frame plane (§12.6). The transport is no exception, and that is the load-bearing part: it reaches sockets through names, and it is reached — by the host and by every app — through the protocol id it claims, exactly as an app is.
 
 ## What belongs in the core
 
-The test is Saltzer, Reed and Clark's:
+The core is what a rebuild is needed to change, so it is worth naming in one line: **two raw I/O seams — a socket and an `fs`, each bytes in and out over an opaque name — their flood limits, an entropy source, a clock, a private key, and a map.** Plus the two things no test could remove, because they are what would admit their own replacement: the manifest verifier and a policy file with a version floor. That is a seed. Everything else is content, and one test is what emptied it out — Saltzer, Reed and Clark's:
 
 > **A function belongs in a lower layer only if it cannot be correctly implemented at the endpoints.**
 
@@ -34,31 +42,24 @@ The end-to-end test decides *which side* of the line a function is on. A second 
 
 > **A core interface is a flat map over opaque names. If the core must understand what a name *means* in order to serve it, the meaning is content that leaked in.**
 
-Four things follow, and together they are most of what the core is:
+Four things follow:
 
 - **One seam, name-addressed.** A guest reaches a primitive by name through the same `host.call` it uses for everything else: `host.call("crypto/blake2b-256", …)`, and the host holds the catalog: `crypto/x25519/dh`, `crypto/chacha20poly1305-ietf/seal`, `crypto/ml-kem-768/encaps`. A new algorithm is a catalog entry — no op number, no ABI rev, no manifest field. A host missing a name refuses the load *by name*.
 - **A pure transform is not a capability.** A function of bytes the guest already holds is computation it could have done itself — correct and fast rather than permitted. So the seam holds **primitives**, which are free, and **authorities**, which reach something no confined module can hold: the node key, the entropy source, the clock, a socket, the disk.
 - **Signing is domain separation, not parsing.** The node's Ed25519 key never leaves the host, so a module that needs a signature asks for one — and the host signs `DOMAIN ‖ scope ‖ opaque`, choosing the domain from which admission point the asking bundle came through, over a suffix it does not read.
-- **Raw net is the capability; structured net is what the transport provides.** The raw capability is an opaque link id with bytes in and out — the socket-side twin of `fs`. The transport bundle consumes that and *provides* the attributed peer, protocol id and correlation every app reaches. What it provides is not a second capability: the transport claims the reserved id `_net` (§12.10), and an app reaches the network with the same call the host uses to deliver an inbound frame.
+- **Raw net is the capability; structured net is what the transport provides.** The transport bundle consumes the opaque link and *provides* the attributed peer, protocol id and correlation every app reaches — not as a second capability, but by claiming the reserved id `_net` (§12.10), so an app reaches the network with the same call the host uses to deliver an inbound frame.
 
-**Capability-by-non-wiring makes raw I/O core permanently.** A confined module holds no ambient authority by construction (§12.2), so it can never hold a file descriptor, at any point in the process's life and whatever has already been installed. The host owns the socket forever.
-
-What survives all of this is a socket seam with its flood limits, an entropy source, a private key, and a map — plus the two things no test could remove, because they are what would admit their own replacement: the manifest verifier and a policy file with a version floor. That is a seed.
+**And the core cannot grow back.** A confined module holds no ambient authority by construction (§12.2), so it can never hold a file descriptor — at any point in the process's life, whatever has already been installed. The host owns the socket forever, which is what makes raw I/O core permanently rather than for now.
 
 ## The transport is a bundle
 
-The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle loaded as the node's transport. It is a **guest**, not a WASM module, and the reason is structural: a §4 module is a synchronous pure transform that imports nothing and holds no capabilities, which an AKE carrying session state cannot be. State lives in the guest's own heap keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one: RFC 6455 is `ws.wasm`, a no-capability module of the same bundle, reached by logical name.
+The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle, admitted by the same loader as any other app. It is a **guest** rather than a WASM module for a structural reason: a §4 module is a synchronous pure transform that imports nothing, which an AKE carrying session state cannot be. So the session state lives in the guest's own heap, keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one — RFC 6455 is `ws.wasm`, a no-capability module of the same bundle.
 
-What this buys is that the **protocol** is replaceable without a fork: the handshake's messages, its transcript, the record framing and the dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime.
+What this buys is that the **protocol** is replaceable without a fork: handshake, transcript, record framing and dial policy are all content, and a deployment that wants different ones ships a signed bundle and one policy entry instead of a patched runtime. It can even be swapped under a running node, because that is a routing rule rather than a protocol — a transport is an app claiming `_net`, so a later load takes the id the way a later chat app takes `chat-v1`, and redials from the address book the *node* owns. Live links do not survive, since the session keys are in the outgoing guest's private memory — exactly what makes the transport confineable — so an upgrade is a **reconnect** (§12.10).
 
-Two properties make that safe:
+Two things keep that safe. Policy is keyed on the **capability** rather than on a kind of bundle, so who may *be* the network — the holder sees all plaintext and holds the session keys — is a decision the operator makes apart from who may ship an app (§12.5). And a link speaks exactly one suite, named by a byte both ends fold into what they sign, so a mixed period is a rollout rather than a corruption and an in-path downgrade is a dead link (§12.6).
 
-- **The transport is an authority grant, not a preference.** Admitting an ordinary app risks that app; granting the transport risks the channel, which sees all plaintext and holds the session keys — so policy is keyed on the *capability*: `authors` says who may load at all, `grants` names a privilege from the catalog and who may hold it (`grants: { "link": [...] }`). Which privileges are in play is read off `guest.requires`, and requiring `link/open` puts `link` in that set rather than taking it out, so an author trusted for apps gains nothing by asking (§12.5). The privilege is named for exactly the four `link/*` names it gates.
-- **The suite byte makes a mixed period a rollout rather than a corruption.** One suite per link, unknown ids close the connection, and the byte is covered by both signatures and read before verification (§12.6). An in-path attacker who flips it only makes the two ends sign different bytes, so AUTH fails and the link dies.
-
-**It can be swapped under a running node, and that is a routing rule rather than a protocol.** The transport is an app that claims `_net`, so a second transport bundle wins that id the way a second chat app wins `chat-v1` (§12.10) — a later load takes it. There is nothing to hand over: the socket driver holds link ids, the address book and the listeners, all of which belong to the node rather than to whichever guest is currently the transport, so the incoming guest gets the same config turn the first one got and redials from the same address book — same listening port, same node identity. Live links do not survive: session keys live in the outgoing guest's private memory, which is exactly what makes the transport confineable. An upgrade is a **reconnect**.
-
-**The first transport ships inside the host artifact.** A node has no network until it has a transport, so there is nothing to fetch the first one over except raw net to a peer it does not yet trust — which would open a metadata window before any channel exists to close it. What travels is the *next* transport: a replacement bundle can arrive over the transport already running, like any other bundle, since what admits it is the manifest signature and not the route it took.
+**The first transport ships inside the host artifact,** because a node has no network until it has a transport (§12.6). What travels is the *next* one: a replacement arrives over the transport already running, like any other bundle, since what admits it is the manifest signature and not the route it took.
 
 ## The shape of it
 
@@ -150,9 +151,7 @@ The reference composition stacks the layers so each depends only on the layers b
 
 ## One implementation, three targets
 
-The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which: `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content.
-
-The line that matters is not `core/` vs `host/` — it is **shared** vs **per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing. Lines of code are computed using: `npm run loc` (in `WASM/`).
+The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
 **Shared — compiled once, run by all three targets (2,122 LOC)**
 
@@ -167,16 +166,10 @@ The line that matters is not `core/` vs `host/` — it is **shared** vs **per-ta
 
 **Four reasons a row is shared**, and which reason applies decides whether it could ever leave the set:
 
-- **Trust root.** The bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle — it is the thing that would admit its own replacement. None of it is core by the end-to-end test; all of it is stuck.
-- **Vocabulary.** The domain prefixes, manifest suite ids, primitive names and flood bounds in `core/`. A bundle is replaceable and the vocabulary it draws on is not (§14.1); a bundle defining the vocabulary its own signature is verified under is circular.
-- **A stable adapter.** The transport driver holds the link ids, the listeners and the address book — the node's, not the occupant's — and it is what makes a transport swap a re-attach rather than a handover. Folding it into the thing being swapped is backwards.
-- **Reuse.** Protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule — a manifest's claim, one dispatch — on every target, not because agreement is load-bearing.
-
-**The vocabulary row is the one that would grow silently, so a name enters the catalog (`core/domains.ts`) only if it costs the trusted base nothing — the shipped trust root or transport bundle already carries the implementation — or if it cannot be delivered as a module at all: the ML-DSA-65 verifier, the suite byte, the master-seed scheme.** `ml-kem-768/*` is the one entry provisioned ahead of its caller, because §14.1 puts it on a clock. Everything else is a bundle module, and that complement is most of a real deployment: [seed store](https://github.com/arj03/seedstore) is a whole storage layer and added no name to either table — it reaches `crypto/xchacha20/xor` for encryption at rest, which is free because it is a core-API call of the libsodium every node already links.
-
-**Wire framing is in none of them, and so it is not here.** Length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test — state machines over whole messages, which an endpoint can run — so they are the transport bundle's, over `ws.wasm` as one of *its* modules. What the host says about a link is which of those codecs applies (`FRAMING`, §12.1); what to do about it is entirely the bundle's. The browser needs none of it: a platform `WebSocket` and an `RTCDataChannel` arrive framed already and go to the driver as they are.
-
-What differs per target is only the object that moves bytes — and wrapping it is host code on every target, because a confined guest never holds a socket, so whoever owns the platform's object does the wrapping. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md) for which target wraps what).
+- **Trust root** — the bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle. None of it is core by the end-to-end test; all of it is stuck.
+- **Vocabulary** — the domain prefixes, manifest suite ids, primitive names and flood bounds in `core/`. A bundle defining the vocabulary its own signature is verified under is circular. It is also the row that would grow silently, so a name enters the catalog only under the three-part test in [SECURITY §14](docs/SECURITY.md) — which [seed store](https://github.com/arj03/seedstore), a whole storage layer, passes by adding no name at all.
+- **A stable adapter** — the transport driver holds the link ids, the listeners and the address book, which are the node's rather than the occupant's, and that is what makes a transport swap a re-attach rather than a handover.
+- **Reuse** — protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule on every target, not because agreement is load-bearing.
 
 **Per-target platform — the seam, written once per target**
 
@@ -185,17 +178,9 @@ What differs per target is only the object that moves bytes — and wrapping it 
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,496 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (388), the Go binding, and `native-polyfills.ts` (93), the Web globals QuickJS lacks, both TypeScript and both riding in the shared bundle | 2,160 Go + 481 TS |
 
-**Signed content — not host code at all**
+What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,381 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
-| | Where | LOC |
-| --- | --- | --- |
-| Transport bundle — the wire codecs, the AKE and record layer, link routing, the request/response frame codec | `transport/src/*.js` + `ws.wasm` | 1,381 + 5 KB |
-
-Each target therefore runs 2,122 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it — the codec that frames a link and the protocol inside it both live in the signed bundle.
-
-Three wasm binaries are shared the same way and for the same reason: `libsodium.wasm` (Ed25519, BLAKE2b, ChaCha20/XChaCha20, sumo build), `mldsa65.wasm` (ML-DSA-65, the `0x02` hybrid manifest suite verifier) and `mlkem768.wasm` (ML-KEM-768, the primitive catalog's KEM). Byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses. Their sizes are the distribution figures in [RUNTIME §10.2](docs/RUNTIME.md).
-
-The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go. The `core/` and `host/` split inside `WASM/` is the *other* axis: `core/` is what has no endpoint substitute, `host/` is the runtime around it, and both contribute to the shared set and to the JS platform.
+Each target therefore runs 2,122 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
 
 ## The overhead, measured
 
