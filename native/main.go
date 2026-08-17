@@ -54,7 +54,7 @@ type boundModule struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// moduleCallDeadline bounds one module invocation (PROTOCOL §4.3, SECURITY §14.1):
+// moduleCallDeadline bounds one module invocation (PROTOCOL §4.3, SECURITY §14):
 // callModule runs under it, and the module table's runtime is armed with wazero's
 // WithCloseOnContextDone so a call that burns past the bound is interrupted at the
 // next loop back-edge and the module closed, instead of holding the thread forever.
@@ -65,15 +65,11 @@ type boundModule struct {
 // bound would be one the guest budget already made unreachable.
 //
 // Arming costs ~1.1–1.2x on the paths modules sit on (RS encode 1.21x, RS decode 1.15x,
-// XChaCha20 1.07x, Ed25519 verify 1.12x — module_bound_bench_test.go, SECURITY §14.1),
+// XChaCha20 1.07x, Ed25519 verify 1.12x — module_bound_bench_test.go, SECURITY §14),
 // because a termination check is compiled into every loop of every module on the runtime.
-// On STOCK wazero the same paths cost 2.1–3.1x: its check is an unconditional exit from
-// native code into Go per back-edge, where the loader's patched wazero (the go.mod
-// replace) tests the module's Closed word inline and exits only when it is set — keeping
-// a rare unconditional exit (every 256 back-edges) purely as the loop's GC safepoint.
-// That is what took the bound from a price a deployment had to opt into to one it can
-// simply pay, which is the only reason a default is defensible here: the JS targets have
-// always been armed (module-table.ts), so an unarmed native target was the odd one out.
+// Those numbers need the patched wazero in the go.mod replace, which tests the module's
+// Closed word inline and exits to Go only when it is set, keeping a rare unconditional
+// exit (every 256 back-edges) purely as the loop's GC safepoint.
 //
 // SEEDKERNEL_MODULE_DEADLINE_MS (ms) overrides it; 0 means no bound, and an unbound
 // runtime is also left unarmed, so a deployment that turns the lever off stops paying
