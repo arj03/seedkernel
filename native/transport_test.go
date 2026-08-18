@@ -11,23 +11,19 @@ import (
 	"seedloader/qjs"
 )
 
-// The full routing + transport runs as the
-// transport bundle's guest program inside QuickJS, over the
-// Go socket primitive. Two independent nodes (each running its own transport
-// guest) complete the PeerLink handshake, route, and exchange a typed
-// request/response over a real loopback socket — the dial/accept/promote/deliver
-// path and the correlation/timeout layer, none of it logic in Go.
+// Routing and transport run as the transport bundle's guest program inside QuickJS, over
+// the Go socket primitive. Two independent nodes complete the PeerLink handshake, route,
+// and exchange a typed request/response over a real loopback socket — the
+// dial/accept/promote/deliver path and the correlation/timeout layer, none of it Go logic.
 //
-// Only the WebSocket transport is exercised here — it drives the full WS path: the
-// raw Go byte stream (sock.go connectRaw/listenRaw), the shared net-frame WsChannel,
-// and the RFC 6455 framing in ws.wasm (via __ws). The TCP twin of this exact flow is
-// covered by asyncnet_test (a confined guest over a real TCP socket) and end-to-end
-// against real node/bun nodes by scripts/loader-interop.sh.
-
-// The realm a networking test runs in is the production one: boot() installs the __net
-// socket primitive and ws.wasm, then evaluates the shared bundle carrying the routing
-// core — so `makeTransportNode` here is the very factory the binary boots with, not a
-// harness that assembles the stack a second way.
+// Only the WebSocket transport is exercised here, which drives the full WS path: the raw
+// Go byte stream (sock.go), the shared net-frame WsChannel and the RFC 6455 codec. The TCP
+// twin is asyncnet_test, and scripts/loader-interop.sh covers both against real node/bun
+// nodes.
+//
+// The realm is the production one — boot() installs the primitives and evaluates the
+// shared bundle — so `makeTransportNode` is the factory the binary boots with, not a
+// harness assembling the stack a second way.
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `wsListen: { host: "127.0.0.1", port: 0 },`)

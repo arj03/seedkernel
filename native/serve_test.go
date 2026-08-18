@@ -11,12 +11,11 @@ import (
 	"seedloader/qjs"
 )
 
-// Serving (README §12.8, §12.10): a node answers a peer's request through the SHARED
-// dispatch — the protocol id off the wire is resolved to the installed app whose manifest
-// claims it, and that app answers. There is no native dispatch of its own, which is
-// what these tests pin: they drive the real boot path (boot → bootNode → loadBundle →
-// serve), so what they exercise is createShell's `dispatch`, byte for byte the same
-// function the Node and browser shells run.
+// Serving (README §12.8, §12.10): the protocol id off the wire is resolved to the
+// installed app whose manifest claims it, and that app answers. There is no native
+// dispatch, which is what these pin — they drive the real boot path (boot → bootNode →
+// loadBundle → serve), so what runs is createShell's `dispatch`, the same function the
+// Node and browser shells use.
 
 // The holder guest: type 1 = STORE (payload already framed for fs/put), type 2 = FETCH
 // (payload = key). Local fs only — and it AWAITS, because the fs names round-trip
@@ -177,12 +176,10 @@ func TestServeGuestApp(t *testing.T) {
 	}
 }
 
-// Two apps on one node, and each protocol reaches ITS OWN app (§12.10) — the property
-// the native target could not hold while it assembled its own dispatch: that one asked
-// whether a protocol was bound and then called the single guest whatever the answer
-// named, had no arm at all for a module-only app, and dropped the sender. All three
-// are checked here at once, since only a node hosting two apps with different code
-// shapes can tell the difference.
+// Two apps on one node, and each protocol reaches ITS OWN app (§12.10) — the property the
+// native target could not hold while it assembled its own dispatch, which called the
+// single guest whatever the answer named, had no arm for a module-only app, and dropped
+// the sender. Only a node hosting two apps with different code shapes can tell.
 func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())

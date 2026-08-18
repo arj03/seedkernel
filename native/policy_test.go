@@ -32,16 +32,14 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 	}
 }
 
-// The `link/*` names carry a PRIVILEGE an operator grants separately (§12.5): the transport
+// The `link/*` names carry a PRIVILEGE an operator grants separately (§12.5): a transport
 // sees all plaintext and holds the session keys, so "I trust this author's apps" must not
-// answer "may this author be my transport". There is no self-description in the manifest
-// — the bundle format has no role field — so `guest.requires` alone decides which
-// privileges are in play, and the derivation only ever runs the strict way: naming
-// any `link/*` name puts `link` in the set, never takes it out.
+// answer "may this author be my transport". The manifest has no role field, so
+// `guest.requires` alone decides which privileges are in play, and only in the strict
+// direction: naming any `link/*` puts `link` in the set, never takes it out.
 //
-// Driven through the native loader because the policy file is an operator-facing surface
-// on this target — `--policy` is parsed by the shared JS, and this is what proves the
-// loader reaches that decision and not a permissive default.
+// Driven through the native loader, since `--policy` is an operator-facing surface here —
+// this is what proves it reaches that decision rather than a permissive default.
 func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)

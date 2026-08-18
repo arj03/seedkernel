@@ -1,13 +1,11 @@
 package main
 
-// The native half of "one implementation, three targets" for the catalog's KEM
-// (§12.9, §14.1) — the sibling of mldsa_test.go, and the same argument: the JS suite
-// checks mlkem768.wasm from Node, and without this the target that embeds its own
-// copy of the artifact would be the one nobody checked.
+// The native half of "one implementation, three targets" for the catalog's KEM (§12.9,
+// §14.1) — mldsa_test.go's sibling, same argument.
 //
-// It reads the fixture the JS suite reads rather than keeping a second copy. The
-// whole value of the test is that both targets are judged by the same vectors, so a
-// local copy could quietly drift into agreeing only with itself.
+// It reads the fixture the JS suite reads rather than keeping a second copy: the value of
+// the test is that both targets are judged by the same vectors, and a local copy could
+// quietly drift into agreeing only with itself.
 
 import (
 	"bytes"
@@ -136,16 +134,14 @@ func TestMlKemAcvpVectors(t *testing.T) {
 }
 
 // TestMlKemThroughCatalog drives the KEM the way a guest does — by name, through the
-// `crypto/` prefix — rather than through the Go wrapper. That is the path that has
-// to work end to end on this target: the `crypto/*` entries of `HOST_CALL_NAMES` are
-// what a manifest's `guest.requires` is checked against in `verifyManifest` (bundle.ts),
-// so a host whose `__sodium` lacked these methods would admit a bundle by name and then
-// fail it at first use — the legibility failure the check exists to prevent.
+// `crypto/` prefix. That is the path that has to work end to end: a manifest's
+// `guest.requires` is checked against `HOST_CALL_NAMES` (bundle.ts verifyManifest), so a
+// host whose `__sodium` lacked these methods would admit a bundle by name and then fail it
+// at first use.
 //
-// It also pins the thing the Go wrapper alone cannot: that the shared guest seam, the
-// sodium shim's ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract
-// line up. A bundle declaring NO requires runs it, because a pure transform is
-// not a capability.
+// It also pins what the Go wrapper alone cannot: that the guest seam, the sodium shim's
+// ArrayBuffer→Uint8Array wrapping and the null-is-a-rejection contract line up. A bundle
+// declaring NO requires runs it, because a pure transform is not a capability.
 func TestMlKemThroughCatalog(t *testing.T) {
 	guestSeamRealm(t)
 

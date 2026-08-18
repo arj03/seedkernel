@@ -30,11 +30,10 @@ const (
 func TestGuestSeamOps(t *testing.T) {
 	guestSeamRealm(t)
 
-	// Grant node/sign, node/verify, node/identity, fs/put, fs/get and clock/now (not
-	// net, not link) and an identity from sodium. The
-	// guest-signing scope binds node/sign + node/verify to a bundle namespace (README
-	// §12.2); a real node derives it from the manifest's (author, app), here a
-	// throwaway pair.
+	// Grant node/sign, node/verify, node/identity, fs/put, fs/get and clock/now (not net,
+	// not link), plus an identity from sodium. The signing scope binds node/sign and
+	// node/verify to a bundle namespace (README §12.2) — a real node derives it from the
+	// manifest's (author, app); here it is a throwaway pair.
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__other = sodium.crypto_sign_keypair();

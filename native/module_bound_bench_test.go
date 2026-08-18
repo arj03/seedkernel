@@ -1,23 +1,18 @@
 package main
 
 // module_bound_bench_test.go — what the §4.3 module-call bound COSTS, which is what
-// decided it should be a default (SECURITY §14.1). Arming a wazero runtime with
-// WithCloseOnContextDone compiles a termination check into every loop of every module on
-// it, and this file prices that check on real module-shaped wasm: libsodium's XChaCha20
-// and Ed25519 (the TCB's own crypto, for comparison against the numbers in
-// sodium_bench_test.go) and, opt-in, seedstore's Reed–Solomon codec — an installed app
-// module, which is the code the bound actually exists to stop.
+// decided it should be a default (SECURITY §14.1). Arming a runtime compiles a termination
+// check into every loop of every module on it, and this prices that check on real
+// module-shaped wasm: libsodium's XChaCha20 and Ed25519, and — opt-in — seedstore's
+// Reed–Solomon codec, an installed app module and so the code the bound exists to stop.
 //
 //	go test -run x -bench BenchmarkBound -benchtime 2s -count 5 ./...
 //	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench BenchmarkBound ./...
 //
-// Both configurations run in one process so a comparison is not across two builds:
-// `unarmed` is a stock runtime (what an unbounded deployment runs), `armed` is the same
-// wasm on a runtime with the bound armed. The ratio between them is the number
-// SECURITY §14.1 quotes, and the one to re-measure after any wazero bump — the loader
-// runs a patched wazero whose back-edge check is inline rather than an exit into Go,
-// keeping only a rare unconditional exit as the loop's GC safepoint (see the go.mod
-// replace), and that patch is exactly what this bench keeps honest.
+// Both configurations run in one process, so the comparison is not across two builds. The
+// ratio between them is the number SECURITY §14.1 quotes, and the one to re-measure after
+// any wazero bump: the loader runs a patched wazero whose back-edge check is inline rather
+// than an exit into Go (see the go.mod replace), and this bench keeps that patch honest.
 
 import (
 	"bytes"

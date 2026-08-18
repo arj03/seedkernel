@@ -1,24 +1,18 @@
 // mlkem.go — ML-KEM-768 (FIPS 203) for the native loader: the KEM in the primitive
 // catalog (§12.2, §14.1), reachable from a guest as `ml-kem-768/{keypair,encaps,decaps}`.
 //
-// Like mldsa.go, this is deliberately NOT a Go implementation. It drives
-// wasm/mlkem768.wasm — the same artifact the browser fetches and Node reads,
-// compiled from the pinned mlkem-native submodule by WASM/scripts/build-mlkem.mjs —
-// through wazero. The argument is weaker than ML-DSA's, and worth stating so it is
-// not mistaken for the same one: a KEM is not a verifier, so its accept/reject
-// boundary is not consensus. Two implementations that disagree at the edges do not
-// split the network over a bundle; they just fail to agree on a key. That is still
-// a bug found in production rather than at build time, and there is no capability
-// to be gained by having a second implementation, so there is one.
+// Like mldsa.go this is deliberately NOT a Go implementation; it drives
+// wasm/mlkem768.wasm through wazero. The argument is weaker than ML-DSA's, and worth
+// stating so it is not mistaken for the same one: a KEM is not a verifier, so its
+// accept/reject boundary is not consensus, and implementations disagreeing at the edges
+// only fail to agree on a key. Still a bug found in production rather than at build time,
+// with no capability gained by a second implementation.
 //
-// It is here before anything calls it. A bundle is replaceable and the vocabulary
-// it draws on is not, so a core primitive is provisioned ahead of need or not at
-// all (§14.1) — a post-quantum channel suite is a bundle rollout only if the name
-// it reaches for already exists on every target.
+// It is here before anything calls it: a bundle is replaceable and the vocabulary it draws
+// on is not, so a core primitive is provisioned ahead of need or not at all (§14.1).
 //
-// Like mldsa65.wasm, the module has NO imports: the coins are an argument (which is
-// also what keeps the catalog entries pure functions) and there is no libc, so
-// instantiation is the whole wiring.
+// Like mldsa65.wasm the module has NO imports — the coins are an argument, which is also
+// what keeps the catalog entries pure functions — so instantiation is the whole wiring.
 
 package main
 
@@ -104,9 +98,9 @@ func (m *mlkem) keypairFromSeed(seed []byte) (pk, sk []byte) {
 	return m.read(pkP, mlkemPkBytes), m.read(skP, mlkemSkBytes)
 }
 
-// encapsulate returns ok=false for a public key that fails the modulus check of
-// FIPS 203 §7.2, and for a wrong-width argument — the caller holds a peer's key it
-// did not choose, and "unusable" is the only distinction it can act on.
+// encapsulate returns ok=false for a public key that fails the modulus check of FIPS 203
+// §7.2, and for a wrong-width argument: the caller holds a peer's key it did not choose,
+// and "unusable" is the only distinction it can act on.
 func (m *mlkem) encapsulate(pk, coins []byte) (ct, ss []byte, ok bool) {
 	if len(pk) != mlkemPkBytes || len(coins) != mlkemCoinsBytes {
 		return nil, nil, false
@@ -127,10 +121,10 @@ func (m *mlkem) encapsulate(pk, coins []byte) (ct, ss []byte, ok bool) {
 	return m.read(ctP, mlkemCtBytes), m.read(ssP, mlkemSsBytes), true
 }
 
-// decapsulate returns ok=false only when the SECRET KEY fails the hash check of
-// FIPS 203 §7.3 — never for a bad ciphertext. ML-KEM answers those with a shared
-// secret derived from the key's own z, in constant time, and reporting that apart
-// from success is exactly the oracle implicit rejection exists to deny.
+// decapsulate returns ok=false only when the SECRET KEY fails the hash check of FIPS 203
+// §7.3 — never for a bad ciphertext. ML-KEM answers those with a shared secret derived
+// from the key's own z, in constant time, and reporting that apart from success is exactly
+// the oracle implicit rejection exists to deny.
 func (m *mlkem) decapsulate(sk, ct []byte) (ss []byte, ok bool) {
 	if len(sk) != mlkemSkBytes || len(ct) != mlkemCtBytes {
 		return nil, false
@@ -151,9 +145,8 @@ func (m *mlkem) decapsulate(sk, ct []byte) (ss []byte, ok bool) {
 	return m.read(ssP, mlkemSsBytes), true
 }
 
-// exposeMlKem adds the three ml_kem768_* methods to the realm's `__sodium` object,
-// in the shape kem.ts gives the JS targets — the guest seam's catalog calls them by
-// those names, so the shared TS runs unchanged here.
+// exposeMlKem adds the three ml_kem768_* methods to the realm's `__sodium` object, in the
+// shape kem.ts gives the JS targets, so the guest seam's catalog runs unchanged here.
 func exposeMlKem(qc *qjs.Context, o *qjs.Value, m *mlkem) {
 	o.SetPropertyStr("ml_kem768_keypair_from_seed", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		pk, sk := m.keypairFromSeed(argBytes(t, 0))

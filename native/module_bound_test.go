@@ -1,16 +1,12 @@
 package main
 
-// module_bound_test.go — the §4.3 lever, functionally: the module table's runtime is
-// armed with wazero's WithCloseOnContextDone unless SEEDKERNEL_MODULE_DEADLINE_MS turns
-// the bound off, and callModule runs under that deadline (main.go). A module that never returns is the
-// one case the bound exists for (SECURITY §14.1): the wasm call holds the thread it runs
-// on, and only the deadline ends it. This test proves the bound actually fires, that the
-// closed module is evicted (the guest realm's markDead, per module), and that a reinstall
-// recovers the app.
+// module_bound_test.go — the §4.3 lever, functionally: a module that never returns holds
+// the thread it runs on, and only the deadline ends it (SECURITY §14.1). These tests prove
+// the bound fires, that the closed module is evicted, and that a reinstall recovers the app.
 //
-// There are two wedges, because there are two places a module can refuse to return:
-// its `handle` (the call, below) and its START section (the bind — instantiation runs
-// it, so `TestModuleBindBound` is what says the deadline covers that too).
+// Two wedges, because there are two places a module can refuse to return: its `handle`
+// (the call, below) and its START section, which instantiation runs — TestModuleBindBound
+// is what says the deadline covers that too.
 //
 // The wedge is a minimal hand-assembled module whose handle is an infinite loop; it
 // declares the §4.1 exports like any installed module. WAT:
@@ -189,21 +185,19 @@ func TestModuleCallBound(t *testing.T) {
 	}
 }
 
-// TestModuleCallBoundArmedByDefault proves the bound is ON with no configuration at
-// all, and that SEEDKERNEL_MODULE_DEADLINE_MS=0 is a real off switch rather than a
-// value the parser shrugs at. Both are asked of wazero behaviorally, with an
-// already-canceled context — which an armed runtime honors at call entry by closing
-// the module (call_engine.go's ctx.Done select), and an unarmed one ignores entirely:
+// TestModuleCallBoundArmedByDefault proves the bound is ON with no configuration, and that
+// SEEDKERNEL_MODULE_DEADLINE_MS=0 is a real off switch. Both are asked of wazero
+// behaviorally, with an already-canceled context — which an armed runtime honors at call
+// entry by closing the module, and an unarmed one ignores entirely:
 //
-//   - default boot (no env): the call fails and the module is closed — the lever, at
-//     its cheapest (entry check, no wedge needed), with nobody having asked for it;
-//   - with the deadline set to 0: the same call runs normally and the module stays
-//     open — the escape hatch, and with it the "no bound, no checks" baseline, since
-//     an unbound runtime is left unarmed rather than paying for a disabled lever.
+//   - default boot: the call fails and the module is closed;
+//   - deadline 0: the same call runs normally and the module stays open — the escape
+//     hatch, and the "no bound, no checks" baseline, since an unbound runtime is left
+//     unarmed rather than paying for a disabled lever.
 //
-// A wedge would also prove it, but a goroutine stuck in wasm forever poisons the
-// test process (the runtime's close under an executing call hangs the next boot), so
-// the infinite-loop module stays in the armed test, where the bound ends it.
+// A wedge would prove it too, but a goroutine stuck in wasm forever poisons the test
+// process (closing the runtime under an executing call hangs the next boot), so the
+// infinite-loop module stays in the armed test, where the bound ends it.
 func TestModuleCallBoundArmedByDefault(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()

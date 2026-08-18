@@ -7,22 +7,17 @@ import (
 	"seedloader/qjs"
 )
 
-// A guest that chains fs ops must keep advancing with NOTHING else driving the loop.
-//
-// This is the holder's shape, and it is the one case the loop's pump ordering cannot
-// carry on its own. pumpAll drains the host realm and THEN the guest realms, so a host
-// job that schedules a guest job lands in the same round. The reverse does not: a guest
+// A guest that chains fs ops must keep advancing with NOTHING else driving the loop —
+// the holder's shape, and the one case the pump ordering cannot carry on its own. A guest
 // continuation that issues `await host.call("fs/*")` parks, and its settlement is a
-// HOST-realm microtask (native-shim.ts nativeCall attaches `.then` → bridge.realmSettle)
-// queued after el.c was already drained this round. Nothing schedules the next round —
-// step() blocks with no timer and no task — so without the wake in __host_call the chain
-// advances exactly one fs call per externally-provoked round and then stops dead.
+// HOST-realm microtask queued after el.c was already drained this round, so without the
+// wake in __host_call the chain advances one fs call per externally-provoked round and
+// then stops dead.
 //
-// A holder serving from local disk generates no I/O of its own, which is why it is the
-// case that strands: while a peer keeps sending frames the socket reader posts tasks and
-// the loop is woken incidentally, so the stall only shows once the inbound burst ends —
-// the blocks are already written and the response is never produced. This test removes
-// the incidental traffic entirely: no net, no timers, just a chain of fs awaits.
+// A holder serving from local disk generates no I/O of its own, which is why it strands:
+// while a peer keeps sending frames the loop is woken incidentally, so the stall only
+// shows once the inbound burst ends. This test removes that traffic entirely — no net, no
+// timers, just a chain of fs awaits.
 func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`

@@ -20,12 +20,10 @@ func newSodium(t *testing.T) *libsodium {
 	return bootSodium(rt)
 }
 
-// genericHash (no key, 32-byte out) is plain BLAKE2b-256, and runs on native Go rather
-// than libsodium (sodium.go header). It is the one system hash — the block-id, the guest
-// HASH op, and the loader's genesis/content hash all route here — so a Go node and a Bun
-// node MUST agree on it. Beyond the x/crypto cross-check, pin it to
-// known-answer vectors captured from the libsodium.wasm this build embeds. If native Go
-// ever diverged from that exact binary, these fail rather than silently forking storage.
+// genericHash runs on native Go rather than libsodium (sodium.go header) and is the one
+// system hash, so a Go node and a Bun node MUST agree on it. Beyond the x/crypto
+// cross-check it is pinned to vectors captured from the libsodium.wasm this build embeds:
+// a divergence fails here rather than silently forking storage.
 func TestSodiumGenericHash(t *testing.T) {
 	s := newSodium(t)
 	for _, msg := range [][]byte{nil, []byte("hello"), bytes.Repeat([]byte{1}, 333)} {
@@ -47,12 +45,10 @@ func TestSodiumGenericHash(t *testing.T) {
 }
 
 // The ChaCha20-Poly1305-IETF record layer (§12.6) runs on native Go, not libsodium
-// (sodium.go header). Every node's frames must open on every peer's link, so native
-// ciphertext MUST be byte-identical to libsodium's. RFC 8439 is byte-exact, so it is —
-// pinned three ways: a round-trip + tamper/wrong-key check of the no-AAD wrapper, KATs
-// captured from the libsodium.wasm this build embeds (native/binary drift fails here
-// rather than silently forking the wire), and the independent RFC 8439 §2.8.2 vector
-// (with AAD, exercising the primitive against the published standard).
+// (sodium.go header), and every node's frames must open on every peer's link — so the
+// ciphertext MUST be byte-identical to libsodium's. Pinned three ways: a round-trip plus
+// tamper/wrong-key check, KATs captured from the embedded libsodium.wasm (drift fails here
+// rather than forking the wire), and the independent RFC 8439 §2.8.2 vector.
 func TestSodiumAead(t *testing.T) {
 	s := newSodium(t)
 	key := bytes.Repeat([]byte{0x42}, 32)

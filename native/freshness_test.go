@@ -79,12 +79,11 @@ func TestBundleFreshnessPersistsAcrossReboot(t *testing.T) {
 	}
 }
 
-// A mark the disk refuses is a FAILED load on this target too. The native store used to
-// catch its write error and only log it, which turned the shared rollback (bundle.ts
+// A mark the disk refuses is a FAILED load on this target too. The native store once
+// caught its write error and only logged it, which turned the shared rollback (bundle.ts
 // installBundle) off for the whole binary: the load reported success while the mark it
-// depends on was never written, so the next boot re-opened the downgrade gate for that
-// (author, app) with nothing anywhere saying why. The write seam is Go's, so this is the
-// only place the behaviour can be checked (README §12.4).
+// depends on was never written, re-opening the downgrade gate at the next boot with
+// nothing saying why. The write seam is Go's, so this is the only place to check it.
 func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
 	parent := t.TempDir()
 	dataDir := filepath.Join(parent, "data")

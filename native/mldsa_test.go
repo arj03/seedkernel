@@ -1,13 +1,10 @@
 package main
 
 // The native half of "one implementation, three targets" (§12.9, §14.1). The JS suite
-// checks mldsa65.wasm from Node; these tests check that THIS target — the embedded copy,
-// instantiated under wazero — reaches the same verdicts, both on NIST's own vectors and
-// on a whole hybrid-signed bundle driven through the production loader.
-//
-// Without them the claim would rest on the targets that run the JS suite, and the one
-// that embeds its own copy of the artifact would be the one nobody checked. A verifier's
-// accept/reject boundary is consensus: a bundle one node admits, every node must admit.
+// checks mldsa65.wasm from Node; these check that THIS target's embedded copy, under
+// wazero, reaches the same verdicts — on NIST's vectors and on a whole hybrid-signed
+// bundle through the production loader. Otherwise the target that embeds its own copy of
+// the artifact would be the one nobody checked, and a verifier's boundary is consensus.
 
 import (
 	"crypto/ed25519"
@@ -23,12 +20,10 @@ import (
 
 // ─── a test-only signer ──────────────────────────────────────────────────────────
 //
-// The shipped loader binds mldsa65_verify and nothing else (mldsa.go), which is what
-// keeps it from being turned into a signing oracle (§12.4). A test still has to produce
-// a hybrid bundle for it to admit, so it instantiates its OWN module — a second instance
-// of the same artifact, under a different name — and binds the signing exports there.
-// The signing half therefore exists only in _test files, which is the property the
-// production header claims.
+// The shipped loader binds mldsa65_verify and nothing else, which is what keeps it from
+// being turned into a signing oracle (§12.4). A test still has to produce a hybrid bundle
+// for it to admit, so it instantiates its OWN copy of the same artifact and binds the
+// signing exports there — keeping the signing half to _test files.
 
 type mldsaSigner struct {
 	mldsa
@@ -224,10 +219,8 @@ const (
 )
 
 // The author identity, the envelope writer and the bundle fixtures are the shared
-// harness's (bundle_helper_test.go): there is one manifest suite, so every bundle any
-// test writes is hybrid-signed and there is no second path for these tests to exercise.
-// What is left here is what is specific to the PQ half — that THIS target's embedded
-// artifact reaches the same verdicts as the JS one.
+// harness's (bundle_helper_test.go): one manifest suite, so every bundle any test writes
+// is hybrid-signed. What is left here is specific to the PQ half.
 
 // The whole point of the suite on this target: a hybrid-signed bundle loads, and its
 // module binds under the DERIVED author id — the key-set hash, never either key alone.

@@ -1,14 +1,11 @@
 // wasmmod.go — the shared driver for the two no-import PQ wasm modules (mldsa.go,
-// mlkem.go): instantiate the artifact, cross-check its constant-width exports, and
-// hand out buffers from its own linear memory with a bump pointer. Both modules
-// never allocate and never retain anything across a call — the host writes
-// arguments in, the module runs to completion, the host reads results back — so a
-// rewind at the start of each op is the whole memory manager and there is no free
-// list to corrupt.
+// mlkem.go): instantiate the artifact, cross-check its constant-width exports, and hand
+// out buffers from its own linear memory with a bump pointer. Neither module allocates or
+// retains anything across a call, so a rewind at the start of each op is the whole memory
+// manager and there is no free list to corrupt.
 //
-// One shared linear memory and a bump allocator over it mean an op must not
-// interleave with another, so every op is serialized by mu. Held only for the
-// duration of one call — never across a callback into JS or Go.
+// One linear memory and one bump allocator mean ops must not interleave, so each is
+// serialized by mu — held for one call, never across a callback into JS or Go.
 package main
 
 import (
@@ -30,12 +27,11 @@ type wasmModule struct {
 	name     string
 }
 
-// newWasmModule compiles and instantiates wasm under name (no imports, no start
-// functions) and cross-checks the constant-width exports against want. A module
-// built for another parameter set would otherwise look like a working
-// implementation right up until a real bundle arrived — an ML-DSA verifier that
-// reports valid bundles as bad signatures, or two nodes silently failing to agree
-// on a KEM key — so it must fail at boot instead.
+// newWasmModule compiles and instantiates wasm under name (no imports, no start functions)
+// and cross-checks the constant-width exports against want. A module built for another
+// parameter set would otherwise look like a working implementation until a real bundle
+// arrived — a verifier reporting valid bundles as bad signatures, or two nodes silently
+// failing to agree on a KEM key — so it fails at boot instead.
 func newWasmModule(rt wazero.Runtime, name string, wasm []byte, widths map[string]uint64) *wasmModule {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {

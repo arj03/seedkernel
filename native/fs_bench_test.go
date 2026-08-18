@@ -1,25 +1,20 @@
 package main
 
-// fs.* perf for the Go loader — the storage hot path. A seedstore holder turns every
-// FETCH into store.get → fs.get → os.ReadFile and every STORE into a content-hash
-// check + store.put → fs.put → os.WriteFile (storage-node.ts handleRequest), one ~64 KB
-// block at a time (§27). These benches time that block I/O at two levels, mirroring how
-// the crypto benches split the raw primitive from the dispatch pipeline:
+// fs.* perf for the Go loader — the storage hot path, where a holder turns every FETCH
+// into fs.get → os.ReadFile and every STORE into fs.put → os.WriteFile, one ~64 KB block
+// at a time (§27). Timed at two levels:
 //
-//   - BenchmarkNodeFs{Get,Put}64K — the bare Go nodeFs (disk + the fsKeySafe regex).
-//     Report MB/s so it lines up next to the BLAKE2b/XChaCha20 rates: that comparison
-//     is what tells you whether GET is disk-bound or crypto-bound.
-//   - BenchmarkFs{Get,Put}JS64K — the same op through the QuickJS shim (fs.go exposeFs),
-//     so the delta over the bare Go number is the per-block ArrayBuffer copy the storage
-//     guest actually pays on the JS↔Go boundary.
+//   - BenchmarkNodeFs{Get,Put}64K — the bare Go nodeFs. MB/s, so it lines up next to the
+//     BLAKE2b/XChaCha20 rates: that comparison says whether GET is disk- or crypto-bound.
+//   - BenchmarkFs{Get,Put}JS64K — the same op through the QuickJS shim, so the delta is
+//     the per-block ArrayBuffer copy the storage guest pays on the JS↔Go boundary.
 //
-// Plus BenchmarkNodeFsOpenScan: FsBlobStore rebuilds its in-memory index at open by
-// listing the fs once and stat-ing every block (store-fs.ts) — has/list/stat then never
-// touch the backend, so this O(N) scan is a node-startup cost, not per-request. The
-// sweep over directory size shows that scaling.
+// Plus BenchmarkNodeFsOpenScan: FsBlobStore rebuilds its index at open by listing the fs
+// and stat-ing every block (store-fs.ts), so that O(N) scan is a node-startup cost, not a
+// per-request one. The sweep over directory size shows its scaling.
 //
-// These are loader-internal numbers: node uses node:fs, so unlike the crypto/RS benches
-// there's no byte-identical cross-runtime twin to compare against.
+// Loader-internal numbers: node uses node:fs, so there is no byte-identical twin to
+// compare against.
 //
 //	go test -run x -bench 'BenchmarkNodeFs|BenchmarkFs' -benchmem ./...
 

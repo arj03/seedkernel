@@ -1,11 +1,10 @@
 package main
 
-// The one way a test stands the loader up. There is a single assembly path in
-// production — boot() installs the platform primitives and evaluates the shared
-// bundle, bootNode() builds the node and the shell inside it — so the tests drive
-// that path rather than a parallel wiring of their own. A harness that assembles the
-// realm differently is exactly the second implementation this target exists not to
-// have (README §12.9).
+// The one way a test stands the loader up. Production has a single assembly path — boot()
+// installs the platform primitives and evaluates the shared bundle, bootNode() builds the
+// node and shell inside it — so the tests drive that path. A harness that assembled the
+// realm differently would be the second implementation this target exists not to have
+// (README §12.9).
 
 import (
 	"crypto/rand"
@@ -46,10 +45,9 @@ func jsonString(s string) string {
 
 // ── the realm entry points a test drives ─────────────────────────────────────
 //
-// These are TEST drivers, not production code: the binary reaches the realm once, at
-// `runMain`, and everything below it — the config, the load, the console line — is the
-// shared CLI's. A test needs finer joints than one call, so it uses the same realm
-// exports `runCli` does, never a second formatting or a second assembly of its own.
+// TEST drivers, not production code: the binary reaches the realm once, at `runMain`, and
+// everything below that is the shared CLI's. A test needs finer joints than one call, so
+// it uses the same realm exports `runCli` does — never a second assembly of its own.
 
 // nodeConfig is what `bootNode` takes: the operator's choices as one JSON object. In
 // production the shared CLI builds this from the flags; here a test builds it directly
@@ -190,11 +188,10 @@ func applyPolicy(policyJSON string) error {
 	return err
 }
 
-// testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience
-// over the shared createGuestSeam, so a test can hand a realm a seam with no signed
-// bundle behind it. Production never takes this path — createShell wires the
-// seam from the admitted manifest's declared requires (§12.2) — which is why this
-// lives in a _test file and not in the shipped glue.
+// testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience over the
+// shared createGuestSeam, so a test can hand a realm a seam with no signed bundle behind
+// it. Production wires the seam from the admitted manifest's requires (§12.2), which is
+// why this lives in a _test file.
 const testGuestSeamJS = `
 "use strict";
 globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
@@ -275,10 +272,9 @@ func realmCall(entry string, payload []byte) ([]byte, error) {
 }
 
 // TestCallRealmReleasesStagedArgs covers the argument staging: callRealm lands each
-// argument on a __aN global for the duration of the call and must release it when the
-// call returns — otherwise a one-shot op (an --op put of a large file, an uninstall after
-// which nothing else runs) leaves its payload rooted on the global object for the
-// process's life.
+// argument on a __aN global and must release it when the call returns — otherwise a
+// one-shot op (an --op put of a large file) leaves its payload rooted on the global object
+// for the process's life.
 func TestCallRealmReleasesStagedArgs(t *testing.T) {
 	bootRealm(t)
 	if _, err := qc.Eval("probe.js", qjs.Code(`

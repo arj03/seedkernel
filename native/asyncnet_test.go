@@ -11,17 +11,14 @@ import (
 	"seedloader/qjs"
 )
 
-// asyncnet: a confined guest *initiates* a real network round-trip. The
-// guest's only net surface is an await on the id the transport claims; the engine has no
-// Asyncify, so that call returns a callId-backed Promise instead of blocking. This
-// proves the cross-realm async seam end to end: the guest's await suspends, the host
-// realm's transport bundle dials a responder over a loopback socket, and when its promise
-// settles the shared loop (loop.go) resolves the guest's promise and resumes the
-// awaiting entrypoint — all driven by one loop pumping both realms.
+// asyncnet: a confined guest *initiates* a real network round-trip, which proves the
+// cross-realm async seam end to end. The guest's await suspends (the engine has no
+// Asyncify, so the call returns a callId-backed Promise rather than blocking), the host
+// realm's transport dials a responder over a loopback socket, and when its promise settles
+// the shared loop resolves the guest's and resumes the entrypoint — one loop, both realms.
 //
 // Topology: one host realm, two networks. A (responder) listens and echoes
-// [type, ...payload]; B (the guest's node) holds the guest seam over its transport.
-// The guest, running as initiator, asks A and returns the echoed bytes.
+// [type, ...payload]; B holds the guest seam over its transport, and its guest asks A.
 func TestAsyncNetInitiator(t *testing.T) {
 	guestSeamRealm(t)
 

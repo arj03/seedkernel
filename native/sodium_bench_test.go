@@ -16,12 +16,10 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
-// benchSodium stands up an isolated libsodium for a benchmark (mirrors newSodium in
-// sodium_test.go, but takes a *testing.B). The runtime mirrors boot()'s rtCore:
-// deliberately UNARMED — libsodium is the TCB's own trusted code, never the thing a
-// module-call bound exists to stop, and the termination checks still cost on this wasm
-// (module_bound_bench_test.go prices them), so arming it would bill the bound to crypto
-// every node runs (SECURITY §14.1).
+// benchSodium stands up an isolated libsodium for a benchmark (newSodium's twin in
+// sodium_test.go). The runtime mirrors boot()'s rtCore: deliberately UNARMED, since
+// libsodium is the TCB's own trusted code and the checks are not free
+// (module_bound_bench_test.go prices them).
 func benchSodium(b *testing.B) *libsodium {
 	b.Helper()
 	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())

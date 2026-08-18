@@ -1,7 +1,5 @@
-// bridge.go — shared helpers for installing Go-backed functions on the bridge
-// objects (bridge, __net, __fs, __sodium) set up by exposeBridge, exposeNet,
-// exposeFs, exposeSodium and installRealmBridge. Each installer used to carry
-// its own copies.
+// bridge.go — shared helpers for installing Go-backed functions on the bridge objects
+// (bridge, __net, __fs, __sodium).
 package main
 
 import "seedloader/qjs"

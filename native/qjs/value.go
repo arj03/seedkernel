@@ -7,10 +7,9 @@ type Context struct {
 	rt     *Runtime
 	handle uint64 // JSContext*
 	global *Value
-	// Cached intrinsics, resolved on first use and retained for the realm's life (freed
-	// with the runtime). isByteArray/classTag run on every JS→Go bulk transfer, so
-	// re-walking the prototype chain for Object.prototype.toString and re-looking-up the
-	// ArrayBuffer constructor on each call was needless churn on a hot path.
+	// Cached intrinsics, resolved on first use and retained for the realm's life.
+	// isByteArray/classTag run on every JS→Go bulk transfer, so re-resolving them per call
+	// was needless churn on a hot path.
 	objToString *Value // Object.prototype.toString, for classTag
 	abCtor      *Value // the ArrayBuffer constructor, for isByteArray's instanceof
 }
@@ -48,9 +47,8 @@ func (v *Value) Context() *Context { return v.c }
 // Free releases the JSValue reference.
 func (v *Value) Free() {
 	if v != nil && v.raw != 0 {
-		// A runtime terminated by a Budget deadline has had its whole linear memory
-		// reclaimed by wazero, so there is nothing left to free and the call would
-		// panic. Drop the handle instead: a killed call path is full of deferred
+		// A closed runtime has had its linear memory reclaimed by wazero, so there is
+		// nothing to free and the call would panic. A killed call path is full of deferred
 		// Free()s, and they must not turn a clean error into a panic.
 		if !v.c.rt.Alive() {
 			v.raw = 0
@@ -61,10 +59,9 @@ func (v *Value) Free() {
 	}
 }
 
-// Dup retains an extra reference to the value (QJS_CloneValue == JS_DupValue), so a
-// JS value handed to a host callback (e.g. a setTimeout / onMessage function) can
-// outlive that synchronous call. The returned *Value must be Free()d once when the
-// host no longer needs it — used by the Go-owned event loop to hold JS callbacks.
+// Dup retains an extra reference (QJS_CloneValue == JS_DupValue), so a JS value handed to
+// a host callback can outlive that synchronous call — the event loop holds JS callbacks
+// this way. The returned *Value must be Free()d once.
 func (v *Value) Dup() *Value {
 	if v == nil || v.raw == 0 {
 		return nil
@@ -107,9 +104,8 @@ func (c *Context) NewString(s string) *Value {
 	return c.callV("QJS_NewString", c.handle, ptr)
 }
 
-// NewArrayBuffer creates a JS ArrayBuffer copy of b. It stages the bytes straight into
-// one wasm buffer rather than through a Go-side scratch slice, so the payload is walked
-// once; QJS_NewArrayBufferCopy then makes the engine-owned copy.
+// NewArrayBuffer creates a JS ArrayBuffer copy of b, staging the bytes straight into one
+// wasm buffer so the payload is walked once before QJS_NewArrayBufferCopy takes it.
 func (c *Context) NewArrayBuffer(b []byte) *Value {
 	if len(b) == 0 {
 		return c.callV("QJS_NewArrayBufferCopy", c.handle, 0, 0)
@@ -166,16 +162,14 @@ func (v *Value) IsUndefined() bool { return v.boolCall("QJS_IsUndefined", v.raw)
 func (v *Value) IsNull() bool      { return v.boolCall("QJS_IsNull", v.raw) }
 func (v *Value) IsObject() bool    { return v.boolCall("QJS_IsObject", v.raw) }
 
-// isByteArray reports whether the value is an ArrayBuffer.
-// isByteArray reports whether v is an ArrayBuffer (a bare buffer toByteArray can read
-// directly). A typed-array/DataView view is NOT one — JsTypedArrayToGo reads those via
-// their .buffer — so this returns false for them.
+// isByteArray reports whether v is an ArrayBuffer — a bare buffer toByteArray can read
+// directly. A typed-array/DataView view is NOT one (JsTypedArrayToGo reads those via their
+// .buffer), so this returns false for them.
 //
 // The brand check must use classTag (Object.prototype.toString.call), NOT v.String():
-// String() is the value's *own* toString, which for a TypedArray is Array's join — it
-// serializes every element to a comma-joined string. Probing a 64 KB Uint8Array's type
-// that way built a ~200 KB string per call and made every JS→Go bulk transfer (fs.put,
-// __net.send, the storage block plane) O(payload) with a huge constant — ~12 ms for a
+// String() is the value's *own* toString, which for a TypedArray is Array's join and
+// serializes every element. Probing a 64 KB Uint8Array that way built a ~200 KB string per
+// call and made every JS→Go bulk transfer O(payload) with a huge constant — ~12 ms for a
 // 64 KB block, vs ~80 µs the other direction. The class tag is O(1) and contents-blind.
 func (v *Value) isByteArray() bool {
 	if !v.IsObject() {
@@ -190,9 +184,9 @@ func (v *Value) isByteArray() bool {
 	return v.classTag() == "[object ArrayBuffer]"
 }
 
-// arrayBufferCtor returns the realm's ArrayBuffer constructor, cached after first use.
-// nil if the realm has no ArrayBuffer global (never in practice — it's a standard
-// intrinsic), in which case isByteArray falls back to the class tag.
+// arrayBufferCtor returns the realm's ArrayBuffer constructor, cached after first use, or
+// nil if the realm has no ArrayBuffer global — in which case isByteArray falls back to the
+// class tag.
 func (c *Context) arrayBufferCtor() *Value {
 	if c.abCtor == nil {
 		ctor := c.Global().GetPropertyStr("ArrayBuffer")
@@ -205,9 +199,9 @@ func (c *Context) arrayBufferCtor() *Value {
 	return c.abCtor
 }
 
-// classTag returns v's brand via Object.prototype.toString.call(v) — e.g.
-// "[object ArrayBuffer]", "[object Uint8Array]". Unlike String() it ignores the value's
-// own toString, so it is O(1) regardless of contents (see isByteArray).
+// classTag returns v's brand via Object.prototype.toString.call(v) — e.g. "[object
+// ArrayBuffer]". Unlike String() it ignores the value's own toString, so it is O(1)
+// regardless of contents (see isByteArray).
 func (v *Value) classTag() string {
 	r, err := v.c.Invoke(v.c.objectToString(), v) // Object.prototype.toString.call(v)
 	if err != nil {
@@ -231,15 +225,11 @@ func (c *Context) objectToString() *Value {
 
 // toByteArray returns a copy of the ArrayBuffer's bytes, leaving the source intact.
 //
-// QJS_GetArrayBuffer (the C shim) wraps JS_GetArrayBuffer, which returns a pointer to
-// the buffer's *live* storage (not a copy) plus a freshly malloc'd 8-byte (addr<<32 |
-// size) cell. So the only thing this owns to free is that cell. The earlier sequence
-// (inherited from fastschema) instead freed `addr` — the live buffer's data — which
-// detached the source ArrayBuffer out from under QuickJS: harmless when a value is
-// read once and dropped, but a use-after-free when the value is reused (e.g. the node
-// identity's privateKey signed against more than one peer, or any retained Uint8Array
-// read twice). It also leaked the QJS_CloneValue dup and mis-freed the cell as a
-// JSValue. We now read straight from the live buffer and free only the cell.
+// QJS_GetArrayBuffer returns a pointer to the buffer's *live* storage plus a freshly
+// malloc'd packed cell, so the cell is the only thing this owns to free. Freeing `addr`
+// instead detaches the source ArrayBuffer out from under QuickJS — harmless when a value
+// is read once and dropped, a use-after-free when it is reused (a node identity's
+// privateKey signed against more than one peer, any retained Uint8Array read twice).
 func (v *Value) toByteArray() []byte {
 	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
 	if packed == 0 {
@@ -256,14 +246,11 @@ func (v *Value) toByteArray() []byte {
 	return out
 }
 
-// toByteArrayWindow copies just the [offset, offset+length) window of the
-// ArrayBuffer's bytes, with the same ownership story as toByteArray: addr is the
-// buffer's live storage, so only the packed bookkeeping cell is freed and the source
-// stays intact. The window is validated against the buffer size QuickJS itself
-// reports — never the caller's numbers alone — so a forged byteOffset/byteLength
-// cannot read past the buffer. Cost is O(window): a small typed-array view over a
-// large buffer copies only its own bytes, instead of copying — and, via the returned
-// subslice, pinning — the entire backing store.
+// toByteArrayWindow copies just the [offset, offset+length) window, with the same
+// ownership story as toByteArray. The window is validated against the buffer size QuickJS
+// itself reports — never the caller's numbers alone — so a forged byteOffset/byteLength
+// cannot read past the buffer. O(window), so a small view over a large buffer neither
+// copies nor pins the whole backing store.
 func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
 	packed := v.c.rt.call("QJS_GetArrayBuffer", v.c.handle, v.raw)
 	if packed == 0 {
@@ -271,8 +258,8 @@ func (v *Value) toByteArrayWindow(offset, length int64) ([]byte, error) {
 	}
 	addr, size := v.c.rt.unpackPtr(packed)
 	v.c.rt.freeAt(packed) // the malloc'd cell only — addr is the live buffer, owned by JS
-	// Compare via subtraction (length > size-offset), not addition: offset and length
-	// arrive from JS getters, and a hostile pair near 2^62 would overflow offset+length.
+	// Compare by subtraction, not addition: offset and length arrive from JS getters, and a
+	// hostile pair near 2^62 would overflow offset+length.
 	if offset < 0 || length < 0 || offset > int64(size) || length > int64(size)-offset {
 		return nil, errors.New("qjs: typed array view out of range")
 	}
@@ -327,9 +314,8 @@ func (c *Context) Invoke(fn, this *Value, args ...*Value) (*Value, error) {
 	return c.normalize(res)
 }
 
-// marshalArgs writes the JSValue args contiguously into wasm memory. The 8-byte
-// words go straight into the malloc'd region (WriteUint64Le), skipping the Go-side
-// staging slice the old path built and then copied in — this runs on every Invoke.
+// marshalArgs writes the JSValue args contiguously into wasm memory, straight into the
+// malloc'd region rather than through a Go-side staging slice — this runs on every Invoke.
 func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	if len(args) == 0 {
 		return 0, 0
@@ -341,11 +327,9 @@ func (c *Context) marshalArgs(args ...*Value) (uint64, uint64) {
 	return uint64(len(args)), ptr
 }
 
-// normalize converts a pending JS exception into a Go error. A throw sets the context's
-// exception flag (and QJS_Call/QJS_Eval return JS_EXCEPTION), which hasException()
-// catches — that is the only failure signal. It deliberately does NOT treat an Error
-// *value* as a failure: a JS function may legitimately return (not throw) an Error as
-// data, and on the core Invoke/Eval path that must round-trip, not surface as an error.
+// normalize converts a pending JS exception into a Go error. The context's exception flag
+// is the only failure signal: an Error *value* is deliberately not one, since a JS function
+// may legitimately return an Error as data, which must round-trip.
 func (c *Context) normalize(v *Value) (*Value, error) {
 	if c.hasException() {
 		v.Free()
@@ -384,7 +368,7 @@ func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
 	// QJS_CreateEvalOption(codeBuf, bytecodeBuf, bytecodeLen, filename, flags)
 	optPtr := c.rt.call("QJS_CreateEvalOption", codePtr, 0, 0, filePtr, o.flags)
 	res := c.callV("QJS_Eval", c.handle, optPtr)
-	// The eval buffers must outlive QJS_Eval; free them now.
+	// The eval buffers had to outlive QJS_Eval; free them now.
 	if codePtr != 0 {
 		c.rt.freeAt(codePtr)
 	}
@@ -394,11 +378,10 @@ func (c *Context) Eval(file string, opts ...EvalOptionFunc) (*Value, error) {
 }
 
 // Pump runs the QuickJS job queue (microtasks and settled-promise reactions) to
-// completion. QJS_Eval calls js_std_loop after evaluating; because the loader
-// supplies Go-backed timers (it overrides os.setTimeout), there are no os timers
-// to wait on, so js_std_loop drains the pending jobs and returns immediately. The
-// Go-owned event loop calls this after every re-entry into JS (a delivered socket
-// frame, a fired timer) so promise chains advance. Verified by TestQjsPumpModel.
+// completion. QJS_Eval calls js_std_loop after evaluating, and since the loader supplies
+// Go-backed timers there are no os timers to wait on, so it drains the pending jobs and
+// returns immediately. The event loop calls this after every re-entry into JS so promise
+// chains advance. Verified by TestQjsPumpModel.
 func (c *Context) Pump() error {
 	v, err := c.Eval("<pump>", Code("0"))
 	if v != nil {
@@ -408,19 +391,14 @@ func (c *Context) Pump() error {
 }
 
 // JsTypedArrayToGo returns the bytes of a TypedArray/DataView/ArrayBuffer as an
-// independent Go copy. The source is left fully intact: it is NOT detached or
-// neutered, so the same value (a shared singleton, a retained Uint8Array, a node
-// key signed against many peers) can be read any number of times. For views it
-// returns only the view's window (byteOffset..byteOffset+byteLength), and copies only
-// those bytes — O(view), not O(backing buffer) — so a small subarray over a large
-// buffer neither pays for nor pins the whole store. Callers never need a defensive
-// .slice() before handing a typed array across this seam — the copy happens here, by
-// default. (The underlying reads copy out of the live buffer and free only QuickJS's
-// bookkeeping cell, never the buffer itself.)
+// independent Go copy. The source is NOT detached, so the same value (a shared singleton,
+// a node key signed against many peers) can be read any number of times, and callers never
+// need a defensive .slice() before handing a typed array across this seam. For a view it
+// returns only that view's window, copying O(view) rather than the backing buffer.
 func JsTypedArrayToGo(input *Value) ([]byte, error) {
-	// Reject non-objects up front: GetPropertyStr("buffer") below would throw a
-	// TypeError on null/undefined/a primitive and leave the exception flag set,
-	// poisoning the next unrelated JS call (and a nil *Value would panic here).
+	// Reject non-objects up front: GetPropertyStr("buffer") below would throw a TypeError
+	// on null/undefined/a primitive and leave the exception flag set, poisoning the next
+	// unrelated JS call (and a nil *Value would panic here).
 	if input == nil || !input.IsObject() {
 		return nil, errors.New("qjs: expected a typed array or ArrayBuffer")
 	}

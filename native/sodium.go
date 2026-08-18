@@ -1,35 +1,24 @@
-// sodium.go — the Go target's crypto *primitive*: the same browser/libsodium.wasm,
-// driven over wazero. Mostly not Go-native crypto. The point is interop: a Go node's
-// sealed boxes / ed25519→curve25519 conversions / xchacha20 blocks must be
-// byte-identical to a Bun node's, which only the exact same libsodium binary
-// guarantees. This file is the FFI seam over the emscripten ABI (malloc / copy-in /
-// call / copy-out) plus a `sodium` object into the QuickJS realm carrying
-// libsodium-wrappers method names — so the shared host JS (and, later, guest-seam.ts)
-// calls `sodium.*` unchanged.
+// sodium.go — the Go target's crypto *primitive*: the same browser/libsodium.wasm, driven
+// over wazero. The point is interop — a Go node's sealed boxes, ed25519→curve25519
+// conversions and xchacha20 blocks must be byte-identical to a Bun node's, which only the
+// exact same binary guarantees. This file is the FFI seam over the emscripten ABI plus a
+// `sodium` object carrying libsodium-wrappers method names, so the shared host JS calls
+// `sodium.*` unchanged.
 //
-// Two primitives run on native Go instead, under the native fast-path rule (§12.9):
-// *where a primitive is standardized, a target may substitute a native implementation,
-// because the bytes are identical and only the speed differs* — subject to the three
-// conditions stated there (standardized, byte-identical and KAT-pinned, no protocol
-// judgement inside). The rule is written down once in the docs rather than re-derived
-// here per primitive; what belongs in this file is which primitives took it and what
-// pins them:
+// Two primitives run on native Go instead, under the native fast-path rule (§12.9). Which
+// took it and what pins them:
 //
-//   - genericHash — BLAKE2b-256, the content-address block-id hash
-//     (golang.org/x/crypto/blake2b). Pinned by TestSodiumGenericHash. Every block is
-//     hashed on PUT and verified on bulk receive (§12.6), and it is the one hash
-//     wazero runs slower than V8 (~600 vs ~390 MB/s native).
+//   - genericHash — BLAKE2b-256, the content-address block-id hash. Pinned by
+//     TestSodiumGenericHash. Every block is hashed on PUT and verified on bulk receive
+//     (§12.6), and it is the one hash wazero runs slower than V8 (~390 vs ~600 MB/s).
 //
-//   - the ChaCha20-Poly1305-IETF record layer — RFC 8439
-//     (golang.org/x/crypto/chacha20poly1305). Pinned by TestSodiumAead, captured from
-//     this build's own binary. Every post-AUTH frame is a seal on send and an open on
-//     receive (§12.6); native runs it ~8× faster and, needing no scratch arena, takes
-//     no lock.
+//   - the ChaCha20-Poly1305-IETF record layer (RFC 8439). Pinned by TestSodiumAead,
+//     captured from this build's own binary. Every post-AUTH frame is a seal or an open
+//     (§12.6); native runs it ~8× faster and, needing no scratch arena, takes no lock.
 //
-// Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm on condition 3, not on
-// speed: a verifier decides whether to *accept*, and its accept/reject boundary is
-// consensus. X25519/scalarmult stays wasm because there is nothing to win —
-// handshake-only, amortized over the link.
+// Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm on the rule's third condition,
+// not on speed: a verifier's accept/reject boundary is consensus. X25519/scalarmult stays
+// wasm because there is nothing to win — handshake-only, amortized over the link.
 package main
 
 import (
@@ -59,16 +48,13 @@ type libsodium struct {
 	mod api.Module
 	mem api.Memory
 	fns map[string]api.Function
-	// One shared scratch heap + allocator means an op is a malloc/call/read/free
-	// sequence that must not interleave with another. The net stack (net.go) now
-	// drives sign/verify from per-connection goroutines and the host's
-	// env.ed25519_verify from the main thread, so every op takes this lock. Held
-	// only for the duration of one op — never across a callback into JS or Go.
+	// One shared scratch heap and allocator, so an op is a malloc/call/read sequence that
+	// must not interleave with another — and sign/verify are driven from per-connection
+	// goroutines. Held for one op only, never across a callback into JS or Go.
 	mu sync.Mutex
 
-	// Persistent scratch arena reused across ops (the README reference-host's "pre-allocate
-	// suite scratch once and reuse it"), replacing the 2–4 malloc/free pairs each op made.
-	// Every op is serialized by mu and needs only its own buffers live at once, so one
+	// Scratch arena reused across ops, replacing the 2–4 malloc/free pairs each one made.
+	// Every op is serialized by mu and needs only its own buffers live, so one
 	// grow-on-demand block with a per-op bump allocator suffices. Guarded by mu.
 	arena    uint32 // wasm ptr to the scratch block (0 until first grown)
 	arenaCap int    // its size in bytes; grows to the high-water op need, never shrinks
@@ -103,19 +89,15 @@ var sodiumExports = map[string]string{
 	"crypto_sign_ed25519_sk_to_curve25519": "gi",
 	"crypto_box_seal":                      "gb",
 	"crypto_box_seal_open":                 "hb",
-	// The §12.6 transport AKE's X25519 stays on wasm (handshake-only, amortized over
-	// the link). One export covers it: the transport bundle reaches scalarmult through
-	// the guest seam's `x25519/dh`, and derives its ephemeral PUBLIC key with that same
-	// entry against the base point — so there is no separate keypair primitive to export
-	// (guest-seam.ts says as much). The ChaCha20-Poly1305-IETF record layer is native Go
-	// (see aeadEncrypt / the file header), so it needs no export here.
+	// One export covers the §12.6 AKE's X25519: the transport bundle reaches scalarmult
+	// through the guest seam's `x25519/dh` and derives its ephemeral PUBLIC key with the
+	// same entry against the base point, so there is no keypair primitive to export.
 	"crypto_scalarmult": "Dg",
 }
 
-// EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes
-// routes through the asm-const import `a.b`; the only snippets in this build are
-// these two. We satisfy them from crypto/rand (the entropy source need not match
-// across nodes — only its consumers' deterministic structure does).
+// EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes routes
+// through the asm-const import `a.b`, and these two are the only snippets in this build.
+// Satisfied from crypto/rand — the entropy source need not match across nodes.
 const (
 	sodiumRandU32  = 40712 // ()->u32: one random word
 	sodiumRandInit = 40748 // ()->void: lazy RNG init (a no-op here)
@@ -124,16 +106,16 @@ const (
 const sealBytes = 48 // crypto_box_SEALBYTES (ephemeral pk 32 + MAC 16)
 
 // bootSodium wires the four emscripten host imports (module "a"), instantiates
-// libsodium.wasm, binds the exports we use, and runs sodium_init — mirroring what
-// libsodium-wrappers does after load.
+// libsodium.wasm, binds the exports used, and runs sodium_init — what libsodium-wrappers
+// does after load.
 func bootSodium(rt wazero.Runtime) *libsodium {
 	a := rt.NewHostModuleBuilder("a")
 	// a.a — __assert_fail(cond,file,line,func): only reached on a libsodium bug.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) {
 		panic("libsodium: assertion failed")
 	}).Export("a")
-	// a.b — _emscripten_asm_const_int(code,sig,args): the EM_JS dispatcher. In this
-	// build it only ever runs the two entropy snippets, both argument-free.
+	// a.b — _emscripten_asm_const_int(code,sig,args): the EM_JS dispatcher, which in this
+	// build only ever runs the two entropy snippets, both argument-free.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, code, _, _ uint32) uint32 {
 		switch code {
 		case sodiumRandU32:
@@ -198,10 +180,9 @@ func (s *libsodium) malloc(n int) uint32 {
 
 func (s *libsodium) free(p uint32) { s.fns["free"].Call(ctx, uint64(p)) }
 
-// arenaReset ensures the scratch arena can hold total bytes (growing it once, up front,
-// before any per-op pointer is handed out) and rewinds the bump allocator. Call once at
-// the top of an op with the op's total need — Σ alignUp(each buffer) — then take/takeIn
-// the buffers. Growing only ever happens here, never mid-op, so pointers can't dangle.
+// arenaReset ensures the arena can hold total bytes and rewinds the bump allocator. Call
+// once at the top of an op with its total need — Σ alignUp(each buffer) — then take/takeIn
+// the buffers: growing happens only here, never mid-op, so pointers cannot dangle.
 func (s *libsodium) arenaReset(total int) {
 	if total > s.arenaCap {
 		if s.arena != 0 {
@@ -225,7 +206,7 @@ func (s *libsodium) take(n int) uint32 {
 }
 
 // takeIn is take plus a copy of b into the sub-allocation (min 1 byte, so an empty input
-// still yields a valid non-null pointer, as the old copyIn did).
+// still yields a valid non-null pointer).
 func (s *libsodium) takeIn(b []byte) uint32 {
 	p := s.take(len(b))
 	if len(b) > 0 {
@@ -252,16 +233,13 @@ func (s *libsodium) call(name string, args ...uint64) int32 {
 	return int32(uint32(r[0]))
 }
 
-// mustCall is call for a PRODUCING op whose failure is an invariant violation — a key
-// or nonce of the wrong length, an arena that could not hold the output. libsodium
-// signals that with -1 and leaves the output buffer UNTOUCHED, and the arena is reused
-// across ops: reading it anyway hands the caller whatever the previous op left there,
-// which has been a secret key or a plaintext. So a producing op either succeeds or
-// stops here; it never returns bytes it did not compute. Panic rather than an error
-// return because every caller of these passes lengths this process itself derived
-// (`sodium_init`, `malloc` and `genericHash` fail the same way) — an op that CAN fail on
-// its inputs, like crypto_scalarmult or the ed→curve conversions, checks the code
-// itself and answers ok=false.
+// mustCall is call for a PRODUCING op whose failure is an invariant violation — a key or
+// nonce of the wrong length, an arena too small for the output. libsodium signals that
+// with -1 and leaves the output buffer UNTOUCHED, and the arena is reused across ops, so
+// reading it anyway would hand the caller whatever the previous op left there (a secret
+// key, a plaintext). Panic rather than an error return, because these callers pass lengths
+// this process derived itself; an op that can fail on its INPUTS (crypto_scalarmult, the
+// ed→curve conversions) checks the code itself and answers ok=false.
 func (s *libsodium) mustCall(name string, args ...uint64) {
 	if r := s.call(name, args...); r != 0 {
 		panic(fmt.Sprintf("libsodium: %s returned %d (output not written)", name, r))
@@ -274,14 +252,11 @@ func lenArgs(n int) (lo, hi uint64) { return uint64(uint32(n)), 0 }
 
 // ───────────────────────── the crypto ops ─────────────────────────
 
-// genericHash is native Go BLAKE2b (not libsodium) — see the file header. It is the one
-// system hash: the content-address block-id, the guest `HASH` op, and the loader's
-// genesis/content hash (`genesisHash`, §12.4) all route here. This build only ever
-// computes the UNKEYED, 32-byte digest, which is KAT-pinned byte-identical to libsodium.
-// Reject any other length loudly: 1–15 diverges from libsodium's BYTES_MIN, and 0/>64
-// would panic inside blake2b.New — a quietly-wrong, consensus-affecting hash is worse
-// than a hard failure. (Keyed hashing is rejected at the JS seam, where the key would
-// otherwise be silently dropped.)
+// genericHash is native Go BLAKE2b (see the file header) and the one system hash: the
+// content-address block-id, the guest `HASH` op and the loader's genesis hash (§12.4) all
+// route here. This build computes only the UNKEYED 32-byte digest; any other length is
+// rejected loudly, because a quietly-wrong consensus-affecting hash is worse than a hard
+// failure. (Keyed hashing is rejected at the JS seam, where the key would be dropped.)
 func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 	if outLen != 32 {
 		panic(fmt.Sprintf("genericHash: native blake2b is 32-byte-only in this build, got %d", outLen))
@@ -324,10 +299,9 @@ func (s *libsodium) verifyDetached(sig, msg, pk []byte) bool {
 	return s.call("crypto_sign_verify_detached", uint64(sp), uint64(in), lo, hi, uint64(pkp)) == 0
 }
 
-// There is no separate public-key point check. crypto_core_ed25519_is_valid_point used
-// to gate keys here to match a JS-side _pubkeyIsValidPoint, but no target does that any
-// more — Ed25519 verification is the one gate, on every target, and a second one on only
-// this one would be the exact disagreement it was added to prevent (§12.6).
+// There is no separate public-key point check: Ed25519 verification is the one gate on
+// every target, and a second one here alone would be the exact disagreement such a check
+// exists to prevent (§12.6).
 
 func (s *libsodium) signKeypair() (pk, sk []byte) {
 	s.mu.Lock()
@@ -348,10 +322,9 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 }
 
 // edPkToCurve converts an Ed25519 public key to its X25519 counterpart. ok=false rather
-// than a panic on -1: the input is somebody ELSE's key, and libsodium refuses one that
-// is not a canonical point — a data-dependent failure a caller must be able to handle,
-// not an invariant of ours. The 32 output bytes are only read when it succeeded (the
-// arena otherwise still holds the previous op's).
+// than a panic on -1: the input is somebody ELSE's key and libsodium refuses one that is
+// not a canonical point — a data-dependent failure, not an invariant of ours. The output
+// is read only on success (the arena otherwise still holds the previous op's bytes).
 func (s *libsodium) edPkToCurve(edPk []byte) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -403,11 +376,10 @@ func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
 
 // ── §12.6 transport AKE primitives ──
 
-// scalarmult computes the X25519 shared point q = n·p (32 bytes). Against the base
-// point it is also the ephemeral public-key derivation, which is why the AKE needs no
-// keypair primitive of its own. Returns ok=false on a low-order / all-zero result
-// (return -1), which the handshake treats as failed — mirroring libsodium-wrappers
-// throwing there.
+// scalarmult computes the X25519 shared point q = n·p. Against the base point it is also
+// the ephemeral public-key derivation, which is why the AKE needs no keypair primitive.
+// ok=false on a low-order / all-zero result, which the handshake treats as failed —
+// mirroring libsodium-wrappers throwing there.
 func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -419,12 +391,11 @@ func (s *libsodium) scalarmult(n, p []byte) ([]byte, bool) {
 	return s.read(q, 32), true
 }
 
-// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, no AAD; the
-// result is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header): RFC
-// 8439 is byte-exact, so the ciphertext is identical to the wasm's (pinned by
-// TestSodiumAead). npub/key are locally derived (always 12/32 B), so New/Seal can only
-// fail on an invariant violation — panic, matching the other primitives. No wasm
-// scratch means no lock: per-connection goroutines seal concurrently.
+// aeadEncrypt seals msg under (npub, key) with ChaCha20-Poly1305-IETF, no AAD; the result
+// is msg ‖ 16-byte Poly1305 tag. Native Go, not libsodium (file header). npub/key are
+// locally derived, so New/Seal can only fail on an invariant violation — panic, like the
+// other primitives. No wasm scratch means no lock: per-connection goroutines seal
+// concurrently.
 func (s *libsodium) aeadEncrypt(msg, npub, key []byte) []byte {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -434,10 +405,9 @@ func (s *libsodium) aeadEncrypt(msg, npub, key []byte) []byte {
 }
 
 // aeadDecrypt opens a ChaCha20-Poly1305-IETF record (native Go, see aeadEncrypt).
-// ok=false on any tag/length failure — PeerLink tears the link down (strict
-// per-direction ordering). ct is attacker-controlled, so a bad tag or a short ct is
-// an ordinary open failure (ok=false), never a panic; npub/key are ours, so a wrong
-// length there is an invariant violation and does panic.
+// ct is attacker-controlled, so a bad tag or a short ct is an ordinary open failure
+// (ok=false, and PeerLink tears the link down); npub/key are ours, so a wrong length there
+// is an invariant violation and panics.
 func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 	aead, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -452,23 +422,21 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 
 // ───────────────────────── QuickJS exposure ─────────────────────────
 
-// exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and
-// the whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the
-// shared code consumes (Uint8Array results, {publicKey,privateKey} keypairs, a throw
-// where the wrappers throw) is `wrapNativeSodium` in host/native-shim.ts, which is
-// where it is typechecked against `ShellSodium`. Go grows with primitives; the
-// reusable shape lives in JS, and in TypeScript rather than in a string constant.
+// exposeSodium installs `__sodium` — the ArrayBuffer-returning byte primitives, and the
+// whole of Go's crypto surface. Shaping them into the libsodium-wrappers API the shared
+// code consumes is `wrapNativeSodium` in host/native-shim.ts, where it is typechecked
+// against `ShellSodium`.
 //
-// Only what JS actually reaches is registered here. The curve25519 conversions and
-// crypto_box_seal are Go-side primitives with no caller above this seam (they are
-// exercised directly by sodium_test.go), so they are not published into the realm.
+// Only what JS actually reaches is registered. The curve25519 conversions and
+// crypto_box_seal have no caller above this seam (sodium_test.go exercises them directly),
+// so they are not published into the realm.
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 
 	o.SetPropertyStr("crypto_generichash", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		// libsodium-wrappers is crypto_generichash(hashLength, message, key?). The native
-		// blake2b shim computes only the UNKEYED hash, so a key arg would be SILENTLY
-		// dropped — a plain hash where libsodium computes a MAC. Reject it loudly instead.
+		// crypto_generichash(hashLength, message, key?): the native blake2b shim computes
+		// only the UNKEYED hash, so a key arg would be silently dropped — a plain hash
+		// where libsodium computes a MAC.
 		if len(t.Args()) > 2 && !t.Args()[2].IsNull() && !t.Args()[2].IsUndefined() {
 			if k, _ := qjs.JsTypedArrayToGo(t.Args()[2]); len(k) > 0 {
 				return nil, fmt.Errorf("crypto_generichash: keyed hashing not supported by the native blake2b shim")
@@ -515,12 +483,10 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		crand.Read(b)
 		return bytesAB(t, b), nil
 	}))
-	// The PQ half of the manifest suite lives in its own module (mldsa.go) but on the
-	// same object: the shared loader's crypto surface is one `sodium`, and it
-	// feature-detects suite 0x02 by the presence of this method.
+	// The PQ half of the manifest suite (mldsa.go) and the catalog's KEM (mlkem.go) hang
+	// off the same object: the shared loader's crypto surface is one `sodium`, and it
+	// feature-detects suite 0x02 by the presence of the ML-DSA method.
 	exposeMlDsa(qc, o, md)
-	// And the catalog's KEM, on the same object for the same reason — the guest seam
-	// reaches every primitive through one `sodium` (mlkem.go).
 	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)
 }

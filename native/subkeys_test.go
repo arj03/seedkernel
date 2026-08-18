@@ -2,13 +2,11 @@ package main
 
 import "testing"
 
-// The native node's identity IS the key derived from the master seed (§12.6.2b): bootNode
-// derives it from the one 32-byte seed in the shared code (deriveNodeKeys,
-// core/subkeys.ts) — the exact derivation the JS CLI runs — so the peer id it reports must
-// be that key's public half. This pins the native target to the shared derivation rather
-// than a raw keypair of its own, and to ONE identity: the same key answers node/identity,
-// signs guest records and signs the handshake, so a record authored here names an author
-// every peer in the cohort already knows.
+// The native node's identity IS the key the shared code derives from the master seed
+// (deriveNodeKeys, core/subkeys.ts, §12.6.2b), so the peer id it reports must be that
+// key's public half. Pins this target to the shared derivation rather than a raw keypair
+// of its own, and to ONE identity: the same key answers node/identity, signs guest records
+// and signs the handshake.
 func TestBootNodeDerivesIdentity(t *testing.T) {
 	bootRealm(t)
 	seedHex := "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"

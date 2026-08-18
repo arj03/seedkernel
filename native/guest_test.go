@@ -92,12 +92,11 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	}
 }
 
-// The realm's heap cap is a confinement property, not a tuning knob: the admission
-// policy decides WHICH guest runs, but an admitted guest that runs away must exhaust
-// its own realm rather than the host — including on the request path, which a remote
-// peer drives. Asserted on the real createRealm path, since the cap can only be set at
-// runtime creation and is easy to drop there silently. The modest allocation is the
-// control: without it a realm that was simply broken would pass the same test.
+// The realm's heap cap is a confinement property, not a tuning knob: an admitted guest
+// that runs away must exhaust its own realm rather than the host, including on the request
+// path a remote peer drives. Asserted on the real createRealm path, since the cap can only
+// be set at runtime creation and is easy to drop there silently. The modest allocation is
+// the control.
 func TestGuestRealmHeapCapped(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -130,14 +129,12 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 
 // A guest that never yields is stopped by its execution budget (README §12.3, §16.1).
 //
-// This is the native half of safe-js.ts's interrupt handler, and it is the SAME lever:
-// QuickJS's own, armed through the shim's QJS_SetDeadline (qjs.Runtime.Budget). So the
-// consequence asserted below is the one safe-js has — the overrun is a throw, the caller
-// gets an error, and the realm is still usable afterwards. A guest that spends its
-// allowance has failed one invocation, not destroyed the app.
+// The native half of safe-js.ts's interrupt handler, and the SAME lever: QuickJS's own,
+// armed through qjs.Runtime.Budget. So the consequence asserted below is safe-js's — the
+// overrun is a throw, the caller gets an error, and the realm is still usable. A guest
+// that spends its allowance has failed one invocation, not destroyed the app.
 //
-// The trivial call first is the control: without it a realm that was simply broken would
-// pass the same test. The trivial call AFTER is the point.
+// The trivial call first is the control; the trivial call AFTER is the point.
 func TestGuestRealmExecutionBudget(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -173,13 +170,12 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 
 // A realm killed mid-flight must SETTLE the calls it still owes, not strand them.
 //
-// The dangerous shape is an entrypoint that parks on net and then burns its budget in
-// the continuation: the kill lands inside settleNet, i.e. after the initiator's promise
-// was handed to the shell but before anything settled it. safe-js has no equivalent
-// problem — its interrupt throws, the guest's promise rejects, the caller sees an error —
-// so a native realm that merely stopped answering would be a divergence that hangs the
-// node rather than failing it. A hang is strictly worse than an error: the caller cannot
-// retry, time out on its own, or even tell that anything went wrong.
+// The dangerous shape is an entrypoint that parks on net and then burns its budget in the
+// continuation: the kill lands inside settleNet, after the initiator's promise reached the
+// shell but before anything settled it. safe-js has no equivalent problem (its interrupt
+// throws and the guest's promise rejects), so a native realm that merely stopped answering
+// would hang the node rather than fail it — strictly worse, since the caller cannot retry,
+// time out, or tell anything went wrong.
 func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	guestSeamRealm(t)
 
@@ -223,13 +219,10 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	}
 }
 
-// The budget also covers continuations the loop pumps directly.
-//
-// A plain `await` (no host.call) resumes through eventLoop.pumpAll rather than settleNet,
-// which for a while was outside every guard the realm had: one `await Promise.resolve()`
-// bought an unbounded loop, since only the segment before the await was budgeted. The
-// loop now drains a guest realm through guestRealm.pump, so a queued job is guest code
-// like any other.
+// The budget also covers continuations the loop pumps directly. A plain `await` (no
+// host.call) resumes through eventLoop.pumpAll rather than settleNet, which was once
+// outside every guard the realm had: one `await Promise.resolve()` bought an unbounded
+// loop, since only the segment before the await was budgeted.
 //
 // Runs on the test goroutine, not a helper one: qjs contexts are not goroutine-safe, and
 // the loop must be driven by whoever is waiting on it.

@@ -9,17 +9,16 @@ import (
 	"seedloader/qjs"
 )
 
-// TestHostConsoleReachesStderr covers a platform facility this target silently lacked.
-// quickjs-ng gives the realm a `console` with `log` and nothing else, writing it to a
-// WASI stdout wazero leaves disconnected — so shared host code's `console.log` went to
-// nowhere and its `console.error` threw a TypeError. The one that matters is
-// transport-host.ts's: it reports a guest that failed inside a `.catch` handler, so a
-// wedged transport was invisible twice over, once silently and once as a different
-// error. host/native-polyfills.ts replaces console over `bridge.logErr`.
+// TestHostConsoleReachesStderr covers a platform facility this target silently lacked:
+// quickjs-ng gives the realm a `console` with `log` alone, writing to a WASI stdout wazero
+// leaves disconnected, so shared host code's `console.log` went nowhere and its
+// `console.error` threw a TypeError — which made a transport wedged inside a `.catch`
+// handler invisible twice over. host/native-polyfills.ts replaces console over
+// `bridge.logErr`.
 //
 // Asserted on stderr rather than on the bridge function, because *which* stream it lands
-// on is the property: stdout carries the operator's lines and `--op`'s raw response
-// bytes, and a diagnostic mixed into those corrupts a piped response.
+// on is the property: stdout carries `--op`'s raw response bytes, which a diagnostic
+// mixed in would corrupt.
 func TestHostConsoleReachesStderr(t *testing.T) {
 	bootRealm(t)
 	for _, method := range []string{"log", "error", "warn", "info", "debug"} {

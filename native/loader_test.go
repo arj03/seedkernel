@@ -47,11 +47,10 @@ func TestScratchRegion(t *testing.T) {
 	}
 }
 
-// TestBundleModuleRuns is the end-to-end shape: build a minimal signed bundle right here
-// (no seedstore / sibling-repo dependency), load it, then reach its installed module by
-// name and confirm the pure-transform executes. The host reaches installed modules only by
-// name now (README §4, §12.4) — there is no host-call/dispatch seam to drive one through —
-// so echoing a payload back is the whole "the bundle-installed wasm runs" proof.
+// TestBundleModuleRuns is the end-to-end shape: build a minimal signed bundle here, load
+// it, then reach its installed module by name and confirm the pure-transform executes.
+// Modules are reached only by name (README §4, §12.4) — there is no dispatch seam to drive
+// one through — so echoing a payload back is the whole proof.
 func TestBundleModuleRuns(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)
@@ -68,12 +67,11 @@ func TestBundleModuleRuns(t *testing.T) {
 	}
 }
 
-// TestManifestClaimIsTheRouting covers the load-time claim (§12.10). The manifest names
-// the protocol ids the app serves, and the load that admits the code claims them — so
-// there is no operator step between installing an app and it answering, and no app key to
-// retype into a typo whose only symptom is a node that boots clean and answers an empty
-// body on that protocol forever. The id's format is checked at the load, on the shared
-// path both targets run, so an unroutable claim is refused where the refusal can name it.
+// TestManifestClaimIsTheRouting covers the load-time claim (§12.10): the manifest names
+// the protocol ids the app serves and the load that admits the code claims them, so there
+// is no operator step between installing an app and it answering — and no app key to
+// mistype into a node that boots clean and answers an empty body forever. The id's format
+// is checked at the load, so an unroutable claim is refused where it can be named.
 func TestManifestClaimIsTheRouting(t *testing.T) {
 	bootShell(t, t.TempDir(), "", nil)
 	author := testAuthor(t)

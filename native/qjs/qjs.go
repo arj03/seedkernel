@@ -1,22 +1,17 @@
-// Package qjs is a thin, in-repo bridge to the quickjs-ng engine running on
-// wazero. It is the Go counterpart of sodium.go's raw-wasm-over-wazero pattern:
-// the engine is the prebuilt qjs.wasm blob (quickjs-ng + a small C shim exposing
-// a flat QJS_* C ABI), and this package drives it directly over wazero linear
-// memory with a single host import (env.jsFunctionProxy) for JS→Go callbacks.
+// Package qjs is a thin, in-repo bridge to the quickjs-ng engine running on wazero — the
+// Go counterpart of sodium.go's raw-wasm-over-wazero pattern. The engine is the prebuilt
+// qjs.wasm blob (quickjs-ng plus a small C shim exposing a flat QJS_* ABI, forked under
+// csrc/ and built by build-qjs.sh; see README.md), driven directly over wazero linear
+// memory with one host import, env.jsFunctionProxy, for JS→Go callbacks.
 //
-// It replaces github.com/fastschema/qjs, which pinned an old wazero and carried a
-// reflection/generics marshaling layer we don't need (it was never a binary-size
-// cost — the ~7.5 MiB stripped floor is wazero's compiler backend, not this). We
-// only ever need a small, synchronous slice of the API (objects, strings,
-// ArrayBuffers, function callbacks, eval, invoke), so this bridge mirrors exactly
-// that surface — and the exact call/free sequences fastschema used against this same
-// wasm — and nothing more. The C shim is forked under csrc/ and the blob is built from
-// it by build-qjs.sh; see README.md.
+// The loader needs only a small synchronous slice of the API — objects, strings,
+// ArrayBuffers, function callbacks, eval, invoke — so this mirrors exactly that surface
+// and nothing more.
 //
-// JSValue ABI: the wasm is built with NaN-boxed JSValues, so every QJS_* function
-// takes and returns a single i64 (uint64). A *Value is just a wrapper around that
-// uint64 handle. "Packed pointer" returns (QJS_ToCString, QJS_GetArrayBuffer) are a
-// pointer to an 8-byte cell holding (addr<<32 | size) in little-endian.
+// JSValue ABI: the wasm is built with NaN-boxed JSValues, so every QJS_* function takes
+// and returns a single i64, and a *Value wraps that handle. "Packed pointer" returns
+// (QJS_ToCString, QJS_GetArrayBuffer) point at an 8-byte little-endian cell holding
+// (addr<<32 | size).
 package qjs
 
 import (
@@ -36,8 +31,7 @@ import (
 var wasmBytes []byte
 
 const (
-	// eval flags (quickjs JS_EVAL_*): global scope + strict mode, matching the
-	// fastschema default used to eval the host shims.
+	// eval flags (quickjs JS_EVAL_*): global scope + strict mode.
 	evalTypeGlobal = 0
 	evalFlagStrict = 1 << 3
 )
@@ -46,8 +40,8 @@ const (
 type goFunc = func(*This) (*Value, error)
 
 // Runtime owns the wazero runtime, the instantiated qjs module and the QuickJS
-// runtime/context handles. It is single-threaded: the loader drives the realm from
-// one goroutine (the main thread), so no locking around engine calls is needed.
+// runtime/context handles. Single-threaded: the loader drives the realm from one
+// goroutine, so engine calls need no locking.
 type Runtime struct {
 	ctx           context.Context
 	wrt           wazero.Runtime
@@ -102,17 +96,14 @@ func WithMemoryLimit(bytes uint64) Option {
 }
 
 // Budget bounds the wall time of guest execution on this runtime until the returned
-// restore func runs. It arms QuickJS's own interrupt handler (QJS_SetDeadline in the
-// shim), which the interpreter consults once every ~10k bytecodes: past the deadline it
-// throws, so a spinning guest is stopped by the engine yielding rather than by anything
-// outside it.
+// restore func runs, by arming QuickJS's own interrupt handler (QJS_SetDeadline in the
+// shim), which the interpreter consults every ~10k bytecodes and then throws.
 //
-// That makes the kill an ordinary catchable JS exception and leaves the runtime USABLE
-// afterwards — the caller sees an error from the call that overran, and the next call
-// works. The alternative this replaced (wazero's WithCloseOnContextDone terminating the
-// wasm call) had to close the module to stop it, which cost a termination check compiled
-// into every loop in the engine: measured at ~2.3x on a guest realm dispatch and ~2x on
-// every network round trip, for a bound that also destroyed the realm it enforced.
+// So the kill is an ordinary catchable JS exception and the runtime stays USABLE: the
+// caller sees an error from the call that overran, and the next call works. The
+// alternative — wazero's WithCloseOnContextDone — had to close the module to stop it, and
+// cost ~2.3x on a guest realm dispatch and ~2x on every network round trip for a bound
+// that also destroyed the realm it enforced.
 //
 // A non-positive d leaves the runtime unbounded.
 func (r *Runtime) Budget(d time.Duration) func() {
@@ -130,12 +121,10 @@ func (r *Runtime) Budget(d time.Duration) func() {
 }
 
 // TookInterrupt reports whether the Budget deadline fired since it was last asked, and
-// clears the flag.
-//
-// It is the only way to know. An interrupt throws into whatever guest frame was running,
-// and when that frame is a promise-reaction job the job loop consumes the exception — so
-// the call the host made (a pump) returns success, and a guest that ran out of budget is
-// indistinguishable from one that finished. Every entry into guest code has to ask.
+// clears the flag. It is the only way to know: an interrupt throws into whatever guest
+// frame was running, and when that frame is a promise-reaction job the job loop consumes
+// the exception — so the host's call (a pump) returns success and a guest that ran out of
+// budget is indistinguishable from one that finished. Every entry into guest code asks.
 func (r *Runtime) TookInterrupt() bool {
 	if !r.Alive() {
 		return false
@@ -157,9 +146,8 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	ctx := context.Background()
 	rt = &Runtime{ctx: ctx, reg: newRegistry(), fnPool: map[string][]api.Function{}}
 
-	// On any failure — a panic or an error return — after the wazero runtime is
-	// created but before the module is live, close it so a failed New leaks nothing
-	// (the runtime holds this instance's compiled machine code).
+	// On any failure after the wazero runtime is created but before the module is live,
+	// close it: the runtime holds this instance's compiled machine code.
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("qjs.New: %v", r)
@@ -171,13 +159,11 @@ func New(opts ...Option) (rt *Runtime, err error) {
 			rt = nil
 		}
 	}()
-	// A shared compilation cache makes the per-runtime CompileModule cheap when
-	// several runtimes are created (e.g. across tests); a CompiledModule is bound
-	// to the runtime that compiled it, so each runtime must compile its own.
+	// A CompiledModule is bound to the runtime that compiled it, so each runtime compiles
+	// its own; the shared cache is what keeps that cheap when several are created.
 	//
-	// Nothing here arms an execution bound: the engine carries its own (Budget →
-	// QJS_SetDeadline → QuickJS's interrupt handler), so wazero needs no
-	// WithCloseOnContextDone and the compiled code pays no termination check.
+	// Nothing here arms an execution bound — the engine carries its own (see Budget) — so
+	// the compiled code pays no termination check.
 	wcfg := wazero.NewRuntimeConfig().WithCompilationCache(sharedCache())
 	rt.wrt = wazero.NewRuntimeWithConfig(ctx, wcfg)
 
@@ -214,24 +200,18 @@ func New(opts ...Option) (rt *Runtime, err error) {
 	rt.free = rt.mod.ExportedFunction("free")
 	rt.mem = rt.mod.Memory()
 	// New_QJS(memoryLimit, maxStackSize, maxExecutionTime, gcThreshold); 0 = default.
-	// maxStackSize is load-bearing: qjs.wasm has only a ~161 KiB shadow stack
-	// (--stack-first), but QuickJS's default limit is 256 KiB — larger than the stack
-	// that actually exists. With the default, the overflow guard never trips, so deep
-	// JS recursion (QuickJS burns several KiB of C stack per frame) runs the shadow
-	// stack off the end of linear memory and traps as an OOB *crash* instead of a
-	// catchable "stack overflow". Capping below the real stack makes the guard fire
-	// first (a throw), but the guard also needs the stack top calibrated to the wasm
-	// SP — see QJS_UpdateStackTop below. Headroom left for the C frames between the
-	// check and the deepest alloca.
+	// maxStackSize is load-bearing: QuickJS's default limit (256 KiB) is larger than
+	// qjs.wasm's ~161 KiB shadow stack, so the overflow guard never trips and deep JS
+	// recursion runs the stack off the end of linear memory, trapping as an OOB crash
+	// instead of a catchable "stack overflow". Capping below the real stack makes the
+	// guard fire first — but only once the stack top is calibrated, below.
 	rt.qjs = rt.call("New_QJS", cfg.memoryLimit, maxStackSize, 0, 0)
 	rt.ctxt = &Context{rt: rt, handle: rt.call("QJS_GetContext", rt.qjs)}
-	// Calibrate QuickJS's stack_top to the actual wasm shadow-SP. JS_NewRuntime
-	// captured it deep inside New_QJS; recording it here (a shallow Go→wasm entry, the
-	// same depth every top-level QJS_Call/QJS_Eval re-enters at, since wazero restores
-	// __stack_pointer between calls) makes stack_limit = stack_top - maxStackSize land
-	// in the real stack region. Done ONCE — never per-call: a re-entrant Invoke (a host
-	// callback that calls back into JS) must measure against this top, not reset to its
-	// own deeper SP.
+	// Calibrate QuickJS's stack_top to the actual wasm shadow-SP, which JS_NewRuntime
+	// captured deep inside New_QJS. Recording it from this shallow entry — the depth every
+	// top-level QJS_Call/QJS_Eval re-enters at, since wazero restores __stack_pointer
+	// between calls — makes stack_limit land in the real stack region. ONCE, never
+	// per-call: a re-entrant Invoke must measure against this top, not its own deeper SP.
 	rt.call("QJS_UpdateStackTop", rt.qjs)
 	return rt, nil
 }
@@ -256,11 +236,9 @@ func sharedCache() wazero.CompilationCache {
 // Context returns the runtime's JS execution context.
 func (r *Runtime) Context() *Context { return r.ctxt }
 
-// Close tears down the engine. It closes both the module instance and the wazero
-// runtime that compiled it — the runtime holds this instance's compiled machine
-// code, so closing only the module would leak it (matters when many runtimes are
-// created and dropped, e.g. across tests). The compilation cache is process-wide
-// (sharedCache) and is intentionally left open.
+// Close tears down the engine: both the module instance and the wazero runtime that
+// compiled it, since the runtime holds this instance's compiled machine code. The
+// process-wide compilation cache is intentionally left open.
 func (r *Runtime) Close() {
 	if r == nil || r.mod == nil {
 		return
@@ -279,13 +257,11 @@ func (r *Runtime) Close() {
 // the function is void). Panics on a wasm trap — the loader treats engine faults
 // as fatal, same as the rest of main.go.
 func (r *Runtime) call(name string, args ...uint64) uint64 {
-	// wazero's api.Function lazily allocates and then reuses a per-instance execution
-	// stack, so a single cached instance corrupts under re-entrancy (a host import calling
-	// back into JS→wasm). Resolving fresh per call is correct but pays a map lookup + an
-	// allocation under every engine call. A per-name free list keeps the correctness — each
-	// in-flight (possibly nested) call pops its own instance and returns it after — while
-	// amortizing the resolve so a steady call reuses a pooled instance. Single-threaded
-	// (the Runtime drives from one goroutine), so the pool needs no locking.
+	// wazero's api.Function lazily allocates and reuses a per-instance execution stack, so
+	// one cached instance corrupts under re-entrancy (a host import calling back into
+	// JS→wasm), while resolving fresh per call pays a lookup and an allocation every time.
+	// The per-name free list keeps both: each in-flight (possibly nested) call pops its own
+	// instance and returns it after. Single-threaded, so the pool needs no locking.
 	fn := r.acquireFn(name)
 	res, err := fn.Call(r.ctx, args...)
 	r.releaseFn(name, fn)
@@ -298,9 +274,8 @@ func (r *Runtime) call(name string, args ...uint64) uint64 {
 	return res[0]
 }
 
-// acquireFn hands out a resolved export instance for name: a pooled one if free (so a
-// nested re-entrant call gets a distinct instance from the one in flight), else a freshly
-// resolved one on a miss.
+// acquireFn hands out a resolved export instance for name: a pooled one if free, so a
+// nested re-entrant call gets a distinct instance from the one in flight.
 func (r *Runtime) acquireFn(name string) api.Function {
 	if pool := r.fnPool[name]; len(pool) > 0 {
 		fn := pool[len(pool)-1]
@@ -357,18 +332,14 @@ func (r *Runtime) unpackPtr(packedPtr uint64) (addr, size uint32) {
 	return uint32(v >> 32), uint32(v)
 }
 
-// readPackedString reads a string described by a packed pointer (addr<<32 | size)
-// and releases both the string and the packed cell. size is the JS_ToCString result's
-// strlen — it excludes the NUL terminator — so the read is exact (no trailing \x00).
+// readPackedString reads a string described by a packed pointer and releases both the
+// string and the packed cell. size is strlen, excluding the NUL, so the read is exact.
 //
-// addr is NOT a malloc block: it points into a refcounted JSString whose ref count
-// QJS_ToCString (via JS_ToCString) incremented. The only correct release is
-// JS_FreeCString, which recovers the JSString header from addr and drops that ref — a
-// plain free(addr) would corrupt the heap. (Contrast QJS_GetArrayBuffer's addr, which
-// is live ArrayBuffer storage that must NOT be freed — see toByteArray.) Without this
-// call every JS→Go string read leaked a JSString; fastschema had the same bug. We pass
-// r.ctxt because the bridge is one-context-per-runtime and every QJS_ToCString here ran
-// in that context.
+// addr is NOT a malloc block: it points into a refcounted JSString whose count
+// QJS_ToCString incremented, and the only correct release is JS_FreeCString, which
+// recovers the header from addr and drops that ref — a plain free(addr) corrupts the heap.
+// (Contrast QJS_GetArrayBuffer's addr, live storage that must NOT be freed; see
+// toByteArray.) Without this every JS→Go string read leaks a JSString.
 func (r *Runtime) readPackedString(packedPtr uint64) string {
 	if packedPtr == 0 {
 		return ""
@@ -385,15 +356,13 @@ func (r *Runtime) readPackedString(packedPtr uint64) string {
 	return s
 }
 
-// jsFunctionProxy is the env.jsFunctionProxy host import. The C trampoline lays
-// argv out as [fnID, ctxID, isAsync, promise, ...realArgs]; we dispatch fnID and
-// pass the real args (borrowed handles, valid only for the call — the loader's
-// callbacks read them synchronously and never retain them).
+// jsFunctionProxy is the env.jsFunctionProxy host import. The C trampoline lays argv out
+// as [fnID, ctxID, isAsync, promise, ...realArgs]; the real args are borrowed handles,
+// valid only for the call.
 func (r *Runtime) jsFunctionProxy(_ context.Context, _ api.Module, _ uint32, thisVal uint64, argc, argv uint32) (rs uint64) {
 	c := r.ctxt
-	// Registered before any arg processing so a panic below (a malformed argv, an
-	// out-of-range index, a panicking callback) surfaces as a catchable JS exception
-	// rather than an uncaught host-side wasm trap that would kill the node.
+	// Registered before any arg processing, so a panic below (a malformed argv, a panicking
+	// callback) surfaces as a catchable JS exception rather than a wasm trap killing the node.
 	defer func() {
 		if rec := recover(); rec != nil {
 			rs = c.throwError(fmt.Errorf("%v", rec))

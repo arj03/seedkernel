@@ -1,14 +1,10 @@
 package main
 
-// Networking round-trip perf for the Go loader. Where the crypto and RS benches time
-// individual primitives, this one times the transport bundle's
-// request/response over a real loopback socket: dial/accept, the AKE + record layer
-// (amortized — the warmup request establishes the link, steady-state requests reuse it),
-// routing, the [len][bytes] TCP framing (net.go), the Go↔JS frame-delivery boundary
-// (sock.go: reader goroutine → el.post → __netDeliver → pump), and the correlation /
-// timeout layer (transport-host.ts + the transport guest) — none of which is Go logic,
-// all driven by one loop. This is the wall-clock that wraps the crypto/RS arithmetic the
-// other benches already cover.
+// Networking round-trip perf for the Go loader: the transport bundle's request/response
+// over a real loopback socket — dial/accept, the AKE + record layer (amortized: the warmup
+// request establishes the link), routing, the TCP framing (net.go), the Go↔JS
+// frame-delivery boundary (sock.go), and the correlation/timeout layer. This is the
+// wall-clock wrapping the crypto/RS arithmetic the other benches cover.
 //
 //   - BenchmarkNetRoundTrip — a tiny control-plane request (HAVE/OFFER-shaped); ns/op is
 //     the per-request latency, 1e9/ns ≈ serial req/s.
@@ -37,9 +33,8 @@ import (
 const benchProto = "netbench"
 
 // netBenchGuestSource is the bench APP — both ends of it. There is no host-side request
-// facade: an app reaches the network by calling the id the transport claims (`_net`) and is
-// reached by the id it claims itself, so the thing being benchmarked has to be an app.
-// That is the point rather than the cost — this is the path a deployment uses.
+// facade, so the thing being benchmarked has to be an app, which is the point: this is the
+// path a deployment uses.
 //
 //	handle — one entrypoint, both ends. A remote peer's frame is keyed on the first
 //	         payload byte: type 7 is FETCH-shaped (a fixed 64 KB block), type 9 is

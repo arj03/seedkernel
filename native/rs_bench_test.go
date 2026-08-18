@@ -1,23 +1,18 @@
 package main
 
-// Reed–Solomon codec perf for the Go loader. RS isn't a libsodium primitive — it
-// lives in the seedstore repo's codec.wasm (AssemblyScript GF(2^8) erasure coding) —
-// but the loader runs that same wasm through the installed `seedstore:codec` module,
-// so its encode/decode throughput is comparable runtime-to-runtime against the node
-// numbers from seedstore/WASM/tests/bench.mjs. Same shape as that bench: RS(10,6),
-// 64 KB blocks, 640 KB of data per chunk; throughput is reported over data bytes
-// (b.SetBytes(k*bs)), matching bench.mjs's rate() which divides by the data size.
+// Reed–Solomon codec perf for the Go loader. RS lives in the seedstore repo's codec.wasm,
+// which the loader runs as an installed module, so its throughput is comparable
+// runtime-to-runtime against seedstore/WASM/tests/bench.mjs. Same shape as that bench:
+// RS(10,6), 64 KB blocks, 640 KB per chunk, throughput reported over data bytes.
 //
-// RS lives in the seedstore repo, so this bench is opt-in: point SEEDSTORE_BUNDLE at a
-// built seedstore bundle BLOB to run it; with the var unset the benchmarks Skip. The
-// loader itself has no seedstore dependency (its own tests use a minimal in-repo bundle).
+// Opt-in, since the loader has no seedstore dependency: with SEEDSTORE_BUNDLE unset these
+// Skip.
 //
 //	SEEDSTORE_BUNDLE=/path/to/seedstore/WASM/bundle/seedstore.skb go test -run x -bench 'BenchmarkRS' -benchmem ./...
 //
-// NB: with the var SET, every failure below is fatal rather than a Skip. This bench spent
-// a while reporting nothing because it still expected the old directory-form bundle: it
-// read `<dir>/manifest.bundle`, got an error, and silently skipped. An opt-in the operator
-// explicitly asked for must not quietly decline.
+// With the var SET every failure below is fatal rather than a Skip: this bench once spent
+// a while reporting nothing because it still expected the old directory-form bundle and
+// silently skipped. An opt-in the operator asked for must not quietly decline.
 
 import (
 	"bytes"
