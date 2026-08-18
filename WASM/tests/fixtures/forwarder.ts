@@ -4,13 +4,9 @@
 // as a generic installable module: something real to drive install policy, bundle
 // loading, and the §4.1 scratch clamp without pulling in a full app.
 //
-// It echoes its input: the host stages bytes at `scratch`, calls `handle`, and reads
-// the response back from `scratch` (README §4). Returning `input_len` hands the same
-// bytes straight back — so a caller reaching it by name (host `callModule`, or a
-// guest through the guest seam by its bare name, §12.2) gets its payload returned.
-//
-// Not a chat module: the chat-shell demo has its own modules under
-// assembly/chat-app-v*.
+// It echoes its input: the host stages bytes at `scratch`, calls `handle` and reads the
+// response back from the same region, so returning `input_len` hands the payload straight
+// back to whoever called it by name.
 
 // Reserved past the AssemblyScript runtime's own low memory at module instantiation
 // (top-level statements run in the implicit start function). Reserving two buffers
@@ -27,13 +23,10 @@ heap.alloc(SCRATCH_SIZE); // headroom past scratch (see above)
 // region. A negative or oversized return would be a failure (README §4); `input_len` is
 // neither, so the host reads exactly the bytes it staged.
 export function handle(input_len: i32): i32 {
-  // Carries the *whole* AssemblyScript shim set — `abort`, `seed`, `trace` — rather
-  // than just `abort`, so every host that instantiates this fixture proves it resolves
-  // all three (§4.2). A host resolving a subset instantiates real AS modules only by
-  // luck: one `trace()` or `Math.random()` anywhere in a module makes the difference
-  // between loading and a missing-import failure, and that must not be a property of
-  // which target the module landed on. The guard never fires — `handle` is only ever
-  // called with a length the host staged — but the optimizer cannot prove that, so the
+  // Carries the WHOLE AssemblyScript shim set — `abort`, `seed`, `trace` — so every host
+  // instantiating this fixture proves it resolves all three (§4.2): a host resolving a
+  // subset loads real AS modules only by luck, and that must not depend on which target a
+  // module landed on. The guard never fires, but the optimizer cannot prove it, so the
   // imports survive `--optimizeLevel 3`.
   if (input_len < 0) trace("unreachable", 1, Math.random());
   return input_len;

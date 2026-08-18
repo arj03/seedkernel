@@ -2,9 +2,8 @@
 
 const HEX_BYTE = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
 
-/** One TextEncoder/TextDecoder for the whole host: constructing one per call (or
- *  per module) used to copy the same two lines into a dozen files. Both are
- *  stateless and present on every target (browser, Node, the native shell). */
+/** One TextEncoder/TextDecoder for the whole host. Both are stateless and present on every
+ *  target (the native shell polyfills them, host/native-polyfills.ts). */
 export const enc = new TextEncoder();
 export const dec = new TextDecoder();
 
@@ -65,9 +64,8 @@ export function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
-/** The message of a thrown value, whatever it is: `Error.message` when present,
- *  else the value itself stringified. The one shape callers may match on without
- *  re-implementing the unwrap at every catch site. */
+/** The message of a thrown value: `Error.message` when present, else the value
+ *  stringified. */
 export function errMessage(e: unknown): string {
   const m = (e as Error | null)?.message;
   return m == null ? String(e) : String(m);

@@ -3,39 +3,27 @@
 // mixes straight into the object the guest seam already consumes, exactly as pq.ts
 // does for ML-DSA-65.
 //
-// **Host code, not core**, on the same grounds as pq.ts: this is the JS targets'
-// *driver* for mlkem768.wasm, the twin of native/mlkem.go. What is core is the catalog
-// NAME a guest reaches (`ml-kem-768/*`, core/domains.ts) — which is the thing every
-// host must agree on — not which driver serves it.
+// Host code, not core, on the same grounds as pq.ts: the JS targets' driver for
+// mlkem768.wasm, twin of native/mlkem.go. What is core is the catalog NAME a guest reaches
+// (`ml-kem-768/*`, core/domains.ts), not which driver serves it.
 //
-// **Why it is here before anything asks for it.** A bundle is replaceable; the
-// vocabulary it draws on is not. The channel's post-quantum suite is content — a
-// signed transport bundle and one policy entry — but only once the primitive it
-// needs exists on all three targets, and a primitive cannot be delivered as a
-// bundle because the trusted base does not hand-write crypto. So a core vocabulary
-// is provisioned ahead of need or not at all (§14.1). This file is that
-// provisioning; nothing in the tree calls it yet, and that is the point.
+// **Here before anything asks for it.** A bundle is replaceable; the vocabulary it draws
+// on is not. The channel's post-quantum suite is content — a signed transport bundle and a
+// policy entry — but only once the primitive exists on all three targets, and a primitive
+// cannot be delivered as a bundle. So a core vocabulary is provisioned ahead of need or
+// not at all (§14.1); nothing in the tree calls this yet, and that is the point.
 //
-// **One artifact, three targets.** The wasm is built from mlkem-native
-// (pq/mlkem-native, pinned; scripts/build-mlkem.mjs) and the same bytes are
-// instantiated by the browser, by Node, and by wazero in the Go loader
-// (native/mlkem.go). The reason is weaker than ML-DSA's — a KEM is not a verifier,
-// so its accept/reject boundary is not consensus — but the conclusion is the same:
-// two implementations that disagree on a rejected encoding fail to share a key, and
-// the cheapest way not to discover that in production is not to have two.
+// **One artifact, three targets** (pq/mlkem-native, pinned; scripts/build-mlkem.mjs). The
+// reason is weaker than ML-DSA's, a KEM not being a verifier, but the conclusion is the
+// same: two implementations that disagree on a rejected encoding fail to share a key.
 //
-// **Nothing here draws entropy.** Every operation takes its coins as an argument,
-// because a catalog entry is a pure function of its argument bytes (guest-seam.ts):
-// a guest gets randomness from `node/random`, an authority it was granted, and hands it
-// in — the same shape as an ephemeral X25519 pair being `node/random(32)` plus
-// `x25519/dh`. Keeping the grant out of the primitive is what makes the primitive
-// free to call.
+// **Nothing here draws entropy.** Every operation takes its coins as an argument, because a
+// catalog entry is a pure function of its argument bytes: a guest draws randomness from
+// `node/random`, an authority it was granted, and hands it in. Keeping the grant out of the
+// primitive is what makes the primitive free to call.
 //
-// **This file imports nothing**, for the reason pq.ts states: a caller hands it an
-// instantiated module, so it loads as plain ESM in the browser and carries no
-// specifier for a non-npm target to resolve. The small bump arena below is repeated
-// from pq.ts rather than shared for exactly that reason — the invariant is worth
-// more than the twenty lines.
+// **This file imports nothing**, for the reason pq.ts states — which is also why the bump
+// arena below is repeated rather than shared.
 
 /** FIPS 203 ML-KEM-768 field widths. Fixed by the parameter set, and cross-checked
  *  against the module's own exports at load (`createMlKem768`). */
@@ -72,10 +60,9 @@ interface MlKemExports {
   mlkem768_bytes(): number;
 }
 
-/** Instantiate mlkem768.wasm. Async because browsers refuse synchronous
- *  compilation of anything over 4 KB on the main thread — but only the *load* is
- *  async: every operation below is synchronous, which is what lets the seam's
- *  `crypto/` prefix stay a synchronous byte transform. */
+/** Instantiate mlkem768.wasm. Async because browsers refuse synchronous compilation over
+ *  4 KB on the main thread — but only the *load* is: every operation below is synchronous,
+ *  which is what keeps the seam's `crypto/` names synchronous byte transforms. */
 export async function loadMlKem768(wasm: BufferSource): Promise<MlKem768> {
   const { instance } = await WebAssembly.instantiate(wasm, {});
   return createMlKem768(instance);
@@ -85,9 +72,9 @@ export async function loadMlKem768(wasm: BufferSource): Promise<MlKem768> {
  *  that gets its instance elsewhere (a cached compile, a worker) can still use it. */
 export function createMlKem768(instance: WebAssembly.Instance): MlKem768 {
   const e = instance.exports as unknown as MlKemExports;
-  // Fail at load, not at first encapsulation: a module built for another parameter
-  // set would otherwise sit there looking like a working ML-KEM-768 until two nodes
-  // tried to agree on a key and silently did not.
+  // Fail at load, not at first encapsulation: a module built for another parameter set
+  // would otherwise look like a working ML-KEM-768 until two nodes tried to agree on a key
+  // and silently did not.
   const widths: [string, number, number][] = [
     ["public key", e.mlkem768_publickeybytes(), ML_KEM768_PK_LEN],
     ["secret key", e.mlkem768_secretkeybytes(), ML_KEM768_SK_LEN],
@@ -100,10 +87,9 @@ export function createMlKem768(instance: WebAssembly.Instance): MlKem768 {
 
   const heapBase = e.__heap_base.value as number;
   let top = heapBase;
-  // A bump allocator over the module's own heap, rewound before every call. The
-  // module never allocates and never retains anything across a call — the host
-  // calls in, it runs to completion, the host reads bytes back out — so a bump
-  // pointer is the whole memory manager, and there is no free list to corrupt.
+  // A bump allocator over the module's own heap, rewound before every call: the module
+  // never allocates and retains nothing across a call, so a bump pointer is the whole
+  // memory manager and there is no free list to corrupt.
   const rewind = () => { top = heapBase; };
   const alloc = (n: number): number => {
     const p = (top + 15) & ~15;
@@ -137,9 +123,8 @@ export function createMlKem768(instance: WebAssembly.Instance): MlKem768 {
     },
 
     ml_kem768_encaps(pk: Uint8Array, coins: Uint8Array) {
-      // A wrong-width key is the same answer as a malformed one — null. The caller
-      // holds a peer's key it did not choose, and "this key is unusable" is the only
-      // distinction it can act on.
+      // A wrong-width key answers like a malformed one: the caller holds a peer's key it
+      // did not choose, and "unusable" is the only distinction it can act on.
       if (pk.length !== ML_KEM768_PK_LEN || coins.length !== ML_KEM768_COINS_LEN) return null;
       rewind();
       const ctP = alloc(ML_KEM768_CT_LEN), ssP = alloc(ML_KEM768_SS_LEN);
@@ -156,19 +141,18 @@ export function createMlKem768(instance: WebAssembly.Instance): MlKem768 {
       if (sk.length !== ML_KEM768_SK_LEN || ct.length !== ML_KEM768_CT_LEN) return null;
       rewind();
       const ssP = alloc(ML_KEM768_SS_LEN), ctP = put(ct), skP = put(sk);
-      // null here means the SECRET KEY failed its hash check — never that the
-      // ciphertext was bad. ML-KEM answers a bad ciphertext with a shared secret
-      // derived from the key's own z, in constant time, and reporting that apart
-      // from success is exactly the oracle implicit rejection exists to deny.
+      // null here means the SECRET KEY failed its hash check, never that the ciphertext was
+      // bad: ML-KEM answers a bad ciphertext with a shared secret derived from the key's
+      // own z, in constant time, and reporting that apart from success is the oracle
+      // implicit rejection exists to deny.
       if (e.mlkem768_decaps(ssP, ctP, skP) !== 1) return null;
       return bytes().slice(ssP, ssP + ML_KEM768_SS_LEN);
     },
   };
 }
 
-/** Mix ML-KEM-768 into a libsodium instance. A target calls this once at boot, at
- *  the same seam it mixes in ML-DSA-65 (`withMlDsa65`), so "which primitives does
- *  this host serve" has one answer set in one place. */
+/** Mix ML-KEM-768 into a libsodium instance, at the same boot seam `withMlDsa65` uses, so
+ *  "which primitives does this host serve" is set in one place. */
 export function withMlKem768<T extends object>(sodium: T, kem: MlKem768): T & MlKem768 {
   return Object.assign(sodium, kem);
 }

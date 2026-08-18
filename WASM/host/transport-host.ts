@@ -6,38 +6,28 @@
 // between that guest and the platform's sockets: a link table, an address book, the
 // listeners, and the links a host-managed transport hands over. That is the whole of it.
 //
-// **There is no transport-shaped seam here, in either direction.**
+// There is no transport-shaped seam here, in either direction:
 //
-//   guest → host  the four `link/*` names (guest-seam.ts): a byte duplex behind an opaque
-//                 link id. The platform's whole contribution to the network. Its
-//                 deadlines are not among them — `timer/*` is an ordinary authority any
-//                 guest may declare, so a fired timer comes out of the shell's per-realm
-//                 table (shell-core.ts), not this driver's.
-//   host → guest  the SAME cross-realm call an app makes: the transport claims `_net`
-//                 (core/domains.ts) and this driver reaches it through the shell's
-//                 routing, with the caller id 32 zero bytes for "the host itself" where an
-//                 app's call carries the app's own. One shape, one attribution rule.
+//   guest → host  the four `link/*` names (guest-seam.ts) — a byte duplex behind an opaque
+//                 link id. Deadlines are not among them: `timer/*` is an ordinary
+//                 authority, so a fired timer comes out of the shell's per-realm table.
+//   host → guest  the SAME cross-realm call an app makes. The transport claims `_net` and
+//                 this driver reaches it through the shell's routing, with the caller id
+//                 32 zero bytes for "the host itself".
 //
-// **The op name travels in the payload, and stays a NAME.** Collapsing twelve entrypoints
-// onto one `handle` would otherwise have bought a tagged union with a number this file and
-// the guest must agree on — the one thing the old per-entrypoint dispatch was right to
-// avoid. So the first field after the caller id is a length-prefixed name, and an op the
-// guest does not implement fails loud by name exactly as a missing entrypoint did.
+// The op name travels in the payload as a length-prefixed NAME, so an op the guest does
+// not implement fails loud rather than turning into a number the two sides must agree on.
 //
-// **One invariant makes the whole arrangement safe: no call re-enters a live frame.** The
-// transport calls out from inside its `handle`, so a name that called straight back in would
-// re-enter it. None does — a socket write does not deliver during the write, an armed
-// timer fires on a later turn, and a cross-realm call runs its callee on a later turn by
-// construction (guest-seam.ts). The transport's own answers ride `defer()` rather than an
-// await for the same reason (realm-queue.ts).
+// One invariant makes the arrangement safe: no call re-enters a live frame. The transport
+// calls out from inside its `handle`, and nothing calls straight back in — a socket write
+// does not deliver during the write, an armed timer fires later, and a cross-realm call
+// runs its callee on a later turn by construction. The transport's own answers ride
+// `defer()` for the same reason (realm-queue.ts).
 //
-// The crypto surface the guest reaches is the seam's, and it names no algorithm the host
-// understands: the record layer and the ephemeral DH go through
-// `host.call("crypto/<name>", bytes)` over the opaque primitive catalog, and the transcript
-// signature is the ordinary `node/sign` name, which the seam scopes to
-// `DOMAIN_channel ‖ networkKey` because THIS bundle reaches the `link` privilege. The host
-// prefixes and does not read the suffix, so no handshake shape is pinned into the core and
-// the node's key never enters the guest.
+// The crypto the guest reaches is the seam's opaque primitive catalog, and the transcript
+// signature is the ordinary `node/sign`, which the seam scopes to
+// `DOMAIN_channel ‖ networkKey`. The host prefixes and never reads the suffix, so no
+// handshake shape is pinned into the core and the node's key never enters the guest.
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
@@ -51,11 +41,8 @@ import { opHeader, type RawNet } from "./guest-seam.js";
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
-// The link close-reason codes are the transport occupant's vocabulary — the host only
-// relays the number it reports through the `_host` link-down op (shell-core.ts) to
-// whoever handed the channel in, never interpreting it. The codes live with the occupant
-// (transport/src/ake.js, `REASON_*`) and with the tests that assert them
-// (tests/transport-harness.mjs).
+// The link close-reason codes are the occupant's vocabulary (transport/src/ake.js
+// `REASON_*`); the host relays the number and never interprets it.
 
 const EMPTY = new Uint8Array(0);
 
@@ -70,42 +57,30 @@ export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
 export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
 export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
 /** ...and the budget past the door: how many links a node holds AUTHENTICATED at once.
- *  The half-open tiers bound who is getting in; without this one, anybody who can
- *  complete a handshake — every admitted peer, and every stranger on an open node — can
- *  open links without limit, each holding a framer, session keys, timers and buffers.
- *  Same size as the verified tier: a link that has proved an identity is not entitled to
- *  more of the node than one that is proving one. */
+ *  Without it, anybody who can complete a handshake can open links without limit, each
+ *  holding a framer, session keys, timers and buffers. Same size as the verified tier — a
+ *  link that has proved an identity is not entitled to more than one still proving one. */
 export const DEFAULT_MAX_AUTHED_LINKS = 256;
 
-/** How long one request may take when its caller names no deadline (§12.6). Generous
- *  on purpose: it is the number that has to be right for a caller who did not think
- *  about it, which includes every app guest. Shipped to the guest at init, because the
- *  request path is now entirely the guest's — an app's send reaches it as a cross-realm
- *  call carrying whatever deadline the app chose, or nothing, and "nothing" is resolved
- *  against this. */
+/** How long one request may take when its caller names no deadline (§12.6). Generous on
+ *  purpose: it has to be right for a caller who did not think about it. Shipped to the
+ *  guest at init, since the request path is entirely the guest's. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
-/** How long an AUTHENTICATED link may carry no traffic in either direction before the
- *  guest retires it (with the authenticated goodbye — the address book redials on the
- *  next send). The other half of the authed-link budget: a cap alone would let a peer
- *  fill it and sit there, and the handshake deadlines stop applying the moment a link
- *  authenticates. Generous, because it is not a liveness probe: nothing legitimate is
- *  harmed by a reconnect after five silent minutes, and nothing hostile survives one. */
+/** How long an AUTHENTICATED link may carry no traffic before the guest retires it (the
+ *  address book redials on the next send). The other half of the authed-link budget: a cap
+ *  alone would let a peer fill it and sit there, since the handshake deadlines stop
+ *  applying the moment a link authenticates. Generous, because it is not a liveness
+ *  probe. */
 export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 
-/** `[caller 32][nameLen u8][name utf8]` for one op, built once and shared.
+/** `[caller 32][nameLen u8][name utf8]` for one op, memoized. The LAYOUT is the seam's
+ *  (`opHeader`); what this adds is the memo, because the op set is tiny and fixed while the
+ *  header is rebuilt on the INBOUND FRAME PATH — once per socket read, per link. Shared
+ *  safely because nothing mutates a header: `Args` only pushes it into a parts list that
+ *  `build()` copies out of.
  *
- *  The LAYOUT is the seam's (`opHeader`, guest-seam.ts) — the same bytes the guest
- *  preamble's `readOp` reads back — and what this adds is the memo. The op set is fixed
- *  and tiny (nine names, all string literals in this file) while the header is rebuilt on
- *  the INBOUND FRAME PATH: once per socket read, per link. A `TextEncoder` run and a
- *  fresh allocation there price a constant, so the constant is computed once. Shared
- *  safely because nothing mutates a header: `Args` only ever pushes it into a parts list
- *  that `build()` copies OUT of.
- *
- *  The leading 32 bytes stay zero — the caller id for "the host itself", which is
- *  `opHeader`'s default, where an app's cross-realm call carries its own app key
- *  (shell-core.ts). */
+ *  The leading 32 bytes stay zero: the caller id for "the host itself". */
 const OP_HEADERS = new Map<string, Uint8Array>();
 function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
@@ -118,23 +93,18 @@ function hostOpHeader(op: string): Uint8Array {
 
 /** Op-argument encoder: `[fields …]` where a field is a u32 BE, a u8, or a
  *  length-prefixed blob, in the fixed order the op declares. The op's NAME is the
- *  discriminator and it is the FIRST thing encoded, so nothing here is a number the two
- *  sides have to agree on.
- *
- *  The guest twin is `Reader` (transport/src/util.js) — an encoder and a decoder over the
- *  same three field shapes, not one body written twice, so there is nothing to factor
- *  out. A field written and not read (or read out of order) desyncs the payload rather
- *  than degrading quietly, which is what makes the pair testable at all. */
+ *  discriminator and is encoded first, so nothing here is a number the two sides must
+ *  agree on. The guest twin is `Reader` (transport/src/util.js); a field written and not
+ *  read desyncs the payload rather than degrading quietly. */
 class Args {
   /** The op this payload is for, or `""` for a nested list that is somebody's blob.
    *  Read back for diagnostics — a failed op reports by name (`tell`). */
   readonly op: string;
   private readonly parts: Uint8Array[] = [];
   private len = 0;
-  /** Naming the op here rather than at the send is what lets `build()` emit the WHOLE
-   *  cross-realm call in one pass. The alternative — build the fields, then copy them
-   *  again behind a header — costs a second full copy of every payload, which on
-   *  `linkBytes` is a copy of the frame itself on every socket read. */
+  /** Naming the op here rather than at the send is what lets `build()` emit the whole
+   *  cross-realm call in one pass — otherwise every payload is copied a second time behind
+   *  its header, which on `linkBytes` is a copy of the frame per socket read. */
   constructor(op = "") {
     this.op = op;
     if (op !== "") this.raw(hostOpHeader(op));
@@ -203,15 +173,11 @@ export interface TransportHostOptions {
   /** The peers this node will talk to, as 32-byte channel keys. Shipped to the guest at
  *  init and applied there.
  *
- *  **It is a lint, and it is named as one.** It used to be a host-side predicate run on
- *  the attribution the transport reported, on the argument that a gate the occupant applies
- *  to itself gates nothing against a hostile occupant. That argument does not survive
- *  contact: the host was checking a key the occupant supplied, so a hostile occupant
- *  simply supplied one that passes — or forged the attribution with no link at all. What
- *  the check actually catches is a BUGGY transport, or an honest one meeting a peer the
- *  operator did not list, and both are the transport's own business. So it ships as
- *  configuration. What holds against a hostile occupant is what always did: it reaches no
- *  authority but `link/*`, and nothing it says about a peer widens that.
+ *  A LINT, not a gate: a host-side version would check a key the occupant supplied, so a
+ *  hostile occupant simply supplies one that passes. What it catches is a buggy transport,
+ *  or an honest one meeting a peer the operator did not list — the transport's own
+ *  business, hence configuration. What holds against a hostile occupant is that it reaches
+ *  no authority but `link/*`.
  *
  *  Absent ⇒ admit every peer that completes the handshake. */
   admitPeers?: Uint8Array[];
@@ -262,21 +228,16 @@ export interface OpenLinkOptions {
 
 /** The host side of the node's network: sockets, addresses, listeners.
  *
- *  **What is deliberately not here.** No request/response facade, no correlation table,
- *  no peer set, no inbound dispatch sink, no `Network`/`Endpoint` pair — every one of
- *  those was the host standing between two guests. An app's send is a call to `_net`;
- *  the transport's reply is that call's return value; its own wire correlation never
- *  leaves its heap. Nothing on this object is reached by an app, at all.
+ *  Deliberately NOT here: any request/response facade, correlation table, peer set or
+ *  dispatch sink — each of those was the host standing between two guests. An app's send is
+ *  a call to `_net`, the transport's reply is that call's return value, and its wire
+ *  correlation never leaves its heap. Nothing on this object is reached by an app.
  *
- *  **And no handover.** `handover()`/`adopt()` existed to carry host state across an
- *  in-place transport upgrade. There is no longer any per-transport state on this object to
- *  carry: the driver holds link ids and the address book, and both belong to the NODE
- *  rather than to whichever bundle is currently the transport. So replacing a transport
- *  is a later load winning a contested protocol id (shell-core `rebuildRoutes`) — a rule
- *  the routing already had, applied to `_net` like any other claim. Live links still do
- *  not survive it, and still cannot: the session keys are in the outgoing guest's private
- *  memory (§4.3), which is what makes the occupant confineable. An upgrade is a
- *  reconnect, and the incoming guest redials from this address book. */
+ *  There is no handover either: the driver holds link ids and the address book, both the
+ *  NODE's rather than the current bundle's, so replacing a transport is just a later load
+ *  winning a contested protocol id (shell-core `rebuildRoutes`). Live links cannot survive
+ *  it — the session keys are in the outgoing guest's private memory (§4.3) — so an upgrade
+ *  is a reconnect, and the incoming guest redials from this address book. */
 export class TransportHost {
   readonly peerId: PeerId;
   port = 0;
@@ -303,12 +264,10 @@ export class TransportHost {
    *  transport replacement is: the incoming guest is configured exactly as the first one
    *  was, by the same call, because there is no second path for a replacement to take. */
   attach(transport: TransportCall): void {
-    // A RE-attach means the previous occupant is gone, and its link state went with it:
-    // session keys and direction counters lived in its private memory (§4.3), which is
-    // what makes the occupant confineable. The sockets are still open and the far ends
-    // still believe in them, so they are torn down here rather than left as channels the
-    // incoming guest has never heard of. This is the reconnect an upgrade is; the
-    // incoming guest redials from the address book re-seeded below.
+    // A RE-attach means the previous occupant is gone, and its link state went with it
+    // (§4.3). The sockets are still open and the far ends still believe in them, so they
+    // are torn down here rather than left as channels the incoming guest never heard of;
+    // it redials from the address book re-seeded below.
     if (this.transport) {
       for (const c of this.channels.values()) {
         try { c.close(false); } catch { /* already gone */ }
@@ -320,9 +279,8 @@ export class TransportHost {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    // The config turn answers the same way every other op does: a rejected one is a
-    // transport that failed to stand — logged, never a reason to take the host down —
-    // so it goes through the same `tell` as the ops that follow it.
+    // Through the same `tell` as every other op: a rejected config turn is a transport
+    // that failed to stand — logged, never a reason to take the host down.
     this.tell(new Args("init")
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
@@ -336,8 +294,8 @@ export class TransportHost {
       .u32(MAX_HANDSHAKE_FRAME_BYTES)
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
       .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
-      // Absent and empty are the same thing — "admit everyone" — said as a zero-length
-      // list rather than as a missing field, so the guest reads one shape.
+      // Absent and empty both mean "admit everyone", said as a zero-length list so the
+      // guest reads one shape.
       .blob(admit.build()));
     // The incoming guest starts with an empty address book, so re-seed it. On a first
     // attach there is nothing to send; on a replacement this is what lets it redial.
@@ -351,26 +309,22 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
 
-  /** Call the transport. The op name and the 32-byte caller id — zeros, "the host
-   *  itself", where an app's call carries its own app key — are already the head of
-   *  `args`, so the payload the guest reads is exactly what `build()` returns and no byte
-   *  is copied twice. One shape either way: the occupant tells the platform's events from
-   *  an app's requests by those 32 bytes and needs no second seam.
+  /** Call the transport. The op name and the 32-byte caller id are already the head of
+   *  `args`, so the payload the guest reads is exactly what `build()` returns. The occupant
+   *  tells the platform's events from an app's requests by those 32 bytes and needs no
+   *  second seam.
    *
-   *  Fire-and-forget by default, but not unordered: the realm serializes invocations in
-   *  acceptance order (realm-queue.ts), so bytes arriving on one link reach the occupant
-   *  in arrival order. An op that throws is a wedged transport whose links are moot, not
-   *  a reason to take the host down. */
+   *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
+   *  so bytes arriving on one link reach the occupant in arrival order. */
   private toTransport(args: Args): Promise<Uint8Array> | null {
     if (this.closed || !this.transport) return null;
     return this.transport(args.build());
   }
 
-  /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged
-   *  and dropped, with ONE exception: a realm that was disposed out from under the op
-   *  is a teardown or an in-place replacement (§12.6), which is this driver's own doing
-   *  and not something an operator can act on. Reporting it would print an error line
-   *  for every ordinary shutdown. */
+  /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged and
+   *  dropped, except a realm disposed out from under the op: that is this driver's own
+   *  teardown or replacement, and reporting it would print an error per ordinary
+   *  shutdown. */
   private tell(args: Args): void {
     const r = this.toTransport(args);
     if (r) void r.catch((err: unknown) => {
@@ -396,10 +350,9 @@ export class TransportHost {
   rawNet(): RawNet {
     return {
       open: (dest) => {
-        // The destination name is the peer's 32-byte channel key; the host resolves
-        // it in the address book it was configured with. No address book entry, or
-        // no channel factory at all (a browser edge), is "no route" — which the
-        // caller treats exactly as a fabric dropping a frame.
+        // The destination name is the peer's 32-byte channel key, resolved in the address
+        // book. No entry, or no channel factory at all (a browser edge), is "no route",
+        // which the caller treats as a fabric dropping a frame.
         if (!this.opts.channels) return NO_ROUTE;
         const addr = this.addrs.get(toHex(dest));
         if (!addr) return NO_ROUTE;
@@ -412,9 +365,8 @@ export class TransportHost {
       close: (linkId, graceful) => {
         try { this.channels.get(linkId)?.close(graceful); } catch { /* already gone */ }
       },
-      // A link that is gone, or a channel that cannot say, both read 0 — indistinguishable
-      // from "nothing queued", which is the safe answer: the occupant's stall clock then
-      // sees no progress and lets the deadline decide, exactly as before this existed.
+      // A link that is gone, or a channel that cannot say, both read 0 — the safe answer:
+      // the occupant's stall clock sees no progress and lets the deadline decide.
       buffered: (linkId) => {
         try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
       },
@@ -536,12 +488,10 @@ export class TransportHost {
     this.wsPort = wsPort;
   }
 
-  /** Dial every known peer address and resolve once each is authenticated (or the
-   *  guest's deadline passes). The dialing itself is the guest's — it counts the
-   *  shortfall to connsPerPeer and opens links through the raw capability — and so is
-   *  the waiting: the answer is this op's return value, which the guest hands back with
-   *  `defer()` when the last peer comes up. Nothing is held host-side, which is why
-   *  there is no waiter to join or overwrite. */
+  /** Dial every known peer address and resolve once each is authenticated (or the guest's
+   *  deadline passes). Both the dialing and the waiting are the guest's: the answer is this
+   *  op's return value, handed back with `defer()` when the last peer comes up, so nothing
+   *  is held host-side. */
   async ready(timeoutMs = 5000): Promise<void> {
     await this.ask(new Args("ready").u32(timeoutMs));
   }
@@ -558,12 +508,10 @@ export class TransportHost {
 
   // ── lifecycle ───────────────────────────────────────────────────────────────
 
-  /** Tear the driver down. Everything released here is the **host's** — the sockets and
-   *  the listener — and **none of it goes through the occupant**. The host owns the
-   *  descriptor for the life of the process (README §1), so a teardown that needed the
-   *  occupant's cooperation to release one would be a teardown a wedged occupant could
-   *  refuse; and an invocation queues (§12.3) while the caller disposes the realm on
-   *  return, so asking would not even be reliable. */
+  /** Tear the driver down. Everything released here is the HOST's — the sockets and the
+   *  listener — and none of it goes through the occupant: the host owns the descriptor for
+   *  the life of the process (§1), so a teardown needing the occupant's cooperation would
+   *  be one a wedged occupant could refuse. */
   close(): void {
     if (this.closed) return;
     // First, so nothing below re-enters a realm the caller is about to dispose: the

@@ -3,13 +3,11 @@
 // them). Both of that target's realms take them from here: the host realm by evaluating
 // this module, the confined realm by evaluating the same text (native/guest.go).
 //
-// These are ordinary JavaScript that has to behave the same on every target, and one
-// text serves both realms — the point of the string: the host realm cannot fetch it
-// from the shell (the shell IS what needs it — `core/domains.ts` builds its DOMAIN
-// constants with a `TextEncoder` at module scope), so this module is first in the
-// loader bundle and installs them on the way past. A second, TypeScript-typed copy for
-// the host realm would be two implementations of one polyfill, which is the shape this
-// file prevents.
+// One text serves both realms, which is the point of the string: the host realm cannot
+// fetch it from the shell, because the shell IS what needs it (core/domains.ts builds its
+// DOMAIN constants with a `TextEncoder` at module scope), so this module is first in the
+// loader bundle and installs them on the way past. A second typed copy for the host realm
+// would be two implementations of one polyfill.
 const POLYFILLS = `
 "use strict";
 (function () {
@@ -56,10 +54,9 @@ const POLYFILLS = `
     };
   }
 
-  // atob — the artifact-embedded transport bundle is inlined as base64
-  // (transport-bundle.ts) and decoded at module scope. Without this the decode threw,
-  // the blob read as ABSENT, and the node came up with no network at all — which is
-  // also what a deliberate deny-all policy looks like, so nothing said so.
+  // atob — the embedded transport bundle is inlined as base64 and decoded at module
+  // scope. Without this the decode threw, the blob read as ABSENT, and the node came up
+  // with no network — which is also what a deliberate deny-all policy looks like.
   if (typeof globalThis.atob === "undefined") {
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     globalThis.atob = function (b64) {
@@ -86,26 +83,22 @@ const POLYFILLS = `
     globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
   }
 
-  // console — quickjs-ng's own has \`log\` and nothing else, and writes it to a WASI
-  // stdout wazero leaves disconnected. So on this target console.log was discarded and
-  // console.error threw a TypeError *inside* the handler that reports a wedged transport
-  // guest (transport-host.ts): the one diagnostic that says the network is stuck was
-  // invisible twice over, once silently and once as a different error.
+  // console — quickjs-ng's own has \`log\` and nothing else, written to a WASI stdout
+  // wazero leaves disconnected. So console.log was discarded and console.error threw a
+  // TypeError *inside* the handler that reports a wedged transport guest: the one
+  // diagnostic saying the network is stuck was invisible twice over.
   //
-  // Everything here goes to STDERR, through the bridge rather than the WASI fd — which
-  // is also why the fd stays disconnected. Stdout is the operator's channel: it carries
-  // \`bridge.log\`'s lines and, for --op with no --out, the app's raw response bytes, and
-  // a diagnostic interleaved into that corrupts a piped response.
+  // Everything here goes to STDERR through the bridge, because stdout is the operator's
+  // channel — it carries \`bridge.log\` and, for --op, the app's raw response bytes, which
+  // an interleaved diagnostic would corrupt.
   //
-  // Guarded on the bridge, so this replaces console only in the HOST realm. A confined
-  // guest has no bridge and keeps quickjs's discarding console, which is the closer
-  // match to the JS target, where a guest realm holds the ECMAScript intrinsics and no
-  // console at all (safe-js.ts).
+  // Guarded on the bridge, so only the HOST realm gets it. A confined guest keeps quickjs's
+  // discarding console, which matches the JS target's realm holding no console at all.
   if (typeof bridge !== "undefined" && typeof bridge.logErr === "function") {
     const show = (a) => {
       if (typeof a === "string") return a;
-      // Message first, then the frames: quickjs's \`stack\` is the frames ALONE, so
-      // printing it by itself drops the only part that says what went wrong.
+      // Message first: quickjs's \`stack\` is the frames ALONE, so printing it by itself
+      // drops the part that says what went wrong.
       if (a instanceof Error) return a.stack ? String(a) + "\\n" + a.stack : String(a);
       try {
         const j = JSON.stringify(a);
@@ -132,10 +125,9 @@ const POLYFILLS = `
 // bundler gives every module a scope of its own (scripts/bundle-loader.mjs).
 (0, eval)(POLYFILLS);
 
-/** The same text, for the confined realm — fetched by Go the way `guestPreamble` and
- *  `guestDriver` are, before it evaluates either of them into a fresh QuickJS context
- *  (native/guest.go). A guest gets the encoders and the microtask queue; the console
- *  branch above no-ops there, since a confined realm holds no bridge. */
+/** The same text for the confined realm — fetched by Go the way `guestPreamble` and
+ *  `guestDriver` are (native/guest.go). A guest gets the encoders and the microtask queue;
+ *  the console branch no-ops there, since a confined realm holds no bridge. */
 export function nativePolyfills(): string {
     return POLYFILLS;
 }

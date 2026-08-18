@@ -1,17 +1,13 @@
-// Browser↔node edge over a plain WebSocket (the README's "browser edge over
-// WebSocket"). A browser cannot open raw TCP, and WebRTC (net-rtc.ts) needs a
-// signaling relay + STUN; when a node is directly reachable — a public IP, a LAN,
-// a port-forward — the simplest path is a WebSocket straight at the node's
-// --ws-listen endpoint.
+// The browser↔node edge over a plain WebSocket. A browser cannot open raw TCP, and WebRTC
+// (net-rtc.ts) needs a signaling relay plus STUN; when a node is directly reachable, the
+// simplest path is a WebSocket straight at its --ws-listen endpoint.
 //
-// The transport itself — the identity handshake, the record layer, the routing —
-// runs in the transport bundle's guest program, driven by the shared TransportHost
-// (transport-host.ts). This file is the browser end of the socket seam: it opens
-// platform WebSockets and hands them to the driver's openLink() — everything above
-// is the bundle's, identical to the TCP path with only the bottom swapped.
+// The browser end of the socket seam and nothing more: it opens platform WebSockets and
+// hands them to the driver's `openLink()`. Everything above — the handshake, the record
+// layer, the routing — is the transport bundle's, identical to the TCP path.
 //
-// Platform-neutral: the WebSocket global is touched only inside a dial (or an
-// injected factory), so importing this module where WebSocket is absent is safe.
+// The WebSocket global is touched only inside a dial (or an injected factory), so importing
+// this where WebSocket is absent is safe.
 
 import type { PeerId } from "../core/socket-seam.js";
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
@@ -33,33 +29,27 @@ export interface WsLike {
   addEventListener(type: "message", cb: (ev: { data: unknown }) => void): void;
 }
 
-// ── RawLink over one WebSocket ─────────────────────────────────────────────
-// A WebSocket delivers whole binary messages in order, so this is a thin adapter.
-// MessageChannel (net-channel.ts) carries the shared machinery, including the
-// pre-open send buffer the transport needs because it emits its HELLO the instant
-// a link is constructed.
+// A WebSocket delivers whole binary messages in order, so this is a thin adapter over
+// MessageChannel (net-channel.ts) — including its pre-open send buffer, which the transport
+// needs because it emits its HELLO the instant a link is constructed.
 export class WsChannel extends MessageChannel {
   constructor(ws: WsLike) { super(ws); }
 }
 
 export interface WsNetworkOptions {
-  /** The transport driver — the shell's `net` once the transport bundle is
-   *  admitted. It holds the node identity, the network key, the contact secret
-   *  and the peer lint; this file only opens sockets. */
+  /** The transport driver — the shell's `net` once the transport bundle is admitted. It
+   *  holds the node identity, the network key, the contact secret and the peer lint; this
+   *  file only opens sockets. */
   driver: TransportHost;
-  /** Open a WebSocket to `url`. Defaults to the platform global, which is what a
-   *  browser tab (and Node ≥22 / Bun) provide. Referenced only here, so importing
-   *  this module where WebSocket is absent stays safe. */
+  /** Open a WebSocket to `url`. Defaults to the platform global. */
   webSocketFactory?: (url: string) => WsLike;
-  /** Called when a peer's link authenticates / drops — the storage demo mirrors
-   *  these into a StorageNode's cohort (addPeer / removePeer), same as RtcNetwork. */
+  /** Called when a peer's link authenticates / drops. */
   onPeerUp?: (peerId: PeerId) => void;
   onPeerDown?: (peerId: PeerId) => void;
-  /** How many parallel connections to open per peer (default 1). Bulk PUT/GET
-   *  stripes its frames round-robin across them — each still its own link and
-   *  record session — so a high-RTT/lossy link that a single TCP flow can't fill
-   *  is filled by N flows. The peer must keep multiple inbound links per peer for
-   *  this to take effect (the routing core does). */
+  /** How many parallel connections to open per peer (default 1). A bulk transfer stripes
+   *  its frames across them — each its own link and record session — so a high-RTT link a
+   *  single TCP flow cannot fill is filled by N. The peer must accept multiple inbound
+   *  links for this to take effect. */
   connsPerPeer?: number;
 }
 
@@ -79,16 +69,13 @@ export class WsNetwork extends SingleIdentityNetwork {
 
   /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
    *  `wss://…` for TLS). The link authenticates in-channel, pinned to the declared
-   *  `pubkey`, and onPeerUp fires once it does. Idempotent top-up, mirroring the
-   *  routing core's dial(): it opens only the shortfall to connsPerPeer. Returns
-   *  the parsed peer id either way. */
+   *  `pubkey`, and onPeerUp fires once it does. An idempotent top-up: it opens only the
+   *  shortfall to connsPerPeer, and returns the parsed peer id either way. */
   connect(spec: string): PeerId {
     const { peerId, contactSecret, url } = parseWsPeer(spec);
     if (peerId === this.ownId) return peerId;
-    // `dialing` holds every live link we dialed to this peer — pre-auth AND
-    // post-auth (the guest forgets one the instant it closes) — so its length is
-    // the current outbound flow count. Open connsPerPeer parallel connections,
-    // each its own link over its own WebSocket.
+    // `dialing` holds every live link dialed to this peer, pre- and post-auth, so its
+    // length is the current outbound flow count.
     let arr = this.dialing.get(peerId);
     if (!arr) {
       arr = [];
@@ -99,9 +86,8 @@ export class WsNetwork extends SingleIdentityNetwork {
         channel: new WsChannel(this.mkWs(url)),
         weDialed: true,
         expectPeerId: peerId, // pin the far key to the address we dialed
-        // DIALING: the secret gating the far end is THEIRS, from the peer spec —
-        // not ours. Passing our own here would seal msg1 under a secret the peer
-        // has never seen, so every dial to a gated peer would draw silence.
+        // DIALING gates on THEIR secret, from the peer spec: passing ours would seal msg1
+        // under a secret the peer has never seen, so every dial would draw silence.
         contactSecret,
         onAuth: () => this.peerUp(peerId),
         onClose: () => { this.peerDown(peerId); this.forget(peerId, handle); },
@@ -119,8 +105,8 @@ export class WsNetwork extends SingleIdentityNetwork {
     for (const l of pending) l.close();
   }
 
-  // A link died (or was declined by the peer lint): remove it from the outbound
-  // `dialing` pool. The router bookkeeping is the guest's.
+  // A link died, or the peer lint declined it: drop it from the outbound pool. The router
+  // bookkeeping is the guest's.
   private forget(peerId: PeerId, handle: LinkHandle): void {
     const dl = this.dialing.get(peerId);
     if (dl) {
@@ -135,9 +121,9 @@ export class WsNetwork extends SingleIdentityNetwork {
  *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
  *  ws:// scheme; pass wss:// explicitly for TLS.
  *
- *  Who the peer is comes from `parsePeerRef` (cli.ts) — the one place that
- *  grammar is written. This edge's own address form is a URL rather than a host:port,
- *  which is the only reason a second entry point exists. */
+ *  Who the peer is comes from `parsePeerRef` (cli.ts), the one place that grammar is
+ *  written; this edge's address form being a URL is the only reason a second entry point
+ *  exists. */
 export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
   const { peerId, contactSecret, location } = parsePeerRef(spec);
   const url = (location.startsWith("ws://") || location.startsWith("wss://")) ? location : "ws://" + location;

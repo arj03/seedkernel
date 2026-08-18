@@ -1,22 +1,14 @@
-// The native loader's binding of the shared host core (README §12.9) — and the whole
-// of it. The Go loader (native/) runs this inside QuickJS; it is bundled, together
-// with every shared module it imports, into native/host-shell.gen.js by
-// scripts/bundle-loader.mjs.
+// The native loader's binding of the shared host core (README §12.9) — and the whole of
+// it. The Go loader (native/) runs this inside QuickJS, bundled with every shared module
+// it imports into native/host-shell.gen.js by scripts/bundle-loader.mjs.
 //
-// This file is a SEAM, not an implementation. Go supplies platform *primitives* —
-// a module table over wazero, libsodium, an `fs` directory, TCP sockets, a second
-// QuickJS realm — and this file adapts them to the interfaces the shared shell
-// already consumes (`BundleHost`, `FreshnessStore`, `ChannelFactory`, `RealmFactory`,
-// `ShellPlatform`) and hands the result to `createShell`. Everything above the
-// primitives — which checks run and in what order (§12.4), who may install (§12.5),
-// the name derivation (§5.1), the freshness arithmetic, the deny-all default (§14),
-// how the guest seam is wired for a bundle's declared domains (§12.2), which app a
-// protocol is delivered to (§12.10) — comes from those shared modules.
-//
-// The ASSEMBLY ORDER is the point. It is the last thing two hosts could disagree
-// about, so it is not restated here: `createShell` owns it, and this file only names
-// the platform. Because it is TypeScript checked against those same interfaces, drift
-// in a hand-written second assembly is a compile error.
+// A SEAM, not an implementation: Go supplies platform *primitives* (a module table over
+// wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm) and this file
+// adapts them to the interfaces the shared shell consumes — `BundleHost`,
+// `FreshnessStore`, `ChannelFactory`, `RealmFactory`, `ShellPlatform` — then hands the
+// result to `createShell`. Every rule above the primitives comes from those shared
+// modules, assembly order included. Being TypeScript checked against the same interfaces
+// is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
 import { runCli, loadedLine, parsePeerSpec, type CliHost, type NodeSetup } from "./cli.js";
@@ -35,11 +27,10 @@ import { isAdmissionRejected } from "./shell-core.js";
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
 
-/** The seam as Go calls into it — `HostCall` (guest-seam.ts) in the currency this
- *  boundary carries. A null return means the call parked: Go holds the guest's Promise
- *  under `callId` and settles it later through `bridge.realmSettle` — the same
- *  null-means-async contract safe-js.ts implements. A sync name returns its bytes here
- *  instead. */
+/** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
+ *  `null` means the call parked: Go holds the guest's Promise under `callId` and settles it
+ *  through `bridge.realmSettle`, the same null-means-async contract safe-js.ts
+ *  implements. */
 type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
 /** The module table and realm plumbing Go exposes (main.go). */
@@ -58,12 +49,11 @@ declare const bridge: {
    *  set, or 0 to leave the platform default. */
   writeFile(path: string, bytes: Uint8Array, mode: number): void;
   /** One operator line on stderr. QuickJS's own `console.log` writes to a WASI stdout
-   *  wazero leaves disconnected, so operator output cannot go through it — and stdout is
-   *  the DATA channel (`stdout` below), which an operator line would corrupt. */
+   *  wazero leaves disconnected, and stdout is the DATA channel (`stdout` below), which an
+   *  operator line would corrupt. */
   log(line: string): void;
   /** One diagnostic line on stderr — where every `console.*` in this realm goes
-   *  (host/native-polyfills.ts), so that a diagnostic can never land in the middle of
-   *  the operator's stdout. */
+   *  (host/native-polyfills.ts). */
   logErr(line: string): void;
   /** Raw bytes on stdout — `--op` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
@@ -79,10 +69,9 @@ declare const bridge: {
   realmDispose(realm: number): void;
 };
 
-/** Go's raw crypto primitives (native/sodium.go, plus native/mldsa.go and
- *  native/mlkem.go on the same object). Bytes come back as ArrayBuffers and a failure
- *  comes back as `null`, because that is what the bridge can carry — every method here
- *  is one wazero or Go call and nothing more.
+/** Go's raw crypto primitives (native/sodium.go, plus mldsa.go and mlkem.go on the same
+ *  object). Bytes come back as ArrayBuffers and a failure as `null`, because that is what
+ *  the bridge can carry — every method here is one wazero or Go call and nothing more.
  *
  *  `crypto_generichash` takes its optional key so the native blake2b shim can REFUSE a
  *  keyed hash loudly; dropping the argument here would turn a MAC into a plain hash. */
@@ -120,17 +109,12 @@ export interface NativeSodium extends ShellSodium {
 
 /** libsodium, in libsodium-wrappers method names, over Go's primitives: Uint8Array
  *  results, `{publicKey, privateKey}` keypairs, and a throw where the wrappers throw.
- *
- *  **This adaptation is here rather than in Go.** It is ordinary shaping code — the
- *  kind that must be identical on every target — so it is TypeScript the compiler
- *  checks: the `ShellSodium` annotation below is a check of it, not an assertion about
- *  a Go constant. A primitive that stops satisfying the surface fails the build. Go
- *  keeps the byte primitives and nothing else.
+ *  Ordinary shaping code, so it lives here as TypeScript the compiler checks rather than
+ *  in Go, which keeps the byte primitives and nothing else.
  *
  *  `null` means different things on the two halves and both are preserved: libsodium's
  *  wrappers throw on a failed open or a bad scalarmult, while ML-KEM's `null` is a
- *  *rejection* the caller must be able to read (a key failing FIPS 203's checks), so it
- *  is passed through. */
+ *  *rejection* the caller must be able to read (a key failing FIPS 203's checks). */
 function wrapNativeSodium(N: typeof __sodium): NativeSodium {
   const u8 = (b: ArrayBuffer) => new Uint8Array(b);
   const kp = (k: { publicKey: ArrayBuffer; privateKey: ArrayBuffer }): Keypair =>
@@ -169,25 +153,18 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
 }
 
 /** The one `sodium` this target has. Exported — and published as a global by the loader
- *  bundle — so the native tests drive the same wrapper production does, for the reason
- *  `fs` below is exported: a second shaping in a harness is a second thing to keep in
- *  step. Built at module scope because `embeddedTransportAuthor` verifies a bundle with
- *  it further down this file. */
+ *  bundle — so the native tests drive the same wrapper production does. Built at module
+ *  scope because `embeddedTransportAuthor` verifies a bundle with it below. */
 export const sodium: NativeSodium = wrapNativeSodium(__sodium);
 
-/** The `fs.*` primitive over Go's data directory (native/fs.go).
- *
- *  Declared with its real, **synchronous** shape: Go answers a read from the local disk
- *  in the call, and qjs has no promise primitive to hand back anyway. The seam the shared
- *  code consumes is async (`Fs`, core/fs.ts), so the adaptation happens here — which is
- *  the right place for it, because "this target's storage is synchronous" is exactly the
- *  kind of platform fact a shim exists to absorb. Go grows with primitives, never with
- *  logic; making it construct promises would be the latter. */
+/** The `fs.*` primitive over Go's data directory (native/fs.go), declared with its real,
+ *  **synchronous** shape: Go answers a read in the call, and qjs has no promise primitive
+ *  to hand back anyway. The seam the shared code consumes is async (`Fs`, core/fs.ts), so
+ *  the adaptation happens here — Go grows with primitives, never with logic. */
 declare const __fs: {
-  /** Point the backend at a data directory, creating it if needed. Late-bound rather
-   *  than fixed at engine boot: WHICH directory is an operator's `--dir`, and Go no
-   *  longer reads the command line to find out. Until this is called the store answers
-   *  as empty and refuses writes. */
+  /** Point the backend at a data directory, creating it if needed. Late-bound because
+   *  which directory is the operator's `--dir`, which Go does not read. Until this is
+   *  called the store answers as empty and refuses writes. */
   open(dir: string): void;
   get(key: string): ArrayBuffer | null;
   put(key: string, bytes: Uint8Array): void;
@@ -201,14 +178,11 @@ declare const __fs: {
   stat(): { used: number; available: number };
 };
 
-/** The async `Fs` seam over that synchronous primitive: a get miss is null, a hit is a
- *  Uint8Array, and list's joined string becomes the string[].
+/** The async `Fs` seam over that synchronous primitive. `async` rather than
+ *  `Promise.resolve(...)` so a throw from Go becomes a rejection like every other
+ *  backend's, instead of a synchronous throw out of a method the caller awaits.
  *
- *  `async` rather than `Promise.resolve(...)` so a throw from Go becomes a rejection like
- *  every other backend's, instead of a synchronous throw out of a method the caller
- *  awaits. */
-// Exported so the native target's tests drive the SAME wrapper production does, rather
-// than a second one in a test harness that could quietly disagree with it.
+ *  Exported so the native tests drive the SAME wrapper production does. */
 export const fs: Fs = {
   async get(key) { const r = __fs.get(key); return r === null ? null : new Uint8Array(r); },
   async put(key, bytes) { __fs.put(key, bytes); },
@@ -216,18 +190,18 @@ export const fs: Fs = {
   // An empty listing arrives as "", which must map to [] — split would yield [""].
   async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
   async delete(key) { return __fs.delete(key); },
-  // Go answers -1 when it cannot ask the OS for free space; the sentinel is the
-  // seam's (core/fs.ts), so the value a guest reads cannot differ by backend.
+  // Go answers -1 when it cannot ask the OS for free space; the sentinel a guest reads
+  // is the seam's (core/fs.ts), so it cannot differ by backend.
   async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
-/** Go's socket byte primitives (native/sock.go): a raw byte duplex and nothing else.
- *  `listen` returns the bound port. This is the whole networking seam — the wire codec,
- *  the channel handshake, the routing table and the request/response layer above it are
- *  all the transport bundle's, over the same primitive every other target hands it.
+/** Go's socket byte primitives (native/sock.go): a raw byte duplex and nothing else. The
+ *  whole networking seam — the wire codec, the handshake, the routing and the
+ *  request/response layer are the transport bundle's, over the same primitive every target
+ *  hands it.
  *
- *  A link arrives WITHOUT a `framing`: which codec applies follows from the address,
- *  which is this file's to read and never Go's. */
+ *  A link arrives WITHOUT a `framing`: which codec applies follows from the address, which
+ *  is this file's to read and never Go's. */
 type GoLink = Omit<RawLink, "framing">;
 declare const __net: {
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
@@ -244,12 +218,10 @@ declare const __net: {
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //
-// Go's byte-level `__net` becomes the RawLink objects below, and Go's socket
-// reader goroutines route deliveries through the three dispatchers defined at the
-// end of this block. The dispatchers are typed TS here, and Go picks them up AFTER
-// the bundle evaluates (main.go boot: exposeNet → eval host-shell.gen.js →
-// netHost.retain) — the deferred retention is what lets the shaping live where
-// TypeScript sees it.
+// Go's byte-level `__net` becomes the RawLink objects below, and Go's reader goroutines
+// route deliveries through the three dispatchers at the end of this block. Go retains
+// those AFTER the bundle evaluates (main.go boot: exposeNet → eval host-shell.gen.js →
+// netHost.retain), which is what lets the shaping live where TypeScript sees it.
 
 /** Channel table + accept registry, keyed by Go's socket ids / bound ports. */
 const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
@@ -269,8 +241,7 @@ function makeGoLink(id: number): GoLink {
     onData: (cb) => { onData = cb; },
     onClose: (cb) => { onClose = cb; },
     // A deliberate close never fires __netClosed (Go closes silently), so drop our own
-    // map entry here too — otherwise every local close leaks a chans entry unbounded
-    // (the mirror of the guard in native/sock.go's close()).
+    // map entry here too, or every local close leaks one.
     close: () => { __net.close(id); netChans.delete(id); },
   };
 }
@@ -288,9 +259,8 @@ function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void)
 
 function netCloseListeners(): void {
   __net.closeListeners();
-  // Teardown closes every bound listener in Go, so every accept closure here is
-  // stale — clear them too, or they pin their onAccept graphs for the process
-  // lifetime in a long-lived holder that re-serves.
+  // Teardown closes every bound listener in Go, so every accept closure here is stale —
+  // clear them too, or they pin their onAccept graphs for the process lifetime.
   netAccepts.clear();
 }
 
@@ -314,16 +284,12 @@ globalThis.__netAccept = (port, id) => { const a = netAccepts.get(port); if (a) 
  *  be JS values). Shape only — every rule about what may land is the shared loader's. */
 const table: ModuleTableBackend = {
     // Straight through: the all-or-none guarantee is Go's, because Go holds the
-    // half-built wazero instances — and has to close them, since neither an instance nor
-    // its compiled code is reclaimed on its own (main.go `bindAll`). The §4.1 scratch
-    // default crosses with it: it is the shared host's number (core/wasm-limits.ts),
-    // so Go's table never owns a copy of the default the JS table enforces.
+    // half-built wazero instances and has to close them (main.go `bindAll`). The §4.1
+    // scratch default crosses with it, so Go's table owns no copy of it.
     bindAll(appKey, mods) { bridge.bindAll(appKey, mods, DEFAULT_SCRATCH_SIZE); },
-    // The seam shape is uniform across targets: a module call is a promise since ABI 6,
-    // and its bound comes from the calling guest's remaining segment. On THIS target the
-    // bridge call still runs synchronously inside the caller's frame (Go's wazero call
-    // with the host's own deadline, main.go `SEEDKERNEL_MODULE_DEADLINE_MS`), so the
-    // passed deadline is deliberately ignored — Go's bound is the deployed one.
+    // A module call is a promise on every target. On THIS one the bridge call runs
+    // synchronously inside the caller's frame, under Go's own deadline (main.go
+    // `SEEDKERNEL_MODULE_DEADLINE_MS`), so the passed deadline is deliberately ignored.
     callModule(appKey, module, payload, _deadlineMs) {
         const r = bridge.callModule(appKey, module, payload);
         return Promise.resolve(r === null ? null : new Uint8Array(r));
@@ -342,10 +308,9 @@ function openStore(dir: string): void {
     __fs.open(dir);
     storeDir = dir;
 }
-/** The freshness store over the Go file seam (README §12.4). The marks live in a
- *  SIBLING of the data dir so a `fs`-capable guest cannot reach its own mark; where
- *  exactly is `freshnessPathFor`, shared with the Node shell rather than computed
- *  again here. A realm with no store open keeps its marks in memory. */
+/** The freshness store over the Go file seam (§12.4). The marks live in a SIBLING of the
+ *  data dir (`freshnessPathFor`, shared with the Node shell) so a `fs`-capable guest cannot
+ *  reach its own mark. A realm with no store open keeps its marks in memory. */
 class NativeFreshnessStore extends FreshnessMarks {
     path;
     constructor(dir: string | null) {
@@ -360,13 +325,10 @@ class NativeFreshnessStore extends FreshnessMarks {
     }
     persist(json: string) {
         if (this.path === null) return;
-        // Fatal, and deliberately so: `FreshnessMarks` treats a throw from here as the
-        // signal that the write did not land, and that is what rolls a revocation back
-        // (so the retry is not a silent no-op) and un-binds a load whose mark could not
-        // be raised. Swallowing the error would report both as successes while the next
-        // boot re-admits the revoked author and re-opens the downgrade gate.
-        // 0600: the marks are a node's own downgrade guard, not something a co-tenant
-        // reads. (The freshness file predates this seam at exactly this mode.)
+        // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
+        // land", which is what rolls a revocation back and un-binds a load whose mark
+        // could not be raised. Swallowing it would report both as successes while the next
+        // boot re-admits the revoked author. 0600 — a node's own downgrade guard.
         bridge.writeFile(this.path, utf8.encode(json), 0o600);
     }
 }
@@ -375,10 +337,9 @@ class NativeFreshnessStore extends FreshnessMarks {
 function framed(link: GoLink, framing: Framing, authority?: string): RawLink {
     return { ...link, framing, authority };
 }
-/** This target's socket seam, backed by Go's sockets: the transport driver's
- *  ChannelFactory. connect/listen produce RawLinks identically to the node:net
- *  factory, so the transport bundle's link state machine — driven by TransportHost
- *  — runs over Go's primitives unchanged. */
+/** This target's socket seam: the transport driver's ChannelFactory over Go's sockets,
+ *  producing RawLinks identically to the node:net factory, so the transport bundle's link
+ *  state machine runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
     connect: (addr) => addr.transport === "ws"
         ? framed(netConnectRaw(addr.host, addr.port), FRAMING.WS_CLIENT, `${addr.host}:${addr.port}`)
@@ -399,10 +360,9 @@ const embeddedTransport = (() => {
         return null;
     }
 })();
-/** Who signed the transport this artifact ships — hex, DERIVED from the blob rather
- *  than restated anywhere. This is the id an operator pins under `grants.link` in a
- *  policy file (§12.5), so a build with a different key needs a different entry and
- *  nothing has to be kept in step by hand. Empty if the artifact carries no transport. */
+/** Who signed the transport this artifact ships — hex, DERIVED from the blob rather than
+ *  restated anywhere. It is the id an operator pins under `grants.link` in a policy file
+ *  (§12.5). Empty if the artifact carries no transport. */
 const embeddedTransportAuthor = (() => {
     if (!embeddedTransport)
         return "";
@@ -413,35 +373,27 @@ const embeddedTransportAuthor = (() => {
         return "";
     }
 })();
-/** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm
- *  driven by Go's event loop. safe-js.ts is the JS platform's answer to the same
- *  seam; both present the same `SafeRealm`, so the shell drives either.
+/** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm driven by
+ *  Go's event loop, presenting the same `SafeRealm` safe-js.ts does.
  *
- *  The promise plumbing stays here rather than in Go: `nativeCall` closes over this
- *  realm, so a settled net op routes to the realm that parked it structurally, and
- *  an initiator's result is delivered into a Promise built in plain ECMAScript. Go
- *  needs no promise primitive of its own. */
-// The shell resolves both resource bounds to the shared defaults (core/wasm-limits.ts)
-// before calling — see shell-core's `ensureRealm` — so `memoryLimitBytes` here is a
-// real number or the same shared default for a direct caller, never "0 means default".
-// `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers
-// and not `undefined`/`Infinity`: a negative value means Infinity — no budget, said
-// explicitly rather than reached by omission — and everything else is milliseconds.
+ *  The promise plumbing stays here rather than in Go: `nativeCall` closes over this realm,
+ *  so a settled op routes to the realm that parked it structurally, and Go needs no promise
+ *  primitive of its own. */
+// `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers and
+// not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds.
 //
-// Note the native realm does NOT enforce this through QuickJS: New_QJS's maxExecutionTime
-// argument is inert in the vendored qjs.wasm (a 1 ms limit does not interrupt a spinning
-// loop), so guest.go arms a wazero deadline instead. That makes a budget kill fatal to the
-// realm rather than a catchable JS error — see qjs.Runtime.Budget.
+// The native realm does NOT enforce it through QuickJS — New_QJS's maxExecutionTime is
+// inert in the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes
+// a budget kill fatal to the realm rather than a catchable JS error (qjs.Runtime.Budget).
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
     // Assigned before any guest code can call back: bridge.createRealm evaluates the
     // guest, whose top-level can only reach sync names (a Promise it could not await).
     let realm: number;
-    // No `CallBudget` crosses here: this realm's segment lives in the engine (guest.go
-    // arms QuickJS's deadline, qjs.Runtime.Budget), not in JS, so there is nothing on
-    // this side to read a remainder from or to bill a module's burn back to. The module
-    // bound this target enforces is its own — Go's `SEEDKERNEL_MODULE_DEADLINE_MS`, armed
-    // on the table's runtime (native/main.go) — which is why the seam takes the budget as
-    // optional rather than requiring a number no target could always supply.
+    // No `CallBudget` crosses here: this realm's segment lives in the engine, not in JS,
+    // so there is nothing on this side to read a remainder from or bill a module's burn
+    // back to. The module bound this target enforces is Go's own
+    // (`SEEDKERNEL_MODULE_DEADLINE_MS`), which is why the seam takes the budget as
+    // optional.
     const nativeCall: NativeHostCall = (name, payload, callId) => {
         const r = hostCall(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
@@ -452,10 +404,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
     let disposed = false;
     return {
-        // Serialized here, in the shared TS, rather than in Go: the guarantee is the
-        // realm contract's (realm-queue.ts) and one implementation of it is what keeps
-        // the two targets from differing about when a second entrypoint may begin. Go
-        // grows with primitives, never with logic.
+        // Serialized in the shared TS rather than in Go: one implementation of the realm
+        // contract (realm-queue.ts) is what keeps the two targets from differing about
+        // when a second entrypoint may begin.
         call: serializeCalls(
             (entry: string, payload: Uint8Array) => {
                 // The executor runs synchronously, so `deferred` carries Go's answer by
@@ -471,17 +422,16 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         dispose: () => { disposed = true; bridge.realmDispose(realm); },
     };
 };
-/** Everything that crosses back to Go crosses as BYTES — that is the currency of this
- *  seam (host.call, callModule, a realm result), and the one shape Go's await harness
- *  carries out of a settled promise. A JSON report is no exception. */
+/** Everything that crosses back to Go crosses as BYTES — the currency of this seam, and
+ *  the one shape Go's await harness carries out of a settled promise. A JSON report is no
+ *  exception. */
 const utf8 = new TextEncoder();
 const utf8dec = new TextDecoder();
 let shell: Shell | null = null;
-/** The admission predicate in force (§12.5). It starts deny-all — the realm boots
- *  refusing everything, so the absence of a decision is never permission (README §14)
- *  — and `--policy` replaces it at boot. The shell closes over this indirection rather
- *  than over a fixed predicate, so an operator can narrow or widen trust without
- *  restarting the node; the rules themselves are entirely policy.ts's. */
+/** The admission predicate in force (§12.5). It starts deny-all, so the absence of a
+ *  decision is never permission (§14), and `--policy` replaces it at boot. The shell
+ *  closes over this indirection rather than a fixed predicate, so trust can be narrowed or
+ *  widened without restarting the node. */
 let admissionPolicy = policyFromJson(null);
 /** Point the realm at a policy config (§12.5). `null` restores the deny-all default;
  *  malformed JSON throws, so a typo fails loudly rather than silently widening trust. */
@@ -498,11 +448,10 @@ function theShell() {
  *  the policy in force, and its listeners bound. Returns the shell and the driver
  *  that IS its network.
  *
- *  There is one of these and everything uses it — `bootNode` below, and a native test
- *  that needs a second endpoint in the process. That is deliberate: a test standing a
- *  node up some other way is the second assembly this target exists not to have
- *  (§12.9), and the last time the two diverged the drift did not fail to compile, it
- *  surfaced as a network timeout. The config is an OBJECT for the same reason — a
+ *  One of these, used by `bootNode` below and by any native test that needs a second
+ *  endpoint: a test standing a node up some other way is the second assembly this target
+ *  exists not to have (§12.9), and when the two last diverged it surfaced as a network
+ *  timeout rather than a compile error. The config is an OBJECT for the same reason — a
  *  positional signature drifting against a Go harness string is a silent break. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
@@ -518,10 +467,8 @@ async function makeTransportNode(cfg: {
     /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate. */
     networkKey?: Uint8Array;
     requestDeadlineMs?: number;
-    /** The §12.3 guest bounds. Both reach `createShell` from here for the reason
-     *  main.ts states about its own: a bound the shell accepts but no target can set is
-     *  a bound nobody has — which is what these were on this target until they were
-     *  threaded through. */
+    /** The §12.3 guest bounds, threaded through to `createShell`: a bound the shell accepts
+     *  but no target can set is a bound nobody has. */
     guestDeadlineMs?: number;
     realmMemoryBytes?: number;
     /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
@@ -553,13 +500,13 @@ async function makeTransportNode(cfg: {
             if (!isAdmissionRejected(err)) {
                 throw err;
             }
-            // A deliberate configuration — "this node does not speak to anyone" — but
-            // one that is indistinguishable from a broken network unless it says so.
+            // A deliberate configuration, but indistinguishable from a broken network
+            // unless it says so.
             bridge.log('  no transport: the policy grants "link" to no author of this bundle');
         }
     }
-    // Conditional on there BEING a driver: a policy granting `link` to nobody leaves
-    // this node with no network, which is a configuration rather than a failure.
+    // Conditional on there BEING a driver: a policy granting `link` to nobody is a
+    // configuration rather than a failure.
     await s.transport?.start();
     return s;
 }
@@ -568,11 +515,9 @@ async function makeTransportNode(cfg: {
  *  Go can print the real ports. */
 async function bootNode(cfgJson: string): Promise<Uint8Array> {
     const cfg = JSON.parse(cfgJson);
-    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). The
-    // node's keypair is derived from it HERE, in the shared subkey code — the exact
-    // derivation the JS CLI runs (host/cli.ts loadNodeKeys) — so this target's peer id is
-    // the same key the JS shell would compute from the same seed. Go holds the seed and
-    // nothing derived from it.
+    // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Derived
+    // HERE, by the shared subkey code the JS CLI runs, so this target's peer id is the key
+    // the JS shell would compute from the same seed. Go holds the seed and nothing else.
     const keys = deriveNodeKeys(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
     const s = await makeTransportNode({
@@ -607,13 +552,10 @@ function serve(): Promise<void> {
 }
 
 // ── the operator flow ────────────────────────────────────────────────────────
-/** This platform, as `cli.ts` needs it. Files, a console line, raw stdout, entropy,
- *  and "stand a node up here" — five members, none of which decides anything.
- *
- *  Everything an operator can choose is on the other side of this record: the flag set,
- *  the defaults, the deny-all reading of an absent `--policy`, the order remedies run
- *  in, which failures are fatal, and the console lines. None of it is restated for this
- *  platform — cli.ts owns it once. */
+/** This platform, as `cli.ts` needs it: files, a console line, raw stdout, entropy, and
+ *  "stand a node up here" — none of which decides anything. The flag set, the defaults,
+ *  the deny-all reading of an absent `--policy`, the order remedies run in and the console
+ *  lines are all cli.ts's. */
 function nativeCliHost(): CliHost {
     return {
         banner: "seedkernel-loader",
@@ -644,8 +586,7 @@ function nativeCliHost(): CliHost {
                 transportBundle: cfg.transportBundle,
                 config: cfg.config,
             });
-            // One "the shell" per realm, whichever entry point stood it up, so the
-            // native tests' drivers and the flow above address the same node.
+            // One "the shell" per realm, whichever entry point stood it up.
             shell = stood;
             return stood;
         },
@@ -660,33 +601,28 @@ async function runMain(): Promise<Uint8Array> {
     return utf8.encode(JSON.stringify({ serving }));
 }
 /** Load a bundle FILE and return the operator's console line for it — byte for byte the
- *  line `runCli` prints, because it is the same `loadedLine`.
- *
- *  Here for the native tests, which drive the real §12.4 load path and assert on what an
- *  operator would actually see. A test formatting that line itself would be the second
- *  implementation this target exists not to have. */
+ *  line `runCli` prints, because it is the same `loadedLine`. Here for the native tests,
+ *  which drive the real §12.4 load path and assert on what an operator would see. */
 async function cliLoadBundle(path: string): Promise<Uint8Array> {
     const raw = bridge.readFile(path);
     if (raw === null) throw new Error(`cannot read ${path}`);
     return utf8.encode(loadedLine(await theShell().loadBundleBlob(new Uint8Array(raw))));
 }
 
-/** The confined realm's own plumbing (native/guest.go `guestDriverJS`): a microtask
- *  queue over the shared loop and one pre-compiled `__start` wrapper, so an initiator
- *  call costs an Invoke rather than a parse. Not the guest ABI (that is
- *  `guestPreamble`, guest-seam.ts), but this driver's twin of what safe-js.ts does in
- *  TypeScript — fetched by Go like the preamble is, rather than restated as a Go
- *  string that TypeScript never saw. */
+/** The confined realm's own plumbing (native/guest.go `guestDriverJS`): one pre-compiled
+ *  `__start` wrapper, so an initiator call costs an Invoke rather than a parse. Not the
+ *  guest ABI (that is `guestPreamble`) but this target's twin of what safe-js.ts does —
+ *  fetched by Go rather than restated as a Go string TypeScript never saw. */
 function guestDriver(): string {
     return GUEST_DRIVER;
 }
 const GUEST_DRIVER = `
 "use strict";
 // Returns 1 when the entrypoint handed its answer to a later turn (the preamble's
-// defer()), which is Go's signal that the realm is free for the next invocation even
-// though this one has not settled — realm-queue.ts's Invocation.released. Read after
-// __invoke has run its synchronous segment, and __invoke cleared the flag on entry, so
-// it describes exactly this invocation.
+// defer()) — Go's signal that the realm is free for the next invocation even though this
+// one has not settled (realm-queue.ts's Invocation.released). Read after __invoke's
+// synchronous segment, and __invoke cleared the flag on entry, so it describes exactly
+// this invocation.
 globalThis.__start = function (id, entry, arg) {
   try {
     Promise.resolve(__invoke(entry, arg)).then(
@@ -699,8 +635,7 @@ globalThis.__start = function (id, entry, arg) {
 };
 `;
 
-// What Go reaches by name in the realm. `createRealm` and the transport bundle
-// helpers are here as much for the native tests as for the boot above: a test that
-// stands up a guest or a second node drives the very factories production does, so
-// there is no test-only wiring to keep in step with the real one.
+// What Go reaches by name in the realm. `createRealm` and the transport helpers are here
+// for the native tests as much as for the boot above, so a test that stands up a guest or
+// a second node drives the very factories production does.
 export { runMain, cliLoadBundle, openStore, bootNode, setPolicy, serve, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

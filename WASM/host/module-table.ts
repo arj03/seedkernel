@@ -1,61 +1,27 @@
-// The module table (README §3, §4), as the JS targets implement it.
-//
-// **Host code, not core.** What is core about the table is the CONTRACT — the table,
-// the §4 module ABI, the bind/unbind semantics, and the §4.3 memory ceiling
-// (core/wasm-limits.ts). This file is one platform's implementation of it; the native
-// target's is a wazero map in Go behind its byte bridge (native/main.go), and neither
-// is more canonical than the other. It sits with the other backends — `fs-node.ts`,
-// `safe-js.ts` — for the same reason they do.
+// The module table (README §3, §4), as the JS targets implement it. Host code, not core:
+// the CONTRACT is core (the §4 module ABI, the bind/unbind semantics, the §4.3 memory
+// ceiling in core/wasm-limits.ts) and this is one platform's implementation of it — the
+// native target's is a wazero map in Go (native/main.go), neither more canonical.
 //
 // **A module call is bounded here, by construction.** The JS platform's WebAssembly
-// exposes no fuel or timeout, and QuickJS ticks its interrupt handler between bytecode
-// executions while a WASM call is one bytecode — so no budget can land *inside* a call
-// (§4.3). The bound is structural instead: **each module lives in its own worker — a
-// dedicated isolate, instantiated once at bind, so statics live there — and a call
-// carries a deadline.** On expiry the host kills the worker (the engine destroys the
-// isolate, even mid-loop; `terminate` is the one interrupt mechanism JS exposes),
-// answers the call with an empty response exactly as a trap does, and respawns a fresh
-// instance. A spinning module burns at most one core for at most one budget. The native
-// target holds the same contract at its own engine lever (native/main.go,
-// `SEEDKERNEL_MODULE_DEADLINE_MS`).
+// exposes no fuel or timeout, and a WASM call is one bytecode to QuickJS's interrupt
+// handler, so no budget can land *inside* a call (§4.3). The bound is structural instead:
+// each module lives in its own worker — a dedicated isolate, instantiated once at bind, so
+// statics live there — and a call carries a deadline. On expiry the host kills the worker
+// (`terminate` is the one interrupt JS exposes, and it works mid-loop), answers empty
+// exactly as a trap does, and respawns. A spinning module burns at most one core for at
+// most one budget. The native target holds the same contract at its own engine lever.
 //
-// The table is a **contract, not an artifact**: the table (`apps[appKey].get(module)`),
-// the pure-transform module ABI (§4), and the bind/unbind semantics (§3.1). Its whole
-// implementation is the two `Map`s below. The outer level is an INSTALL RECORD — what
-// a bundle load created — and the inner level is the app's module map, which is what a
-// call resolves: `apps[appKey].modules[name] = wasm_bytes`. There is nothing to
-// instantiate beside it, no module-id indirection, and no second table to keep in sync
-// with a first.
+// The whole implementation is the two `Map`s below: `apps[appKey].get(module)`. Two levels
+// because there are two things — an app is what installs and what `revoke` removes, a
+// module is what a call resolves — and the outer key IS the ownership (§5.1), visible
+// without parsing anything. There is no shared module namespace to defend: a guest reaches
+// only its own app's modules and a table name never leaves the host.
 //
-// **Two levels, because there are two things.** An app is what installs, what a binding
-// points at and what `revoke` removes; a module is what a call resolves. Encoding both
-// into one string key — `"<author hex>:<app>:<module>"` — bought a flat map at the cost of
-// a codec: a charset rule so the module half could not contain the separator, a
-// fixed-width author half so the app half could, a prefix scan for the unbind, and an
-// argument about why the author hex must not be truncated lest one author grind their way
-// onto another's names. Every one of those defends a shared namespace, and there is no
-// shared namespace: a guest reaches only its own app's modules, the routing points at app
-// keys, and a table name never leaves the host (§5.1). The outer key IS the ownership,
-// visible without parsing anything.
-//
-// A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global, and
-// `handle(input_len)`; the host stages input at `scratch`, calls `handle`, and reads the
-// response back from `scratch`. Modules import nothing — no host seam, no I/O, no
-// callback. Inbound delivery reaches an app's GUEST (§12.10), and the guest drives its
-// modules by their bare name through the guest seam (README §12.2); a host-side
-// embedder reaches the same path directly with `callModule`, and does all I/O and
-// authorization itself. Every entry is an installed WASM module: a bundle is the one
-// way code arrives (§12.4), so the table holds one kind of thing and `callModule` has
-// one path through it.
-//
-// The table is the host's ONLY install state. There is no ownership register beside it,
-// because ownership is the outer key (§5.1) — so who may bind a module is answered by
-// where it sits, and nothing can fall out of step with the table. That is also why
-// nothing here touches crypto: hashing belongs to the loader (`genesisHash`, bundle.ts),
-// and this component is the `Map` §3 says it is.
-//
-// Authenticity is the transport's job (the AKE channel attributes every frame), not a
-// per-message signature — so there is no signature wrapper and no signer scoping here.
+// A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global and
+// `handle(input_len)`, imports nothing, and cannot call back. The table is the host's only
+// install state, which is why nothing here touches crypto — hashing belongs to the loader
+// (`genesisHash`, bundle.ts) and this component is the `Map` §3 says it is.
 
 import {
   checkModuleMemory,
@@ -73,42 +39,36 @@ export interface ModuleTableOptions {
    *  `installBundle` also applies; lower it to hold this host's direct installs to
    *  something tighter than the bundle path requires. */
   maxModuleMemoryBytes?: number;
-  /** Bound on one module invocation — one call, and one worker load at install — in
-   *  milliseconds, for a call that carries no deadline of its own. A call from a
-   *  GUEST carries the calling guest's remaining execution segment (§4.3, "charged to
-   *  the calling guest's budget" made literal): the seam passes it through, so this
-   *  default is what a host-side embedder's `callModule` gets, and it defaults to the
-   *  shared guest budget (`DEFAULT_GUEST_DEADLINE_MS`) — one number for untrusted code
-   *  wherever it runs. On expiry the module's worker is killed and respawned and the
-   *  call answers empty, exactly as a trap would. `Infinity` disables the bound. */
+  /** Bound on one module invocation — one call, and one worker load at install — in ms,
+   *  for a call that carries no deadline of its own; a call from a GUEST carries that
+   *  guest's remaining execution segment instead (§4.3). Defaults to the shared guest
+   *  budget, one number for untrusted code wherever it runs. On expiry the worker is
+   *  killed and respawned and the call answers empty. `Infinity` disables it. */
   deadlineMs?: number;
 }
 
-/** What the table holds at one name: a module running in its own worker, reached by
- *  name through `callModule`. The instance itself lives in the worker — the host holds
- *  the verified bytes (for the respawn after a kill), the live worker, and the bookkeeping
- *  that makes one call at a time answer within one deadline. */
+/** What the table holds at one name. The instance lives in the worker; the host holds the
+ *  verified bytes (for the respawn after a kill), the live worker, and the bookkeeping that
+ *  makes one call at a time answer within one deadline. */
 interface WasmModuleRef {
   /** The verified bytes, retained for the respawn after a kill (§4.3). */
   wasm: Uint8Array;
   /** The live worker, or null while a killed module respawns. */
   worker: ModuleWorker | null;
-  /** The respawn in progress, shared so concurrent callers wait on one. EVERY respawn
-   *  is recorded here, including the one a deadline kill starts on its own: a load does
-   *  not adopt its worker until it has spawned, so a second load started in that window
-   *  would stand up a worker nothing can reach — an orphan isolate, still spinning,
-   *  which is exactly what the bound exists to stop. */
+  /** The respawn in progress, shared so concurrent callers wait on one. EVERY respawn is
+   *  recorded here, including the one a deadline kill starts: a load does not adopt its
+   *  worker until it has spawned, so a second load started in that window would stand up an
+   *  orphan isolate — still spinning, which is what the bound exists to stop. */
   spawning: Promise<void> | null;
-  /** Set once the ref leaves the table (`teardown`). A load in flight at that moment
-   *  must not adopt its worker onto a ref nothing holds any more — the worker would be
-   *  unreachable and unkillable — so it kills what it spawned instead. */
+  /** Set once the ref leaves the table (`teardown`). A load in flight then must kill what
+   *  it spawned rather than adopt it onto a ref nothing holds — the worker would be
+   *  unreachable and unkillable. */
   dead: boolean;
-  /** One in-flight call per module (§3's "one transform at a time"): calls chain on
-   *  this, so a spinning module burns at most one core, for at most one bound. */
+  /** One in-flight call per module (§3's "one transform at a time"): calls chain on this,
+   *  so a spinning module burns at most one core for at most one bound. */
   tail: Promise<unknown>;
-  /** The module's scratch region, read off the worker's own instance at load — the
-   *  host's copy of the §4.1 number, used to refuse an oversized payload without a
-   *  worker round-trip. */
+  /** The module's scratch region, read off the worker's instance at load, so an oversized
+   *  payload is refused without a worker round-trip. */
   scratchSize: number;
   /** Calls awaiting their worker's answer, by the id this host minted. */
   pending: Map<number, (bytes: Uint8Array | null) => void>;
@@ -126,12 +86,11 @@ interface ModuleWorker {
   onMessage(cb: (msg: WorkerMsg) => void): void;
   onError(cb: (err: unknown) => void): void;
   post(msg: object, transfer?: ArrayBuffer[]): void;
-  /** Hold the host's event loop open, or stop holding it. An idle module worker must
-   *  never keep a process alive (a Node CLI that installed a bundle would never exit),
-   *  but one with a call in flight must: an unbounded call arms no timer, so nothing
-   *  else would be pending and the process would exit mid-transform with its caller's
-   *  promise unsettled. Node's ref/unref; a no-op in the browser, which has no such
-   *  notion. */
+  /** Hold the host's event loop open, or stop holding it. An idle worker must never keep a
+   *  process alive (a Node CLI that installed a bundle would never exit), but one with a
+   *  call in flight must: an unbounded call arms no timer, so the process would exit
+   *  mid-transform with its caller's promise unsettled. Node's ref/unref; a no-op in the
+   *  browser. */
   keepAlive(on: boolean): void;
   kill(): void;
 }
@@ -156,11 +115,9 @@ port.onmessage = (e) => {
     try {
       const mod = new WebAssembly.Module(m.wasm);
       // The three AssemblyScript runtime shims and nothing else — the same set every
-      // other target resolves (native/main.go), so "does this module load" is never a
-      // property of which target it landed on. All three are inert: \`seed\` is a constant
-      // rather than Date.now(), because a pure transform is deterministic and reaches no
-      // clock (§4.2), and \`trace\` drops its arguments rather than writing them where
-      // anything could observe them (§4.3).
+      // other target resolves (native/main.go), so "does this module load" never depends
+      // on which target it landed on. All three are inert: \`seed\` is a constant, because
+      // a pure transform reaches no clock (§4.2), and \`trace\` drops its arguments.
       instance = new WebAssembly.Instance(mod, {
         env: {
           abort: (_m, _f, l, c) => { throw new Error("dynamic module abort at " + l + ":" + c); },
@@ -235,10 +192,8 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
   if (typeof browserCtor === "function") {
     const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
     const w = new browserCtor(url);
-    // The worker has its script; the URL is a document-lifetime entry in the blob
-    // registry and nothing revokes it later. A module respawns once per deadline kill,
-    // so an unrevoked URL per spawn is a leak that grows with the thing it defends
-    // against.
+    // The worker has its script, and the URL is a document-lifetime blob-registry entry
+    // nothing else revokes — a leak that would grow one entry per deadline kill.
     URL.revokeObjectURL(url);
     return {
       onMessage: (cb) => { w.onmessage = (e) => cb(e.data as WorkerMsg); },
@@ -253,10 +208,8 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
   }
   const WorkerCtor = await nodeWorkerCtor;
   const w = new WorkerCtor(src, { eval: true });
-  // An IDLE module worker is host-owned bookkeeping, never a reason for the process to
-  // stay up: an orphaned worker (a respawn racing a teardown) must not hold the node
-  // alive. A worker with work in flight does — `keepAlive` re-refs it for exactly that
-  // window.
+  // An IDLE worker is never a reason for the process to stay up; one with work in flight
+  // is, and `keepAlive` re-refs it for exactly that window.
   w.unref?.();
   return {
     onMessage: (cb) => { w.on("message", (m) => cb(m as WorkerMsg)); },
@@ -268,10 +221,9 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
 }
 
 export class ModuleTable {
-  /** The module table (README §3): app key → that app's modules by logical name. A
-   *  module is bound exactly when it is a key in its app's map, so the §3.1 bind /
-   *  unbind / resolve operations are `set` / `delete` / `get` and nothing else can
-   *  disagree about what resolves. */
+  /** The module table (§3): app key → that app's modules by logical name. A module is
+   *  bound exactly when it is a key in its app's map, so §3.1's bind / unbind / resolve are
+   *  `set` / `delete` / `get` and nothing else can disagree about what resolves. */
   private readonly apps = new Map<string, Map<string, WasmModuleRef>>();
 
   /** The §4.3 memory ceiling this host holds installs to. */
@@ -280,8 +232,8 @@ export class ModuleTable {
   /** The default module-call bound (ModuleTableOptions.deadlineMs). */
   private readonly deadlineMs: number;
 
-  /** Ids for calls in flight to this table's workers — one stream, so a worker can
-   *  correlate an answer with the call that asked, and never two calls share an id. */
+  /** Ids for calls in flight to this table's workers — one stream, so no two calls share
+   *  an id and a worker's answer correlates with the call that asked. */
   private callSeq = 0;
 
   constructor(opts: ModuleTableOptions = {}) {
@@ -294,20 +246,16 @@ export class ModuleTable {
   /** Land an app's modules on the table, all or none (§3.1) — the one way code arrives,
    *  and the only mutating entry point besides `removeApp`.
    *
-   *  Every module is spawned, instantiated and validated BEFORE anything is written, so
-   *  a bundle whose third module is malformed leaves the table exactly as it was rather
-   *  than half-replaced. The atomicity is structural rather than argued: the app's whole
-   *  module map is built first and then assigned under its key, so the commit is ONE
-   *  assignment and there is no window in which some of an app's modules are the new
-   *  version and the rest are the old.
+   *  Every module is spawned, instantiated and validated BEFORE anything is written, and
+   *  the app's whole module map is built first and then assigned under its key — so the
+   *  commit is ONE assignment, with no window in which some of an app's modules are the new
+   *  version and the rest the old.
    *
-   *  A re-install REPLACES the app's map rather than merging into it, which is what a
-   *  version of an app is: a bundle dropping a module from its manifest leaves nothing
-   *  of the old one behind — the replaced map's workers are killed as the old map goes.
+   *  A re-install REPLACES the app's map rather than merging into it, so a bundle dropping
+   *  a module from its manifest leaves nothing of the old one behind.
    *
-   *  Async because each module now stands up a worker: the instance, its compile and its
-   *  statics all land in a fresh isolate, and this returns when every one of them has
-   *  reported `ready` (or throws on the first `loadError`). */
+   *  Async because each module stands up a worker; this returns when every one has reported
+   *  `ready`, or throws on the first `loadError`. */
   async bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): Promise<void> {
     if (appKey.length === 0) throw new Error("table: empty app key");
     const built = new Map<string, WasmModuleRef>();
@@ -318,8 +266,8 @@ export class ModuleTable {
       }
     }
     catch (e) {
-      // Nothing above touched the table; release the workers the attempt already stood
-      // up so a refused bundle leaves no orphaned isolates behind.
+      // Nothing above touched the table; release what the attempt stood up, so a refused
+      // bundle leaves no orphaned isolates behind.
       for (const ref of built.values()) this.teardown(ref);
       throw e;
     }
@@ -330,11 +278,10 @@ export class ModuleTable {
     }
   }
 
-  /** Stand up a module's worker: the §4.3 memory ceiling is read off the bytes HERE,
-   *  before any worker exists (instantiation is what allocates the declared initial
-   *  memory — wasm-limits.ts, which also refuses an imported or shared memory); the §4
-   *  export checks run in the worker on the same load, and its `loadError` reports
-   *  failure rather than binding a broken ref. */
+  /** Stand up a module's worker. The §4.3 memory ceiling is read off the bytes HERE,
+   *  before any worker exists, because instantiation is what allocates the declared initial
+   *  memory (wasm-limits.ts, which also refuses an imported or shared memory); the §4 export
+   *  checks run in the worker on the same load and report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
     if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
     checkModuleMemory(wasmBytes, this.maxModuleMemoryBytes);
@@ -351,19 +298,18 @@ export class ModuleTable {
     return ref;
   }
 
-  /** Bring `ref`'s worker up: spawn, load, wait for `ready` — or fail. Bounded like a
-   *  call, because a module whose initialization never completes is the same bug as one
-   *  whose `handle` never returns — instantiation RUNS the start section, so an
-   *  unbounded load is a wedged node at install. */
+  /** Bring `ref`'s worker up: spawn, load, wait for `ready` — or fail. Bounded like a call,
+   *  because instantiation RUNS the start section, so an unbounded load is a wedged node at
+   *  install. */
   private async load(ref: WasmModuleRef): Promise<void> {
     const worker = await spawnWorker(moduleWorkerSrc());
     // The ref may have left the table while this was spawning (`removeApp`, a replacing
-    // bind, a refused bundle). Adopting the worker now would hand it to a ref nothing
-    // holds — unreachable, unkillable, and still running whatever it was given.
+    // bind, a refused bundle). Adopting the worker now would leave it unreachable,
+    // unkillable, and still running whatever it was given.
     if (ref.dead) { worker.kill(); throw new Error("table: module was released while it loaded"); }
     ref.worker = worker;
-    // A load holds the loop open for the same reason a call does: an unbounded table
-    // arms no load timer, and a bind is something its caller is waiting on.
+    // A load holds the loop open for the same reason a call does: an unbounded table arms
+    // no load timer, and a bind is something its caller is waiting on.
     worker.keepAlive(true);
     await new Promise<void>((resolve, reject) => {
       let loading = true;
@@ -376,9 +322,8 @@ export class ModuleTable {
           reject(new Error(`table: module failed to initialize within ${this.deadlineMs}ms`));
         }, this.deadlineMs);
       }
-      // One handler per worker, for both phases — load and calls are strictly
-      // sequential per module (a call reaches a worker only after `ready`, and a
-      // respawn holds the queue), so one dispatch covers both.
+      // One handler for both phases: load and calls are strictly sequential per module (a
+      // call reaches a worker only after `ready`, and a respawn holds the queue).
       worker.onMessage((m) => {
         if (m.type === "result") {
           const settle = ref.pending.get(m.id);
@@ -408,15 +353,15 @@ export class ModuleTable {
       });
       worker.post({ type: "load", wasm: ref.wasm });
     });
-    // Loaded and idle: it holds nothing open until a call is posted. (Every rejection
-    // path above killed the worker, so there is nothing to release there.)
+    // Loaded and idle: it holds nothing open until a call is posted. (Every rejection path
+    // above killed the worker.)
     worker.keepAlive(false);
-    // A release that landed while the load was in flight — the module is off the table
-    // and `teardown` had no worker to kill, so this one must not be left standing.
+    // A release that landed while the load was in flight: `teardown` had no worker to kill,
+    // so this one must not be left standing.
     if (ref.dead) { ref.worker = null; worker.kill(); throw new Error("table: module was released while it loaded"); }
-    // After the load settles, an engine crash (not a wasm trap — traps are caught
-    // inside the worker and reported as a null result) fails whatever call is in
-    // flight with the same empty answer and leaves the module to respawn.
+    // After the load settles, an engine crash — not a wasm trap, which the worker catches
+    // and reports as a null result — fails the in-flight call with the same empty answer
+    // and leaves the module to respawn.
     worker.onError(() => {
       if (ref.worker !== worker) return;
       for (const settle of ref.pending.values()) settle(null);
@@ -428,23 +373,16 @@ export class ModuleTable {
   // ─── public API ──────────────────────────────────────────────────────
 
   /** Invoke one app's module with `payload`, returning its response bytes, or null if
-   *  nothing is bound there or the module produced no response. This is the
-   *  scratch-region contract (README §4): write input at the module's scratch offset,
-   *  call handle(input_len), read the response back from the same offset. The generic
-   *  "run a transform" primitive: the host uses it directly, and a guest reaches it
-   *  through the guest seam by its bare name (README §12.2) — with the app key bound at
-   *  seam construction, so `module` is the LOGICAL name from the guest's own manifest
-   *  and a guest cannot address another app's modules by naming one. Modules cannot
-   *  call back, so there is no re-entrancy.
+   *  nothing is bound there or the module produced no response. The scratch-region contract
+   *  (§4): write input at the module's scratch offset, call handle(input_len), read the
+   *  response back from the same offset. A guest reaches this through the seam by the bare
+   *  logical name, with the app key bound at seam construction, so it cannot address
+   *  another app's modules. Modules cannot call back, so there is no re-entrancy.
    *
-   *  Async since the JS targets run modules in a worker (a call crosses an isolate),
-   *  and BOUNDED: `deadlineMs` (defaulting to this host's `deadlineMs`) is the call's
-   *  whole budget. A call that exceeds it is answered empty — the worker killed, a
-   *  fresh instance respawned — so a module that never returns fails like a trap
-   *  instead of holding the node's thread (the §4.3 compute residual, closed at the
-   *  engine). A guest's call carries the calling guest's remaining execution segment,
-   *  passed through the seam, which is what makes "charged to the calling guest's
-   *  budget" (§4.3) enforced rather than aspirational. */
+   *  Async (a call crosses an isolate) and BOUNDED: `deadlineMs` is the call's whole
+   *  budget, and exceeding it answers empty with the worker killed and respawned, so a
+   *  module that never returns fails like a trap instead of holding the node's thread. A
+   *  guest's call carries its own remaining segment (§4.3). */
   async callModule(appKey: string, module: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null> {
     const w = this.apps.get(appKey)?.get(module);
     if (!w) return null;
@@ -462,7 +400,7 @@ export class ModuleTable {
    *  — is the same empty answer a trap produces today, so nothing downstream changes. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<Uint8Array | null> {
     // The previous call may have killed the worker; run on the fresh instance the kill
-    // asked for. Its statics are gone, which is the point.
+    // asked for, whose statics are gone — which is the point.
     if (w.worker === null) await this.respawn(w);
     const worker = w.worker;
     if (!worker) return null;
@@ -481,17 +419,15 @@ export class ModuleTable {
       if (Number.isFinite(bound)) {
         timer = setTimeout(() => {
           // The module did not return within its bound. Kill the isolate — the engine's
-          // one interrupt, which works even mid-loop because it is the engine destroying
-          // the worker — answer empty, and respawn a fresh instance for the next call.
+          // one interrupt, which works even mid-loop — answer empty, and respawn.
           w.pending.delete(id);
           resolve(null);
           if (w.worker === worker) {
             w.worker = null;
             worker.kill();
-            // Recorded as THE respawn, not started loose: the call already queued behind
-            // this one resumes on the next microtask, well before the new worker has
-            // spawned, and a second load started there would leave the first one's worker
-            // reachable by nobody — an orphan isolate running the code the kill was for.
+            // Recorded as THE respawn, not started loose: the call queued behind this one
+            // resumes before the new worker has spawned, and a second load started there
+            // would orphan an isolate running the code the kill was for.
             void this.respawn(w);
           }
         }, bound);
@@ -518,15 +454,11 @@ export class ModuleTable {
   }
 
   /** Drop an app and everything it landed, returning how many modules went — the §3.1
-   *  unbind, and the whole of it. The unit is an APP, which is simply the key: the
-   *  shell's `uninstall` and `revoke` (§12.5) are the only callers, and both mean exactly
-   *  this. Install and removal are visibly the same unit, so there is no asymmetry to
-   *  explain.
-   *
-   *  There is no single-module remove. Nothing wants one — a module is not a unit anything
-   *  installs or revokes — and with modules living inside their app there is no shared
-   *  namespace for a freed one to be contended for, so there is nothing to keep in step
-   *  and no tombstone to leave behind. */
+   *  unbind, and the whole of it. The unit is an APP, which is the key, so install and
+   *  removal are the same unit; the shell's `uninstall` and `revoke` (§12.5) are the only
+   *  callers and both mean exactly this. There is no single-module remove: a module is not
+   *  a unit anything installs, and with modules living inside their app there is no shared
+   *  namespace for a freed one to be contended for. */
   removeApp(appKey: string): number {
     const mods = this.apps.get(appKey);
     if (!mods) return 0;
@@ -544,9 +476,8 @@ export class ModuleTable {
   /** Kill a module's worker and settle everything waiting on it as empty — the module
    *  is gone, and no caller may hang on a promise nothing can settle. */
   private teardown(ref: WasmModuleRef): void {
-    // Marked before anything else: a respawn may be mid-flight, and the load that
-    // finishes after this returns has to kill what it spawned rather than adopt it onto
-    // a ref that has left the table.
+    // Marked first: a respawn may be mid-flight, and the load that finishes after this
+    // returns has to kill what it spawned rather than adopt it onto a departed ref.
     ref.dead = true;
     for (const settle of ref.pending.values()) settle(null);
     ref.pending.clear();

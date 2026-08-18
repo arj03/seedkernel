@@ -1,15 +1,10 @@
-// The `fs.*` capability (exported as `seedkernel-wasm/fs`): raw bytes under an
-// opaque, flat key. It is the storage-side twin of `net.*` (raw bytes to/from an
-// opaque peer id) — see the runtime split, "raw-byte caps in the host,
-// structure in modules". The host knows nothing about content-addressing,
-// descriptors, or quota: those are app policy that an application layers on top
-// (seedstore's FsBlobStore does exactly that). Only real platform conditions
-// surface — a full disk makes `put` throw, and `stat` reports what the backend
-// can see.
+// The `fs.*` capability (exported as `seedkernel-wasm/fs`): raw bytes under an opaque,
+// flat key — the storage-side twin of the raw net capability. The host knows nothing about
+// content-addressing, descriptors or quota; those are app policy layered on top. Only real
+// platform conditions surface: a full disk makes `put` throw, and `stat` reports what the
+// backend can see.
 //
-// Keys are opaque and flat (not POSIX paths). Backends may constrain the key
-// charset to what maps safely onto their medium (NodeFs requires filesystem-safe
-// names); seedstore's keys are hashes plus a short suffix, well within that.
+// Keys are flat, not POSIX paths (see the key rule below).
 
 export interface FsStat {
   /** Total bytes stored across all keys (best-effort). */
@@ -19,28 +14,20 @@ export interface FsStat {
   available: number;
 }
 
-/** The `available` sentinel a backend reports when it cannot ask the OS for free
- *  space (MemoryFs, the native primitive) — a large number that never reads as
- *  "nearly full". Backends that CAN answer (NodeFs on POSIX, via statfs)
- *  substitute the real figure. One value on every target: a guest that sizes its
- *  writes against `stat()` must see the same answer whatever the backend is, so
- *  the sentinel is part of the seam rather than a per-backend choice. */
+/** The `available` sentinel a backend reports when it cannot ask the OS for free space — a
+ *  large number that never reads as "nearly full". Part of the seam rather than a
+ *  per-backend choice, so a guest sizing its writes against `stat()` sees the same answer
+ *  whatever the backend is. */
 export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
 
-/** The storage seam. **Every method is async**, and that is a property of the seam
- *  rather than of any backend: a synchronous `get(key): Uint8Array | null` is a shape no
- *  browser backend can implement — IndexedDB is asynchronous by construction and OPFS is
- *  synchronous only inside a Worker — so a sync seam would have made the browser the one
- *  target that could not carry `fs`, which is core (README §1). A backend that genuinely
- *  is synchronous (`MemoryFs`, host/fs-memory.ts) returns an already-resolved promise and
- *  costs a microtask. The backends themselves are host code, as are the wrappers that
- *  apply the key rule over them (`validatedFs`/`scopedFs`, shell-core.ts) — this file is
- *  the seam they satisfy plus the consensus key rule, and nothing else.
+/** The storage seam. **Every method is async**, as a property of the seam rather than of
+ *  any backend: a synchronous `get` is a shape no browser backend can implement (IndexedDB
+ *  is async by construction, OPFS is sync only inside a Worker), so a sync seam would make
+ *  the browser the one target that could not carry `fs`. A genuinely synchronous backend
+ *  (`MemoryFs`) returns a resolved promise and costs a microtask.
  *
- *  It is ABI-visible: `FS_*` are round-tripping ops (§12.2), so a guest reads them with
- *  `await`. Which side of that line an op sits on is exactly what `guest.abi` versions, so
- *  a guest written against another shape is refused by name at load rather than handed a
- *  Promise where it expected bytes. */
+ *  ABI-visible: the `fs/*` names round-trip (§12.2), so a guest reads them with `await`.
+ *  Which side of that line an op sits on is what `guest.abi` versions. */
 export interface Fs {
   get(key: string): Promise<Uint8Array | null>;
   put(key: string, bytes: Uint8Array): Promise<void>;
@@ -56,28 +43,23 @@ export interface Fs {
 
 // ─── what a key may be ───────────────────────────────────────────────────────
 //
-// A key is opaque to the runtime but it is not opaque to the *medium*: both real
-// backends map it to a filename verbatim, so it must be flat and safe — no separators,
-// nothing that escapes a directory, nothing a platform resolves to something other
-// than a file. seedstore's keys (hex block-ids plus a short suffix) satisfy this.
+// A key is opaque to the runtime but not to the *medium*: both real backends map it to a
+// filename verbatim, so it must be flat and safe — no separators, nothing that escapes a
+// directory, nothing a platform resolves to something other than a file.
 //
-// **It lives here because it is a consensus predicate, not a backend detail.** Which
-// keys a node admits decides which blocks it stores and advertises, so two nodes that
-// disagree about it disagree about their contents — the same argument that keeps one
-// ML-DSA verifier for all three targets (`pq.ts`). It was previously written twice, in
-// `host/fs-node.ts` and again in `native/fs.go`, with a comment on each saying the two
-// had to match. Now the rule is applied once, in shared JS, over whichever backend a
-// target supplies (`validatedFs`, shell-core.ts), and a backend's own path check is
-// defence in depth rather than the thing being relied on.
+// It lives here because it is a consensus predicate, not a backend detail: which keys a
+// node admits decides which blocks it stores and advertises, so two nodes that disagree
+// about it disagree about their contents. Applied once, in shared JS, over whichever
+// backend a target supplies (`validatedFs`, shell-core.ts); a backend's own path check is
+// defence in depth rather than the thing relied on.
 
 /** The key charset. Also the scope charset: a scope is a prefix of a key, so anything
  *  it could not be part of is not a scope either. */
 const SAFE_CHARS = /^[A-Za-z0-9._-]+$/;
 
-/** Names Windows resolves to a *device* before it ever touches the filesystem: opening
- *  "CON"/"NUL"/"COM1"… — with or without an extension — reaches the console, the null
- *  device or a serial port, not a file. Refused on every OS, not only Windows, because
- *  the key space must not depend on where a node runs. */
+/** Names Windows resolves to a *device* before touching the filesystem: "CON"/"NUL"/"COM1"…
+ *  reach the console, the null device or a serial port. Refused on every OS, because the
+ *  key space must not depend on where a node runs. */
 const RESERVED_DEVICE_NAMES = new Set<string>(["CON", "PRN", "AUX", "NUL"]);
 for (let i = 0; i <= 9; i++) { // COM0/LPT0 are reserved on current Windows too
   RESERVED_DEVICE_NAMES.add("COM" + i);

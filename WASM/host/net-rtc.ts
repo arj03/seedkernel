@@ -1,42 +1,28 @@
-// WebRTC as a first-class Network (README §12.6: net.send is "addressed unicast
-// to a peer over its data channel"). This is the real-P2P fabric: peers reach each
-// other directly over RTCDataChannels — the relay is only a signaling rendezvous
-// and can be killed once channels are up — so there is no server in the data path.
+// The WebRTC socket seam (README §12.6): peers reach each other directly over
+// RTCDataChannels, so the relay is only a signaling rendezvous and there is no server in
+// the data path. This file manages RTCPeerConnections and signaling and hands each data
+// channel to the driver's `openLink()`; everything above — the handshake, the record layer,
+// the routing — is the transport bundle's, identical to the TCP path.
 //
-// The transport itself — the identity handshake, the record layer, the routing —
-// runs in the transport bundle's guest program, driven by the shared TransportHost
-// (transport-host.ts). This file is the WebRTC socket seam: it manages
-// RTCPeerConnections and signaling; each data channel is handed to the driver's
-// openLink(), and everything above is the bundle's, identical to the TCP path
-// with only the bottom swapped.
+// Raw I/O only. Anything a peer connection can carry BESIDES bytes (live audio/video)
+// belongs to the app, which subclasses RtcNetwork and works against the PeerEntry `pc`;
+// media never enters the runtime.
 //
-// The seam is raw I/O only: connections, signaling and data channels. Anything a
-// peer connection can carry *besides* bytes — live audio/video, say — belongs to
-// the app, which subclasses RtcNetwork and works against the PeerEntry `pc` (that
-// is what seedchat's call feature does). Media never enters the runtime.
+// Identity is proved by the transport's AUTH challenge INSIDE the channel, not by an
+// SDP-fingerprint assertion at the signaling layer: a MITM relay can splice SDP and bring
+// up DTLS to itself, but it can never complete AUTH without the peer's private key, so the
+// link never authenticates and never delivers a byte.
 //
-// Identity: the transport runs its HELLO/AUTH challenge *inside* the channel,
-// proving each end holds the channel private key for the pubkey it claims. It is
-// continuous channel binding rather than a one-shot SDP-fingerprint assertion at
-// the signaling layer: a MITM relay can splice SDP and bring up DTLS to itself,
-// but it can never complete AUTH without the peer's private key, so the link
-// never authenticates and never delivers a byte.
-//
-// This module is browser-native (it uses the platform RTCPeerConnection /
-// RTCDataChannel / WebSocket). A Node/Bun console peer joins the same mesh by
-// passing a werift-backed `peerConnectionFactory` (./net-rtc-node
-// `weriftPeerConnectionFactory`) behind the same RtcChannel / Signaling — only
-// the connection implementation differs. The browser globals are referenced only
-// inside RtcNetwork / relaySignaling, never at module scope, so importing this
-// module under Node (e.g. to unit-test RtcChannel) is safe.
+// Browser-native, but the globals are referenced only inside RtcNetwork / relaySignaling,
+// so importing this under Node is safe — a console peer joins the same mesh with a
+// werift-backed `peerConnectionFactory` (./net-rtc-node).
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { type PeerId } from "../core/socket-seam.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
- *  Exported because it is the seam an app subclass works against: this file is
- *  raw I/O only, so anything above bytes (an app publishing live media over the
- *  same connections, say) subclasses RtcNetwork and reaches the `pc` here. */
+ *  Exported because it is the seam an app subclass works against — see the note on media
+ *  above. */
 export interface PeerEntry {
   pc: RTCPeerConnection;
   link: LinkHandle | null;
@@ -72,12 +58,9 @@ export interface RtcNetworkOptions {
     signaling: Signaling;
     /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
     rtcConfig?: RTCConfiguration;
-    /** Factory for the underlying RTCPeerConnection. Defaults to the platform
-     *  global, which is what a browser tab uses. A Node/Bun *console* node passes a
-     *  werift-backed factory (./net-rtc-node `weriftPeerConnectionFactory`) so this
-     *  exact stack runs off-browser — "swap the connection, keep the stack".
-     *  Referenced only inside ensurePeer(), never at module scope, so importing this
-     *  module under Node without a factory stays safe. */
+    /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
+     *  Node/Bun console node passes a werift-backed one (./net-rtc-node) so this exact
+     *  stack runs off-browser. */
     peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
     /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
      *  admits every peer to the rendezvous; the in-channel peer lint (the
@@ -89,18 +72,15 @@ export interface RtcNetworkOptions {
     onPeerDown?: (peerId: PeerId) => void;
 }
 
-// ── RawLink over one RTCDataChannel ────────────────────────────────────────
-// An RTCDataChannel is already an ordered, whole-message binary pipe (WebRTC does
-// framing + ordering), so this is a thin adapter over MessageChannel (net-channel.ts) —
-// with the same pre-open send buffer the transport needs because it emits its HELLO
-// the instant a link is constructed.
+// An RTCDataChannel is already an ordered, whole-message binary pipe, so this is a thin
+// adapter over MessageChannel (net-channel.ts) — including its pre-open send buffer, which
+// the transport needs because it emits its HELLO the instant a link is constructed.
 export class RtcChannel extends MessageChannel {
   constructor(dc: RTCDataChannel) { super(dc); }
 }
-// Cap on speculative (unauthenticated) peer entries the relay can force us to
-// allocate by spamming `hello`s with arbitrary `from` values. Authenticated peers
-// do not count, so genuine fleet size is unconstrained. 256 is comfortable
-// headroom for a churn storm.
+// Cap on speculative (unauthenticated) peer entries the relay can force us to allocate by
+// spamming `hello`s with arbitrary `from` values. Authenticated peers do not count, so a
+// genuine fleet is unconstrained.
 const MAX_UNAUTHED_PEERS = 256;
 export class RtcNetwork extends SingleIdentityNetwork {
     opts;
@@ -109,11 +89,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
     constructor(opts: RtcNetworkOptions) {
         super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
         this.opts = opts;
-        // The peer-connection factory is fixed per network; defaulting to the platform
-        // global here (not per ensurePeer) keeps a browser tab's RTCPeerConnection the
-        // default and a werift-backed one the Node/Bun path.
+        // Resolved once per network rather than per ensurePeer, so the browser global is
+        // only touched where it exists.
         this.makePc = opts.peerConnectionFactory ?? ((cfg) => new RTCPeerConnection(cfg));
-        // Cohort edges come from the driver's router (the transport bundle's).
         opts.signaling.onMessage((m) => this.onSignal(m));
     }
     // ── Network interface ────────────────────────────────────────────────────────
@@ -134,11 +112,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.opts.signaling.close();
     }
     // ── per-peer connection (perfect negotiation) ───────────────────────────────────
-    /** Whether a NEW (pre-auth) peer entry may be created. The relay can force
-     *  speculative entries by naming arbitrary peers in hellos AND in offers, so
-     *  every path that would CREATE an entry answers to the same cap; a peer with
-     *  an entry already (pre- or post-auth) is never counted against it, so a
-     *  genuine fleet is unconstrained. */
+    /** Whether a NEW (pre-auth) peer entry may be created. The relay can force speculative
+     *  entries by naming arbitrary peers in hellos AND in offers, so every path that would
+     *  CREATE one answers to the same cap. */
     private admitNewPeer(): boolean {
         let unauthed = 0;
         for (const e of this.peers.values()) if (!e.authed) unauthed++;
@@ -173,10 +149,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
         pc.addEventListener("connectionstatechange", () => {
             const s = pc.connectionState;
             if (s === "disconnected") {
-                // A transient path failure (network blip, NAT rebind). restartIce()
-                // schedules negotiationneeded with fresh ICE credentials; the existing
-                // handler ships the offer over signaling and the link recovers without
-                // a full teardown. Only "failed"/"closed" are terminal.
+                // A transient path failure (network blip, NAT rebind): restartIce()
+                // schedules negotiationneeded with fresh credentials and the link recovers
+                // without a teardown. Only "failed"/"closed" are terminal.
                 try {
                     pc.restartIce();
                 }
@@ -240,9 +215,8 @@ export class RtcNetwork extends SingleIdentityNetwork {
     }
     async onHello(msg: SignalMsg) {
         const broadcast = !msg.to;
-        // A speculative entry that never authenticated is a zombie; on a fresh
-        // broadcast hello, replace it (the peer reloaded). Bound how many such
-        // unauthenticated entries the relay can force us to hold.
+        // A speculative entry that never authenticated is a zombie; a fresh broadcast
+        // hello means the peer reloaded, so replace it.
         if (broadcast) {
             const existing = this.peers.get(msg.from);
             if (existing && !existing.authed)
@@ -262,10 +236,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
     async onSdp(msg: SignalMsg) {
         if (!msg.sdp)
             return;
-        // Only an offer may create a peer; a stray answer for an unknown peer is dropped.
-        // An offer must clear the same speculative-entry cap a hello does — the relay
-        // can name arbitrary `from` values in offers too, and each entry carries an
-        // RTCPeerConnection, so the hello path was never the only door.
+        // Only an offer may create a peer; a stray answer for an unknown one is dropped.
+        // An offer clears the same speculative-entry cap a hello does — the relay can name
+        // arbitrary `from` values in offers too, and each entry costs a connection.
         const e = msg.sdp.type === "offer"
             ? (this.peers.get(msg.from) ?? (this.admitNewPeer() ? this.ensurePeer(msg.from) : undefined))
             : this.peers.get(msg.from);

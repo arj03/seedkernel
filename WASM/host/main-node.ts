@@ -6,18 +6,17 @@
 //        --listen 0.0.0.0:7000 [--guest-timeout 5000] [--guest-memory 64]
 //
 // Everything below is platform: files, stdout, entropy, and "stand a node up on Node".
-// Which flags exist, what they default to, and what the node does with them is
-// `cli.ts` — the same module the native binary runs inside QuickJS.
+// Which flags exist and what the node does with them is `cli.ts`, the same module the
+// native binary runs inside QuickJS.
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { runCli, type CliHost, type NodeSetup } from "./cli.js";
 import { boot } from "./main.js";
 import { loadCrypto } from "./crypto-node.js";
 import { errMessage } from "../core/util.js";
 
-/** Write atomically: a temp beside the target, then a rename onto it. The file this
- *  writes — the node's master seed — is one a truncated version of would be worse than
- *  none: a seed half-written on a first boot is a node whose identity changes the next
- *  time it starts. */
+/** Write atomically: a temp beside the target, then a rename onto it. What this writes is
+ *  the node's master seed, and a seed half-written on a first boot is a node whose identity
+ *  changes the next time it starts. */
 function writeFileAtomic(path: string, bytes: Uint8Array, mode?: number): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, bytes, mode === undefined ? undefined : { mode });
@@ -36,22 +35,20 @@ async function nodeHost(): Promise<CliHost> {
       catch { return null; }
     },
     writeFile: writeFileAtomic,
-    // STDERR, not stdout. stdout is the operator's data channel — `--op` writes an app's
-    // raw response bytes there — so an operator line landing in it would corrupt a
-    // redirect. The native target says the same thing with `bridge.logErr`.
+    // STDERR, not stdout: stdout carries an app's raw `--op` response bytes, which an
+    // operator line landing in it would corrupt.
     log(line) { console.error(line); },
     stdout(bytes) { process.stdout.write(bytes); },
-    // Whatever was piped in, or empty when nothing was. Reading fd 0 throws rather than
-    // blocking when stdin is a terminal nobody redirected, which is the same answer:
-    // this op takes no argument.
+    // Whatever was piped in, or empty. Reading fd 0 throws rather than blocking when stdin
+    // is a terminal nobody redirected, which is the same answer: no argument.
     stdin() {
       try { return new Uint8Array(readFileSync(0)); }
       catch { return new Uint8Array(0); }
     },
     sodium,
     async standUp(cfg: NodeSetup) {
-      // ShellOptions is NodeSetup plus this platform's own optional members, so the
-      // config crosses unchanged — no field-by-field copy to fall out of step.
+      // ShellOptions is NodeSetup plus this platform's optional members, so the config
+      // crosses unchanged — no field-by-field copy to fall out of step.
       return boot(cfg);
     },
   };

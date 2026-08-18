@@ -1,30 +1,23 @@
 // socket-seam.ts — the socket-side types shared by the host's raw-I/O layers.
 //
-// What these types describe is the CORE seam (README §12.1, §12.6): bytes to and from
-// an opaque link over an already-ordered channel. Everything structural above them —
-// the wire codec, the AKE, the record layer, link routing, the request/response layer
-// — is the transport bundle's guest program, driven through host/transport-host.ts.
-// This file is the shapes the socket adapters (net-node, net-ws, net-rtc, net-channel)
-// compile against — bytes, links, addresses, and nothing above them.
+// The CORE seam (README §12.1, §12.6): bytes to and from an opaque link over an
+// already-ordered channel. Everything structural above — the wire codec, the AKE, the
+// record layer, link routing, the request/response layer — is the transport bundle's guest
+// program, driven through host/transport-host.ts. These are the shapes the socket adapters
+// (net-node, net-ws, net-rtc, net-channel) compile against.
 //
-// It carries no crypto shape. The `TransportCrypto` interface that used to sit here
-// described "the narrow libsodium surface the channel handshake needs", and the channel
-// handshake is now the transport bundle's program, which reaches crypto through the
-// the guest seam's `crypto/` prefix (`SeamCrypto`, guest-seam.ts) like any other guest. A
-// second, parallel declaration of the host's crypto surface had stopped describing
-// anything: the native shim already refuses the keyed `crypto_generichash` that
-// interface promised, and nothing noticed, because nothing called it.
+// No crypto shape lives here: the channel handshake is the transport bundle's program and
+// reaches crypto through the guest seam's `crypto/` names like any other guest.
 
 /** One link, as the platform hands it to the driver. The transport bundle never sees
  *  the object: the driver (transport-host.ts) wires it to the guest by a host-supplied
  *  link id, and bytes cross as events/actions.
  *
- *  **Some platform transports have message boundaries and some do not.** A browser
- *  WebSocket and an RTCDataChannel arrive already framed; a TCP socket is a byte duplex
- *  whose boundaries are the transport's to impose. A seam that presented one shape
- *  would not remove that difference, only hide it — and it could hide it only by
- *  framing in the host, which is content living below the seam. So the link states its
- *  `framing` and the guest branches on it. */
+ *  Some platform transports have message boundaries and some do not: a WebSocket and an
+ *  RTCDataChannel arrive already framed, a TCP socket is a byte duplex whose boundaries are
+ *  the transport's to impose. A seam presenting one shape could hide that only by framing
+ *  in the host, which is content living below the seam — so the link states its `framing`
+ *  and the guest branches on it. */
 export interface RawLink {
   send(bytes: Uint8Array): void;
   /** Inbound bytes. `framing` says what one call means: a whole message, or an
@@ -36,14 +29,11 @@ export interface RawLink {
  *  transport that discards that write turns a clean close into exactly the truncation
  *  the record exists to rule out. */
   close(graceful?: boolean): void;
-  /** Bytes written to this link that the transport has NOT yet put on the wire.
- *  The one thing that distinguishes a slow exchange from a stalled one: a request whose
- *  bytes are still draining is progressing, however long it is taking, while one whose
- *  backlog has not moved is waiting on the far end. The transport bundle's stall clock
- *  polls it (link/stat) rather than timing an exchange from the moment it was
- *  *queued*, which would measure our own upload and cancel healthy requests under
- *  backpressure. Optional: a transport that cannot say returns nothing and the clock
- *  falls back to a plain deadline. */
+  /** Bytes written to this link that the transport has NOT yet put on the wire — what
+ *  distinguishes a slow exchange from a stalled one. The bundle's stall clock polls it
+ *  (link/stat) rather than timing from when a request was *queued*, which would measure our
+ *  own upload and cancel healthy requests under backpressure. Optional: a transport that
+ *  cannot say leaves the clock a plain deadline. */
   buffered?(): number;
   /** Optional transport-supplied identifier for the far end (an IP, say), used only to
  *  bucket the per-source half-open cap — enforced in the transport bundle. Optional
@@ -61,12 +51,9 @@ export interface RawLink {
   readonly authority?: string;
 }
 
-/** The wire codecs a link can need, as the host declares one at open (§12.1).
- *
- *  This is the whole of what the platform says about framing, and it is deliberately a
- *  closed set of *codecs* rather than a description of the socket: the host is not
- *  telling the bundle what the transport is, it is telling it which of the codecs it
- *  already knows applies here. Adding one is a bundle change plus one constant. */
+/** The wire codecs a link can need, as the host declares one at open (§12.1). A closed set
+ *  of *codecs* rather than a description of the socket: the host is not saying what the
+ *  transport is, only which codec the bundle already knows applies here. */
 export const FRAMING = {
   /** The transport already delivers whole messages; the bundle frames nothing. */
   PLATFORM: 0,
@@ -80,12 +67,8 @@ export const FRAMING = {
 export type Framing = (typeof FRAMING)[keyof typeof FRAMING];
 
 /** WHO a peer is: its 32-byte channel public key, lowercase hex. The one identity the
- *  address book is keyed on and the one every attributed frame names.
- *
- *  It lives here, with the addresses it keys, because that is all the host has left to
- *  say about a peer. There is no `Network`/`Endpoint` pair any more — the transport is a
- *  guest that claims `_net` (core/domains.ts), so a fabric interface the host implements
- *  would be describing an object nobody holds. */
+ *  address book is keyed on and the one every attributed frame names — and all the host has
+ *  left to say about a peer, the transport being a guest that claims `_net`. */
 export type PeerId = string;
 
 /** How a peer is reachable (README §12.6). The optional contact secret is THE

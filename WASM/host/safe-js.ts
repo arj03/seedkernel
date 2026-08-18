@@ -1,42 +1,26 @@
-// safe-js — a zero-authority JavaScript sandbox. It runs untrusted/confined JS
-// inside a QuickJS interpreter compiled to WASM (quickjs-emscripten, the sync
-// non-Asyncify build), driven from the host. A fresh QuickJS context has *only* the
-// ECMAScript intrinsics, so the guest cannot even name `fs`/`net`/`Bun`/`process`/
-// `fetch` — confinement is the default, not something we lock down (ShadowRealm was
-// disqualified on exactly this; see the ShadowRealm probes). The single seam to the
-// outside is one injected host function, `__host_call`, which funnels every capability
-// access through a copy-model byte boundary, the same shape as the ModuleTable's own
-// `callModule(name, payload) -> bytes`.
+// safe-js — a zero-authority JavaScript sandbox (README §12.3): confined JS inside a
+// QuickJS interpreter compiled to WASM (quickjs-emscripten, the sync non-Asyncify build).
+// A fresh QuickJS context has *only* the ECMAScript intrinsics, so the guest cannot even
+// name `fs`/`net`/`process`/`fetch` — confinement is the default rather than something
+// locked down (which is what disqualified ShadowRealm). The single seam out is one
+// injected host function, `__host_call`, over a copy-model byte boundary.
 //
-// Async seam: a guest is typically multi-step, and several steps genuinely round-trip.
-// `host.call(name, bytes)` resolves a **sync name** (the primitive catalog, clock,
-// timers, the raw-link names, a bundle's own modules) to its bytes immediately, and a
-// **round-tripping name** — every `fs/*`, and a cross-realm call — to a real Promise
-// the guest `await`s. It builds that Promise itself (the shared preamble parks it under a
-// `callId`); this host returns `null` to say "started async", then settles it with
-// `__netResolve`/`__netReject` and pumps `executePendingJobs()` so the awaiting
-// continuation runs. Deliberately NOT
-// quickjs-emscripten's `newPromise()` deferred: keeping the async half in plain
-// ECMAScript is what lets this host and the native loader (guest.go, quickjs-ng over
-// wazero, which has no promise primitive) share ONE preamble — see `guestPreamble` in
-// guest-seam.ts.
+// A round-tripping name — every `fs/*`, a cross-realm call, a module call — returns a real
+// Promise the guest builds itself (the shared preamble parks it under a `callId`); this
+// host returns `null` for "started async", then settles it with `__netResolve`/
+// `__netReject` and pumps `executePendingJobs()`. Deliberately NOT quickjs-emscripten's
+// `newPromise()` deferred: keeping the async half in plain ECMAScript is what lets this
+// host and the native loader share ONE preamble (`guestPreamble`, guest-seam.ts).
 //
-// There is no Asyncify and no host-driven step loop: a suspended async guest is just heap
-// state. There is exactly ONE way in — `call` — serving both roles, the initiator that
-// awaits the network and the holder that awaits `fs`. A synchronous second entry is not
-// on offer, because a holder answers from local storage and storage does not answer in
-// the same turn on a target whose backend is asynchronous (core/fs.ts). What a
-// synchronous entry would have given for free — one entrypoint invocation running to
-// completion before the next begins — is an explicit per-realm FIFO queue instead
-// (realm-queue.ts). One `quickjs.wasm` build serves both roles. An app builds its own
-// guest confinement on top of this generic primitive (README §12.3).
+// No Asyncify and no host-driven step loop — a suspended async guest is just heap state.
+// Exactly ONE way in, `call`, serving both roles; what a synchronous second entry would
+// have given for free (one invocation running to completion before the next begins) is an
+// explicit per-realm FIFO queue instead (realm-queue.ts).
 
-// `quickjs-emscripten-core` — the JS API layer alone, NOT the `quickjs-emscripten`
-// umbrella. The umbrella's whole added value is bundling default engine variants, and
-// it does so with STATIC imports of all four Bellard-flavoured `@jitl/quickjs-wasmfile-*`
-// packages; this realm supplies its own variant (below), so the umbrella would only pull
-// four engines nothing runs into every consumer's module graph — a browser app vendoring
-// this file had to map all four to a decoy just to make the graph resolve.
+// `quickjs-emscripten-core` — the JS API layer alone, NOT the umbrella package, whose
+// value is bundling default engine variants via STATIC imports of all four Bellard
+// `@jitl/quickjs-wasmfile-*` packages. This realm supplies its own variant below, so the
+// umbrella would only pull four unused engines into every consumer's module graph.
 import {
   newQuickJSWASMModuleFromVariant,
   type QuickJSWASMModule,
@@ -48,15 +32,10 @@ import {
 // ceiling and the same budget whether its realm is this one or the native target's.
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { errMessage } from "../core/util.js";
-// Use the actively-maintained quickjs-ng build rather than quickjs-emscripten's default
-// (original-Bellard) variant. Only the non-Asyncify (sync) flavour is needed — net is
-// a real Promise resolved by the host, not an Asyncify stack unwind.
-//
-// The engine is the in-repo build (quickjs/): the same quickjs-ng v0.16.1 the native
-// loader compiles, emscripten-built from `csrc/interface.c` by
-// quickjs/build-quickjs-ng.sh — whose glue serves node AND the browser, so this file
-// imports the same way on both targets. The variant module is ESM; cast to the
-// factory's own parameter type to bridge the typing gap.
+// The in-repo quickjs-ng build (quickjs/): the same v0.16.1 the native loader compiles,
+// emscripten-built by quickjs/build-quickjs-ng.sh, whose glue serves node AND the browser.
+// Only the non-Asyncify (sync) flavour is needed — net is a real Promise resolved by the
+// host, not an Asyncify stack unwind. The cast bridges the ESM variant's typing gap.
 import ngVariantMod from "seedkernel-wasm/quickjs";
 const ngVariant = ngVariantMod as unknown as NonNullable<
   Parameters<typeof newQuickJSWASMModuleFromVariant>[0]
@@ -68,9 +47,7 @@ import { guestPreamble, type CallBudget, type HostCall } from "./guest-seam.js";
 import { serializeCalls, type Invocation } from "./realm-queue.js";
 
 /** The seam a realm is wired with — re-exported so `./safe-js` is a whole import for a
- *  caller standing one up. It is DECLARED in guest-seam.ts, beside the names it carries:
- *  this file is a realm *factory*, one consumer of the seam among two, and the signature
- *  of what the seam produces is not a consumer's to own. */
+ *  caller standing one up. Declared in guest-seam.ts, beside the names it carries. */
 export type { HostCall };
 
 export interface SafeRealmOptions {
@@ -82,41 +59,29 @@ export interface SafeRealmOptions {
   /** Hard cap on the realm's heap (default 64 MiB). A runaway guest hits this
    *  instead of the host's memory. */
   memoryLimitBytes?: number;
-  /** Budget of guest *execution* time per entrypoint invocation, in ms
-   *  (default `DEFAULT_DEADLINE_MS`). Exceeding it interrupts the guest, which
-   *  surfaces to the caller as a thrown error.
+  /** Budget of guest *execution* time per entrypoint invocation, in ms. Exceeding it
+   *  interrupts the guest, which surfaces to the caller as a thrown error.
    *
-   *  This measures time the guest is actually **running**, not wall clock: the budget
-   *  is stopped whenever the guest is parked awaiting a host seam and resumed when
-   *  its continuation runs (see `execClock`). That is what lets one number be correct
-   *  for both roles — an initiator legitimately spends seconds parked on a network
-   *  request without spending any of its budget, while a holder that loops forever
-   *  burns it in one segment.
+   *  Time the guest is actually **running**, not wall clock: the budget stops whenever the
+   *  guest is parked on a host seam (see `ExecClock`), which is what lets one number serve
+   *  both roles — an initiator spends seconds parked on the network without spending
+   *  budget, while a holder looping forever burns it in one segment.
    *
-   *  `Infinity` disables the guard. There is no "omitted ⇒ unbounded" case: the
-   *  default is a real number, so a caller that forgets this field gets a bounded
-   *  guest rather than an unbounded one. */
+   *  `Infinity` disables the guard; omitting it gets the default, never unbounded. */
   deadlineMs?: number;
 }
 
 export interface SafeRealm {
-  /** Invoke a guest entrypoint — the **only** way into the realm, for both roles: the
-   *  initiator that may `await` net, and the holder answering an inbound request. The arg
-   *  and result cross as raw bytes (the copy model). Resolves when the guest promise
-   *  settles, including all awaited host calls.
+  /** Invoke a guest entrypoint — the ONLY way into the realm, for both roles. Arg and
+   *  result cross as raw bytes; resolves when the guest promise settles, awaited host calls
+   *  included.
    *
-   *  **Invocations are serialized per realm.** A call does not begin until the previous
-   *  one has settled, so no two guest frames are ever in flight in one realm and neither
-   *  can observe the other's half-updated state at an await point. Both roles can yield,
-   *  so this is a queue rather than a property of the host's call stack (realm-queue.ts).
-   *
-   *  The cost is head-of-line blocking, and it is a real one: an initiator parked on a
-   *  network round trip holds the queue, so an inbound request to the same app waits for
-   *  it rather than being answered around. That is the price
-   *  of the guarantee — the alternative is two frames interleaving at every `await`, which
-   *  is exactly what a guest author has no way to reason about. An app that wants
-   *  concurrency across the two roles wants two realms, which the shell can give it,
-   *  rather than one realm with two frames inside it. */
+   *  **Invocations are serialized per realm** (realm-queue.ts), so no two guest frames are
+   *  ever in flight and neither can observe the other's half-updated state at an await
+   *  point. The cost is real head-of-line blocking: an initiator parked on a network round
+   *  trip holds the queue. That is the price of the guarantee — the alternative is two
+   *  frames interleaving at every `await`, which a guest author cannot reason about. An app
+   *  wanting concurrency across the two roles wants two realms. */
   call(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   dispose(): void;
 }
@@ -133,21 +98,15 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : (u8.slice().buffer as ArrayBuffer);
 }
 
-/** The guest's execution-time accounting (README §4.3, §12.3).
+/** The guest's execution-time accounting (§4.3, §12.3): a budget over *running* time,
+ *  summed over the segments in which guest code holds the thread. A segment opens when the
+ *  host enters the realm and closes when control returns; time between segments is the
+ *  host awaiting the seam on the guest's behalf, and is nobody's budget.
  *
- *  A budget over *running* time rather than wall clock, kept by summing the segments
- *  during which guest code actually holds the thread. A segment opens when the host
- *  enters the realm — `evalCode` for an entrypoint, `callFunction` + `executePendingJobs`
- *  when settling a parked net op — and closes when control returns to the host. Time
- *  between segments, which is the host awaiting the seam on the guest's behalf, is
- *  nobody's budget.
+ *  Without the split one number cannot serve both roles: an initiator parked 2s on the
+ *  network would be killed by any budget tight enough to catch a holder's infinite loop.
  *
- *  Without the split, one number cannot serve both roles: an initiator parked 2s on a
- *  network request would be killed by any budget tight enough to catch a holder's
- *  infinite loop.
- *
- *  There is no nested-budget case: invocations are serialized (see `call`), so exactly
- *  one budget window is open at a time and `reset` is the whole of it. */
+ *  No nested-budget case — invocations are serialized, so exactly one window is open. */
 interface ExecClock {
   /** Guest code is about to run. */
   begin(): void;
@@ -155,21 +114,17 @@ interface ExecClock {
   end(): void;
   /** Start a fresh budget — one entrypoint invocation. */
   reset(): void;
-  /** The guest's remaining execution segment, in ms — what a call out of this realm is
-   *  charged against (§4.3). Read at the moment the call is made: a module call carries
-   *  it as its deadline, so a module runs under the budget of the segment that called it
-   *  instead of getting a fresh dial of its own. Infinity for an unbounded realm. */
+  /** The guest's remaining execution segment, in ms — read at the moment a call is made,
+   *  and carried as a module call's deadline, so a module runs under the budget of the
+   *  segment that called it (§4.3). Infinity for an unbounded realm. */
   remaining(): number;
   /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module
-   *  call, whose time is the guest's by §4.3 but is burned while the guest is parked and
-   *  the segment closed. Without it the deadline alone bounds one call and nothing bounds
-   *  the sequence: a guest looping `await host.call("spinner")` advances its own clock by
-   *  microseconds per turn, so every call draws a fresh full budget and the guest holds a
-   *  core indefinitely. Charged time depletes the same `consumedMs` the interrupt handler
-   *  reads, so the guest is killed on its next tick once the total exceeds the budget.
-   *  A parked `fs/*` or `_net` call is NOT charged: that is waiting, not burning, and
-   *  charging it would kill exactly the initiator the run-time/wall-clock split exists
-   *  to protect. */
+   *  call, whose time is the guest's by §4.3 but is burned while the segment is closed.
+   *  Without it a deadline bounds one call and nothing bounds the sequence: a guest looping
+   *  `await host.call("spinner")` advances its own clock by microseconds per turn and draws
+   *  a fresh full budget each time. Charged time depletes the same `consumedMs` the
+   *  interrupt handler reads. A parked `fs/*` or `_net` call is NOT charged — that is
+   *  waiting, and charging it would kill the initiator the split exists to protect. */
   charge(ms: number): void;
 }
 
@@ -180,14 +135,11 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
   let consumedMs = 0;
   let segmentStart = 0;
   let running = false;
-  // Installed only when there is a budget to enforce. QuickJS calls the handler
-  // periodically while guest code runs, and here that call crosses out of wasm into JS —
-  // so a handler that can never return true is not a free `Infinity` comparison but a
-  // host callback every few thousand bytecodes, paid by every guest for a guard nobody
-  // armed. An unbounded realm is now unbounded by the handler's ABSENCE.
+  // Installed only when there is a budget to enforce: the handler crosses out of wasm into
+  // JS every few thousand bytecodes, so one that can never return true is a real cost paid
+  // for a guard nobody armed. An unbounded realm is unbounded by the handler's ABSENCE.
   //
-  // While it is installed it reads `running`, so a parked initiator — the host awaiting
-  // the seam on the guest's behalf — is never interrupted.
+  // While installed it reads `running`, so a parked initiator is never interrupted.
   if (Number.isFinite(budgetMs)) {
     ctx.runtime.setInterruptHandler(
       () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
@@ -220,11 +172,9 @@ function copyPayload(ctx: QuickJSContext, payloadHandle: QuickJSHandle): Uint8Ar
   return payload;
 }
 
-/** Take ownership of a result handle and copy its bytes out (copy boundary). The
- *  handle must go back even when the value is not an ArrayBuffer — a guest entrypoint
- *  that returns a non-bytes value must not leave an orphaned handle behind, because
- *  an orphaned handle keeps its object on the runtime's GC list, which aborts the
- *  module at runtime free. */
+/** Take ownership of a result handle and copy its bytes out (copy boundary). The handle
+ *  must go back even when the value is not an ArrayBuffer: an orphaned handle keeps its
+ *  object on the runtime's GC list, which aborts the module at runtime free. */
 function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
   const lt = ctx.getArrayBuffer(handle);
   try {
@@ -250,24 +200,13 @@ const disposeDisposableResult = (result: unknown): void => {
   }
 };
 
-/** A realm's QuickJS **runtime** is created separately from its context, and `dispose()`
- *  frees both: the context first, its runtime in the same deferred turn.
- *
- *  The ordering is required by `JS_FreeRuntime`, which asserts an empty GC object list
- *  (`list_empty(&rt->gc_obj_list)`): any object still referenced — for example by an
- *  undisposed host handle — aborts the whole wasm module, every other realm in the
- *  process with it. The realm releases every handle it owns before teardown, so nothing
- *  survives to the runtime's free.
- *
- *  Teardown is deferred one macrotask so a parked invocation's rejection continuation —
- *  the `finally` in `invoke` — can run as a microtask after `failPending` while the
- *  context is still alive. By the macrotask, nothing can re-enter (the queue fails on
- *  `disposed`), so the realm is quiescent when it dies. The context goes first because
- *  `JS_FreeRuntime`'s assertion is satisfiable only once the context and its GC objects
- *  are gone.
- *
- *  `dispose()` thus returns the realm's memory — roughly 1.2 MB per runtime — to the
- *  wasm heap. */
+/** A realm's QuickJS **runtime** is created separately from its context, so `dispose()` can
+ *  free both in the required order: the context first, its runtime in the same deferred
+ *  turn. `JS_FreeRuntime` asserts an empty GC object list, so any object still referenced —
+ *  an undisposed host handle, or a context still alive — aborts the whole wasm module and
+ *  every other realm in the process with it. Deferring one macrotask lets a parked
+ *  invocation's rejection continuation run first, after which nothing can re-enter (the
+ *  queue fails on `disposed`) and the realm is quiescent when it dies. */
 const newRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
 
 export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
@@ -277,18 +216,14 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // control itself.
   const runtime = newRuntime(mod);
   const ctx: QuickJSContext = runtime.newContext();
-  // Contexts quickjs-emscripten creates from a contextPointer that READ as undefined —
-  // the phantom in `pumpJobs` below. Tracked from after the realm's own context is
-  // created, so that one is not one of them.
+  // Contexts quickjs-emscripten creates from a contextPointer that READ as undefined — the
+  // phantom in `pumpJobs` below. Tracked from after the realm's own context, so that one is
+  // not one of them.
   //
-  // The test is `options` present with `contextPointer` undefined, not `options?.` — and
-  // the difference is the whole precision of this hook. The phantom arises from
-  // `?? newContext({ contextPointer: ctxPtr })` with `ctxPtr` undefined, so it always
-  // arrives WITH an options object. A call passing no options at all is a different
-  // caller entirely: `getSystemContext()` builds one that way and CACHES it on the
-  // runtime, so treating it as a phantom would dispose a context the runtime still hands
-  // out. Nothing here calls it today; the guard costs one comparison and means a future
-  // `computeMemoryUsage()` cannot turn this into a use-after-free.
+  // The test is `options` present with `contextPointer` undefined, not `options?.`: the
+  // phantom arises from `?? newContext({ contextPointer: ctxPtr })`, so it always arrives
+  // WITH an options object, while a call passing no options at all is `getSystemContext()`,
+  // which CACHES its context on the runtime — disposing that would be a use-after-free.
   const phantoms = new Set<QuickJSContext>();
   {
     const newContext = runtime.newContext.bind(runtime);
@@ -304,10 +239,9 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // Drain the guest's job queue, surfacing a failure as a thrown error.
   //
   // `executePendingJobs` does NOT throw — it *returns* a result whose `error` is a live
-  // QuickJS handle. Two consequences, both of which bit: an interrupted continuation
-  // (the budget firing inside a queued job rather than in the call that started it) was
-  // silently swallowed, and the undisposed error handle later aborted the whole wasm
-  // module at dispose() time via QuickJS's `list_empty(&rt->gc_obj_list)` assertion.
+  // QuickJS handle. Both consequences bit: an interrupted continuation (the budget firing
+  // inside a queued job) was silently swallowed, and the undisposed error handle later
+  // aborted the wasm module at dispose() time on the empty-GC-list assertion.
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
     try {
@@ -326,19 +260,16 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       }
       throw new Error(msg);
     } finally {
-      // quickjs-emscripten's executePendingJobs can create a context nothing will
-      // dispose: when the wasm heap grows mid-call, its ctxPtrOut view detaches,
-      // ctxPtr reads undefined, and the `?? newContext({contextPointer})` fallback
-      // fires. Such a context keeps GC objects alive, aborting the module at
-      // runtime free — so release it here, after the call is done with it.
+      // quickjs-emscripten's executePendingJobs can create a context nothing will dispose:
+      // when the wasm heap grows mid-call its ctxPtrOut view detaches, ctxPtr reads
+      // undefined, and the `?? newContext({contextPointer})` fallback fires. Such a context
+      // keeps GC objects alive, aborting the module at runtime free.
       //
-      // **After the error handle, not before**, which is why this is a `finally` around
-      // the block above rather than the first thing in the function. When a job throws in
-      // the same call that grew the heap, BOTH happen — and `res.error` is a handle the
-      // phantom minted (`context.getMemory(...).heapValueHandle(valuePtr)`), so its
-      // `dispose()` reaches through that context. Freeing the context first turns the
-      // release above into a throw on a dead Lifetime, which loses the guest's real error
-      // AND leaks the very handle this exists to return.
+      // **After the error handle, not before**, which is why this is a `finally` around the
+      // block above: when a job throws in the same call that grew the heap, `res.error` is
+      // a handle the phantom minted, so freeing the context first turns the release above
+      // into a throw on a dead Lifetime — losing the guest's real error and leaking the
+      // very handle this exists to return.
       for (const phantom of phantoms) {
         if (phantom.alive) {
           try { phantom.dispose(); } catch { /* already gone */ }
@@ -348,13 +279,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // Rejectors for initiator calls currently awaiting a guest promise (README §12.3).
-  //
-  // A guest promise is settled from *inside* the realm, so anything that stops the realm
-  // mid-flight — an execution-budget interrupt during a continuation, or dispose() while
-  // a call is parked — leaves that promise permanently pending and its caller waiting on
-  // it forever. The realm therefore tracks who is waiting and fails them explicitly. A
-  // bound that converts a runaway guest into a hung host would not be much of a bound.
+  // Rejectors for calls currently awaiting a guest promise (§12.3). A guest promise is
+  // settled from *inside* the realm, so anything that stops the realm mid-flight — a budget
+  // interrupt during a continuation, or dispose() while a call is parked — leaves it
+  // permanently pending. A bound that turns a runaway guest into a hung host is not much of
+  // a bound, so the realm tracks who is waiting and fails them explicitly.
   const pending = new Set<(err: Error) => void>();
   const failPending = (err: Error): void => {
     for (const reject of [...pending]) {
@@ -368,23 +297,21 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
-    // The continuation of a parked `await` is guest code, so it runs on the guest's
-    // budget — resumed here and suspended again when the job queue drains.
+    // The continuation of a parked `await` is guest code, so it runs on the guest's budget
+    // — resumed here and suspended again when the job queue drains.
     //
-    // Every handle is released in `finally`, and that is load-bearing rather than tidy:
-    // this call can now be interrupted mid-flight by the execution budget, and QuickJS
-    // asserts `list_empty(&rt->gc_obj_list)` when a runtime is freed with live handles —
-    // an *abort of the whole wasm module*, i.e. the host process, at dispose() time. A
-    // leak on the interrupt path is therefore a crash, not a leak.
+    // Every handle is released in `finally`, which is load-bearing rather than tidy: this
+    // call can be interrupted mid-flight by the budget, and a runtime freed with live
+    // handles aborts the whole wasm module at dispose() time. A leak on the interrupt path
+    // is a crash, not a leak.
     clock.begin();
     try {
       const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
       res.dispose();
       pumpJobs();
     } catch (err) {
-      // The guest was interrupted while resuming. Nothing inside the realm will ever
-      // settle the initiator's promise now, so the realm has to fail it here — otherwise
-      // `call()` awaits a promise that cannot settle and the caller hangs forever.
+      // The guest was interrupted while resuming, so nothing inside the realm will ever
+      // settle the caller's promise: fail it here, or `call()` hangs forever.
       failPending(err instanceof Error ? err : new Error(String(err)));
     } finally {
       clock.end();
@@ -394,26 +321,23 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // The single seam. QuickJS calls it synchronously: a sync name resolves to its bytes
-  // and we hand the ArrayBuffer straight back; a net/fs name genuinely round-trips, so
-  // we return null — the preamble parks a Promise under callId — and settle it when the
-  // seam's promise resolves. Returning null (rather than a host-created deferred) is
-  // what keeps this seam identical to the native loader's; see guestPreamble.
+  // The single seam. QuickJS calls it synchronously: a sync name hands its ArrayBuffer
+  // straight back; a round-tripping name returns null — the preamble parks a Promise under
+  // callId — settled when the seam's promise resolves. Returning null rather than a
+  // host-created deferred is what keeps this seam identical to the native loader's.
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    // The third argument is host plumbing, not ABI (guest-seam.ts `CallBudget`): this
-    // guest's execution segment, both halves of it. `remainingMs` is read HERE, while the
-    // segment is live, and is what a module call runs under; `charge` is how the seam
-    // bills a module's burn back once it settles, since the segment is closed by then and
-    // nothing else would ever notice the time (§4.3).
+    // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment
+    // is live, and is what a module call runs under; `charge` bills a module's burn back
+    // once it settles, since the segment is closed by then (§4.3).
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
     const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), budget);
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
       // Sync name — return the bytes directly (no promise, no job queue).
       return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
     }
-    // Net/fs name — a genuine round trip. The guest holds the Promise; we settle it by callId.
+    // A genuine round trip: the guest holds the Promise, settled here by callId.
     (result as Promise<Uint8Array>).then(
       (bytes) => {
         if (disposed || !ctx.alive) return;
@@ -430,8 +354,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   hostCallFn.dispose();
 
   // Load the ABI preamble, then the guest. Neither has authority. Each eval's completion
-  // value (the trailing assignment) is an owned handle — dispose it so nothing leaks past
-  // the context (the QuickJS build asserts on leaks).
+  // value is an owned handle — dispose it, since the QuickJS build asserts on leaks.
   ctx.unwrapResult(ctx.evalCode(guestPreamble(), "guest-preamble.js")).dispose();
   ctx.unwrapResult(ctx.evalCode(opts.source, "safe-js-guest.js")).dispose();
 
@@ -453,11 +376,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
    *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
    *  the moment the synchronous segment ends, which is before the answer exists. */
   const invoke = (entry: string, payload: Uint8Array): Invocation => {
-    // Safe unconditionally because the queue guarantees nothing else is RUNNING: this is
-    // one invocation's own budget window. A deferred entrypoint has already ended its
-    // segment by the time the next one resets, so what it spends settling later is
-    // charged to whichever window is open — which is the honest accounting, since that
-    // is whose turn the guest code actually runs on.
+    // Safe unconditionally because the queue guarantees nothing else is RUNNING. A deferred
+    // entrypoint has already ended its segment by the time the next one resets, so what it
+    // spends settling later is charged to whichever window is open — which is whose turn
+    // the guest code actually runs on.
     clock.reset();
     stageArg(ctx, payload);
     // evalCode runs the entrypoint synchronously up to its first await; the completion
@@ -474,12 +396,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
       pumpJobs();
     } finally {
-      // Closed before the await below: everything past this point is the host
-      // waiting on the seam, which is not the guest's time to spend.
+      // Closed before the await below: past this point the host is waiting on the seam,
+      // which is not the guest's time to spend.
       clock.end();
-      // resolvePromise has consumed the value; the eval handle is no longer needed
-      // and must go back even when pumpJobs throws above — an orphaned handle keeps
-      // its object on the runtime's GC list, which aborts the module at runtime free.
+      // resolvePromise has consumed the value; the eval handle must go back even when
+      // pumpJobs throws, or it aborts the module at runtime free.
       evalResult?.dispose();
     }
     // Read before anything awaits, so no later invocation's `__invoke` can have cleared
@@ -496,13 +417,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
         return takeBytes(ctx, ctx.unwrapResult(settled as never));
       } finally {
         pending.delete(rejectThis);
-        // An invocation that lost the race to failPending — a budget interrupt or
-        // dispose() — has no consumer for the settled result. If the guest promise
-        // still settles afterwards (a seam op resolving after the interrupt), its
-        // dup'd result handle would be orphaned, keeping the value on the runtime's
-        // GC list and aborting the module at runtime free. Release it when it lands.
-        // Safe by construction: `consumed` is set by the await continuation above,
-        // which always runs before this finally.
+        // An invocation that lost the race to failPending has no consumer for the settled
+        // result, so if the guest promise still settles afterwards its dup'd handle would
+        // be orphaned and abort the module at runtime free. Release it when it lands.
+        // `consumed` is set by the await continuation above, which always runs first.
         if (!consumed) {
           void (settledNative as Promise<unknown>).then(disposeDisposableResult);
         }
@@ -522,23 +440,18 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // promises can only be settled from inside the realm, so disposing first would
       // strand every parked caller.
       failPending(new Error("guest realm disposed"));
-      // ...but the engine must NOT die in the same turn. A parked invocation's
-      // rejection continuation — the `finally` above — runs as a microtask after
-      // failPending, and a handle released after its context died would abort the whole
-      // wasm module. Deferring the teardown to a later macrotask runs it after every
-      // microtask of the parked continuations, by which point nothing can re-enter (the
-      // queue fails on `disposed`): the realm is quiescent when it dies. The context goes
-      // first and its runtime in the same turn — JS_FreeRuntime's empty-GC-list assertion
-      // is only satisfiable once the context is gone (see newRuntime above).
+      // ...but the engine must NOT die in the same turn: a parked invocation's rejection
+      // continuation runs as a microtask after failPending, and a handle released after its
+      // context died would abort the whole wasm module. See `newRuntime` above for the
+      // ordering this deferral buys.
       const timer = setTimeout(() => {
         if (disposed && ctx.alive) {
           ctx.dispose();
           runtime.dispose();
         }
       }, 0) as unknown as { unref?: () => void };
-      // Freeing a realm is housekeeping, so it must not be a reason for a process to stay
-      // up: a host that disposes its last realm and exits should not wait a turn to
-      // release memory the exit reclaims anyway. No-op off Node.
+      // Freeing a realm is housekeeping and must not keep a process up: a host that
+      // disposes its last realm and exits reclaims the memory anyway. No-op off Node.
       timer.unref?.();
     },
   };

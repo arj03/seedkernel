@@ -1,8 +1,6 @@
-// Node backend for the `fs.*` capability (exported as `seedkernel-wasm/fs-node`),
-// the storage twin of `net-node`. One flat file per key under a directory; no
-// nested paths. The raw syscalls live in the runtime: this backend is the host
-// side of the `fs.*` seam, and the storage app layers content-addressing and
-// quota on top (the runtime split).
+// Node backend for the `fs.*` capability (exported as `seedkernel-wasm/fs-node`): one flat
+// file per key under a directory, no nested paths. Content-addressing and quota are the
+// app's, layered on top.
 
 import { mkdirSync } from "node:fs";
 // The seam is async (core/fs.ts), so this backend is genuinely async rather than sync
@@ -20,12 +18,10 @@ import { FS_AVAILABLE_UNKNOWN } from "../core/fs.js";
 export class NodeFs implements Fs {
   constructor(private readonly dir: string) { mkdirSync(dir, { recursive: true }); }
 
-  /** Which keys are representable is `isSafeFsKey` (core/fs.ts), applied over every
-   *  backend by `validatedFs` (shell-core.ts) where the shell takes one — not restated
-   *  here, because a backend's copy of that rule is how the key space starts differing
-   *  between targets.
-   *  What this backend adds is containment: a key that reached this far and still holds
-   *  a separator would escape `dir`, so refuse it whatever admitted it. */
+  /** Which keys are representable is `isSafeFsKey` (core/fs.ts), applied over every backend
+   *  by `validatedFs` — not restated here, because a backend's copy of that rule is how key
+   *  spaces start differing between targets. What this adds is containment: a key that got
+   *  this far still holding a separator would escape `dir`. */
   private path(key: string): string {
     if (key.includes("/") || key.includes("\\") || key === "." || key === "..") {
       throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
@@ -51,9 +47,8 @@ export class NodeFs implements Fs {
   async stat(): Promise<FsStat> {
     let used = 0;
     try {
-      // One pass, concurrently: a directory of a few thousand keys is a few thousand
-      // stats, and awaiting them in sequence would make `stat()` the slowest op on the
-      // seam for no reason. Absent entries (-1) are simply not counted.
+      // Concurrently: a directory of a few thousand keys is a few thousand stats, and
+      // awaiting them in sequence would make `stat()` the slowest op on the seam.
       const sizes = await Promise.all((await readdir(this.dir)).map((n) => this.size(n)));
       for (const s of sizes) if (s >= 0) used += s;
     } catch { /* dir absent */ }

@@ -1,34 +1,27 @@
 // A werift-backed RTCPeerConnection for the *console* side of net-rtc.ts.
 //
-// net-rtc.ts is browser-native: RtcNetwork builds connections from the platform
-// RTCPeerConnection / RTCDataChannel. This module is the Node side of that swap,
-// implemented in *pure JS* with werift (no native addon, so it also bundles into the
-// `bun --compile` shell), and wired through the single `peerConnectionFactory` seam
-// RtcNetwork exposes.
+// net-rtc.ts is browser-native; this is the Node side of that swap, in pure JS with werift
+// (no native addon, so it also bundles into the `bun --compile` shell), wired through the
+// single `peerConnectionFactory` seam RtcNetwork exposes.
 //
 //   browser tab  ──RTCDataChannel──┐
 //                                  ├── relay (signaling only) ── same room
 //   console node ──werift DC───────┘
 //
-// The whole job here is an impedance match: werift speaks an rxjs-style
-// `.subscribe()` event API, delivers Buffers, wants explicit createOffer/
-// createAnswer, and exposes no `binaryType` — whereas RtcNetwork / RtcChannel
-// drive the W3C surface (addEventListener, parameterless setLocalDescription,
-// ArrayBuffer-ish message payloads). We present werift through a thin W3C facade
-// so net-rtc.ts needs zero werift-specific code. PeerLink's in-channel identity
-// handshake still does the real authentication — werift's DTLS only has to bring
-// up *a* channel, exactly as the browser path documents.
+// The whole job is an impedance match: werift speaks an rxjs-style `.subscribe()` API,
+// delivers Buffers, wants explicit createOffer/createAnswer and exposes no `binaryType`,
+// where net-rtc.ts drives the W3C surface. The facade below means net-rtc.ts needs zero
+// werift-specific code. The transport's in-channel handshake still does the real
+// authentication; werift's DTLS only has to bring up *a* channel.
 //
-// This file imports werift and node:Buffer, so it is Node/Bun only. The browser
-// never imports it (p2p.html resolves `seedkernel-wasm/net-rtc`, not this), and
-// the comment-stripping minifier copies it without bundling werift, so a stray
-// copy in a browser dir stays inert.
+// Node/Bun only (it imports werift and node:Buffer). The browser resolves
+// `seedkernel-wasm/net-rtc` instead, and the minifier copies this without bundling werift,
+// so a stray copy in a browser dir stays inert.
 import { RTCPeerConnection as WeriftPeerConnection } from "werift";
 import type { RTCDataChannel as WeriftDataChannel, PeerConfig as WeriftPeerConfig } from "werift";
-// ── a minimal addEventListener target ─────────────────────────────────────────
-// RtcNetwork/RtcChannel only ever addEventListener (never remove), so a tiny
-// type→listeners map is the whole contract. dispatch() tolerates a throwing
-// listener so one bad handler can't wedge the connection.
+// RtcNetwork/RtcChannel only ever addEventListener (never remove), so a type→listeners map
+// is the whole contract. dispatch() tolerates a throwing listener so one bad handler cannot
+// wedge the connection.
 class Emitter {
     private readonly listeners = new Map<string, ((ev?: unknown) => void)[]>();
 
@@ -49,10 +42,9 @@ class Emitter {
     }
 }
 // ── RTCDataChannel facade over a werift data channel ──────────────────────────
-// MessageChannel (net-channel.ts) consumes exactly: binaryType (set),
-// addEventListener("message"|"open"|"close"|"error"), send(Uint8Array), close(),
-// and optional bufferedAmount. werift gives us .onMessage/.stateChanged/.error
-// Events and a Buffer-only send.
+// MessageChannel (net-channel.ts) consumes binaryType, addEventListener, send(Uint8Array),
+// close() and an optional bufferedAmount; werift offers .onMessage/.stateChanged/.error
+// and a Buffer-only send.
 export class WeriftRtcDataChannel extends Emitter {
     dc;
     // RtcChannel sets this to "arraybuffer"; werift always hands us a Buffer, so it
@@ -62,9 +54,8 @@ export class WeriftRtcDataChannel extends Emitter {
     constructor(dc: WeriftDataChannel) {
         super();
         this.dc = dc;
-        // A Buffer is a Uint8Array, so RtcChannel's `new Uint8Array(ev.data)` copies
-        // the bytes correctly, and `typeof ev.data !== "string"` still distinguishes
-        // a (multiplexed) text frame from our binary frames.
+        // A Buffer is a Uint8Array, so the channel's `new Uint8Array(ev.data)` copies
+        // correctly and its string test still separates a text frame from a binary one.
         dc.onMessage.subscribe((data: string | Buffer) => this.dispatch("message", { data }));
         dc.stateChanged.subscribe((state: string) => {
             if (state === "open")
@@ -73,9 +64,9 @@ export class WeriftRtcDataChannel extends Emitter {
                 this.dispatch("close");
         });
         dc.error.subscribe(() => this.dispatch("error"));
-        // A channel received via ondatachannel can already be "open" before we
-        // subscribe; surface that on a microtask so RtcChannel (constructed right
-        // after us) has its "open" listener registered before it fires.
+        // A channel received via ondatachannel can already be "open" before we subscribe;
+        // surface that on a microtask so RtcChannel, constructed right after us, has its
+        // "open" listener registered before it fires.
         if (dc.readyState === "open")
             queueMicrotask(() => this.markOpen());
     }
@@ -94,26 +85,23 @@ class WeriftRtcPeerConnection extends Emitter {
     constructor(config?: Partial<WeriftPeerConfig>) {
         super();
         this.pc = new WeriftPeerConnection(config);
-        // Trickle ICE: werift emits each gathered candidate (and a final `undefined`,
-        // which RtcNetwork ignores via its `if (ev.candidate)` guard). werift's
-        // RTCIceCandidate.toJSON() — which RtcNetwork calls — is already the standard
-        // {candidate,sdpMid,sdpMLineIndex,usernameFragment} init a browser accepts.
+        // Trickle ICE: werift emits each gathered candidate and a final `undefined`, which
+        // RtcNetwork's `if (ev.candidate)` guard drops. Its RTCIceCandidate.toJSON() is
+        // already the standard init a browser accepts.
         this.pc.onIceCandidate.subscribe((candidate: unknown) => this.dispatch("icecandidate", { candidate }));
         this.pc.onDataChannel.subscribe((channel) => this.dispatch("datachannel", { channel: new WeriftRtcDataChannel(channel) }));
         this.pc.connectionStateChange.subscribe(() => this.dispatch("connectionstatechange"));
     }
     createDataChannel(label: string, opts?: Record<string, unknown>) {
         const dc = this.pc.createDataChannel(label, opts);
-        // The browser fires `negotiationneeded` after the impolite side opens the
-        // channel; that is RtcNetwork's single entry point for making an offer. werift
-        // has its own onNegotiationneeded with looser timing, so we synthesise the
-        // event here instead — deterministic, and exactly once per dial.
+        // `negotiationneeded` is RtcNetwork's single entry point for making an offer.
+        // werift's own has looser timing, so it is synthesised here — deterministic, and
+        // exactly once per dial.
         queueMicrotask(() => this.dispatch("negotiationneeded"));
         return new WeriftRtcDataChannel(dc);
     }
-    // Parameterless setLocalDescription: the W3C "implicit" form RtcNetwork relies
-    // on. werift needs the description spelled out, so pick offer vs answer from the
-    // signaling state — offer unless we are answering a received offer.
+    // The W3C "implicit" form RtcNetwork relies on. werift needs the description spelled
+    // out, so pick offer vs answer from the signaling state.
     async setLocalDescription() {
         const desc = this.pc.signalingState === "have-remote-offer"
             ? await this.pc.createAnswer()
@@ -133,9 +121,9 @@ class WeriftRtcPeerConnection extends Emitter {
 function norm(d: { type?: string; sdp?: string } | null | undefined) {
     return d ? { type: d.type, sdp: d.sdp } : null;
 }
-// Translate a W3C RTCConfiguration into werift's PeerConfig. The only real
-// mismatch is iceServers.urls: the W3C field is `string | string[]`, werift's is
-// a single `string`, so a multi-URL entry fans out into one werift server each.
+// Translate a W3C RTCConfiguration into werift's PeerConfig. The only real mismatch is
+// iceServers.urls — `string | string[]` there, a single `string` here — so a multi-URL
+// entry fans out into one werift server each.
 function translateConfig(config: RTCConfiguration | undefined, extra?: Partial<WeriftPeerConfig>): WeriftPeerConfig {
     const iceServers: { urls: string }[] = [];
     for (const s of config?.iceServers ?? []) {

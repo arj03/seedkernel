@@ -1,24 +1,17 @@
-// net-channel.ts — shared plumbing for the host socket adapters. Two families of
-// duplication live here once:
+// net-channel.ts — shared plumbing for the host socket adapters, in two parts:
 //
-// 1. RawLink adapters over an already-ordered binary transport: WsChannel (net-ws,
-//    a browser WebSocket) and RtcChannel (net-rtc, an RTCDataChannel). Every one of
-//    them delivers whole messages, so this base is FRAMING.PLATFORM; a byte duplex
-//    (a raw socket, handed to the transport bundle to frame itself) has no boundaries
-//    to buffer per message and does not come through here.
-//    The onData/onClose sinks, the `dead` flag, the pre-open send buffer (PeerLink
-//    emits HELLO before the transport is writable), and the close/fail teardown are
-//    written once here; a subclass only wires its transport's events to
-//    open()/deliver()/fail() and says how to write bytes and tear the transport down.
+// 1. RawLink over an already-ordered binary transport — WsChannel (net-ws) and RtcChannel
+//    (net-rtc). Both deliver whole messages, so this base is FRAMING.PLATFORM; a byte
+//    duplex handed to the transport bundle to frame itself does not come through here. The
+//    sinks, the `dead` flag, the pre-open send buffer (the transport emits HELLO before the
+//    socket is writable) and the teardown are written once; a subclass only wires its
+//    events to open()/deliver()/fail().
 //
-// 2. The little that RtcNetwork and WsNetwork still share over the same TransportHost
-//    driver: this node's own id, the cohort query, and the peer-edge bookkeeping each
-//    of them used to get from the driver.
+// 2. What RtcNetwork and WsNetwork share over one TransportHost: this node's id, the cohort
+//    query and the peer-edge bookkeeping.
 //
-// Host code, not core: it defines no seam. `RawLink` — the shape it satisfies — is the
-// core seam (socket-seam.ts), and this is one convenience for the two host adapters
-// that implement it against a platform object. A target with its own message transport
-// is free to satisfy RawLink without ever touching this file.
+// Host code, not core: it defines no seam. `RawLink` is the core seam (socket-seam.ts), and
+// a target with its own message transport can satisfy it without touching this file.
 import { FRAMING, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost } from "./transport-host.js";
 
@@ -76,10 +69,9 @@ export abstract class BufferedChannel {
     /** A whole message arrived. */
     protected deliver(bytes: Uint8Array): void { if (!this.dead)
         this.onMsg?.(bytes); }
-    /** The transport failed/closed: mark dead and notify onClose once. close() sets
-     *  `dead` first, so a deliberate close never re-enters here — but a failure on a
-     *  live channel must reach onClose, or the PeerLink is never forgotten and the peer
-     *  is blackholed until restart. */
+    /** The transport failed/closed: mark dead and notify onClose once. `close()` sets `dead`
+     *  first, so a deliberate close never re-enters here — but a failure on a live channel
+     *  must reach onClose, or the link is never forgotten and the peer is blackholed. */
     protected fail(): void {
         if (this.dead)
             return;
@@ -135,20 +127,15 @@ export class MessageChannel extends BufferedChannel {
     protected stop(_graceful: boolean): void { this.t.close(); }
 }
 
-/** What RtcNetwork and WsNetwork share over one TransportHost.
+/** What RtcNetwork and WsNetwork share over one TransportHost: an identity, and the peer
+ *  edges.
  *
- *  It is no longer a `Network` facade, because there is no `Network`: a fabric interface
- *  the host implements would be describing an object nobody holds now that the transport
- *  is a guest claiming `_net`. What is left is a dialer with an identity — and the peer
- *  edges, which these two report themselves.
- *
- *  **The edges are kept HERE rather than asked of the driver**, and that is the honest
- *  place for them: the driver hands these sockets over (`openLink`) and hears back per
- *  link, so "this peer's first link came up" and "its last one went down" is a count
- *  this class already has everything to keep. Asking the host to maintain a mirror of
- *  the transport's peer set, and to push an edge across the seam whenever it changed, was
- *  two copies of one fact. `linkedPeers()` is the transport's own answer, for a caller that
- *  wants the whole set rather than the transitions. */
+ *  The edges are kept HERE rather than asked of the driver, because these classes hand the
+ *  sockets over (`openLink`) and hear back per link — so "this peer's first link came up"
+ *  and "its last went down" is a count this class already has everything to keep, where a
+ *  host-side mirror of the transport's peer set would be two copies of one fact.
+ *  `linkedPeers()` is the transport's own answer, for a caller that wants the whole set
+ *  rather than the transitions. */
 export abstract class SingleIdentityNetwork {
     protected readonly driver: TransportHost;
     protected readonly ownId: PeerId;
@@ -175,9 +162,8 @@ export abstract class SingleIdentityNetwork {
         if (n === 1) { this.live.delete(peerId); this.hooks.onPeerDown?.(peerId); }
         else this.live.set(peerId, n - 1);
     }
-    /** The peers the TRANSPORT currently holds at least one authenticated link to. A question
-     *  now rather than a field: the set lives in the transport guest, which is the only
-     *  thing that knows what a link is. */
+    /** The peers the TRANSPORT holds at least one authenticated link to. A question rather
+     *  than a field: the set lives in the transport guest. */
     linkedPeers(): Promise<PeerId[]> { return this.driver.linkedPeers(); }
     abstract close(): void;
 }
