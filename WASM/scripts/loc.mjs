@@ -4,22 +4,19 @@
 //   npm run loc            print the table and check the README against it (exit 1 on drift)
 //   npm run loc -- --write rewrite the README's numbers to match
 //
-// **Why this exists.** Those counts carry an argument — that the shared set is small
-// and that each target's plumbing is the larger, replaceable part — so a wrong one is
-// not a typo, it is a claim the repo cannot support. They are also the most
-// mechanically drift-prone text in the file: every refactor invalidates them and none
-// of them fails a test. A row once sat 13 lines high on two files the change never
-// touched, which made a real reduction read as flat.
+// Those counts carry an argument — that the shared set is small and each target's
+// plumbing is the larger, replaceable part — so a wrong one is a claim the repo cannot
+// support, and they are the most drift-prone text in the file: every refactor
+// invalidates them and none of them fails a test.
 //
 // The counting rule is the README's own sentence: "lines of code — non-test sources
 // with blank lines and comments excluded."
 //
-// **The shared set is derived, not listed.** `build:loader-bundles` names the files
-// compiled into `host-shell.gen.js`, and the README says that list *is* the shared
-// set — so it is read from package.json and reconciled against the rows below. A file
-// that joins the shared bundle without joining a row fails this script, which is the
-// drift worth catching: a wrong number misinforms, but a file that quietly entered the
-// trusted shared set and appears in no row is invisible.
+// The shared set is DERIVED, not listed: `build:loader-bundles` names the files
+// compiled into `host-shell.gen.js`, and the README says that list *is* the shared set,
+// so it is read from package.json and reconciled against the rows below. A wrong number
+// misinforms, but a file that quietly entered the trusted shared set and appears in no
+// row is invisible — so that fails the script too.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -73,12 +70,10 @@ const sharedRows = [
       files: [...sharedSet].filter((f) => f.startsWith("WASM/core/")) },
 ];
 
-// `native-shim.ts`, `native-polyfills.ts` and `transport-bundle.ts` ride in the shared
-// bundle but are counted elsewhere and on purpose: the first two are the Go target's own
-// (a per-target row) — the binding and the Web globals only that target lacks — and
-// transport-bundle.ts is one line holding the signed blob's base64, which is content,
-// not host code. Named here so the reconciliation below can tell "counted elsewhere"
-// apart from "counted nowhere".
+// These ride in the shared bundle but are counted elsewhere on purpose: the first two are
+// the Go target's own (a per-target row), and transport-bundle.ts is one line holding the
+// signed blob's base64, which is content rather than host code. Named here so the
+// reconciliation below can tell "counted elsewhere" from "counted nowhere".
 const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
 const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
 
@@ -94,21 +89,14 @@ const goFiles = readdirSync(resolve(repoDir, "native"))
     .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))
     .map((f) => `native/${f}`);
 
-// The Native row's TS side is `nativeTs` (above): both files of the Go target's own
-// code ride in the shared bundle, so a third such file extends `nativeTs`, and the
-// row's numbers follow from it — one list, not a list plus a row.
+// The Native row's TS side follows from `nativeTs` above, so a third such file extends
+// that list and the row's numbers follow — one list, not a list plus a row.
 const rows = [
     ...sharedRows.map((r) => ({ ...r, n: sum(r.files), render: cell })),
     { find: /\*\*JS\*\* \(browser \+ Node\)/, n: sum(jsFiles),
       render: (n) => `| ${fmt(n)} TS |` },
     { find: /\*\*Native\*\* \(Go\)/, n: sum(goFiles),
       render: (n) => `| ${fmt(n)} Go + ${fmt(sum(nativeTs))} TS |` },
-    // The transport bundle's guest is split into parts but counted as one row: the README
-    // names the concatenated source, and `n` sums the parts the build assembles into it.
-    // The list is read from the assembler, so a part added to the guest is counted here
-    // without touching this file (scripts/guest-source.mjs).
-    { find: /`transport\/src\/\*\.js` \+ `ws\.wasm`/, n: sum(guestSourcePaths()),
-      render: (n) => `| ${fmt(n)} + 5 KB |` },
 ];
 const sharedTotal = sharedRows.reduce((n, r) => n + sum(r.files), 0);
 
@@ -143,10 +131,9 @@ for (const row of rows) {
 }
 readme = lines.join("\n");
 
-// The Native row's prose gives each of its TS files its own figure, the style the
-// three moved-in strings already had (`native-shim.ts` (N)). Checked here like the
-// cells above — an inline figure drifts just as easily as a cell, and one already
-// did (the `(335)` a row used to carry) without anything noticing.
+// The Native row's prose gives each of its TS files its own figure (`native-shim.ts`
+// (N)). Checked like the cells above: an inline figure drifts just as easily as a cell,
+// and nothing else would notice.
 const inlineChecks = [
     { file: "WASM/host/native-shim.ts", re: /native-shim\.ts` \((\d+)\)/ },
     { file: "WASM/host/native-polyfills.ts", re: /native-polyfills\.ts` \((\d+)\)/ },
@@ -169,22 +156,26 @@ for (const { file, re } of inlineChecks) {
     }
 }
 
-// The two prose totals, which have to agree with the shared rows above. Both are
-// checked, not just the heading: they are the same claim stated twice, 30 lines apart,
-// which is exactly how one of them ends up saying something the other does not.
-const totals = [
-    ["shared total (heading)", /(all three targets \()[\d,]+( LOC\))/],
-    ["shared total (prose)", /(therefore runs )[\d,]+( shared lines)/],
+// Figures the README states in PROSE rather than in a table cell — same discipline as the
+// rows above, matched on the words either side so the number is the only thing rewritten.
+// The two shared totals are one claim stated twice, 30 lines apart, so both are checked;
+// the guest is one row's worth of files summed from the assembler (guest-source.mjs), so a
+// part added to it is counted without touching this file.
+const proseFigures = [
+    ["shared total (heading)", /(all three targets \()[\d,]+( LOC\))/, sharedTotal],
+    ["shared total (prose)", /(therefore runs )[\d,]+( shared lines)/, sharedTotal],
+    ["transport/src/*.js", /(transport bundle — )[\d,]+( lines of `transport\/src\/\*\.js`)/,
+     sum(guestSourcePaths())],
 ];
-for (const [label, re] of totals) {
+for (const [label, re, n] of proseFigures) {
     const m = readme.match(re);
-    if (!m) { console.error(`  MISSING  no README total matches ${label}`); drift++; continue; }
-    const want = `${m[1]}${fmt(sharedTotal)}${m[2]}`;
+    if (!m) { console.error(`  MISSING  no README figure matches ${label}`); drift++; continue; }
+    const want = `${m[1]}${fmt(n)}${m[2]}`;
     if (m[0] === want) {
-        console.log(`  ok       ${String(sharedTotal).padStart(5)}  ${label}`);
+        console.log(`  ok       ${String(n).padStart(5)}  ${label}`);
     } else {
         drift++;
-        console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(sharedTotal).padStart(5)}  ${label}   README says ${m[0].match(/[\d,]+/)[0]}`);
+        console.log(`  ${write ? "fixed" : "DRIFT"}    ${String(n).padStart(5)}  ${label}   README says ${m[0].match(/[\d,]+/)[0]}`);
         readme = readme.replace(re, want);
     }
 }

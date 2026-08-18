@@ -1,9 +1,7 @@
-// loopback-channels.mjs — the in-process socket fabric the transport tests run
-// over. Moved here from host/transport-host.ts: it is test/demo infrastructure,
-// not runtime, so it no longer rides in the shared bundle every target ships.
-//
-// Tests drive the transport driver through this ChannelFactory the way a node
-// drives it through real sockets: `listen` registers a listener per port and
+// loopback-channels.mjs — the in-process socket fabric the transport tests run over.
+// Test infrastructure rather than runtime, so it stays out of the shared bundle every
+// target ships. Tests drive the transport driver through this ChannelFactory the way a
+// node drives it through real sockets: `listen` registers a listener per port and
 // `connect` opens a microtask-delivered pipe pair into it.
 
 import { FRAMING } from "../build/core/socket-seam.js";
@@ -103,16 +101,13 @@ export class LoopbackChannels {
     this.listeners.clear();
   }
 
-  /** A per-node view of this fabric: it dials and listens through the same registry,
-   *  but its `close` unbinds only the ports *it* bound.
+  /** A per-node view of this fabric: it dials and listens through the same registry, but
+   *  its `close` unbinds only the ports *it* bound.
    *
-   *  Sharing one `LoopbackChannels` between nodes is a test convenience — in
-   *  production each shell holds its own `NodeChannelFactory` — and the whole-fabric
-   *  `close` above is right for teardown and wrong for anything else. An in-place
-   *  transport upgrade closes the outgoing driver and re-binds its port, so on the
-   *  shared object that would unbind every other node in the test. This is the shape
-   *  the file header already claimed: closing one driver clears its listeners without
-   *  poisoning the fabric for the others. */
+   *  Sharing one `LoopbackChannels` between nodes is a test convenience (in production
+   *  each shell holds its own `NodeChannelFactory`), and the whole-fabric `close` above is
+   *  right only for teardown. An in-place transport upgrade closes the outgoing driver and
+   *  re-binds its port, which on the shared object would unbind every other node. */
   view() {
     const fabric = this;
     const mine = [];

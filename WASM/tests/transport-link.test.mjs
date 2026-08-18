@@ -1,22 +1,17 @@
 // transport-link.test.mjs — regression tests for the §12.6.1 link hardening and the
 // §12.6.2 concealed handshake.
 //
-// The AKE, the record layer, the half-open limiter and the link router are the signed
-// transport bundle's (`transport/src`), where no test can reach in and hold an
-// object. So each property is pinned where it ships — through the real host stack,
-// shell → driver (TransportHost) → guest realm — with an instrumented in-process
-// channel standing in for the socket.
+// The AKE, the record layer, the half-open limiter and the link router live in the signed
+// transport bundle (`transport/src`), where no test can reach in and hold an object. So
+// each property is pinned where it ships — through the real host stack, shell → driver
+// (TransportHost) → guest realm — with an instrumented in-process channel standing in for
+// the socket. What these tests observe is the wire and the host-visible edges of the
+// shipped artifact, never a parallel reimplementation.
 //
-// That is a strictly better place to pin them: what these tests observe is the wire and
-// the host-visible edges of the shipped artifact, not a parallel reimplementation. It is
-// also the only place they *can* be observed, which is the point.
-//
-// `TransportHost.openLink()` is the seam that makes it possible: it is the host half of
-// one link, taking exactly what a link needs to be stood up (weDialed, expectPeerId,
-// contactSecret, source, handshakeTimeoutMs, rekeyAfterFrames, onAuth, onClose) and
-// handing back a handle. The half-open budgets are the exception: a host-managed link spends no
-// budget by design, so those tests use real listeners and raw dials instead, and live in
-// transport-load.test.mjs.
+// `TransportHost.openLink()` is the seam that makes it possible: the host half of one
+// link, taking what a link needs to be stood up and handing back a handle. The half-open
+// budgets are the exception — a host-managed link spends no budget by design — so those
+// tests use real listeners and raw dials, in transport-load.test.mjs.
 //
 // Each test names the property it pins, so a failure says which guarantee broke.
 
@@ -26,14 +21,13 @@ import {
 import { testkit } from "./testkit.mjs";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
-// The RawLink shape (core/socket-seam.ts), with the hooks these tests need:
-// every byte written is recorded, `tamper` may corrupt or drop a message in flight,
-// `destructive` models a transport that discards unflushed writes on a hard close,
-// and `closeArgs` records what the guest asked the transport to do. `framing` picks the
-// codec the guest runs over the pair: 0 leaves it alone, 1 makes it length-prefix its
-// own messages, which is what a real TCP link gets.
-// Delivery is deferred a microtask so nothing re-enters a live guest frame, which is
-// the same discipline a real socket imposes.
+// The RawLink shape (core/socket-seam.ts) with the hooks these tests need: every byte
+// written is recorded, `tamper` may corrupt or drop a message in flight, `destructive`
+// models a transport that discards unflushed writes on a hard close, and `closeArgs`
+// records what the guest asked the transport to do. `framing` picks the codec the guest
+// runs over the pair — 0 leaves it alone, 1 length-prefixes, as a real TCP link gets.
+// Delivery is deferred a microtask so nothing re-enters a live guest frame, the same
+// discipline a real socket imposes.
 function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, framing = 0 } = {}) {
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
@@ -151,10 +145,10 @@ await test("baseline: two ends authenticate and exchange frames", async (keep) =
 });
 
 await test("a request's deadline is the CALLER's, not a node-wide clock", async (keep) => {
-  // Two requests to the same peer, over the same live link, with different deadlines —
-  // and the short one must settle on its own schedule. This is what the old silence
-  // clock could not do: it re-armed on ANY frame from the peer, so a request's lifetime
-  // depended on unrelated traffic, and every request on a node shared one window.
+  // Two requests to the same peer, over the same live link, with different deadlines: the
+  // short one must settle on its own schedule. A node-wide silence clock cannot do that —
+  // it re-arms on ANY frame from the peer, so a request's lifetime depends on unrelated
+  // traffic and every request on the node shares one window.
   const st = keep(await upPair(undefined, undefined, { mode: "hang" }));
   const proto = PROTO;
   // A holder that never answers: the deadline is the only thing that can settle these.
@@ -177,10 +171,9 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
 });
 
 await test("the deadline is a STALL clock: a request still draining out is not late", async (keep) => {
-  // The failure this exists to stop: a 50 MB PUT queued ~42 MB behind its sockets and
-  // every request in the window was cancelled at its 5 s deadline while the wire was
-  // moving perfectly. The clock was armed when the request was QUEUED, so it timed our
-  // own upload and blamed the holders for our backlog.
+  // A clock armed when the request is QUEUED times our own upload and blames the holder
+  // for our backlog: a 50 MB PUT queued ~42 MB behind its sockets cancels every request
+  // in the window at its 5 s deadline while the wire moves perfectly.
   const chans = wirePair();
   const st = keep(await linked(chans, {}, { mode: "hang" }));
   const proto = PROTO;
@@ -244,10 +237,9 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
 });
 
 await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
-  // The enumeration primitive. A node that speaks first is a directory service: one
-  // connect reads its identity straight off the wire. A caller without the contact secret
-  // must get silence — not an error, not a close, nothing that distinguishes this node
-  // from a port that is not listening.
+  // A node that speaks first is a directory service: one connect reads its identity
+  // straight off the wire. A caller without the contact secret must get silence — nothing
+  // that distinguishes this node from a port that is not listening.
   const chans = wirePair();
   // The caller holds a secret that is not the receiver's.
   const st = keep(await linked(chans, {}, {}, { dialSecret: new Uint8Array(32).fill(9) }));
@@ -268,10 +260,10 @@ await test("CONCEALMENT: neither identity appears in cleartext on the wire", asy
 });
 
 await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveals none", async (keep) => {
-  // Why identities are deferred past the ephemeral-ephemeral DH instead of sealed to the
-  // responder's static key the way Noise IK does. Anything msg1 carries is readable by
-  // whoever holds that static key — including an attacker who seizes the node years
-  // later and replays a recording. So msg1 carries no identity at all.
+  // Why identities are deferred past the ephemeral-ephemeral DH rather than sealed to the
+  // responder's static key as Noise IK does: anything msg1 carries is readable by whoever
+  // holds that static key, including an attacker who seizes the node years later and
+  // replays a recording.
   const chans = wirePair();
   const st = keep(await linked(chans));
   await until(() => chans[0].sent.length > 0, 4000, "msg1");
@@ -281,11 +273,10 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
 });
 
 await test("CONTACT SECRET: the address book alone does not grant a probe", async (keep) => {
-  // The property the contact secret exists for. Every peer holding this node's ADDRESS also
-  // holds its static key, so without a contact secret an address book leak is a probe
-  // capability: elicit msg2, confirm which identity lives at that host, and keep doing
-  // it after being removed from the member set. With one, probing needs a secret no address
-  // contains — so an address leak costs the address and nothing more.
+  // Every peer holding this node's ADDRESS also holds its static key, so without a contact
+  // secret an address book leak is a probe capability: elicit msg2, confirm which identity
+  // lives at that host, and keep doing it after being removed from the member set. With
+  // one, an address leak costs the address and nothing more.
   const chans = wirePair();
   // The caller knows B's address (and so its static key) but not B's contact secret.
   const st = keep(await linked(chans, {}, {}, { dialSecret: new Uint8Array(32).fill(9) }));
@@ -322,15 +313,10 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
 });
 
 await test("REASSEMBLY: a frame dribbled one byte at a time is still one message", async (keep) => {
-  // The framer used to join every inbound slice onto one buffer, so a peer that
-  // dribbles a full-size frame one byte at a time forced a quadratic number of
-  // copies — a CPU-exhaustion budget no frame-size cap controls (the cap bounds
-  // the buffer, not the copying). Keeping every slice instead traded that for a
-  // memory hole (one view and one pinned chunk per byte, ~50× the cap on a dribble),
-  // so small slices are now merged into a doubling tail buffer: amortized copying,
-  // and a slice count bounded by the bytes rather than by the segments. This pins the
-  // behaviour all of that has to preserve: arbitrary slice boundaries in, exactly one
-  // message out.
+  // The behaviour the framer's merge rule has to preserve (framing.js): arbitrary slice
+  // boundaries in, exactly one message out. A dribbled full-size frame is the case both
+  // naive assemblers get wrong — quadratic copying if every slice is joined onto one
+  // buffer, ~50× the cap in pinned chunks if none are.
   let armed = false;
   const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
@@ -356,11 +342,10 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
 });
 
 await test("REASSEMBLY: slices that straddle the merge threshold reassemble too", async (keep) => {
-  // The merge rule has three paths — a small slice into a fresh accumulator, into one
-  // with room, and into one that has to grow — plus a large slice, which is kept as it
-  // arrived and ends the accumulator. A dribble exercises one of them. This feeds slice
-  // sizes that cross the threshold in both directions, repeatedly, so a boundary error
-  // in the accumulator shows up as a message that never completes or completes wrong.
+  // The merge rule has four paths — a small slice into a fresh accumulator, into one with
+  // room, into one that has to grow, and a large slice kept as it arrived — and a dribble
+  // exercises one. Feeding sizes that cross the threshold in both directions turns a
+  // boundary error into a message that never completes or completes wrong.
   let armed = false;
   const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
@@ -386,12 +371,10 @@ await test("REASSEMBLY: slices that straddle the merge threshold reassemble too"
 });
 
 await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied", async (keep) => {
-  // `send` used to hex the destination and slice both bodies straight out of the
-  // caller's arguments, then build a request frame from them — three copies — and only
-  // then have the record layer drop the frame for being over the cap. A co-resident app
-  // naming a 50 MiB payload took the transport realm down before the frame it would have
-  // been refused for existed. The refusal is now the first thing `send` does, and it is
-  // loud: the app's own `_net` call rejects by name rather than silently going nowhere.
+  // The refusal is the first thing `send` does, and it is LOUD — the app's own `_net` call
+  // rejects by name. Measuring after the copies would let a co-resident app naming a
+  // 50 MiB payload take the transport realm down before the frame it would have been
+  // refused for existed.
   const st = keep(await upPair());
   let refused = "";
   try { await st.A.request(st.B.driver.peerId, PROTO, new Uint8Array(3 * 1024 * 1024)); }
@@ -406,11 +389,10 @@ await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied",
 });
 
 await test("IDLE: an authenticated link carrying no traffic is retired", async (keep) => {
-  // The handshake deadlines stop applying the moment a link authenticates, and the
-  // half-open budget used to be released at the same point — so an authenticated link
-  // that went quiet was held forever, with its framer, session keys, timers and buffers.
-  // It is now retired on an idle clock, and with the authenticated goodbye, because it
-  // is our own deliberate shutdown: the far end reads a clean close, not a truncation.
+  // The handshake deadlines stop applying the moment a link authenticates, so without an
+  // idle clock a link that went quiet is held forever with its framer, session keys,
+  // timers and buffers. Retired with the authenticated goodbye, since it is our own
+  // deliberate shutdown: the far end reads a clean close, not a truncation.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 60 }, { linkIdleTimeoutMs: 60 }));
   await until(() => st.a.closed, 4000, "the idle clock to retire a silent link");
   assert(st.a.reason === CLOSE_REASON.LOCAL || st.a.reason === CLOSE_REASON.CLEAN,
@@ -431,11 +413,9 @@ await test("IDLE: traffic keeps a link alive across the clock", async (keep) => 
 });
 
 await test("READY: a second ready() does not strand the first", async (keep) => {
-  // A single waiter slot let the second call overwrite the first, leaving the first
-  // caller's promise to be settled by the second's timer — or never. The slot is now a
-  // list, and it lives in the transport guest rather than the driver: with the answer
-  // being the `ready` op's own return value, each caller holds its own deferred and the
-  // stranding is a property of that list, which is exactly where the test can see it.
+  // A single waiter slot would let the second call overwrite the first, leaving the first
+  // caller's promise to the second's timer — or to nothing. It is a LIST, in the transport
+  // guest, and each caller holds its own deferred (the `ready` op's return value).
   const st = keep(await upPair());
   const [r1, r2] = await Promise.all([
     st.A.driver.ready(50).then(() => "ok", () => "failed"),
@@ -460,10 +440,10 @@ await test("SUBKEYS: one master seed, one derived identity, deterministic", asyn
 });
 
 await test("NETWORK KEY: two networks are structurally unable to reach each other", async (keep) => {
-  // The isolation boundary. A staging fleet and a production one can share addresses,
-  // configs and operators and still never cross: the network key seeds the transcript,
-  // so every derived key and every signature preimage differs and the handshake dies at
-  // the first message. Not access control — a boundary.
+  // A boundary, not access control: the network key seeds the transcript, so every derived
+  // key and every signature preimage differs and the handshake dies at the first message.
+  // A staging fleet and a production one can share addresses, configs and operators and
+  // still never cross.
   const chans = wirePair();
   const st = keep(await linked(chans,
     { networkKey: new Uint8Array(32).fill(1) },
@@ -491,9 +471,8 @@ await test("CONTACT SECRET: absent means OPEN — the node still conceals identi
 });
 
 await test("CONTACT SECRET: it is the RECEIVER's, and only the receiver's", async (keep) => {
-  // Per node, not per deployment and not per pair. A caller must present the secret of
-  // the node it is dialing; holding some other node's is worth nothing. This is what
-  // bounds a leak to one node's inbound side instead of the whole network.
+  // Per node, not per deployment and not per pair: a caller must present the secret of the
+  // node it is dialing, so a leak costs one node's inbound side and not the network.
   const secretB = new Uint8Array(32).fill(11);
   const secretC = new Uint8Array(32).fill(22);
   const st = keep(await upPair(undefined, { contactSecret: secretB }, { contactSecret: secretB }));
@@ -519,10 +498,10 @@ await test("CONTACT SECRET: it never appears on the wire", async (keep) => {
 });
 
 await test("LEAK FIX: a self-closing link still fires onClose", async (keep) => {
-  // The reflection guard closes the link from inside onHello. Before the fix,
-  // ch.close() set `dead` without firing onCls, so onClose never ran and the
-  // transport kept the link in its pre-auth bookkeeping forever.
-  // Two nodes sharing one identity: B sees its own key in A's msg3.
+  // The reflection guard closes the link from inside the handshake, and a channel whose
+  // close() set `dead` without firing onClose would leave the link in the transport's
+  // pre-auth bookkeeping forever. Two nodes share one identity, so B sees its own key in
+  // A's msg3.
   const id = generateKeyPair();
   const chans = wirePair();
   const st = keep(await linked(chans, { identity: id }, { identity: id }));

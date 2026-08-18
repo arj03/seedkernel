@@ -1,28 +1,23 @@
 // Load behaviour of the half-open budgets (§12.6.2 §6.5, §11.4).
 //
-// The concealed handshake refuses strangers by SILENCE — a caller that cannot produce a
-// msg1 opening under the contact secret is not closed on, it is simply left to time out — so
-// a connection that would once have been dropped on sight now occupies a socket for as
-// long as the deadline allows. That is deliberate (an immediate close is an oracle:
-// "I am a seedkernel node and that is not the key"), but it means the budgets stop being
-// defence in depth and become the thing standing between a stranger and the node.
-//
-// This file is the measurement that was owed. Three questions:
+// The concealed handshake refuses strangers by SILENCE: a caller that cannot produce a
+// msg1 opening under the contact secret is left to time out rather than closed on, since
+// an immediate close is an oracle ("I am a seedkernel node and that is not the key"). So
+// an unproven connection occupies a socket for as long as the deadline allows, and the
+// budgets become the thing standing between a stranger and the node. Three questions:
 //
 //   1. What does an unproven connection actually COST us?
 //   2. Can a flood from outside the contact secret stop members from getting in?
 //   3. Do the budgets and deadlines behave as the constants claim?
 //
-// It runs entirely over the in-process channel fabric, so the numbers are about
-// cryptographic and allocation cost per connection, not about kernel socket limits.
-// Deliberately: the socket ceiling is an operator's `ulimit` question, while what the
-// protocol controls is how much work a stranger can buy from us per connection.
+// Entirely over the in-process channel fabric, so the numbers are about cryptographic and
+// allocation cost per connection rather than kernel socket limits — the socket ceiling is
+// an operator's `ulimit` question, while what the protocol controls is how much work a
+// stranger can buy from us.
 //
-// PORTED: the limiter used to be a `HalfOpenLimiter` object this file could read
-// counters off. It now lives inside the transport bundle's guest, so every assertion
-// here is on OBSERVABLE behaviour instead — whether a dialer's socket is evicted or
-// refused, and whether a member still completes its handshake. That is a better test
-// than reading a counter: it is what an attacker and a member actually experience.
+// The limiter lives inside the transport guest, so every assertion here is on OBSERVABLE
+// behaviour rather than a counter: whether a dialer's socket is evicted or refused, and
+// whether a member still completes its handshake.
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, until,
@@ -93,10 +88,9 @@ console.log("\nTransport load behaviour (§12.6.2 §6.5)\n");
 
 // ─────────────────────────────────────────────────────────────────────────────
 await test("a silent stranger costs NO asymmetric crypto", async () => {
-  // The regression that matters most. The accepting side used to generate an X25519
-  // keypair as soon as the socket landed, so every inbound TCP connection bought a
-  // keygen from us before the peer had proved anything — the cheapest flood there is.
-  // Key material is now deferred until a msg1 opens (guest `ensureKeys`).
+  // Key material is deferred until a msg1 opens (guest `ensureKeys`). Generating an X25519
+  // keypair when the socket lands would let every inbound TCP connection buy a keygen
+  // before the peer had proved anything — the cheapest flood there is.
   const N = 200;
   const fabric = new LoopbackChannels();
   const c = countingSodium(realSodium);
@@ -145,11 +139,11 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
 });
 
 await test("an outside flood CANNOT keep members out", async () => {
-  // The property the whole budget design exists for. Separating the tiers was not
-  // enough on its own: a saturating flood refused the member AT THE DOOR, before it
-  // could send the one message that would have promoted it. Eviction fixes the order —
-  // a new arrival displaces the stalest stranger, proves itself in one round trip, and
-  // leaves the contended budget.
+  // The property the whole budget design exists for. Separate tiers are not enough on
+  // their own: a saturating flood would refuse the member AT THE DOOR, before it could
+  // send the one message that promotes it. Eviction fixes the order — a new arrival
+  // displaces the stalest stranger, proves itself in one round trip, and leaves the
+  // contended budget.
   const UNVER = 24;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: UNVER, perSource: UNVER, verified: 8 }));
@@ -192,13 +186,13 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
 });
 
 await test("a leaked contact secret cannot lock members out of the verified budget", async () => {
-  // The same failure the unverified budget had, one tier up. If the address leaks, an
-  // attacker can produce a valid msg1, promote into the verified tier, then stall — and
-  // if promote() merely REFUSED when full, a few hundred of those would shut every real
-  // member out of the handshake. The verified tier evicts too.
+  // The same failure one tier up. If the address leaks, an attacker can produce a valid
+  // msg1, promote into the verified tier, then stall — and a promote() that merely REFUSED
+  // when full would let a few hundred of those shut every real member out. The verified
+  // tier evicts too.
   //
-  // The attacker here is a real node holding the secret whose socket drops everything
-  // after msg1: it promotes, then goes quiet, exactly like a credentialled stall.
+  // The attacker is a real node holding the secret whose socket drops everything after
+  // msg1: it promotes, then goes quiet.
   const VER = 6;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: VER }));
@@ -231,12 +225,12 @@ await test("a leaked contact secret cannot lock members out of the verified budg
 });
 
 await test("the budget bounds links PAST the handshake, not just into it", async () => {
-  // The tiers above bound who is getting IN. The slot used to be released the moment a
-  // link authenticated, which meant anyone who could complete a handshake — every
-  // admitted peer, and on an open node every stranger — could then hold links without
-  // limit, each with its own framer, session keys, timers and buffers. The slot is now
-  // held for the link's life, in a third tier that evicts its stalest occupant like the
-  // other two: newcomers still get in, but the total stays bounded.
+  // The tiers above bound who is getting IN. Releasing the slot at authentication would
+  // let anyone who can complete a handshake — every admitted peer, and on an open node
+  // every stranger — hold links without limit, each with its own framer, session keys,
+  // timers and buffers. The slot is held for the link's life, in a third tier that evicts
+  // its stalest occupant like the other two: newcomers still get in, the total stays
+  // bounded.
   const AUTHED = 3;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
@@ -271,8 +265,8 @@ await test("the per-source cap still bites under flood", async () => {
 
 await test("an unverified connection is dropped on the SHORT deadline", async () => {
   // A stranger holds a slot for the unverified deadline, not the full handshake one.
-  // Measured rather than restated: the constants live in the transport bundle now, and
-  // a number copied out of it here would be drift waiting to happen.
+  // Measured rather than restated: the constants live in the transport bundle, and a
+  // number copied out of it here would be drift waiting to happen.
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 8, perSource: 8, verified: 8 }));
   const d = silentDial(fabric, s.driver.port, "10.4.4.4");

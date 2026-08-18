@@ -3,12 +3,10 @@
 // The flag set and the build plumbing are shared with its sibling build-mlkem.mjs
 // (see scripts/build-pq-wasm.mjs); only the sources differ.
 //
-// ONE artifact for all three targets. The browser instantiates it with
-// WebAssembly, Node instantiates it with WebAssembly, and the Go loader
-// instantiates it with wazero (native/mldsa.go, fed by copy-loader-wasm.mjs) — the
-// same bytes, so the accept/reject boundary cannot drift between a node that admits
-// a bundle and a node that refuses it. That is the same reason Ed25519 stays on the
-// shared libsodium.wasm rather than each target's native implementation.
+// ONE artifact for all three targets (native/mldsa.go is fed by copy-loader-wasm.mjs):
+// the same bytes, so the accept/reject boundary cannot drift between a node that admits
+// a bundle and a node that refuses it. Same reason Ed25519 stays on the shared
+// libsodium.wasm rather than each target's native implementation.
 import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({

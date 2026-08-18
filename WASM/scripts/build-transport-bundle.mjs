@@ -1,34 +1,29 @@
-// Build the transport bundle — the signed artifact the host ships and loads at
-// boot (§12.6). Assembles the guest — the AKE, record layer, link routing and
-// request/response layer as a zero-authority program, concatenated from its parts
-// by scripts/guest-source.mjs — signs a transport manifest with the transport
-// author key, packs the container, and writes:
+// Build the transport bundle — the signed artifact the host ships and loads at boot
+// (§12.6). Assembles the guest from its parts (scripts/guest-source.mjs), signs a
+// transport manifest with the transport author key, packs the container, and writes:
 //
 //   build/transport.skb        the bundle blob (--transport for the CLI)
-//   host/transport-bundle.ts   base64 inline for the JS targets (like ws-wasm.ts)
+//   host/transport-bundle.ts   base64 inline for the JS targets
 //
 // Both outputs are generated and gitignored. host/main.ts imports the second, so a
-// clean checkout cannot typecheck until this script has run — which is why both
-// `build` and `build:loader` sequence it ahead of tsc.
+// clean checkout cannot typecheck until this script has run — hence `build` and
+// `build:loader` sequencing it ahead of tsc.
 //
-// It also prints the author id. THE AUTHOR ID IS WHAT POLICY PINS: the node admits
-// the transport only when the operator's `grants.link` lists it (§12.5), so
-// a different build with a different key simply needs a different policy entry.
+// It also prints the author id, WHICH IS WHAT POLICY PINS: the node admits the
+// transport only when the operator's `grants.link` lists it (§12.5), so a different
+// build with a different key needs a different policy entry.
 //
-// The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65
-// envelope (§12.4, §14.1): a PQ verifier could never have been delivered as a
-// bundle, and a PQ *identity* is equally immovable — the 0x02 author id is a
-// key-set hash, not the Ed25519 key, so an author who migrates later changes every
-// pin and every table name built on the old id. The artifact therefore ships
-// hybrid from the start; the ML-DSA half of the key set is derived from the same
-// `--key` seed as the Ed25519 half, so one key file still holds the whole identity.
+// The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65 envelope
+// (§12.4, §14.1). A PQ *identity* is as immovable as a PQ verifier: the 0x02 author id
+// is a key-set hash, so an author migrating later changes every pin and every table
+// name built on the old id. The ML-DSA half is derived from the same `--key` seed, so
+// one key file holds the whole identity.
 //
-// The author key: `--key <32-byte seed hex>`. The default seed lives at
-// transport/author.key, generated on first run and gitignored, so a fresh clone
-// mints its own transport author. Nothing in-repo pins a fixed id — a policy entry
-// is derived from the built artifact (`verifyBundle(blob).author`), which is what
-// the tests do. This is a well-known developer identity, not a trust boundary: the
-// operator's policy pin is the trust decision.
+// The author key is `--key <32-byte seed hex>`, defaulting to transport/author.key —
+// generated on first run and gitignored, so a fresh clone mints its own author.
+// Nothing in-repo pins a fixed id: a policy entry is derived from the built artifact
+// (`verifyBundle(blob).author`), as the tests do. This is a well-known developer
+// identity, not a trust boundary; the operator's pin is the trust decision.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -57,10 +52,9 @@ const ML_DSA65_SEED_LEN = 32;
 const ML_DSA65_RND_LEN = 32;
 
 // A self-contained ML-DSA-65 driver over mldsa65.wasm, mirroring pq.ts's bump
-// allocator: every call rewinds to __heap_base, writes its inputs into the module's
-// own linear memory, runs it, and reads the output back. The module never allocates
-// and never retains anything across a call, so a bump pointer is the whole memory
-// manager and there is no free list to corrupt.
+// allocator: every call rewinds to __heap_base, writes its inputs into linear memory,
+// runs, and reads the output back. The module never allocates and never retains
+// anything across a call, so a bump pointer is the whole memory manager.
 function makeMlDsa(wasmBytes) {
   const e = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {}).exports;
   const widths = [
@@ -167,34 +161,31 @@ async function main() {
   };
 
   // The author's key set: the Ed25519 key from the seed, and the ML-DSA-65 key derived
-  // from the SAME seed, so one key file holds the whole identity and a rebuild with the
-  // same key is the same author (§12.4).
+  // from the SAME seed, so a rebuild with the same key is the same author (§12.4).
   //
-  // This mirrors `hybridAuthorKeysFromSeed` (host/bundle.ts), which is the one
-  // implementation every OTHER publisher calls — and it is a mirror only because this
-  // script must run before build:host on a clean checkout, so there is no build/ to
-  // import from. Keep the two byte-identical: a drift here does not fail, it silently
-  // re-identifies this artifact's author and invalidates every operator's pin.
+  // A mirror of `hybridAuthorKeysFromSeed` (host/bundle.ts) only because this script must
+  // run before build:host on a clean checkout, so there is no build/ to import from. Keep
+  // the two byte-identical: a drift here does not fail, it silently re-identifies this
+  // artifact's author and invalidates every operator's pin.
   const kp = sodium.crypto_sign_seed_keypair(seed);
   const pqSeed = sodium.crypto_generichash(32, concat([seed, PQ_SEED_LABEL]));
   const mldsa = makeMlDsa(readFileSync(join(root, "browser", "mldsa65.wasm")));
   const pq = mldsa.keypair(pqSeed);
 
   const guest = readGuestSource();
-  // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through
-  // the one install path signed by this program's own author and is reached by logical
-  // name through host.call. It is an ordinary §4 pure transform — three exports, no
-  // imports but the AS shims — so the loader admits it like any other module.
+  // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through the
+  // one install path signed by this program's own author and is reached by logical name.
+  // An ordinary §4 pure transform, admitted like any other module.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
   const manifest = {
     app: "transport",
     version: 1,
     modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
-    // The reserved id this program IS (§12.10). It is an ordinary protocol claim — the
-    // routing resolves it exactly as it resolves `chat-v1`, and a later load taking it
-    // over is how a node replaces its transport in place. What is not ordinary is who
-    // may spell it: the charset reserves `_`-led ids, and `verifyManifest` grants the
-    // exception only to a bundle reaching `link`, which the requires below do.
+    // The reserved id this program IS (§12.10). An ordinary protocol claim — routing
+    // resolves it as it resolves `chat-v1`, and a later load taking it over is how a node
+    // replaces its transport in place. What is not ordinary is who may spell it: the
+    // charset reserves `_`-led ids, and `verifyManifest` grants the exception only to a
+    // bundle reaching `link`, which the requires below do.
     protocols: ["_net"],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
@@ -202,22 +193,15 @@ async function main() {
       // whose declared ABI and actual ABI can differ is one that loads and then
       // misreads its own arguments (the failure `guest.abi` exists to make loud).
       abi: readGuestAbi(),
-      // EXACTLY the authorities this program holds — and, since the list is grants only,
-      // exactly what an operator is agreeing to when they grant it `link`. `node/sign` +
-      // `node/verify` (scoped signing and its verification twin) and `node/random`
-      // (entropy); `link/*`, the sockets behind opaque link ids, which are the ONLY names
-      // carrying the `link` privilege and therefore the whole of what the operator's
-      // `grants.link` is about; `timer/*`, because a zero-authority realm has no
-      // setTimeout; `_host`, the shell's reserved id, for an inbound request and the fate
-      // of a link the host handed over.
+      // EXACTLY the authorities this program holds, and so exactly what an operator
+      // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
+      // are the ONLY names carrying that privilege.
       //
-      // What this program PROVIDES back is not here, and that is the shape of the thing:
-      // it is not an authority it calls, it is the id it claims above.
-      //
-      // Its ws.wasm and its crypto are absent because neither is a grant and neither can
-      // be missing — a bare `host.call` name reaches modules that arrived in this same
-      // signed bundle, and the primitive catalog is total on any host that has a guest
-      // seam at all. What this program needs of them is the `abi` above (§12.1).
+      // What this program PROVIDES back is not here: it is not an authority it calls, it
+      // is the id it claims above. Its ws.wasm and its crypto are absent because neither
+      // is a grant and neither can be missing — a bare `host.call` name reaches modules
+      // from this same signed bundle, and the primitive catalog is total on any host with
+      // a guest seam. What this program needs of them is the `abi` above (§12.1).
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",
@@ -240,15 +224,12 @@ async function main() {
   writeFileSync(join(root, "build", "transport.skb"), blob);
   const b64 = Buffer.from(blob).toString("base64");
   const ts = `// GENERATED by scripts/build-transport-bundle.mjs — DO NOT EDIT.
-// The artifact-shipped transport bundle (§12.6): the
-// channel AKE, record layer, link routing and request/response layer as a signed
-// bundle for the shell's explicit transport slot. Signed by the seed transport author
+// The artifact-shipped transport bundle (§12.6), signed by the seed transport author
 //   ${toHex(authorId)}
 // under the hybrid suite 0x02 (Ed25519 + ML-DSA-65, §14.1) — pin that id in policy
 // under \`grants.link\` (\u00a712.5) or build your own with this script and pin that.
-// Rebuild with a different key: new author, new policy entry. The ML-DSA half of the
-// key set is derived from the same seed, so one key file holds the whole identity.
-// See scripts/build-transport-bundle.mjs.
+// A rebuild with a different key is a new author and a new policy entry; the ML-DSA half
+// is derived from the same seed, so one key file holds the whole identity.
 export const TRANSPORT_BUNDLE_B64 = "${b64}";
 `;
   writeFileSync(join(root, "host", "transport-bundle.ts"), ts);

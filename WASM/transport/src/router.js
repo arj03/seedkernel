@@ -1,11 +1,11 @@
 // ============================================================================
 // transport/src/router.js — the two routing layers above the record layer: the
-// authenticated link router (ex link-router.ts), which picks the wire a frame
-// goes out on, and the request/response layer (ex net.ts Transport), which
-// gives the wire its correlation, protocol ids and deadlines.
+// authenticated link router, which picks the wire a frame goes out on, and the
+// request/response layer, which gives the wire its correlation, protocol ids and
+// deadlines.
 // ============================================================================
 
-// ── the router (ex link-router.ts) ────────────────────────────────────────────
+// ── the router ────────────────────────────────────────────────────────────────
 
 class Router {
   constructor(ownPubkey, ownId) {
@@ -34,12 +34,10 @@ class Router {
     return true;
   }
 
-  // Install a freshly-authenticated link: the double-connect tie-break and the up edge
-  // on a peer's first link. Returns false — the link closed — when it lost the tie-break.
-  //
-  // The peer lint is not here either — it ran at msg3/msg4 (`admits`, ake.js), which is
-  // the only place it can run without becoming an oracle. By the time a link reaches
-  // here it has already been admitted.
+  // Install a freshly-authenticated link: the double-connect tie-break and the up edge on
+  // a peer's first link. Returns false — the link closed — when it lost the tie-break.
+  // The peer lint already ran at msg3/msg4 (`admits`, ake.js), the only place it can run
+  // without becoming an oracle.
   promote(peerId, link) {
     const pool = this.links.get(peerId) || [];
     const wasEmpty = pool.length === 0;
@@ -47,9 +45,8 @@ class Router {
     for (const l of pool) if (l.weDialed !== link.weDialed) { rival = l; break; }
     if (rival) {
       if (!this.canonicalKeep(link)) { link.close(); return false; }
-      // Splice the rival out BEFORE closing it: close() reaches the transport's
-      // forget() → remove() synchronously, which would otherwise splice the very
-      // array we are editing (link-router.ts promote).
+      // Splice the rival out BEFORE closing it: close() reaches forget() → remove()
+      // synchronously, which would otherwise splice the array we are editing.
       pool.splice(pool.indexOf(rival), 1);
       this.links.set(peerId, pool);
       rival.close();
@@ -93,55 +90,40 @@ class Router {
   }
 }
 
-// ── the request/response layer (ex net.ts Transport) ──────────────────────────
+// ── the request/response layer ────────────────────────────────────────────────
 
 /** A request frame's own head: `[kind u8][corr u32][protoLen u8]`. Named because the
  *  `send` op measures a caller's arguments against the frame cap before copying them,
  *  and what a request adds to a payload is this layer's business to say. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
 
-// Correlation, the response binding, one deadline per request — and, since the corr
-// left the host, THE PROMISE TOO. An app's send arrives as an ordinary invocation of
-// `handle`, which answers with `defer()`: this layer holds the deferred, matches the
-// response frame to it by a corr that is now entirely its own, and settles it. Nothing
-// about a request is visible outside this heap.
+// Correlation, the response binding, one deadline per request — and the promise. An
+// app's send arrives as an ordinary invocation of `handle`, which answers with
+// `defer()`: this layer holds the deferred, matches the response frame to it by corr,
+// and settles it. The corr is a wire value only, never crossing the seam in either
+// direction, so nothing about a request is visible outside this heap. `to`/`from` are
+// hex peer ids; proto is opaque bytes.
 //
-// The corr is therefore a wire value only — it never crosses the seam in either
-// direction — which is what let the host's `pending`/`nextCorr` tables go. `to`/`from`
-// are hex peer ids; proto is opaque bytes.
+// The deadline arrives WITH each request rather than being inferred here: this layer
+// cannot tell a 200-byte control message from a 4 MB block, so anything it computed
+// would be a guess.
 //
-// The deadline arrives WITH each request rather than being inferred here, and that is
-// the whole of the timing policy. This layer cannot tell a 200-byte control message
-// from a 4 MB block, so anything it computed would be a guess. Re-arming a silence
-// window whenever ANY frame arrived from the peer, under an absolute backstop, makes a
-// request's lifetime depend on unrelated traffic to the same peer — a chatty request
-// keeps a stalled one alive, and a quiet-but-progressing transfer dies. The caller
-// knows what it sent; it says so (`request` entrypoint).
-//
-// The deadline is a STALL clock, not a budget for the whole exchange. Arming it at
-// enqueue and letting it expire measured our OWN upload: a request whose bytes are
-// still draining out of a backpressured socket has not been answered late, it has not
-// finished being asked. A 50 MB PUT across two holders queued ~42 MB behind four
-// sockets and every request in the window was cancelled at 5 s while the wire was
-// working perfectly — the holders were blamed for our backlog.
-//
-// So on expiry this asks whether OUR OWN REQUEST is still going out, and only gives up
-// if it is not. Two numbers say it, both from bytes rather than from traffic:
+// It is a STALL clock, not a budget for the whole exchange. A request whose bytes are
+// still draining out of a backpressured socket has not been answered late — it has not
+// finished being asked, and blaming the holder for our own backlog cancels every
+// request in the window while the wire works perfectly. So on expiry this asks whether
+// OUR OWN request is still going out, from bytes rather than traffic:
 //
 //   flushed = sent − buffered   bytes for this peer that actually left (monotone)
 //   owed                        `sent` at the moment this request was handed over
 //
 // A link is FIFO, so `flushed ≥ owed` means precisely "this request's last byte is on
-// the wire". Until then the exchange has not begun — we are still asking — and an
-// expiry that finds `flushed` moving re-arms. After that the clock is a pure silence
-// window and settles on schedule.
+// the wire". Until then an expiry that finds `flushed` moving re-arms; after it, the
+// clock is a pure silence window and settles on schedule.
 //
-// Bounding the re-arm by `owed` is what keeps this from being the old silence window
-// under a new name. Progress measured per PEER would let unrelated frames to the same
-// peer keep a request alive — a chatty caller resurrecting a stalled request, exactly
-// the flaw that got the previous design deleted. Later frames raise `sent`, never this
-// request's `owed`, so nothing another request does can extend this one past its own
-// transmission.
+// Bounding the re-arm by `owed` is what keeps this from being a silence window under
+// another name: progress measured per PEER would let a chatty caller's unrelated frames
+// resurrect a stalled request. Later frames raise `sent`, never this request's `owed`.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
@@ -179,11 +161,10 @@ class ReqRes {
   armStall(corr, to, deadlineMs, owed) {
     // The baseline is taken on the FIRST expiry, not here. A frame handed over while the
     // peer is still being dialled routes through the pre-auth pool, where there is no
-    // link to read a backlog from — so a baseline taken now would be `sent` with nothing
-    // subtracted, an over-estimate no later reading could ever beat, and every such
-    // request would settle on its first tick however hard the wire was working. One
-    // deadline of grace to find the link is the cost, and it is bounded by `owed` like
-    // everything else here.
+    // link to read a backlog from — a baseline taken now would be `sent` with nothing
+    // subtracted, an over-estimate no later reading could beat, and every such request
+    // would settle on its first tick however hard the wire was working. The cost is one
+    // deadline of grace to find the link.
     let mark = null;
     const tick = () => {
       this.timers.delete(corr);
@@ -207,12 +188,8 @@ class ReqRes {
   }
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
-   *  returned (null for a noReply send, which nothing is waiting on); `deadlineMs` is
-   *  the caller's, already resolved against the node's default at init.
-   *
-   *  The corr is minted HERE. It used to be the host's, because the host held the
-   *  promise; now that the promise is here too, the correlation never leaves this heap
-   *  and there is nothing to keep in step. */
+   *  returned (null for a noReply send, which nothing is waiting on); `deadlineMs` is the
+   *  caller's, already resolved against the node's default. */
   request(d, to, proto, payload, noReply, deadlineMs) {
     const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
@@ -240,13 +217,11 @@ class ReqRes {
   }
 
   onFrame(from, frame) {
-    // A response is `[1][corr u32][payload]`, so an EMPTY response is exactly five
-    // bytes — the shortest legal frame. Requiring six here dropped it, and since a
-    // request nobody is bound to answers empty by contract, that made "no app serves
-    // this protocol" indistinguishable from an unreachable peer: the caller waited out
-    // its whole deadline instead of being told nothing was there. The six-byte floor is
-    // the REQUEST branch's (it needs the protocol-id length at offset 5) and is
-    // checked there.
+    // A response is `[1][corr u32][payload]`, so an EMPTY response is exactly five bytes
+    // — the shortest legal frame, and the one a request nobody claims answers with. A
+    // six-byte floor here would drop it and make "no app serves this protocol"
+    // indistinguishable from an unreachable peer. Six is the REQUEST branch's floor (it
+    // needs the protocol-id length at offset 5) and is checked there.
     if (frame.length < 5) return;
     const kind = frame[0];
     const noReply = !!(kind & 0x80);
@@ -265,9 +240,8 @@ class ReqRes {
       const proto = frame.slice(6, 6 + idLen);
       const payload = frame.slice(6 + idLen);
       // Dispatched with `.then`, never awaited: the answer comes back through THIS
-      // realm's queue, so a frame that awaited it would be holding the queue against
-      // its own reply (realm-queue.ts). The continuation runs on a later turn, which is
-      // where an answer to an inbound request belongs.
+      // realm's queue, so a frame that awaited it would hold the queue against its own
+      // reply (realm-queue.ts).
       hostDeliver(fromHex(from), proto, payload).then(
         (resp) => this.respond(corr, noReply, from, resp),
         // A protocol nobody claims, or an app whose handler threw: the request is

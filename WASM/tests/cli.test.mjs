@@ -1,12 +1,10 @@
 // The operator flow (host/cli.ts): the flag set, the defaults, the key file, the order
 // a node does things in, and the lines it prints.
 //
-// This is covered here rather than per target on purpose. The flow used to exist twice —
-// once in TypeScript and once again in Go — and the drift it accumulated was invisible
-// precisely because each target's tests only ever exercised its own copy: `--contact-secret`
-// came to name a file on one and the hex itself on the other, and `--guest-timeout` was
-// reachable on neither. There is one implementation now, so there is one place to test it,
-// and the native target inherits every case below by running the same module.
+// Covered here rather than per target on purpose: there is one implementation, so there
+// is one place to test it, and the native target inherits every case below by running the
+// same module. A second copy accumulates drift invisibly, since each target's tests only
+// ever exercise their own.
 //
 // `standUp` is stubbed. What is under test is the flow — which files are read, in what
 // order things happen, what the console says — not the assembly of a node, which
@@ -32,9 +30,9 @@ const work = mkdtempSync(join(tmpdir(), "seedkernel-cli-"));
 const utf8 = new TextEncoder();
 
 console.log("\n— argument parsing —");
-// An unknown flag is an ERROR, not an ignored token. The failure this prevents is the
-// silent one: a mistyped --polcy left the old parser building a deny-all node that boots,
-// serves and installs nothing, which is indistinguishable from a policy doing its job.
+// An unknown flag is an ERROR, not an ignored token: a mistyped --polcy would otherwise
+// build a deny-all node that boots, serves and installs nothing, which is
+// indistinguishable from a policy doing its job.
 throws(() => parseArgs(["--polcy", "x"]), "an unknown flag is refused");
 throws(() => parseArgs(["--policy"]), "a flag with no value is refused");
 throws(() => parseArgs(["--policy", "--dir"]), "a flag followed by another flag is refused");
@@ -117,9 +115,8 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
     "the node's identity is the peer id, not a sibling key");
 }
 
-// Defaults: one --dir and one --key on every target. These differed before (./data
-// natively, ./seedkernel-data on Node), so the same command line ran two different nodes
-// over two different stores.
+// Defaults: one --dir and one --key on every target, or the same command line runs two
+// different nodes over two different stores.
 {
   const host = fakeHost(["--key", join(work, "d.key")]);
   await runCli(host);
@@ -129,9 +126,8 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(host.lines.includes("  policy (none — installs disabled)"), "and the console says so");
 }
 
-// The §12.3 guest bounds reach the shell. A bound the shell accepts but no target can
-// set is a bound nobody has — which is what these were on the native target until the
-// flow became shared.
+// The §12.3 guest bounds reach the shell: a bound the shell accepts but no target can set
+// is a bound nobody has.
 {
   const host = fakeHost(["--key", join(work, "g.key"), "--guest-timeout", "250", "--guest-memory", "8"]);
   await runCli(host);

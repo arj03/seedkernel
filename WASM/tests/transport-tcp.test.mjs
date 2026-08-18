@@ -1,15 +1,13 @@
 // Two nodes over REAL node:net sockets — the path the loopback fabric cannot reach.
 //
-// Everything else in the suite drives the transport over LoopbackChannels, which is a
-// *framed* link: one send is one delivery. A TCP socket is not. It is handed to the
-// transport bundle as an unframed RawLink (socket-seam.ts), and imposing message
-// boundaries on it is the bundle's own job — so the guest's length framer, its
-// two-stage pre-auth cap, and the reassembly of a message split across TCP segments
-// are all code that ONLY this path exercises.
+// Everything else in the suite drives the transport over LoopbackChannels, a *framed*
+// link where one send is one delivery. A TCP socket is not: it reaches the bundle as an
+// unframed RawLink (socket-seam.ts), so the guest's length framer, its two-stage pre-auth
+// cap and the reassembly of a message split across segments are exercised only here.
 //
-// It also covers the seam's graceful close, which the loopback fabric has no way to
-// get wrong: the end-of-stream record has to be flushed before FIN, or a clean
-// shutdown reads at the far end as the truncation that record exists to rule out.
+// So is the graceful close, which the loopback fabric cannot get wrong: the end-of-stream
+// record must be flushed before FIN, or a clean shutdown reads at the far end as the
+// truncation that record exists to rule out.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { testkit } from "./testkit.mjs";
@@ -108,11 +106,10 @@ assert(true, "closing the dialing node did not wedge the listener");
 await bNet.close();
 
 // ── the same thing over RFC 6455 ──────────────────────────────────────────────
-// The browser edge, minus the browser: a node dialing another node's --ws-listen
-// endpoint runs the guest's WsFramer at BOTH ends — the client half sending the
-// upgrade and masking its frames, the server half computing the accept value through
-// the bundle's own ws.wasm module and refusing unmasked client frames. None of that is
-// host code, so nothing but this test covers it end to end.
+// The browser edge, minus the browser: a node dialing another's --ws-listen endpoint runs
+// the guest's WsFramer at BOTH ends — the client half sending the upgrade and masking its
+// frames, the server half computing the accept value through the bundle's own ws.wasm and
+// refusing unmasked client frames. None of it is host code.
 console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle module)");
 
 const c = await makeNode(true);

@@ -3,15 +3,12 @@
 // pq/mlkem-native. The flag set and the build plumbing are shared with its sibling
 // build-mldsa.mjs (see scripts/build-pq-wasm.mjs); only the sources differ.
 //
-// ONE artifact for all three targets: the browser instantiates it with
-// WebAssembly, Node instantiates it with WebAssembly, and the Go loader
-// instantiates it with wazero (native/mlkem.go, fed by copy-loader-wasm.mjs).
-// The reason differs from ML-DSA's, though, and is worth stating: a KEM is not a
-// verifier, so its accept/reject boundary is not consensus. What makes it one
-// artifact is that a catalog entry is a *name* two nodes hand each other bytes
-// under (§12.6) — two implementations that disagree on a rejected encoding do not
-// disagree about a bundle, they simply fail to share a key, and the cheapest way
-// not to find that out in production is not to have two implementations.
+// ONE artifact for all three targets (native/mlkem.go is fed by copy-loader-wasm.mjs),
+// but for a different reason than ML-DSA's: a KEM is not a verifier, so its
+// accept/reject boundary is not consensus. What makes it one artifact is that a catalog
+// entry is a *name* two nodes hand each other bytes under (§12.6) — two implementations
+// disagreeing on a rejected encoding simply fail to share a key, and the cheapest way
+// not to find that out in production is not to have two.
 import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({

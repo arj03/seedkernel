@@ -26,9 +26,8 @@ const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packB
 // libsodium cannot sign one.
 const { withMlDsa65, loadMlDsa65 } = await imp("build/host/pq.js");
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
-/** A manifest author: both halves of the key set, plus the 32-byte id they derive —
- *  which is the identity policy pins and app keys lead with (testkit.mjs). `ed` doubles
- *  as a node identity where a block needs one. */
+/** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
+ *  identity policy pins and app keys lead with. `ed` doubles as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
@@ -65,8 +64,7 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   await rejects(tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
-  // table exactly as it was, rather than with its first module landed. Atomicity is the
-  // host's guarantee, so it holds without the caller doing anything to earn it.
+  // table exactly as it was. The host's guarantee, so a caller does nothing to earn it.
   const atomic = new ModuleTable();
   await rejects(atomic.bindAll("aa:app", [
     { name: "first", wasm: withMax },
@@ -108,9 +106,9 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
 {
   const kp = testAuthor();
   const verify = (m) => verifyManifest(sodium, signManifest(sodium, kp, m));
-  // Refused BY NAME, like an unimplemented ABI or an unknown cap domain: this is the
-  // manifest a bundle written against the retired module-only format produces, so its
-  // author has to learn the rule, not read "malformed manifest".
+  // Refused BY NAME, like an unimplemented ABI: this is what a bundle written against the
+  // retired module-only format produces, so its author has to learn the rule rather than
+  // read "malformed manifest".
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
@@ -132,10 +130,9 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: UNRESTRICTED_NAMES } }) === "function",
     "naming the sentinel is accepted");
 
-  // A guest reaches its own app's modules with NO grant at all: a bare name is a
-  // primitive — the asking bundle's own code, scoped structurally by the app key the
-  // seam was wired with — so it resolves under an empty requires set, exactly like
-  // `crypto`. Scoping is the shape rather than a lookup table that could be omitted.
+  // A guest reaches its own app's modules with NO grant: a bare name is the asking
+  // bundle's own code, scoped by the app key the seam was wired with, so it resolves under
+  // an empty requires set exactly like `crypto`.
   const chat = new ModuleTable();
   await chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
   await chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
@@ -147,9 +144,8 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
       has: (n) => chat.isBound("aa:chat", n),
     },
   });
-  // The forwarder echoes its input, so a resolved module answers with the body; a name
-  // this app never installed is refused like any other unknown name in the catalog.
-  // A module call is async since ABI 6 (it round-trips through the module's worker).
+  // The forwarder echoes its input, so a resolved module answers with the body. A module
+  // call is async since ABI 6 (it round-trips through the module's worker).
   ok((await scoped("codec", new Uint8Array([7, 7, 7]))).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
     "another app's module name reaches nothing through this seam");
@@ -175,8 +171,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   spinner.dispose();
 
   // The budget is guest RUN time: parking on a slow seam does not spend it, so an
-  // initiator legitimately awaiting the network outlives a budget far shorter than
-  // the wait. This is the case a wall-clock deadline would have killed.
+  // initiator legitimately awaiting the network outlives a budget far shorter than the
+  // wait — the case a wall-clock deadline would kill.
   const slowSeam = (name) => name === "slow"
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
@@ -189,9 +185,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   waiter.dispose();
 
   // Invocations are serialized per realm: a holder invoked while an initiator is parked
-  // waits for it rather than interleaving with it, and then runs on a budget of its own
-  // rather than on what the initiator left. This is the guarantee the old re-entrant
-  // callSync got from the host's call stack, now that every role can yield (§12.3).
+  // waits for it rather than interleaving, and then runs on a budget of its own rather
+  // than on what the initiator left (§12.3).
   const order = [];
   const both = await createSafeRealm({
     source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });'
@@ -218,7 +213,7 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(await first === "failed", "a parked call is failed by dispose rather than left pending");
   ok(await queued === "failed", "and so is one still waiting in the queue");
 
-  // Default is a real number, so forgetting the field bounds the guest rather than
+  // The default is a real number, so forgetting the field bounds the guest rather than
   // unbounding it — the same posture as the seam gates above.
   const defaulted = await createSafeRealm({ source: 'register("handle", () => { for(;;){} });', hostCall: noop });
   let defaultInterrupted = false;
@@ -231,9 +226,9 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 {
-  // The regression that let safe-js's deadlineMs rot: a bound declared on every
-  // interface between the operator and the realm, and passed by none of them. This
-  // drives createShell with a stub realm factory and asserts the numbers arrive.
+  // A bound can be declared on every interface between the operator and the realm and
+  // passed by none of them, so this drives createShell with a stub realm factory and
+  // asserts the numbers arrive.
   const kp = testAuthor();
   const guestSrc = 'register("handle", () => new Uint8Array([1]));';
   const guestBytes = new TextEncoder().encode(guestSrc);
@@ -275,9 +270,8 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     "uninstalling it twice reports nothing the second time");
   shell.close();
 
-  // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts) — not
-  // undefined, and not "unbounded". The shell resolves them so a factory never has
-  // to own the numbers (safe-js and the native realm once carried their own copies).
+  // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts), not undefined
+  // and not "unbounded". The shell resolves them so no factory owns the numbers.
   let seen2 = null;
   const bare = createShell({
     platform: {
@@ -299,19 +293,17 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
-  // The catalog calls `timer/*` an app authority (core/domains.ts), so the property under
-  // test is that an ORDINARY app gets one: no transport bundle is loaded anywhere below.
-  // The wiring used to come off the transport driver, which admitted such an app and then
-  // failed it at its first `host.call` — a manifest the loader accepted naming a backend
-  // nothing had wired.
+  // The catalog calls `timer/*` an app authority (core/domains.ts), so what is under test
+  // is that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring
+  // it off the transport driver would admit such an app and then fail it at its first
+  // `host.call` — a manifest the loader accepted naming a backend nothing wired.
   const kp = testAuthor();
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    // One entrypoint: handle reads [caller 32][opLen u8][op][args] through the preamble's
-    // own callerOf/readOp, and the ops are this app's local vocabulary — arm [id][ms],
-    // clear [id], fired. timer is the kernel's deadline callback and is reached by the
-    // shell, never by invoke.
+    // handle reads [caller 32][opLen u8][op][args] through the preamble's callerOf/readOp;
+    // the ops are this app's own vocabulary. timer is the deadline callback, reached by
+    // the shell rather than by invoke.
     register("handle", (arg) => {
       const { op, args: p } = readOp(callerOf(arg).body);
       if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
@@ -367,10 +359,10 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
   ungated.close();
 
-  // Uninstall CANCELS. A pending setTimeout holds a callback that re-enters the realm, so
+  // Uninstall CANCELS: a pending setTimeout holds a callback that re-enters the realm, so
   // one outliving its realm is a call into a freed QuickJS context (§2.1) rather than an
-  // error. Driven through a stub realm, because what has to be observed is the entrypoint
-  // NOT being invoked — which a real realm would report only by crashing, or not at all.
+  // error. Through a stub realm, since what must be observed is the entrypoint NOT being
+  // invoked — which a real realm would report only by crashing, or not at all.
   let armed = null;
   const entries = [];
   const stub = createShell({

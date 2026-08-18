@@ -13,13 +13,10 @@
 // Requires clang (>= 15, any build with the wasm32 target — `apt install clang lld`
 // suffices; no sysroot, no emsdk). Run `git submodule update --init` first.
 //
-// On Windows the compiler is expected to live in WSL rather than on the host, the same
-// arrangement `native/gorun.sh` uses for the Go toolchain: this is a C toolchain a
-// Windows checkout is unlikely to have, and installing one natively to build a
-// freestanding wasm32 object would be a second way to produce an artifact that must be
-// byte-identical everywhere (§12.4 — a bundle one node admits, every node must admit).
-// So the build shells out through `wsl`, with paths translated. Set CC to override and
-// use a native compiler instead.
+// On Windows the compiler is expected to live in WSL, as `native/gorun.sh` expects the
+// Go toolchain: installing one natively would be a second way to produce an artifact
+// that must be byte-identical everywhere (§12.4). So the build shells out through
+// `wsl`, with paths translated. Set CC to use a native compiler instead.
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -63,9 +60,9 @@ export function buildPqWasm(cfg) {
     "-Wall",
     "-Wextra",
     "-Werror",
-    // Freestanding: no libc is linked. The only stdlib headers reached are the ones
-    // clang ships itself (stdint.h, stddef.h); each PQ library's
-    // memcpy/memset/zeroize are redirected to local definitions by its config header.
+    // Freestanding: no libc is linked, and the only stdlib headers reached are the ones
+    // clang ships itself. Each PQ library's memcpy/memset/zeroize are redirected to
+    // local definitions by its config header.
     "-nostdlib",
     "-ffreestanding",
     "-DNDEBUG",
@@ -89,10 +86,9 @@ export function buildPqWasm(cfg) {
     resolve(pq, cfg.shim),
   ];
 
-  // Through `wsl` on Windows unless CC names a native compiler. `bash -lc` with the
-  // command quoted here rather than `wsl clang …`: wsl.exe re-parses the command line
-  // Node builds, and the config define carries the quotes the preprocessor needs, so
-  // handing it one already-quoted string is the only way those survive intact.
+  // `bash -lc` with the command quoted here rather than `wsl clang …`: wsl.exe re-parses
+  // the command line Node builds, and the config define carries quotes the preprocessor
+  // needs, so one already-quoted string is the only way those survive.
   const native = process.env.CC ?? (process.platform === "win32" ? null : "clang");
   if (native) {
     execFileSync(native, args, { stdio: "inherit" });

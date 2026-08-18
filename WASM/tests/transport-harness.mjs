@@ -22,10 +22,9 @@ export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js"
 export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
-/** The link close-reason codes the transport guest reports through transport/link-down
- *  (transport/src/ake.js, `REASON_*`). The host only relays the number to whoever
- *  handed the channel in, so the vocabulary lives with the occupant and here,
- *  where the tests assert it. */
+/** The link close-reason codes the transport guest reports through link-down
+ *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
+ *  lives with the occupant and here, where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 export const { signManifest, packBundle, genesisHash, MANIFEST_FILE, GUEST_FILE } = await imp("build/host/bundle.js");
@@ -37,25 +36,19 @@ export const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "
 /** The protocol id the harness app claims. */
 export const PROTO = "harness/v1";
 
-/** The harness APP — a real signed bundle, because there is no host-side request facade
- *  left to fake one with. An app reaches the network by calling the id the transport claims
- *  (`_net`), and is reached by the id it claims itself, so a test that drives the
- *  transport has to be an app. That is the point rather than the cost: what these tests
- *  exercise is now the same path a deployment uses, end to end.
+/** The harness APP — a real signed bundle, since an app reaches the network by calling the
+ *  id the transport claims (`_net`) and is reached by the id it claims itself. A test that
+ *  drives the transport therefore has to be an app, which is what makes these tests
+ *  exercise the same path a deployment does.
  *
- *  ONE entrypoint, and a mode chosen at load through the manifest's `config`:
- *    handle — reached by `dispatch` (a remote peer's frame, the payload echoed) and by
- *             the host's own `invoke` loopback (the 32 zero-byte caller id, the op
- *             envelope in the payload). The local ops are:
- *       send — one request out: `[noReply u8][deadline u32][to 32][protoLen u8][proto][payload]`.
- *              Answers `[ok u8][response]`, straight through from `_net`.
- *       op   — the transport's op wire, unwrapped: an already-framed `[opLen u8][op][args]`
- *              handed to `_net` verbatim. `send` writes that framing itself, which is the
- *              common case; this is for the tests whose subject is WHICH ops an app may
- *              name at all, and it deliberately writes no name of its own so a refusal is
- *              the transport's.
- *       seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`, for the
- *              tests that assert on what the far end actually received. */
+ *  ONE entrypoint, and a mode chosen at load through the manifest's `config`. `handle` is
+ *  reached by `dispatch` (a remote peer's frame, echoed) and by the host's `invoke`
+ *  loopback (the 32 zero-byte caller id, the op envelope in the payload), whose ops are:
+ *    send — one request out; answers `[ok u8][response]` straight through from `_net`.
+ *    op   — an already-framed `[opLen u8][op][args]` handed to `_net` verbatim, for the
+ *           tests whose subject is WHICH ops an app may name. It writes no name of its
+ *           own, so a refusal is the transport's.
+ *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`. */
 const HARNESS_GUEST = `
 const seen = [];
 register("handle", (arg) => {
@@ -154,7 +147,7 @@ export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply =
 }
 
 /** One request out of `shell`, through the harness app it loaded — the path a real
- *  deployment uses, since there is no host-side request facade left. */
+ *  deployment uses. */
 export async function appRequest(shell, appKey, to, payload, opts) {
   const r = await invoke(shell, appKey, OP.SEND, sendArgs(to, payload, opts));
   if (r[0] !== 1) throw new Error("net: request failed");
@@ -166,10 +159,9 @@ export function generatorRequest(len, mul) {
   return Uint8Array.from([255, (len >>> 24) & 255, (len >>> 16) & 255, (len >>> 8) & 255, len & 255, mul]);
 }
 
-/** The author of the artifact-shipped transport bundle, read OUT of the artifact
- *  rather than restated. A fresh clone mints its own transport author, so anything
- *  that names a fixed id — or scrapes the generated header — is drift waiting to
- *  happen. */
+/** The author of the artifact-shipped transport bundle, read OUT of the artifact. A fresh
+ *  clone mints its own, so a fixed id — or one scraped from the generated header — is
+ *  drift waiting to happen. */
 export function transportAuthor() {
   return Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 }
@@ -188,9 +180,8 @@ export function transportPolicy(authorHex, appAuthors = []) {
  *  platform (admitPeers for the peer list, networkKey, contactSecret, channels) and to
  *  createShell (requestDeadlineMs, transportHalfOpen, linkIdleTimeoutMs).
  *
- *  The returned `request`/`sendNoReply`/`seen`/`peers` are what the tests use where they
- *  used to reach into the driver. Each is one `invoke` into the harness app, so the
- *  bytes cross exactly the seam a real app's would. */
+ *  `request`/`sendNoReply`/`seen`/`peers` are each one `invoke` into the harness app, so
+ *  the bytes cross exactly the seam a real app's would. */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
@@ -250,8 +241,8 @@ export async function makeTransportHost(opts = {}) {
   node.sendNoReply = (to, proto, payload) => call(to, proto, payload, 0, true);
   node.appKey = appKey;
   /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller
-   *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the name,
-   *  which is the property those tests are pinning. */
+   *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the
+   *  name, which is what those tests pin. */
   node.op = (name, args = new Uint8Array(0)) => {
     const n = enc.encode(name);
     const out = new Uint8Array(1 + n.length + args.length);

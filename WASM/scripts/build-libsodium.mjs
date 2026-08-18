@@ -2,12 +2,10 @@
 // browser/libsodium-wrappers.mjs from the upstream libsodium-wrappers-sumo
 // package — the one libsodium the runtime depends on.
 //
-// Why: the npm dist embeds the WASM as a base64 string inside the JS. We strip
-// that string out and ship the raw .wasm so the browser fetches it directly
-// (smaller payload, the browser caches the .wasm separately, no base64 decode
-// cost on every load). The embedded decoder is left in place but fed an empty
-// string — robust against the exact minified shape — since the patched wrapper
-// supplies its own instantiateWasm and never reads the decoder's output.
+// The npm dist embeds the WASM as a base64 string inside the JS. Stripping it and
+// shipping the raw .wasm lets the browser fetch and cache it directly, with no base64
+// decode per load. The embedded decoder stays in place but is fed an empty string — the
+// patched wrapper supplies its own instantiateWasm and never reads its output.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";

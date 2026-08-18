@@ -2,15 +2,14 @@
 // target's bound is measured: the same workload on the same module, with and without
 // the interrupt mechanism in the path, as a ratio.
 //
-// The native numbers this mirrors (SECURITY §14.1) are the seedstore write path with
-// wazero's WithCloseOnContextDone armed: 2.8x RS encode, 4.8x RS decode, 2.6x
-// XChaCha20, 1.65x Ed25519 verify — a MULTIPLICATIVE cost, a termination check
-// compiled into every loop of every module on the armed runtime.
+// The native cost it mirrors (SECURITY §14.1) is MULTIPLICATIVE — wazero's
+// WithCloseOnContextDone compiles a termination check into every loop of every module:
+// 2.8x RS encode, 4.8x RS decode, 2.6x XChaCha20, 1.65x Ed25519 verify.
 //
-// The JS worker model is ADDITIVE instead: the module runs at full engine speed in its
-// own worker and the cost is a fixed isolate round-trip per call. This bench quantifies
-// that hop on the one module this repo ships — ws.wasm, the RFC 6455 codec, the
-// transport's per-frame hot path — at the record-layer payload sizes:
+// The JS worker model is ADDITIVE instead: the module runs at full engine speed in its own
+// worker and the cost is a fixed isolate round-trip per call. This quantifies that hop on
+// the one module this repo ships — ws.wasm, the transport's per-frame hot path — at the
+// record-layer payload sizes:
 //
 //   baseline = same module, same op, called in-thread (the pre-worker table)
 //   worker   = the same call through the worker-per-module table (§4.3)

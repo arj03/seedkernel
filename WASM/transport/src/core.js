@@ -1,8 +1,8 @@
 // ============================================================================
-// transport/src/core.js — the link bookkeeping (ex net-route.ts NodeNetworkCore),
-// the per-host state, and the entrypoints the host invokes by name. This is the
-// last part of the concatenation: it declares the state the earlier parts read
-// at runtime and registers the whole program's face to the host.
+// transport/src/core.js — the link bookkeeping, the per-host state, and the
+// entrypoints the host invokes by name. Last part of the concatenation: it declares
+// the state the earlier parts read at runtime and registers the program's face to
+// the host.
 // ============================================================================
 
 // ── per-host state, set by EVT_INIT ───────────────────────────────────────────
@@ -12,31 +12,26 @@ let ownId = "";            // its hex — the peer id
 let networkKey = null;     // 32B
 let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
 let connsPerPeer = 1;
-// The operator's peer list, as a Set of hex keys — or null for "admit everyone". A
-// LINT applied by `admits` (ake.js), not a gate, and configuration rather than a seam:
-// the host ships it at init and never asks about a peer again.
+// The operator's peer list as a Set of hex keys, or null for "admit everyone". A LINT
+// applied by `admits` (ake.js), and configuration rather than a seam: the host ships it
+// at init and never asks about a peer again.
 let admitPeers = null;
-// The node's fallback request deadline, learned at init. A caller that names its own
-// overrides it; this is the number that has to be right for one that did not think
-// about it. Resolved here now that the request path is entirely ours.
+// Fallback request deadline, learned at init — the number that has to be right for a
+// caller that named none of its own.
 let requestDeadlineMs = 10000;
-// The peers we hold at least one authenticated link to. It lives here because it is a
-// fact about links, and links are ours — the host asks for it with the `peers` op
-// rather than keeping a mirror it would have to be told about.
+// The peers we hold at least one authenticated link to. A fact about links, and links
+// are ours: the host asks with the `peers` op rather than keeping a mirror.
 const connected = new Set();
-// The HOST's flood cap, learned at INIT — this module never declares the number
-// that bounds it (net-limits.ts stays core); it only sizes its own send budget
-// against it. The literal is the value INIT overwrites, never a second declaration.
+// Every literal below is what INIT overwrites, never a second declaration — the bounds
+// belong to whoever owns the resource (net-limits.ts, core), and this module only
+// applies them.
 let maxFrameBytes = 2 * 1024 * 1024;
-// The pre-auth cap, learned at init from the same place. Enforced HERE rather than by
-// the host, because on an unframed link the host has no frames to measure — it holds a
-// byte duplex and we are the ones imposing boundaries on it. The number is still the
-// host's: whoever owns the resource declares the bound, whoever parses applies it.
+// The pre-auth cap, applied HERE because on an unframed link the host holds a byte
+// duplex and has no frames to measure — we are the ones imposing boundaries on it.
 let maxHandshakeFrameBytes = 8 * 1024;
 let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256, maxAuthed = 256;
 // How long an AUTHENTICATED link may carry no traffic in either direction before it is
-// retired, learned at init from the same place as the budgets above — the socket is the
-// host's, so how long an idle one may be held is the host's number too. 0 disables it.
+// retired; 0 disables it.
 let linkIdleTimeoutMs = 0;
 
 // The one router and the one request/response layer per host instance.
@@ -54,21 +49,17 @@ const deferQueue = [];
 // Host-managed (openLink) links by id — the pre-auth ones are in no pool.
 const openLinks = new Map();
 
-// The link limiter (ex net-link.ts HalfOpenLimiter). The budgets come from EVT_INIT — a
-// module does not declare the numbers that bound it either.
+// The link limiter, over budgets from INIT.
 //
-// THREE tiers, not two, and the third is what makes it a link budget rather than a
-// half-open one: a slot is acquired when a socket is accepted, moves to `verified` when a
-// msg1 opens under the contact secret, and moves again to `authed` when the peer's
-// identity is proved and admitted — where it is HELD for the link's whole life. It used
-// to be released at that point, which bounded only how many peers could be *getting in*
-// at once: past the door, anyone who could complete a handshake could open links without
-// limit, each holding a framer, session keys, timers and buffers.
+// THREE tiers, and the third is what makes it a link budget rather than a half-open one:
+// a slot is acquired when a socket is accepted, moves to `verified` when a msg1 opens
+// under the contact secret, and moves to `authed` once the peer's identity is proved and
+// admitted — where it is HELD for the link's whole life.
 //
 // Each tier evicts its own stalest occupant when full, so a newcomer that has proved more
 // than the incumbents is never refused at the door — the property `transport-load` pins.
-// Per-source is deliberately not evictable and now spans all three tiers: one address
-// gets `maxPerSource` links, not `maxPerSource` handshakes and then as many as it likes.
+// Per-source is deliberately not evictable and spans all three tiers: one address gets
+// `maxPerSource` links, not `maxPerSource` handshakes and then as many as it likes.
 class LinkLimiter {
   constructor(maxUnverified, maxPerSource, maxVerified, maxAuthed) {
     this.maxPerSource = maxPerSource;
@@ -143,7 +134,7 @@ class LinkLimiter {
   }
 }
 
-// ── the routing core (ex net-route.ts NodeNetworkCore) ────────────────────────
+// ── the routing core ──────────────────────────────────────────────────────────
 
 class Core {
   constructor() {
@@ -169,10 +160,9 @@ class Core {
     this.addrs.set(toHex(peerBytes), secret.length > 0 ? secret : null);
   }
 
-  // Top a dialed peer up to connsPerPeer outbound links. `link/open` is the raw
-  // capability and it answers immediately with the link id (or 0 for no route), so the
-  // link lands in `connecting` before this returns — there is no in-flight dial window,
-  // and so no queue of frames waiting one out.
+  // Top a dialed peer up to connsPerPeer outbound links. `link/open` answers immediately
+  // with the link id (or 0 for no route), so the link lands in `connecting` before this
+  // returns — no in-flight dial window, and so no queue of frames waiting one out.
   dial(peerId) {
     if (!this.addrs.has(peerId)) return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
@@ -217,9 +207,8 @@ class Core {
   onAuth(peerId, link) {
     this.inbound.delete(link);
     Core.drop(this.connecting, peerId, link);
-    // The peer lint already answered, at msg3 or msg4 — a link that reaches auth is one
-    // the host admitted, so a refused peer never appears on a cohort edge it would
-    // immediately have to be taken off again. All that is left here is routing.
+    // The peer lint already answered at msg3/msg4, so a refused peer never appears on a
+    // cohort edge that would immediately have to be taken down. Only routing is left.
     router.promote(peerId, link);
   }
 
@@ -235,34 +224,27 @@ class Core {
     if (to === ownId) return;
     if (router.send(to, frame)) return;
     let pool = this.connecting.get(to);
-    // Dialing lands the link synchronously now, so the frame goes straight into its
-    // pre-auth queue. (No address → dropped, exactly as a fabric with no route drops
-    // a frame.)
+    // Dialing lands the link synchronously, so the frame goes straight into its pre-auth
+    // queue. No address → dropped, as a fabric with no route drops a frame.
     if (!pool || pool.length === 0) { this.dial(to); pool = this.connecting.get(to); }
     if (!pool || pool.length === 0) return;
     pool[0].send(frame);
   }
 
-  // Resolve once every known peer is authenticated (or the deadline passes) —
-  // event-driven off the router's up edge, like net-route.ts.
-  //
-  // `d` is the deferred the `ready` op's invocation returned. The answer is that op's
-  // return value now, rather than a `transport/ready` call back to a waiter the host was
-  // holding — so there is no waiter to join, overwrite or leak, and a second `ready`
-  // while one is in flight simply supersedes it.
+  // Resolve once every known peer is authenticated, or the deadline passes —
+  // event-driven off the router's up edge. `d` is the deferred the `ready` op returned.
   ready(d, timeoutMs) {
     const targets = [...this.addrs.keys()].filter((p) => p !== ownId);
     for (const p of targets) this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
-    // A LIST, not a slot. Two callers may be waiting at once — each holds its own
-    // deferred and its own deadline — and a single slot would let the second strand
-    // the first, which is a bug this design inherited rather than invented.
+    // A LIST, not a slot: two callers may wait at once, each with its own deferred and
+    // deadline, and a single slot would let the second strand the first.
     const w = { check: allUp, d, timer: 0 };
     w.timer = armTimer(timeoutMs, () => {
       this.dropWaiter(w);
-      // Settles either way: the caller asked to wait for the cohort, not to be told
-      // whether it arrived, and every caller that cares reads `peers` afterwards.
+      // Settles either way: the caller asked to WAIT for the cohort, not to be told
+      // whether it arrived — one that cares reads `peers` afterwards.
       d.settle(EMPTY);
     });
     this.readyWaiters.push(w);
@@ -311,7 +293,7 @@ function init(cfg) {
   requestDeadlineMs = cfg.requestDeadlineMs;
   linkIdleTimeoutMs = cfg.linkIdleTimeoutMs;
   // An empty list means "admit everyone", said as a zero-length blob rather than a
-  // missing field — one shape to read.
+  // missing field, so there is one shape to read.
   admitPeers = cfg.admitPeers.length > 0 ? new Set(cfg.admitPeers) : null;
 
   router = new Router(ownPk, ownId);
@@ -320,9 +302,8 @@ function init(cfg) {
   connected.clear();
   reqres.attach((to, frame) => core.sendFrame(to, frame));
   router.sink = (from, frame) => reqres.onFrame(from, frame);
-  // The cohort edges stay in this heap. Nothing host-side is told about them any more:
-  // what the host used to do with a peer edge was maintain a mirror of this set, and it
-  // reads the set itself now (the `peers` op).
+  // The cohort edges stay in this heap; the host reads them with the `peers` op rather
+  // than being told about each one.
   router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
   router.onPeerDown = (peerId) => { connected.delete(peerId); };
 }
@@ -357,16 +338,14 @@ function findLink(linkId) {
 //              op an app may name; anything else is refused, because the platform's
 //              events are not an app's to fake.
 //
-// The op is a NAME, not a tag byte. Collapsing twelve entrypoints onto one call must not
-// smuggle in a number two sides have to agree on — that is what the per-entrypoint
-// dispatch was right about — so the discriminator stays a string and an op this program
-// does not implement fails loud by name.
+// The op is a NAME, not a tag byte: collapsing many entrypoints onto one call must not
+// smuggle in a number two sides have to agree on, so an unimplemented op fails loud.
 //
-// Most ops answer with `NOTHING` and do their work by calling out. Three genuinely have
-// an answer: `send` (the peer's response), `ready` (the cohort arrived) and `peers`. The
-// first two cannot be answered in the same turn, and cannot be AWAITED either — the
-// events that settle them arrive as further invocations of this same realm, which would
-// queue behind the frame doing the awaiting (realm-queue.ts). They use `defer()`.
+// Most ops answer with `NOTHING` and do their work by calling out. Three have an answer:
+// `send` (the peer's response), `ready` (the cohort arrived) and `peers`. The first two
+// cannot be answered in the same turn, and cannot be AWAITED either — the events that
+// settle them arrive as further invocations of this realm, which would queue behind the
+// frame doing the awaiting (realm-queue.ts). They use `defer()`.
 //
 // A deferred teardown (Link's over-budget path) is flushed at the end of whichever op
 // provoked it, so a link's bookkeeping is never undone by an onClose that ran before its
@@ -384,22 +363,16 @@ function entry(name, fn) { ops[name] = fn; }
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
 register("handle", (argBytes) => {
-  // The envelope is the guest ABI's, read with the preamble's own two functions
-  // (guest-seam.ts) rather than open-coded here: this program and the host write and
-  // read the same bytes, so they are described in one place.
+  // Read with the preamble's own functions (guest-seam.ts) rather than open-coded, so
+  // the envelope this program and the host share is described in one place.
   const { fromHost, caller, body } = callerOf(argBytes);
   const { op, args } = readOp(body);
   const r = new Reader(args);
   const fn = ops[op];
   if (!fn) throw new Error("transport: no op '" + op + "'");
-  // The platform's events are the host's alone. An app that could spell `init` could
-  // re-key the node; one that could spell `linkBytes` could inject a frame on any link.
+  // The platform's events are the host's alone: an app that could spell `init` could
+  // re-key the node, one that could spell `linkBytes` could inject a frame on any link.
   // The caller id is the host's to write, so this is a real boundary and not a hint.
-  //
-  // Two ops are an APP's to name: `send` and `peers`. Both are
-  // questions about the app's own traffic rather than levers on the platform — `peers`
-  // reads the authenticated set, which is what an app placing replicas has to know. The
-  // rest stay the host's.
   if (!APP_OPS[op] && !fromHost) throw new Error("transport: '" + op + "' is the host's, not an app's");
   try {
     return fn(r, caller) || NOTHING;
@@ -410,11 +383,7 @@ register("handle", (argBytes) => {
 });
 
 /** The one config turn: who we are, which network, and the budgets — including the
- *  HOST's flood cap, which this module learns rather than declares.
- *
- *  There is no request-timing config here. A deadline is per request, not per node, so
- *  it rides on `request` instead — which is also what leaves the host's default in one
- *  place (transport-host.ts) rather than mirrored on both sides of the seam. */
+ *  HOST's flood cap, which this module learns rather than declares. */
 entry("init", (r) => {
   const cfg = {
     ownPk: r.blob(), networkKey: r.blob(), contactSecret: r.blob(),
@@ -466,9 +435,9 @@ entry("linkOpen", (r) => {
   // auth goes to the shared router, and the host tracks the link by its id.
   const link = new Link(Object.assign({}, spec, {
     onAuth: (peerId, l) => {
-      // The peer lint answered at msg3/msg4 (`admits`); what is left is ours — the
-      // double-connect tie-break. The host is told only because IT owns this socket
-      // and handed it over, so whoever passed it in is waiting to hear.
+      // The peer lint answered at msg3/msg4 (`admits`); what is left is the
+      // double-connect tie-break. The host is told because IT owns this socket and
+      // handed it over, so whoever passed it in is waiting to hear.
       if (!router.promote(peerId, l)) { l.close(); return; }
       hostLinkAuth(linkId, fromHex(peerId));
     },
@@ -496,10 +465,9 @@ entry("linkClosed", (r) => {
   if (link) link.onChannelClosed();
 });
 
-// A fired deadline, and the ONE other entrypoint this program registers. It is not an
-// op on `handle` because it is not a call: it is the shell's per-realm timer table
-// re-entering the realm that armed it (shell-core.ts), and every guest that declares
-// `timer/*` gets the same one. Nothing about it is the transport's.
+// A fired deadline, and the ONE other entrypoint this program registers. Not an op on
+// `handle` because it is not a call: it is the shell's per-realm timer table re-entering
+// the realm that armed it (shell-core.ts), and every guest declaring `timer/*` has it.
 register("timer", (argBytes) => {
   fireTimer(readU32BE(argBytes, 0));
   const deferred = deferQueue.splice(0);
@@ -507,21 +475,17 @@ register("timer", (argBytes) => {
   return NOTHING;
 });
 
-/** THE app-facing op — one of the two an app may name (`APP_OPS`). `[noReply u8][deadlineMs u32]
- *  [to blob][proto blob][payload blob]` in, `[ok u8][response]` out.
- *
- *  `deadlineMs` 0 means the caller named none and takes the node's default. Resolving it
- *  here rather than host-side is not a move of policy: the default is a CONFIG value the
- *  host ships at init, and this is simply where the config now lives.
+/** THE app-facing op (`APP_OPS`): `[noReply u8][deadlineMs u32][to blob][proto blob]
+ *  [payload blob]` in, `[ok u8][response]` out. A `deadlineMs` of 0 takes the node's
+ *  default, shipped as config at init.
  *
  *  The answer cannot be produced in this turn — the peer's response arrives as another
- *  invocation of this realm — and cannot be awaited either, for exactly that reason. So
- *  the op returns a deferred and `ReqRes` settles it. A noReply send has no answer to
- *  wait for and says so immediately.
+ *  invocation of this realm — and cannot be awaited for the same reason, so the op
+ *  returns a deferred and `ReqRes` settles it. A noReply send answers immediately.
  *
- *  `caller` is unused today beyond the boundary check above. It is the app's key,
- *  prepended host-side like an inbound frame's sender, and it is what a future
- *  per-app accounting or rate limit would key on without any new seam. */
+ *  `caller` is unused beyond the boundary check above. It is the app's key, prepended
+ *  host-side like an inbound frame's sender, and what a per-app accounting or rate limit
+ *  would key on without any new seam. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
   const deadlineMs = r.u32() || requestDeadlineMs;
@@ -529,14 +493,13 @@ entry("send", (r, caller) => {
   const to = r.blob();
   const protoIn = r.blob();
   const payloadIn = r.blob();
-  // Measured BEFORE anything is copied, which is the whole point of doing it here. What
-  // follows hexes `to`, slices both bodies, and builds a request frame out of them —
-  // three copies of the caller's argument — and only then would the record layer drop the
-  // frame for being over the cap. A co-resident app naming a 50 MiB payload would take
-  // this realm down before the frame it was refused for was ever built.
+  // Measured BEFORE anything is copied, which is the whole point of doing it here: what
+  // follows makes three copies of the caller's argument, and only then would the record
+  // layer drop the frame for being over the cap — so a co-resident app naming a 50 MiB
+  // payload would take this realm down before the frame it was refused for existed.
   //
   // A caller error, so it is LOUD: the app's `_net` call rejects by name. The silent drop
-  // in Link.send is for a frame we chose to build, not for one an app asked for.
+  // in Link.send is for a frame we chose to build, not one an app asked for.
   if (to.length !== PK_LEN) throw new Error("transport: send needs a 32-byte peer id");
   if (protoIn.length > 0xff) throw new Error("transport: protocol id too long");
   if (REQ_HEAD_LEN + protoIn.length + payloadIn.length > maxFrameBytes - TAG_LEN) {
@@ -567,22 +530,18 @@ entry("ready", (r) => {
 });
 
 /** The peers we hold at least one authenticated link to, as raw 32-byte keys. Answered
- *  in the same turn — it is a read of this heap, not a question about the wire.
- *
- *  An app's to name as well as the host's (`APP_OPS`): "who am I linked to" is what an
- *  app placing replicas across a cohort has to know. */
+ *  in the same turn — a read of this heap, not a question about the wire. An app's to
+ *  name as well as the host's: it is what an app placing replicas has to know. */
 entry("peers", () => {
   const out = [];
   for (const p of connected) out.push(fromHex(p));
   return concatBytes(out);
 });
 
-// There is no `shutdown` entrypoint, deliberately. Teardown releases the sockets and the
-// timers, and both are the HOST's — it closes them itself (transport-host.ts `close`)
-// rather than asking the occupant, because it owns the descriptor and a wedged occupant
-// must not be able to refuse. What is left is this realm's own heap, which dies with the
-// realm. An entrypoint whose only effect would be tidying memory about to be freed is one
-// more thing to keep in step for nothing.
+// There is deliberately no `shutdown` entrypoint. Teardown releases sockets and timers,
+// both the HOST's, and it closes them itself (transport-host.ts `close`) rather than
+// asking an occupant that must not be able to refuse. What is left is this realm's heap,
+// which dies with the realm.
 
 // ── the host-managed link handle (openLink's LinkHandle) ──────────────────────
 

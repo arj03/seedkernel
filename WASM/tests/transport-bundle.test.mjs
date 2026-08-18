@@ -46,13 +46,11 @@ const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
 assert(transportVerified.authorKeys.mlDsa !== undefined,
   "the shipped transport bundle carries the ML-DSA-65 public key of its signing key set");
 
-// The build script derives the author's key set from its seed with its OWN copy of that
-// derivation — it has to, since it runs before build/ exists (scripts/build-transport-
-// bundle.mjs) — so this pins the copy against `hybridAuthorKeysFromSeed`, the one every
-// other publisher calls. A drift between them does not fail any build: it silently
-// re-identifies this artifact's author and invalidates every operator's pinned id, which
-// is exactly the class of bug a comment saying "keep these identical" does not catch.
-// The seed is per-clone and gitignored; the build writes it, so it is here after one.
+// The build script must derive the author's key set with its OWN copy of that derivation,
+// since it runs before build/ exists, so this pins the copy against
+// `hybridAuthorKeysFromSeed` — the one every other publisher calls. A drift fails no
+// build: it silently re-identifies this artifact's author and invalidates every
+// operator's pinned id. The seed is per-clone and gitignored, written by the build.
 {
   const keyPath = join(root, "transport", "author.key");
   if (existsSync(keyPath)) {
@@ -66,12 +64,9 @@ assert(transportVerified.authorKeys.mlDsa !== undefined,
 }
 
 // A SECOND transport, version 2, signed by a different author — the realistic upgrade
-// shape, and the one that exercises both admission gates at once: the `link` grant
-// must list the new author, and the freshness floor (which v1 set to 1) must be
-// cleared by the new version. Same guest program, because what is under test is the
-// swap and not a different protocol.
-// A whole author identity (§12.4): both halves of the key set, and the derived id policy
-// actually pins — never either key alone (testkit.mjs).
+// shape, exercising both admission gates at once: the `link` grant must list the new
+// author, and the freshness floor v1 set must be cleared by the new version. Same guest
+// program, because what is under test is the swap.
 const upgrade = makeAuthor(sodium);
 const upgradeKeys = { ed: upgrade.ed, mlDsa: upgrade.mlDsa };
 const upgradeAuthor = Buffer.from(upgrade.id).toString("hex");
@@ -92,10 +87,9 @@ function transportBundleAt(version, keys, guestSource) {
       // Read, never restated: a hardcoded number here would pass a test that the
       // production loader would refuse the moment the seam revved (§12.4).
       abi: GUEST_ABI_VERSION,
-      // Exactly the authorities the transport guest (transport/src) holds — mirror of
-      // the artifact manifest (scripts/build-transport-bundle.mjs). Its `crypto/*` and
-      // its own module name calls are not grants and are not declared. `link/*` is what
-      // carries the `link` privilege the admission dispatch reads (§12.5).
+      // Exactly the authorities the transport guest holds — a mirror of the artifact
+      // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
+      // `link` privilege the admission dispatch reads (§12.5).
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/open", "link/send", "link/close", "link/stat",
@@ -169,11 +163,11 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
 //
-// It is not a protocol any more. `_net` is an ordinary protocol claim, so a later load
-// wins it exactly as a later chat app wins `chat-v1` (§12.10), and the driver — which
-// holds only link ids, the address book and the listener, all of them the NODE's — is
-// re-pointed at the new claimant rather than replaced. That is why there is no handover
-// to check here: there is nothing the outgoing guest held that the node needed back.
+// `_net` is an ordinary protocol claim, so a later load wins it exactly as a later chat
+// app wins `chat-v1` (§12.10), and the driver — which holds only link ids, the address
+// book and the listener, all the NODE's — is re-pointed at the new claimant rather than
+// replaced. Hence no handover to check: the outgoing guest held nothing the node needed
+// back.
 console.log("  upgrading A's transport in place…");
 const oldDriver = a.transport;
 const oldPort = aNet.port;
@@ -206,13 +200,12 @@ assert(refused, "a lower version from the same author is refused after the upgra
 assert(a.transport === aNet2, "…and the refused load left the standing transport in place");
 
 // ── A version that never ran must not consume the claim ──────────────────────────
-// Every app's realm is built lazily, but the transport's is built at LOAD: the node's network
-// has to be up when the load returns. So a v3 whose guest cannot compile dies there. If
-// the mark had been advanced on the way in, the node would keep serving the transport it
-// has and yet never be able to reinstall it: every version it can reach now sits below a
-// mark that a bundle which never executed a line raised. That is rollback bricked by a
-// failed upgrade — the exact outcome the downgrade refusals exist to prevent — so the
-// mark is deferred until the realm stands (bundle.ts `deferMark`).
+// Every app's realm is built lazily, but the transport's is built at LOAD, since the
+// node's network has to be up when the load returns — so a v3 whose guest cannot compile
+// dies there. A mark advanced on the way in would leave the node serving the transport it
+// has and unable to reinstall it: every version it can reach would sit below a mark a
+// bundle that never executed a line raised. So the mark is deferred until the realm
+// stands (bundle.ts `deferMark`).
 const brokenGuest = new TextEncoder().encode("const nope = ( ;");
 let v3Failed = false;
 try { await a.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
@@ -228,12 +221,11 @@ assert(a.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds th
 
 // ── A mark that cannot be written is a failed transport load ─────────────────────
 //
-// The transport's mark is DEFERRED to the shell (bundle.ts `deferMark`), so it is raised
-// after the realm stands rather than inside installBundle — which is also outside the
-// rollback installBundle does for every other app. A write that fails there used to
-// throw raw: the caller was told the load failed while the node was already serving the
-// new guest, and the disk mark stayed at the version it had, so the next boot re-admitted
-// the bundle this one replaced. A failed persist keeps nothing, here as everywhere (§12.4).
+// The transport's mark is DEFERRED to the shell (bundle.ts `deferMark`), raised after the
+// realm stands and so outside the rollback installBundle does for every other app. A write
+// that failed there and threw raw would tell the caller the load failed while the node
+// already served the new guest, with the disk mark still at the old version — so the next
+// boot re-admits the bundle this one replaced. A failed persist keeps nothing (§12.4).
 console.log("  a transport mark that cannot be persisted fails the load…");
 {
   let broken = false;
