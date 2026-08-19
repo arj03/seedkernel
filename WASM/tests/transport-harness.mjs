@@ -206,7 +206,7 @@ export async function makeTransportHost(opts = {}) {
     platform: {
       sodium: opts.sodium ?? sodium,
       identity,
-      table: new ModuleTable(),
+      modules: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       networkKey: opts.networkKey,
       transportHost: driver,

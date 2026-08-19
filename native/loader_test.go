@@ -7,12 +7,6 @@ import (
 	"testing"
 )
 
-// boundToWasm reports whether an app's module resolves — through the module table, the way
-// every call path resolves it — to an installed wasm module.
-func boundToWasm(appKey, module string) bool {
-	return apps[appKey][module] != nil
-}
-
 // TestScratchRegion covers the §4.1 reservation on this target: a module that declares no
 // `scratchSize` gets the 128 KB default, and the host clamps its I/O to what it reserved
 // rather than to whatever its linear memory happens to allow. The forwarder reserves a
@@ -21,15 +15,15 @@ func boundToWasm(appKey, module string) bool {
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 //
 // The default itself is the shared host's number (core/wasm-limits.ts
-// DEFAULT_SCRATCH_SIZE), passed by the shim at every bindAll; the test mirrors it,
+// DEFAULT_SCRATCH_SIZE), passed by the shim at every slot build; the test mirrors it,
 // since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp")
-	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
 		t.Fatalf("bindAll(forwarder) refused: %v", err)
 	}
-	w := apps[key]["fwd"]
+	w := moduleSlots[key]["fwd"]
 	if w.size != 0x20000 {
 		t.Fatalf("a module exporting no scratchSize should get the 128 KB default, got %d",
 			w.size)
@@ -62,7 +56,8 @@ func TestBundleModuleRuns(t *testing.T) {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")
-	if r := callModule(appKey, "fwd", msg); !bytes.Equal(r, msg) {
+	r, err := invokeBundle(appKey, msg)
+	if err != nil || !bytes.Equal(r, msg) {
 		t.Fatalf("bundle module echo = %q, want %q (module ran + host read its response)", r, msg)
 	}
 }

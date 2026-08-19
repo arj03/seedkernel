@@ -73,10 +73,9 @@ var (
 	qrt    *qjs.Runtime
 	// el drives the host realm and every confined realm attached to it (loop.go).
 	el *eventLoop
-	// apps is the module table (README §3): app key → that app's modules by logical
-	// name, so §3.1 bind/unbind/resolve are assignment, delete and lookup. No id
-	// indirection and no second table to drift from this one.
-	apps = map[string]map[string]*boundModule{}
+	// Native module instances live behind opaque slot handles. This map is target
+	// plumbing, not shell identity or routing state.
+	moduleSlots = map[string]map[string]*boundModule{}
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
@@ -86,18 +85,16 @@ var (
 )
 
 // The §4.1 scratch default arrives from the shared host (core/wasm-limits.ts
-// DEFAULT_SCRATCH_SIZE) with every bindAll, so Go owns no copy that could drift from
+// DEFAULT_SCRATCH_SIZE) with every slot build, so Go owns no copy that could drift from
 // the JS table's. A module needing more exports a `scratchSize` global.
 
-// bindApp replaces `appKey`'s whole module set — the §3.1 install, one assignment
-// because an app is one value. Also the one place a displaced instance is closed:
+// replaceModuleSlot replaces one opaque handle's whole module set. Also the one place a
+// displaced instance is closed:
 // wazero frees neither the instance nor its compiled code, so dropping the map value
 // alone leaks a linear memory + its JITed code per re-install.
-func bindApp(appKey string, mods map[string]*boundModule) {
-	for _, w := range apps[appKey] {
-		closeModule(w)
-	}
-	apps[appKey] = mods
+func replaceModuleSlot(slot string, mods map[string]*boundModule) {
+	disposeModuleSlot(slot)
+	moduleSlots[slot] = mods
 }
 
 // closeModule releases a module's wasm instance and compiled code. nil-safe.
@@ -109,17 +106,13 @@ func closeModule(w *boundModule) {
 	_ = w.cmod.Close(ctx)
 }
 
-// removeApp drops an app and releases every instance it held — the shell's uninstall
-// (§12.5).
-func removeApp(appKey string) int {
-	mods, ok := apps[appKey]
-	if !ok {
-		return 0
-	}
+// disposeModuleSlot releases every instance behind one opaque handle.
+func disposeModuleSlot(slot string) int {
+	mods := moduleSlots[slot]
 	for _, w := range mods {
 		closeModule(w)
 	}
-	delete(apps, appKey)
+	delete(moduleSlots, slot)
 	return len(mods)
 }
 
@@ -128,8 +121,8 @@ func removeApp(appKey string) int {
 // into an installed module, for the shell and for the guest seam's bare-name calls
 // (§12.2). Modules are pure transforms and cannot call back, so there is no re-entrancy
 // to guard.
-func callModule(appKey, module string, payload []byte) []byte {
-	w := apps[appKey][module]
+func callModule(slot, module string, payload []byte) []byte {
+	w := moduleSlots[slot][module]
 	if w == nil {
 		return nil
 	}
@@ -154,7 +147,7 @@ func callModule(appKey, module string, payload []byte) []byte {
 		// answering empty and a reinstall recovers it.
 		if w.mod.IsClosed() {
 			closeModule(w)
-			delete(apps[appKey], module)
+			delete(moduleSlots[slot], module)
 		}
 		return nil
 	}
@@ -181,13 +174,13 @@ func callModule(appKey, module string, payload []byte) []byte {
 	return out
 }
 
-// bindAll lands a bundle's modules on the module table, all or none (README §3.1) —
-// reached from JS as bridge.bindAll.
+// buildModuleSlot constructs one opaque slot's modules, all or none (README §3.1) —
+// reached from JS as bridge.buildModules.
 //
 // The transaction is HERE rather than in the loader because this is the side holding the
 // half-built instances: a bundle rejected at its third module has to close the first
 // two, and a caller that forgot would leak a linear memory plus its JITed code.
-func bindAll(appKey string, names []string, wasms [][]byte, scratchDefault uint32) error {
+func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault uint32) error {
 	built := make(map[string]*boundModule, len(wasms))
 	for i, wasm := range wasms {
 		w, err := instantiateWasm(wasm, scratchDefault)
@@ -200,12 +193,12 @@ func bindAll(appKey string, names []string, wasms [][]byte, scratchDefault uint3
 		built[names[i]] = w
 	}
 	// Nothing above touched the table and nothing below can fail.
-	bindApp(appKey, built)
+	replaceModuleSlot(slot, built)
 	return nil
 }
 
 // instantiateWasm compiles, instantiates and validates module bytes against the §4 ABI.
-// No table effect: the result is an intermediate of bindAll's transaction.
+// No slot effect: the result is an intermediate of buildModuleSlot's transaction.
 func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
@@ -362,7 +355,7 @@ func shutdown() {
 		_ = rtCore.Close(ctx)
 		rtCore = nil
 	}
-	apps = map[string]map[string]*boundModule{}
+	moduleSlots = map[string]map[string]*boundModule{}
 }
 
 // exposeBridge installs `bridge`: the byte-level host powers QuickJS genuinely cannot
@@ -370,13 +363,11 @@ func shutdown() {
 func exposeBridge(qc *qjs.Context) {
 	b := qc.NewObject()
 
-	// ── the module table (§3) ──
-	// One transactional install (§3.1) of an app's whole module set: the app key, the
-	// loader's `{name, wasm}[]` read out here so the bridge and the BundleHost interface
-	// are the same shape, and the §4.1 scratch default the shim passes from the shared
-	// host rather than Go owning a copy of it.
-	b.SetPropertyStr("bindAll", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		appKey := t.Args()[0].String()
+	// ── private module slots (§3) ──
+	// One transactional build of an opaque slot's module set. The §4.1 scratch default
+	// arrives from the shared host rather than Go owning a copy of it.
+	b.SetPropertyStr("buildModules", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		slot := t.Args()[0].String()
 		mods := t.Args()[1]
 		lenv := mods.GetPropertyStr("length")
 		n := int(lenv.Int64())
@@ -397,7 +388,7 @@ func exposeBridge(qc *qjs.Context) {
 			}
 			wasms[i] = wb
 		}
-		if err := bindAll(appKey, names, wasms, uint32(t.Args()[2].Int64())); err != nil {
+		if err := buildModuleSlot(slot, names, wasms, uint32(t.Args()[2].Int64())); err != nil {
 			return nil, err
 		}
 		return t.Context().NewNull(), nil
@@ -413,11 +404,8 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
-	b.SetPropertyStr("isBound", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(apps[t.Args()[0].String()][t.Args()[1].String()] != nil), nil
-	}))
-	b.SetPropertyStr("removeApp", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewInt64(int64(removeApp(t.Args()[0].String()))), nil
+	b.SetPropertyStr("disposeModules", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewInt64(int64(disposeModuleSlot(t.Args()[0].String()))), nil
 	}))
 
 	// ── the operator's world (host/cli.ts) ──

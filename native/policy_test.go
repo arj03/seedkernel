@@ -144,19 +144,19 @@ func TestSameAppNameFromTwoAuthorsCoexists(t *testing.T) {
 	if status := loadBundle(bundleA); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author A's install should be admitted: %s", status)
 	}
-	if !boundToWasm(keyA, "fwd") {
-		t.Fatalf("author A's module is not bound under `%s`", keyA)
+	if out, err := invokeBundle(keyA, []byte("A")); err != nil || string(out) != "A" {
+		t.Fatalf("author A's slot did not run through `%s`: %q, %v", keyA, out, err)
 	}
 	// B's bundle declares the same app name and installs too — beside A, never over it.
 	bundleB, _ := writeTestBundle(t, authorB, "ownedapp", 2)
 	if status := loadBundle(bundleB); !strings.Contains(status, "ownedapp") {
 		t.Fatalf("author B's install should be admitted under its own name: %s", status)
 	}
-	if !boundToWasm(keyB, "fwd") {
-		t.Fatalf("author B's module is not bound under `%s`", keyB)
+	if out, err := invokeBundle(keyB, []byte("B")); err != nil || string(out) != "B" {
+		t.Fatalf("author B's slot did not run through `%s`: %q, %v", keyB, out, err)
 	}
 	// The decisive assertion: A's slot is untouched by B's install.
-	if !boundToWasm(keyA, "fwd") {
-		t.Fatalf("author B's install displaced author A under `%s`", keyA)
+	if out, err := invokeBundle(keyA, []byte("A2")); err != nil || string(out) != "A2" {
+		t.Fatalf("author B's install displaced author A's slot `%s`: %q, %v", keyA, out, err)
 	}
 }

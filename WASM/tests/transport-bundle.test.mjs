@@ -124,7 +124,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   const shell = createShell({
     platform: {
       sodium, identity,
-      table: new ModuleTable(),
+      modules: new ModuleTable(),
       freshnessStore,
       transportHost: transport,
       createRealm: async (o) => createSafeRealm(o),

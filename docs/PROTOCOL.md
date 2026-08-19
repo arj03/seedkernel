@@ -1,6 +1,6 @@
 # Seed kernel — Protocol
 
-*The message model, the module table, host-level module management, the pure-transform WASM module ABI, and layering. §16 collects the protocol constants.*
+*The message model, bundle slots, the pure-transform WASM module ABI, and layering. §16 collects the protocol constants.*
 
 > **Part of the [seed kernel](../README.md) spec.** Section numbers are global across the doc set — a `(§X.Y)` reference points to whichever file below holds that section:
 >
@@ -10,72 +10,49 @@
 
 ## 2. The message model
 
-The host parses nothing off the wire. Its entire dispatch state is a table mapping a **name** to a **module**, and the only thing an inbound frame reaches is an app's guest (§12.10). There is no envelope format, no message header, no dispatch loop — an inbound frame is one routing lookup and one guest entrypoint call.
+A message at the runtime boundary is `(protocol id, input bytes)`. The transport has already decrypted it and attributed it to a peer key (§12.6). The host resolves the protocol claim directly to a bundle slot, prepends that peer key, and invokes the slot's guest `handle` entrypoint. There is no module dispatch on the inbound path.
 
-A "message," at the boundary the runtime cares about, is a `(protocol id, input bytes)` pair the **host** assembles. The host is the orchestrator: it receives bytes from the transport (already decrypted and attributed to a peer key, §12.6), resolves the protocol id to the app whose manifest claims it (§12.10), and invokes that app's guest `handle` entrypoint with the input (§12.2), reading the response back. The guest may compose its own modules — **pure transforms** (§4) — by calling them by name on the same `host.call` seam; neither the host nor a module sees a caller context the guest did not hand it.
+The guest may call one of its own pure-transform modules by bare name on `host.call` (§12.2). Those modules are private values captured by that guest's slot: no app key participates in lookup and no other guest can address them.
 
-That leaves three orthogonal pieces in every table entry, none of which the host interprets:
+**No wire format means no host-level size cap.** The bounds live where bytes flow: the transport caps a frame at `MAX_FRAME_BYTES` and a module caps I/O at its scratch size (§4.1).
 
-- **Name** — an opaque key, a string. Its meaning is a convention (§5.1), not a host concern; the host matches names and nothing more.
-- **Bytes** — the WASM module held at that name, a pure transform the host stages input into and reads output from (§4).
-- **Author** — the signer of the bundle that installed the bytes. It is half of every app key (§5.1), which is the table's outer key, so the table itself carries it; the host stores and matches keys without interpreting them.
-
-**No wire format means no host-level size cap.** The host parses nothing, so it has nothing to bound; the two bounds that exist live where the bytes actually flow — the transport caps a single frame at `MAX_FRAME_BYTES` (2 MiB, §12.6), and a module caps its own I/O region at its `scratch` size (128 KB default, §4.1). The host imposes neither; it only ever holds a name and a module.
-
-**Authenticity is the channel's, not the host's.** Because the transport hands the host frames already authenticated to a peer key (§12.6), there is no per-message signature to check and no signature logic anywhere in the host or its modules. Signing survives in exactly two host-side places, both off the message path: the **bundle manifest** that installs code (§12.4) and the channel **AUTH** that opens a link (§12.6). An app that needs to attribute a *relayed* message to its original author — a forum or feed, where the channel only authenticates the immediate hop — carries its own per-message signature and backlinks on top (§5.1, §14); that is an app concern, not a host one.
+**Authenticity is the channel's.** There is no per-message signature in the host. Signing survives off the message path for bundle manifests and channel AUTH; an app that relays content carries any end-to-end attribution it needs itself.
 
 ---
 
-## 3. The module table
+## 3. Bundle slots
 
-The runtime has no kernel component: the **host** owns the table, and this section is what the table is and how it is maintained. It is a **named table of modules**: bind a name to a module, resolve a name to the module bound there. It holds no cryptography, no authorization, no installation logic, and no message dispatch — an inbound frame reaches an app's guest (§12.10), and a module is reached only when that guest calls one.
-
-The table is a **contract, not an artifact**. It is this section — the table, the pure-transform ABI (§4), and the bind/unbind semantics (§3.1) — and each host implements it as one map:
+The shell's lifecycle model is one direct projection:
 
 ```
-apps[appKey][name] → module      bind / replace / resolve / remove   (§3.1)
+claim → { verifiedBundle, realm, pureModules, fsScope, signingScope }
 ```
 
-`Map<string, Map<string, WasmModuleRef>>` in the JS host, `map[string]map[string]*boundModule` in the Go host. There is nothing else to instantiate beside it, no module-id indirection, no memory staging across a boundary, and no second table to keep in step with a first.
+The realm is the only inbound entry. `pureModules` is a private name-to-instance map captured by that realm's seam. `fsScope` and `signingScope` are derived host-side from the verified `(author, app)` and never chosen by guest code. A slot can own several claims; each points to the same value.
 
-**The outer level is an install record, not a dispatch level.** `apps[appKey]` is what a bundle load created: one record per installed app, keyed by the author-derived app key (§5.1), holding the app's module map (and, in the shell, the realm its guest runs in — §12.8). Inbound dispatch resolves a protocol to an app key and stops there; it never descends into the table. The only paths *into* the module map are a guest naming one of its own modules on `host.call` (§12.2) and a host-side embedder's `callModule` — both of which name a module inside one app.
+The shell also retains the installed slots in load order for administration, initiator-only bundles, and fallback when two bundles claim the same protocol. That collection is not a second routing model: dispatch is always one `claim → slot` lookup. The most recently installed claimant wins; removing it reprojects the remaining slots and reveals the preceding claimant.
 
-**Two levels, because there are two things.** An app is what installs, what a protocol claim routes to, and what `revoke` removes; a module is what a call resolves. Flattening both into one string key would buy a single map at the cost of a codec — a charset rule so the module half could not contain the separator, a fixed-width author half so the app half could, a prefix scan for the unbind — and every one of those defends a shared namespace. There is no shared namespace: a guest reaches only its own app's modules, routing points at an app key, and nothing on the wire names either (§5.1). Nesting the maps makes ownership the outer key, readable without parsing anything.
+App keys remain only where identity is required: freshness and revocation records, filesystem and signing scope derivation, audit output, and the operator's explicit `invoke`/`uninstall` selector. They are not module addresses and claims do not route through them.
 
-**Why the table is not itself a WASM module.** Compiling it would buy "one table binary, every host" — but the table is two operations, and the module *instances* it points at are per-target regardless (a `WebAssembly.Instance` in JS, a wazero `api.Module` in Go), so it could never be self-contained: each host would keep a parallel map beside it, keyed by an id invented to cross the boundary, plus the alloc/copy/call/dealloc round trip per lookup. What genuinely must not diverge between hosts is the bundle **load order** and the **admission rules**, and those *are* shared — as compiled TypeScript evaluated on every target (§12.9), where sharing pays.
+### 3.1 Atomic load and replacement
 
-**Name resolution** is two map lookups — the app, then its module. Both keys are strings (§5.1), so a module reads plainly in a log as its app key and its logical name. A module that is not a key in its app's map — or an app that is not a key at all — is unbound, and the two are the same answer.
+A load performs these steps:
 
-**Unbound is a refusal on the guest seam, and no bytes on the host's.** A host-side embedder's `callModule` returns no bytes for a name absent from the table — it is the raw primitive and its caller already knows what it installed. A guest naming a module it never declared is a different event: the name is a *typo* in the one catalog, so the seam refuses it exactly as it refuses an unknown `crypto/` name (§12.2). A module that runs and fails still answers empty, which is also what a module returning nothing says. The empty-response shape does hold one level up at the protocol routing — a protocol no installed app claims reaches no app, and the transport answers the request with an empty body rather than discarding the frame (§12.10). Nothing on either path is silently discarded, so there is no "drop" for the table to define; what the host does *not* do is produce unsolicited output, and every reply an app sends travels as a fresh frame under that app's own logic.
+1. Verify the complete signed bundle and ask the admission predicate.
+2. Build every pure module off to the side. If any module fails validation or instantiation, release the partial set.
+3. Derive the filesystem and signing scopes, then stand the confined realm wired to that private module set.
+4. Persist the freshness mark for the version that successfully ran.
+5. Synchronously replace the installed identity and reproject all claims, then dispose the previous slot.
 
-**No re-entrancy to reason about.** A module is a pure transform that runs to completion and returns before anything else runs (§4). Modules cannot call one another, so there is no call stack, no depth limit, no current-signer or caller state living across a call. Concurrency is the host's concern: it drives one transform at a time — per module, on a single event loop (the JS hosts run each module in its own worker and keep one call in flight per module, §4.3).
+Nothing is published before step 5. A malformed module, broken guest, or failed freshness write disposes only the candidate; the running version and all of its claims remain unchanged. The claim commit contains no `await`, so a bundle that owns several claims cannot be observed with only some replaced.
 
-### 3.1 Host-level module management
+An upgrade replaces the entire slot. A module omitted by the new manifest therefore disappears with the old slot, as do the old realm, timers, scopes, and all other module instances. `uninstall` and `revoke` remove the slot as the same unit and dispose everything it owns; there is no single-module lifecycle.
 
-The table has two mutating operations, and they are the **same unit** — an app:
+### 3.2 Target implementation
 
-```
-bindAll(appKey, [{name, wasm}, ...])   admit a bundle's modules, all or none   (the loader's)
-removeApp(appKey)                      drop one app and everything it landed    (the shell's)
-```
+Only construction and execution of `pureModules` vary by target. JS builds a private map of worker-backed instances and returns closures over it. Native may keep an opaque handle into a Go map because wazero modules cannot be JS values. That map is an implementation detail behind the slot, not a shell API or kernel model.
 
-**The bind belongs to the loader, and there is only one.** Nothing hands the host a ready-made module to drop into a slot, and there is no per-module install: the sole caller is the loader's admission (§12.4), which reaches `bindAll` only after the manifest signature and the policy have both passed, and hands it a whole bundle's modules at once. A bundle may declare no modules at all — a guest-only app — in which case `bindAll` creates the app's record with an empty map (§12.4). So every entry in the table is a bundle module admitted under a verified manifest — there is no second kind of occupant, and no question of who authored what a call resolves to, because the author is half of the key it sits under (§5.1). That is what makes "one install path" (§1) literally true rather than nearly true.
-
-**The bind is atomic, and it is visibly so.** `bindAll` builds the app's whole module map first — validating each against the §4 ABI, releasing whatever it had already built if any fails — and then assigns it under the app key. The commit is one assignment, so a partially-installed bundle is not a state a caller has to avoid reaching; it is one that cannot be expressed. This matters most where a wasm instance is a real resource: on a host whose modules are not garbage-collected, the release path is the host's own, so no target can forget it.
-
-Binding an occupied app **replaces its whole module map**, which is what a version of an app is — a bundle that drops a module from its manifest leaves nothing of the old one behind. This is how a same-author, higher-`version` bundle lands (§12.4). It is internal to the host process, never reachable from an inbound frame or from a WASM module; the host controls access through its own authentication (process permissions, operator console, HSM), and the host defines no access-control policy for it.
-
-**The unbind belongs to the shell, and its unit is the same app.** `removeApp` deletes the key — the shell's `uninstall`, and `revoke`'s teardown of everything a written-off key landed (§12.5). There is no single-module remove: a module is not a unit anything installs, so it is not one anything revokes either.
-
-**Dropping an app drops only that app.** There is no side table to keep in step, and no shared namespace for a freed entry to be contended for — an app key can only be derived by the author whose public key is half of it (§5.1) — so an unbind cannot hand anything to anyone, the misattribution a stale ownership record would invite has no way to arise, and there is no tombstone: the key accepts the author's next bundle immediately.
-
-### 3.2 Growth is the loader's job, not the host's
-
-Most deployments grow by loading signed bundles (§12.4), not by wiring every module by hand. The bundle loader admits a bundle's modules — a policy decision (§12.5) followed by one `bindAll` under the app key it derives from the manifest (§5.1). None of that is the table's: admission is host-side, off any wire path, and the table sees only the resulting bind. Frozen-config deployments load no bundles and grow no further.
-
-**Standing a host up.** Because the table is a map rather than an artifact, there is no bootstrap sequence to speak of: ready libsodium, construct the host, and the table is live — empty, resolving nothing. Growth is then two ordered steps, and the order is the only constraint: wire an admission policy (§12.5), then load a bundle (§12.4). A host whose policy is never wired is not misconfigured but *frozen* — deny-all is the default, so it boots, serves, and admits nothing (§14). There is no step for instantiating a table binary, seeding a signature module, or wiring a slot by hand.
-
-Because the loader verifies the manifest signature before it admits anything, "who authored this code" is already settled by an ordinary signature check (§12.4). Installation is not a special operation; it is `apps[appKey].modules[name] = wasm_bytes`, gated by the author + hash policy (§12.5).
+The shared loader owns verification, admission, ordering, scope derivation, realm construction, and the atomic claim commit (§12.9). A host starts with no slots and a deny-all admission policy; loading signed bundles is the only growth path.
 
 ---
 
@@ -116,7 +93,7 @@ Concretely, a module **cannot**:
 
 Everything a transform needs arrives **in its input**, and everything it produces leaves **in its output**. When a message must carry the sender's identity to the module, the orchestrator prepends it to the input from the authenticated channel (§12.6) — as the chat app does, staging `senderPk ‖ body` (§11). This is the boundary that makes the sandbox trivial to reason about: a module that can only read its input and write its output has no confused-deputy surface, no ambient authority, nothing to revoke.
 
-**Composition is the guest's job.** Chaining transforms — running one module's output into another, fanning out, doing I/O between steps — is the app's guest (or a host-side embedder), never a module's. A guest reaches its own modules through the guest seam by their bare names (§12.2); the host-side equivalent is `callModule(appKey, name, bytes)`. Because a module cannot call back, these compose without re-entrancy: each transform returns before the next runs.
+**Composition is the guest's job.** Chaining transforms — running one module's output into another, fanning out, doing I/O between steps — is the app's guest, never a module's. A guest reaches only the private module set captured by its slot, using bare names on the guest seam (§12.2). Because a module cannot call back, these compose without re-entrancy: each transform returns before the next runs.
 
 ### 4.3 Safety & memory model
 
@@ -144,21 +121,19 @@ Modules form an onion — the stack diagram in §1 draws it: each layer depends 
 
 | Layer | Modules | What lives there |
 | --- | --- | --- |
-| **Host table** | the host's `apps[appKey][module]` map | The name → module table and its two lookups (§3). No crypto, no I/O, no dispatch — an app's guest is what an inbound frame reaches (§12.10). |
+| **Bundle slot** | `claim → {bundle, realm, modules, fsScope, signingScope}` | Direct dispatch plus the private resources one verified bundle owns (§3). |
 | **Guest seam** | Guest seam (host-side) | The `host.call(name, bytes)` seam a confined guest reaches its I/O through — the only outward reach the guest has (§12.2). |
 | **App** | [seedchat](https://github.com/arj03/seedchat) (§11), [seed store](https://github.com/arj03/seedstore) — both live outside this repo | A confined JS guest (the app's logic) over its pure-transform WASM modules — delivered as one signed bundle (§12.4). |
 
 Each layer is testable standalone: the table is exercised on its own, the loader against a bundle with no live transport, chat as a guest over a handful of pure transforms with no crypto in sight. Composition across layers is the guest's (or a host-side embedder's), through `callModule` / a guest`s bare-name `host.call` (§4.2) — never a module reaching sideways.
 
-**The hash function used for id derivation.** Two places hash: `bytes_hash` (§12.4) and any allowlist that pins a binary. Both mean **BLAKE2b-256** — the *genesis hash*, computed host-side by `genesisHash` (libsodium's core `crypto_generichash`). There is exactly one hash across the whole system: the same BLAKE2b-256 is the `blake2b-256` entry of the primitive catalog a guest reaches by name (§12.1), the AKE KDF and transcript hash (§12.6), and the block-id path. Swapping it shifts every `bytes_hash` — but **app keys and module names are literal ASCII, not hashes**, so no table key shifts with it. Pick the genesis hash once and treat it as a deployment-wide constant.
+**The hash function used for id derivation.** Content hashes and binary pins use **BLAKE2b-256** — the genesis hash, computed by `genesisHash`. The same primitive appears in the guest catalog, AKE KDF/transcript, and block-id path. App identities and module names remain literal fields rather than derived module addresses.
 
 **Names are strings.** A name is an opaque string the host only ever matches — nothing forces a hash, so a name reads plainly in a log and in a manifest.
 
-**A name is node-local.** Nothing on the wire ever names another node's module. A peer sends an application-level id or opcode — the chat demo's frame carries a *protocol id* (§11), a storage message carries its protocol op — and the receiving host resolves that (§12.10) to whichever of its installed apps claims it; a confined guest reaches its own modules by the logical name from its manifest through `host.call`, against the app key its seam was built with — so the guest never names an app at all. So names must be unambiguous within one node, not agreed across a deployment. Two hosts that bound the same code under different app names interoperate fine, and a host may hold two independent implementations of one protocol at once.
+**A name is slot-local.** Nothing on the wire names a module. A peer sends a protocol id and the receiving host resolves that claim directly to a slot; the confined guest reaches only that slot's modules by manifest name through `host.call`. Two hosts can install the same code under different app names and still interoperate.
 
-**There is no composite name to derive.** A module is addressed by two values that already exist: the **app key** `"<author hex>:<app>"` (§12.4) and the **logical name** the manifest declares for the module. Neither is invented at bind time and neither is declared as a bind name, so a manifest holds nothing to forge — both are covered by the author's signature. There is no second namespace to keep disjoint from this one, because there is no second way to bind (§3.1).
-
-Encoding the two into one string — `"<author hex>:<app>:<module>"` — would oblige everything downstream to decode it again: a fixed-width author half so the app half may contain colons, a charset rule so the module half may not, and a last-colon split to read the parts back out. Nesting the maps means the structure is simply there. The app key itself keeps its fixed-length author prefix regardless, so `"<author hex>:<app>"` stays unambiguous with an `app` free to contain `:`.
+**There is no composite module name.** A module is addressed only by its manifest logical name inside the private slot value. `"<author hex>:<app>"` remains a host-internal identity for scopes, freshness, audit, and operator selection; it is not concatenated with or consulted for module dispatch.
 
 The author is the **full** hex, never a truncated prefix. A short prefix would be grindable: an admitted author could generate a key matching another's first bytes and land on their app. App keys are node-local table keys that never travel, so their length costs nothing but log width.
 
@@ -175,7 +150,7 @@ All limits and reserved values in one place. Multi-byte integers are big-endian 
 | Constant | Value | Where enforced | Notes |
 | --- | --- | --- | --- |
 | `DEFAULT_SCRATCH_SIZE` | `131072` (128 KB) | Module instantiation | Per-module I/O region at `scratch`; a module may declare more via `scratchSize` (§4.1). |
-| `MAX_MODULE_MEMORY_BYTES` | `67108864` (64 MiB) | Bundle admission (`installBundle`) | Ceiling on a module's declared initial *and* maximum linear memory, read off the module bytes before instantiation (§4.1). A module above it, or declaring no maximum, is refused. A host may hold its own direct installs to something tighter; none may be looser about what a bundle may land. |
+| `MAX_MODULE_MEMORY_BYTES` | `67108864` (64 MiB) | Slot construction (`loadBundleModules`) | Ceiling on a module's declared initial *and* maximum linear memory, read before instantiation (§4.1). |
 
 A name absent from the table resolves to an **empty response**, never an error (§3). The host enforces nothing else — no magic, no version, no size cap; the transport and the module own those bounds (§2).
 

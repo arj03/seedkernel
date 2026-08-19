@@ -135,7 +135,7 @@ func TestModuleCallBound(t *testing.T) {
 	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "50")
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0x5e}, 32), "wedgeapp")
-	if err := bindAll(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
+	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
 		t.Fatalf("bindAll refused: %v", err)
 	}
 	// The healthy module on the same app works before and after the kill: the bound
@@ -162,7 +162,7 @@ func TestModuleCallBound(t *testing.T) {
 	// The kill CLOSED the module, so it is evicted from the table — a closed instance
 	// left in place would fail every later call silently, which is the app answering
 	// empty on a protocol forever. The app key still holds the healthy module.
-	if apps[key]["wedge"] != nil {
+	if moduleSlots[key]["wedge"] != nil {
 		t.Fatal("the wedged module must be evicted from the table, not left as a closed instance")
 	}
 	if r := callModule(key, "wedge", nil); r != nil {
@@ -172,7 +172,7 @@ func TestModuleCallBound(t *testing.T) {
 
 	// A reinstall binds a fresh instance and the bound fires again on it — recovery
 	// is the ordinary reload path, not a restart of the host.
-	if err := bindAll(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
+	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
 		t.Fatalf("reinstall refused: %v", err)
 	}
 	echo()
@@ -202,10 +202,10 @@ func TestModuleCallBoundArmedByDefault(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()
 		key := appKeyFor(bytes.Repeat([]byte{0x5c}, 32), "probeapp")
-		if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
 			t.Fatalf("bindAll refused: %v", err)
 		}
-		w := apps[key]["fwd"]
+		w := moduleSlots[key]["fwd"]
 		done, cancel := context.WithCancel(ctx)
 		cancel() // done before the call: armed runtimes refuse at entry
 		defer cancel()
@@ -242,7 +242,7 @@ func TestModuleBindBound(t *testing.T) {
 	key := appKeyFor(bytes.Repeat([]byte{0x5d}, 32), "startwedge")
 
 	start := time.Now()
-	err := bindAll(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000)
+	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("bindAll accepted a module whose start section never returns")
@@ -257,13 +257,13 @@ func TestModuleBindBound(t *testing.T) {
 		t.Fatalf("the bind was refused after %s, want ~50 ms: that is not the bound firing", elapsed)
 	}
 	// All-or-none (§3.1): a refused bind leaves the table exactly as it was.
-	if apps[key] != nil {
+	if moduleSlots[key] != nil {
 		t.Fatal("a refused bind left the app on the table")
 	}
 
 	// The host is unharmed — the runtime that killed the wedge still binds and runs an
 	// ordinary module.
-	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
 		t.Fatalf("bindAll refused a healthy module after the wedge: %v", err)
 	}
 	msg := []byte("still alive")

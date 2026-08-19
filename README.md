@@ -19,10 +19,10 @@ A minimal runtime: a **host** admits signed **bundles**, and every bundle is an 
 
 | Component | Role |
 | --- | --- |
-| **Bundles** | The only way code arrives (§12.4): a manifest, a guest JS program, any number of WASM modules, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5) and the loader admits the app — a policy decision, then one all-or-none bind. **The transport is one of these.** |
+| **Bundles** | The only way code arrives (§12.4): a manifest, a guest JS program, any number of WASM modules, and one author signature over the whole set. The host checks that signature against the operator's policy (§12.5), builds a complete private slot, and atomically replaces its claims. **The transport is one of these.** |
 | **Guests** | Every app's logic (§12.2): a zero-authority QuickJS realm holding only the ECMAScript intrinsics, whose entire seam is `host.call(name, …)` out and `realm.call(entry, bytes)` in — serialized per realm and bounded in heap and execution time (§12.3). Inbound delivery is an entrypoint invocation on the app's guest; everything a synchronous pure transform cannot be — session state, app logic, the transport's AKE — lives here, and the modules are the library it drives by name. |
 | **Modules** | An app's *library*: pure-transform WASM modules (§4), reached by the guest by their bare name through `host.call` (§12.2). The host stages input at the module's `scratch` offset, calls `handle`, and reads the response back. They import **nothing from the runtime** — no host seam, no I/O of their own — so the sandbox is an absence of wiring rather than a rule. Any language that compiles to WASM qualifies; the contract is three exports and no imports. A module runs only when its app's guest calls it. |
-| **Host** | The runtime: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — the install records and the module table (§3), the inbound dispatch (§12.10), and `loadBundle`, the single admin path that admits new code (§12.4). |
+| **Host** | The runtime: the same shared JS on every target (browser, Node, or QuickJS inside the native binary, §12.9). It owns the platform seam — sockets, entropy, the clock, the node identity key — the bundle slots and direct claim routing (§3), the inbound dispatch (§12.10), and `loadBundle`, the single admin path that admits new code (§12.4). |
 | **Raw I/O** | Two capabilities of the same shape: `link` is `send(link, bytes)` / `onData` over an opaque link id, `fs` is get/put/size/list/delete/stat over an opaque flat key (§12.1). Raw bytes over an opaque name, plus the flood limits that must sit with whoever holds the descriptor. A *link*, not a peer: a peer id is an attributed identity, which is the transport's output rather than the platform's contribution. |
 
 **Authorization, capability gating and application logic are none of them.** They are layers that compose around the guest seam without the host knowing what any of them mean, so a node bootstraps from one trusted policy — the authors it will install, or none — into arbitrarily complex behaviour.
@@ -33,7 +33,7 @@ There are no special cases and exactly one way to do everything: one app shape (
 
 ## What belongs in the core
 
-The core is what a rebuild is needed to change, so it is worth naming in one line: **two raw I/O seams — a socket and an `fs`, each bytes in and out over an opaque name — their flood limits, an entropy source, a clock, a private key, and a map.** Plus the two things no test could remove, because they are what would admit their own replacement: the manifest verifier and a policy file with a version floor. That is a seed. Everything else is content, and one test is what emptied it out — Saltzer, Reed and Clark's:
+The core is what a rebuild is needed to change, so it is worth naming in one line: **two raw I/O seams — a socket and an `fs`, each bytes in and out over an opaque name — their flood limits, an entropy source, a clock, a private key, and direct claim-to-slot routing.** Plus the two things no test could remove, because they are what would admit their own replacement: the manifest verifier and a policy file with a version floor. That is a seed. Everything else is content, and one test is what emptied it out — Saltzer, Reed and Clark's:
 
 > **A function belongs in a lower layer only if it cannot be correctly implemented at the endpoints.**
 
@@ -76,14 +76,10 @@ loadBundle (host admin path)                         §12.4
 policy check — author trusted? version >= floor?     §12.5
         │
         ▼
-admit each module — policy ok?                       §12.4
+build complete slot off to the side                  §3.1
         │
         ▼
-bindAll([{name, wasm}]) — table updated, all or none §3.1
-        │
-        ▼
-compile & register guest JS in QuickJS realm
-(zero-authority, awaits first invocation)
+atomically replace every claim the bundle owns       §3.1
 ```
 
 Request flow:
@@ -123,7 +119,7 @@ The reference composition stacks the layers so each depends only on the layers b
 │   its only reach to real I/O        │
 ├─────────────────────────────────────┤
 │   Host                              │
-│   install records + module table,   │
+│   bundle slots + claim routing,     │
 │   dispatch, the platform seam       │
 ├─────────────────────────────────────┤
 │   Transport — a signed bundle       │
@@ -148,20 +144,20 @@ The reference composition stacks the layers so each depends only on the layers b
 - Untrusted code is **bounded** as well as confined. A WASM module declares its linear-memory ceiling in the module bytes and the loader reads it there, before instantiating, refusing anything unbounded or over budget; a JS guest runs under a heap cap *and* an operator-set execution budget (5 s by default), enforced on every target by QuickJS's interrupt handler. A module call carries a deadline — the calling guest's remaining execution segment — and a call that burns it is killed at the engine and answered empty, exactly as a trap is (§4.3, §14). It is one step from the wire either way: a module is only ever reached by a guest calling it by name, under that guest's budget.
 - Node-to-node links are confidential by default — the transport bundle opens each connection with an authenticated key exchange, then carries every frame as a forward-secret, individually-authenticated encrypted record, uniform across TCP, WebSocket and WebRTC and needing no external TLS or Noise tunnel.
 - The channel authenticates one hop, not the whole path. An app that **relays** messages through intermediaries cannot lean on the channel to attribute the *original* author, so it layers its own scheme on top. Bundles already work this way, which is why they need no channel at all.
-- The module table is a specification, not a binary. Each host implements it as a plain map; what must not drift is the bundle load order and the admission rules, and those are shared as one compiled implementation on every target (§12.9).
+- Modules are private slot values, not a shell namespace. JS may use a map and native an opaque Go handle, but neither is part of routing or the shell API (§3).
 
 ## One implementation, three targets
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,097 LOC)**
+**Shared — compiled once, run by all three targets (2,093 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 536 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 534 |
 | Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 284 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 433 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 349 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 347 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 205 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 290 |
 
@@ -176,12 +172,12 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, the safe-js realm, the module table, the PQ module drivers, entry points, key derivation | 1,544 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and the PQ modules over wazero, raw net and fs, the module table — plus `native-shim.ts` (395), the Go binding, and `native-polyfills.ts` (93), the Web globals QuickJS lacks, both TypeScript and both riding in the shared bundle | 2,160 Go + 488 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, PQ drivers, entry points, key derivation | 1,535 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (401) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,152 Go + 494 TS |
 
 What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,381 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
-Each target therefore runs 2,097 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
+Each target therefore runs 2,093 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
 
 ## The overhead, measured
 
@@ -221,7 +217,7 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 
 | Doc | Sections | Contents |
 | --- | --- | --- |
-| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | The module table, host-level module management, standing a host up, the pure-transform WASM module ABI, layering, the protocol constants. |
+| [PROTOCOL](docs/PROTOCOL.md) | §2–§5, §16 | Bundle slots, atomic claim replacement, the pure-transform WASM module ABI, layering, and protocol constants. |
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the shell: capability backends, the guest-seam ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 | [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the four messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |

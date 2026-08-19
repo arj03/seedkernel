@@ -56,7 +56,7 @@ function timeInThread(inst, reqs, iters) {
 async function timeWorker(table, reqs, iters) {
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < iters; i++) {
-    const r = await table.callModule("bb:ws", "ws", reqs[i % reqs.length]);
+    const r = await table.call("ws", reqs[i % reqs.length]);
     if (r === null || r.length === 0) throw new Error("ws: module error");
   }
   return Number(process.hrtime.bigint() - t0) / 1e6;
@@ -65,7 +65,7 @@ async function timeWorker(table, reqs, iters) {
 const mod = new WebAssembly.Module(wasm);
 const inst = new WebAssembly.Instance(mod, { env: { abort: () => {}, seed: () => 0, trace: () => {} } });
 const table = new ModuleTable({ deadlineMs: 60_000 });
-await table.bindAll("bb:ws", [{ name: "ws", wasm }]);
+const modules = await table.build([{ name: "ws", wasm }]);
 
 console.log("module-call cost, in-thread vs worker-per-module — ws.wasm (RFC 6455 codec)\n");
 console.log(`${"workload".padEnd(38)}${"in-thread".padStart(12)}${"worker".padStart(12)}${"ratio".padStart(8)}`);
@@ -78,7 +78,7 @@ for (const [name, payloadLen, iters] of [
 ]) {
   const reqs = [frameReq(payloadLen, true)];
   const tIn = timeInThread(inst, reqs, iters);
-  const tW = await timeWorker(table, reqs, iters);
+  const tW = await timeWorker(modules, reqs, iters);
   console.log(`${name.padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
 }
 
@@ -94,7 +94,7 @@ for (const [name, payloadLen, iters] of [
   dec[0] = OP_DECODE_ONE; dec[1] = 1; dec.set(frame, 2); // expectMasked, whole frame
   const iters = 2000;
   const tIn = timeInThread(inst, [dec], iters);
-  const tW = await timeWorker(table, [dec], iters);
+  const tW = await timeWorker(modules, [dec], iters);
   console.log(`${"decode 64 KiB frame".padEnd(38)}${(tIn / iters * 1000).toFixed(1).padStart(10)} us${(tW / iters * 1000).toFixed(1).padStart(10)} us${(tW / tIn).toFixed(2).padStart(7)}x`);
 }
 
@@ -104,9 +104,9 @@ for (const [name, payloadLen, iters] of [
   const t0 = process.hrtime.bigint();
   for (let i = 0; i < 10; i++) {
     const t = new ModuleTable();
-    await t.bindAll("bb:spawn" + i, [{ name: "ws", wasm }]);
-    t.removeApp("bb:spawn" + i);
+    const built = await t.build([{ name: "ws", wasm }]);
+    built.dispose();
   }
   console.log(`\nbind (worker spawn + compile): ${(Number(process.hrtime.bigint() - t0) / 1e6 / 10).toFixed(1)} ms/module`);
 }
-table.removeApp("bb:ws");
+modules.dispose();

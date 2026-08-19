@@ -1,27 +1,18 @@
-// The module table (README §3, §4), as the JS targets implement it. Host code, not core:
-// the CONTRACT is core (the §4 module ABI, the bind/unbind semantics, the §4.3 memory
-// ceiling in core/wasm-limits.ts) and this is one platform's implementation of it — the
-// native target's is a wazero map in Go (native/main.go), neither more canonical.
+// The JS target's builder for one slot's private pure modules (README §3, §4). The native
+// target returns the same interface over an opaque wazero-owned handle.
 //
 // **A module call is bounded here, by construction.** The JS platform's WebAssembly
 // exposes no fuel or timeout, and a WASM call is one bytecode to QuickJS's interrupt
 // handler, so no budget can land *inside* a call (§4.3). The bound is structural instead:
-// each module lives in its own worker — a dedicated isolate, instantiated once at bind, so
+// each module lives in its own worker — a dedicated isolate, instantiated with the slot, so
 // statics live there — and a call carries a deadline. On expiry the host kills the worker
 // (`terminate` is the one interrupt JS exposes, and it works mid-loop), answers empty
 // exactly as a trap does, and respawns. A spinning module burns at most one core for at
 // most one budget. The native target holds the same contract at its own engine lever.
 //
-// The whole implementation is the two `Map`s below: `apps[appKey].get(module)`. Two levels
-// because there are two things — an app is what installs and what `revoke` removes, a
-// module is what a call resolves — and the outer key IS the ownership (§5.1), visible
-// without parsing anything. There is no shared module namespace to defend: a guest reaches
-// only its own app's modules and a table name never leaves the host.
-//
 // A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global and
 // `handle(input_len)`, imports nothing, and cannot call back. The table is the host's only
-// install state, which is why nothing here touches crypto — hashing belongs to the loader
-// (`genesisHash`, bundle.ts) and this component is the `Map` §3 says it is.
+// slot construction, which is why nothing here touches crypto.
 
 import {
   checkModuleMemory,
@@ -29,6 +20,7 @@ import {
   DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
+import type { PureModuleLoader, PureModules } from "./bundle.js";
 
 // ─── module routing ─────────────────────────────────────────────────────
 
@@ -36,7 +28,7 @@ export interface ModuleTableOptions {
   /** Ceiling on a module's declared initial *and* maximum linear memory, in bytes.
    *  A module above it — or one declaring no maximum at all — is refused at install
    *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES` that
-   *  `installBundle` also applies; lower it to hold this host's direct installs to
+   *  `loadBundleModules` also applies; lower it to hold this target's builds to
    *  something tighter than the bundle path requires. */
   maxModuleMemoryBytes?: number;
   /** Bound on one module invocation — one call, and one worker load at install — in ms,
@@ -220,11 +212,7 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
   };
 }
 
-export class ModuleTable {
-  /** The module table (§3): app key → that app's modules by logical name. A module is
-   *  bound exactly when it is a key in its app's map, so §3.1's bind / unbind / resolve are
-   *  `set` / `delete` / `get` and nothing else can disagree about what resolves. */
-  private readonly apps = new Map<string, Map<string, WasmModuleRef>>();
+export class ModuleTable implements PureModuleLoader {
 
   /** The §4.3 memory ceiling this host holds installs to. */
   private readonly maxModuleMemoryBytes: number;
@@ -256,12 +244,12 @@ export class ModuleTable {
    *
    *  Async because each module stands up a worker; this returns when every one has reported
    *  `ready`, or throws on the first `loadError`. */
-  async bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): Promise<void> {
-    if (appKey.length === 0) throw new Error("table: empty app key");
+  async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
     const built = new Map<string, WasmModuleRef>();
     try {
       for (const m of mods) {
         if (m.name.length === 0) throw new Error("table: empty module name");
+        if (built.has(m.name)) throw new Error(`table: duplicate module name ${m.name}`);
         built.set(m.name, await this.spawn(m.wasm));
       }
     }
@@ -271,11 +259,13 @@ export class ModuleTable {
       for (const ref of built.values()) this.teardown(ref);
       throw e;
     }
-    const prev = this.apps.get(appKey);
-    this.apps.set(appKey, built);
-    if (prev) {
-      for (const ref of prev.values()) this.teardown(ref);
-    }
+    return {
+      call: (name, payload, deadlineMs) => this.callModule(built, name, payload, deadlineMs),
+      dispose: () => {
+        for (const ref of built.values()) this.teardown(ref);
+        built.clear();
+      },
+    };
   }
 
   /** Stand up a module's worker. The §4.3 memory ceiling is read off the bytes HERE,
@@ -372,19 +362,16 @@ export class ModuleTable {
 
   // ─── public API ──────────────────────────────────────────────────────
 
-  /** Invoke one app's module with `payload`, returning its response bytes, or null if
-   *  nothing is bound there or the module produced no response. The scratch-region contract
-   *  (§4): write input at the module's scratch offset, call handle(input_len), read the
-   *  response back from the same offset. A guest reaches this through the seam by the bare
-   *  logical name, with the app key bound at seam construction, so it cannot address
-   *  another app's modules. Modules cannot call back, so there is no re-entrancy.
+  /** Invoke one module in this private set, returning its response bytes or null. The
+   *  scratch-region contract (§4) writes input at scratch, calls handle, and reads the
+   *  response back. The set itself is the scope, so no app key participates in lookup.
    *
    *  Async (a call crosses an isolate) and BOUNDED: `deadlineMs` is the call's whole
    *  budget, and exceeding it answers empty with the worker killed and respawned, so a
    *  module that never returns fails like a trap instead of holding the node's thread. A
    *  guest's call carries its own remaining segment (§4.3). */
-  async callModule(appKey: string, module: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null> {
-    const w = this.apps.get(appKey)?.get(module);
+  private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null> {
+    const w = modules.get(module);
     if (!w) return null;
     if (payload.length > w.scratchSize) return null;
     const bound = deadlineMs ?? this.deadlineMs;
@@ -451,26 +438,6 @@ export class ModuleTable {
       w.spawning = done;
     }
     return w.spawning;
-  }
-
-  /** Drop an app and everything it landed, returning how many modules went — the §3.1
-   *  unbind, and the whole of it. The unit is an APP, which is the key, so install and
-   *  removal are the same unit; the shell's `uninstall` and `revoke` (§12.5) are the only
-   *  callers and both mean exactly this. There is no single-module remove: a module is not
-   *  a unit anything installs, and with modules living inside their app there is no shared
-   *  namespace for a freed one to be contended for. */
-  removeApp(appKey: string): number {
-    const mods = this.apps.get(appKey);
-    if (!mods) return 0;
-    this.apps.delete(appKey);
-    for (const ref of mods.values()) this.teardown(ref);
-    return mods.size;
-  }
-
-  /** True if `module` is bound for `appKey` — the §3.1 resolve, as a predicate. A shell
-   *  uses it to check that the modules it expects a bundle to have landed are bound. */
-  isBound(appKey: string, module: string): boolean {
-    return this.apps.get(appKey)?.has(module) ?? false;
   }
 
   /** Kill a module's worker and settle everything waiting on it as empty — the module

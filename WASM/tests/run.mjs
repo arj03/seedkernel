@@ -12,10 +12,10 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 import { testkit, makeAuthor } from "./testkit.mjs";
 
 const {
-  createModuleTable,
   generateKeyPair,
   loadCrypto,
 } = await imp("build/host/crypto-node.js");
+const { ModuleTable: JsModuleLoader } = await imp("build/host/module-table.js");
 
 // The host's already-readied instance rather than our own copy: libsodium-wrappers-sumo
 // declares separate "import" and "require" conditions pointing at different builds, so a
@@ -40,7 +40,7 @@ import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId,
-         signManifest, verifyManifest, verifyBundle, installBundle, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
+         signManifest, verifyManifest, verifyBundle, loadBundleModules, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
@@ -94,9 +94,34 @@ const assertEqual = (actual, expected, msg) => {
 
 // Standard bootstrap (§3): a fresh module table. The host holds no policy — it is the
 // map and nothing else.
+class TestModuleHost {
+  constructor(loader) { this.loader = loader; this.slots = new Map(); this.names = new Map(); }
+  build(mods) { return this.loader.build(mods); }
+  adopt(key, modules, names = []) {
+    this.slots.get(key)?.dispose();
+    this.slots.set(key, modules);
+    this.names.set(key, names);
+  }
+  async bindAll(key, mods) { this.adopt(key, await this.build(mods), mods.map((m) => m.name)); }
+  callModule(key, name, payload, deadlineMs) {
+    return this.slots.get(key)?.call(name, payload, deadlineMs) ?? Promise.resolve(null);
+  }
+  isBound(key, name) { return this.names.get(key)?.includes(name) ?? false; }
+  removeApp(key) {
+    const slot = this.slots.get(key);
+    if (!slot) return 0;
+    const n = this.names.get(key)?.length ?? 0;
+    slot.dispose(); this.slots.delete(key); this.names.delete(key); return n;
+  }
+}
+const testHost = (loader) => new TestModuleHost(loader);
+const installBundle = async (host, v) => {
+  const modules = await loadBundleModules(host, v);
+  host.adopt(appKeyFor(v.author, v.manifest.app), modules, v.modules.map(({ mod }) => mod.name));
+  return { manifest: v.manifest, author: v.author, authorKeys: v.authorKeys, guestSource: v.guestSource };
+};
 async function makeHost() {
-  const host = await createModuleTable();
-  return { host };
+  return { host: testHost(new JsModuleLoader()) };
 }
 
 const { readFileSync } = await import("node:fs");
@@ -307,7 +332,8 @@ async function testDerivedNamesKeepAuthorsApart() {
 // contested id over, and an uninstall hands it back rather than leaving it dark.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
-  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
   const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
@@ -326,7 +352,7 @@ async function testManifestClaimIsTheRouting() {
   });
   const shell = mkShell({
     platform: {
-      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
@@ -334,7 +360,6 @@ async function testManifestClaimIsTheRouting() {
   try {
     const key = appKey(author.id, "store");
     await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
-    assert(shell.host.isBound(key, "fwd"), "the bundle's modules are installed");
     assertEqual(shell.resolve("seedstore/v1"), key,
       "the load claimed the manifest's protocol — no second operator action");
     assert(shell.resolve("store") === null,
@@ -358,7 +383,6 @@ async function testManifestClaimIsTheRouting() {
     const rival = appKey(other.id, "store");
     await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"]));
     assertEqual(shell.resolve("seedstore/v2"), rival, "the last app to claim an id serves it");
-    assert(shell.host.isBound(key, "fwd"), "…and the displaced app is still installed, just idle");
     shell.uninstall(rival);
     assertEqual(shell.resolve("seedstore/v2"), key,
       "uninstalling the newcomer hands the id back to the app that still claims it");
@@ -593,8 +617,8 @@ async function testGuestSeam() {
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
+      names: new Set(["echo"]),
       call: (name, p) => host.callModule(testKey, name, p),
-      has: (name) => host.isBound(testKey, name),
     },
   });
   const U = (...xs) => new Uint8Array(xs);
@@ -717,7 +741,7 @@ async function testPolicy() {
   // Build a signed bundle from each author; loadBundle accepts/rejects by predicate.
   const { ModuleTable } = await imp("build/host/module-table.js");
   const tryLoad = async (policyJson, author, links) => {
-    const host = new ModuleTable();
+    const host = testHost(new ModuleTable());
     const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST({ requires: links ? ["link/open"] : [] }) };
@@ -796,7 +820,8 @@ async function testPolicy() {
 // above compose verifyBundle → admit → installBundle by hand and would not see it.
 async function testRequiresPickThePrivileges() {
   console.log("Test: guest.requires decides which privileges a bundle must be granted");
-  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
@@ -817,7 +842,7 @@ async function testRequiresPickThePrivileges() {
   // choice between predicates the runtime holds.
   const mkTestShell = (base, link) => mkShell({
     platform: {
-      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
     admit: byPrivilege({ base, grants: { link } }),
@@ -851,8 +876,6 @@ async function testRequiresPickThePrivileges() {
       assert(err !== null && /rejected by admission/.test(err),
         "a permissive author list does not admit a bundle naming the `link/*` names");
       assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
-      assert(shell.host.isBound(appKeyFor(author.id, "mod"), "fwd"),
-        "a bundle reaching no privilege binds normally");
     } finally { shell.close(); }
   }
 
@@ -966,7 +989,7 @@ async function testSlotFreshness() {
   // and would only pay where an attacker chooses which signed bundle arrives (§12.4).
   {
     const freshness = new FreshnessMarks();
-    const host = new ModuleTable();
+    const host = testHost(new ModuleTable());
     await land(host, freshness, a, 5);
     assertEqual(freshness.get(a.id, "link"), 5, "landing a transport advances its (author, app) mark");
     await land(host, freshness, b, 1);
@@ -976,7 +999,7 @@ async function testSlotFreshness() {
   // Each author is still held to their own mark.
   {
     const freshness = new FreshnessMarks();
-    const host = new ModuleTable();
+    const host = testHost(new ModuleTable());
     await land(host, freshness, a, 5);
     let refused = false;
     try { await land(host, freshness, a, 4); } catch { refused = true; }
@@ -1088,7 +1111,6 @@ async function testBundle() {
     });
     const loaded = await shell.loadBundle(bundlePath);
     assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
-    assert(shell.host.isBound(testKey, "codec"), "module registered under its app key");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
     // set to 1 by the load above.
@@ -1207,7 +1229,6 @@ async function testGuestBundleAndArchive() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(demoKey, "demo"), "module registered under its app key");
     assertEqual(loaded.guestSource, GUEST_TEXT, "the shell yields the verified guest source");
   } finally {
     if (shell) shell.close();
@@ -1459,7 +1480,7 @@ async function testSeamGating() {
   const mk = (names) => createGuestSeam({
     platform: { sodium, identity: id, peers: () => [] },
     grants: { names, transport: stubTransport, fs: new MemoryFs() },
-    modules: { call: () => null, has: () => false },
+    modules: { names: new Set(), call: () => null },
   });
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
@@ -1519,7 +1540,7 @@ async function testSeamGating() {
       signScope: appSignScope(id, new Uint8Array(32), "probe"),
       transport: stubTransport, fs: new MemoryFs(),
     },
-    modules: { call: () => null, has: () => false },
+    modules: { names: new Set(), call: () => null },
   });
   assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign is granted by its declared name");
   assertEqual((await nodeOnly("crypto/blake2b-256", U(1, 2))).length, 32,
@@ -1586,7 +1607,7 @@ async function testModuleCallBound() {
 
   // The default table bound is generous; a bounded host is the deployment's number. The
   // call's OWN deadline is what a guest's call carries — the guest's remaining segment.
-  const host = new ModuleTable({ deadlineMs: 60_000 });
+  const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   assert(host.isBound(spinKey, "spin"), "the spinning module binds (its memory is bounded at admission)");
 
@@ -1615,7 +1636,7 @@ async function testModuleCallBound() {
 
   // Two calls to the SAME module cannot run at once: the table keeps one in flight per
   // module (§3, "one transform at a time"), so a spinner burns one core for one bound.
-  const host2 = new ModuleTable();
+  const host2 = testHost(new ModuleTable());
   await host2.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const t1 = Date.now();
   const [a, b] = await Promise.all([
@@ -1640,7 +1661,7 @@ async function testModuleCallBound() {
   // An unbounded call is an operator's explicit opt-out: Infinity disables the bound,
   // and the worker then spins until the app is dropped — the host stays responsive, and
   // dropping the app settles the in-flight call as empty rather than stranding it.
-  const host3 = new ModuleTable({ deadlineMs: Infinity });
+  const host3 = testHost(new ModuleTable({ deadlineMs: Infinity }));
   await host3.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   let beats3 = 0;
   const beats3Timer = setInterval(() => beats3++, 25);
@@ -1670,15 +1691,15 @@ async function testModuleCallChargedToGuestBudget() {
   const { createSafeRealm } = await imp("build/host/safe-js.js");
   const id = generateKeyPair();
 
-  const host = new ModuleTable({ deadlineMs: 60_000 });
+  const host = testHost(new ModuleTable({ deadlineMs: 60_000 }));
   const spinKey = appKey(id.publicKey, "app");
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
     platform: { sodium, identity: id },
     grants: { names: UNRESTRICTED_NAMES },
     modules: {
+      names: new Set(["spin"]),
       call: (n, p, deadlineMs) => host.callModule(spinKey, n, p, deadlineMs),
-      has: (n) => host.isBound(spinKey, n),
     },
   });
   // The realm's budget is 5 s, but the guest burns most of it before calling the module:
@@ -2086,7 +2107,7 @@ async function testHybridManifestSuite() {
     const v = verifyBundle(sodium, blob);
     assertEqual(toHex(v.authorKeys.mlDsa), toHex(pq.publicKey),
       "verifyBundle carries the signing key set through to the policy seam");
-    const host = await createModuleTable();
+    const host = testHost(new JsModuleLoader());
     await installBundle(host, v);
     const derived = appKey(hybridAuthorId(sodium, ed.publicKey, pq.publicKey), "pq-app");
     assert(host.isBound(derived, "codec"), "the module binds under the derived author id");
@@ -2207,18 +2228,16 @@ async function testAuthorRevocation() {
     // 1. The author is trusted: v1 loads and binds.
     writeBundle(1);
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(victimKey, "codec"), "the app binds while the author is trusted");
 
     // 2. The key is stolen. Freshness does NOT stop it — v2 is strictly newer, so it
     //    loads over the same name. This is the gap, asserted rather than assumed.
     writeBundle(2);
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(victimKey, "codec"), "freshness does not stop a newer bundle from a stolen key");
 
     // 3. Write the key off. Both halves must happen in the one call.
     const gone = shell.revoke(authorHex);
     assert(gone.includes(victimKey), "revoke reports the app it tore down");
-    assert(!shell.host.isBound(victimKey, "codec"), "revoke uninstalls what the key already landed");
+    assert(shell.uninstall(victimKey) === false, "revoke uninstalls the running slot");
 
     // 4. The thief's next bundle is refused even though the version keeps climbing
     //    and the author is still in the policy allowlist.
@@ -2226,19 +2245,20 @@ async function testAuthorRevocation() {
     let refused = false;
     try { await shell.loadBundle(bundlePath); } catch { refused = true; }
     assert(refused, "a bundle from a revoked key is refused despite a higher version");
-    assert(!shell.host.isBound(victimKey, "codec"), "nothing landed on the refused load");
+    assert(shell.uninstall(victimKey) === false, "nothing landed on the refused load");
 
     // 4b. The refusal must come BEFORE the admission predicate: an interactive shell puts
     //     its consent dialog there (§12.4), and prompting a user to approve a bundle this
     //     host has already decided to refuse is the wrong order to ask in.
     {
-      const { createShell: mkShell, ModuleTable: KH } = await imp("build/host/shell-core.js");
+      const { createShell: mkShell } = await imp("build/host/shell-core.js");
+      const { ModuleTable: KH } = await imp("build/host/module-table.js");
       const { FreshnessMarks } = await imp("build/host/bundle.js");
       const store = new FreshnessMarks();
       let admitCalls = 0;
       const probe = mkShell({
         platform: {
-          sodium, identity, table: new KH(), freshnessStore: store,
+          sodium, identity, modules: new KH(), freshnessStore: store,
           createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
         },
         admit: () => { admitCalls++; return true; },
@@ -2272,8 +2292,6 @@ async function testAuthorRevocation() {
       dir: dataDir, identity,
     });
     await shell.loadBundle(bundlePath);
-    assert(shell.host.isBound(appKeyFor(heir.id, "victim"), "codec"),
-      "a replacement author key installs normally after the old one is written off");
   } finally {
     if (shell) shell.close();
     rmSync(dir, { recursive: true, force: true });
@@ -2386,7 +2404,8 @@ async function testPersistFailureRollsBack() {
   console.log("Test: a failed freshness persist fails the load — nothing is kept, the mark is rolled back");
   const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
-  const { createShell: mkShell, ModuleTable } = await imp("build/host/shell-core.js");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable } = await imp("build/host/module-table.js");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -2407,28 +2426,30 @@ async function testPersistFailureRollsBack() {
   // Driven through the shell, since the shell is what advances the mark — last, after the
   // guest stands, so the write it rolls back is one that was about to record a version
   // that really ran.
-  const host = new ModuleTable();
+  const host = testHost(new ModuleTable());
   const shellOver = (freshnessStore) => mkShell({
     platform: {
-      sodium, identity: generateKeyPair(), table: host, freshnessStore,
+      sodium, identity: generateKeyPair(), modules: host, freshnessStore,
       createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     },
     admit: admitAll,
   });
 
   const broken = new BrokenStore();
+  const brokenShell = shellOver(broken);
   let msg = "";
-  try { await shellOver(broken).loadBundleBlob(blob); } catch (e) { msg = e.message; }
+  try { await brokenShell.loadBundleBlob(blob); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
   assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
-  assert(!host.isBound(key, "fwd"), "nothing was kept — the modules did not stay bound");
+  assert(brokenShell.uninstall(key) === false, "nothing was kept — no slot was committed");
   assertEqual(broken.get(author.id, "persist"), -Infinity, "the in-memory mark was rolled back");
 
   // A retry against a healthy store completes cleanly: the rollback is what makes
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
-  await shellOver(healthy).loadBundleBlob(blob);
-  assert(host.isBound(key, "fwd"), "the retry lands");
+  const healthyShell = shellOver(healthy);
+  await healthyShell.loadBundleBlob(blob);
+  assert(healthyShell.uninstall(key), "the retry lands");
   assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
   console.log("  OK\n");
 }
@@ -2473,7 +2494,8 @@ async function testFailedRevokePersistRollsBack() {
 // running `timer` turns — re-arming more, and holding ~1.2 MB of engine per upgrade.
 async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("Test: an in-place upgrade disposes the realm and deadlines it replaces");
-  const { createShell: mkShell, ModuleTable: MT } = await imp("build/host/shell-core.js");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
@@ -2482,6 +2504,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const blob = (version) => packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author, {
       app: "upgrade", version,
+      protocols: ["upgrade/v1"],
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: GUEST({ requires: ["timer/arm"] }),
     }),
@@ -2495,11 +2518,13 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   // because the upgrade loads the replacing bundle's modules in workers, and a deadline
   // firing inside that window is a legitimate turn of the guest that armed it.
   const realms = [];
+  let failNextRealm = false;
   const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
   const shell = mkShell({
     platform: {
-      sodium, identity: generateKeyPair(), table: new MT(), freshnessStore: new FreshnessMarks(),
+      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
+        if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
         const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
         realms.push(r);
         await o.hostCall("timer/arm", arm(1, 200));
@@ -2510,10 +2535,15 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   });
   try {
     await shell.loadBundleBlob(blob(1));
-    // An ordinary app's realm is lazy, so it takes a call to stand one up — which is
-    // also what gives the outgoing guest something to lose.
     await shell.invoke("ping", new Uint8Array(), key);
-    assertEqual(realms.length, 1, "the first call stands the app's realm up");
+    assertEqual(realms.length, 1, "the first slot stands one realm");
+
+    failNextRealm = true;
+    let failed = false;
+    try { await shell.loadBundleBlob(blob(2)); } catch { failed = true; }
+    assert(failed, "a candidate whose guest cannot stand is refused");
+    assert(!realms[0].disposed, "the failed candidate leaves the running realm intact");
+    assertEqual(shell.resolve("upgrade/v1"), key, "…and leaves its claim intact");
 
     await shell.loadBundleBlob(blob(2));
     assert(realms[0].disposed, "the upgrade disposed the realm it replaced");

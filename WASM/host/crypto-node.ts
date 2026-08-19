@@ -10,7 +10,6 @@
 // (docs/EXPORTS.md).
 
 import { readFileSync } from "node:fs";
-import { ModuleTable } from "./module-table.js";
 import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "./pq.js";
 import { withMlKem768, loadMlKem768 } from "./kem.js";
 
@@ -40,14 +39,6 @@ function ensurePq(): Promise<void> {
     ]).then(() => {});
   }
   return pqReady;
-}
-
-/** Await crypto readiness and stand up a ModuleTable. The module table is host
- *  state — there is no blob to load — so booting is "ready the crypto, done"
- *  (§3); installing bundles stays the caller's job. */
-export async function createModuleTable(): Promise<ModuleTable> {
-  await ensureCrypto();
-  return new ModuleTable();
 }
 
 // Every half of the crypto surface, always together. A caller that awaited only
@@ -84,5 +75,3 @@ export function generateKeyPair(): {
   const kp = sodium.crypto_sign_keypair();
   return { publicKey: kp.publicKey, privateKey: kp.privateKey };
 }
-
-export { ModuleTable } from "./module-table.js";

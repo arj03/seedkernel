@@ -177,7 +177,10 @@ func realmString(expr string) string {
 // The stub guest every test bundle that does not exercise the guest declares: every
 // app is a guest (§12.4), so the one app shape ships a guest program even when the
 // test's point is elsewhere (policy, freshness, suite admission…).
-const stubGuestSrc = "register('ping', () => new Uint8Array([1]));"
+const stubGuestSrc = `register("handle", async (arg) => {
+	const { body } = callerOf(arg);
+	return host.call("fwd", readOp(body).args);
+});`
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
@@ -189,8 +192,7 @@ func writeTestBundle(t testing.TB, a authorKeys, app string, version int) (strin
 
 // writeBundle assembles a signed bundle FILE: one forwarder module ("fwd") plus the given
 // guest, under an author-signed manifest. A zero guestSrc falls back to the stub — every
-// app is a guest (§12.4). Returns the bundle's path and the app key its modules bind
-// under. Requires a booted realm (it hashes with the booted sodium).
+// app is a guest (§12.4). Returns the bundle's path and host audit identity.
 func writeBundle(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) (string, string) {
 	t.Helper()
 	if guestSrc == "" {
