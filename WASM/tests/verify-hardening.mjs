@@ -38,7 +38,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
 /** Await a promise and assert it rejects — the async form of `throws`, which is what a
- *  bind that stands up workers now needs (bindAll is async). */
+ *  build that stands up workers now needs (`PureModuleLoader.build` is async). */
 const rejects = async (p, msg) => { let threw = false; try { await p; } catch { threw = true; } ok(threw, msg); };
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
@@ -56,22 +56,22 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
   const host = new ModuleTable();
-  await host.bindAll("aa:app", [{ name: "ok", wasm: withMax }]);
-  ok(host.isBound("aa:app", "ok"), "ModuleTable binds a bounded module");
-  await rejects(host.bindAll("aa:app", [{ name: "bad", wasm: noMax }]),
+  const loaded = await host.build([{ name: "ok", wasm: withMax }]);
+  ok((await loaded.call("ok", new Uint8Array())) instanceof Uint8Array,
+    "ModuleTable builds a bounded module set");
+  await rejects(host.build([{ name: "bad", wasm: noMax }]),
     "ModuleTable refuses an unbounded module at install");
   const tiny = new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 });
-  await rejects(tiny.bindAll("aa:app", [{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
+  await rejects(tiny.build([{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was. The host's guarantee, so a caller does nothing to earn it.
   const atomic = new ModuleTable();
-  await rejects(atomic.bindAll("aa:app", [
+  await rejects(atomic.build([
     { name: "first", wasm: withMax },
     { name: "second", wasm: noMax },
   ]), "a bundle with one bad module is refused whole");
-  ok(!atomic.isBound("aa:app", "first"), "the good module of a refused bundle did not land");
-  ok(!atomic.isBound("aa:app", "second"), "neither did the bad one");
+  loaded.dispose();
 }
 
 console.log("\n§12.2 — fs is scoped per app key");
@@ -124,7 +124,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   const base = {
     platform: { sodium, identity, peers: () => [] },
     grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs() },
-    modules: { call: () => null, has: () => false },
+    modules: { names: new Set(), call: () => null },
   };
   throws(() => createGuestSeam({ ...base }), "omitting grants.names throws at construction");
   ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: UNRESTRICTED_NAMES } }) === "function",
@@ -134,21 +134,19 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
   // bundle's own code, scoped by the app key the seam was wired with, so it resolves under
   // an empty requires set exactly like `crypto`.
   const chat = new ModuleTable();
-  await chat.bindAll("aa:chat", [{ name: "codec", wasm: withMax }]);
-  await chat.bindAll("bb:other", [{ name: "evil", wasm: withMax }]);
+  const chatModules = await chat.build([{ name: "codec", wasm: withMax }]);
+  const otherModules = await chat.build([{ name: "evil", wasm: withMax }]);
   const scoped = createGuestSeam({
     ...base,
     grants: { ...base.grants, names: [] },
-    modules: {
-      call: (n, p, deadlineMs) => chat.callModule("aa:chat", n, p, deadlineMs),
-      has: (n) => chat.isBound("aa:chat", n),
-    },
+    modules: { names: new Set(["codec"]), call: chatModules.call },
   });
   // The forwarder echoes its input, so a resolved module answers with the body. A module
   // call is async since ABI 6 (it round-trips through the module's worker).
   ok((await scoped("codec", new Uint8Array([7, 7, 7]))).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
     "another app's module name reaches nothing through this seam");
+  chatModules.dispose(); otherModules.dispose();
 }
 
 console.log("\n§4.3 — the guest realm has an execution budget");
@@ -244,7 +242,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   let seen = null;
   const shell = createShell({
     platform: {
-      sodium, identity: kp.ed, table: new ModuleTable(), fs: new MemoryFs(),
+      sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen = o;
@@ -275,7 +273,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   let seen2 = null;
   const bare = createShell({
     platform: {
-      sodium, identity: kp.ed, table: new ModuleTable(), fs: new MemoryFs(),
+      sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
         seen2 = o;
@@ -326,7 +324,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   };
   const newShell = () => createShell({
     platform: {
-      sodium, identity: kp.ed, table: new ModuleTable(),
+      sodium, identity: kp.ed, modules: new ModuleTable(),
       freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
     },
     admit: admitAll,
@@ -367,7 +365,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const entries = [];
   const stub = createShell({
     platform: {
-      sodium, identity: kp.ed, table: new ModuleTable(),
+      sodium, identity: kp.ed, modules: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
     },

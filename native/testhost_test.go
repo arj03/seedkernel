@@ -103,6 +103,12 @@ func loadBundle(path string) string {
 	return string(out)
 }
 
+// invokeBundle drives a loaded slot through its guest; pure modules are intentionally
+// unreachable from the host test seam except through this path.
+func invokeBundle(appKey string, payload []byte) ([]byte, error) {
+	return callRealm("invokeApp", 30*time.Second, qc.NewString(appKey), qc.NewArrayBuffer(payload))
+}
+
 // bootShell stands a whole node up exactly as the binary does — bootRealm, then
 // bootNode inside the realm (identity, network, createShell over this platform).
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all

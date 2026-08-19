@@ -1,6 +1,6 @@
 // The shell's admission predicate (README §12.5) — ONE pure function, asked once, on
 // the one install path. Admission is the single seam between verifyBundle and
-// installBundle (§12.4): governance is this file, mechanics is installBundle.
+// slot construction (§12.4): governance is this file, mechanics follows admission.
 //
 // **One predicate, not a scatter of gates.** A revocation check, a version floor and a
 // per-capability operator predicate compose into one `Admit` at shell construction and are

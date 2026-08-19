@@ -7,12 +7,6 @@ import (
 	"testing"
 )
 
-// boundToWasm reports whether an app's module resolves — through the module table, the way
-// every call path resolves it — to an installed wasm module.
-func boundToWasm(appKey, module string) bool {
-	return apps[appKey][module] != nil
-}
-
 // TestScratchRegion covers the §4.1 reservation on this target: a module that declares no
 // `scratchSize` gets the 128 KB default, and the host clamps its I/O to what it reserved
 // rather than to whatever its linear memory happens to allow. The forwarder reserves a
@@ -21,15 +15,15 @@ func boundToWasm(appKey, module string) bool {
 // seedstore's RS codec, which reserves 2 MB; no in-repo fixture declares one.)
 //
 // The default itself is the shared host's number (core/wasm-limits.ts
-// DEFAULT_SCRATCH_SIZE), passed by the shim at every bindAll; the test mirrors it,
+// DEFAULT_SCRATCH_SIZE), passed by the shim at every slot build; the test mirrors it,
 // since Go no longer owns a copy.
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp")
-	if err := bindAll(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
-		t.Fatalf("bindAll(forwarder) refused: %v", err)
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		t.Fatalf("buildModuleSlot(forwarder) refused: %v", err)
 	}
-	w := apps[key]["fwd"]
+	w := moduleSlots[key]["fwd"]
 	if w.size != 0x20000 {
 		t.Fatalf("a module exporting no scratchSize should get the 128 KB default, got %d",
 			w.size)
@@ -62,7 +56,8 @@ func TestBundleModuleRuns(t *testing.T) {
 		t.Fatalf("bundle load: %s", status)
 	}
 	msg := []byte("relayed")
-	if r := callModule(appKey, "fwd", msg); !bytes.Equal(r, msg) {
+	r, err := invokeBundle(appKey, msg)
+	if err != nil || !bytes.Equal(r, msg) {
 		t.Fatalf("bundle module echo = %q, want %q (module ran + host read its response)", r, msg)
 	}
 }
@@ -87,6 +82,30 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 	badPath, _ := signBundleJSON(t, author, "badclaim", claimManifest(t, "badclaim", "bad id"), stubGuestSrc)
 	if status := loadBundle(badPath); !strings.Contains(status, "malformed manifest") {
 		t.Fatalf("a malformed protocol id must be refused at the load: %s", status)
+	}
+
+	// `_net` is where every accepted link's RAW bytes are handed in, before any peer has
+	// authenticated, so it is claimable only by a bundle that reaches `link` (§12.10). This
+	// author is on the plain `authors` list and holds no `link` grant, and `claimManifest`
+	// declares no requires — an ordinary app, which is exactly what must not be able to
+	// take the id: it would read the node's unauthenticated traffic ungranted, and squat
+	// the claim the real transport needs. Refused at VERIFY, since the privilege is derived
+	// from the same signed manifest — so this fails identically under any policy.
+	netPath, _ := signBundleJSON(t, author, "netsquat", claimManifest(t, "netsquat", "_net"), stubGuestSrc)
+	if status := loadBundle(netPath); !strings.Contains(status, `claimable only by a bundle that reaches "link"`) {
+		t.Fatalf("an ordinary app claiming _net must be refused by name: %s", status)
+	}
+	// `_host` is the shell's own and answered rather than routed, so nobody claims it —
+	// the other reserved id refused by name rather than as a syntax error.
+	hostPath, _ := signBundleJSON(t, author, "hostsquat", claimManifest(t, "hostsquat", "_host"), stubGuestSrc)
+	if status := loadBundle(hostPath); !strings.Contains(status, "reserved for the host") {
+		t.Fatalf("a bundle claiming _host must be refused by name: %s", status)
+	}
+	// An ordinary `_`-led id is a LOCAL service name no peer can reach, so it claims like
+	// any other id: the reservation is about routing, not about authority.
+	localPath, appKey2 := signBundleJSON(t, author, "offerapp", claimManifest(t, "offerapp", "_offer"), stubGuestSrc)
+	if status := loadBundle(localPath); status != loadedLine("offerapp", 1, appKey2, "_offer") {
+		t.Fatalf("an ordinary reserved id claims like any other: %s", status)
 	}
 }
 

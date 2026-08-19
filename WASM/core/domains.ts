@@ -59,11 +59,18 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  thing they are, and this is what keeps the loader from importing the whole name catalog
  *  and preamble to check one manifest field. guest-seam.ts re-exports it.
  *
- *  At 6 a bare name — one of the asking bundle's own modules — is on the ASYNC side of the
- *  catalog: a module call round-trips so it can be bounded (§4.3). 5 is refused rather than
- *  tolerated, since a guest written against it reads `host.call("codec", …)` synchronously
- *  and would get a Promise where it expects bytes. */
-export const GUEST_ABI_VERSION = 6;
+ *  At 7 `link/config` answers immutable node identity and deployment limits only: the
+ *  mutable address book left that snapshot and arrives as ordinary `addr` events once `_net`
+ *  is published (§12.6). That is a payload framing change, so 6 is refused rather than
+ *  tolerated — a guest written against it reads the removed trailing field off the end of
+ *  the buffer, where a short read is indistinguishable from an empty one, and comes up with
+ *  a correct identity and an address book of nobody. It dials no peer and reports nothing,
+ *  which is precisely the silent wrong answer this number exists to turn into a refused
+ *  load.
+ *
+ *  A bare name — one of the asking bundle's own modules — has been on the ASYNC side of the
+ *  catalog since 6: a module call round-trips so it can be bounded (§4.3). */
+export const GUEST_ABI_VERSION = 7;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half of
  *  the seam, and NOT something a manifest declares: `cryptoCatalog` (guest-seam.ts) is
  *  total over this list, so a partial catalog is unrepresentable and there is nothing for a
@@ -138,6 +145,7 @@ export const AUTHORITY_CALLS = {
     "clock/now": "app",
     "timer/arm": "app",
     "timer/clear": "app",
+    "link/config": "link",
     "link/open": "link",
     "link/send": "link",
     "link/close": "link",
@@ -174,16 +182,21 @@ export const PRIVILEGE_LINK = "link" satisfies Privilege;
 // caller's promise, exactly as `fs/*` does. And a callable id is a GRANT, declared in
 // `requires` like any authority, so the call graph an operator reads off the bundles is
 // the call graph.
-/** A reserved id — one the runtime answers or routes ahead of ordinary dispatch, and one
- *  no bundle's `protocols` may spell unless it holds the privilege that owns it. The test
- *  is the first character, which is also the charset rule (§12.10). */
+/** A reserved id — one routed between local realms ahead of ordinary dispatch. The
+ *  spelling carries no authority on its own; two ids are singled out by name in
+ *  `verifyManifest` — `_host`, which the shell answers rather than routes, and `_net`,
+ *  which only a bundle reaching `link` may claim. The test is the first character, which
+ *  is also the charset rule (§12.10). */
 export function isReservedProtocol(name: string): boolean {
     return name.charCodeAt(0) === 0x5f; // "_"
 }
-/** The id the transport claims, and the one every app's outbound network call names. It
- *  is an ordinary protocol claim — the transport is reached by the same call the host uses
- *  to dispatch an inbound frame, with the caller's app key prepended exactly as the
- *  sender's key is prepended inbound. */
+/** The id the transport claims, and the one every app's outbound network call names. It is
+ *  routed like any claim — the transport is reached by the same call the host uses to
+ *  dispatch an inbound frame, with the caller's app key prepended exactly as the sender's
+ *  key is prepended inbound. CALLING it is ungoverned, an ordinary `requires` entry any app
+ *  may declare. CLAIMING it is not: this is where every accepted link's raw bytes are
+ *  handed in, so `verifyManifest` refuses the claim to a bundle that does not reach
+ *  `link`. */
 export const NET_PROTOCOL = "_net";
 /** The id the SHELL answers itself, ahead of dispatch — the transport's way back to the
  *  host for the things that are genuinely pushes: an inbound frame, and the auth or

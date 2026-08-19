@@ -14,7 +14,7 @@
 //
 // The format is application-neutral; seedstore fills in storage content.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, PRIVILEGE_LINK, isAuthority, isGrant, isReservedProtocol, NET_PROTOCOL, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, PRIVILEGE_LINK, isAuthority, isGrant, isReservedProtocol, NET_PROTOCOL, SHELL_PROTOCOL, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -82,13 +82,14 @@ export interface BundleManifest {
      *  frames and claims nothing. Empty and absent mean the same thing.
      *
      *  A claim is not authority — it routes frames a peer already sent here, to code this
-     *  node already admitted (§12.5). The last claimant of an id wins, so installing an app
-     *  takes a protocol over from an installed one, which stays installed and idle and
-     *  resumes if the newcomer is uninstalled (shell-core `rebuildRoutes`).
+     *  node already admitted (§12.5). One installed slot owns a claim at a time; another
+     *  identity must wait for it to be released rather than silently shadowing it.
      *
-     *  The transport claims exactly one: the reserved `_net`, which is what makes it
-     *  reachable. Not a routing special case, only a spelling one — the charset reserves
-     *  `_`-led ids and `verifyManifest` grants the exception to a bundle holding `link`. */
+     *  The transport claims `_net`, which is what makes it reachable. The claim does not
+     *  GRANT link access — `guest.requires` and policy decide that — but it does require
+     *  it: `_net` is where every accepted link's raw bytes land, so `verifyManifest` refuses
+     *  the claim to a bundle that does not reach `link`. Every other `_`-led id is an
+     *  ordinary claim; `_host` alone is the shell's and is claimable by nobody. */
     protocols?: string[];
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
@@ -175,39 +176,22 @@ export interface FreshnessStore {
     /** Roll a mark back to a captured previous value — the one legal rewind, for the load
      *  that raised the mark and then failed to persist it, so the in-memory state matches
      *  the store the retry will persist against. `previous` is what `get` returned before
-     *  the load (−Infinity when unmarked). Optional; the load fails loudly either way. */
-    resetMark?(author: Uint8Array, app: string, previous: number): void;
+     *  the load (−Infinity when unmarked). */
+    resetMark(author: Uint8Array, app: string, previous: number): void;
 }
 
-/** The one host power a bundle load needs: land a bundle's modules on the module table,
- *  all or none. `ModuleTable` satisfies it; the native loader forwards it over its Go
- *  bridge (§12.9).
- *
- *  Atomicity is the host's because the host is the party holding the half-built instances
- *  when the third module turns out to be malformed. A caller-side instantiate/bind/discard
- *  triad would make every target re-implement the same accumulate-and-release loop, and
- *  one that forgot the release would leak a linear memory per rejected bundle.
- *
- *  Hashing is deliberately not here (`genesisHash` takes the crypto), so the component that
- *  owns the module table needs no crypto at all (§3). */
-export interface BundleHost {
-    /** Compile, instantiate and validate every module against the §4 ABI, then bind them
-     *  as `appKey`'s module set under their LOGICAL names, replacing whatever that app
-     *  held — the caller already ran admission (§12.4, §12.5), and an app key is only ever
-     *  reachable by the author whose key is half of it.
-     *
-     *  Throws on any structural failure **with the table untouched**, releasing whatever
-     *  was built before the failure.
-     *
-     *  May be async: the JS targets stand each module up in its own worker (§4.3), so the
-     *  bind returns once every worker has loaded. */
-    bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void | Promise<void>;
-    /** Unbind an app's whole module set, returning how many modules went. Wanted for the
-     *  two loads that land modules and then fail: a guest that will not stand, and a mark
-     *  that will not persist (shell-core.ts `loadBundleBlob`). A host that omits it still
-     *  fails those loads loudly, it just leaves the modules on the table until the retry
-     *  replaces them. */
-    removeApp?(appKey: string): number;
+/** One slot's private pure modules. The builder owns partial-instance cleanup, because it
+ *  is the target holding those resources when a later module fails. */
+export interface PureModules {
+    call(name: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null>;
+    dispose(): void;
+}
+
+/** The one target-specific power a bundle load needs: build all of its pure modules or
+ *  build none. JS returns closures over worker-backed instances; native returns closures
+ *  over an opaque Go-owned slot. */
+export interface PureModuleLoader {
+    build(mods: { name: string; wasm: Uint8Array }[]): PureModules | Promise<PureModules>;
 }
 
 export interface VerifiedBundle {
@@ -227,8 +211,8 @@ export interface VerifiedBundle {
     guestSource: string;
 }
 
-/** What the shell returns from `loadBundleBlob`: everything the manifest proved,
- *  minus the raw module bytes already bound into the module table. */
+/** What the shell returns from `loadBundleBlob`: verified metadata and guest source,
+ *  without retaining the raw module bytes after the private instances are built. */
 export type LoadedBundle = Omit<VerifiedBundle, "modules">;
 
 /** The manifest envelope's name inside the container. */
@@ -237,9 +221,9 @@ export const MANIFEST_FILE = "manifest.bundle";
 export const GUEST_FILE = "guest.js";
 /** A module's name inside the container, derived from its logical name. */
 export function moduleFile(name: string): string { return name + ".wasm"; }
-/** An app's identity: `"<author hex>:<app>"` (§12.4) — the freshness key (FreshnessMarks
- *  below), the module-table key (§5.1), and what protocol routing points at (§12.10). Both
- *  halves are signed, so it is derived from the manifest, never declared.
+/** An app's host-internal identity: `"<author hex>:<app>"` (§12.4) — used for freshness,
+ *  scope derivation, audit output, and explicit operator selection. Claims route directly
+ *  to slots and module calls stay on the slot's private value.
  *
  *  Ownership is structural: a second author shipping an app called `chat` gets a different
  *  key and installs alongside, never over — so the loader keeps no ownership register and
@@ -247,16 +231,13 @@ export function moduleFile(name: string): string { return name + ".wasm"; }
  *  short prefix would be grindable. Fixed-length regardless, so the two halves stay
  *  readable even when `app` contains `:`.
  *
- *  Nothing derives a per-module name from this: an app's modules live in a map UNDER this
- *  key by their logical names (`ModuleTable.callModule`). App keys never leave the host
- *  either — peers send a protocol id or an opcode, which the receiver resolves through its
- *  own routing, and a guest addresses its modules by bare name. */
+ *  Peers never send it: they send a protocol claim, which the receiver resolves locally. */
 export function appKeyFor(author: Uint8Array, app: string): string {
     return toHex(author) + ":" + app;
 }
 /** The genesis hash (BLAKE2b-256, §5.1) — the one system hash: a module's `bytesHash`, a
  *  manifest's `modules[].hash`. A free function taking the crypto rather than a host
- *  method, so the module table stays a `Map` with no crypto dependency (§3). */
+ *  method, so target module builders need no crypto dependency (§3). */
 export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
 }
@@ -316,10 +297,10 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  *  most 64 bytes. These travel on the wire and are what a receiving host routes by, so the
  *  whitespace, control and lookalike characters an operator could not tell apart are out. */
 const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
-/** A RESERVED protocol id: the same charset behind a leading `_`. These are the runtime's
- *  own — `_net`, claimed by the transport, and `_host`, answered by the shell — and the
- *  only ids a guest may CALL (core/domains.ts). Shape only; who may claim one is a
- *  privilege question, answered in `verifyManifest`. */
+/** A reserved protocol id: the same charset behind a leading `_`. These are local
+ *  cross-realm service names, reachable by no peer and the only ids a guest may CALL
+ *  (core/domains.ts). Shape only — who may CLAIM one is decided below, where `_host` is
+ *  refused to everyone and `_net` to anything that does not reach `link`. */
 const RESERVED_PROTO_RE = /^_[A-Za-z0-9._/-]{1,63}$/;
 /** Canonical manifest bytes. The signed envelope carries these verbatim and the verifier
  *  parses the exact bytes it checked, so there is no separate canonicalisation — the bytes
@@ -418,8 +399,8 @@ function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof m !== "object" || m === null || Array.isArray(m))
         return false;
     const o = m as Record<string, unknown>;
-    // `app` scopes the guest's signing namespace (guestSignScope), keys the freshness
-    // mark, and is half of every module's app key. guestSignScope encodes the name in one
+    // `app` scopes guest signatures and keys freshness/audit identity. appSignScope
+    // encodes the name in one
     // length byte, so a name over 255 UTF-8 bytes would verify and install but throw on
     // the guest's first call — refused here, where the error names the rule.
     if (typeof o.app !== "string" || o.app.length === 0)
@@ -576,16 +557,31 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
             throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
         }
     }
-    // A RESERVED id may be claimed only by a bundle holding the privilege it belongs to:
-    // today, `_net` by whatever reaches `link` (§12.10). `_host` is the shell's and is
-    // claimable by nobody — it is answered, not routed.
-    const reserved = (parsed.protocols ?? []).filter(isReservedProtocol);
-    if (reserved.length > 0) {
-        const links = privilegesOf(parsed).includes(PRIVILEGE_LINK);
-        const bad = reserved.filter((p) => !(links && p === NET_PROTOCOL));
-        if (bad.length > 0) {
-            throw new Error(`bundle: "${bad.join(", ")}" is reserved (§12.10) — ${NET_PROTOCOL} is claimable only by a bundle that reaches "${PRIVILEGE_LINK}", and no bundle claims any other reserved id`);
-        }
+    // TWO ids the format hands out on terms of its own, checked here because both are pure
+    // facts about the manifest (§12.10).
+    //
+    // `_host` is answered by the shell rather than routed, so nobody claims it.
+    //
+    // `_net` is the id inbound RAW LINK BYTES are handed to — every accepted socket, from
+    // any peer, before anything has authenticated. Only a bundle that reaches `link` may
+    // claim it, because otherwise a bundle the operator admitted as an ordinary app would
+    // read the node's whole unauthenticated network traffic without ever being granted the
+    // privilege that governs exactly that. It would also be a squat: a claim has one active
+    // owner, so an app taking `_net` first would stop the real transport from installing at
+    // all. It is a shape rule over an already-signed fact — `privilegesOf` reads the same
+    // `guest.requires` admission reads to ask the operator's `grants.link` (§12.5) — so it
+    // belongs here with the other well-formedness rules rather than in the predicate, and
+    // adds no second vocabulary. Declaring `link` is not the other half: a link-capable
+    // bundle that claims nothing is an ordinary initiator (§12.8).
+    //
+    // Every OTHER `_`-led id is an ordinary claim under the ordinary rule: a local
+    // cross-realm service name, reachable by no peer, carrying no authority in its spelling.
+    const claims = parsed.protocols ?? [];
+    if (claims.includes(SHELL_PROTOCOL)) {
+        throw new Error(`bundle: "${SHELL_PROTOCOL}" is reserved for the host (§12.10) and cannot be claimed`);
+    }
+    if (claims.includes(NET_PROTOCOL) && !privilegesOf(parsed).includes(PRIVILEGE_LINK)) {
+        throw new Error(`bundle: "${NET_PROTOCOL}" is claimable only by a bundle that reaches "${PRIVILEGE_LINK}" (§12.10) — it is handed every accepted link's raw bytes, so a bundle declaring no "${PRIVILEGE_LINK}/*" authority may not serve it`);
     }
     return { author, authorKeys, manifest: parsed };
 }
@@ -812,9 +808,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     }
     return result;
 }
-/** Land a verified bundle (§12.4 steps 4b, 5b): instantiate every verified module and bind
- *  them atomically. Any module failing fails the whole load — a half-landed bundle is the
- *  incoherent state the manifest exists to prevent.
+/** Build a verified bundle's private module set. Any module failing releases the partial
+ *  set and fails the candidate slot.
  *
  *  Admission (§12.5) runs BEFORE this, as the one predicate (policy.ts `Admit`), which is
  *  where revocation and the version floor live. So this is mechanics only.
@@ -825,7 +820,7 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
  *
  *  There is no per-module admission callback: `modules[].hash` commits to exactly which
  *  bytes are authorized and `verifyBundle` proved they match. */
-export async function installBundle(host: BundleHost, v: VerifiedBundle): Promise<LoadedBundle> {
+export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundle): Promise<PureModules> {
     // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
     // instantiation is what allocates the declared initial memory, so a host-side check
     // could only run after the damage. An admission rule, so §3 puts it in the one
@@ -834,19 +829,12 @@ export async function installBundle(host: BundleHost, v: VerifiedBundle): Promis
     for (const { wasm } of v.modules) {
         checkModuleMemory(wasm, DEFAULT_MAX_MODULE_MEMORY_BYTES);
     }
-    // One transactional call: every module lands or none does, and the host owns that
-    // guarantee (BundleHost). They land under the app key DERIVED from the signed
-    // `(author, app)` pair (§5.1), so a reload re-installs and a higher-version bundle
-    // from the same author replaces the same app's map.
+    // One transactional call: every module stands or none does, and the target owns that
+    // guarantee because it holds the half-built instances.
     try {
-        await host.bindAll(appKeyFor(v.author, v.manifest.app),
-            v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
+        return await host.build(v.modules.map(({ mod, wasm }) => ({ name: mod.name, wasm })));
     }
     catch (e) {
         throw new Error(`bundle: module ${errMessage(e)}`, { cause: e });
     }
-    return {
-        manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
-        guestSource: v.guestSource,
-    };
 }

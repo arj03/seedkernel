@@ -93,6 +93,9 @@ export interface SeamCalls {
  *  implementation does anyway, a socket not delivering during the write that provoked
  *  it. */
 export interface RawNet {
+    /** This node's link configuration. Reading it has no side effects, so a candidate
+     *  slot may initialize before it is published. */
+    config(): Uint8Array;
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
      *  host resolves the name in its own address book; the caller learns no route it could
@@ -173,10 +176,10 @@ export interface SeamGrants {
 /** Per-APP: this bundle's OWN WASM modules, by the logical names its manifest declared.
  *
  *  Not a grant and not gated — the code was installed and verified with the guest, so
- *  calling one reaches nothing the guest does not already hold. The shell binds the app key
- *  when it wires the seam, so what arrives here is already scoped: "a guest reaches only
- *  its own modules" is the shape rather than a lookup that could be omitted. */
+ *  calling one reaches nothing the guest does not already hold. The slot wires this
+ *  private value directly, so there is no wider module namespace to scope. */
 export interface SeamModules {
+    names: ReadonlySet<string>;
     /** Reach one of this app's modules through the SAME `host.call` as everything else, by
      *  the bare logical name (§12.2) — the dispatch knows a bare name is one of these
      *  because no host name is bare.
@@ -185,11 +188,6 @@ export interface SeamModules {
      *  crosses an isolate). `deadlineMs` is the calling guest's REMAINING execution segment
      *  (§4.3), computed by the realm — host plumbing, never guest-supplied. */
     call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<Uint8Array | null> | null;
-    /** Whether this app declares a module by that name — one error surface over the unified
-     *  catalog, so an unknown name is refused whichever half it came from. It cannot be
-     *  read off `call`, whose `null` also means a trap: a module that FAILS answers empty,
-     *  and only a name that was never installed is a refusal. */
-    has: (name: string) => boolean;
 }
 
 /** Everything the seam needs, in the three groups that own it. */
@@ -691,6 +689,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // whole of what the platform contributes to the network (§12.1). No peer, no
         // protocol id, no correlation: those are the transport's own. Inbound bytes arrive
         // the other way, as ordinary invocations of the transport's `handle`.
+        "link/config": () => rawNet().config(),
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);
@@ -795,14 +794,13 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
                 throw new Error("guest-seam: no realm claims " + name);
             return answer;
         }
-        // A bare name is one of THIS bundle's own modules, by the logical name from its
-        // manifest (§5.1) — the name it is bound under in this app's module map, so there
-        // is nothing to resolve and no scoping to apply. The app key was fixed when the
-        // shell wired this seam, so no name reaches another app. Ungated like `crypto/*`.
+        // A bare name is one of THIS slot's private modules, by its manifest name. The
+        // slot wired this value directly, so no name can reach another app. Ungated like
+        // `crypto/*`.
         //
         // A name the app never installed is a typo, refused by name like an unknown host
         // name. A module that runs and FAILS is a different event and answers empty bytes.
-        if (!modules.has(name))
+        if (!modules.names.has(name))
             throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
         // A module call is the one name charged to the caller's segment on BOTH sides
         // (§4.3): it runs under what the guest has left, and what it burns is billed back

@@ -2,18 +2,18 @@
 // it. The Go loader (native/) runs this inside QuickJS, bundled with every shared module
 // it imports into native/host-shell.gen.js by scripts/bundle-loader.mjs.
 //
-// A SEAM, not an implementation: Go supplies platform *primitives* (a module table over
+// A SEAM, not an implementation: Go supplies platform *primitives* (pure modules over
 // wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm) and this file
-// adapts them to the interfaces the shared shell consumes — `BundleHost`,
-// `FreshnessStore`, `ChannelFactory`, `RealmFactory`, `ShellPlatform` — then hands the
+// adapts them to the interfaces the shared shell consumes — `PureModuleLoader`,
+// `FreshnessStore`, channel, realm and shell platform seams — then hands the
 // result to `createShell`. Every rule above the primitives comes from those shared
 // modules, assembly order included. Being TypeScript checked against the same interfaces
 // is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";
-import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
+import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, loadedLine, parsePeerSpec, requireNetClaimant, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import {
-  createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
+  createShell, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
@@ -24,7 +24,6 @@ import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_
 import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
 import { isAdmissionRejected } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
-import { NET_PROTOCOL } from "../core/domains.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
@@ -35,12 +34,11 @@ import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
  *  implements. */
 type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
 
-/** The module table and realm plumbing Go exposes (main.go). */
+/** The opaque native-module slots and realm plumbing Go exposes (main.go). */
 declare const bridge: {
-  bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
-  callModule(appKey: string, module: string, payload: Uint8Array): ArrayBuffer | null;
-  isBound(appKey: string, module: string): boolean;
-  removeApp(appKey: string): number;
+  buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
+  callModule(slot: string, module: string, payload: Uint8Array): ArrayBuffer | null;
+  disposeModules(slot: string): number;
   /** The process arguments after the program name, as a JSON array. JSON rather than a
    *  joined string because an argument may legitimately contain any byte. */
   argv(): string;
@@ -282,22 +280,21 @@ globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed()
 globalThis.__netAccept = (port, id) => { const a = netAccepts.get(port); if (a) a(id); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
-/** The §3 module table, which on this target lives in Go (wazero instances cannot
- *  be JS values). Shape only — every rule about what may land is the shared loader's. */
-const table: ModuleTableBackend = {
-    // Straight through: the all-or-none guarantee is Go's, because Go holds the
-    // half-built wazero instances and has to close them (main.go `bindAll`). The §4.1
-    // scratch default crosses with it, so Go's table owns no copy of it.
-    bindAll(appKey, mods) { bridge.bindAll(appKey, mods, DEFAULT_SCRATCH_SIZE); },
-    // A module call is a promise on every target. On THIS one the bridge call runs
-    // synchronously inside the caller's frame, under Go's own deadline (main.go
-    // `SEEDKERNEL_MODULE_DEADLINE_MS`), so the passed deadline is deliberately ignored.
-    callModule(appKey, module, payload, _deadlineMs) {
-        const r = bridge.callModule(appKey, module, payload);
-        return Promise.resolve(r === null ? null : new Uint8Array(r));
+/** Build private module values over opaque Go handles (wazero instances cannot be JS
+ *  values). The handle is target plumbing and never an app identity. */
+let moduleSlotSeq = 0;
+const modules: PureModuleLoader = {
+    build(mods) {
+        const slot = `slot:${++moduleSlotSeq}`;
+        bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE);
+        return {
+            call(module, payload, _deadlineMs) {
+                const r = bridge.callModule(slot, module, payload);
+                return Promise.resolve(r === null ? null : new Uint8Array(r));
+            },
+            dispose() { bridge.disposeModules(slot); },
+        };
     },
-    isBound(appKey, module) { return bridge.isBound(appKey, module); },
-    removeApp(appKey) { return bridge.removeApp(appKey); },
 };
 /** The data directory a store was opened on, or null for a realm that never opened one
  *  (the native tests' bare `makeTransportNode`, which needs no durable marks). It names
@@ -488,7 +485,7 @@ async function makeTransportNode(cfg: {
     });
     const s = createShell({
         platform: {
-            sodium, identity: cfg.identity, table, fs,
+            sodium, identity: cfg.identity, modules, fs,
             freshnessStore: new NativeFreshnessStore(storeDir),
             networkKey: cfg.networkKey, transportHost, createRealm,
         },
@@ -514,9 +511,9 @@ async function makeTransportNode(cfg: {
             bridge.log('  no transport: the policy grants "link" to no author of this bundle');
         }
     }
-    // Conditional on there BEING a driver: a policy granting `link` to nobody is a
-    // configuration rather than a failure.
-    if (s.resolve(NET_PROTOCOL)) await transportHost.start();
+    // Listener lifecycle is host configuration, independent of the `_net`
+    // route. With no claimant, accepted links are closed.
+    await transportHost.start();
     return { shell: s, transport: transportHost };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
@@ -558,6 +555,11 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     };
     return utf8.encode(JSON.stringify(status));
 }
+
+/** Native test seam: drive a slot through the host invocation path. Pure modules stay
+ *  private; no module lookup crosses this boundary. */
+const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) =>
+    theShell().invoke("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload), appKey);
 
 // ── the operator flow ────────────────────────────────────────────────────────
 /** This platform, as `cli.ts` needs it: files, a console line, raw stdout, entropy, and
@@ -646,4 +648,4 @@ globalThis.__start = function (id, entry, arg) {
 // What Go reaches by name in the realm. `createRealm` and the transport helpers are here
 // for the native tests as much as for the boot above, so a test that stands up a guest or
 // a second node drives the very factories production does.
-export { runMain, cliLoadBundle, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, cliLoadBundle, openStore, bootNode, invokeApp, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

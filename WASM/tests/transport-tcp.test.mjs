@@ -55,7 +55,7 @@ async function makeNode(ws = false) {
   const shell = createShell({
     platform: {
       sodium, identity,
-      table: new ModuleTable(),
+      modules: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
       transportHost: transport,
       createRealm: async (o) => createSafeRealm(o),

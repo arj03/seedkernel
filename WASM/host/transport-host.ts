@@ -8,7 +8,7 @@
 //
 // There is no transport-shaped seam here, in either direction:
 //
-//   guest → host  the four `link/*` names (guest-seam.ts) — a byte duplex behind an opaque
+//   guest → host  the `link/*` names (guest-seam.ts) — configuration and a byte duplex behind an opaque
 //                 link id. Deadlines are not among them: `timer/*` is an ordinary
 //                 authority, so a fired timer comes out of the shell's per-realm table.
 //   host → guest  the SAME cross-realm call an app makes. The transport claims `_net` and
@@ -234,10 +234,9 @@ export interface OpenLinkOptions {
  *  correlation never leaves its heap. Nothing on this object is reached by an app.
  *
  *  There is no handover either: the driver holds link ids and the address book, both the
- *  NODE's rather than the current bundle's, so replacing a transport is just a later load
- *  winning a contested protocol id (shell-core `rebuildRoutes`). Live links cannot survive
- *  it — the session keys are in the outgoing guest's private memory (§4.3) — so an upgrade
- *  is a reconnect, and the incoming guest redials from this address book. */
+ *  NODE's rather than the current bundle's. A transport update replaces its own slot.
+ *  Live links cannot survive it — the session keys are in the outgoing guest's private
+ *  memory (§4.3) — so an upgrade is a reconnect from this address book. */
 export class TransportHost {
   readonly peerId: PeerId;
   port = 0;
@@ -249,6 +248,7 @@ export class TransportHost {
   private readonly addrs = new Map<PeerId, PeerAddr>;
   private nextLinkId = 1;
   private transport: TransportCall | null = null;
+  private transportAvailable: () => boolean = () => false;
   private closed = false;
 
   constructor(opts: TransportHostOptions) {
@@ -256,33 +256,33 @@ export class TransportHost {
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Point the adapter at the shell's current `_net` claimant and send the one config turn:
-   *  who we are, which network, the budgets, the peer list. The guest learns the host's
-   *  flood cap here — the module never declares the number that bounds it.
-   *
-   *  Called again whenever the claimant of `_net` changes, which is what an in-place
-   *  transport replacement is: the incoming guest is configured exactly as the first one
-   *  was, by the same call, because there is no second path for a replacement to take. */
-  attach(transport: TransportCall): void {
-    // A RE-attach means the previous occupant is gone, and its link state went with it
-    // (§4.3). The sockets are still open and the far ends still believe in them, so they
-    // are torn down here rather than left as channels the incoming guest never heard of;
-    // it redials from the address book re-seeded below.
-    if (this.transport) {
-      this.transport = null;
-      for (const c of this.channels.values()) {
-        try { c.close(false); } catch { /* already gone */ }
-      }
-      this.channels.clear();
-      this.openLinks.clear();
-    }
+  /** Wire the `_net` destination once. Both callbacks resolve the claim
+   *  dynamically, so claim changes never reconfigure this driver. */
+  route(transport: TransportCall, available: () => boolean): void {
     this.transport = transport;
+    this.transportAvailable = available;
+  }
+
+  /** Link configuration is a side-effect-free read of immutable node identity and
+   *  deployment limits. A candidate transport can initialize offside without disturbing
+   *  the slot currently serving `_net`.
+   *
+   *  The mutable address book deliberately is not here: a one-shot snapshot can go stale
+   *  between candidate construction and claim commit. It is replayed after publication
+   *  through the same `addr` event used for later additions (`replayAddresses`).
+   *
+   *  Its shape is versioned by `guest.abi` and nothing else. A version word here would be a
+   *  second, hand-maintained clock on the same fact, checked one step too late to help: by
+   *  the time a guest parses it the bundle has already loaded, and a bundle signed before
+   *  the word existed cannot carry it at all. `abi` is signed into the manifest, stamped
+   *  from `GUEST_ABI_VERSION` at build time, and refused by name before a line of guest code
+   *  runs — so REMOVING or reordering a field here means bumping it (§12.4). Appending one
+   *  does not: a guest that never reads the tail cannot notice it. */
+  private configuration(): Uint8Array {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    // Through the same `tell` as every other op: a rejected config turn is a transport
-    // that failed to stand — logged, never a reason to take the host down.
-    this.tell(new Args("init")
+    return new Args()
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -295,26 +295,19 @@ export class TransportHost {
       .u32(MAX_HANDSHAKE_FRAME_BYTES)
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
       .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
-      // Absent and empty both mean "admit everyone", said as a zero-length list so the
-      // guest reads one shape.
-      .blob(admit.build()));
-    // The claimant starts with an empty address book, so seed everything accumulated by
-    // the platform before it was first used (and re-seed after a replacement).
-    for (const [id, addr] of this.addrs) this.announceAddr(id, addr);
+      .blob(admit.build())
+      .build();
   }
 
-  /** Give the adapter no claimant, without closing the listener or forgetting the address
-   *  book — those are the NODE's, and a later `_net` claim attaches to this same adapter
-   *  and is re-seeded from them. Uninstalling the transport bundle is the case: the node
-   *  stops speaking the protocol, it does not stop being a node. */
-  detach(): void {
-    if (!this.transport) return;
-    this.transport = null;
-    for (const c of this.channels.values()) {
-      try { c.close(false); } catch { /* already gone */ }
-    }
+  /** Release link state owned by a departing link-capable slot, retaining listeners and
+   *  the address book for a replacement. */
+  reset(): void {
+    const channels = [...this.channels.values()];
     this.channels.clear();
     this.openLinks.clear();
+    for (const c of channels) {
+      try { c.close(false); } catch { /* already gone */ }
+    }
   }
 
   /** Whether `close` has run. Public because "the outgoing driver was actually shut
@@ -360,10 +353,10 @@ export class TransportHost {
   // ── the capability backend the transport guest's seam is wired to ───────────
 
   /** The RAW net capability, as this node implements it: an opaque link id over the
-   *  platform's sockets. This is the whole of what the host contributes to the network,
-   *  and it is wired to no seam but the transport's. */
+   *  platform's sockets. This is the whole of what the host contributes to the network. */
   rawNet(): RawNet {
     return {
+      config: () => this.configuration(),
       open: (dest) => {
         // The destination name is the peer's 32-byte channel key, resolved in the address
         // book. No entry, or no channel factory at all (a browser edge), is "no route",
@@ -415,7 +408,7 @@ export class TransportHost {
       this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => {
-      this.channels.delete(linkId);
+      if (!this.channels.delete(linkId)) return;
       this.tell(new Args("linkClosed").u32(linkId));
     });
     return linkId;
@@ -449,7 +442,7 @@ export class TransportHost {
    *  The channel object stays the caller's; the link state machine runs in the
    *  guest, keyed by the returned link id. */
   openLink(opts: OpenLinkOptions): LinkHandle {
-    if (!this.transport) throw new Error("transport: no bundle claims the network");
+    if (!this.transportAvailable()) throw new Error("transport: no bundle claims the network");
     const linkId = this.register(opts.channel);
     this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
     this.announce(linkId, {
@@ -488,14 +481,20 @@ export class TransportHost {
       .blob(addr.contactSecret ?? ZERO32));
   }
 
+  /** Seed the current `_net` claimant from the node-owned address book. Called only after
+   *  a new claimant is published; later mutations use `addPeerAddr`'s identical event.
+   *  Queueing is synchronous, so a following `ready`/request cannot overtake the replay. */
+  replayAddresses(): void {
+    for (const [peerId, addr] of this.addrs) this.announceAddr(peerId, addr);
+  }
+
   /** Bind the listeners (if any) through the channel factory. */
   async start(): Promise<void> {
-    if (!this.transport) throw new Error("transport: no bundle claims the network");
     if (!this.opts.channels) return;
     const { port, wsPort } = await this.opts.channels.listen(
       this.opts.listen, this.opts.wsListen,
       (channel) => {
-        if (!this.transport) {
+        if (!this.transportAvailable()) {
           try { channel.close(false); } catch { /* already gone */ }
           return;
         }
@@ -539,11 +538,8 @@ export class TransportHost {
     // channel closes fire `onClose`, which would otherwise queue a `linkClosed`.
     this.closed = true;
     this.transport = null;
-    for (const c of this.channels.values()) {
-      try { c.close(false); } catch { /* already gone */ }
-    }
-    this.channels.clear();
-    this.openLinks.clear();
+    this.transportAvailable = () => false;
+    this.reset();
     this.opts.channels?.close();
   }
 }

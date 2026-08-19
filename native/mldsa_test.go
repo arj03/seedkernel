@@ -235,8 +235,8 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	if status := loadBundle(path); !strings.HasPrefix(status, "pqapp v1") {
 		t.Fatalf("hybrid bundle should load: %s", status)
 	}
-	if !boundToWasm(key, "fwd") {
-		t.Fatalf("hybrid bundle's module is not bound under `%s`", key)
+	if out, err := invokeBundle(key, []byte("hybrid")); err != nil || string(out) != "hybrid" {
+		t.Fatalf("hybrid bundle's private module did not run through `%s`: %q, %v", key, out, err)
 	}
 	// The id is the key-set hash, not the Ed25519 key — the property hybrid signing
 	// actually rests on (§12.4), since otherwise an attacker who breaks Ed25519 brings
@@ -244,8 +244,8 @@ func TestHybridManifestBundleLoads(t *testing.T) {
 	if hex.EncodeToString(a.id()) == hex.EncodeToString(a.edPub) {
 		t.Fatal("the hybrid author id must not be the Ed25519 public key")
 	}
-	if boundToWasm(appKeyFor(a.edPub, "pqapp"), "fwd") {
-		t.Fatal("a hybrid bundle bound under its Ed25519 key rather than its derived id")
+	if _, err := invokeBundle(appKeyFor(a.edPub, "pqapp"), []byte("wrong")); err == nil {
+		t.Fatal("a hybrid bundle was selectable under its Ed25519 key rather than its derived id")
 	}
 }
 
