@@ -263,16 +263,25 @@ export class TransportHost {
     this.transportAvailable = available;
   }
 
-  /** Link configuration is a side-effect-free capability read. A candidate transport can
-   *  initialize offside without disturbing the slot currently serving `_net`. */
+  /** Link configuration is a side-effect-free read of immutable node identity and
+   *  deployment limits. A candidate transport can initialize offside without disturbing
+   *  the slot currently serving `_net`.
+   *
+   *  The mutable address book deliberately is not here: a one-shot snapshot can go stale
+   *  between candidate construction and claim commit. It is replayed after publication
+   *  through the same `addr` event used for later additions (`replayAddresses`).
+   *
+   *  Its shape is versioned by `guest.abi` and nothing else. A version word here would be a
+   *  second, hand-maintained clock on the same fact, checked one step too late to help: by
+   *  the time a guest parses it the bundle has already loaded, and a bundle signed before
+   *  the word existed cannot carry it at all. `abi` is signed into the manifest, stamped
+   *  from `GUEST_ABI_VERSION` at build time, and refused by name before a line of guest code
+   *  runs — so REMOVING or reordering a field here means bumping it (§12.4). Appending one
+   *  does not: a guest that never reads the tail cannot notice it. */
   private configuration(): Uint8Array {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    const addrs = new Args();
-    for (const [id, addr] of this.addrs) {
-      addrs.blob(fromHex(id)).blob(addr.contactSecret ?? ZERO32);
-    }
     return new Args()
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
@@ -287,7 +296,6 @@ export class TransportHost {
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
       .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
       .blob(admit.build())
-      .blob(addrs.build())
       .build();
   }
 
@@ -471,6 +479,13 @@ export class TransportHost {
     this.tell(new Args("addr")
       .blob(fromHex(peerId))
       .blob(addr.contactSecret ?? ZERO32));
+  }
+
+  /** Seed the current `_net` claimant from the node-owned address book. Called only after
+   *  a new claimant is published; later mutations use `addPeerAddr`'s identical event.
+   *  Queueing is synchronous, so a following `ready`/request cannot overtake the replay. */
+  replayAddresses(): void {
+    for (const [peerId, addr] of this.addrs) this.announceAddr(peerId, addr);
   }
 
   /** Bind the listeners (if any) through the channel factory. */

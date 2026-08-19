@@ -109,19 +109,28 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     grants: { link: [transportAuthor] },
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
+  // A test may pause exactly one freshly evaluated candidate before the shell publishes
+  // it. At that point `link/config` has been read but the incumbent still owns `_net`,
+  // which exposes address-book updates in the replacement window deterministically.
+  const realmControl = { pauseNext: null };
   const shell = createShell({
     platform: {
       sodium, identity,
       modules: new ModuleTable(),
       freshnessStore,
       transportHost: transport,
-      createRealm: async (o) => createSafeRealm(o),
+      createRealm: async (o) => {
+        const realm = await createSafeRealm(o);
+        const pause = realmControl.pauseNext;
+        if (pause) { realmControl.pauseNext = null; await pause(); }
+        return realm;
+      },
     },
     admit: policy,
   });
   await shell.loadBundleBlob(transportBlob);
   await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return { shell, transport };
+  return { shell, transport, realmControl };
 }
 
 console.log("Test: transport bundle drives two nodes over loopback");
@@ -135,11 +144,15 @@ const b = await makeNode(fabric.view(), listen);
 const aNet = a.transport;
 const bNet = b.transport;
 const bId = b.transport.peerId;
+const c = await makeNode(fabric.view(), listen);
+const cNet = c.transport;
+const cId = cNet.peerId;
 
 console.log("  starting listeners…");
 await aNet.start();
 await bNet.start();
-assert(aNet.port > 0 && bNet.port > 0, "both nodes bound loopback listeners");
+await cNet.start();
+assert(aNet.port > 0 && bNet.port > 0 && cNet.port > 0, "all nodes bound loopback listeners");
 
 // Each node runs the echo app, so both directions work — the upgrade below has to be
 // checked both ways: A dialing out through the new transport, and B reaching A.
@@ -158,12 +171,29 @@ console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
 const oldPeerId = aNet.peerId;
 const oldClaimant = a.shell.resolve(NET_PROTOCOL);
-await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
+let candidateConfigured;
+const configured = new Promise((resolve) => { candidateConfigured = resolve; });
+let publishCandidate;
+const publish = new Promise((resolve) => { publishCandidate = resolve; });
+a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; };
+const upgrading = a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
+await configured;
+// The candidate has consumed its static config, but the incumbent still owns `_net`.
+// This address update must survive the commit even though its live `addr` event goes to
+// the outgoing realm. A mutable config snapshot loses it; post-publish replay does not.
+aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
+publishCandidate();
+await upgrading;
 
 assert(a.shell.resolve(NET_PROTOCOL) === oldClaimant, "the update retained its own transport claim");
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
 assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
+
+let racedAddrResp = null;
+try { racedAddrResp = await request(a.shell, cId, new Uint8Array([7, 8, 9])); } catch { /* assertion below */ }
+assert(racedAddrResp?.length === 3 && racedAddrResp[2] === 9,
+  "an address added after candidate config but before claim commit is replayed to the replacement");
 
 // Live links do not survive and are not meant to: session keys live in the outgoing
 // guest's private memory. What survives is the host's half — the address book — so the
@@ -237,4 +267,5 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
 
 a.shell.close();
 b.shell.close();
+c.shell.close();
 summary("transport bundle smoke");

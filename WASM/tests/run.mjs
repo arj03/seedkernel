@@ -349,10 +349,14 @@ async function testManifestClaimIsTheRouting() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
+  let realmBuilds = 0;
   const shell = mkShell({
     platform: {
       sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
+      createRealm: async () => {
+        realmBuilds++;
+        return { call: async () => new Uint8Array(), dispose() {} };
+      },
     },
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
   });
@@ -377,8 +381,10 @@ async function testManifestClaimIsTheRouting() {
     assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
     // A second identity cannot shadow an active claim. Rejection leaves both the existing
-    // route and the candidate's install state untouched.
+    // route and the candidate's install state untouched — including never evaluating its
+    // guest, whose top level could already exercise its admitted capabilities.
     const rival = appKey(other.id, "store");
+    const buildsBeforeConflict = realmBuilds;
     let conflict = "";
     try { await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"])); }
     catch (e) { conflict = String(e); }
@@ -387,6 +393,8 @@ async function testManifestClaimIsTheRouting() {
     assertEqual(shell.resolve("seedstore/v2"), key,
       "a rejected claimant does not disturb the active route");
     assert(shell.uninstall(rival) === false, "the rejected candidate did not install a slot");
+    assertEqual(realmBuilds, buildsBeforeConflict,
+      "a known claim conflict is refused before the candidate guest executes");
 
     // Uninstall drops what the app claimed: a route never outlives its app.
     shell.uninstall(key);
@@ -466,12 +474,19 @@ async function testShellProtocolIsTheClaimantsOnly() {
   // Each load stands exactly one realm, so the seam captured after an `await` is that
   // bundle's own `host.call` — the very function its guest would hold.
   let lastSeam = null;
+  const realms = [];
   const shell = mkShell({
     platform: {
       sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
       createRealm: async ({ hostCall }) => {
         lastSeam = hostCall;
-        return { call: async () => new Uint8Array(), dispose() { } };
+        const realm = {
+          calls: [],
+          async call(entry, payload) { realm.calls.push({ entry, payload }); return new Uint8Array(); },
+          dispose() { },
+        };
+        realms.push(realm);
+        return realm;
       },
     },
     // Everything admitted, `link` included: the boundary under test is the shell's claim
@@ -489,9 +504,14 @@ async function testShellProtocolIsTheClaimantsOnly() {
     // The transport: reaches `link`, and claims `_net`.
     await shell.loadBundleBlob(blob("transport", ["_net"], ["_host", "link/open"]));
     const transportSeam = lastSeam;
+    // A bundle-owned reserved claim is a LOCAL realm service. It remains callable through
+    // another admitted realm's declared grant, but an authenticated peer's protocol bytes
+    // must not fall through to it.
+    await shell.loadBundleBlob(blob("offer", ["_offer"], []));
+    const offerRealm = realms.at(-1);
     // A link-capable bundle that claims NOTHING — the initiator shape (§12.8). It holds
     // the same privilege and is the case the old privilege-keyed gate let through.
-    await shell.loadBundleBlob(blob("dialer", undefined, ["_host", "link/open"]));
+    await shell.loadBundleBlob(blob("dialer", undefined, ["_host", "_offer", "link/open"]));
     const dialerSeam = lastSeam;
 
     const reached = await say(transportSeam);
@@ -500,6 +520,18 @@ async function testShellProtocolIsTheClaimantsOnly() {
     const refused = await say(dialerSeam);
     assert(/answered only for the _net claimant/.test(refused),
       `a link-capable bundle that claims no _net is refused _host: ${refused || "no error"}`);
+
+    const proto = enc.encode("_offer");
+    const remoteDeliver = concatBytes([
+      opHeader("deliver", EMPTY), new Uint8Array(32).fill(7), Uint8Array.of(proto.length), proto,
+      Uint8Array.of(1, 2, 3),
+    ]);
+    await transportSeam("_host", remoteDeliver);
+    assertEqual(offerRealm.calls.length, 0,
+      "an authenticated peer cannot reach a bundle's local reserved claim");
+    await dialerSeam("_offer", Uint8Array.of(4, 5, 6));
+    assertEqual(offerRealm.calls.length, 1,
+      "a co-resident realm with the declared reserved grant still reaches the local claim");
 
     // The claim is what carries it, not the app key: uninstalling the transport takes
     // `_host` away from a realm that still holds `link` and still has its seam.
@@ -1845,14 +1877,23 @@ async function testModuleCallChargedToGuestBudget() {
   console.log("  OK\n");
 }
 
-// ─── Test: guest ABI 5 is refused — module calls moved across the sync/async line ─
-async function testAbiFiveRefused() {
-  console.log("Test: guest ABI 5 is refused at load — bare module names are async since ABI 6");
+// ─── Test: the seam version just retired is refused, not tolerated ───────────────
+//
+// The number is only worth carrying if the host refuses a seam it does not implement, and
+// the case that matters is always the one just retired — the population that actually
+// exists. At ABI 7 `link/config` dropped its trailing address book, and an ABI-6 transport
+// reads that removed field off the end of the buffer as an empty one: a node with a correct
+// identity that dials nobody and reports nothing. Written against the constant, so the
+// boundary moves with it rather than pinning whichever version was current the day it was
+// written.
+async function testPreviousAbiRefused() {
+  const stale = GUEST_ABI_VERSION - 1;
+  console.log(`Test: guest ABI ${stale} is refused at load — a retired seam is not tolerated`);
 
   const author = testAuthor();
   const manifest = { app: "legacy", version: 1,
     modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-    guest: { hash: "aa", abi: 5, requires: [] } };
+    guest: { hash: "aa", abi: stale, requires: [] } };
   const env = signManifest(sodium, author, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: env,
@@ -1861,8 +1902,9 @@ async function testAbiFiveRefused() {
   });
   let msg = "";
   try { verifyBundle(sodium, blob); } catch (e) { msg = e.message; }
-  assert(msg.includes("guest ABI 5 is not implemented"), `ABI 5 is refused by name (got: ${msg || "no throw"})`);
-  assert(msg.includes("6"), "the refusal names the supported ABI");
+  assert(msg.includes(`guest ABI ${stale} is not implemented`),
+    `ABI ${stale} is refused by name (got: ${msg || "no throw"})`);
+  assert(msg.includes(String(GUEST_ABI_VERSION)), "the refusal names the supported ABI");
 
   console.log("  OK\n");
 }
@@ -2684,7 +2726,7 @@ await testSeamGating();
 await testCallModuleGuards();
 await testModuleCallBound();
 await testModuleCallChargedToGuestBudget();
-await testAbiFiveRefused();
+await testPreviousAbiRefused();
 await testManifestSuiteByte();
 await testMlDsaAcvpVectors();
 await testMlKemAcvpVectors();

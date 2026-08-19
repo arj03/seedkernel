@@ -279,6 +279,9 @@ class Core {
 // ── init ──────────────────────────────────────────────────────────────────────
 
 function init() {
+  // No version word to check: this program declares the seam it was compiled against as
+  // `guest.abi`, and a host implementing a different `link/config` shape refuses the whole
+  // bundle before this line runs (§12.4).
   const r = new Reader(netConfig());
   ownPk = r.blob();
   ownId = toHex(ownPk);
@@ -298,7 +301,6 @@ function init() {
   const peers = new Reader(r.blob());
   admitPeers = peers.b.length > 0 ? new Set() : null;
   while (peers.off < peers.b.length) admitPeers.add(toHex(peers.blob()));
-  const addresses = new Reader(r.blob());
 
   router = new Router(ownPk, ownId);
   reqres = new ReqRes();
@@ -310,7 +312,6 @@ function init() {
   // than being told about each one.
   router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
   router.onPeerDown = (peerId) => { connected.delete(peerId); };
-  while (addresses.off < addresses.b.length) core.addAddr(addresses.blob(), addresses.blob());
 }
 
 init();

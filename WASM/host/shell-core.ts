@@ -18,7 +18,7 @@ import { createGuestSeam, appSignScope, transportSignScope, opCall, readOp, type
 import type { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { NET_PROTOCOL, PRIVILEGE_LINK, SHELL_PROTOCOL, type Privilege } from "../core/domains.js";
+import { isReservedProtocol, NET_PROTOCOL, PRIVILEGE_LINK, SHELL_PROTOCOL, type Privilege } from "../core/domains.js";
 import { dec, enc, fromHex, toHex, readU32BE, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
@@ -128,10 +128,11 @@ export interface CreateShellOptions {
      *  seedchat's `_offer`, which carries a bundle between two browsers before either has
      *  an app that could receive it.
      *
-     *  `null` means "not mine" and falls through to the routing table, so a shell that
-     *  answers one id does not shadow the apps. Consulted on INBOUND frames only: a
-     *  co-resident app's cross-realm call carries an app key rather than a peer key, and an
-     *  app addresses an app. */
+     *  `null` means "not mine" and falls through to the routing table for an ordinary wire
+     *  id, so a shell that answers one does not shadow the apps — but never to a bundle's
+     *  reserved claim, which is a LOCAL service name no peer may reach (§12.10). Consulted
+     *  on INBOUND frames only: a co-resident app's cross-realm call carries an app key
+     *  rather than a peer key, and an app addresses an app. */
     answer?: (from: PeerId, proto: string, payload: Uint8Array) => Promise<Uint8Array> | null;
 }
 
@@ -531,16 +532,21 @@ export function createShell(opts: CreateShellOptions & {
             // needs.
             //
             // The shell's own protocols get first refusal (`opts.answer`); `null` and an
-            // absent hook fall through to the routing table, so a shell answers an id of
-            // its own and never shadows the apps.
+            // absent hook fall through only for ordinary wire protocols, so a shell answers
+            // an id of its own without exposing a bundle's local reserved claim to a peer.
             case "deliver": {
                 const from = toHex(a.slice(0, 32));
                 const protoLen = a[32];
                 const proto = dec.decode(a.slice(33, 33 + protoLen));
                 const body = a.slice(33 + protoLen);
                 return opts.answer?.(from, proto, body)
-                    ?? doDispatch(from, proto, body)
-                    ?? Promise.resolve(EMPTY);
+                    // Reserved claims are LOCAL realm services. The shell's own inbound
+                    // hook gets first refusal (e.g. a browser bootstrap `_offer`), but a
+                    // peer may never fall through to a bundle's reserved claim: it has no
+                    // manifest whose `requires` could grant that call.
+                    ?? (isReservedProtocol(proto)
+                        ? Promise.resolve(EMPTY)
+                        : doDispatch(from, proto, body) ?? Promise.resolve(EMPTY));
             }
             // A link this driver handed over (openLink) authenticated, or tore down.
             // Relayed to whoever passed the channel in; the shell forms no opinion.
@@ -559,10 +565,10 @@ export function createShell(opts: CreateShellOptions & {
      *  hands without its owner ever being uninstalled. This identity's own claims are not a
      *  contest — replacing them in place is what an update is.
      *
-     *  Asked in the synchronous commit window rather than at the top of the load, which is
-     *  the difference between a check and a guarantee: a candidate builds its modules and
-     *  stands its realm across two yields, and a claim taken during either would slip past
-     *  a decision made before them. */
+     *  Asked once before candidate code can execute, then again in the synchronous commit
+     *  window. The first prevents a known loser from exercising irreversible authorities;
+     *  the second is the guarantee, because a claim taken while modules and the realm build
+     *  across yields would slip past the early decision. */
     const refuseContestedClaims = (loaded: LoadedBundle, key: string) => {
         for (const claim of loaded.manifest.protocols ?? []) {
             const incumbent = claims.get(claim);
@@ -660,6 +666,12 @@ export function createShell(opts: CreateShellOptions & {
                 guestSource: v.guestSource,
             };
             const key = appKeyFor(loaded.author, loaded.manifest.app);
+            // Refuse a conflict already standing BEFORE the candidate's modules or guest
+            // execute. The guest's top level can use every authority its admitted manifest
+            // declares, and disposing a rejected candidate cannot undo an fs write or a raw
+            // link it opened. The second check in the synchronous commit window remains
+            // necessary: another load may take a free claim while this candidate is built.
+            refuseContestedClaims(loaded, key);
             const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules);
             // STAND THE GUEST, before anything already standing is replaced. Every app is a
@@ -693,6 +705,11 @@ export function createShell(opts: CreateShellOptions & {
             // claim hand-over above, so `onClose` finds the channels already gone and queues
             // no `linkClosed` at the new realm for links it never had.
             if (replacingNetwork) netHost?.reset();
+            // The address book is mutable node state, not part of the candidate's static
+            // `link/config` snapshot. Publish first, then replay it through the ordinary
+            // host-event path. No await in between: a concurrent add is either in this
+            // replay or is announced directly to the newly published claimant.
+            if (slotClaims(slot).includes(NET_PROTOCOL)) netHost?.replayAddresses();
             disposeSlot(previous);
             return loaded;
         },
