@@ -78,18 +78,15 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
     sodium,
     async standUp(cfg) {
       host.stood = cfg;
-      return {
+      return { shell: {
+        resolve: () => "_net",
         revoke: () => [],
         uninstall: () => false,
         loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
         invoke: async () => new Uint8Array(0),
-        serve: async () => {},
         close: () => { host.closed = true; },
-        // The node's transport driver — the one field the flow reads its ports and its
-        // address book off. `null` here would be the no-transport-bundle node.
-        transport: { port, wsPort },
         ...shell,
-      };
+      }, transport: { port, wsPort } };
     },
   };
   return host;
@@ -203,14 +200,13 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(host.lines.includes("  tcp    listening on :7777"), "the console reports the port actually bound");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }
-// --peers with no transport bundle admitted says what is wrong, rather than throwing a
-// TypeError off the null the shell hands back.
+// --peers with no `_net` claimant says what is wrong before touching the adapter.
 {
   const host = fakeHost(["--key", join(work, "p.key"), "--peers", `${good}@127.0.0.1:7000`],
-    { shell: { transport: null } });
+    { shell: { resolve: () => null } });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("the transport bundle is not loaded"), "--peers without a transport explains itself");
+  ok(msg.includes("there is nothing to dial from"), "--peers without an `_net` claimant explains itself");
 }
 
 console.log("\n— the load line —");

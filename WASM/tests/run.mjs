@@ -946,9 +946,10 @@ async function testSlotFreshness() {
     [GUEST_FILE]: GUEST_BYTES,
   });
   // The load path as the shell composes it: the host's gates read the store into an
-  // `AdmissionContext` and answer once, then installBundle lands the modules and advances
-  // the mark. The predicate never touches the store, so "who refuses a downgrade" is one
-  // place.
+  // `AdmissionContext` and answer once, installBundle lands the modules, and the mark is
+  // advanced last — after the guest stands, which is the shell's job and is why the mark
+  // is written here rather than inside installBundle. The predicate never touches the
+  // store, so "who refuses a downgrade" is one place.
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
     await hostGates(v, {
@@ -956,7 +957,8 @@ async function testSlotFreshness() {
       highWater: freshness.get(v.author, v.manifest.app),
       revoked: freshness.isRevoked(v.author),
     });
-    await installBundle(host, v, freshness);
+    await installBundle(host, v);
+    freshness.set(v.author, v.manifest.app, v.manifest.version);
   };
 
   // Versions are an author's own lineage, transport or not: a floor keyed to the
@@ -2382,9 +2384,10 @@ async function testAppNameLengthRefused() {
 // the retry a no-op against a store that still lacks it.
 async function testPersistFailureRollsBack() {
   console.log("Test: a failed freshness persist fails the load — nothing is kept, the mark is rolled back");
-  const { FreshnessMarks, installBundle, verifyBundle, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
+  const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
-  const { ModuleTable } = await imp("build/host/module-table.js");
+  const { createShell: mkShell, ModuleTable } = await imp("build/host/shell-core.js");
+  const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
   const manifest = { app: "persist", version: 1,
@@ -2395,17 +2398,27 @@ async function testPersistFailureRollsBack() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
   });
-  const v = verifyBundle(sodium, blob);
   const key = appKey(author.id, "persist");
 
   // A store whose durable write always fails, as a full disk would.
   class BrokenStore extends FreshnessMarks {
     persist() { throw new Error("disk full"); }
   }
+  // Driven through the shell, since the shell is what advances the mark — last, after the
+  // guest stands, so the write it rolls back is one that was about to record a version
+  // that really ran.
   const host = new ModuleTable();
+  const shellOver = (freshnessStore) => mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), table: host, freshnessStore,
+      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
+    },
+    admit: admitAll,
+  });
+
   const broken = new BrokenStore();
   let msg = "";
-  try { await installBundle(host, v, broken); } catch (e) { msg = e.message; }
+  try { await shellOver(broken).loadBundleBlob(blob); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
   assert(msg.includes("disk full"), `the original persist error survives the wrap (got: ${msg})`);
   assert(!host.isBound(key, "fwd"), "nothing was kept — the modules did not stay bound");
@@ -2414,7 +2427,7 @@ async function testPersistFailureRollsBack() {
   // A retry against a healthy store completes cleanly: the rollback is what makes
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
-  await installBundle(host, v, healthy);
+  await shellOver(healthy).loadBundleBlob(blob);
   assert(host.isBound(key, "fwd"), "the retry lands");
   assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
   console.log("  OK\n");

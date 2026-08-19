@@ -22,6 +22,9 @@ import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
+import { NET_PROTOCOL } from "../core/domains.js";
+import { TransportHost } from "./transport-host.js";
+import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
 
 export interface ShellOptions {
     /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
@@ -79,6 +82,12 @@ export interface Shell extends CoreShell {
     loadBundle(file: string): Promise<LoadedBundle>;
 }
 
+/** The CLI's runtime pair, narrowed to this platform's shell — one declaration of the
+ *  shape, so `standUp` returning it stays a compile-time fact rather than a coincidence. */
+export interface NodeRuntime extends CliNodeRuntime {
+    shell: Shell;
+}
+
 /** A `FreshnessStore` backed by one JSON file (`{ marks, revoked }`), kept OUTSIDE the
  *  guest-writable fs directory so a `fs`-capable guest cannot tamper with its own mark or
  *  the dead-key set beside it (§12.5). An operator rolls back a mark, or un-revokes a key,
@@ -111,69 +120,96 @@ export class FileFreshnessStore extends FreshnessMarks {
 const createRealm: RealmFactory = async (o) => (await import("./safe-js.js")).createSafeRealm(o);
 /** Assemble the runtime on Node: build the platform seam, hand it to `createShell`, then
  *  load the transport bundle — the signed program that IS the node's network. */
-export async function boot(opts: ShellOptions): Promise<Shell> {
+export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     const sodium = await loadCrypto();
     // ── Node platform seam ─────────────────────────────────────────────────────
     const fs = new NodeFs(opts.dir);
     const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
     const channels = opts.channels ?? new NodeChannelFactory();
-    // ── Assemble the shared shell ───────────────────────────────────────────────
-    const policy = policyFromJson(opts.policyJson);
-    const core = createShell({
-        platform: {
-            sodium: sodium as unknown as ShellSodium, identity: opts.identity,
-            table: new ModuleTable(), fs, freshnessStore: freshness,
-            channels, listen: opts.listen, wsListen: opts.wsListen,
-            contactSecret: opts.contactSecret, networkKey: opts.networkKey,
-            createRealm,
-        },
-        admit: policy,
+    const transport = new TransportHost({
+        identity: opts.identity,
+        networkKey: opts.networkKey,
+        contactSecret: opts.contactSecret,
         requestDeadlineMs: opts.requestDeadlineMs,
-        guestDeadlineMs: opts.guestDeadlineMs,
-        realmMemoryBytes: opts.realmMemoryBytes,
-        config: opts.config,
+        channels,
+        listen: opts.listen,
+        wsListen: opts.wsListen,
     });
-    // ── Load the transport bundle: the node's network (§12.6) ───────────────────
-    // The ONE install path, like any other bundle: verify, govern under policy, install,
-    // and — because it reaches `link` — stand the driver up. A policy that does not admit
-    // the transport author leaves the node without a network, which is a deliberate
-    // configuration rather than an error.
-    if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {
-        try {
-            await core.loadBundleBlob(opts.transportBundle ?? EMBEDDED_TRANSPORT!);
-        }
-        catch (err) {
-            if (isAdmissionRejected(err)) {
-                console.warn('  no transport: the policy grants "link" to no author of this bundle');
+    // Everything below can fail — a bundle that does not verify, a listener whose port is
+    // taken — and a boot that throws returns no handle, so whatever it stood up would be
+    // unreachable and unclosable for the process's life: a bound socket and an open
+    // channel factory with nobody left to close them. One teardown, swapped for the
+    // shell's as soon as there IS a shell, since `core.close()` disposes the realms and
+    // the adapter both.
+    let undo = () => transport.close();
+    try {
+        // ── Assemble the shared shell ───────────────────────────────────────────
+        const policy = policyFromJson(opts.policyJson);
+        const core = createShell({
+            platform: {
+                sodium: sodium as unknown as ShellSodium, identity: opts.identity,
+                table: new ModuleTable(), fs, freshnessStore: freshness,
+                networkKey: opts.networkKey, transportHost: transport,
+                createRealm,
+            },
+            admit: policy,
+            guestDeadlineMs: opts.guestDeadlineMs,
+            realmMemoryBytes: opts.realmMemoryBytes,
+            config: opts.config,
+        });
+        undo = () => core.close();
+        // ── Load the transport bundle: the node's network (§12.6) ───────────────
+        // The ONE install path, like any other bundle: verify, govern under policy, install,
+        // and — because it reaches `link` — stand the driver up. A policy that does not admit
+        // the transport author leaves the node without a network, which is a deliberate
+        // configuration rather than an error.
+        if (opts.transportBundle ?? EMBEDDED_TRANSPORT) {
+            try {
+                await core.loadBundleBlob(opts.transportBundle ?? EMBEDDED_TRANSPORT!);
             }
-            else {
-                throw err;
+            catch (err) {
+                if (isAdmissionRejected(err)) {
+                    console.warn('  no transport: the policy grants "link" to no author of this bundle');
+                }
+                else {
+                    throw err;
+                }
             }
         }
+        // The adapter is host integration state. Binding its listeners does not put it on
+        // the shell, and only happens when an ordinary bundle currently claims `_net`.
+        if (core.resolve(NET_PROTOCOL)) await transport.start();
+        // ── Node wrapper: add file-backed loadBundle ────────────────────────────
+        const shell: Shell = {
+            host: core.host,
+            resolve: core.resolve,
+            routes: core.routes,
+            // boot() always supplies an fs (Node always has a filesystem), so the optional
+            // seam member is non-null here.
+            fs: core.fs!,
+            sodium: core.sodium,
+            loadBundleBlob: core.loadBundleBlob,
+            uninstall: core.uninstall,
+            revoke: core.revoke,
+            async loadBundle(file) {
+                return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
+            },
+            invoke: core.invoke,
+            dispatch: core.dispatch,
+            close() { core.close(); },
+        };
+        return { shell, transport };
     }
-    // Conditional on there BEING a driver, for the same reason.
-    await core.transport?.start();
-    // ── Node wrapper: add file-backed loadBundle ───────────────────────────────
-    return {
-        host: core.host,
-        resolve: core.resolve,
-        routes: core.routes,
-        get transport() { return core.transport; },
-        // boot() always supplies an fs (Node always has a filesystem), so the optional
-        // seam member is non-null here.
-        fs: core.fs!,
-        sodium: core.sodium,
-        loadBundleBlob: core.loadBundleBlob,
-        uninstall: core.uninstall,
-        revoke: core.revoke,
-        async loadBundle(file) {
-            return core.loadBundleBlob(new Uint8Array(readFileSync(file)));
-        },
-        invoke: core.invoke,
-        dispatch: core.dispatch,
-        serve: core.serve,
-        close() { core.close(); channels.close(); },
-    };
+    catch (err) {
+        undo();
+        throw err;
+    }
+}
+
+/** Assemble a Node shell. Callers that also operate the concrete channel adapter use
+ *  {@link bootRuntime}; ordinary shell callers do not receive host integration state. */
+export async function boot(opts: ShellOptions): Promise<Shell> {
+    return (await bootRuntime(opts)).shell;
 }
 /** The artifact-shipped transport bundle, as raw bytes (transport-bundle.ts). */
 const EMBEDDED_TRANSPORT = (() => {

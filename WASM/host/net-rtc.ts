@@ -48,9 +48,8 @@ interface SignalMsg {
 }
 
 export interface RtcNetworkOptions {
-    /** The transport driver — the shell's `net` once the transport bundle is
-     *  admitted. It holds the node identity, the network key, the contact secret
-     *  and the peer lint; this file only manages connections. */
+    /** The platform's concrete channel adapter. It holds the node identity, the network
+     *  key, the contact secret and the peer lint; this file only manages connections. */
     driver: TransportHost;
     /** Resolve a peer's contact secret when dialing it. Signaling already names the
      *  peer, so it can carry the credential too. */

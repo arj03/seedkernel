@@ -202,10 +202,11 @@ export interface BundleHost {
      *  May be async: the JS targets stand each module up in its own worker (§4.3), so the
      *  bind returns once every worker has loaded. */
     bindAll(appKey: string, mods: { name: string; wasm: Uint8Array }[]): void | Promise<void>;
-    /** Unbind an app's whole module set, returning how many modules went. Optional, and
-     *  wanted for one case: the load that bound its modules and then could not persist its
-     *  freshness mark (see `installBundle`). A host that omits it still fails that load
-     *  loudly, it just leaves the modules on the table until the retry replaces them. */
+    /** Unbind an app's whole module set, returning how many modules went. Wanted for the
+     *  two loads that land modules and then fail: a guest that will not stand, and a mark
+     *  that will not persist (shell-core.ts `loadBundleBlob`). A host that omits it still
+     *  fails those loads loudly, it just leaves the modules on the table until the retry
+     *  replaces them. */
     removeApp?(appKey: string): number;
 }
 
@@ -811,30 +812,20 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     }
     return result;
 }
-/** Land a verified bundle (§12.4 steps 4b, 5b): instantiate every verified module, bind
- *  them atomically, and advance the `(author, app)` freshness mark. Any module failing
- *  fails the whole load — a half-landed bundle is the incoherent state the manifest exists
- *  to prevent.
+/** Land a verified bundle (§12.4 steps 4b, 5b): instantiate every verified module and bind
+ *  them atomically. Any module failing fails the whole load — a half-landed bundle is the
+ *  incoherent state the manifest exists to prevent.
  *
  *  Admission (§12.5) runs BEFORE this, as the one predicate (policy.ts `Admit`), which is
- *  where revocation and the version floor live, reading the same store this function
- *  writes. So this is mechanics only, and the store it takes is a place to WRITE rather
- *  than a second gate — one answer, from one call, before anything lands.
+ *  where revocation and the version floor live. So this is mechanics only.
+ *
+ *  It does not touch the freshness mark. The mark records the highest version that
+ *  actually RAN, and whether a guest runs is not known until it stands — so the shell
+ *  advances it after that, as the last step of the load (shell-core.ts `commitMark`).
  *
  *  There is no per-module admission callback: `modules[].hash` commits to exactly which
- *  bytes are authorized and `verifyBundle` proved they match.
- *
- *  `deferMark` is for the one load whose "actually loaded" boundary is not this function's.
- *  Realms are built lazily, so a guest that cannot compile is discovered at its first
- *  message — except the transport's, which the shell builds eagerly because the node's
- *  network has to be up when the load returns. Advancing the mark inside would raise it
- *  for a bundle that never ran a line, leaving the node unable to reinstall any version it
- *  can reach: rollback bricked by a failed upgrade. */
-export async function installBundle(host: BundleHost, v: VerifiedBundle, freshness?: FreshnessStore, deferMark = false): Promise<LoadedBundle> {
-    // Whether this version may land was answered by the admission predicate against this
-    // same store (policy.ts `freshVersion`, `notRevoked`); the store below is written,
-    // never consulted.
-    const version = v.manifest.version;
+ *  bytes are authorized and `verifyBundle` proved they match. */
+export async function installBundle(host: BundleHost, v: VerifiedBundle): Promise<LoadedBundle> {
     // The §4.3 memory bound, read off the bytes BEFORE the host instantiates them —
     // instantiation is what allocates the declared initial memory, so a host-side check
     // could only run after the damage. An admission rule, so §3 puts it in the one
@@ -853,39 +844,6 @@ export async function installBundle(host: BundleHost, v: VerifiedBundle, freshne
     }
     catch (e) {
         throw new Error(`bundle: module ${errMessage(e)}`, { cause: e });
-    }
-    // Advance the mark only after a fully successful load (or leave it to the caller under
-    // `deferMark`) — it records the highest version that actually loaded (§12.4).
-    // Advancing it where the downgrade is DECIDED would brick rollback: a signed but
-    // corrupt newer bundle would raise the mark and then throw. Which is why the admission
-    // predicate is pure and this is the only writer. The flip side: once a good newer
-    // version lands, reloading the known-good older bundle is refused until an operator
-    // hand-edits the freshness file.
-    if (freshness && !deferMark) {
-        // A persist that FAILS is a failed load: the modules landed but the mark did not,
-        // so the downgrade gate would be off on the next boot while the app looks
-        // installed. Roll the in-memory mark back, so a retry persists a fresh advance
-        // rather than no-op'ing against the stale value, and un-bind what landed where the
-        // host can.
-        //
-        // That restores "nothing of this load was kept", NOT "the table as it was":
-        // `bindAll` REPLACES an app's module map, so on an upgrade the previous version is
-        // already gone and the app ends up unbound. An idempotent retry re-lands it once
-        // the store is fixed; until then the app is absent rather than silently ungated.
-        const appKey = appKeyFor(v.author, v.manifest.app);
-        const prev = freshness.get(v.author, v.manifest.app);
-        try {
-            freshness.set(v.author, v.manifest.app, version);
-        }
-        catch (e) {
-            freshness.resetMark?.(v.author, v.manifest.app, prev);
-            host.removeApp?.(appKey);
-            throw new Error(
-                `bundle: the load succeeded but the freshness mark could not be persisted — nothing of it was kept: ${errMessage(e)}. ` +
-                "Fix the store and re-run the load.",
-                { cause: e },
-            );
-        }
     }
     return {
         manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,

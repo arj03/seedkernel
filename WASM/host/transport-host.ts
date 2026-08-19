@@ -256,9 +256,9 @@ export class TransportHost {
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Point the driver at the shell's routing and send the one config turn: who we are,
-   *  which network, the budgets, the peer list. The guest learns the host's flood cap
-   *  here — the module never declares the number that bounds it.
+  /** Point the adapter at the shell's current `_net` claimant and send the one config turn:
+   *  who we are, which network, the budgets, the peer list. The guest learns the host's
+   *  flood cap here — the module never declares the number that bounds it.
    *
    *  Called again whenever the claimant of `_net` changes, which is what an in-place
    *  transport replacement is: the incoming guest is configured exactly as the first one
@@ -269,6 +269,7 @@ export class TransportHost {
     // are torn down here rather than left as channels the incoming guest never heard of;
     // it redials from the address book re-seeded below.
     if (this.transport) {
+      this.transport = null;
       for (const c of this.channels.values()) {
         try { c.close(false); } catch { /* already gone */ }
       }
@@ -297,9 +298,23 @@ export class TransportHost {
       // Absent and empty both mean "admit everyone", said as a zero-length list so the
       // guest reads one shape.
       .blob(admit.build()));
-    // The incoming guest starts with an empty address book, so re-seed it. On a first
-    // attach there is nothing to send; on a replacement this is what lets it redial.
+    // The claimant starts with an empty address book, so seed everything accumulated by
+    // the platform before it was first used (and re-seed after a replacement).
     for (const [id, addr] of this.addrs) this.announceAddr(id, addr);
+  }
+
+  /** Give the adapter no claimant, without closing the listener or forgetting the address
+   *  book — those are the NODE's, and a later `_net` claim attaches to this same adapter
+   *  and is re-seeded from them. Uninstalling the transport bundle is the case: the node
+   *  stops speaking the protocol, it does not stop being a node. */
+  detach(): void {
+    if (!this.transport) return;
+    this.transport = null;
+    for (const c of this.channels.values()) {
+      try { c.close(false); } catch { /* already gone */ }
+    }
+    this.channels.clear();
+    this.openLinks.clear();
   }
 
   /** Whether `close` has run. Public because "the outgoing driver was actually shut
@@ -434,6 +449,7 @@ export class TransportHost {
    *  The channel object stays the caller's; the link state machine runs in the
    *  guest, keyed by the returned link id. */
   openLink(opts: OpenLinkOptions): LinkHandle {
+    if (!this.transport) throw new Error("transport: no bundle claims the network");
     const linkId = this.register(opts.channel);
     this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
     this.announce(linkId, {
@@ -474,10 +490,15 @@ export class TransportHost {
 
   /** Bind the listeners (if any) through the channel factory. */
   async start(): Promise<void> {
+    if (!this.transport) throw new Error("transport: no bundle claims the network");
     if (!this.opts.channels) return;
     const { port, wsPort } = await this.opts.channels.listen(
       this.opts.listen, this.opts.wsListen,
       (channel) => {
+        if (!this.transport) {
+          try { channel.close(false); } catch { /* already gone */ }
+          return;
+        }
         const linkId = this.register(channel);
         this.announce(linkId, {
           weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,

@@ -24,6 +24,7 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
+const { TransportHost } = await imp("build/host/transport-host.js");
 const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
@@ -44,22 +45,26 @@ async function makeNode(ws = false) {
     authors: [transportAuthor, appAuthorHex],
     grants: { link: [transportAuthor] },
   }));
+  const transport = new TransportHost({
+    identity,
+    channels: new NodeChannelFactory(),
+    listen: { host: HOST, port: 0 },
+    ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
+    requestDeadlineMs: 2000,
+  });
   const shell = createShell({
     platform: {
       sodium, identity,
       table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
-      channels: new NodeChannelFactory(),
-      listen: { host: HOST, port: 0 },
-      ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
+      transportHost: transport,
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: policy,
-    requestDeadlineMs: 2000,
   });
   await shell.loadBundleBlob(transportBlob);
   await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return shell;
+  return { shell, transport };
 }
 
 const { ok, summary } = testkit();
@@ -85,13 +90,13 @@ aNet.addPeerAddr(b.transport.peerId, { host: HOST, port: bNet.port, transport: "
 await aNet.ready(4000);
 assert((await aNet.linkedPeers()).includes(b.transport.peerId), "the AKE completed over a real socket");
 
-const small = await appRequest(a, appKey, b.transport.peerId, new Uint8Array([1, 2, 3, 4]));
+const small = await appRequest(a.shell, appKey, b.transport.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(small.length === 4 && small[3] === 4, "a small request round-trips through the guest's framer");
 
 // The reassembly case: a response guaranteed to span many segments, checked byte for
 // byte. A framer that mishandled a partial length prefix or a split body would either
 // hang here or deliver a corrupted message rather than merely a short one.
-const big = await appRequest(a, appKey, b.transport.peerId, generatorRequest(BIG, 1));
+const big = await appRequest(a.shell, appKey, b.transport.peerId, generatorRequest(BIG, 1));
 assert(big.length === BIG, `a ${BIG}-byte response reassembled from many TCP segments`);
 let intact = true;
 for (let i = 0; i < BIG; i++) if (big[i] !== (i & 0xff)) { intact = false; break; }
@@ -125,11 +130,11 @@ cNet.addPeerAddr(d.transport.peerId, { host: HOST, port: dNet.wsPort, transport:
 await cNet.ready(4000);
 assert((await cNet.linkedPeers()).includes(d.transport.peerId), "the AKE completed through the WS upgrade");
 
-const wsSmall = await appRequest(c, appKey, d.transport.peerId, new Uint8Array([5, 6, 7]));
+const wsSmall = await appRequest(c.shell, appKey, d.transport.peerId, new Uint8Array([5, 6, 7]));
 assert(wsSmall.length === 3 && wsSmall[2] === 7, "a small request round-trips as masked WS frames");
 
 // Large enough to force 64-bit WS length headers and multi-segment reassembly at once.
-const wsBig = await appRequest(c, appKey, d.transport.peerId, generatorRequest(BIG, 7));
+const wsBig = await appRequest(c.shell, appKey, d.transport.peerId, generatorRequest(BIG, 7));
 assert(wsBig.length === BIG, `a ${BIG}-byte response crossed as WS frames`);
 let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }
@@ -141,7 +146,7 @@ assert(wsIntact, "every byte survived WS framing + reassembly");
 // two parses from running over one reassembly buffer is the framer's read chain
 // (framing.js `push`). Each answer must be the one its own request asked for.
 const burst = await Promise.all(
-  Array.from({ length: 12 }, (_, i) => appRequest(c, appKey, d.transport.peerId, generatorRequest(1024 + i, 11 + i))));
+  Array.from({ length: 12 }, (_, i) => appRequest(c.shell, appKey, d.transport.peerId, generatorRequest(1024 + i, 11 + i))));
 let burstIntact = burst.length === 12;
 burst.forEach((resp, i) => {
   if (resp.length !== 1024 + i) { burstIntact = false; return; }

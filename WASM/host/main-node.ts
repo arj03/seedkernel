@@ -10,7 +10,7 @@
 // native binary runs inside QuickJS.
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { runCli, type CliHost, type NodeSetup } from "./cli.js";
-import { boot } from "./main.js";
+import { bootRuntime } from "./main.js";
 import { loadCrypto } from "./crypto-node.js";
 import { errMessage } from "../core/util.js";
 
@@ -49,7 +49,7 @@ async function nodeHost(): Promise<CliHost> {
     async standUp(cfg: NodeSetup) {
       // ShellOptions is NodeSetup plus this platform's optional members, so the config
       // crosses unchanged — no field-by-field copy to fall out of step.
-      return boot(cfg);
+      return bootRuntime(cfg);
     },
   };
 }

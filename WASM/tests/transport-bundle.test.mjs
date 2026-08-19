@@ -3,8 +3,8 @@
 // request/response through it. Everything after boot is the bundle's code.
 //
 // The second half is the claim the whole arrangement rests on: a node **replaces its
-// transport while running**, through the explicit transport slot, and comes back on
-// the same port. That is what "the protocol is replaceable without a fork" means in
+// `_net` claimant while running**, while the concrete channel adapter stays on the same
+// port. That is what "the protocol is replaceable without a fork" means in
 // practice.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -27,6 +27,7 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, hybridAuthorId, hybridAuthorKeysFromSeed, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
+const { TransportHost } = await imp("build/host/transport-host.js");
 const { GUEST_ABI_VERSION, NET_PROTOCOL } = await imp("build/core/domains.js");
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
@@ -119,20 +120,20 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     authors: [transportAuthor, upgradeAuthor, appAuthorHex],
     grants: { link: [transportAuthor, upgradeAuthor] },
   }));
+  const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
   const shell = createShell({
     platform: {
       sodium, identity,
       table: new ModuleTable(),
       freshnessStore,
-      channels, listen,
+      transportHost: transport,
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: policy,
-    requestDeadlineMs: 800,
   });
   await shell.loadBundleBlob(transportBlob);
   await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return shell;
+  return { shell, transport };
 }
 
 console.log("Test: transport bundle drives two nodes over loopback");
@@ -158,7 +159,7 @@ aNet.addPeerAddr(bId, { host: "loopback", port: bNet.port, transport: "tcp" });
 await aNet.ready(2000);
 assert((await aNet.linkedPeers()).includes(bId), "A authenticated B over loopback (AKE ran)");
 
-const resp = await request(b, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
+const resp = await request(b.shell, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through the record layer");
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
@@ -169,64 +170,61 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 // replaced. Hence no handover to check: the outgoing guest held nothing the node needed
 // back.
 console.log("  upgrading A's transport in place…");
-const oldDriver = a.transport;
 const oldPort = aNet.port;
-await a.loadBundleBlob(transportBundleAt(2, upgradeKeys));
-const aNet2 = a.transport;
+const oldPeerId = aNet.peerId;
+const oldClaimant = a.shell.resolve(NET_PROTOCOL);
+await a.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys));
 
-assert(aNet2 === oldDriver, "the driver survives the swap — it holds nothing the outgoing guest owned");
-assert(oldDriver.isClosed === false, "…so it is neither closed nor leaked; it was re-attached");
-assert(aNet2.port === oldPort, "the node stayed on the SAME port its peers hold");
-assert(a.transport.peerId === aNet.peerId, "the node identity is the host's, untouched by the swap");
-assert(a.resolve(NET_PROTOCOL) !== null, "the incoming bundle claims the transport id");
+// The claim moved; the adapter did not. Asserted on the adapter's own state rather than on
+// object identity — `a.transport` is the platform's field and comparing it to itself would
+// pass however badly the swap went.
+assert(a.shell.resolve(NET_PROTOCOL) !== oldClaimant, "the incoming bundle took the transport id off the outgoing one");
+assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the swap — it was re-attached");
+assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
+assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
 
 // Live links do not survive and are not meant to: session keys live in the outgoing
 // guest's private memory. What survives is the host's half — the address book — so the
 // first request redials and succeeds.
-const resp2 = await request(a, bId, new Uint8Array([9, 9]));
+const resp2 = await request(a.shell, bId, new Uint8Array([9, 9]));
 assert(resp2.length === 2 && resp2[0] === 9, "A reconnects from the re-seeded address book and requests through the NEW transport");
 
 // And the reverse direction: B dials A on the port it already knew, and reaches A's app
 // through the incoming guest.
-const resp3 = await request(b, aNet.peerId, new Uint8Array([5, 6, 7]));
+const resp3 = await request(b.shell, aNet.peerId, new Uint8Array([5, 6, 7]));
 assert(resp3.length === 3 && resp3[2] === 7, "B reaches A on the unchanged port, through the new guest");
 
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
 // and the transport answers to that mark like any other bundle (§12.4).
 let refused = false;
-try { await a.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version from the same author is refused after the upgrade");
-assert(a.transport === aNet2, "…and the refused load left the standing transport in place");
+assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
+  "…and the refused load left the standing transport serving");
 
 // ── A version that never ran must not consume the claim ──────────────────────────
-// Every app's realm is built lazily, but the transport's is built at LOAD, since the
-// node's network has to be up when the load returns — so a v3 whose guest cannot compile
-// dies there. A mark advanced on the way in would leave the node serving the transport it
-// has and unable to reinstall it: every version it can reach would sit below a mark a
-// bundle that never executed a line raised. So the mark is deferred until the realm
-// stands (bundle.ts `deferMark`).
+// Every app's guest is STOOD at load (shell-core.ts), so a v3 that cannot compile dies
+// there. A mark advanced on the way in would leave the node unable to reinstall the
+// transport it had: every version an operator can reach would sit below a floor a bundle
+// that never executed a line raised — rollback bricked by a failed upgrade. So the mark is
+// the last step of the load, after the guest stands.
 const brokenGuest = new TextEncoder().encode("const nope = ( ;");
 let v3Failed = false;
-try { await a.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
 catch { v3Failed = true; }
 assert(v3Failed, "a v3 whose guest cannot compile fails the load");
-assert(a.transport === aNet2, "…and the node keeps the transport that was standing");
 
 let v2Reloaded = true;
-try { await a.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
 catch { v2Reloaded = false; }
-assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what loaded");
-assert(a.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds the transport id again");
+assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
+assert(a.shell.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds the transport id again");
+assert((await request(a.shell, bId, new Uint8Array([8, 8]))).length === 2,
+  "…and the node is back on the network through it");
 
-// ── A mark that cannot be written is a failed transport load ─────────────────────
-//
-// The transport's mark is DEFERRED to the shell (bundle.ts `deferMark`), raised after the
-// realm stands and so outside the rollback installBundle does for every other app. A write
-// that failed there and threw raw would tell the caller the load failed while the node
-// already served the new guest, with the disk mark still at the old version — so the next
-// boot re-admits the bundle this one replaced. A failed persist keeps nothing (§12.4).
-console.log("  a transport mark that cannot be persisted fails the load…");
+// ── A mark that cannot be persisted is a failed load ─────────────────────────────
+console.log("  an `_net` claimant whose mark cannot be persisted fails the load…");
 {
   let broken = false;
   class FlakyStore extends FreshnessMarks {
@@ -234,14 +232,14 @@ console.log("  a transport mark that cannot be persisted fails the load…");
   }
   const store = new FlakyStore();
   const c = await makeNode(fabric.view(), undefined, store);
-  assert(c.resolve(NET_PROTOCOL) !== null, "the node stands its transport up normally");
+  assert(c.shell.resolve(NET_PROTOCOL) !== null, "the node stands its `_net` claimant up normally");
 
   broken = true;
   let msg = "";
-  try { await c.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch (e) { msg = e.message; }
-  assert(msg.includes("could not be persisted"), `a transport whose mark cannot be written fails the load (got: ${msg})`);
+  try { await c.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch (e) { msg = e.message; }
+  assert(msg.includes("could not be persisted"), `a bundle whose mark cannot be written fails the load (got: ${msg})`);
   assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
-  assert(c.resolve(NET_PROTOCOL)?.startsWith(transportAuthor),
+  assert(c.shell.resolve(NET_PROTOCOL)?.startsWith(transportAuthor),
     "nothing of the failed load was kept — the claim went back to the transport that was standing, " +
     "rather than the uncommitted bundle serving on");
 
@@ -249,12 +247,12 @@ console.log("  a transport mark that cannot be persisted fails the load…");
   // store that never got the first one.
   broken = false;
   let reloaded = true;
-  try { await c.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch { reloaded = false; }
+  try { await c.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch { reloaded = false; }
   assert(reloaded, "the retry against a healthy store lands");
   assert(store.get(upgrade.id, "transport") === 2, "…and the mark it persists is the one the failed load rolled back");
-  c.close();
+  c.shell.close();
 }
 
-a.close();
-b.close();
+a.shell.close();
+b.shell.close();
 summary("transport bundle smoke");

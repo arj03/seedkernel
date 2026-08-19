@@ -48,11 +48,11 @@ const requesterJS = `
 globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
-  const shell = await makeTransportNode({
+  const node = await makeTransportNode({
     identity: id, contactSecret: fromHex(contactSecretHex), timeoutMs: 2000,
   });
-  globalThis.__requesterShell = shell;
-  const net = shell.transport;
+  globalThis.__requesterNode = node;
+  const net = node.transport;
   globalThis.__net2 = net;
   // The secret rides in the ADDRESS, not in this node's own config: on a dial it is the
   // PEER's contact secret (§12.6), and without it the holder answers a stranger's msg1
@@ -69,11 +69,11 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
 globalThis.__requester = null;
 // The requester loads the probe app and asks through it: a request is an app calling
 // the id the transport claims, so there is nothing host-side to call instead.
-globalThis.loadIntoRequester = (bytes) => __requesterShell.loadBundleBlob(new Uint8Array(bytes));
+globalThis.loadIntoRequester = (bytes) => __requesterNode.shell.loadBundleBlob(new Uint8Array(bytes));
 globalThis.ask = async (appKey, sendArgs) => {
   // The op is a NAME the shell frames (invoke, shell-core.ts) — the probe app's own
   // local vocabulary, which the shell passes through without reading.
-  const r = await __requesterShell.invoke("send", new Uint8Array(sendArgs), appKey);
+  const r = await __requesterNode.shell.invoke("send", new Uint8Array(sendArgs), appKey);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 };
@@ -148,13 +148,10 @@ func TestServeGuestApp(t *testing.T) {
 	bundlePath, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
 	holderKey := appKeyFor(author.id(), "holderapp")
 	// The load is the whole of it (§12.10): the manifest claims `holderapp`, so the
-	// bundle that landed is already the destination for that protocol — there is no
-	// second call between installing and serving.
+	// bundle that landed is already the destination for that protocol, and its guest is
+	// already standing — there is no second call between installing and serving.
 	if status := loadBundle(bundlePath); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
 		t.Fatalf("bundle load: %s", status)
-	}
-	if _, err := callRealm("serve", 10*time.Second); err != nil {
-		t.Fatal("serve:", err)
 	}
 	startRequester(t, hex.EncodeToString(author.id()), st.PeerID, st.Port)
 	key := []byte("greeting")
@@ -198,9 +195,6 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	echoKey := appKeyFor(author.id(), "echoapp")
 	if status := loadBundle(echoBundle); status != loadedLine("echoapp", 1, echoKey, "echoapp") {
 		t.Fatalf("echo bundle load: %s", status)
-	}
-	if _, err := callRealm("serve", 10*time.Second); err != nil {
-		t.Fatal("serve:", err)
 	}
 	peerID := startRequester(t, hex.EncodeToString(author.id()), st.PeerID, st.Port)
 

@@ -2,7 +2,7 @@
 // The transport bundle guest — the channel handshake (AKE + forward-secret record
 // layer), the authenticated link router, the link bookkeeping and the
 // request/response layer — as the zero-authority JS program of a signed bundle
-// claiming the shell's transport slot (§12.6). The host keeps only what has no
+// reaching the raw-link capability and claiming `_net` (§12.6). The host keeps only what has no
 // endpoint substitute: the sockets, the flood caps, the node key, the entropy
 // source. Everything here is state machines.
 //

@@ -187,28 +187,36 @@ export async function makeTransportHost(opts = {}) {
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
   const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
+  const driver = new TransportHost({
+    identity,
+    channels: opts.channels,
+    listen: opts.listen,
+    networkKey: opts.networkKey,
+    contactSecret: opts.contactSecret,
+    admitPeers: opts.admitPeers,
+    connsPerPeer: opts.connsPerPeer,
+    requestDeadlineMs: opts.requestDeadlineMs,
+    maxHalfOpenUnverified: opts.transportHalfOpen?.unverified,
+    maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
+    maxHalfOpenVerified: opts.transportHalfOpen?.verified,
+    maxAuthedLinks: opts.transportHalfOpen?.authed,
+    linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
+  });
   const shell = createShell({
     platform: {
       sodium: opts.sodium ?? sodium,
       identity,
       table: new ModuleTable(),
       freshnessStore: new FreshnessMarks(),
-      channels: opts.channels,
-      listen: opts.listen,
       networkKey: opts.networkKey,
-      contactSecret: opts.contactSecret,
-      admitPeers: opts.admitPeers,
-      connsPerPeer: opts.connsPerPeer,
+      transportHost: driver,
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: policy,
     answer: opts.answer,
-    requestDeadlineMs: opts.requestDeadlineMs,
-    transportHalfOpen: opts.transportHalfOpen,
-    linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
-  const node = { shell, driver: shell.transport, identity, appAuthor };
+  const node = { shell, driver, identity, appAuthor };
   if (opts.app === false) return node;
   const appKey = `${appAuthorHex}:harness`;
   await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
@@ -262,7 +270,7 @@ export async function makeTransportHost(opts = {}) {
     }
     return out;
   };
-  node.peers = () => shell.transport.linkedPeers();
+  node.peers = () => driver.linkedPeers();
   return node;
 }
 

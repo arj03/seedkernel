@@ -52,7 +52,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.__nodeB = b;
 		  // The seam a confined guest on B runs against: _net resolves through B's own
 		  // routing, which is what an app's seam is wired with (shell-core crossRealmCall).
-		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => b.dispatch("0".repeat(64), id, payload) });
+		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => b.shell.dispatch("0".repeat(64), id, payload) });
 		})();
 	`, hex.EncodeToString(sender.id())))); err != nil {
 		t.Fatal("setup:", err)
@@ -62,7 +62,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	}
 
 	// Bind A's listener (sets netA.port), then point B at A.
-	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); await __nodeA.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
+	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); await __nodeA.shell.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(

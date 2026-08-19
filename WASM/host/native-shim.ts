@@ -11,7 +11,7 @@
 // is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor } from "./bundle.js";
-import { runCli, loadedLine, parsePeerSpec, type CliHost, type NodeSetup } from "./cli.js";
+import { runCli, loadedLine, parsePeerSpec, requireNetClaimant, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import {
   createShell, type ModuleTableBackend, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
@@ -23,6 +23,8 @@ import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
 import { isAdmissionRejected } from "./shell-core.js";
+import { TransportHost } from "./transport-host.js";
+import { NET_PROTOCOL } from "../core/domains.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
@@ -474,16 +476,23 @@ async function makeTransportNode(cfg: {
     /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
     transportBundle?: Uint8Array;
     config?: Record<string, string | number>;
-}): Promise<Shell> {
+}): Promise<NodeRuntime> {
+    const transportHost = new TransportHost({
+        identity: cfg.identity,
+        networkKey: cfg.networkKey,
+        contactSecret: cfg.contactSecret,
+        requestDeadlineMs: cfg.requestDeadlineMs,
+        channels,
+        listen: cfg.listen,
+        wsListen: cfg.wsListen,
+    });
     const s = createShell({
         platform: {
             sodium, identity: cfg.identity, table, fs,
             freshnessStore: new NativeFreshnessStore(storeDir),
-            channels, listen: cfg.listen, wsListen: cfg.wsListen,
-            contactSecret: cfg.contactSecret, networkKey: cfg.networkKey, createRealm,
+            networkKey: cfg.networkKey, transportHost, createRealm,
         },
         admit: (v, ctx) => admissionPolicy(v, ctx),
-        requestDeadlineMs: cfg.requestDeadlineMs,
         guestDeadlineMs: cfg.guestDeadlineMs,
         realmMemoryBytes: cfg.realmMemoryBytes,
         config: cfg.config,
@@ -507,8 +516,8 @@ async function makeTransportNode(cfg: {
     }
     // Conditional on there BEING a driver: a policy granting `link` to nobody is a
     // configuration rather than a failure.
-    await s.transport?.start();
-    return s;
+    if (s.resolve(NET_PROTOCOL)) await transportHost.start();
+    return { shell: s, transport: transportHost };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so
@@ -528,27 +537,26 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         requestDeadlineMs: cfg.requestDeadlineMs,
         config: cfg.config,
     });
-    shell = s;
+    shell = s.shell;
     const network = s.transport;
-    if (network) {
-        for (const spec of cfg.peers ?? []) {
+    const peers: string[] = cfg.peers ?? [];
+    if (peers.length > 0) {
+        // The same diagnosis the operator flow gives (`--peers`): the adapter is the
+        // platform's and always there, so an unclaimed `_net` has to be said rather than
+        // discovered as a dial that answers nothing.
+        requireNetClaimant(s.shell, "peers were configured, but there is nothing to dial from");
+        for (const spec of peers) {
             const { peerId, addr } = parsePeerSpec(spec, "tcp");
             network.addPeerAddr(peerId, addr);
         }
         // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
         // cohort member that is not up yet delays the boot but never fails it.
-        if (cfg.peers && cfg.peers.length > 0)
-            await network.ready();
+        await network.ready();
     }
     const status = {
-        peerId: toHex(keys.channel.publicKey), port: network?.port, wsPort: network?.wsPort,
+        peerId: toHex(keys.channel.publicKey), port: network.port, wsPort: network.wsPort,
     };
     return utf8.encode(JSON.stringify(status));
-}
-/** Serve the cohort: route inbound requests to whichever installed app claims the
- *  protocol (§12.10), through the shared dispatch. */
-function serve(): Promise<void> {
-    return theShell().serve();
 }
 
 // ── the operator flow ────────────────────────────────────────────────────────
@@ -587,7 +595,7 @@ function nativeCliHost(): CliHost {
                 config: cfg.config,
             });
             // One "the shell" per realm, whichever entry point stood it up.
-            shell = stood;
+            shell = stood.shell;
             return stood;
         },
     };
@@ -638,4 +646,4 @@ globalThis.__start = function (id, entry, arg) {
 // What Go reaches by name in the realm. `createRealm` and the transport helpers are here
 // for the native tests as much as for the boot above, so a test that stands up a guest or
 // a second node drives the very factories production does.
-export { runMain, cliLoadBundle, openStore, bootNode, setPolicy, serve, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, cliLoadBundle, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

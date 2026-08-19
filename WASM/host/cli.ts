@@ -11,7 +11,9 @@ import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { appKeyFor, type LoadedBundle } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
-import { requireTransport, type Shell } from "./shell-core.js";
+import { NET_PROTOCOL, PRIVILEGE_LINK } from "../core/domains.js";
+import type { TransportHost } from "./transport-host.js";
+import type { Shell } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted. One value on every target, so
  *  the same command line runs the same node over the same store wherever it runs. */
@@ -54,6 +56,22 @@ export interface NodeSetup {
   config?: Record<string, string | number>;
 }
 
+/** Platform-owned channel integration kept beside the shell. */
+export interface NodeRuntime {
+  shell: Shell;
+  transport: TransportHost;
+}
+
+/** The diagnosis a cohort operation needs when no bundle claims `_net`. The adapter is
+ *  always there — it is the platform's — so a node with no transport bundle answers
+ *  "no route" rather than failing, which is a legitimate configuration (§12.6) and exactly
+ *  the wrong answer to give an operator who typed `--peers`. */
+export function requireNetClaimant(shell: Pick<Shell, "resolve">, what: string): void {
+  if (!shell.resolve(NET_PROTOCOL)) {
+    throw new Error(`shell: ${what} — load a bundle that reaches the "${PRIVILEGE_LINK}" privilege and claims ${NET_PROTOCOL}, first`);
+  }
+}
+
 /** The platform under the operator flow. */
 export interface CliHost extends CliFiles {
   /** The first word of the first console line — the artifact you are running
@@ -77,7 +95,7 @@ export interface CliHost extends CliFiles {
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
   /** Assemble a node on this platform: the platform seam, `createShell`, and the
    *  transport bundle that is its network. */
-  standUp(cfg: NodeSetup): Promise<Shell>;
+  standUp(cfg: NodeSetup): Promise<NodeRuntime>;
 }
 
 /** What `runCli` leaves behind: whether the node is listening (so the caller knows to
@@ -240,7 +258,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const keys = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
 
-  const shell = await host.standUp({
+  const { shell, transport: net } = await host.standUp({
     dir,
     policyJson,
     identity: keys.channel,
@@ -266,31 +284,27 @@ export async function runCli(host: CliHost): Promise<CliResult> {
       ? JSON.parse(utf8.decode(mustRead(host, args.get("app-config")!, "--app-config")))
       : undefined,
   });
-  // The node's transport driver, or null when the policy admitted no transport bundle.
-  // Read once and held: nothing below stands a second one up.
-  const net = shell.transport;
-
   // Cohort peers: teach the transport their addresses so it can dial them. A policy
   // admitting no transport bundle leaves nothing to dial FROM — say so, rather than
   // letting the flag pass silently on a node with no network.
   const peers = list(args.get("peers"));
   if (peers.length > 0) {
-    const dialer = requireTransport(shell, "--peers given, but there is nothing to dial from");
+    requireNetClaimant(shell, "--peers given, but there is nothing to dial from");
     for (const spec of peers) {
       const { peerId, addr } = parsePeerSpec(spec, "tcp");
-      dialer.addPeerAddr(peerId, addr);
+      net.addPeerAddr(peerId, addr);
     }
     // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
     // cohort member that is not up yet delays the boot but never fails it.
-    await dialer.ready();
+    await net.ready();
   }
 
   host.log(`${host.banner} ${toHex(keys.channel.publicKey)}`);
   host.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);
-  if (net?.port) host.log(`  tcp    listening on :${net.port}`);
-  if (net?.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
+  if (net.port) host.log(`  tcp    listening on :${net.port}`);
+  if (net.wsPort) host.log(`  ws     listening on :${net.wsPort}`);
 
   // Operator remedies (§12.5), deliberately BEFORE the bundle: a node booting with both
   // should never briefly install what it was told to refuse. --revoke is the whole remedy
@@ -335,12 +349,12 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   }
 
   const close = () => shell.close();
-  if (!net?.port && !net?.wsPort) return { serving: false, close };
+  if (!net.port && !net.wsPort) return { serving: false, close };
   // A serving node with an app loaded also answers for the cohort: inbound requests route
   // by protocol id to whichever app claims it, answered from its own confined realm — no
-  // app-specific host code, no second dispatch (§12.8, §12.10).
+  // app-specific host code, no second dispatch (§12.8, §12.10). Nothing to arm: the load
+  // stood the guest, so the app has been answerable since the line above.
   if (bundlePath !== undefined) {
-    await shell.serve();
     host.log("  serving the app's request side from the confined guest");
   }
   host.log("serving — Ctrl-C to stop");

@@ -168,7 +168,7 @@ func TestGuestSeamOps(t *testing.T) {
 	if _, err := call(nameNodeRandom, []byte{0, 0, 0, 4}); err == nil {
 		t.Fatal("node/random resolved despite not being a declared name")
 	}
-	// And raw net is not merely undeclared here — it is the transport slot's, so no app
+	// And raw net is not merely undeclared here — it is capability-wired, so no app
 	// seam is ever wired one.
 	if _, err := call(nameLinkSend, make([]byte, 8)); err == nil {
 		t.Fatal("a link/* name resolved on an app seam")

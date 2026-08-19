@@ -37,9 +37,8 @@ export class WsChannel extends MessageChannel {
 }
 
 export interface WsNetworkOptions {
-  /** The transport driver — the shell's `net` once the transport bundle is admitted. It
-   *  holds the node identity, the network key, the contact secret and the peer lint; this
-   *  file only opens sockets. */
+  /** The platform's concrete channel adapter. It holds the node identity, the network key,
+   *  the contact secret and the peer lint; this file only opens sockets. */
   driver: TransportHost;
   /** Open a WebSocket to `url`. Defaults to the platform global. */
   webSocketFactory?: (url: string) => WsLike;

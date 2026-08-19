@@ -60,8 +60,8 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const a = await makeTransportNode({ identity: idA, %s timeoutMs: 1000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 1000 });
 		  await a.transport.start();
-		  await a.loadBundleBlob(__probe);
-		  await b.loadBundleBlob(__probe);
+		  await a.shell.loadBundleBlob(__probe);
+		  await b.shell.loadBundleBlob(__probe);
 		  b.transport.addPeerAddr(aId, { host: "127.0.0.1", port: a.transport.%s, transport: "%s" });
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME and
@@ -78,7 +78,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  args.set(proto, off); off += proto.length;
 		  dv.setUint32(off, payload.length); off += 4;
 		  args.set(payload, off);
-		  const r = await b.invoke("send", args, %q);
+		  const r = await b.shell.invoke("send", args, %q);
 		  if (r[0] !== 1) throw new Error("net: request failed");
 		  return r.slice(1);
 		};

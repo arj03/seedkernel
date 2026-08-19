@@ -546,7 +546,7 @@ export function appSignScope(key: {
 }, author: Uint8Array, app: string): SignScope {
     return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
-/** The transport slot's signing scope: `DOMAIN_channel ‖ networkKey`, signed by the node's
+/** The `link` capability's signing scope: `DOMAIN_channel ‖ networkKey`, signed by the node's
  *  CHANNEL key (its peer identity). The suffix — a handshake transcript — is the slot
  *  occupant's business and the host does not look at it. An absent network key is the
  *  public network's zero key, said explicitly (§12.6). */
@@ -601,7 +601,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     };
     const rawNet = () => {
         if (!grants.rawNet)
-            throw new Error("guest-seam: link.* used but no raw net is wired (only the transport slot holds sockets)");
+            throw new Error("guest-seam: link.* used but no raw net is wired");
         return grants.rawNet;
     };
     const timers = () => {

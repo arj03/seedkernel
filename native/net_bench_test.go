@@ -86,8 +86,8 @@ const netBenchHarness = `
 	  globalThis.netB = b.transport;
 	  // A claims the protocol so inbound frames route to its guest; B holds the same app
 	  // because the request goes out THROUGH it.
-	  await a.loadBundleBlob(__appBlob);
-	  await b.loadBundleBlob(__appBlob);
+	  await a.shell.loadBundleBlob(__appBlob);
+	  await b.shell.loadBundleBlob(__appBlob);
 
 	  // The transport's 'send' op argument order (transport/src/core.js):
 	  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
@@ -107,7 +107,7 @@ const netBenchHarness = `
 	  // One request out of B, answered by A's app. The [ok u8][response] answer shape is
 	  // the transport's; a 0 means unreachable, a deadline, or a refusal.
 	  const req = async (args) => {
-	    const r = await b.invoke("send", args, __appKey);
+	    const r = await b.shell.invoke("send", args, __appKey);
 	    if (r[0] !== 1) throw new Error("net: request failed");
 	    return r.slice(1);
 	  };
@@ -125,7 +125,7 @@ const netBenchHarness = `
 	  // receiver's), so it is what says whether a round-trip number is the wire or the
 	  // guest boundary.
 	  const localArg = new Uint8Array(34);
-	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.invoke("echo", localArg, __appKey); return new Uint8Array(0); };
+	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.shell.invoke("echo", localArg, __appKey); return new Uint8Array(0); };
 	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 	})();
 `
