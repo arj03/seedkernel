@@ -9,7 +9,7 @@
 // lines. Those are decisions, and a decision made twice eventually gets made differently.
 import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
-import { appKeyFor, type LoadedBundle } from "./bundle.js";
+import { appKeyFor, isJsonObject, type JsonObject, type LoadedBundle } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
 import { NET_PROTOCOL, PRIVILEGE_LINK } from "../core/domains.js";
 import type { TransportHost } from "./transport-host.js";
@@ -53,7 +53,6 @@ export interface NodeSetup {
   guestDeadlineMs?: number;
   realmMemoryBytes?: number;
   transportBundle?: Uint8Array;
-  config?: Record<string, string | number>;
 }
 
 /** Platform-owned channel integration kept beside the shell. */
@@ -257,6 +256,17 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     : utf8.decode(mustRead(host, policyPath, "--policy"));
   const keys = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
+  const bundlePath = args.get("bundle");
+  if (args.has("app-config") && bundlePath === undefined) {
+    throw new Error("--app-config requires --bundle so the configuration has one app scope");
+  }
+  // Checked here, not at the load, so a malformed file fails before a node is listening.
+  let localConfig: JsonObject | undefined;
+  if (args.has("app-config")) {
+    const parsed: unknown = JSON.parse(utf8.decode(mustRead(host, args.get("app-config")!, "--app-config")));
+    if (!isJsonObject(parsed)) throw new Error("--app-config must hold a JSON object");
+    localConfig = parsed;
+  }
 
   const { shell, transport: net } = await host.standUp({
     dir,
@@ -278,11 +288,6 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     guestDeadlineMs: args.has("guest-timeout") ? (Number(args.get("guest-timeout")) || Infinity) : undefined,
     realmMemoryBytes: args.has("guest-memory") ? Number(args.get("guest-memory")) * 1024 * 1024 : undefined,
     transportBundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
-    // Operator-supplied app config (e.g. a storage node's quota), merged over the
-    // bundle's author-signed config. Opaque JSON the shell forwards into `const APP`.
-    config: args.has("app-config")
-      ? JSON.parse(utf8.decode(mustRead(host, args.get("app-config")!, "--app-config")))
-      : undefined,
   });
   // Cohort peers: teach the transport their addresses so it can dial them. A policy
   // admitting no transport bundle leaves nothing to dial FROM — say so, rather than
@@ -321,11 +326,15 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // A signed bundle from disk. Reading the file is all the operator flow does: the whole
   // load — signature, policy, freshness, integrity, binding, claiming the manifest's
   // protocol ids — is the shared shell's (§12.4, §12.10).
-  const bundlePath = args.get("bundle");
   if (bundlePath !== undefined) {
     let loaded: LoadedBundle;
     try {
-      loaded = await shell.loadBundleBlob(mustRead(host, bundlePath, "--bundle"));
+      // The file named by --app-config belongs only to this explicit load. It never
+      // reaches the transport bundle stood above or another app loaded into this shell.
+      loaded = await shell.loadBundleBlob(
+        mustRead(host, bundlePath, "--bundle"),
+        localConfig === undefined ? undefined : { localConfig },
+      );
     } catch (err) {
       // Fatal, and labelled: a node whose bundle did not land has no app to run, and a
       // driving script must see that rather than a silent bundle-less relay.

@@ -137,6 +137,40 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(host.stood.guestDeadlineMs === Infinity, "--guest-timeout 0 is Infinity — no budget, said explicitly");
 }
 
+// App config belongs to the bundle named in the same invocation. It is not node setup,
+// which would also feed it to the transport and every later bundle on this shell.
+{
+  const configPath = join(work, "app.json");
+  const bundlePath = join(work, "app.skb");
+  writeFileSync(configPath, JSON.stringify({ mode: "local", nested: [1, { enabled: true }] }));
+  writeFileSync(bundlePath, new Uint8Array([1, 2, 3]));
+  let loadOpts = null;
+  const author = new Uint8Array(32).fill(0x44);
+  const host = fakeHost([
+    "--key", join(work, "app.key"), "--bundle", bundlePath, "--app-config", configPath,
+  ], {
+    shell: {
+      loadBundleBlob: async (_blob, opts) => {
+        loadOpts = opts;
+        return { author, manifest: { app: "configured", version: 1 } };
+      },
+    },
+  });
+  await runCli(host);
+  ok(host.stood.config === undefined, "--app-config is not shell-wide node setup");
+  ok(loadOpts?.localConfig.mode === "local" && loadOpts.localConfig.nested[1].enabled === true,
+    "--app-config is attached to the explicit bundle load as general JSON");
+}
+{
+  const configPath = join(work, "orphan.json");
+  writeFileSync(configPath, "{}");
+  const host = fakeHost(["--key", join(work, "orphan.key"), "--app-config", configPath]);
+  let msg = "";
+  try { await runCli(host); } catch (e) { msg = String(e.message); }
+  ok(msg.includes("requires --bundle") && host.stood === null,
+    "--app-config without an app target is refused before a shell is stood up");
+}
+
 // --contact-secret names a FILE of hex, on every target. Passing the secret itself on the
 // command line would put it in `ps` output and shell history.
 {

@@ -472,7 +472,6 @@ async function makeTransportNode(cfg: {
     realmMemoryBytes?: number;
     /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
     transportBundle?: Uint8Array;
-    config?: Record<string, string | number>;
 }): Promise<NodeRuntime> {
     const transportHost = new TransportHost({
         identity: cfg.identity,
@@ -492,7 +491,6 @@ async function makeTransportNode(cfg: {
         admit: (v, ctx) => admissionPolicy(v, ctx),
         guestDeadlineMs: cfg.guestDeadlineMs,
         realmMemoryBytes: cfg.realmMemoryBytes,
-        config: cfg.config,
     });
     // The transport bundle IS the node's network: verify + govern under the policy's
     // `link` grant, install, and the shell stands the driver up. A policy that does not
@@ -532,7 +530,6 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         listen: cfg.listen,
         wsListen: cfg.wsListen,
         requestDeadlineMs: cfg.requestDeadlineMs,
-        config: cfg.config,
     });
     shell = s.shell;
     const network = s.transport;
@@ -594,7 +591,6 @@ function nativeCliHost(): CliHost {
                 guestDeadlineMs: cfg.guestDeadlineMs,
                 realmMemoryBytes: cfg.realmMemoryBytes,
                 transportBundle: cfg.transportBundle,
-                config: cfg.config,
             });
             // One "the shell" per realm, whichever entry point stood it up.
             shell = stood.shell;

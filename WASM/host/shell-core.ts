@@ -13,7 +13,7 @@
 //
 // There is no raw module install path: signed bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, genesisHash, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
+import { appKeyFor, appScopeFor, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, opCall, readOp, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import type { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
@@ -109,9 +109,6 @@ export interface CreateShellOptions {
      *  composed AROUND whatever is passed here (`hostGates`), so no operator posture can
      *  be a way to lose them. */
     admit?: Admit;
-    /** Operator-supplied app config, merged *over* the bundle manifest's `config`
-     *  into the guest's `const APP = …`. Opaque to the shell. */
-    config?: Record<string, string | number>;
     /** QuickJS heap limit for the guest realm, in bytes. Omitted ⇒
      *  `DEFAULT_REALM_MEMORY_BYTES`. A target that streams large windows through the guest
      *  raises it (seedstore's `realmMemoryBytes`). */
@@ -136,6 +133,15 @@ export interface CreateShellOptions {
     answer?: (from: PeerId, proto: string, payload: Uint8Array) => Promise<Uint8Array> | null;
 }
 
+/** Configuration supplied by this installation for one particular bundle load. Kept
+ *  separate from the author's signed `APP`, and scoped to this call rather than to the
+ *  shell, which may host unrelated apps at once. The guest receives it as `LOCAL` and owns
+ *  any validation or precedence between the two values. An object for the same reason
+ *  `guest.config` is one: the guest reads it by name. */
+export interface LoadBundleOptions {
+    localConfig?: JsonObject;
+}
+
 export interface Shell {
     /** Which app serves this protocol, or null (§12.10). A read of the projection the
      *  installed manifests define — there is nothing to write here. */
@@ -155,7 +161,7 @@ export interface Shell {
      *  here, so a guest that cannot compile fails the load rather than the first frame that
      *  reaches it, and the freshness mark — which records the highest version that actually
      *  RAN — is advanced last, once it has. */
-    loadBundleBlob(blob: Uint8Array): Promise<LoadedBundle>;
+    loadBundleBlob(blob: Uint8Array, opts?: LoadBundleOptions): Promise<LoadedBundle>;
     /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
      *  realm, private modules, timers and scopes as one unit. */
     uninstall(appKey: string): boolean;
@@ -405,12 +411,23 @@ export function createShell(opts: CreateShellOptions & {
         slot?.realm?.dispose();
         slot?.pureModules.dispose();
     };
+    /** Reify a JSON value through JSON.parse rather than as an object literal. Besides
+     *  keeping strings safely quoted inside source, this preserves JSON's treatment of a
+     *  key named `__proto__` as ordinary data instead of invoking object-literal prototype
+     *  syntax. */
+    const jsonPreamble = (name: string, value: JsonObject): string => {
+        const json = JSON.stringify(value);
+        return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
+    };
     /** Stand one candidate realm. It remains outside `slots` and `claims` until this and
      *  the freshness write both succeed. */
-    const standRealm = async (slot: AppSlot): Promise<void> => {
+    const standRealm = async (slot: AppSlot, localConfig: JsonObject): Promise<void> => {
         const b = slot.verifiedBundle;
+        // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
+        // already refused any non-object).
+        const appConfig = b.manifest.guest.config ?? {};
         slot.realm = await platform.createRealm({
-            source: `const APP = ${JSON.stringify({ ...(b.manifest.guest.config ?? {}), ...(opts.config ?? {}) })};\n` + b.guestSource,
+            source: jsonPreamble("APP", appConfig) + jsonPreamble("LOCAL", localConfig) + b.guestSource,
             hostCall: seamFor(slot),
             memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
             deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
@@ -638,7 +655,10 @@ export function createShell(opts: CreateShellOptions & {
         routes: () => [...claims].map(([claim, slot]) => [claim, keyOf(slot)]),
         fs,
         sodium,
-        async loadBundleBlob(blob) {
+        async loadBundleBlob(blob, loadOpts = {}) {
+            const localConfig = loadOpts.localConfig ?? {};
+            if (!isJsonObject(localConfig))
+                throw new Error("shell: localConfig must be a JSON object");
             const v = verifyBundle(sodium, blob);
             // WHAT THIS BUNDLE REACHES, read off the requires and nothing else (§12.5):
             // there is no `role` field, because the requires are what the seam actually
@@ -678,7 +698,7 @@ export function createShell(opts: CreateShellOptions & {
             // a bundle that never ran a line, putting every version an operator can reach
             // below a floor a broken upgrade raised: rollback bricked by a failed upgrade.
             try {
-                await standRealm(slot);
+                await standRealm(slot, localConfig);
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.

@@ -43,34 +43,19 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
  *  than a signing prefix, hence no trailing NUL. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 // ── The guest seam's version ────────────────────────────────────────────────────
-/** The guest ABI version — which shape of `host.call` a guest was written against
- *  (§12.2). A bundle's manifest declares it (`BundleGuest.abi`, §12.4) and the loader
- *  refuses a guest written for an ABI this host does not implement.
+/** The guest ABI version — the shape of `host.call`, its sync/async boundary, payload
+ *  framing, entrypoint protocol and preamble globals (§12.2). A bundle declares it in
+ *  `BundleGuest.abi` and the loader refuses a shape it does not implement.
  *
- *  Bumped when the seam's shape changes — the naming scheme of `host.call`'s first
- *  argument, a payload framing change, a name moving across the sync/async line. Adding a
- *  name to the catalog does not.
+ *  The preamble exposes the author's signed JSON as `APP` and this installation's
+ *  per-load JSON as `LOCAL`. `link/config` contains immutable node identity and deployment
+ *  limits; mutable addresses arrive as `addr` events. Bare module calls are asynchronous
+ *  so the host can bound them (§4.3).
  *
- *  The field exists because the failure it guards is silent: a guest written against a
- *  different seam shape reads `undefined` where bytes were expected — a wrong answer rather
- *  than an error, and one no care at the call site turns into a loud one.
- *
- *  It lives HERE, with the suite ids, rather than in guest-seam.ts: it is the same kind of
- *  thing they are, and this is what keeps the loader from importing the whole name catalog
- *  and preamble to check one manifest field. guest-seam.ts re-exports it.
- *
- *  At 7 `link/config` answers immutable node identity and deployment limits only: the
- *  mutable address book left that snapshot and arrives as ordinary `addr` events once `_net`
- *  is published (§12.6). That is a payload framing change, so 6 is refused rather than
- *  tolerated — a guest written against it reads the removed trailing field off the end of
- *  the buffer, where a short read is indistinguishable from an empty one, and comes up with
- *  a correct identity and an address book of nobody. It dials no peer and reports nothing,
- *  which is precisely the silent wrong answer this number exists to turn into a refused
- *  load.
- *
- *  A bare name — one of the asking bundle's own modules — has been on the ASYNC side of the
- *  catalog since 6: a module call round-trips so it can be bounded (§4.3). */
-export const GUEST_ABI_VERSION = 7;
+ *  Adding a catalog name does not change the ABI. Changing an existing name, framing or
+ *  preamble meaning does. The constant lives with the suite ids so manifest verification
+ *  need not import the seam implementation; guest-seam.ts re-exports it. */
+export const GUEST_ABI_VERSION = 8;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half of
  *  the seam, and NOT something a manifest declares: `cryptoCatalog` (guest-seam.ts) is
  *  total over this list, so a partial catalog is unrepresentable and there is nothing for a

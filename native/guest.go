@@ -142,8 +142,8 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 }
 
 // newGuestRealm builds a confined realm running `source` — already fronted by the shell
-// with the guest preamble, the bundle facts and the app config, so what arrives here is
-// what a safe-js realm would be handed — with host.call funnelled into `hostCall`.
+// with the guest preamble, signed APP config and per-load LOCAL config, so what arrives
+// here is what a safe-js realm would be handed — with host.call funnelled into `hostCall`.
 func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
 	hostQc := loop.c
 	// The execution bound needs nothing at construction: it lives in the engine

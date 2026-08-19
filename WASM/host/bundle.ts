@@ -27,6 +27,14 @@ export interface BundleModule {
     hash: string;
 }
 
+/** A value representable by the manifest's signed JSON encoding. App configuration is
+ *  deliberately schema-free here: its shape and meaning belong to the bundle that reads
+ *  it, not to the runtime carrying it. */
+export type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+export interface JsonObject {
+    [key: string]: JsonValue;
+}
+
 /** The crypto a bundle load needs, in libsodium-wrappers method names so a raw libsodium
  *  satisfies it directly (as does the native loader's Go-backed `sodium`, §12.9).
  *  Identical to `ManifestVerifier` today; kept separate because call sites are written
@@ -56,15 +64,16 @@ export interface BundleGuest {
      *  guest also calls `crypto/*` and its own modules; neither can be absent from a host,
      *  so declaring them would bury the two or three names that carry authority. */
     requires: string[];
-    /** App-structural constants injected into the guest preamble as `const APP = …` (e.g.
-     *  storage k/m/blockSize). Opaque to the runtime.
+    /** The app's signed configuration, injected unchanged into the guest preamble as
+     *  `const APP = …`. Its schema is the app's alone; the one shape the runtime insists on
+     *  is an OBJECT, since a guest reads config by name and a signed scalar would leave
+     *  every `APP.x` `undefined` at run time instead of failing the load. Absent ≡ `{}`.
      *
      *  Not for anything the runtime already derives from the admitted manifest: identity
      *  is read through the seam (`node/identity`), and the signing namespace is applied
-     *  host-side by `node/sign`/`node/verify`. A copy here is a build-time copy of a
-     *  load-time fact, and APP is operator-mergeable, so it would be operator-writable
-     *  too. */
-    config?: Record<string, string | number>;
+     *  host-side by `node/sign`/`node/verify`. A copy here would be a build-time copy of a
+     *  load-time fact. */
+    config?: JsonObject;
 }
 
 export interface BundleManifest {
@@ -390,6 +399,48 @@ export function signManifest(sodium: ManifestCrypto, keys: HybridAuthorKeys, m: 
         edSig, mlSig, json,
     ]);
 }
+function isJsonValueAt(value: unknown, ancestors: Set<object>): value is JsonValue {
+    if (value === null || typeof value === "string" || typeof value === "boolean")
+        return true;
+    if (typeof value === "number")
+        return Number.isFinite(value);
+    if (typeof value !== "object")
+        return false;
+    const object = value as object;
+    if (ancestors.has(object))
+        return false;
+    const proto = Object.getPrototypeOf(object);
+    if (!Array.isArray(value) && proto !== Object.prototype && proto !== null)
+        return false;
+    ancestors.add(object);
+    try {
+        return (Array.isArray(value) ? value : Object.values(value))
+            .every((item) => isJsonValueAt(item, ancestors));
+    }
+    finally {
+        ancestors.delete(object);
+    }
+}
+
+/** True for exactly the values the signed manifest JSON can carry. Cycles, exotic
+ *  prototypes and non-finite numbers are refused rather than silently changed by
+ *  `JSON.stringify`. The prototype test is THIS realm's, so a value parsed in another
+ *  realm is refused too — an embedder holding one re-parses it here. */
+export function isJsonValue(value: unknown): value is JsonValue {
+    try {
+        return isJsonValueAt(value, new Set());
+    }
+    catch {
+        return false;
+    }
+}
+
+/** True for a JSON object — the shape both config channels carry. Exported because
+ *  `localConfig` comes from an untyped embedding, where the type guarantees nothing. */
+export function isJsonObject(value: unknown): value is JsonObject {
+    return isJsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /** Structural check on a parsed manifest, run only *after* the signature verified — so not
  *  a security boundary: it turns a manifest the author signed but got wrong into a loud
  *  rejection instead of a TypeError deep in the loader, and lets the rest of the runtime
@@ -455,14 +506,8 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string"))
             return false;
-        if (g.config !== undefined) {
-            if (typeof g.config !== "object" || g.config === null || Array.isArray(g.config))
-                return false;
-            for (const v of Object.values(g.config)) {
-                if (typeof v !== "string" && typeof v !== "number")
-                    return false;
-            }
-        }
+        if (g.config !== undefined && !isJsonObject(g.config))
+            return false;
     }
     return true;
 }

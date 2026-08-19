@@ -60,7 +60,6 @@ type nodeConfig struct {
 	WsListen         *hostPort      `json:"wsListen,omitempty"`
 	Peers            []string       `json:"peers,omitempty"`
 	RequestDeadline  int            `json:"requestDeadlineMs,omitempty"`
-	Config           map[string]any `json:"config,omitempty"`
 }
 
 type hostPort struct {
@@ -242,8 +241,8 @@ func guestSeamRealm(tb testing.TB) {
 // newTestRealm creates a confined realm through the SAME factory production uses
 // (createRealm, host/native-shim.ts) over a seam the caller has already installed at
 // `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared guest
-// preamble and the given APP config, mirroring what createShell composes for a real
-// bundle's guest.
+// preamble, the given signed APP fixture and an empty LOCAL value, mirroring what
+// createShell composes for a real bundle's guest.
 func newTestRealm(tb testing.TB, appJSON, source string) {
 	tb.Helper()
 	newTestRealmBudget(tb, appJSON, source, 0)
@@ -254,7 +253,8 @@ func newTestRealm(tb testing.TB, appJSON, source string) {
 // other test paying for a non-default path.
 func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	tb.Helper()
-	qc.Global().SetPropertyStr("__src", qc.NewString("const APP = "+appJSON+";\n"+source))
+	qc.Global().SetPropertyStr("__src", qc.NewString(
+		"const APP = JSON.parse("+jsonString(appJSON)+");\nconst LOCAL = {};\n"+source))
 	qc.Global().SetPropertyStr("__deadlineMs", qc.NewInt64(int64(deadlineMs)))
 	if _, err := callRealm(
 		`(async () => {

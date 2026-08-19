@@ -230,22 +230,26 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const kp = testAuthor();
   const guestSrc = 'register("handle", () => new Uint8Array([1]));';
   const guestBytes = new TextEncoder().encode(guestSrc);
+  const signedConfig = JSON.parse('{"mode":"signed","nested":[true,null,{"n":3}],"__proto__":{"kept":"data"}}');
   const manifest = {
     app: "probe", version: 1, modules: [],
-    guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires: [] },
+    guest: {
+      hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires: [],
+      config: signedConfig,
+    },
   };
   const blob = packBundle({
     [MANIFEST_FILE]: signManifest(sodium, kp, manifest),
     [GUEST_FILE]: guestBytes,
   });
 
-  let seen = null;
+  const seen = [];
   const shell = createShell({
     platform: {
       sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
       freshnessStore: new FreshnessMarks(),
       createRealm: async (o) => {
-        seen = o;
+        seen.push(o);
         return { call: async () => new Uint8Array(), dispose() {} };
       },
     },
@@ -253,11 +257,54 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     guestDeadlineMs: 1234,
     realmMemoryBytes: 7 * 1024 * 1024,
   });
-  await shell.loadBundleBlob(blob);
+  await shell.loadBundleBlob(blob, {
+    localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
+  });
   await shell.invoke("probe", new Uint8Array());
-  ok(seen !== null, "the shell created a realm for the loaded guest");
-  ok(seen && seen.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen && seen.deadlineMs})`);
-  ok(seen && seen.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
+  ok(seen.length === 1, "the shell created a realm for the loaded guest");
+  ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
+  ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
+
+  // APP and LOCAL are two provenance-preserving values, not one host-side merge. Evaluate
+  // only the two generated preamble lines (the guest body expects register to exist).
+  const valuesFrom = (source) => Function(
+    source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+  )();
+  const [app, local] = valuesFrom(seen[0].source);
+  ok(app.mode === "signed" && !("localOnly" in app), "LOCAL never overwrites or extends signed APP");
+  ok(local.mode === "local" && local.localOnly.quota === 7, "the load's local JSON arrives separately as LOCAL");
+  ok(app.nested[1] === null && app.nested[2].n === 3, "signed config accepts general nested JSON");
+  ok(Object.hasOwn(app, "__proto__") && app.__proto__.kept === "data" && Object.getPrototypeOf(app) === Object.prototype,
+    "JSON config preserves an own __proto__ key as data");
+
+  // A second load receives no residue from the first load's LOCAL value.
+  await shell.loadBundleBlob(blob);
+  const [appAgain, localAgain] = valuesFrom(seen[1].source);
+  ok(appAgain.mode === "signed" && Object.keys(localAgain).length === 0,
+    "local config is scoped to one load, not retained by the shell for another app or reload");
+  const cyclic = {}; cyclic.self = cyclic;
+  await rejects(shell.loadBundleBlob(blob, { localConfig: cyclic }),
+    "a non-JSON local value is refused instead of being silently changed during injection");
+  // Both channels are OBJECTS. A guest reads config by name, so a scalar or array would
+  // make every `LOCAL.x` read `undefined` at run time rather than fail at the load.
+  await rejects(shell.loadBundleBlob(blob, { localConfig: [1, 2] }),
+    "a JSON array is refused as local config — a guest reads config by name");
+  await rejects(shell.loadBundleBlob(blob, { localConfig: 7 }),
+    "a JSON scalar is refused as local config");
+  // The same rule on the signed side, enforced by the manifest's structural check: an
+  // author who signs a scalar `config` gets a refused bundle, not a guest reading undefined.
+  {
+    const scalarManifest = {
+      ...manifest,
+      guest: { ...manifest.guest, config: "not-an-object" },
+    };
+    const scalarBlob = packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, kp, scalarManifest),
+      [GUEST_FILE]: guestBytes,
+    });
+    await rejects(shell.loadBundleBlob(scalarBlob),
+      "a signed guest.config that is not a JSON object is a refused manifest");
+  }
 
   // §12.5 — uninstalling a GUEST-ONLY app reports success. An app is its modules and
   // its realm, and this bundle legitimately declares no modules at all, so a count of
