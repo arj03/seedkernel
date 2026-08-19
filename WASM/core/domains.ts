@@ -138,6 +138,7 @@ export const AUTHORITY_CALLS = {
     "clock/now": "app",
     "timer/arm": "app",
     "timer/clear": "app",
+    "link/config": "link",
     "link/open": "link",
     "link/send": "link",
     "link/close": "link",
@@ -174,16 +175,21 @@ export const PRIVILEGE_LINK = "link" satisfies Privilege;
 // caller's promise, exactly as `fs/*` does. And a callable id is a GRANT, declared in
 // `requires` like any authority, so the call graph an operator reads off the bundles is
 // the call graph.
-/** A reserved id — one the runtime answers or routes ahead of ordinary dispatch, and one
- *  no bundle's `protocols` may spell unless it holds the privilege that owns it. The test
- *  is the first character, which is also the charset rule (§12.10). */
+/** A reserved id — one routed between local realms ahead of ordinary dispatch. The
+ *  spelling carries no authority on its own; two ids are singled out by name in
+ *  `verifyManifest` — `_host`, which the shell answers rather than routes, and `_net`,
+ *  which only a bundle reaching `link` may claim. The test is the first character, which
+ *  is also the charset rule (§12.10). */
 export function isReservedProtocol(name: string): boolean {
     return name.charCodeAt(0) === 0x5f; // "_"
 }
-/** The id the transport claims, and the one every app's outbound network call names. It
- *  is an ordinary protocol claim — the transport is reached by the same call the host uses
- *  to dispatch an inbound frame, with the caller's app key prepended exactly as the
- *  sender's key is prepended inbound. */
+/** The id the transport claims, and the one every app's outbound network call names. It is
+ *  routed like any claim — the transport is reached by the same call the host uses to
+ *  dispatch an inbound frame, with the caller's app key prepended exactly as the sender's
+ *  key is prepended inbound. CALLING it is ungoverned, an ordinary `requires` entry any app
+ *  may declare. CLAIMING it is not: this is where every accepted link's raw bytes are
+ *  handed in, so `verifyManifest` refuses the claim to a bundle that does not reach
+ *  `link`. */
 export const NET_PROTOCOL = "_net";
 /** The id the SHELL answers itself, ahead of dispatch — the transport's way back to the
  *  host for the things that are genuinely pushes: an inbound frame, and the auth or

@@ -23,7 +23,7 @@ export const WASM_PAGE_BYTES = 65536;
 /** The I/O region a module reserves at its `scratch` export when it declares no
  *  `scratchSize` (§4.1). One number on every target: a payload the JS table admits and the
  *  Go one refuses is a module that loads on one node and not another. The Go side receives
- *  it from the shared shim at every bindAll. */
+ *  it from the shared shim at every slot build. */
 export const DEFAULT_SCRATCH_SIZE = 0x20000; // 128 KB
 
 /** Default heap cap for a confined guest realm (§12.3). Deliberately equal to
@@ -42,9 +42,9 @@ export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 export const DEFAULT_MAX_LIVE_TIMERS = 1 << 16;
 
 /** Default ceiling on a module's declared linear memory. Declared here rather than in a
- *  host because `installBundle` applies it on the shared admission path (§3): a host may
- *  hold its own direct installs to something tighter, but none may be looser about what a
- *  *bundle* may land. */
+ *  host because `loadBundleModules` applies it on the shared admission path (§3): a host
+ *  may hold its own direct builds to something tighter, but none may be looser about what
+ *  a *bundle* may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 export interface MemoryLimits {

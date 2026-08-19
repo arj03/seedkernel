@@ -24,7 +24,6 @@ import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_
 import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
 import { isAdmissionRejected } from "./shell-core.js";
 import { TransportHost } from "./transport-host.js";
-import { NET_PROTOCOL } from "../core/domains.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
 import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
@@ -512,9 +511,9 @@ async function makeTransportNode(cfg: {
             bridge.log('  no transport: the policy grants "link" to no author of this bundle');
         }
     }
-    // Conditional on there BEING a driver: a policy granting `link` to nobody is a
-    // configuration rather than a failure.
-    if (s.resolve(NET_PROTOCOL)) await transportHost.start();
+    // Listener lifecycle is host configuration, independent of the `_net`
+    // route. With no claimant, accepted links are closed.
+    await transportHost.start();
     return { shell: s, transport: transportHost };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.

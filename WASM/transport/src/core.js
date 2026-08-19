@@ -278,23 +278,27 @@ class Core {
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
-function init(cfg) {
-  ownPk = cfg.ownPk;
+function init() {
+  const r = new Reader(netConfig());
+  ownPk = r.blob();
   ownId = toHex(ownPk);
-  networkKey = cfg.networkKey;
-  contactSecret = cfg.contactSecret;
-  connsPerPeer = Math.max(1, Math.floor(cfg.connsPerPeer || 1));
-  maxFrameBytes = cfg.maxFrameBytes;
-  maxHandshakeFrameBytes = cfg.maxHandshakeFrameBytes;
-  maxUnverified = cfg.maxUnverified;
-  maxPerSource = cfg.maxPerSource;
-  maxVerified = cfg.maxVerified;
-  maxAuthed = cfg.maxAuthed;
-  requestDeadlineMs = cfg.requestDeadlineMs;
-  linkIdleTimeoutMs = cfg.linkIdleTimeoutMs;
+  networkKey = r.blob();
+  contactSecret = r.blob();
+  connsPerPeer = Math.max(1, r.u32());
+  maxUnverified = r.u32();
+  maxPerSource = r.u32();
+  maxVerified = r.u32();
+  maxAuthed = r.u32();
+  maxFrameBytes = r.u32();
+  maxHandshakeFrameBytes = r.u32();
+  requestDeadlineMs = r.u32();
+  linkIdleTimeoutMs = r.u32();
   // An empty list means "admit everyone", said as a zero-length blob rather than a
   // missing field, so there is one shape to read.
-  admitPeers = cfg.admitPeers.length > 0 ? new Set(cfg.admitPeers) : null;
+  const peers = new Reader(r.blob());
+  admitPeers = peers.b.length > 0 ? new Set() : null;
+  while (peers.off < peers.b.length) admitPeers.add(toHex(peers.blob()));
+  const addresses = new Reader(r.blob());
 
   router = new Router(ownPk, ownId);
   reqres = new ReqRes();
@@ -306,7 +310,10 @@ function init(cfg) {
   // than being told about each one.
   router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
   router.onPeerDown = (peerId) => { connected.delete(peerId); };
+  while (addresses.off < addresses.b.length) core.addAddr(addresses.blob(), addresses.blob());
 }
+
+init();
 
 /** Every core link, wherever it currently sits: authenticated ones live in the
  *  router's pools, pre-auth ones in the core's connecting/inbound tables, and a
@@ -330,8 +337,8 @@ function findLink(linkId) {
 // `handle` is invoked with `[caller 32][opLen u8][op][args]`. Two kinds of caller, told
 // apart by those 32 bytes and nothing else:
 //
-//   the HOST   32 zero bytes (transport-host.ts) — the platform's own events: the config
-//              turn, sockets opening, bytes arriving, an address, and the two questions
+//   the HOST   32 zero bytes (transport-host.ts) — the platform's own events: sockets
+//              opening, bytes arriving, an address, and the two questions
 //              the operator's console asks (`ready`, `peers`).
 //   an APP     its app key, derived host-side from the admitted manifest, exactly as an
 //              inbound frame carries the authenticated sender's key. `send` is the only
@@ -370,8 +377,8 @@ register("handle", (argBytes) => {
   const r = new Reader(args);
   const fn = ops[op];
   if (!fn) throw new Error("transport: no op '" + op + "'");
-  // The platform's events are the host's alone: an app that could spell `init` could
-  // re-key the node, one that could spell `linkBytes` could inject a frame on any link.
+  // The platform's events are the host's alone: an app that could spell `linkBytes` could
+  // inject a frame on any link.
   // The caller id is the host's to write, so this is a real boundary and not a hint.
   if (!APP_OPS[op] && !fromHost) throw new Error("transport: '" + op + "' is the host's, not an app's");
   try {
@@ -380,24 +387,6 @@ register("handle", (argBytes) => {
     const deferred = deferQueue.splice(0);
     for (const f of deferred) { try { f(); } catch { /* teardown of a gone link */ } }
   }
-});
-
-/** The one config turn: who we are, which network, and the budgets — including the
- *  HOST's flood cap, which this module learns rather than declares. */
-entry("init", (r) => {
-  const cfg = {
-    ownPk: r.blob(), networkKey: r.blob(), contactSecret: r.blob(),
-    connsPerPeer: r.u32(),
-    maxUnverified: r.u32(), maxPerSource: r.u32(), maxVerified: r.u32(), maxAuthed: r.u32(),
-    maxFrameBytes: r.u32(),
-    maxHandshakeFrameBytes: r.u32(),
-    requestDeadlineMs: r.u32(),
-    linkIdleTimeoutMs: r.u32(),
-    admitPeers: [],
-  };
-  const list = new Reader(r.blob());
-  while (list.off < list.b.length) cfg.admitPeers.push(toHex(list.blob()));
-  init(cfg);
 });
 
 /** A link the HOST opened: an accepted socket (kind CORE), or one a host-managed

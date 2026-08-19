@@ -8,7 +8,7 @@
 // practice.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { testkit, makeAuthor } from "./testkit.mjs";
 // The same assembler the build signs through, imported rather than mirrored: these
 // bundles must be signed over the byte-for-byte guest production signs, and a second copy
@@ -52,25 +52,13 @@ assert(transportVerified.authorKeys.mlDsa !== undefined,
 // `hybridAuthorKeysFromSeed` — the one every other publisher calls. A drift fails no
 // build: it silently re-identifies this artifact's author and invalidates every
 // operator's pinned id. The seed is per-clone and gitignored, written by the build.
-{
-  const keyPath = join(root, "transport", "author.key");
-  if (existsSync(keyPath)) {
-    const seed = Uint8Array.from(Buffer.from(readFileSync(keyPath, "utf8").trim(), "hex"));
-    const keys = hybridAuthorKeysFromSeed(sodium, seed);
-    const derived = Buffer.from(
-      hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey)).toString("hex");
-    assert(derived === transportAuthor,
-      "the shared seed→key-set derivation reproduces the shipped bundle's author id");
-  }
-}
-
-// A SECOND transport, version 2, signed by a different author — the realistic upgrade
-// shape, exercising both admission gates at once: the `link` grant must list the new
-// author, and the freshness floor v1 set must be cleared by the new version. Same guest
-// program, because what is under test is the swap.
-const upgrade = makeAuthor(sodium);
-const upgradeKeys = { ed: upgrade.ed, mlDsa: upgrade.mlDsa };
-const upgradeAuthor = Buffer.from(upgrade.id).toString("hex");
+const transportSeed = Uint8Array.from(Buffer.from(
+  readFileSync(join(root, "transport", "author.key"), "utf8").trim(), "hex"));
+const transportKeys = hybridAuthorKeysFromSeed(sodium, transportSeed);
+const derivedTransportAuthor = Buffer.from(
+  hybridAuthorId(sodium, transportKeys.ed.publicKey, transportKeys.mlDsa.publicKey)).toString("hex");
+assert(derivedTransportAuthor === transportAuthor,
+  "the shared seed→key-set derivation reproduces the shipped bundle's author id");
 
 // `guestSource` overrides the artifact's guest — the only caller that passes one hands in
 // a program that cannot compile, to fail the load at the point where the DRIVER stands
@@ -93,7 +81,7 @@ function transportBundleAt(version, keys, guestSource) {
       // `link` privilege the admission dispatch reads (§12.5).
       requires: [
         "node/sign", "node/verify", "node/random",
-        "link/open", "link/send", "link/close", "link/stat",
+        "link/config", "link/open", "link/send", "link/close", "link/stat",
         "timer/arm", "timer/clear",
         "_host",
       ],
@@ -117,8 +105,8 @@ async function request(shell, to, payload) {
 async function makeNode(channels, listen, freshnessStore = new FreshnessMarks()) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
-    authors: [transportAuthor, upgradeAuthor, appAuthorHex],
-    grants: { link: [transportAuthor, upgradeAuthor] },
+    authors: [transportAuthor, appAuthorHex],
+    grants: { link: [transportAuthor] },
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
   const shell = createShell({
@@ -164,22 +152,16 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
 //
-// `_net` is an ordinary protocol claim, so a later load wins it exactly as a later chat
-// app wins `chat-v1` (§12.10), and the driver — which holds only link ids, the address
-// book and the listener, all the NODE's — is re-pointed at the new claimant rather than
-// replaced. Hence no handover to check: the outgoing guest held nothing the node needed
-// back.
+// An update replaces its own complete slot atomically. The claim and host adapter stay
+// stable while the realm and its private session state are replaced.
 console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
 const oldPeerId = aNet.peerId;
 const oldClaimant = a.shell.resolve(NET_PROTOCOL);
-await a.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys));
+await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
 
-// The claim moved; the adapter did not. Asserted on the adapter's own state rather than on
-// object identity — `a.transport` is the platform's field and comparing it to itself would
-// pass however badly the swap went.
-assert(a.shell.resolve(NET_PROTOCOL) !== oldClaimant, "the incoming bundle took the transport id off the outgoing one");
-assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the swap — it was re-attached");
+assert(a.shell.resolve(NET_PROTOCOL) === oldClaimant, "the update retained its own transport claim");
+assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
 assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
 
@@ -197,7 +179,7 @@ assert(resp3.length === 3 && resp3[2] === 7, "B reaches A on the unchanged port,
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
 // and the transport answers to that mark like any other bundle (§12.4).
 let refused = false;
-try { await a.shell.loadBundleBlob(transportBundleAt(1, upgradeKeys)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(1, transportKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version from the same author is refused after the upgrade");
 assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
@@ -211,12 +193,12 @@ assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
 // the last step of the load, after the guest stands.
 const brokenGuest = new TextEncoder().encode("const nope = ( ;");
 let v3Failed = false;
-try { await a.shell.loadBundleBlob(transportBundleAt(3, upgradeKeys, brokenGuest)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys, brokenGuest)); }
 catch { v3Failed = true; }
 assert(v3Failed, "a v3 whose guest cannot compile fails the load");
 
 let v2Reloaded = true;
-try { await a.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); }
+try { await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
 assert(a.shell.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds the transport id again");
@@ -236,7 +218,7 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
 
   broken = true;
   let msg = "";
-  try { await c.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch (e) { msg = e.message; }
+  try { await c.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), `a bundle whose mark cannot be written fails the load (got: ${msg})`);
   assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
   assert(c.shell.resolve(NET_PROTOCOL)?.startsWith(transportAuthor),
@@ -247,9 +229,9 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
   // store that never got the first one.
   broken = false;
   let reloaded = true;
-  try { await c.shell.loadBundleBlob(transportBundleAt(2, upgradeKeys)); } catch { reloaded = false; }
+  try { await c.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); } catch { reloaded = false; }
   assert(reloaded, "the retry against a healthy store lands");
-  assert(store.get(upgrade.id, "transport") === 2, "…and the mark it persists is the one the failed load rolled back");
+  assert(store.get(transportVerified.author, "transport") === 2, "…and the mark it persists is the one the failed load rolled back");
   c.shell.close();
 }
 

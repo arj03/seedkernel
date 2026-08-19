@@ -76,7 +76,7 @@ export interface ShellPlatform {
     createRealm: RealmFactory;
     now?: () => number;
     /** OPTIONAL network key — which network this node belongs to. An isolation boundary,
-     *  not a gate (§12.6); absent ⇒ the public network. Feeds the transport guest's INIT
+     *  not a gate (§12.6); absent ⇒ the public network. Feeds the raw link configuration
      *  and the channel-signing scope granted to a bundle reaching `link`
      *  (`transportSignScope`).
      *
@@ -92,9 +92,9 @@ export interface ShellPlatform {
      *  shell.close() closing it, so there is one teardown rather than a second thing every
      *  embedder must remember.
      *
-     *  The shell's whole part is pointing it at whichever bundle currently claims `_net`.
-     *  Absent for a shell with no raw links at all (a browser edge), where a bundle
-     *  claiming `_net` simply gets no sockets. */
+     *  The shell wires it once to the generic claim lookup. Absent for a shell with no raw
+     *  links at all (a browser edge), where a bundle claiming `_net` simply gets no
+     *  sockets. */
     transportHost?: TransportHost;
 }
 
@@ -359,6 +359,13 @@ export function createShell(opts: CreateShellOptions & {
     };
     const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
     const findSlot = (appKey: string) => slots.find((slot) => keyOf(slot) === appKey);
+    const slotClaims = (slot: AppSlot) => slot.verifiedBundle.manifest.protocols ?? [];
+    const hasLink = (slot: AppSlot) => privilegesOf(slot.verifiedBundle.manifest).includes(PRIVILEGE_LINK);
+    const releaseClaims = (slot: AppSlot) => {
+        for (const claim of slotClaims(slot)) {
+            if (claims.get(claim) === slot) claims.delete(claim);
+        }
+    };
     /** An empty slot for `loaded`, with its timer table already pointed at the realm the
      *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
      *  which is the correct reading anyway: the realm a deadline re-enters is the one
@@ -378,12 +385,12 @@ export function createShell(opts: CreateShellOptions & {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
-        const hasLink = privilegesOf(loaded.manifest).includes(PRIVILEGE_LINK);
+        const links = privilegesOf(loaded.manifest).includes(PRIVILEGE_LINK);
         slot = {
             verifiedBundle: loaded,
             pureModules,
             fsScope: fs ? scopedFs(fs, appScopeFor(platform.sodium, loaded.author, loaded.manifest.app)) : undefined,
-            signingScope: hasLink
+            signingScope: links
                 ? transportSignScope(platform.identity, platform.networkKey)
                 : appSignScope(platform.identity, loaded.author, loaded.manifest.app),
             realm: null,
@@ -421,7 +428,7 @@ export function createShell(opts: CreateShellOptions & {
      *  is an ordinary `"app"` authority (core/domains.ts), so every realm gets a table. */
     const seamFor = (slot: AppSlot) => {
         const b = slot.verifiedBundle;
-        const hasLink = privilegesOf(b.manifest).includes(PRIVILEGE_LINK);
+        const links = hasLink(slot);
         // The 32 bytes this realm is attributed by when it calls another: the app key,
         // hashed. The same shape as the sender key prepended to an inbound frame, so a
         // callee reads one field whether the caller was a peer or a co-resident app. Zero
@@ -456,7 +463,7 @@ export function createShell(opts: CreateShellOptions & {
                 // later load may take the id over, so a claimant captured at seam
                 // construction would pin this realm to whoever was there first.
                 calls: { call: (id, payload) => crossRealmCall(slot, callerId, id, payload) },
-                rawNet: hasLink ? netHost?.rawNet() : undefined,
+                rawNet: links ? netHost?.rawNet() : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
             },
@@ -473,6 +480,10 @@ export function createShell(opts: CreateShellOptions & {
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
         ? slot.realm.call("handle", input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
+    netHost?.route((payload) => {
+        const slot = claims.get(NET_PROTOCOL);
+        return slot ? callSlot(slot, payload) : null;
+    }, () => claims.has(NET_PROTOCOL));
     /** The ONE cross-realm call (§12.10): a guest naming a reserved id reaches the realm
      *  that claims it, on a later turn, and gets back what that realm's `handle`
      *  returned. `null` when nothing claims it, which the seam reports by name.
@@ -493,12 +504,21 @@ export function createShell(opts: CreateShellOptions & {
     /** The shell's own protocol (`_host`), answered ahead of dispatch. All three ops are
      *  the transport telling the host about something only the transport can see.
      *
-     *  Restricted to the realm that claims `_net` structurally rather than by a field in
-     *  the payload: `caller` is the slot whose seam this closure was built for, so there is
-     *  nothing to spoof. An ordinary app that declared `_host` is refused by name. */
+     *  Restricted to the realm that CLAIMS `_net`, not merely to one holding `link`. The
+     *  privilege is the wider set — a link-capable bundle may claim nothing at all and be
+     *  an ordinary initiator (§12.8) — and `deliver` is the difference: it hands the routing
+     *  a frame with a `from` the caller writes, so anything reaching it can forge an inbound
+     *  request attributed to any peer. Being the node's network is what earns that, and the
+     *  claim is what says so.
+     *
+     *  The test is on the SLOT rather than its app key: an in-place transport upgrade builds
+     *  a new slot under the same key, and the candidate has not taken the claim over while
+     *  its realm is standing (`loadBundleBlob`) — a key comparison would let it answer as
+     *  the network one turn early. `caller` is the slot whose seam this closure was built
+     *  for, so there is nothing to spoof. */
     const hostAnswer = (caller: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
         if (claims.get(NET_PROTOCOL) !== caller) {
-            return Promise.reject(new Error(`shell: ${SHELL_PROTOCOL} is reserved for the ${NET_PROTOCOL} claimant, and this realm does not claim it`));
+            return Promise.reject(new Error(`shell: ${SHELL_PROTOCOL} is answered only for the ${NET_PROTOCOL} claimant, and this realm does not claim it`));
         }
         // The same envelope every call in this system carries, read with the same
         // function the guest half writes with (`writeOp`, guest-seam.ts).
@@ -534,56 +554,22 @@ export function createShell(opts: CreateShellOptions & {
                 return Promise.reject(new Error(`shell: no ${SHELL_PROTOCOL} op '${op}'`));
         }
     };
-    /** Point the concrete channel adapter at whatever claims `_net` now.
-     *  Called after every routing rebuild, so the first transport and every replacement
-     *  take the same path — there is no upgrade protocol, because the link ids, addresses
-     *  and listeners are the node's rather than the outgoing guest's. A replacement is
-     *  `attach` again: the incoming guest gets the same config turn and address book, and
-     *  redials. Live links cannot survive — the session keys are in the outgoing guest's
-     *  private memory (§4.3), which is what makes the occupant confineable — so an upgrade
-     *  is a reconnect (§12.6).
+    /** Refuse a candidate contesting a claim ANOTHER identity currently holds (§12.10): a
+     *  claim has one active owner, and a load that took one over would be a route changing
+     *  hands without its owner ever being uninstalled. This identity's own claims are not a
+     *  contest — replacing them in place is what an update is.
      *
-     *  Re-attaching only when the CLAIMANT CHANGED is load-bearing: `attach` on a driver
-     *  that already has a transport tears every channel down, so doing it unconditionally
-     *  would make installing an ORDINARY app disconnect the node.
-     *
-     *  The identity compared is the SLOT, not its app key: an in-place transport upgrade
-     *  builds a new slot with a new realm under the same key, and that realm has never had
-     *  the config turn — a key comparison would skip the case this exists for. */
-    let attachedTransport: AppSlot | null = null;
-    const retargetTransport = () => {
-        const slot = claims.get(NET_PROTOCOL);
-        if (!slot) {
-            netHost?.detach();
-            attachedTransport = null;
-            return;
+     *  Asked in the synchronous commit window rather than at the top of the load, which is
+     *  the difference between a check and a guarantee: a candidate builds its modules and
+     *  stands its realm across two yields, and a claim taken during either would slip past
+     *  a decision made before them. */
+    const refuseContestedClaims = (loaded: LoadedBundle, key: string) => {
+        for (const claim of loaded.manifest.protocols ?? []) {
+            const incumbent = claims.get(claim);
+            if (incumbent && keyOf(incumbent) !== key) {
+                throw new Error(`shell: claim '${claim}' is already held by '${keyOf(incumbent)}'`);
+            }
         }
-        if (!netHost || attachedTransport === slot) return;
-        attachedTransport = slot;
-        // Through the routing rather than at the realm directly, so the driver follows a
-        // later claimant without being told about it.
-        netHost.attach((p) => {
-            const s = claims.get(NET_PROTOCOL);
-            return s ? callSlot(s, p) : null;
-        });
-    };
-    /** Recompute the whole projection from the installed apps (§12.10), on every install and
-     *  every uninstall. Never anything narrower: adding just the new app's claims would
-     *  leave an UPDATE that dropped a protocol still serving it, and deleting just the
-     *  leaving app's would leave a protocol an earlier-loaded app also claims permanently
-     *  dark.
-     *
-     *  Order is load order; an update retains its identity's position, so the LAST app
-     *  installed wins a contested id
-     *  and an update never jumps ahead of an app loaded after it. */
-    const rebuildClaims = () => {
-        claims.clear();
-        for (const slot of slots) {
-            for (const proto of slot.verifiedBundle.manifest.protocols ?? []) claims.set(proto, slot);
-        }
-        // `_net` is a claim like any other, so the driver follows the same "last load
-        // wins" rule — which is the whole of an in-place transport replacement.
-        retargetTransport();
     };
     /** Advance the `(author, app)` freshness mark after the candidate realm stands but
      *  before its synchronous claim commit. It records the highest version that actually
@@ -612,7 +598,13 @@ export function createShell(opts: CreateShellOptions & {
         const i = slots.findIndex((slot) => keyOf(slot) === appKey);
         if (i < 0) return false;
         const [slot] = slots.splice(i, 1);
-        rebuildClaims();
+        // Read BEFORE the claims are released, and asked of the CLAIM rather than of the
+        // `link` privilege: `reset` closes every channel the driver holds, so keying it on
+        // the wider set would let uninstalling a link-capable initiator — a bundle that
+        // never was the network — disconnect the node.
+        const wasNetwork = claims.get(NET_PROTOCOL) === slot;
+        releaseClaims(slot);
+        if (wasNetwork) netHost?.reset();
         disposeSlot(slot);
         return true;
     };
@@ -620,10 +612,10 @@ export function createShell(opts: CreateShellOptions & {
      *  claiming it, prepend the authenticated sender, hand it to that app's one entrypoint.
      *
      *  No branch on how the app is implemented: every app presents the same
-     *  `senderPk ‖ payload` shape and the same single entry, resolved at install
-     *  (`entryFor`). The answer is the realm's — a Promise the transport resumes on a later
-     *  turn rather than inline (transport-host.ts), which is what an asynchronous holder
-     *  needs since `fs` is async. */
+     *  `senderPk ‖ payload` shape and the same single entry, its slot's realm (`callSlot`).
+     *  The answer is the realm's — a Promise the transport resumes on a later turn rather
+     *  than inline (transport-host.ts), which is what an asynchronous holder needs since
+     *  `fs` is async. */
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
         const slot = claims.get(proto);
         if (!slot)
@@ -663,12 +655,12 @@ export function createShell(opts: CreateShellOptions & {
             };
             if (!(await admit(v, ctx)))
                 throw new Error(ADMISSION_REJECTED);
-            const pureModules = await loadBundleModules(moduleLoader, v);
             const loaded: LoadedBundle = {
                 manifest: v.manifest, author: v.author, authorKeys: v.authorKeys,
                 guestSource: v.guestSource,
             };
             const key = appKeyFor(loaded.author, loaded.manifest.app);
+            const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules);
             // STAND THE GUEST, before anything already standing is replaced. Every app is a
             // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
@@ -677,8 +669,10 @@ export function createShell(opts: CreateShellOptions & {
             // below a floor a broken upgrade raised: rollback bricked by a failed upgrade.
             try {
                 await standRealm(slot);
-                // The slot is complete before the commit. Persist the version it ran, then
-                // replace its identity and claims synchronously.
+                // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
+                // what makes the commit atomic: the contest below, the mark, and the claim
+                // hand-over cannot be interleaved with another load or an uninstall.
+                refuseContestedClaims(loaded, key);
                 commitMark(loaded, ctx.highWater);
             }
             catch (err) {
@@ -687,9 +681,18 @@ export function createShell(opts: CreateShellOptions & {
             }
             const previousIndex = slots.findIndex((installed) => keyOf(installed) === key);
             const previous = previousIndex < 0 ? undefined : slots[previousIndex];
+            // Whether the slot being replaced WAS the network, read before its claims go.
+            const replacingNetwork = previous !== undefined && claims.get(NET_PROTOCOL) === previous;
+            if (previous) releaseClaims(previous);
             if (previousIndex < 0) slots.push(slot);
             else slots[previousIndex] = slot;
-            rebuildClaims();
+            for (const claim of slotClaims(slot)) claims.set(claim, slot);
+            // The outgoing guest's link state went with its realm (§4.3), so the sockets it
+            // held are torn down here rather than left as channels nobody can speak for. The
+            // incoming guest redials from the address book, which is the NODE's. After the
+            // claim hand-over above, so `onClose` finds the channels already gone and queues
+            // no `linkClosed` at the new realm for links it never had.
+            if (replacingNetwork) netHost?.reset();
             disposeSlot(previous);
             return loaded;
         },

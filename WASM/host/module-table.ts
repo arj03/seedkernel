@@ -231,8 +231,9 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── installing WASM modules ─────────────────────────────────────────
 
-  /** Land an app's modules on the table, all or none (§3.1) — the one way code arrives,
-   *  and the only mutating entry point besides `removeApp`.
+  /** Build one slot's modules, all or none (§3.1) — the one way code arrives, and the
+   *  only entry point that stands anything up; `dispose` on the returned value is the
+   *  only one that takes it down.
    *
    *  Every module is spawned, instantiated and validated BEFORE anything is written, and
    *  the app's whole module map is built first and then assigned under its key — so the
@@ -293,8 +294,8 @@ export class ModuleTable implements PureModuleLoader {
    *  install. */
   private async load(ref: WasmModuleRef): Promise<void> {
     const worker = await spawnWorker(moduleWorkerSrc());
-    // The ref may have left the table while this was spawning (`removeApp`, a replacing
-    // bind, a refused bundle). Adopting the worker now would leave it unreachable,
+    // The ref may have left its set while this was spawning (a disposed slot, a refused
+    // bundle). Adopting the worker now would leave it unreachable,
     // unkillable, and still running whatever it was given.
     if (ref.dead) { worker.kill(); throw new Error("table: module was released while it loaded"); }
     ref.worker = worker;

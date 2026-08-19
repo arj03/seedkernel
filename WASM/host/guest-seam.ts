@@ -93,6 +93,9 @@ export interface SeamCalls {
  *  implementation does anyway, a socket not delivering during the write that provoked
  *  it. */
 export interface RawNet {
+    /** This node's link configuration. Reading it has no side effects, so a candidate
+     *  slot may initialize before it is published. */
+    config(): Uint8Array;
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
      *  host resolves the name in its own address book; the caller learns no route it could
@@ -686,6 +689,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // whole of what the platform contributes to the network (§12.1). No peer, no
         // protocol id, no correlation: those are the transport's own. Inbound bytes arrive
         // the other way, as ordinary invocations of the transport's `handle`.
+        "link/config": () => rawNet().config(),
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);

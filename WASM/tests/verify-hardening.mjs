@@ -38,7 +38,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const { ok, throws, summary } = testkit();
 /** Await a promise and assert it rejects — the async form of `throws`, which is what a
- *  bind that stands up workers now needs (bindAll is async). */
+ *  build that stands up workers now needs (`PureModuleLoader.build` is async). */
 const rejects = async (p, msg) => { let threw = false; try { await p; } catch { threw = true; } ok(threw, msg); };
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));

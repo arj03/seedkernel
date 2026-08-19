@@ -23,7 +23,6 @@ import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
-import { NET_PROTOCOL } from "../core/domains.js";
 import { TransportHost } from "./transport-host.js";
 import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
 
@@ -177,9 +176,9 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
                 }
             }
         }
-        // The adapter is host integration state. Binding its listeners does not put it on
-        // the shell, and only happens when an ordinary bundle currently claims `_net`.
-        if (core.resolve(NET_PROTOCOL)) await transport.start();
+        // Listener lifecycle is host configuration, independent of which bundle currently
+        // owns the `_net` route. With no claimant, accepted links are closed.
+        await transport.start();
         // ── Node wrapper: add file-backed loadBundle ────────────────────────────
         const shell: Shell = {
             resolve: core.resolve,

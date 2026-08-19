@@ -28,7 +28,7 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION }
+const { createGuestSeam, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION, opHeader }
   = await imp("build/host/guest-seam.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
@@ -327,9 +327,8 @@ async function testDerivedNamesKeepAuthorsApart() {
 // ─── Test: the manifest's claim IS the routing (§12.10) ──────────────────────
 //
 // A bundle declares the protocol ids it serves and the load claims them: one act, no
-// operator step in between. The table is a PROJECTION of the installed manifests, and
-// everything below follows from that — an update re-projects, a later load takes a
-// contested id over, and an uninstall hands it back rather than leaving it dark.
+// operator step in between. Claims have one active owner: an update replaces its own
+// claims atomically, while a different bundle cannot silently displace it.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { createShell: mkShell } = await imp("build/host/shell-core.js");
@@ -377,15 +376,17 @@ async function testManifestClaimIsTheRouting() {
     assertEqual(shell.resolve("seedstore/v2"), key, "an update claims what the new manifest declares");
     assert(shell.resolve("seedstore/v1") === null, "…and drops the claim it no longer makes");
 
-    // A second author's app claiming the same id takes it over: the §12.10 rebind, fused
-    // into the install. The displaced app stays installed and gets the protocol back when
-    // the newcomer leaves.
+    // A second identity cannot shadow an active claim. Rejection leaves both the existing
+    // route and the candidate's install state untouched.
     const rival = appKey(other.id, "store");
-    await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"]));
-    assertEqual(shell.resolve("seedstore/v2"), rival, "the last app to claim an id serves it");
-    shell.uninstall(rival);
+    let conflict = "";
+    try { await shell.loadBundleBlob(blob(other, "store", 1, ["seedstore/v2"])); }
+    catch (e) { conflict = String(e); }
+    assert(conflict.includes("claim 'seedstore/v2' is already held"),
+      `a contested claim is rejected by name, got: ${conflict || "no error"}`);
     assertEqual(shell.resolve("seedstore/v2"), key,
-      "uninstalling the newcomer hands the id back to the app that still claims it");
+      "a rejected claimant does not disturb the active route");
+    assert(shell.uninstall(rival) === false, "the rejected candidate did not install a slot");
 
     // Uninstall drops what the app claimed: a route never outlives its app.
     shell.uninstall(key);
@@ -403,17 +404,109 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
     }
-    // A `_`-led id is well FORMED — the transport claims one — but claiming it is a
-    // privilege, so an ordinary app naming it is refused by name rather than as a
-    // syntax error (§12.10, bundle.ts `verifyManifest`).
-    for (const reserved of [["_net"], ["_host"], ["_offer"]]) {
-      let msg = "";
-      try {
-        verifyManifest(sodium, signManifest(sodium, author,
-          { app: "bad", version: 1, protocols: reserved, modules: [], guest: GUEST() }));
-      } catch (e) { msg = String(e); }
-      assert(/is reserved/.test(msg), `an app claiming ${JSON.stringify(reserved)} is refused: ${msg}`);
-    }
+    // A `_`-led id is a LOCAL service name — no peer can reach one — so claiming an
+    // ordinary one is an ordinary claim, carrying no authority in its spelling.
+    verifyManifest(sodium, signManifest(sodium, author,
+      { app: "reserved", version: 1, protocols: ["_offer"], modules: [], guest: GUEST() }));
+    // Two are refused BY NAME rather than as syntax, each for its own reason (§12.10).
+    //
+    // `_host` is answered by the shell rather than routed, so nobody claims it.
+    let reserved = "";
+    try {
+      verifyManifest(sodium, signManifest(sodium, author,
+        { app: "bad", version: 1, protocols: ["_host"], modules: [], guest: GUEST() }));
+    } catch (e) { reserved = String(e); }
+    assert(/reserved for the host/.test(reserved), `_host is refused by name: ${reserved}`);
+    // `_net` is where every accepted link's RAW BYTES are handed in, before any peer has
+    // authenticated. An ordinary app claiming it would read the node's whole unauthenticated
+    // traffic without ever being granted `link` — and, since a claim has one active owner,
+    // would squat the id the real transport needs. Refused at verify, because the privilege
+    // is derived from the same signed manifest.
+    let squat = "";
+    try {
+      verifyManifest(sodium, signManifest(sodium, author,
+        { app: "squat", version: 1, protocols: ["_net"], modules: [], guest: GUEST() }));
+    } catch (e) { squat = String(e); }
+    assert(/claimable only by a bundle that reaches "link"/.test(squat),
+      `an app with no link authority may not claim _net: ${squat || "no error"}`);
+    // The same manifest with the privilege its claim implies verifies — the rule is the
+    // `link` grant, not a list of blessed authors or a role field.
+    verifyManifest(sodium, signManifest(sodium, author, {
+      app: "transport", version: 1, protocols: ["_net"], modules: [],
+      guest: GUEST({ requires: ["link/open"] }),
+    }));
+  } finally { shell.close(); }
+  console.log("  OK\n");
+}
+
+// ─── Test: `_host` is answered for the `_net` claimant only (§12.10) ─────────
+//
+// `_host` is how the transport tells the host what only the transport can see — above all
+// `deliver`, which hands the routing a frame with a `from` the CALLER writes. Anything
+// reaching it can forge an inbound request attributed to any peer, so the gate is being
+// the node's network, not merely holding `link`: the privilege is the wider set, and a
+// link-capable bundle may claim nothing at all and be an ordinary initiator (§12.8).
+//
+// Driven through the seam the shell wired for each load rather than through a guest,
+// because the boundary under test is the shell's: the caller identity is the slot the
+// closure was built for, so there is nothing a guest could say about itself to move it.
+async function testShellProtocolIsTheClaimantsOnly() {
+  console.log("Test: `_host` is answered for the `_net` claimant only (§12.10)");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { admitAll } = await imp("build/host/policy.js");
+
+  const author = testAuthor();
+  const blob = (app, protocols, requires) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author,
+      { app, version: 1, protocols, modules: [], guest: GUEST({ requires }) }),
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  // Each load stands exactly one realm, so the seam captured after an `await` is that
+  // bundle's own `host.call` — the very function its guest would hold.
+  let lastSeam = null;
+  const shell = mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async ({ hostCall }) => {
+        lastSeam = hostCall;
+        return { call: async () => new Uint8Array(), dispose() { } };
+      },
+    },
+    // Everything admitted, `link` included: the boundary under test is the shell's claim
+    // check, and a policy refusing the privilege would hide it behind an earlier refusal.
+    admit: admitAll,
+  });
+  // An op no `_host` implements. A caller PAST the gate is told the op is unknown; one
+  // stopped BY it is told it does not claim `_net`. Two different sentences, so the test
+  // reads the gate rather than merely "it threw".
+  const probe = opHeader("nope", new Uint8Array(0));
+  const say = async (seam) => {
+    try { await seam("_host", probe); return ""; } catch (e) { return String(e); }
+  };
+  try {
+    // The transport: reaches `link`, and claims `_net`.
+    await shell.loadBundleBlob(blob("transport", ["_net"], ["_host", "link/open"]));
+    const transportSeam = lastSeam;
+    // A link-capable bundle that claims NOTHING — the initiator shape (§12.8). It holds
+    // the same privilege and is the case the old privilege-keyed gate let through.
+    await shell.loadBundleBlob(blob("dialer", undefined, ["_host", "link/open"]));
+    const dialerSeam = lastSeam;
+
+    const reached = await say(transportSeam);
+    assert(/no _host op 'nope'/.test(reached),
+      `the _net claimant reaches _host: ${reached || "no error"}`);
+    const refused = await say(dialerSeam);
+    assert(/answered only for the _net claimant/.test(refused),
+      `a link-capable bundle that claims no _net is refused _host: ${refused || "no error"}`);
+
+    // The claim is what carries it, not the app key: uninstalling the transport takes
+    // `_host` away from a realm that still holds `link` and still has its seam.
+    shell.uninstall(appKey(author.id, "transport"));
+    const orphaned = await say(transportSeam);
+    assert(/answered only for the _net claimant/.test(orphaned),
+      `_host follows the claim, not the privilege: ${orphaned || "no error"}`);
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -2572,6 +2665,7 @@ await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();
+await testShellProtocolIsTheClaimantsOnly();
 await testInstallerRemove();
 await testFs();
 await testFsKeyRule();

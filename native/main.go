@@ -384,7 +384,7 @@ func exposeBridge(qc *qjs.Context) {
 			wv.Free()
 			m.Free()
 			if err != nil {
-				return nil, fmt.Errorf("bindAll: %s: %w", names[i], err)
+				return nil, fmt.Errorf("buildModuleSlot: %s: %w", names[i], err)
 			}
 			wasms[i] = wb
 		}

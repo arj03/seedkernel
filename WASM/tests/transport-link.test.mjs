@@ -104,7 +104,7 @@ async function linked(chans, aOpts = {}, bOpts = {}, linkOpts = {}) {
     onClose: (_id, reason) => { s.closed = true; s.reason = reason; },
   });
   // The dialer presents THE PEER's contact secret (what an address carries); the
-  // acceptor gates on its own, which came from its shell at init.
+  // acceptor gates on its own, which came from its shell configuration.
   st.aLink = A.driver.openLink({
     channel: chans[0], weDialed: true, expectPeerId: B.driver.peerId,
     contactSecret: dialSecret !== undefined ? dialSecret
@@ -667,7 +667,7 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   // msg4 is built, and a concealed refusal is silence rather than a close.
   const chans = wirePair();
   // An empty-but-present list: the receiver admits nobody. The lint is the transport's own
-  // now (transport/src `admits`), shipped as config at init rather than asked of the
+  // now (transport/src `admits`), read from its capability rather than asked of the
   // host per link — see the note there for why the host was never gating this anyway.
   const st = keep(await linked(chans, {}, { admitPeers: [new Uint8Array(32).fill(1)] }));
   await settle();
@@ -743,9 +743,10 @@ await test("ANSWER HOOK: null falls through to the routing table", async (keep) 
 });
 
 // ── the transport guest's caller boundary ────────────────────────────────────
-// The platform events (`init`, `linkBytes`, …) are the host's alone; `send` and `peers`
+// The platform events (`linkBytes`, `linkClosed`, …) are the host's alone; `send` and `peers`
 // are an app's to name, because both are questions about the app's own traffic. An app
-// that could spell `init` could re-key the node, so the line matters in both directions.
+// that could inject link bytes could forge traffic from a peer, so the line matters in
+// both directions.
 
 await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event", async (keep) => {
   const st = keep(await upPair());
@@ -755,9 +756,9 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
   const raw = await st.B.op("peers");
   assert(raw.length === 32 && hexOf(raw) === st.A.driver.peerId,
     "an app asking `peers` must get the authenticated set back");
-  // `init` through the same seam must be refused by NAME, not silently ignored.
+  // `linkBytes` through the same seam must be refused by NAME, not silently ignored.
   let refused = "";
-  try { await st.B.op("init", new Uint8Array(64)); }
+  try { await st.B.op("linkBytes", new Uint8Array(8)); }
   catch (e) { refused = String(e); }
   assert(refused.includes("the host's, not an app's"),
     `an app naming a platform event must be refused, got ${refused || "no error"}`);

@@ -194,7 +194,7 @@ func BenchmarkBoundCallOverhead(b *testing.B) {
 	bootRealm(b)
 	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
-		b.Fatalf("bindAll refused: %v", err)
+		b.Fatalf("buildModuleSlot refused: %v", err)
 	}
 	payload := bytes.Repeat([]byte{0x7e}, 32)
 	saved := moduleCallDeadline

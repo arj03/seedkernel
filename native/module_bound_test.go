@@ -136,7 +136,7 @@ func TestModuleCallBound(t *testing.T) {
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0x5e}, 32), "wedgeapp")
 	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
-		t.Fatalf("bindAll refused: %v", err)
+		t.Fatalf("buildModuleSlot refused: %v", err)
 	}
 	// The healthy module on the same app works before and after the kill: the bound
 	// takes the wedged module, not the app.
@@ -203,7 +203,7 @@ func TestModuleCallBoundArmedByDefault(t *testing.T) {
 		t.Helper()
 		key := appKeyFor(bytes.Repeat([]byte{0x5c}, 32), "probeapp")
 		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
-			t.Fatalf("bindAll refused: %v", err)
+			t.Fatalf("buildModuleSlot refused: %v", err)
 		}
 		w := moduleSlots[key]["fwd"]
 		done, cancel := context.WithCancel(ctx)
@@ -245,7 +245,7 @@ func TestModuleBindBound(t *testing.T) {
 	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000)
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("bindAll accepted a module whose start section never returns")
+		t.Fatal("buildModuleSlot accepted a module whose start section never returns")
 	}
 	// It must be the DEADLINE that refused it, not validation: a compile-time refusal
 	// would pass this test while leaving the wedge wide open. The error comes from
@@ -264,7 +264,7 @@ func TestModuleBindBound(t *testing.T) {
 	// The host is unharmed — the runtime that killed the wedge still binds and runs an
 	// ordinary module.
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
-		t.Fatalf("bindAll refused a healthy module after the wedge: %v", err)
+		t.Fatalf("buildModuleSlot refused a healthy module after the wedge: %v", err)
 	}
 	msg := []byte("still alive")
 	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
