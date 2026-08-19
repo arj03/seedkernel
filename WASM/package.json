@@ -52,6 +52,10 @@
       "types": "./build/host/shell-core.d.ts",
       "default": "./build/host/shell-core.js"
     },
+    "./module-table": {
+      "types": "./build/host/module-table.d.ts",
+      "default": "./build/host/module-table.js"
+    },
     "./transport-host": {
       "types": "./build/host/transport-host.d.ts",
       "default": "./build/host/transport-host.js"

@@ -16,7 +16,7 @@
 // Every name is application-neutral: content addressing, wire formats, erasure coding and
 // nonce conventions are all the guest's business, built on top of these.
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, PRIVILEGE_LINK, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 
 /** What `node/sign` signs under — and what `node/verify` checks against — derived by the
@@ -553,6 +553,29 @@ export function transportSignScope(key: {
     privateKey: Uint8Array;
 }, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_CHANNEL, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
+}
+/** Which of the two a slot gets — the ONE place that decides, so a future third scope is an
+ *  arm here rather than a second signing name or a second key. Keyed on the privilege the
+ *  bundle's `requires` reach (`privilegesOf`, §12.5), never on which bundle it is: what a
+ *  signature MEANS follows from what the occupant may do.
+ *
+ *  The inputs are the node's identity and the admitted manifest's own fields, and nothing
+ *  else — deliberately. A scope is a preimage every node must agree on: fold in anything
+ *  local to one deployment and a cohort's signatures stop verifying for each other
+ *  (`guestSignScope`). `networkKey` is not such a value — it names a network, and nodes on
+ *  different ones cannot link at all (§12.6). Nor does anything the bundle asserts about
+ *  itself enter here: `protocols` claims are revisable per version, and a scope that moved
+ *  with them would silently restate what already-signed records mean. */
+export function slotSignScope(node: {
+    identity: {
+        publicKey: Uint8Array;
+        privateKey: Uint8Array;
+    };
+    networkKey?: Uint8Array;
+}, author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
+    return privileges.includes(PRIVILEGE_LINK)
+        ? transportSignScope(node.identity, node.networkKey)
+        : appSignScope(node.identity, author, app);
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //

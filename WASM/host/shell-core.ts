@@ -14,7 +14,7 @@
 // There is no raw module install path: signed bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, genesisHash, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, appSignScope, transportSignScope, opCall, readOp, type SeamCrypto, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, opCall, readOp, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import type { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -208,7 +208,7 @@ interface AppSlot {
   verifiedBundle: LoadedBundle;
   pureModules: PureModules;
   fsScope?: Fs;
-  signingScope: ReturnType<typeof appSignScope>;
+  signingScope: SignScope;
   realm: SafeRealm | null;
   /** This realm's deadlines. Per SLOT rather than per shell, because a timer is a
    *  pending re-entry into one particular realm: the cap is then one guest's to
@@ -386,14 +386,11 @@ export function createShell(opts: CreateShellOptions & {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
-        const links = privilegesOf(loaded.manifest).includes(PRIVILEGE_LINK);
         slot = {
             verifiedBundle: loaded,
             pureModules,
             fsScope: fs ? scopedFs(fs, appScopeFor(platform.sodium, loaded.author, loaded.manifest.app)) : undefined,
-            signingScope: links
-                ? transportSignScope(platform.identity, platform.networkKey)
-                : appSignScope(platform.identity, loaded.author, loaded.manifest.app),
+            signingScope: slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest)),
             realm: null,
             timers,
         };
@@ -446,9 +443,10 @@ export function createShell(opts: CreateShellOptions & {
                 // is one of these. `crypto/*` and the bundle's own module names are exempt:
                 // a fixed catalog and the app's own code, never grants.
                 names: new Set(b.manifest.guest.requires),
-                // What SIGN signs under is chosen HERE, by the slot the bundle occupies —
-                // the one place that knows it (§12.2). Both slots sign with the node's one
-                // key and the slot picks what the signature MEANS: the transport signs
+                // What SIGN signs under was chosen with the slot, from the privilege the
+                // bundle reaches (`slotSignScope`, §12.2) — not here, and never by the
+                // guest. Both slots sign with the node's one key and the slot picks what
+                // the signature MEANS: the transport signs
                 // transcripts under DOMAIN_channel ‖ networkKey, an app under DOMAIN_guest ‖
                 // its own bundle's scope. The seam prefixes and never parses, so neither
                 // can produce the other's signature and no op signs raw bytes.
