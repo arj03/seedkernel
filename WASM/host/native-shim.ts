@@ -11,7 +11,7 @@
 // is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";
 import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
-import { runCli, loadedLine, parsePeerSpec, requireNetClaimant, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { runCli, loadedLine, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import {
   createShell, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
@@ -289,8 +289,21 @@ const modules: PureModuleLoader = {
         bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE);
         return {
             call(module, payload, _deadlineMs) {
+                // The bridge call runs the module synchronously inside the Go event loop,
+                // so the wall clock around it IS the module's own compute — nothing sits
+                // queued behind earlier calls (the native target serializes per slot in
+                // Go). Return it as `ms` so the seam bills actual work, matching the JS
+                // worker's report (ModuleResult, bundle.ts). `performance` is a JS-target
+                // global; the quickjs-ng host realm has Date, so fall back when absent.
+                const clock = (typeof performance === "object" && typeof performance.now === "function")
+                    ? () => performance.now()
+                    : () => Date.now();
+                const t0 = clock();
                 const r = bridge.callModule(slot, module, payload);
-                return Promise.resolve(r === null ? null : new Uint8Array(r));
+                return Promise.resolve({
+                    bytes: r === null ? null : new Uint8Array(r),
+                    ms: clock() - t0,
+                });
             },
             dispose() { bridge.disposeModules(slot); },
         };
@@ -506,11 +519,11 @@ async function makeTransportNode(cfg: {
             }
             // A deliberate configuration, but indistinguishable from a broken network
             // unless it says so.
-            bridge.log('  no transport: the policy grants "link" to no author of this bundle');
+            bridge.log('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
         }
     }
-    // Listener lifecycle is host configuration, independent of the `_net`
-    // route. With no claimant, accepted links are closed.
+    // Listener lifecycle is host configuration, independent of service claims. With no
+    // raw-link binding owner, accepted links are closed.
     await transportHost.start();
     return { shell: s, transport: transportHost };
 }
@@ -536,9 +549,9 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     const peers: string[] = cfg.peers ?? [];
     if (peers.length > 0) {
         // The same diagnosis the operator flow gives (`--peers`): the adapter is the
-        // platform's and always there, so an unclaimed `_net` has to be said rather than
-        // discovered as a dial that answers nothing.
-        requireNetClaimant(s.shell, "peers were configured, but there is nothing to dial from");
+        // platform's and always there, so an unowned raw-link binding has to be said rather
+        // than discovered as a dial that answers nothing.
+        requireLinkBinding(s.transport, "peers were configured, but there is nothing to dial from");
         for (const spec of peers) {
             const { peerId, addr } = parsePeerSpec(spec, "tcp");
             network.addPeerAddr(peerId, addr);

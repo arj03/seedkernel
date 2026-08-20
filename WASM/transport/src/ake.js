@@ -35,8 +35,8 @@
 //   "node/random" [n u32 BE] -> n bytes            (nonces, ephemeral secrets)
 //   `link/*`      bytes over an opaque link id, opened and closed
 //   `timer/*`     deadlines, since a zero-authority realm has no setTimeout
-//   `_host`       the shell's own id, for the two edges where the host holds the
-//                 other end
+//   "route/deliver" generic submission to an exact local claim
+//   "link/authenticated", "link/down" reports to this raw-link binding's owner
 //
 // Its own ws.wasm needs no grant: a bare name is a primitive, ungated like `crypto`
 // (§12.1). There is no `transport` or `net` domain either — what this program
@@ -70,14 +70,12 @@ const N_LINK_CLOSE = "link/close";
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
 const N_LINK_STAT = "link/stat";
+const N_LINK_AUTHENTICATED = "link/authenticated";
+const N_LINK_DOWN = "link/down";
+const N_ROUTE_DELIVER = "route/deliver";
 
 const N_TIMER_ARM = "timer/arm";
 const N_TIMER_CLEAR = "timer/clear";
-
-// The shell's own reserved id (§12.10), answered rather than routed. It carries only
-// the two edges where the host holds the other end: an inbound request, and the fate
-// of a link the host handed us through openLink.
-const N_HOST = "_host";
 
 const P_HASH = "crypto/blake2b-256";
 const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
@@ -256,29 +254,23 @@ function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId],
  *  stall clock to the deadline alone. */
 function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** Call the shell's own protocol by op name, in the envelope every other call carries
- *  (`writeOp`, guest-seam.ts). The host prepends OUR id on the way in, so there is
- *  nothing here to identify ourselves with. */
-function hostCall(op, tail) {
-  return host.call(N_HOST, writeOp(op, tail));
-}
-
 /** Hand an inbound request to whichever app claims its protocol id, and resolve with
  *  that app's answer. NOT awaited by any caller inside this realm — see the note above.
  *
  *  Delivery and the reply are ONE call: the answer is the app's own `handle` return
  *  value on a later turn, which is what an asynchronous app handler needs. */
 function hostDeliver(fromBytes, proto, payload) {
-  const head = new Uint8Array(1 + proto.length);
-  head[0] = proto.length;
-  head.set(proto, 1);
-  return hostCall("deliver", concatBytes([fromBytes, head, payload]));
+  const attrLen = new Uint8Array(4);
+  writeU32BE(attrLen, 0, fromBytes.length);
+  return host.call(N_ROUTE_DELIVER, concatBytes([
+    Uint8Array.of(proto.length), proto, attrLen, fromBytes, payload,
+  ]));
 }
 /** A link the HOST handed us (openLink) authenticated, or tore down. Relayed so whoever
  *  passed the channel in learns its fate; a core link the guest dialed or accepted is
  *  nobody's business but ours. */
-function hostLinkAuth(linkId, peerBytes) { hostCall("link-auth", args([linkId], [], peerBytes)); }
-function hostLinkDown(linkId, reason) { hostCall("link-down", args([linkId], [reason])); }
+function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
+function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
 /** The peer LINT (§12.6): is this peer on the operator's list? Asked at the FIRST point
  *  the peer is known and — critically — before this end has revealed anything about

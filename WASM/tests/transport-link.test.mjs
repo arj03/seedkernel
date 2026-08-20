@@ -700,23 +700,22 @@ await test("a decrypt failure does not advance the receive counter", async (keep
   assert((await st.B.seen()).length === 0, "a forged record must not be delivered");
 });
 
-// ── §12.10: the shell answers protocols of its own, ahead of the routing table ────
+// ── §12.10: platform handlers register exact claims ─────────────────────────────
 //
-// An inbound frame reaches the shell as the transport's `_host` deliver op and goes straight
-// to the routing table, so a host that serves an id of its own — seedchat's `_offer`,
-// which carries a bundle between two browsers before either has an app that could
-// receive it — needs an explicit seam. `createShell({ answer })` is it. These pin both
-// halves of the contract: the hook wins the ids it claims, and `null` from it is
-// genuinely a fall-through rather than an empty answer.
+// An inbound frame reaches the shell as the transport's `route/deliver` and goes to the
+// routing table, so a host that serves an id of its own — seedchat's `_offer`, which
+// carries a bundle between two browsers before either has an app that could receive it —
+// needs an explicit seam. `createShell({ claims })` is it: exact names, no wildcard and no
+// fall-through. These pin both halves — a registered name wins, and an unregistered one is
+// never consulted — plus the reach that registering one is opting into (below).
 
-await test("ANSWER HOOK: the shell answers its own protocol ahead of dispatch", async (keep) => {
+await test("EXACT CLAIM: the platform answers the claim it registered", async (keep) => {
   const seen = [];
   const st = keep(await upPair(undefined, undefined, {
-    answer: (from, proto, payload) => {
-      if (proto !== "_offer") return null;
-      seen.push({ from, payload });
+    claims: { "_offer": (from, payload) => {
+      seen.push({ from: Buffer.from(from).toString("hex"), payload });
       return Promise.resolve(Uint8Array.from([0xaa, payload.length]));
-    },
+    } },
   }));
   const resp = await st.A.request(st.B.driver.peerId, "_offer", Uint8Array.from([1, 2, 3]));
   assert(resp.length === 2 && resp[0] === 0xaa && resp[1] === 3,
@@ -729,17 +728,38 @@ await test("ANSWER HOOK: the shell answers its own protocol ahead of dispatch", 
   assert(inbound.length === 0, "a frame the shell answered must not also reach the app");
 });
 
-await test("ANSWER HOOK: null falls through to the routing table", async (keep) => {
+await test("EXACT CLAIM: unrelated traffic goes directly to its claimant", async (keep) => {
   let asked = 0;
   const st = keep(await upPair(undefined, undefined, {
-    answer: (_from, proto) => { asked++; return proto === "_offer" ? Promise.resolve(new Uint8Array(0)) : null; },
+    claims: { "_offer": async () => { asked++; return new Uint8Array(0); } },
   }));
   // The harness app claims PROTO, and the hook declines it — so the app answers, exactly
-  // as it would on a shell with no hook at all. A hook is first refusal, not a shadow.
+  // without consulting the unrelated exact platform claim.
   const resp = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([7, 8]));
   assert(resp.length === 2 && resp[1] === 8, `the app must still answer its own id, got ${[...resp]}`);
-  assert(asked === 1, "the hook is consulted for every inbound frame, including ones it declines");
-  assert((await st.B.seen()).length === 1, "…and the declined frame reached the app");
+  assert(asked === 0, "an exact platform claim is not consulted for unrelated traffic");
+  assert((await st.B.seen()).length === 1, "the frame reached its app claimant");
+});
+
+// A peer names the id the TRANSPORT ITSELF claims. Nothing about `route/deliver` reads the
+// protocol bytes off the wire — that is the point of a generic authority — so the refusal
+// has to be the routing's: a bundle's `_`-led claim is a LOCAL service name (§12.10). Were
+// it reachable, this frame would land in the transport realm's own `handle` with the
+// sender's key as the caller id, which `APP_OPS` admits — `peers` would enumerate the
+// node's links and `send` would make it issue requests on the caller's behalf.
+await test("a peer cannot reach a bundle's `_`-led local claim, the transport's included", async (keep) => {
+  const st = keep(await upPair());
+  const opEnvelope = (op) => {
+    const n = Buffer.from(op, "utf8");
+    return Uint8Array.from([n.length, ...n]);
+  };
+  const peers = await st.A.request(st.B.driver.peerId, "_net", opEnvelope("peers"));
+  assert(peers.length === 0,
+    `the transport's own claim must not answer a peer, got ${peers.length} bytes: ${hexOf(peers)}`);
+  // Not merely unanswered — never delivered: the ordinary claim still works on the same
+  // link, so this is a routing rule and not a link that stopped carrying frames.
+  const ordinary = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([4, 5]));
+  assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
 });
 
 // ── the transport guest's caller boundary ────────────────────────────────────

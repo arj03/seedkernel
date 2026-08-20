@@ -11,9 +11,8 @@
 //   guest → host  the `link/*` names (guest-seam.ts) — configuration and a byte duplex behind an opaque
 //                 link id. Deadlines are not among them: `timer/*` is an ordinary
 //                 authority, so a fired timer comes out of the shell's per-realm table.
-//   host → guest  the SAME cross-realm call an app makes. The transport claims `_net` and
-//                 this driver reaches it through the shell's routing, with the caller id
-//                 32 zero bytes for "the host itself".
+//   host → guest  raw-link events go directly to the slot/platform binding that owns this
+//                 capability. No claim name selects the recipient.
 //
 // The op name travels in the payload as a length-prefixed NAME, so an op the guest does
 // not implement fails loud rather than turning into a number the two sides must agree on.
@@ -133,8 +132,7 @@ class Args {
   }
 }
 
-/** How the driver reaches the transport: the shell's cross-realm call, already resolved to
- *  whatever realm claims `_net` right now. `null` when nothing does — a node whose
+/** How the driver reaches the owner of this platform binding. `null` when nothing does — a node whose
  *  transport bundle has been uninstalled, where a socket event has nowhere to go and
  *  the honest answer is to drop it. */
 export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
@@ -249,6 +247,7 @@ export class TransportHost {
   private nextLinkId = 1;
   private transport: TransportCall | null = null;
   private transportAvailable: () => boolean = () => false;
+  private activeOwner: object | null = null;
   private closed = false;
 
   constructor(opts: TransportHostOptions) {
@@ -256,16 +255,34 @@ export class TransportHost {
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Wire the `_net` destination once. Both callbacks resolve the claim
+  /** Wire this platform binding once. Both callbacks resolve its capability owner
    *  dynamically, so claim changes never reconfigure this driver. */
   route(transport: TransportCall, available: () => boolean): void {
     this.transport = transport;
     this.transportAvailable = available;
   }
 
+  /** Whether this platform binding currently has an admitted raw-link owner. */
+  available(): boolean { return !this.closed && this.transportAvailable(); }
+
+  /** Publish one slot's raw-link binding. A different binding is a handover: live links
+   *  belonged to the old guest's private state and are closed before the new owner runs. */
+  activate(owner: object): void {
+    if (this.activeOwner === owner) return;
+    if (this.activeOwner) this.reset();
+    this.activeOwner = owner;
+  }
+
+  /** Release only the binding named by its owner token. */
+  release(owner: object): void {
+    if (this.activeOwner !== owner) return;
+    this.activeOwner = null;
+    this.reset();
+  }
+
   /** Link configuration is a side-effect-free read of immutable node identity and
    *  deployment limits. A candidate transport can initialize offside without disturbing
-   *  the slot currently serving `_net`.
+   *  the slot currently owning this raw-link binding.
    *
    *  The mutable address book deliberately is not here: a one-shot snapshot can go stale
    *  between candidate construction and claim commit. It is replayed after publication
@@ -342,11 +359,11 @@ export class TransportHost {
   }
 
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims
-   *  `_net` — a node with no transport bundle, which is a legitimate configuration and
+   *  the binding — a node with no transport bundle, which is a legitimate configuration and
    *  so has to be an answer rather than a promise that never settles. */
   private ask(args: Args): Promise<Uint8Array> {
     const r = this.toTransport(args);
-    if (!r) return Promise.reject(new Error("transport: no bundle claims the network"));
+    if (!r) return Promise.reject(new Error("transport: no bundle owns the raw-link binding"));
     return r;
   }
 
@@ -354,10 +371,12 @@ export class TransportHost {
 
   /** The RAW net capability, as this node implements it: an opaque link id over the
    *  platform's sockets. This is the whole of what the host contributes to the network. */
-  rawNet(): RawNet {
+  rawNet(owner: object): RawNet {
+    const ownsBinding = () => this.activeOwner === owner;
     return {
       config: () => this.configuration(),
       open: (dest) => {
+        if (!ownsBinding()) return NO_ROUTE;
         // The destination name is the peer's 32-byte channel key, resolved in the address
         // book. No entry, or no channel factory at all (a browser edge), is "no route",
         // which the caller treats as a fabric dropping a frame.
@@ -369,19 +388,23 @@ export class TransportHost {
           linkId: this.register(channel), framing: channel.framing, authority: channel.authority ?? "",
         };
       },
-      send: (linkId, bytes) => { this.channels.get(linkId)?.send(bytes); },
+      send: (linkId, bytes) => { if (ownsBinding()) this.channels.get(linkId)?.send(bytes); },
       close: (linkId, graceful) => {
+        if (!ownsBinding()) return;
         try { this.channels.get(linkId)?.close(graceful); } catch { /* already gone */ }
       },
       // A link that is gone, or a channel that cannot say, both read 0 — the safe answer:
       // the occupant's stall clock sees no progress and lets the deadline decide.
       buffered: (linkId) => {
+        if (!ownsBinding()) return 0;
         try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
       },
+      authenticated: (linkId, peer) => { if (ownsBinding()) this.linkAuthed(linkId, peer); },
+      down: (linkId, reason) => { if (ownsBinding()) this.linkDown(linkId, reason); },
     };
   }
 
-  // ── what the shell hands back off `_host` ───────────────────────────────────
+  // ── reports returned through this raw-link binding ──────────────────────────
 
   /** A link this driver handed over (`openLink`) authenticated as `pk`. Relayed to
    *  whoever passed the channel in; the driver forms no opinion about the peer. */
@@ -442,7 +465,7 @@ export class TransportHost {
    *  The channel object stays the caller's; the link state machine runs in the
    *  guest, keyed by the returned link id. */
   openLink(opts: OpenLinkOptions): LinkHandle {
-    if (!this.transportAvailable()) throw new Error("transport: no bundle claims the network");
+    if (!this.transportAvailable()) throw new Error("transport: no bundle owns the raw-link binding");
     const linkId = this.register(opts.channel);
     this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
     this.announce(linkId, {
@@ -481,7 +504,7 @@ export class TransportHost {
       .blob(addr.contactSecret ?? ZERO32));
   }
 
-  /** Seed the current `_net` claimant from the node-owned address book. Called only after
+  /** Seed the current raw-link owner from the node-owned address book. Called only after
    *  a new claimant is published; later mutations use `addPeerAddr`'s identical event.
    *  Queueing is synchronous, so a following `ready`/request cannot overtake the replay. */
   replayAddresses(): void {
@@ -539,6 +562,7 @@ export class TransportHost {
     this.closed = true;
     this.transport = null;
     this.transportAvailable = () => false;
+    this.activeOwner = null;
     this.reset();
     this.opts.channels?.close();
   }

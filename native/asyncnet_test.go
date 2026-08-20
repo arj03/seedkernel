@@ -42,7 +42,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		// policy has to name the artifact's own transport author before either node
 		// stands up. The id is read from the realm, never restated.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor] } }));
+		                           grants: { link: [embeddedTransportAuthor], route: [embeddedTransportAuthor] } }));
 		globalThis.__setup = (async () => {
 		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
@@ -52,7 +52,17 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.__nodeB = b;
 		  // The seam a confined guest on B runs against: _net resolves through B's own
 		  // routing, which is what an app's seam is wired with (shell-core crossRealmCall).
-		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => b.shell.dispatch("0".repeat(64), id, payload) });
+		  // Driven through invoke rather than dispatch, because _net is a LOCAL service
+		  // name: a co-resident realm reaches it and a peer does not (§12.10), and
+		  // dispatch is the peer's door. This seam is hand-built rather than a loaded
+		  // slot, so the host loopback stands in for the cross-realm call — the same
+		  // slot, the same entrypoint, the same [opLen u8][op][args] envelope.
+		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => {
+		    const n = payload[0];
+		    let op = "";
+		    for (let i = 0; i < n; i++) op += String.fromCharCode(payload[1 + i]);
+		    return b.shell.invoke(op, payload.slice(1 + n), b.shell.resolve(id));
+		  } });
 		})();
 	`, hex.EncodeToString(sender.id())))); err != nil {
 		t.Fatal("setup:", err)

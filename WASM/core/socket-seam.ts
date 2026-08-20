@@ -68,7 +68,7 @@ export type Framing = (typeof FRAMING)[keyof typeof FRAMING];
 
 /** WHO a peer is: its 32-byte channel public key, lowercase hex. The one identity the
  *  address book is keyed on and the one every attributed frame names — and all the host has
- *  left to say about a peer, the transport being a guest that claims `_net`. */
+ *  left to say about a peer, the transport being a guest. */
 export type PeerId = string;
 
 /** How a peer is reachable (README §12.6). The optional contact secret is THE

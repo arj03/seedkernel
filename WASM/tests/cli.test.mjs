@@ -56,7 +56,7 @@ throws(() => parseHex32("ab".repeat(64), "--key"), "a 64-byte ed25519 secret key
 console.log("\n— the operator flow —");
 
 /** A CliHost over in-memory files and a stubbed node, recording everything printed. */
-function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
+function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true } = {}) {
   const lines = [];
   const written = new Map();
   const host = {
@@ -86,7 +86,7 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
-      }, transport: { port, wsPort } };
+      }, transport: { port, wsPort, available: () => linkAvailable } };
     },
   };
   return host;
@@ -234,13 +234,13 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {} } = {}) {
   ok(host.lines.includes("  tcp    listening on :7777"), "the console reports the port actually bound");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }
-// --peers with no `_net` claimant says what is wrong before touching the adapter.
+// --peers with no raw-link binding says what is wrong before touching the adapter.
 {
   const host = fakeHost(["--key", join(work, "p.key"), "--peers", `${good}@127.0.0.1:7000`],
-    { shell: { resolve: () => null } });
+    { linkAvailable: false });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("there is nothing to dial from"), "--peers without an `_net` claimant explains itself");
+  ok(msg.includes("there is nothing to dial from"), "--peers without a raw-link binding explains itself");
 }
 
 console.log("\n— the load line —");

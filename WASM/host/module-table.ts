@@ -20,7 +20,7 @@ import {
   DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
 } from "../core/wasm-limits.js";
-import type { PureModuleLoader, PureModules } from "./bundle.js";
+import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 
 // ─── module routing ─────────────────────────────────────────────────────
 
@@ -63,14 +63,14 @@ interface WasmModuleRef {
    *  payload is refused without a worker round-trip. */
   scratchSize: number;
   /** Calls awaiting their worker's answer, by the id this host minted. */
-  pending: Map<number, (bytes: Uint8Array | null) => void>;
+  pending: Map<number, (r: ModuleResult) => void>;
 }
 
 /** One worker message, the whole protocol between the table and a module worker. */
 type WorkerMsg =
   | { type: "ready"; scratchSize: number }
   | { type: "loadError"; message: string }
-  | { type: "result"; id: number; bytes: ArrayBuffer | null };
+  | { type: "result"; id: number; bytes: ArrayBuffer | null; ms: number };
 
 /** A worker port as the table uses it — the subset the two platforms' workers share
  *  (Node `worker_threads` and the browser's dedicated `Worker`). */
@@ -140,8 +140,13 @@ port.onmessage = (e) => {
   }
   if (m.type === "call") {
     // A trap, an oversized result, a negative length — all the same empty answer, the
-    // shape a caller downstream already reads for a failed transform.
+    // shape a caller downstream already reads for a failed transform. ms is this
+    // worker's own time inside handle — the module's actual compute, excluding however
+    // long this call sat queued behind earlier ones on the same worker. That is what
+    // the caller's execution budget is billed (§12.3), so a burst of fire-and-forget
+    // module calls costs their real work, not their wait.
     let bytes = null;
+    const t0 = performance.now();
     try {
       new Uint8Array(memory.buffer, scratch, m.payload.byteLength).set(new Uint8Array(m.payload));
       const len = handle(m.payload.byteLength);
@@ -149,7 +154,8 @@ port.onmessage = (e) => {
         bytes = new Uint8Array(memory.buffer, scratch, len).slice().buffer;
       }
     } catch { bytes = null; }
-    port.postMessage({ type: "result", id: m.id, bytes }, bytes === null ? [] : [bytes]);
+    const ms = performance.now() - t0;
+    port.postMessage({ type: "result", id: m.id, bytes, ms }, bytes === null ? [] : [bytes]);
   }
 };
 `;
@@ -318,7 +324,10 @@ export class ModuleTable implements PureModuleLoader {
       worker.onMessage((m) => {
         if (m.type === "result") {
           const settle = ref.pending.get(m.id);
-          if (settle) { ref.pending.delete(m.id); settle(m.bytes === null ? null : new Uint8Array(m.bytes)); }
+          if (settle) {
+            ref.pending.delete(m.id);
+            settle({ bytes: m.bytes === null ? null : new Uint8Array(m.bytes), ms: m.ms });
+          }
           return;
         }
         if (!loading) return;
@@ -355,7 +364,7 @@ export class ModuleTable implements PureModuleLoader {
     // and leaves the module to respawn.
     worker.onError(() => {
       if (ref.worker !== worker) return;
-      for (const settle of ref.pending.values()) settle(null);
+      for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
       ref.pending.clear();
       ref.worker = null;
     });
@@ -371,10 +380,10 @@ export class ModuleTable implements PureModuleLoader {
    *  budget, and exceeding it answers empty with the worker killed and respawned, so a
    *  module that never returns fails like a trap instead of holding the node's thread. A
    *  guest's call carries its own remaining segment (§4.3). */
-  private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null> {
+  private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult> {
     const w = modules.get(module);
-    if (!w) return null;
-    if (payload.length > w.scratchSize) return null;
+    if (!w) return { bytes: null, ms: 0 };
+    if (payload.length > w.scratchSize) return { bytes: null, ms: 0 };
     const bound = deadlineMs ?? this.deadlineMs;
     // One in-flight call per module: the next call starts only when the previous one
     // settled, so a spinning module burns one core for one bound, not one per caller.
@@ -386,30 +395,33 @@ export class ModuleTable implements PureModuleLoader {
   /** Run one call on a module's worker, under `bound`. Never rejects: every failure —
    *  a dead worker, a respawn that could not stand up, a worker killed at the deadline
    *  — is the same empty answer a trap produces today, so nothing downstream changes. */
-  private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<Uint8Array | null> {
+  private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
     // The previous call may have killed the worker; run on the fresh instance the kill
     // asked for, whose statics are gone — which is the point.
     if (w.worker === null) await this.respawn(w);
     const worker = w.worker;
-    if (!worker) return null;
+    if (!worker) return { bytes: null, ms: 0 };
     const input = payload.slice();
     // Held open for the duration of the call: an unbounded call arms no timer, and the
     // caller is awaiting an answer only this worker can give.
     worker.keepAlive(true);
-    return new Promise<Uint8Array | null>((resolve) => {
+    return new Promise<ModuleResult>((resolve) => {
       const id = ++this.callSeq;
       let timer: ReturnType<typeof setTimeout> | null = null;
-      w.pending.set(id, (bytes) => {
+      w.pending.set(id, (r) => {
         if (timer !== null) clearTimeout(timer);
         worker.keepAlive(false);
-        resolve(bytes);
+        resolve(r);
       });
       if (Number.isFinite(bound)) {
         timer = setTimeout(() => {
           // The module did not return within its bound. Kill the isolate — the engine's
-          // one interrupt, which works even mid-loop — answer empty, and respawn.
+          // one interrupt, which works even mid-loop — answer empty, and respawn. It
+          // burned the full bound before the kill, so THAT is what the caller's segment
+          // is billed (the worker never got to report its own time): a guest looping on
+          // a wedged module must exhaust its budget rather than spin forever free.
           w.pending.delete(id);
-          resolve(null);
+          resolve({ bytes: null, ms: bound });
           if (w.worker === worker) {
             w.worker = null;
             worker.kill();
@@ -447,7 +459,7 @@ export class ModuleTable implements PureModuleLoader {
     // Marked first: a respawn may be mid-flight, and the load that finishes after this
     // returns has to kill what it spawned rather than adopt it onto a departed ref.
     ref.dead = true;
-    for (const settle of ref.pending.values()) settle(null);
+    for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
     ref.pending.clear();
     ref.worker?.kill();
     ref.worker = null;

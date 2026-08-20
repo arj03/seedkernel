@@ -6,7 +6,6 @@ import (
 	_ "embed"
 	"encoding/binary"
 	"encoding/hex"
-	"strings"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -251,17 +250,12 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	return mjson
 }
 
-// appProtocols is the fixture's claim: the app's own name, or `_net` when the requires
-// reach the `link` privilege (§12.5). Derived from the requires because the loader ties
-// them the same way — `_net` is claimable only by a bundle that reaches `link` (§12.10),
-// so a fixture claiming it without one would be refused at verify. A claim has one active
-// owner, so two fixtures must not derive the same id.
-func appProtocols(app string, requires []string) []string {
-	for _, r := range requires {
-		if strings.HasPrefix(r, "link/") {
-			return []string{"_net"}
-		}
-	}
+// appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
+// spellings carry no authority (§12.10) and the loader ties nothing to one, so a fixture
+// deriving `_net` from a `link/*` requires would only be borrowing the transport's claim
+// and testing the CLAIM contest wherever it meant to test the privilege. A claim has one
+// active owner, so two fixtures must not derive the same id.
+func appProtocols(app string, _ []string) []string {
 	return []string{app}
 }
 

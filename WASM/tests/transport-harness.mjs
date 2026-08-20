@@ -28,7 +28,8 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 export const { signManifest, packBundle, genesisHash, MANIFEST_FILE, GUEST_FILE } = await imp("build/host/bundle.js");
-export const { GUEST_ABI_VERSION, NET_PROTOCOL } = await imp("build/core/domains.js");
+export const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
+export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
 
 export const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
@@ -59,8 +60,8 @@ register("handle", (arg) => {
   // the same one-vocabulary shape the transport's own handle reads.
   if (fromHost) {
     const { op, args } = readOp(p);
-    if (op === "send") return host.call(${JSON.stringify(NET_PROTOCOL)}, writeOp("send", args));
-    if (op === "op") return host.call(${JSON.stringify(NET_PROTOCOL)}, args);
+    if (op === "send") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, writeOp("send", args));
+    if (op === "op") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, args);
     if (op === "seen") {
       let n = 0;
       for (const s of seen) n += 4 + s.length;
@@ -112,7 +113,7 @@ export function harnessAppBlob(author, mode = "echo") {
       hash: Buffer.from(genesisHash(sodium, guest)).toString("hex"),
       abi: GUEST_ABI_VERSION,
       // The whole of what an app needs to talk to the network: the id the transport claims.
-      requires: [NET_PROTOCOL],
+      requires: [TRANSPORT_SERVICE],
       config: { mode },
     },
   };
@@ -171,7 +172,7 @@ export function transportAuthor() {
 export function transportPolicy(authorHex, appAuthors = []) {
   return policyFromJson(JSON.stringify({
     authors: [authorHex, ...appAuthors],
-    grants: { link: [authorHex] },
+    grants: { link: [authorHex], route: [authorHex] },
   }));
 }
 
@@ -213,7 +214,7 @@ export async function makeTransportHost(opts = {}) {
       createRealm: async (o) => createSafeRealm(o),
     },
     admit: policy,
-    answer: opts.answer,
+    claims: opts.claims,
   });
   await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
   const node = { shell, driver, identity, appAuthor };

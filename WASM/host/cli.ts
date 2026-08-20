@@ -11,7 +11,7 @@ import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { appKeyFor, isJsonObject, type JsonObject, type LoadedBundle } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
-import { NET_PROTOCOL, PRIVILEGE_LINK } from "../core/domains.js";
+import { PRIVILEGE_LINK } from "../core/domains.js";
 import type { TransportHost } from "./transport-host.js";
 import type { Shell } from "./shell-core.js";
 
@@ -61,13 +61,13 @@ export interface NodeRuntime {
   transport: TransportHost;
 }
 
-/** The diagnosis a cohort operation needs when no bundle claims `_net`. The adapter is
- *  always there — it is the platform's — so a node with no transport bundle answers
+/** The diagnosis a cohort operation needs when no bundle owns the raw-link binding. The
+ *  adapter is always there — it is the platform's — so a node with no transport bundle answers
  *  "no route" rather than failing, which is a legitimate configuration (§12.6) and exactly
  *  the wrong answer to give an operator who typed `--peers`. */
-export function requireNetClaimant(shell: Pick<Shell, "resolve">, what: string): void {
-  if (!shell.resolve(NET_PROTOCOL)) {
-    throw new Error(`shell: ${what} — load a bundle that reaches the "${PRIVILEGE_LINK}" privilege and claims ${NET_PROTOCOL}, first`);
+export function requireLinkBinding(transport: Pick<TransportHost, "available">, what: string): void {
+  if (!transport.available()) {
+    throw new Error(`shell: ${what} — load a bundle granted the "${PRIVILEGE_LINK}" privilege first`);
   }
 }
 
@@ -294,7 +294,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // letting the flag pass silently on a node with no network.
   const peers = list(args.get("peers"));
   if (peers.length > 0) {
-    requireNetClaimant(shell, "--peers given, but there is nothing to dial from");
+    requireLinkBinding(net, "--peers given, but there is nothing to dial from");
     for (const spec of peers) {
       const { peerId, addr } = parsePeerSpec(spec, "tcp");
       net.addPeerAddr(peerId, addr);

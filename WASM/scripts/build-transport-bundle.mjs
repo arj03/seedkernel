@@ -181,11 +181,7 @@ async function main() {
     app: "transport",
     version: 1,
     modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
-    // The reserved id this program IS (§12.10). An ordinary protocol claim — routing
-    // resolves it as it resolves `chat-v1`, and a later load taking it over is how a node
-    // replaces its transport in place. What is not ordinary is who may spell it: the
-    // charset reserves `_`-led ids, and `verifyManifest` grants the exception only to a
-    // bundle reaching `link`, which the requires below do.
+    // The local service name chosen by this composition. It has no kernel semantics.
     protocols: ["_net"],
     guest: {
       hash: toHex(sodium.crypto_generichash(32, guest)),
@@ -205,8 +201,8 @@ async function main() {
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/config", "link/open", "link/send", "link/close", "link/stat",
+        "link/authenticated", "link/down", "route/deliver",
         "timer/arm", "timer/clear",
-        "_host",
       ],
     },
   };

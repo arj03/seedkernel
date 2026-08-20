@@ -18,6 +18,7 @@
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
 import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, PRIVILEGE_LINK, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
+import type { ModuleResult } from "./bundle.js";
 
 /** What `node/sign` signs under — and what `node/verify` checks against — derived by the
  *  host from the slot the asking bundle occupies, never from anything the guest says
@@ -71,13 +72,13 @@ export interface SeamCrypto {
  *  cross-realm call, and the same mechanism the host dispatches an inbound frame with.
  *
  *  There is no transport-shaped interface here and no `net` domain: the network is a
- *  bundle that claims `_net`, reached exactly as an app claiming `chat-v1` is. The payload
- *  is opaque to the host, and the answer is whatever the callee's `handle` returned; the
- *  host contributes attribution (it prepends the CALLER's id) and resolution.
+ *  bundle serving the local service name its composition chose, reached exactly as an app
+ *  claiming `chat-v1` is. The payload is opaque to the host, and the answer is whatever the
+ *  callee's `handle` returned; the host contributes attribution (it prepends the CALLER's
+ *  id) and resolution.
  *
  *  `null` when nothing claims the id, which the seam turns into a refusal by name rather
- *  than a promise that never settles. The shell satisfies this and answers `_host` itself
- *  rather than routing it (§12.10). */
+ *  than a promise that never settles. */
 export interface SeamCalls {
     call(id: string, payload: Uint8Array): Promise<Uint8Array> | null;
 }
@@ -112,6 +113,21 @@ export interface RawNet {
      *  `RawLink.buffered`). Optional: a host whose channels cannot say omits it,
      *  and the transport's stall clock degrades to a plain deadline. */
     buffered?(linkId: number): number;
+    /** Report the fate of a platform-owned link back to the binding that supplied it. */
+    authenticated(linkId: number, peer: Uint8Array): void;
+    down(linkId: number, reason: number): void;
+}
+
+/** Generic submission of a request that arrived from OUTSIDE this node. Both claim and
+ *  attribution are opaque to the capability; their producer and claimant define their
+ *  meaning — which is exactly why the caller holding it is granted `route` separately from
+ *  `link` (§12.5): the attribution is the submitter's to write.
+ *
+ *  What it therefore cannot reach is a bundle's `_`-led claim, a LOCAL service name (§12.10)
+ *  no remote sender's `requires` could have granted. The host resolves that, not this
+ *  interface: `null` comes back as it does for a claim nobody serves. */
+export interface ClaimDelivery {
+    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -165,6 +181,8 @@ export interface SeamGrants {
      *  that reaches the `link` privilege, so nothing else can ever reach a descriptor
      *  whatever is installed (§1, capability-by-non-wiring). */
     rawNet?: RawNet;
+    /** Separately granted delivery into the claim table. */
+    delivery?: ClaimDelivery;
     /** The platform's event loop, for a guest that declares `timer`. */
     timers?: HostTimers;
     /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
@@ -186,8 +204,10 @@ export interface SeamModules {
      *
      *  A module call is ASYNC (the JS targets run a module in its own worker, so the call
      *  crosses an isolate). `deadlineMs` is the calling guest's REMAINING execution segment
-     *  (§4.3), computed by the realm — host plumbing, never guest-supplied. */
-    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<Uint8Array | null> | null;
+     *  (§4.3), computed by the realm — host plumbing, never guest-supplied. The resolved
+     *  `ModuleResult` carries the module's own processing time, which is what the seam
+     *  bills to the caller's segment — see `ModuleResult` (bundle.ts). */
+    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<ModuleResult> | null;
 }
 
 /** Everything the seam needs, in the three groups that own it. */
@@ -496,10 +516,10 @@ export function opCall(op: string, args: Uint8Array, caller: Uint8Array = HOST_C
     const head = opHeader(op, caller);
     return concatBytes([head, args]);
 }
-/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`,
- *  for the shell reading a guest's cross-realm call to its own `_host` id. Same bytes,
- *  same failure: malformed framing throws rather than yielding a truncated name that
- *  the caller would then see reported as an unimplemented op. */
+/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`, for
+ *  host code reading an op envelope a guest wrote. Same bytes, same failure: malformed
+ *  framing throws rather than yielding a truncated name that the caller would then see
+ *  reported as an unimplemented op. */
 export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
     const n = payload.length > 0 ? payload[0] : -1;
     if (n < 0 || payload.length < 1 + n)
@@ -520,7 +540,7 @@ export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
  *
  *  Neither exemption parses the name for authority: the gate asks `isGrant`, which is
  *  membership in this table or the one-character reservation. */
-export { AUTHORITY_CALLS, PRIVILEGES, NET_PROTOCOL, SHELL_PROTOCOL } from "../core/domains.js";
+export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
  *  guest signs only within its own bundle's namespace; every node running the same bundle
@@ -610,8 +630,8 @@ function u64be(value: number): Uint8Array {
  *
  *  `crypto/*` reaches nothing a guest does not already hold, so it is ungated; every other
  *  name is an authority. `link/*` is the transport's alone; what the transport PROVIDES
- *  back is not in this table at all — it is a realm an app reaches by the id it claims
- *  (`NET_PROTOCOL`), not a host service. */
+ *  back is not in this table at all — it is a realm an app reaches by the ordinary local
+ *  service name selected by its composition. */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
     const { sodium, identity } = platform;
     const now = platform.now ?? (() => Date.now());
@@ -629,6 +649,11 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         if (!grants.timers)
             throw new Error("guest-seam: timer.* used but no timer backend wired");
         return grants.timers;
+    };
+    const delivery = () => {
+        if (!grants.delivery)
+            throw new Error("guest-seam: route/deliver used but no claim routing is wired");
+        return grants.delivery;
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` with an inherited function, which the
@@ -736,6 +761,34 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
             return out;
         },
+        "link/authenticated": (payload) => {
+            rawNet().authenticated(readU32BE(payload, 0), payload.slice(4));
+            return NONE;
+        },
+        "link/down": (payload) => {
+            rawNet().down(readU32BE(payload, 0), payload[4]);
+            return NONE;
+        },
+        // [claimLen u8][claim][attributionLen u32][attribution][payload]. The router does
+        // not interpret attribution; it merely prepends it at the claimant boundary. A claim
+        // nothing wire-reachable serves — including a bundle's own `_`-led local service
+        // name, which this path may not reach (ClaimDelivery) — answers empty, the same
+        // answer a submitter gets for a protocol nobody claims.
+        "route/deliver": (payload) => {
+            const claimLen = payload[0];
+            if (payload.length < 5 + claimLen)
+                throw new Error("guest-seam: malformed route/deliver payload");
+            const claim = dec.decode(payload.slice(1, 1 + claimLen));
+            const attrLen = readU32BE(payload, 1 + claimLen);
+            const attrStart = 5 + claimLen;
+            if (payload.length < attrStart + attrLen)
+                throw new Error("guest-seam: malformed route/deliver attribution");
+            return delivery().deliver(
+                claim,
+                payload.slice(attrStart, attrStart + attrLen),
+                payload.slice(attrStart + attrLen),
+            ) ?? Promise.resolve(NONE);
+        },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {
             // The live-timer cap is the BACKEND's, not here: the table is its memory to
@@ -838,14 +891,17 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // is the interrupt it cannot dodge — the throw lands on its own `await`.
         if (budget !== undefined && budget.remainingMs <= 0)
             throw new Error("guest-seam: execution budget exhausted before " + name);
-        const started = Date.now();
         const r = modules.call(name, payload, budget?.remainingMs);
-        if (r !== null && typeof (r as Promise<Uint8Array | null>).then === "function") {
-            return (r as Promise<Uint8Array | null>).then((b) => {
+        if (r !== null && typeof (r as Promise<ModuleResult>).then === "function") {
+            return (r as Promise<ModuleResult>).then(({ bytes, ms }) => {
+                // Bill the module's OWN processing time (measured on the worker that ran
+                // it), never the issue-to-settle wall clock: a burst of fire-and-forget
+                // module calls serialized through one worker would otherwise charge their
+                // queue wait quadratically, killing a busy-but-honest guest mid-window.
                 // Only the parked path is charged: a module answering synchronously ran
                 // inside the guest's own open segment, which the realm's clock counted.
-                budget?.charge(Date.now() - started);
-                return b ?? NONE;
+                budget?.charge(ms);
+                return bytes ?? NONE;
             });
         }
         return (r as Uint8Array | null) ?? NONE;

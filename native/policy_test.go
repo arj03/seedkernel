@@ -60,14 +60,20 @@ func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	// could fall through to the unprivileged base: a single `link/*` name is the whole
 	// claim, which is what the one-name bundle above already proves.
 
-	// Granting the privilege gets the same blob PAST admission, where it then fails on its
-	// own merits — this fixture's stub guest is not a transport. A different failure, from
-	// a policy edit and nothing else.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`); err != nil {
+	// Granting the privilege gets the same blob PAST admission, where it then fails on a
+	// node-state rule instead: this shell already booted the artifact's own transport, and
+	// the raw-link binding has ONE owner (§12.10). A different failure, from a policy edit
+	// and nothing else — which is the point. The refusal naming the binding rather than
+	// admission is exactly what proves the grant landed.
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"],"route":["` + authorHex + `"]}}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	if status := loadBundle(linkBundle); strings.Contains(status, "rejected by admission") {
+	status := loadBundle(linkBundle)
+	if strings.Contains(status, "rejected by admission") {
 		t.Fatalf("a grants.link entry must admit its author to the transport: %s", status)
+	}
+	if !strings.Contains(status, `"link" binding is already held by`) {
+		t.Fatalf("a second link-capable bundle must be refused the binding, not take it: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)
 	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {

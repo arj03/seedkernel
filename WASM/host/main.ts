@@ -164,15 +164,15 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
             }
             catch (err) {
                 if (isAdmissionRejected(err)) {
-                    console.warn('  no transport: the policy grants "link" to no author of this bundle');
+                    console.warn('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
                 }
                 else {
                     throw err;
                 }
             }
         }
-        // Listener lifecycle is host configuration, independent of which bundle currently
-        // owns the `_net` route. With no claimant, accepted links are closed.
+        // Listener lifecycle is host configuration, independent of service claims. With no
+        // raw-link binding owner, accepted links are closed.
         await transport.start();
         // ── Node wrapper: add file-backed loadBundle ────────────────────────────
         const shell: Shell = {

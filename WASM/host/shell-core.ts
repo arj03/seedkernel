@@ -14,12 +14,12 @@
 // There is no raw module install path: signed bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, opCall, readOp, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import type { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isReservedProtocol, NET_PROTOCOL, PRIVILEGE_LINK, SHELL_PROTOCOL, type Privilege } from "../core/domains.js";
-import { dec, enc, fromHex, toHex, readU32BE, writeU32BE, errMessage } from "../core/util.js";
+import { isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
+import { enc, fromHex, toHex, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -34,6 +34,11 @@ export type ShellSodium = BundleCrypto & SeamCrypto;
  *  re-match — the transport's installers read it as "a node without a network", which is a
  *  deliberate configuration rather than a failure. */
 export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
+
+/** What `resolve`/`routes` report as the owner of a claim the EMBEDDER registered
+ *  (`CreateShellOptions.claims`) rather than a bundle. Unambiguous by construction: an app
+ *  key is `<author hex>:<app>` and always carries a colon, which this cannot. */
+export const PLATFORM_OWNER = "platform";
 
 /** True iff a loadBundleBlob failure was the policy's refusal (see ADMISSION_REJECTED),
  *  whatever shape the thrown value took. */
@@ -60,9 +65,8 @@ export type RealmFactory = (opts: {
  *  so its first `fs/*` call throws by name rather than resolving to a pretend store
  *  (§12.2). `createRealm` is required — every app is a guest.
  *
- *  The current channel adapter remains a platform resource. The shell only points it at
- *  whichever ordinary protocol claimant currently owns `_net`; it neither exposes the
- *  adapter nor gives that bundle a distinct lifecycle. */
+ *  The current channel adapter remains a platform resource. Its events are bound directly
+ *  to the slot granted its raw-link capability; claim names play no part. */
 export interface ShellPlatform {
     sodium: ShellSodium;
     /** The node's keypair (§12.9): its public half is this node's peer id and the one
@@ -92,9 +96,7 @@ export interface ShellPlatform {
      *  shell.close() closing it, so there is one teardown rather than a second thing every
      *  embedder must remember.
      *
-     *  The shell wires it once to the generic claim lookup. Absent for a shell with no raw
-     *  links at all (a browser edge), where a bundle claiming `_net` simply gets no
-     *  sockets. */
+     *  Absent for a shell with no raw links at all (a browser edge). */
     transportHost?: TransportHost;
 }
 
@@ -121,16 +123,18 @@ export interface CreateShellOptions {
      *  The operator's number, not the author's: unlike the module memory ceiling (§4.3),
      *  how long this node will spend on one message is a property of the deployment. */
     guestDeadlineMs?: number;
-    /** The SHELL's own protocols, answered ahead of the routing table (§12.10) — e.g.
-     *  seedchat's `_offer`, which carries a bundle between two browsers before either has
-     *  an app that could receive it.
+    /** Exact platform-owned claims — e.g. seedchat's `_offer`, which carries a bundle
+     *  between two browsers before either has an app that could receive it. They share
+     *  lookup and conflict semantics with bundle claims; there is no wildcard interception
+     *  path, so a name is registered or it is not.
      *
-     *  `null` means "not mine" and falls through to the routing table for an ordinary wire
-     *  id, so a shell that answers one does not shadow the apps — but never to a bundle's
-     *  reserved claim, which is a LOCAL service name no peer may reach (§12.10). Consulted
-     *  on INBOUND frames only: a co-resident app's cross-realm call carries an app key
-     *  rather than a peer key, and an app addresses an app. */
-    answer?: (from: PeerId, proto: string, payload: Uint8Array) => Promise<Uint8Array> | null;
+     *  Registering one is the deliberate act that makes a `_`-led name reachable from
+     *  OUTSIDE the node: a bundle's reserved claim is a local service name and inbound
+     *  delivery refuses it (`deliverInbound`), where host code asking for the name has said
+     *  what it means. Attribution is opaque and its space follows the path — a peer key
+     *  inbound, a caller app key from a co-resident guest — so a handler registered under a
+     *  reserved name must not read it as a peer id. */
+    claims?: Readonly<Record<string, (attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array>>>;
 }
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
@@ -144,9 +148,10 @@ export interface LoadBundleOptions {
 
 export interface Shell {
     /** Which app serves this protocol, or null (§12.10). A read of the projection the
-     *  installed manifests define — there is nothing to write here. */
+     *  installed manifests define — there is nothing to write here. `PLATFORM_OWNER` for a
+     *  claim the embedder registered rather than a bundle. */
     resolve(proto: string): string | null;
-    /** Every protocol this node serves, as `[proto, appKey]` — what an operator's console
+    /** Every protocol this node serves, as `[proto, owner]` — what an operator's console
      *  line or a shell's UI lists. A snapshot, not the live map. */
     routes(): [string, string][];
     /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
@@ -192,7 +197,8 @@ export interface Shell {
     invoke(op: string, payload: Uint8Array, appKey?: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
-     *  `senderPk ‖ payload`. Null when no installed app claims the protocol.
+     *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
+     *  which a bundle's `_`-led LOCAL service claim is not, however it is spelled.
      *
      *  Every app is a guest, so the answer is always the realm's — a Promise the transport
      *  driver resumes on, never raw bytes. */
@@ -203,9 +209,6 @@ export interface Shell {
 // Re-exported so a target reaches the admission constructors from the same module it gets
 // createShell from. Pure-module builders remain target implementations, not shell API.
 export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
-/** The answer to a `_host` op that reports rather than asks. */
-const EMPTY = new Uint8Array(0);
-
 /** A slot's realm. Nullable for exactly the window between the holder being made and the
  *  factory resolving, inside one `loadBundleBlob` — a slot only enters `slots` with its
  *  realm standing, and teardown reads the settled handle synchronously, because the callers
@@ -349,6 +352,7 @@ export function createShell(opts: CreateShellOptions & {
      *  `protocols`, so there is nothing to write, persist, or keep in step. Materialized
      *  rather than scanned for because it is read once per inbound frame. */
     const claims = new Map<string, AppSlot>();
+    const platformClaims = new Map(Object.entries(opts.claims ?? {}));
     /** The existing concrete channel adapter is supplied and owned by the platform. The
      *  shell may wire raw-link calls to it, but it is not part of the Shell API. */
     const netHost = platform.transportHost;
@@ -367,7 +371,13 @@ export function createShell(opts: CreateShellOptions & {
     const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
     const findSlot = (appKey: string) => slots.find((slot) => keyOf(slot) === appKey);
     const slotClaims = (slot: AppSlot) => slot.verifiedBundle.manifest.protocols ?? [];
-    const hasLink = (slot: AppSlot) => privilegesOf(slot.verifiedBundle.manifest).includes(PRIVILEGE_LINK);
+    const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
+    const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
+    const canDeliver = (slot: AppSlot) => privilegesOf(slot.verifiedBundle.manifest).includes(PRIVILEGE_ROUTE);
+    /** The slot the platform's raw-link events go to. Exclusive, like a claim: the driver
+     *  has ONE event sink, so two holders are not a composition — the second would take
+     *  the node's sockets off the first, silently. */
+    let linkOwner: AppSlot | null = null;
     const releaseClaims = (slot: AppSlot) => {
         for (const claim of slotClaims(slot)) {
             if (claims.get(claim) === slot) claims.delete(claim);
@@ -475,11 +485,12 @@ export function createShell(opts: CreateShellOptions & {
                 // declare, and a second test here would decide one grant in two places.
                 fs: slot.fsScope,
                 // The cross-realm call. Resolution happens at CALL time, not here: an app
-                // may be installed before the transport that answers its `_net`, and a
-                // later load may take the id over, so a claimant captured at seam
+                // may be installed before its service, and a later load may replace that
+                // service, so a claimant captured at seam
                 // construction would pin this realm to whoever was there first.
-                calls: { call: (id, payload) => crossRealmCall(slot, callerId, id, payload) },
-                rawNet: links ? netHost?.rawNet() : undefined,
+                calls: { call: (id, payload) => crossRealmCall(callerId, id, payload) },
+                rawNet: links ? netHost?.rawNet(slot) : undefined,
+                delivery: canDeliver(slot) ? { deliver: (claim, attribution, payload) => deliverInbound(claim, attribution, payload) } : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
             },
@@ -497,9 +508,8 @@ export function createShell(opts: CreateShellOptions & {
         ? slot.realm.call("handle", input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
     netHost?.route((payload) => {
-        const slot = claims.get(NET_PROTOCOL);
-        return slot ? callSlot(slot, payload) : null;
-    }, () => claims.has(NET_PROTOCOL));
+        return linkOwner ? callSlot(linkOwner, payload) : null;
+    }, () => linkOwner !== null);
     /** The ONE cross-realm call (§12.10): a guest naming a reserved id reaches the realm
      *  that claims it, on a later turn, and gets back what that realm's `handle`
      *  returned. `null` when nothing claims it, which the seam reports by name.
@@ -507,89 +517,35 @@ export function createShell(opts: CreateShellOptions & {
      *  The host's whole contribution is attribution and resolution: it prepends the
      *  CALLER's 32-byte id exactly as `doDispatch` prepends the authenticated sender's key,
      *  and the id is derived host-side from the admitted manifest, so it is no more
-     *  forgeable than a sender key. `_host` is the exception the shell answers rather than
-     *  routes. */
-    const crossRealmCall = (caller: AppSlot, callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
-        const input = new Uint8Array(callerId.length + payload.length);
-        input.set(callerId, 0);
-        input.set(payload, callerId.length);
-        if (id === SHELL_PROTOCOL) return hostAnswer(caller, payload);
-        const slot = claims.get(id);
-        return slot ? callSlot(slot, input) : null;
+     *  forgeable than a sender key. */
+    const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
+        return callLocal(id, callerId, payload);
     };
-    /** The shell's own protocol (`_host`), answered ahead of dispatch. All three ops are
-     *  the transport telling the host about something only the transport can see.
-     *
-     *  Restricted to the realm that CLAIMS `_net`, not merely to one holding `link`. The
-     *  privilege is the wider set — a link-capable bundle may claim nothing at all and be
-     *  an ordinary initiator (§12.8) — and `deliver` is the difference: it hands the routing
-     *  a frame with a `from` the caller writes, so anything reaching it can forge an inbound
-     *  request attributed to any peer. Being the node's network is what earns that, and the
-     *  claim is what says so.
-     *
-     *  The test is on the SLOT rather than its app key: an in-place transport upgrade builds
-     *  a new slot under the same key, and the candidate has not taken the claim over while
-     *  its realm is standing (`loadBundleBlob`) — a key comparison would let it answer as
-     *  the network one turn early. `caller` is the slot whose seam this closure was built
-     *  for, so there is nothing to spoof. */
-    const hostAnswer = (caller: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
-        if (claims.get(NET_PROTOCOL) !== caller) {
-            return Promise.reject(new Error(`shell: ${SHELL_PROTOCOL} is answered only for the ${NET_PROTOCOL} claimant, and this realm does not claim it`));
-        }
-        // The same envelope every call in this system carries, read with the same
-        // function the guest half writes with (`writeOp`, guest-seam.ts).
-        const { op, args: a } = readOp(payload);
-        switch (op) {
-            // An inbound request the transport attributed: route it to the app claiming the
-            // protocol and hand back its answer. Delivery and the reply are ONE call — the
-            // transport does not await it (it must not; realm-queue.ts) but resumes on the
-            // returned promise on a later turn, which is what an asynchronous app handler
-            // needs.
-            //
-            // The shell's own protocols get first refusal (`opts.answer`); `null` and an
-            // absent hook fall through only for ordinary wire protocols, so a shell answers
-            // an id of its own without exposing a bundle's local reserved claim to a peer.
-            case "deliver": {
-                const from = toHex(a.slice(0, 32));
-                const protoLen = a[32];
-                const proto = dec.decode(a.slice(33, 33 + protoLen));
-                const body = a.slice(33 + protoLen);
-                return opts.answer?.(from, proto, body)
-                    // Reserved claims are LOCAL realm services. The shell's own inbound
-                    // hook gets first refusal (e.g. a browser bootstrap `_offer`), but a
-                    // peer may never fall through to a bundle's reserved claim: it has no
-                    // manifest whose `requires` could grant that call.
-                    ?? (isReservedProtocol(proto)
-                        ? Promise.resolve(EMPTY)
-                        : doDispatch(from, proto, body) ?? Promise.resolve(EMPTY));
-            }
-            // A link this driver handed over (openLink) authenticated, or tore down.
-            // Relayed to whoever passed the channel in; the shell forms no opinion.
-            case "link-auth":
-                netHost?.linkAuthed(readU32BE(a, 0), a.slice(4, 36));
-                return Promise.resolve(EMPTY);
-            case "link-down":
-                netHost?.linkDown(readU32BE(a, 0), a[4]);
-                return Promise.resolve(EMPTY);
-            default:
-                return Promise.reject(new Error(`shell: no ${SHELL_PROTOCOL} op '${op}'`));
-        }
-    };
-    /** Refuse a candidate contesting a claim ANOTHER identity currently holds (§12.10): a
-     *  claim has one active owner, and a load that took one over would be a route changing
-     *  hands without its owner ever being uninstalled. This identity's own claims are not a
-     *  contest — replacing them in place is what an update is.
+    /** Refuse a candidate contesting an exclusive resource ANOTHER identity currently holds
+     *  (§12.10) — a protocol claim, or the raw-link binding. Both have one active owner, and
+     *  a load that took one over would be a route or the node's sockets changing hands
+     *  without the holder ever being uninstalled. This identity's own are not a contest —
+     *  replacing them in place is what an update is.
      *
      *  Asked once before candidate code can execute, then again in the synchronous commit
      *  window. The first prevents a known loser from exercising irreversible authorities;
      *  the second is the guarantee, because a claim taken while modules and the realm build
      *  across yields would slip past the early decision. */
-    const refuseContestedClaims = (loaded: LoadedBundle, key: string) => {
+    const refuseContested = (loaded: LoadedBundle, key: string) => {
         for (const claim of loaded.manifest.protocols ?? []) {
+            if (platformClaims.has(claim)) {
+                throw new Error(`shell: claim '${claim}' is already held by the platform`);
+            }
             const incumbent = claims.get(claim);
             if (incumbent && keyOf(incumbent) !== key) {
                 throw new Error(`shell: claim '${claim}' is already held by '${keyOf(incumbent)}'`);
             }
+        }
+        // Refused rather than shadowed for the same reason a claim is, and LOUDLY because
+        // the alternative is a node that looks installed and is off the network: the
+        // incumbent keeps its claims and its realm, and only its sockets stop answering.
+        if (linkOwner && keyOf(linkOwner) !== key && reachesLink(loaded.manifest)) {
+            throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkOwner)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
         }
     };
     /** Advance the `(author, app)` freshness mark after the candidate realm stands but
@@ -619,40 +575,66 @@ export function createShell(opts: CreateShellOptions & {
         const i = slots.findIndex((slot) => keyOf(slot) === appKey);
         if (i < 0) return false;
         const [slot] = slots.splice(i, 1);
-        // Read BEFORE the claims are released, and asked of the CLAIM rather than of the
-        // `link` privilege: `reset` closes every channel the driver holds, so keying it on
-        // the wider set would let uninstalling a link-capable initiator — a bundle that
-        // never was the network — disconnect the node.
-        const wasNetwork = claims.get(NET_PROTOCOL) === slot;
+        const ownedLinks = linkOwner === slot;
         releaseClaims(slot);
-        if (wasNetwork) netHost?.reset();
+        if (ownedLinks) {
+            linkOwner = null;
+            netHost?.release(slot);
+        }
         disposeSlot(slot);
         return true;
     };
-    /** Route an inbound request to its app (§12.10): resolve the protocol to the app
-     *  claiming it, prepend the authenticated sender, hand it to that app's one entrypoint.
+    /** Hand one request to the realm claiming `claim` (§12.10): prepend the attribution,
+     *  invoke that app's one entrypoint.
      *
      *  No branch on how the app is implemented: every app presents the same
-     *  `senderPk ‖ payload` shape and the same single entry, its slot's realm (`callSlot`).
-     *  The answer is the realm's — a Promise the transport resumes on a later turn rather
-     *  than inline (transport-host.ts), which is what an asynchronous holder needs since
-     *  `fs` is async. */
-    const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) => {
-        const slot = claims.get(proto);
-        if (!slot)
-            return null;
-        const senderBytes = fromHex(from);
-        const input = new Uint8Array(senderBytes.length + payload.length);
-        input.set(senderBytes, 0);
-        input.set(payload, senderBytes.length);
+     *  `attribution ‖ payload` shape and the same single entry, its slot's realm
+     *  (`callSlot`). The answer is the realm's — a Promise the transport resumes on a later
+     *  turn rather than inline (transport-host.ts), which is what an asynchronous holder
+     *  needs since `fs` is async. */
+    const callClaimant = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const slot = claims.get(claim);
+        if (!slot) return null;
+        const input = new Uint8Array(attribution.length + payload.length);
+        input.set(attribution, 0);
+        input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
+    /** A request from OUTSIDE this node — `route/deliver` (guest-seam.ts) and the shell's
+     *  own `dispatch`. The attribution is written by whoever submits it, which is what the
+     *  separate `route` privilege governs (§12.5), so this path reaches strictly less than
+     *  the local one below.
+     *
+     *  A bundle's `_`-led claim is a LOCAL service name and is refused here: no `requires`
+     *  of a remote sender's could have granted it, and the realms that serve one are
+     *  handed an app key by `callLocal` rather than a peer key, so letting a submitted
+     *  attribution in would both reach a surface no peer was ever offered and make the two
+     *  32-byte spaces indistinguishable at the claimant. A PLATFORM claim is the deliberate
+     *  exception: registering one is host code opting a name in (§12.10). */
+    const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const platformHandler = platformClaims.get(claim);
+        if (platformHandler) return platformHandler(attribution, payload);
+        if (isReservedProtocol(claim)) return null;
+        return callClaimant(claim, attribution, payload);
+    };
+    /** The cross-realm call, from a co-resident guest. Only a reserved id is callable (the
+     *  seam's grant gate), so this is the local half of the same table. */
+    const callLocal = (claim: string, callerId: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const platformHandler = platformClaims.get(claim);
+        if (platformHandler) return platformHandler(callerId, payload);
+        return callClaimant(claim, callerId, payload);
+    };
+    const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) =>
+        deliverInbound(proto, fromHex(from), payload);
     return {
         resolve: (proto) => {
             const slot = claims.get(proto);
-            return slot ? keyOf(slot) : null;
+            return slot ? keyOf(slot) : platformClaims.has(proto) ? PLATFORM_OWNER : null;
         },
-        routes: () => [...claims].map(([claim, slot]) => [claim, keyOf(slot)]),
+        routes: () => [
+            ...[...platformClaims.keys()].map((claim): [string, string] => [claim, PLATFORM_OWNER]),
+            ...[...claims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
+        ],
         fs,
         sodium,
         async loadBundleBlob(blob, loadOpts = {}) {
@@ -689,7 +671,7 @@ export function createShell(opts: CreateShellOptions & {
             // declares, and disposing a rejected candidate cannot undo an fs write or a raw
             // link it opened. The second check in the synchronous commit window remains
             // necessary: another load may take a free claim while this candidate is built.
-            refuseContestedClaims(loaded, key);
+            refuseContested(loaded, key);
             const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules);
             // STAND THE GUEST, before anything already standing is replaced. Every app is a
@@ -702,7 +684,7 @@ export function createShell(opts: CreateShellOptions & {
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
-                refuseContestedClaims(loaded, key);
+                refuseContested(loaded, key);
                 commitMark(loaded, ctx.highWater);
             }
             catch (err) {
@@ -711,8 +693,7 @@ export function createShell(opts: CreateShellOptions & {
             }
             const previousIndex = slots.findIndex((installed) => keyOf(installed) === key);
             const previous = previousIndex < 0 ? undefined : slots[previousIndex];
-            // Whether the slot being replaced WAS the network, read before its claims go.
-            const replacingNetwork = previous !== undefined && claims.get(NET_PROTOCOL) === previous;
+            const replacingLinkOwner = previous !== undefined && linkOwner === previous;
             if (previous) releaseClaims(previous);
             if (previousIndex < 0) slots.push(slot);
             else slots[previousIndex] = slot;
@@ -722,12 +703,23 @@ export function createShell(opts: CreateShellOptions & {
             // incoming guest redials from the address book, which is the NODE's. After the
             // claim hand-over above, so `onClose` finds the channels already gone and queues
             // no `linkClosed` at the new realm for links it never had.
-            if (replacingNetwork) netHost?.reset();
+            //
+            // Only ever a free binding or this identity's own: `refuseContested` turned any
+            // other candidate away, so the takeover below cannot be one bundle disconnecting
+            // another. A version that DROPS `link/*` releases it, the same way dropping a
+            // claim releases the claim.
+            if (hasLink(slot)) {
+                netHost?.activate(slot);
+                linkOwner = slot;
+            } else if (replacingLinkOwner) {
+                linkOwner = null;
+                netHost?.release(previous!);
+            }
             // The address book is mutable node state, not part of the candidate's static
             // `link/config` snapshot. Publish first, then replay it through the ordinary
             // host-event path. No await in between: a concurrent add is either in this
             // replay or is announced directly to the newly published claimant.
-            if (slotClaims(slot).includes(NET_PROTOCOL)) netHost?.replayAddresses();
+            if (linkOwner === slot) netHost?.replayAddresses();
             disposeSlot(previous);
             return loaded;
         },

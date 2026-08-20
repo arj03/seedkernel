@@ -104,7 +104,9 @@ class TestModuleHost {
   }
   async bindAll(key, mods) { this.adopt(key, await this.build(mods), mods.map((m) => m.name)); }
   callModule(key, name, payload, deadlineMs) {
-    return this.slots.get(key)?.call(name, payload, deadlineMs) ?? Promise.resolve(null);
+    // PureModules.call resolves `{ bytes, ms }`; the direct-call tests want the bytes.
+    const p = this.slots.get(key)?.call(name, payload, deadlineMs);
+    return p ? p.then((r) => r.bytes) : Promise.resolve(null);
   }
   isBound(key, name) { return this.names.get(key)?.includes(name) ?? false; }
   removeApp(key) {
@@ -412,54 +414,26 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
     }
-    // A `_`-led id is a LOCAL service name — no peer can reach one — so claiming an
-    // ordinary one is an ordinary claim, carrying no authority in its spelling.
-    verifyManifest(sodium, signManifest(sodium, author,
-      { app: "reserved", version: 1, protocols: ["_offer"], modules: [], guest: GUEST() }));
-    // Two are refused BY NAME rather than as syntax, each for its own reason (§12.10).
-    //
-    // `_host` is answered by the shell rather than routed, so nobody claims it.
-    let reserved = "";
-    try {
+    // Every `_`-led spelling is an ordinary local service claim. No legacy name carries a
+    // transport role or privilege in the verifier.
+    for (const claim of ["_offer", "_host", "_net"]) {
       verifyManifest(sodium, signManifest(sodium, author,
-        { app: "bad", version: 1, protocols: ["_host"], modules: [], guest: GUEST() }));
-    } catch (e) { reserved = String(e); }
-    assert(/reserved for the host/.test(reserved), `_host is refused by name: ${reserved}`);
-    // `_net` is where every accepted link's RAW BYTES are handed in, before any peer has
-    // authenticated. An ordinary app claiming it would read the node's whole unauthenticated
-    // traffic without ever being granted `link` — and, since a claim has one active owner,
-    // would squat the id the real transport needs. Refused at verify, because the privilege
-    // is derived from the same signed manifest.
-    let squat = "";
-    try {
-      verifyManifest(sodium, signManifest(sodium, author,
-        { app: "squat", version: 1, protocols: ["_net"], modules: [], guest: GUEST() }));
-    } catch (e) { squat = String(e); }
-    assert(/claimable only by a bundle that reaches "link"/.test(squat),
-      `an app with no link authority may not claim _net: ${squat || "no error"}`);
-    // The same manifest with the privilege its claim implies verifies — the rule is the
-    // `link` grant, not a list of blessed authors or a role field.
-    verifyManifest(sodium, signManifest(sodium, author, {
-      app: "transport", version: 1, protocols: ["_net"], modules: [],
-      guest: GUEST({ requires: ["link/open"] }),
-    }));
+        { app: "reserved", version: 1, protocols: [claim], modules: [], guest: GUEST() }));
+    }
   } finally { shell.close(); }
   console.log("  OK\n");
 }
 
-// ─── Test: `_host` is answered for the `_net` claimant only (§12.10) ─────────
+// ─── Test: attributed delivery is a separately granted generic authority ──────
 //
-// `_host` is how the transport tells the host what only the transport can see — above all
-// `deliver`, which hands the routing a frame with a `from` the CALLER writes. Anything
-// reaching it can forge an inbound request attributed to any peer, so the gate is being
-// the node's network, not merely holding `link`: the privilege is the wider set, and a
-// link-capable bundle may claim nothing at all and be an ordinary initiator (§12.8).
-//
-// Driven through the seam the shell wired for each load rather than through a guest,
-// because the boundary under test is the shell's: the caller identity is the slot the
-// closure was built for, so there is nothing a guest could say about itself to move it.
-async function testShellProtocolIsTheClaimantsOnly() {
-  console.log("Test: `_host` is answered for the `_net` claimant only (§12.10)");
+// `route/deliver` is the path a request from OUTSIDE the node takes, and its attribution is
+// written by whoever submits it — which is the whole reason `route` is granted apart from
+// `link`. Two properties follow and are pinned here: it reaches an ordinary claim (that is
+// the job), and it does NOT reach a bundle's `_`-led claim, which is a local service name a
+// remote sender's `requires` could never have granted. Without the second, a peer naming
+// the id the transport itself claims would be handed straight into the transport's realm.
+async function testGenericClaimDelivery() {
+  console.log("Test: route/deliver submits an opaque attribution to an exact claim");
   const { createShell: mkShell } = await imp("build/host/shell-core.js");
   const { ModuleTable: MT } = await imp("build/host/module-table.js");
   const { FreshnessMarks } = await imp("build/host/bundle.js");
@@ -493,52 +467,88 @@ async function testShellProtocolIsTheClaimantsOnly() {
     // check, and a policy refusing the privilege would hide it behind an earlier refusal.
     admit: admitAll,
   });
-  // An op no `_host` implements. A caller PAST the gate is told the op is unknown; one
-  // stopped BY it is told it does not claim `_net`. Two different sentences, so the test
-  // reads the gate rather than merely "it threw".
-  const probe = opHeader("nope", new Uint8Array(0));
-  const say = async (seam) => {
-    try { await seam("_host", probe); return ""; } catch (e) { return String(e); }
+  const attribution = Uint8Array.of(7, 8, 9), body = Uint8Array.of(1, 2, 3);
+  const attrHead = new Uint8Array(4); writeU32BE(attrHead, 0, attribution.length);
+  /** One `route/deliver` submission: `[claimLen u8][claim][attrLen u32][attr][payload]`. */
+  const deliver = (seam, claim) => {
+    const name = enc.encode(claim);
+    return seam("route/deliver", concatBytes([
+      Uint8Array.of(name.length), name, attrHead, attribution, body,
+    ]));
   };
   try {
-    // The transport: reaches `link`, and claims `_net`.
-    await shell.loadBundleBlob(blob("transport", ["_net"], ["_host", "link/open"]));
-    const transportSeam = lastSeam;
-    // A bundle-owned reserved claim is a LOCAL realm service. It remains callable through
-    // another admitted realm's declared grant, but an authenticated peer's protocol bytes
-    // must not fall through to it.
+    await shell.loadBundleBlob(blob("wire", ["wire-v1"], []));
+    const wireRealm = realms.at(-1);
     await shell.loadBundleBlob(blob("offer", ["_offer"], []));
     const offerRealm = realms.at(-1);
-    // A link-capable bundle that claims NOTHING — the initiator shape (§12.8). It holds
-    // the same privilege and is the case the old privilege-keyed gate let through.
-    await shell.loadBundleBlob(blob("dialer", undefined, ["_host", "_offer", "link/open"]));
-    const dialerSeam = lastSeam;
+    await shell.loadBundleBlob(blob("router", undefined, ["route/deliver"]));
+    const routerSeam = lastSeam;
 
-    const reached = await say(transportSeam);
-    assert(/no _host op 'nope'/.test(reached),
-      `the _net claimant reaches _host: ${reached || "no error"}`);
-    const refused = await say(dialerSeam);
-    assert(/answered only for the _net claimant/.test(refused),
-      `a link-capable bundle that claims no _net is refused _host: ${refused || "no error"}`);
-
-    const proto = enc.encode("_offer");
-    const remoteDeliver = concatBytes([
-      opHeader("deliver", EMPTY), new Uint8Array(32).fill(7), Uint8Array.of(proto.length), proto,
-      Uint8Array.of(1, 2, 3),
-    ]);
-    await transportSeam("_host", remoteDeliver);
+    await deliver(routerSeam, "wire-v1");
+    assertEqual(wireRealm.calls.length, 1, "delivery reaches exactly the named claimant");
+    assert(bytesEqual(wireRealm.calls[0].payload, concatBytes([attribution, body])),
+      "the claimant receives opaque attribution followed by payload");
+    // The one thing this authority may NOT reach. Empty rather than an error, because a
+    // submitter learns exactly what it learns for any id nobody serves — the local service
+    // names of this node are not a namespace a peer gets to probe.
+    const local = await deliver(routerSeam, "_offer");
     assertEqual(offerRealm.calls.length, 0,
-      "an authenticated peer cannot reach a bundle's local reserved claim");
-    await dialerSeam("_offer", Uint8Array.of(4, 5, 6));
-    assertEqual(offerRealm.calls.length, 1,
-      "a co-resident realm with the declared reserved grant still reaches the local claim");
+      "route/deliver must not reach a bundle's `_`-led LOCAL service claim");
+    assertEqual(local.length, 0, "…and says nothing more than an unclaimed id would");
+    const noClaim = await deliver(routerSeam, "_missing");
+    assertEqual(noClaim.length, 0, "an unclaimed delivery still settles asynchronously as empty");
 
-    // The claim is what carries it, not the app key: uninstalling the transport takes
-    // `_host` away from a realm that still holds `link` and still has its seam.
+    await shell.loadBundleBlob(blob("link-only", undefined, ["link/open"]));
+    const linkSeam = lastSeam;
+    let refused = "";
+    try { await linkSeam("route/deliver", new Uint8Array()); } catch (e) { refused = String(e); }
+    assert(/not declared/.test(refused), "raw-link authority does not imply route/deliver");
+  } finally { shell.close(); }
+  console.log("  OK\n");
+}
+
+// ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
+//
+// The driver has one event sink, so a second link-capable slot cannot be a composition: it
+// would take the node's sockets while the incumbent kept its claims and its realm, leaving
+// a node that looks installed and answers nothing. Refused instead, on the same rule as a
+// contested claim — and the incumbent's OWN next version still replaces it in place.
+async function testOneRawLinkOwner() {
+  console.log("Test: a second link-capable identity is refused the raw-link binding (§12.10)");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
+  const { FreshnessMarks } = await imp("build/host/bundle.js");
+  const { admitAll } = await imp("build/host/policy.js");
+
+  const author = testAuthor();
+  const blob = (app, version, requires) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author,
+      { app, version, protocols: undefined, modules: [], guest: GUEST({ requires }) }),
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  const shell = mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async () => ({ async call() { return new Uint8Array(); }, dispose() { } }),
+    },
+    admit: admitAll,
+  });
+  try {
+    await shell.loadBundleBlob(blob("transport", 1, ["link/open"]));
+    // A link-capable bundle that claims nothing — the initiator shape. Same privilege, so
+    // the same binding, so it must not land quietly.
+    let refused = "";
+    try { await shell.loadBundleBlob(blob("dialer", 1, ["link/open"])); } catch (e) { refused = String(e); }
+    assert(/binding is already held by/.test(refused),
+      `a second link-capable identity is refused: ${refused || "no error"}`);
+    // A bundle reaching no `link` name is unaffected — the binding is the privilege's, not
+    // a global lock on loading.
+    await shell.loadBundleBlob(blob("app", 1, ["clock/now"]));
+    // The holder's own next version replaces it in place: an upgrade is not a contest.
+    await shell.loadBundleBlob(blob("transport", 2, ["link/open"]));
+    // And uninstalling the holder frees it for anyone.
     shell.uninstall(appKey(author.id, "transport"));
-    const orphaned = await say(transportSeam);
-    assert(/answered only for the _net claimant/.test(orphaned),
-      `_host follows the claim, not the privilege: ${orphaned || "no error"}`);
+    await shell.loadBundleBlob(blob("dialer", 1, ["link/open"]));
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -743,7 +753,7 @@ async function testGuestSeam() {
     // inside this app's map and cannot reach out of it.
     modules: {
       names: new Set(["echo"]),
-      call: (name, p) => host.callModule(testKey, name, p),
+      call: (name, p) => host.slots.get(testKey)?.call(name, p) ?? Promise.resolve({ bytes: null, ms: 0 }),
     },
   });
   const U = (...xs) => new Uint8Array(xs);
@@ -1824,7 +1834,7 @@ async function testModuleCallChargedToGuestBudget() {
     grants: { names: UNRESTRICTED_NAMES },
     modules: {
       names: new Set(["spin"]),
-      call: (n, p, deadlineMs) => host.callModule(spinKey, n, p, deadlineMs),
+      call: (n, p, deadlineMs) => host.slots.get(spinKey)?.call(n, p, deadlineMs) ?? Promise.resolve({ bytes: null, ms: 0 }),
     },
   });
   // The realm's budget is 5 s, but the guest burns most of it before calling the module:
@@ -2707,7 +2717,8 @@ await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();
-await testShellProtocolIsTheClaimantsOnly();
+await testGenericClaimDelivery();
+await testOneRawLinkOwner();
 await testInstallerRemove();
 await testFs();
 await testFsKeyRule();

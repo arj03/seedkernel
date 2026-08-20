@@ -104,7 +104,8 @@ export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
  *
  *  Each name's VALUE is what it is granted for. `"app"` is the unprivileged case, needing
  *  no operator grant beyond the right to load at all; anything else names a PRIVILEGE an
- *  operator grants per author (`PRIVILEGES`, policy.ts). Today there is one, `link`.
+ *  operator grants per author (`PRIVILEGES`, policy.ts). Raw links and claim delivery are
+ *  deliberately separate privileges.
  *  `timer/*` is deliberately `"app"` — the transport happening to want one is not a reason
  *  to make it a privilege.
  *
@@ -135,6 +136,9 @@ export const AUTHORITY_CALLS = {
     "link/send": "link",
     "link/close": "link",
     "link/stat": "link",
+    "link/authenticated": "link",
+    "link/down": "link",
+    "route/deliver": "route",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
 /** Whether a name is one of the host's own authorities — membership in the table above,
@@ -155,6 +159,9 @@ export const PRIVILEGES: readonly Privilege[] = [
  *  the shell wires the socket driver to whatever holds it, not because admission treats it
  *  specially: to the policy it is one key among `PRIVILEGES`. */
 export const PRIVILEGE_LINK = "link" satisfies Privilege;
+/** Submission to the local claim router. Separate from raw links: possessing a link does
+ *  not entitle a guest to invent attributed inbound requests. */
+export const PRIVILEGE_ROUTE = "route" satisfies Privilege;
 // ── Reserved protocol ids: the cross-realm call ─────────────────────────────────
 //
 // A guest reaches another realm the same way an inbound frame does — by a protocol id,
@@ -167,26 +174,11 @@ export const PRIVILEGE_LINK = "link" satisfies Privilege;
 // caller's promise, exactly as `fs/*` does. And a callable id is a GRANT, declared in
 // `requires` like any authority, so the call graph an operator reads off the bundles is
 // the call graph.
-/** A reserved id — one routed between local realms ahead of ordinary dispatch. The
- *  spelling carries no authority on its own; two ids are singled out by name in
- *  `verifyManifest` — `_host`, which the shell answers rather than routes, and `_net`,
- *  which only a bundle reaching `link` may claim. The test is the first character, which
- *  is also the charset rule (§12.10). */
+/** A reserved id — one routed between local realms rather than accepted from a remote
+ *  delivery. Its spelling carries no authority and no id is special to the kernel. */
 export function isReservedProtocol(name: string): boolean {
     return name.charCodeAt(0) === 0x5f; // "_"
 }
-/** The id the transport claims, and the one every app's outbound network call names. It is
- *  routed like any claim — the transport is reached by the same call the host uses to
- *  dispatch an inbound frame, with the caller's app key prepended exactly as the sender's
- *  key is prepended inbound. CALLING it is ungoverned, an ordinary `requires` entry any app
- *  may declare. CLAIMING it is not: this is where every accepted link's raw bytes are
- *  handed in, so `verifyManifest` refuses the claim to a bundle that does not reach
- *  `link`. */
-export const NET_PROTOCOL = "_net";
-/** The id the SHELL answers itself, ahead of dispatch — the transport's way back to the
- *  host for the things that are genuinely pushes: an inbound frame, and the auth or
- *  teardown of a link the host handed over. Answered rather than routed. */
-export const SHELL_PROTOCOL = "_host";
 /** Whether a name is a *grant* — the one question the seam's gate asks, and exactly what a
  *  manifest may declare in `guest.requires`. Two kinds, because there are two kinds of
  *  thing a guest cannot reach on its own: an authority the host owns, and a reserved id

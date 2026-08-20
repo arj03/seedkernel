@@ -14,7 +14,7 @@
 //
 // The format is application-neutral; seedstore fills in storage content.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, PRIVILEGE_LINK, isAuthority, isGrant, isReservedProtocol, NET_PROTOCOL, SHELL_PROTOCOL, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, isAuthority, isGrant, isReservedProtocol, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -94,11 +94,8 @@ export interface BundleManifest {
      *  node already admitted (§12.5). One installed slot owns a claim at a time; another
      *  identity must wait for it to be released rather than silently shadowing it.
      *
-     *  The transport claims `_net`, which is what makes it reachable. The claim does not
-     *  GRANT link access — `guest.requires` and policy decide that — but it does require
-     *  it: `_net` is where every accepted link's raw bytes land, so `verifyManifest` refuses
-     *  the claim to a bundle that does not reach `link`. Every other `_`-led id is an
-     *  ordinary claim; `_host` alone is the shell's and is claimable by nobody. */
+     *  A transport may claim any local service name its composition chooses. Claims grant
+     *  nothing; raw links and attributed delivery are separately declared authorities. */
     protocols?: string[];
     modules: BundleModule[];
     /** The guest program — required, because every app is a guest: the loader
@@ -189,10 +186,20 @@ export interface FreshnessStore {
     resetMark(author: Uint8Array, app: string, previous: number): void;
 }
 
+/** One module invocation's answer: the transform's bytes (null when it failed), and `ms`
+ *  — the module's OWN processing time, measured on the worker that ran it. The seam bills
+ *  the caller's execution budget the ACTUAL compute, never the issue-to-settle wall clock:
+ *  a burst of fire-and-forget calls serialized through one worker would otherwise charge
+ *  their queue wait quadratically (§12.3). */
+export interface ModuleResult {
+    bytes: Uint8Array | null;
+    ms: number;
+}
+
 /** One slot's private pure modules. The builder owns partial-instance cleanup, because it
  *  is the target holding those resources when a later module fails. */
 export interface PureModules {
-    call(name: string, payload: Uint8Array, deadlineMs?: number): Promise<Uint8Array | null>;
+    call(name: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult>;
     dispose(): void;
 }
 
@@ -256,8 +263,7 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
  *
  *  The one derivation admission asks, and the reason there is no `role` field: what a
  *  bundle may do is read off the names it requires, never off a claim about what it is.
- *  Reserved ids contribute none — calling `_net` is how an app reaches the network, which
- *  is the unprivileged case; who may BE the network is `link/*`.
+ *  Reserved ids contribute none — calling one reaches an ordinary local service.
  *
  *  Not folded into `verifyManifest`: a manifest naming `link/open` is well-formed, and
  *  whether this node grants it is policy, decided where the policy is in hand
@@ -307,9 +313,9 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  *  whitespace, control and lookalike characters an operator could not tell apart are out. */
 const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
 /** A reserved protocol id: the same charset behind a leading `_`. These are local
- *  cross-realm service names, reachable by no peer and the only ids a guest may CALL
- *  (core/domains.ts). Shape only — who may CLAIM one is decided below, where `_host` is
- *  refused to everyone and `_net` to anything that does not reach `link`. */
+ *  cross-realm service names — the only ids a guest may CALL (core/domains.ts), and ones
+ *  inbound delivery refuses (shell-core.ts). Shape only: no spelling carries claim
+ *  authority. */
 const RESERVED_PROTO_RE = /^_[A-Za-z0-9._/-]{1,63}$/;
 /** Canonical manifest bytes. The signed envelope carries these verbatim and the verifier
  *  parses the exact bytes it checked, so there is no separate canonicalisation — the bytes
@@ -584,7 +590,7 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
         // A reserved id grants over another REALM rather than over a host authority, so it
         // is not in the catalog and only its shape can be wrong. Whether anything claims
         // it is a question about the NODE, answered at the call (guest-seam.ts): an app
-        // may legitimately be installed before the transport that answers its `_net`.
+        // may legitimately be installed before the local service that answers it.
         if (isReservedProtocol(r)) {
             if (!RESERVED_PROTO_RE.test(r)) {
                 throw new Error(`bundle: "${r}" is not a well-formed reserved id (manifest guest.requires; "_" then alphanumerics and ._/-, at most 64 bytes)`);
@@ -602,32 +608,8 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
             throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
         }
     }
-    // TWO ids the format hands out on terms of its own, checked here because both are pure
-    // facts about the manifest (§12.10).
-    //
-    // `_host` is answered by the shell rather than routed, so nobody claims it.
-    //
-    // `_net` is the id inbound RAW LINK BYTES are handed to — every accepted socket, from
-    // any peer, before anything has authenticated. Only a bundle that reaches `link` may
-    // claim it, because otherwise a bundle the operator admitted as an ordinary app would
-    // read the node's whole unauthenticated network traffic without ever being granted the
-    // privilege that governs exactly that. It would also be a squat: a claim has one active
-    // owner, so an app taking `_net` first would stop the real transport from installing at
-    // all. It is a shape rule over an already-signed fact — `privilegesOf` reads the same
-    // `guest.requires` admission reads to ask the operator's `grants.link` (§12.5) — so it
-    // belongs here with the other well-formedness rules rather than in the predicate, and
-    // adds no second vocabulary. Declaring `link` is not the other half: a link-capable
-    // bundle that claims nothing is an ordinary initiator (§12.8).
-    //
-    // Every OTHER `_`-led id is an ordinary claim under the ordinary rule: a local
-    // cross-realm service name, reachable by no peer, carrying no authority in its spelling.
-    const claims = parsed.protocols ?? [];
-    if (claims.includes(SHELL_PROTOCOL)) {
-        throw new Error(`bundle: "${SHELL_PROTOCOL}" is reserved for the host (§12.10) and cannot be claimed`);
-    }
-    if (claims.includes(NET_PROTOCOL) && !privilegesOf(parsed).includes(PRIVILEGE_LINK)) {
-        throw new Error(`bundle: "${NET_PROTOCOL}" is claimable only by a bundle that reaches "${PRIVILEGE_LINK}" (§12.10) — it is handed every accepted link's raw bytes, so a bundle declaring no "${PRIVILEGE_LINK}/*" authority may not serve it`);
-    }
+    // Reserved ids are ordinary local claims. Raw-link ownership and attributed delivery
+    // are expressed by separately granted authorities, never inferred from a spelling.
     return { author, authorKeys, manifest: parsed };
 }
 /** True if `bytes` content hashes to the declared genesisHash hex (integrity). */

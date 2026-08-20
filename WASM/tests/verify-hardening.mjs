@@ -57,8 +57,9 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
 
   const host = new ModuleTable();
   const loaded = await host.build([{ name: "ok", wasm: withMax }]);
-  ok((await loaded.call("ok", new Uint8Array())) instanceof Uint8Array,
-    "ModuleTable builds a bounded module set");
+  const echoed = await loaded.call("ok", new Uint8Array());
+  ok(echoed instanceof Object && echoed.bytes instanceof Uint8Array && typeof echoed.ms === "number",
+    "ModuleTable builds a bounded module set (call resolves { bytes, ms })");
   await rejects(host.build([{ name: "bad", wasm: noMax }]),
     "ModuleTable refuses an unbounded module at install");
   const tiny = new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 });

@@ -28,7 +28,8 @@ const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, signManifest, hybridAuthorId, hybridAuthorKeysFromSeed, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
-const { GUEST_ABI_VERSION, NET_PROTOCOL } = await imp("build/core/domains.js");
+const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
+const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
 const { harnessAppBlob, appRequest } = await imp("tests/transport-harness.mjs");
@@ -70,7 +71,7 @@ function transportBundleAt(version, keys, guestSource) {
     app: "transport", version,
     modules: [{ name: "ws", hash: Buffer.from(sodium.crypto_generichash(32, wsWasm)).toString("hex") }],
     // The reserved id the transport claims (§12.10) — mirror of the artifact manifest.
-    protocols: [NET_PROTOCOL],
+    protocols: [TRANSPORT_SERVICE],
     guest: {
       hash: Buffer.from(sodium.crypto_generichash(32, guest)).toString("hex"),
       // Read, never restated: a hardcoded number here would pass a test that the
@@ -82,8 +83,8 @@ function transportBundleAt(version, keys, guestSource) {
       requires: [
         "node/sign", "node/verify", "node/random",
         "link/config", "link/open", "link/send", "link/close", "link/stat",
+        "link/authenticated", "link/down", "route/deliver",
         "timer/arm", "timer/clear",
-        "_host",
       ],
     },
   };
@@ -106,7 +107,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, appAuthorHex],
-    grants: { link: [transportAuthor] },
+    grants: { link: [transportAuthor], route: [transportAuthor] },
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
   // A test may pause exactly one freshly evaluated candidate before the shell publishes
@@ -170,7 +171,7 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
 const oldPeerId = aNet.peerId;
-const oldClaimant = a.shell.resolve(NET_PROTOCOL);
+const oldClaimant = a.shell.resolve(TRANSPORT_SERVICE);
 let candidateConfigured;
 const configured = new Promise((resolve) => { candidateConfigured = resolve; });
 let publishCandidate;
@@ -185,7 +186,7 @@ aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
 publishCandidate();
 await upgrading;
 
-assert(a.shell.resolve(NET_PROTOCOL) === oldClaimant, "the update retained its own transport claim");
+assert(a.shell.resolve(TRANSPORT_SERVICE) === oldClaimant, "the update retained its own transport claim");
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
 assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
@@ -231,7 +232,7 @@ let v2Reloaded = true;
 try { await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
-assert(a.shell.resolve(NET_PROTOCOL) !== null, "…and the reinstalled bundle holds the transport id again");
+assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
 assert((await request(a.shell, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
 
@@ -244,14 +245,14 @@ console.log("  an `_net` claimant whose mark cannot be persisted fails the load�
   }
   const store = new FlakyStore();
   const c = await makeNode(fabric.view(), undefined, store);
-  assert(c.shell.resolve(NET_PROTOCOL) !== null, "the node stands its `_net` claimant up normally");
+  assert(c.shell.resolve(TRANSPORT_SERVICE) !== null, "the node stands its transport claimant up normally");
 
   broken = true;
   let msg = "";
   try { await c.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), `a bundle whose mark cannot be written fails the load (got: ${msg})`);
   assert(msg.includes("disk full"), "…and the original persist error survives the wrap");
-  assert(c.shell.resolve(NET_PROTOCOL)?.startsWith(transportAuthor),
+  assert(c.shell.resolve(TRANSPORT_SERVICE)?.startsWith(transportAuthor),
     "nothing of the failed load was kept — the claim went back to the transport that was standing, " +
     "rather than the uncommitted bundle serving on");
 
