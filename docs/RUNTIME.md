@@ -115,7 +115,7 @@ The names are a **shared guest↔host identifier**, not a wire value: a flat cat
 | Name | Request | Response |
 | --- | --- | --- |
 | `crypto/<primitive>` | the primitive's argument bytes | its output — dispatched through the catalog (§12.1); an unknown name throws |
-| `node/sign` | message bytes | 64-byte detached Ed25519 signature under the node identity, over `domain ‖ scope ‖ msg` — both host-supplied from the asking bundle's slot (below, §16.1), never guest-supplied |
+| `node/sign` | message bytes | 64-byte detached Ed25519 signature under the node identity, over `domain ‖ scope ‖ msg` — both host-supplied from the asking bundle's slot (`slotSignScope`, below, §16.1), never guest-supplied |
 | `node/verify` | `[pk 32][sig 64][msg ..]` | `[ok u8]` — the same `domain ‖ scope` applied host-side: 1 iff `sig` is a valid Ed25519 signature of `domain ‖ scope ‖ msg` under `pk`. The key is caller-named, the scope is not. A payload too short to hold the fixed 96-byte prefix throws rather than answering 0 — a mis-framed call is not a failed verification |
 | `node/identity` | (empty) | the node's 32-byte public key |
 | `node/random` | `[n u32]` | `n` random bytes |
@@ -145,7 +145,7 @@ Every `_`-led name and the six `fs/*` names genuinely round-trip: the guest `awa
 
 **A guest that cannot await its own answer says so: `defer()`.** The realm serializes invocations (§12.3), which is right for a guest whose answer comes from *outside* the realm — an app parked on `fs/get` must hold the queue, because its frame is suspended mid-update. It is wrong for one whose answer arrives *through* the realm: the transport replies to an app's send by reading bytes off a link, and reading those bytes is another invocation of the same realm, so awaiting inside the frame would hold the queue against the only event that could settle it. The preamble's `defer()` is that distinction made statable — an entrypoint hands back a promise it will settle later, its synchronous segment ends, and the realm is genuinely free. Calling it is an assertion that this guest never parks.
 
-**The signing names are scoped, never raw, and the scope comes from the privilege the bundle reaches.** `node/sign` does not sign the guest's bytes as given: the host prepends a domain and a scope, both of its own choosing, and never reads the suffix. An ordinary app gets `DOMAIN_guest ‖ author_pk ‖ app_len u8 ‖ app` (`appSignScope`), derived from the admitted manifest (§12.4) — the same `(author, app)` pair that keys freshness. A bundle reaching **`link`** gets `DOMAIN_channel ‖ network_key` (`transportSignScope`), which is what lets the AKE transcript signature be an ordinary `node/sign` call: no handshake shape is pinned into the core, and the node key never enters the guest. The domain-prefix family is disjoint (§14, §16.1), so a guest-obtained signature never verifies as a manifest; and distinct bundles derive disjoint scopes, so one app cannot sign in another's namespace. **Verification is scoped the same way.** `node/verify` takes the verifying key in its argument bytes — `[pk 32][sig 64][msg …]` → `[ok u8]` — and the host applies the same `domain ‖ scope` prefix, so an app checks a scoped signature by naming the key and never reconstructs the prefix the host owns. It is an authority like `node/sign` because the scope is host-derived: the guest asks "does this signature verify under *my* bundle's namespace?", a fact it cannot state for itself. The raw `crypto/ed25519/verify` primitive stays, ungated like every pure transform, for callers verifying raw bytes. Every node running the same bundle derives the same scope, which makes the signatures portable across a cohort. One consequence: rotating a bundle's author key changes the scope and orphans previously signed objects, so an app anticipating that records its scope inside its own signed formats. §14 has the trust rationale.
+**The signing names are scoped, never raw, and the scope comes from the privilege the bundle reaches.** `node/sign` does not sign the guest's bytes as given: the host prepends a domain and a scope, both of its own choosing, and never reads the suffix. An ordinary app gets `DOMAIN_guest ‖ author_pk ‖ app_len u8 ‖ app` (`appSignScope`), derived from the admitted manifest (§12.4) — the same `(author, app)` pair that keys freshness. A bundle reaching **`link`** gets `DOMAIN_link_scope ‖ network_key` (`linkSignScope`), which is what lets the AKE transcript signature be an ordinary `node/sign` call: the kernel owns the separation and nothing else, so the *format* signed under that scope — including the transport's own `DOMAIN_channel` tag — is bundle content, revisable in a bundle update, and the node key never enters the guest. Both arms are one function of admitted facts (`slotSignScope`), which is why the scope is the same on every load path: boot, an operator's `--bundle`, and the in-place update that replaces a standing slot alike. The domain-prefix family is disjoint (§14, §16.1), so a guest-obtained signature never verifies as a manifest; and distinct bundles derive disjoint scopes, so one app cannot sign in another's namespace. **Verification is scoped the same way.** `node/verify` takes the verifying key in its argument bytes — `[pk 32][sig 64][msg …]` → `[ok u8]` — and the host applies the same `domain ‖ scope` prefix, so an app checks a scoped signature by naming the key and never reconstructs the prefix the host owns. It is an authority like `node/sign` because the scope is host-derived: the guest asks "does this signature verify under *my* bundle's namespace?", a fact it cannot state for itself. The raw `crypto/ed25519/verify` primitive stays, ungated like every pure transform, for callers verifying raw bytes. Every node running the same bundle derives the same scope, which makes the signatures portable across a cohort. One consequence: rotating a bundle's author key changes the scope and orphans previously signed objects, so an app anticipating that records its scope inside its own signed formats. §14 has the trust rationale.
 
 The seam's names are one table, `AUTHORITY_CALLS` (`core/domains.ts`), plus the reserved `_`-led ids, the ungated `crypto/*` primitives and the asking bundle's own module names. The table and the reserved ids together are the manifest vocabulary: a `guest.requires` names a subset of the two and nothing else. A grant is granted *by name* — the seam refuses any `host.call` that is not exactly one of the declared requires — and the gate decides what is a grant by membership in the table or by the one-character reservation the format already enforces (`isGrant`), never by parsing a domain prefix off the name.
 
@@ -410,7 +410,8 @@ See [CHANNEL](CHANNEL.md) §3–§4 for why the identities are deferred and why 
 worth a second round trip.
 
 The transcript root is `H(DOMAIN_channel ‖ network_key)`, so two networks derive disjoint
-keys and signatures (§12.6.3).
+keys; the same network key is the slot's signing scope, so their AUTH signatures are
+disjoint too (§12.6.3).
 
 ```
 root = H(DOMAIN_channel ‖ network_key)
@@ -418,8 +419,10 @@ k1   = KDF(contact,      H(root ‖ suite ‖ eph_i))
 h1   = H(root ‖ msg1)
 ee   = X25519(eph_i_sk, eph_r) = X25519(eph_r_sk, eph_i)
 k2   = KDF(ee ‖ contact, h1)
-h2   = H(h1 ‖ msg2)     k3 = KDF(ee ‖ contact, h2)   sig_i = Ed25519(root ‖ h2 ‖ id_i)
-h3   = H(h2 ‖ msg3)     k4 = KDF(ee ‖ contact, h3)   sig_r = Ed25519(root ‖ h3 ‖ id_r)
+h2   = H(h1 ‖ msg2)     k3 = KDF(ee ‖ contact, h2)   sig_i = Sign(DOMAIN_channel ‖ root ‖ h2 ‖ id_i)
+h3   = H(h2 ‖ msg3)     k4 = KDF(ee ‖ contact, h3)   sig_r = Sign(DOMAIN_channel ‖ root ‖ h3 ‖ id_r)
+
+Sign(m) = Ed25519(DOMAIN_link_scope ‖ network_key ‖ m)   — the prefix is the host's (§12.2)
 h4   = H(h3 ‖ msg4)     k_i2r, k_r2i = KDF(ee ‖ contact, h4, "…i->r-v1\0" / "…r->i-v1\0")
 ```
 
@@ -437,14 +440,17 @@ it only makes the two ends sign different bytes. A suite is *chosen* by the endp
 never *forced* by the network (§14.1). The bytes a node sends and the bytes it folds into
 the transcript are one construction in the transport bundle.
 
-**Each signature commits to its own identity and the whole transcript.** `sig_i` covers
-`DOMAIN_channel ‖ h2 ‖ id_i`, and `h2` chains `DOMAIN_channel`, msg1 and msg2 — hence the
-suite, both ephemeral keys and both nonces. So a signature collected on one connection,
+**Each signature commits to its own identity and the whole transcript.** `sig_i` covers the
+channel-tagged content `DOMAIN_channel ‖ root ‖ h2 ‖ id_i` under the slot's host-applied
+`DOMAIN_link_scope ‖ network_key`, and `h2` chains `DOMAIN_channel`, msg1 and msg2 — hence
+the suite, both ephemeral keys and both nonces. So a signature collected on one connection,
 even from a node used as a signing oracle, names the wrong exchange elsewhere and fails to
 verify; see §14. The identity is committed explicitly because it travels *inside* a
 ciphertext rather than in the hashed wire bytes. `DOMAIN_channel` is
-`"seedkernel-channel-id-v1\0"` — domain separation so a handshake signature cannot double
-as another protocol's over the same bytes. An outbound dial pins `expectPeerId`: if msg4
+`"seedkernel-channel-id-v1\0"` — the transport's own format tag, so a handshake signature
+cannot double as another of its formats over the same bytes; the *cross-protocol*
+separation is the host's `DOMAIN_link_scope` prefix, which no occupant can reach past. An
+outbound dial pins `expectPeerId`: if msg4
 presents a different key, the link closes, and it closes *before* the dial is treated as
 live. Frames sent before authentication are queued, bounded by `MAX_QUEUE_BYTES` (1 MiB)
 with oldest-dropped — a byte bound, not a frame count — so a peer that never authenticates
@@ -532,11 +538,13 @@ derivation is deterministic, so a node rebuilds its key at boot with nothing ext
 persist. Labels are closed and literal, never built from runtime data.
 
 That one key signs for both purposes, and *what a signature means* is the host's decision
-from the asking bundle's slot, not the key's: the transport occupant's `node/sign` binds
-`DOMAIN_channel ‖ network_key`, an ordinary app's binds `DOMAIN_guest ‖ author ‖ app`
+from the asking bundle's slot, not the key's: the link occupant's `node/sign` binds
+`DOMAIN_link_scope ‖ network_key`, an ordinary app's binds `DOMAIN_guest ‖ author ‖ app`
 (§12.2). Both reach the one seam name, the host prefixes and never parses, no op signs raw
-bytes, and the key itself never enters a realm. Why purposes are separated this way rather
-than by a second keypair — and what that costs: [CHANNEL](CHANNEL.md) §7.
+bytes, and the key itself never enters a realm — and inside its own scope the transport
+tags its `DOMAIN_channel` format itself, so the handshake's shape is bundle content. Why
+purposes are separated this way rather than by a second keypair — and what that costs:
+[CHANNEL](CHANNEL.md) §7.
 
 #### 12.6.3 The contact secret, the network key, and the peer list
 
@@ -647,7 +655,7 @@ from the same seed.
 
 Because the wire and the bundles are shared, a Go node and a Node/Bun node interoperate directly in one cohort — `put` on either, `get` on the other, in both directions, against the same signed bundle and genesis (verified end-to-end for seed store by `WASM/scripts/loader-interop.sh`).
 
-**Scope: the native target is a bundle-runner.** Its app path is the §12.4 bundle — load, verify, install the modules, run the guest — and its request path is transport → shared route bundle → guest seam → the app's guest `handle` entrypoint, which reaches the installed modules by their bare names through `host.call` (§12.2). Both targets install code only from a signed bundle (§12.4), so the app-delivery surface is identical. There is no dispatch loop and no signature pipeline to keep in parity: the table is a two-level name table (§3) and modules are pure transforms (§4), so Go's only module-facing duties are staging input into a module's `scratch`, reading its output, and honoring a declared `scratchSize` (§4.1) — byte-identical to the JS host. The loader's admission and policy (§12.4–§12.5), bundle freshness (§12.4), and the domain prefixes (§16.1) are the same shared TS both targets run in QuickJS; the manifest and channel signatures the loader checks read their `DOMAIN_*` prefixes from that one evaluated `domains.ts`, so every signed preimage is byte-identical across the cohort by construction, not by a hand-copied constant.
+**Scope: the native target is a bundle-runner.** Its app path is the §12.4 bundle — load, verify, install the modules, run the guest — and its request path is transport → shared route bundle → guest seam → the app's guest `handle` entrypoint, which reaches the installed modules by their bare names through `host.call` (§12.2). Both targets install code only from a signed bundle (§12.4), so the app-delivery surface is identical. There is no dispatch loop and no signature pipeline to keep in parity: the table is a two-level name table (§3) and modules are pure transforms (§4), so Go's only module-facing duties are staging input into a module's `scratch`, reading its output, and honoring a declared `scratchSize` (§4.1) — byte-identical to the JS host. The loader's admission and policy (§12.4–§12.5), bundle freshness (§12.4), and the domain prefixes (§16.1) are the same shared TS both targets run in QuickJS; the host-applied prefixes on every signature the loader makes or checks come from that one evaluated `domains.ts`, so every signed preimage is byte-identical across the cohort by construction, not by a hand-copied constant. The channel's own `DOMAIN_channel` format tag is not in that family and does not need to be: it lives inside the transport bundle (`transport/src/ake.js`), which is one signed artifact every node in the cohort runs.
 
 **Size.** One file, ~7.5 MB stripped, cross-compiled to win/linux/mac with `GOOS`/`GOARCH` — nothing to install alongside it. The bulk is wazero's compiler backend (~4 MB) and the Go runtime (~2.4 MB); the protocol's own footprint stays tiny (§10.2). Against the JS shell — which needs a Node/Bun install plus the lazily-loaded ~570 KB QuickJS engine — the native binary trades a larger single artifact for zero external dependencies, the right shape for a server or an appliance.
 

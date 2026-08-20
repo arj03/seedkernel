@@ -81,11 +81,10 @@ export interface ShellPlatform {
     now?: () => number;
     /** OPTIONAL network key — which network this node belongs to. An isolation boundary,
      *  not a gate (§12.6); absent ⇒ the public network. Feeds the raw link configuration
-     *  and the channel-signing scope granted to a bundle reaching `link`
-     *  (`transportSignScope`).
+     *  and the signing scope granted to a bundle reaching `link` (`linkSignScope`).
      *
      *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
-     *  the only binding of a channel signature to this node's network that the slot
+     *  the only binding of a link occupant's signature to this node's network that the slot
      *  occupant cannot choose. Drop it from the preimage and a confined transport on one
      *  network can mint transcripts another network's verifier accepts. */
     networkKey?: Uint8Array;
@@ -477,10 +476,10 @@ export function createShell(opts: CreateShellOptions & {
                 // What SIGN signs under was chosen with the slot, from the privilege the
                 // bundle reaches (`slotSignScope`, §12.2) — not here, and never by the
                 // guest. Both slots sign with the node's one key and the slot picks what
-                // the signature MEANS: the transport signs
-                // transcripts under DOMAIN_channel ‖ networkKey, an app under DOMAIN_guest ‖
-                // its own bundle's scope. The seam prefixes and never parses, so neither
-                // can produce the other's signature and no op signs raw bytes.
+                // the signature MEANS: a link occupant signs under DOMAIN_link_scope ‖
+                // networkKey, an app under DOMAIN_guest ‖ its own bundle's scope. The seam
+                // prefixes and never parses, so neither can produce the other's signature
+                // and no op signs raw bytes.
                 signScope: slot.signingScope,
                 // Scoped to this app key, so `fs` grants reach this app's own keyspace and
                 // not the node's — the same structural ownership module names have (§5.1).

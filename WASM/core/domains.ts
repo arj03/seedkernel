@@ -26,9 +26,11 @@ export const DOMAIN_MANIFEST_AUTHOR = domain("seedkernel-manifest-author-v1\0");
 /** Guest-seam SIGN (§12.2): prefixes `scope ‖ msg`, scope host-derived from the
  *  manifest — a guest's signature stays in its bundle's namespace, not a key oracle. */
 export const DOMAIN_GUEST = domain("seedkernel-guest-sig-v1\0");
-/** Channel AUTH (§12.6): prefixes the AKE transcript, so an AUTH signature names
- *  one connection and no other. */
-export const DOMAIN_CHANNEL = domain("seedkernel-channel-id-v1\0");
+/** Guest-seam SIGN for the slot holding the raw-link resource (§12.2, §12.6): prefixes
+ *  the network key, so that slot's signatures name one network and never an app's
+ *  namespace. The kernel owns the separation and nothing else — what format is signed
+ *  under it is the occupant's, carried in the opaque suffix the host never reads. */
+export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
 /** Subkey derivation (§12.9): `DOMAIN_subkey ‖ label ‖ master` hashed to a seed. Its own
  *  domain so a derived seed can never coincide with any other hash this system computes,
  *  and so the label space stays private to subkeys.ts. */

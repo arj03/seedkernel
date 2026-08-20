@@ -212,8 +212,9 @@ occupant is what always did, and it is not this: the occupant reaches no authori
 
 ## 7. Why one identity key, and not a key per purpose
 
-A node signs for two purposes with one key: the handshake, under `DOMAIN_channel ‖
-network_key`, and an app's scoped records, under `DOMAIN_guest ‖ author ‖ app`
+A node signs for two purposes with one key: the handshake, under `DOMAIN_link_scope ‖
+network_key` (with the transport's own `DOMAIN_channel ‖ transcript` inside), and an app's
+scoped records, under `DOMAIN_guest ‖ author ‖ app`
 ([RUNTIME](RUNTIME.md) §12.6.2b). Deriving a second keypair for the second purpose is the
 obvious hardening, and it is worth saying why it is not done.
 
@@ -242,8 +243,10 @@ only resistance to one class of code bug.
 So the purposes are kept apart the way every other pair of purposes here is. The host — not
 the guest, and not the signing code — chooses the domain and scope from the slot the asking
 bundle occupies, binds `domain ‖ scope ‖ msg`, and never parses `msg`. No op signs raw
-bytes, and neither slot can reach the other's prefix. One key, one identity namespace, the
-same meaning on every target.
+bytes, and neither slot can reach the other's prefix. Sub-separating *within* a scope is the
+occupant's own job, one level down: this program's `DOMAIN_channel` tag is exactly that, and
+it is why the handshake's format can change in a bundle update. One key, one identity
+namespace, the same meaning on every target.
 
 The stored secret is still not the signing key: a node holds a 32-byte master seed and
 derives from it under a closed, versioned label set (libsodium `crypto_kdf`'s shape), which
@@ -327,7 +330,7 @@ a msg2. They cannot open it — no ephemeral private key — so they learn only 
 answered. Inherent to any design whose first message is not challenge-bound; Noise has it
 too.
 
-**The protocol is fingerprintable.** A cleartext `0x02` at offset 0 says "seedkernel". That
+**The protocol is fingerprintable.** A cleartext `0x03` at offset 0 says "seedkernel". That
 identifies the protocol, not the peer, and hiding it would cost the self-describing format
 and the migration path of §14.1. First message indistinguishable from random is a separate
 goal and belongs in its own suite.

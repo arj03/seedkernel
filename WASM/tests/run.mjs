@@ -28,7 +28,7 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, transportSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION, opHeader }
+const { createGuestSeam, guestSignScope, appSignScope, linkSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION, opHeader }
   = await imp("build/host/guest-seam.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
@@ -896,7 +896,7 @@ async function testPolicy() {
   assert(!badAuthor, "install by an author not on the allowlist is rejected");
 
   // ── the transport is a GRANTED CAPABILITY, not a kind of bundle (§12.5) ────
-  // The `link` privilege carries raw links and channel-identity signing, so the ordinary
+  // The `link` privilege carries raw links and network-scoped signing, so the ordinary
   // author list must NOT admit one even for an author it already trusts with apps.
   const goodHex = toHex(good.id);
   const appOnly = JSON.stringify({ authors: [goodHex] });
@@ -1029,6 +1029,79 @@ async function testRequiresPickThePrivileges() {
       } finally { shell.close(); }
     }
   }
+  console.log("  OK\n");
+}
+
+// ─── Test: the signing scope follows the privilege, on EVERY load path ───────
+//
+// `slotSignScope` is a function of admitted facts — the node's identity and the manifest —
+// which is the whole reason it cannot drift. Driven through a real shell because the
+// property is about the point where a signed manifest becomes a realm, and because the
+// path that could silently lose it is the in-place UPDATE: a transport that re-scoped
+// itself to `author ‖ app` on upgrade would keep serving while every handshake with an
+// un-upgraded peer failed as an authentication error with nothing naming the cause.
+async function testSigningScopeFollowsPrivilege() {
+  console.log("Test: the signing scope follows the privilege, on every load path");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { FreshnessMarks, signManifest, packBundle } = await imp("build/host/bundle.js");
+  const { ModuleTable: MT } = await imp("build/host/module-table.js");
+  const { byPrivilege, admitAll } = await imp("build/host/policy.js");
+  const linkAuthor = testAuthor(), appAuthor = testAuthor();
+  const identity = generateKeyPair();
+  const networkKey = new Uint8Array(32).fill(0x7a);
+  let seam;
+  const shell = mkShell({
+    platform: {
+      sodium, identity, networkKey, modules: new MT(), freshnessStore: new FreshnessMarks(),
+      createRealm: async ({ hostCall }) => {
+        seam = hostCall;
+        return { call: async () => new Uint8Array(), dispose() {} };
+      },
+    },
+    admit: byPrivilege({ base: admitAll, grants: { link: admitAll } }),
+  });
+  const blob = (author, app, version, requires) => packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author, {
+      app, version, modules: [], guest: GUEST({ requires }),
+    }),
+    [GUEST_FILE]: GUEST_BYTES,
+  });
+  const DOMAIN_GUEST = new TextEncoder().encode("seedkernel-guest-sig-v1\0");
+  const DOMAIN_LINK = new TextEncoder().encode("seedkernel-link-scope-v1\0");
+  const preimage = (domain, scope, msg) => concatBytes([domain, scope, msg]);
+  const signs = (sig, domain, scope, msg) =>
+    sodium.crypto_sign_verify_detached(sig, preimage(domain, scope, msg), identity.publicKey);
+  const msg = new Uint8Array([5, 4, 3]);
+  const linkApp = guestSignScope(linkAuthor.id, "linkprobe");
+  try {
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "link/open"]));
+    const v1 = await seam("node/sign", msg);
+    assert(signs(v1, DOMAIN_LINK, networkKey, msg),
+      "a slot reaching link signs under DOMAIN_link_scope ‖ networkKey");
+    assert(!signs(v1, DOMAIN_GUEST, linkApp, msg),
+      "…and never under its own author/app scope, so it cannot sign as an app");
+
+    // The path a lease would be dropped on: the standing slot is replaced in place.
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "link/open"]));
+    const v2 = await seam("node/sign", msg);
+    assert(signs(v2, DOMAIN_LINK, networkKey, msg),
+      "an in-place update of the link slot keeps the SAME scope — an upgrade cannot re-scope a node");
+
+    // And the other arm, on a shell that already has a link occupant.
+    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node/sign"]));
+    const app = await seam("node/sign", msg);
+    assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
+      "an ordinary app signs under DOMAIN_guest ‖ author ‖ app");
+    assert(!signs(app, DOMAIN_LINK, networkKey, msg),
+      "…and cannot reach the link occupant's network scope");
+
+    // The two arms are the two exported constructors, so a caller building a scope by hand
+    // agrees with what the slot got.
+    assert(bytesEqual(linkSignScope(identity, networkKey).scope, networkKey),
+      "linkSignScope scopes to the network key");
+    assert(bytesEqual(appSignScope(identity, appAuthor.id, "plainapp").scope,
+      guestSignScope(appAuthor.id, "plainapp")), "appSignScope scopes to author ‖ app");
+  } finally { shell.close(); }
   console.log("  OK\n");
 }
 
@@ -2817,6 +2890,7 @@ await testFsKeyRule();
 await testGuestSeam();
 await testPolicy();
 await testRequiresPickThePrivileges();
+await testSigningScopeFollowsPrivilege();
 await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();

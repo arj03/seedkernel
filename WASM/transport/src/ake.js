@@ -25,13 +25,13 @@
 //
 // Authorities — the whole of what this program holds:
 //
-//   "node/sign"   msg -> 64B sig, over `DOMAIN_channel ‖ networkKey ‖ msg`. The host
-//                 chooses the prefix from THIS bundle's admission point and never
-//                 reads the suffix, so no transcript shape is pinned into the host
-//                 and no call signs raw bytes.
+//   "node/sign"   msg -> 64B sig, under the scope the host chose from THIS bundle's
+//                 admission point (`link` ⇒ the network key). The host never reads the
+//                 suffix, and the channel format tag is part of msg below, so no
+//                 handshake shape is pinned into the host and no call signs raw bytes.
 //   "node/verify" [pk 32][sig 64][msg] -> [ok u8], under the SAME host-applied
 //                 scope — so this program checks a peer's transcript signature
-//                 without holding the domain tag it was made under.
+//                 without holding the scope it was made under.
 //   "node/random" [n u32 BE] -> n bytes            (nonces, ephemeral secrets)
 //   `link/*`      bytes over an opaque link id, opened and closed
 //   `timer/*`     deadlines, since a zero-authority realm has no setTimeout
@@ -108,7 +108,7 @@ function reasonCode(link) {
 
 // ── channel handshake constants (§12.6) ──────────────────────────────────────
 
-const SUITE_CHANNEL_CONCEALED = 0x02;
+const SUITE_CHANNEL_CONCEALED = 0x03;
 const SUITE_LEN = 1, PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
 const M1_LEN = SUITE_LEN + EPH_LEN + NONCE_LEN + TAG_LEN; //  81
@@ -124,6 +124,13 @@ const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 // A suite byte is not negotiated: it makes the wire self-describing, and because it
 // sits inside every signed transcript half, an in-path attacker who flips it only makes
 // the two ends sign different bytes (§12.6, §14.1).
+//
+// `0x03` moved the channel's format tag out of the host's signing prefix and into the
+// identity payload this program assembles (`channelIdentityMessage`), which changes what
+// both ends sign. It is a new byte for the reason every suite change is: a node that
+// speaks the old preimage must fail at msg1, by a suite it does not know, rather than
+// authenticate its way to a signature mismatch it cannot explain. 0x02 was removed, not
+// disabled — a node accepting both would take the concealment of the weaker one.
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
 const ZERO_NPUB = new Uint8Array(NPUB_LEN);
@@ -139,10 +146,11 @@ const LABEL_M4 = utf8Encode("seedkernel-c-msg4-v1\0");
 const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 
-// The KDF's domain separator, for the session ROOT derivation only (root =
-// blake2b(DOMAIN_channel ‖ networkKey)). NOT the sign-prefix domain: that half of
-// signing is the host's (transportSignScope) and node/verify applies it for us, so this
-// program never reconstructs it.
+// This channel format tag seeds the session root AND prefixes every identity-signature
+// payload below. It is transport CONTENT, not a kernel signing domain — which is what lets
+// this program change its handshake format in a bundle update: the host contributes only
+// the opaque scope it chose for this slot (`DOMAIN_link_scope ‖ networkKey`) and reads
+// nothing inside.
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
 // Per-suite wire lengths. A later suite changes these and the byte it is keyed by; the
@@ -204,9 +212,14 @@ function boxKeypair() {
   if (!r.ok) throw new Error("transport: ephemeral keygen failed");
   return { publicKey: r.x, privateKey: sk };
 }
-/** Ask the host to sign a handshake transcript under `DOMAIN_channel ‖ networkKey` (the
- *  prefix is the host's, chosen from this bundle's admission point) with the node's
- *  channel key, which never enters this program.
+/** Assemble the channel's tagged identity-signature format. The host treats this whole
+ *  value as an opaque suffix, while still prefixing the scope it chose for this slot. */
+function channelIdentityMessage(root, th, id) {
+  return concatBytes([DOMAIN_CHANNEL, root, th, id]);
+}
+/** Ask the host to sign a tagged handshake transcript, under `DOMAIN_link_scope ‖
+ *  networkKey` (the prefix is the host's, chosen from this bundle's admission point) with
+ *  the node's channel key, which never enters this program.
  *
  *  `node/sign` THROWS when the bundle does not reach the authority or has no
  *  slot-derived scope (guest-seam.ts), so the `{ok}` shape is a real status: catching
@@ -214,10 +227,8 @@ function boxKeypair() {
  *  callback and leave the socket open until it times out. Same idiom as `scalarmult`
  *  and `openZero`. */
 function channelSign(root, th, id) {
-  const out = new Uint8Array(96);
-  out.set(root, 0); out.set(th, 32); out.set(id, 64);
   try {
-    return { ok: true, sig: host.call(N_SIGN, out) };
+    return { ok: true, sig: host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
   } catch {
     return { ok: false, sig: null };
   }
@@ -627,9 +638,10 @@ class Link {
   }
 
   signIdentity(th) {
-    // `root ‖ th ‖ id` is the opaque suffix; the host reads none of it and contributes
-    // the prefix it chose from this bundle's slot, `DOMAIN_channel ‖ networkKey` — which
-    // is why the network binding survives a transport that lies about its own root.
+    // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
+    // it and contributes the prefix it chose from this bundle's slot,
+    // `DOMAIN_link_scope ‖ networkKey` — which is why the network binding survives a
+    // transport that lies about its own root.
     const r = channelSign(this.root, th, ownPk);
     // The seam refused: no `node/sign` grant, or no slot-derived scope. Our own
     // misconfiguration, never anything the peer did, so it aborts — a stall would claim
@@ -644,10 +656,10 @@ class Link {
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
-    // node/verify checks `DOMAIN_channel ‖ networkKey ‖ root ‖ th ‖ id` under `id`, the
-    // same scope this node signs under, so the preimage the two ends must agree on is
-    // the host's and never reconstructed here.
-    if (!verify(id, sig, concatBytes([this.root, th, id]))) return null;
+    // node/verify applies the same host-owned scope this node signs under, so the preimage
+    // the two ends must agree on is the host's for its prefix half. The channel's format
+    // tag is ours, so the two ends reconstruct that half here.
+    if (!verify(id, sig, channelIdentityMessage(this.root, th, id))) return null;
     if (bytesCompare(id, ownPk) === 0) return null; // our own traffic reflected
     return id;
   }

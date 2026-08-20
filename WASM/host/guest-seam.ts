@@ -16,7 +16,7 @@
 // Every name is application-neutral: content addressing, wire formats, erasure coding and
 // nonce conventions are all the guest's business, built on top of these.
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_CHANNEL, AUTHORITY_CALLS, PRIMITIVE_NAMES, PRIVILEGE_LINK, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName, type Privilege } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, PRIMITIVE_NAMES, PRIVILEGE_LINK, isGrant, isReservedProtocol, type PrimitiveName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 
@@ -25,19 +25,21 @@ import type { ModuleResult } from "./bundle.js";
  *  (§12.2).
  *
  *  The host PREFIXES; it does not parse. It signs `domain ‖ scope ‖ msg` with `msg` opaque,
- *  so the guarantee — this key signs channel transcripts and never app data, an app's data
- *  and never another app's — rides entirely on the prefix. Validating the *fields* of what
- *  it signed would pin one protocol's design into the core and buy nothing.
+ *  so the guarantee — this key signs one slot's data and never another's — rides entirely
+ *  on the prefix. Validating the *fields* of what it signed would pin one protocol's design
+ *  into the core and buy nothing: what a link occupant puts under its scope is its own
+ *  format, revisable in a bundle update rather than in the kernel.
  *
  *  `key` is the node's one identity whichever slot asks (core/subkeys.ts), so a signature
  *  a peer receives verifies under the peer id the handshake authenticated. `node/verify`
  *  takes the verifying key from its arguments, so only `domain` and `scope` bind a
  *  verification — a guest checks signatures in its own namespace, never another's. */
 export interface SignScope {
-    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_channel` for the transport. */
+    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_link_scope` for the slot holding
+     *  the raw-link resource. */
     domain: Uint8Array;
     /** Scope bytes under the domain: `author ‖ app` for an app, the network key for the
-     *  transport. */
+     *  link slot. */
     scope: Uint8Array;
     /** The keypair that signs. */
     key: {
@@ -171,7 +173,7 @@ export interface SeamGrants {
      *  opt out deliberately. */
     names: Iterable<string> | typeof UNRESTRICTED_NAMES;
     /** What SIGN signs and VERIFY check under, derived by the host from the asking bundle's
-     *  slot (`appSignScope` / `transportSignScope`). Without a scope both are unavailable,
+     *  slot (`appSignScope` / `linkSignScope`). Without a scope both are unavailable,
      *  because guest signing and scoped verification are never raw. */
     signScope?: SignScope;
     /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
@@ -564,20 +566,23 @@ export function appSignScope(key: {
 }, author: Uint8Array, app: string): SignScope {
     return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
-/** The `link` capability's signing scope: `DOMAIN_channel ‖ networkKey`, signed by the node's
- *  CHANNEL key (its peer identity). The suffix — a handshake transcript — is the slot
- *  occupant's business and the host does not look at it. An absent network key is the
+/** The `link` capability's signing scope: `DOMAIN_link_scope ‖ networkKey`, signed by the
+ *  node's identity key. The suffix is the slot occupant's business and the host does not
+ *  look at it — the transport bundle tags its own handshake format inside it, so changing
+ *  that format is a bundle update and never a kernel change. An absent network key is the
  *  public network's zero key, said explicitly (§12.6). */
-export function transportSignScope(key: {
+export function linkSignScope(key: {
     publicKey: Uint8Array;
     privateKey: Uint8Array;
 }, networkKey?: Uint8Array): SignScope {
-    return { domain: DOMAIN_CHANNEL, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
+    return { domain: DOMAIN_LINK_SCOPE, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
 }
 /** Which of the two a slot gets — the ONE place that decides, so a future third scope is an
  *  arm here rather than a second signing name or a second key. Keyed on the privilege the
  *  bundle's `requires` reach (`privilegesOf`, §12.5), never on which bundle it is: what a
- *  signature MEANS follows from what the occupant may do.
+ *  signature MEANS follows from what the occupant may do. Being a function of admitted
+ *  facts is what makes it hold on every load path — boot, an operator's `--bundle`, and the
+ *  in-place update that replaces a standing slot alike.
  *
  *  The inputs are the node's identity and the admitted manifest's own fields, and nothing
  *  else — deliberately. A scope is a preimage every node must agree on: fold in anything
@@ -594,7 +599,7 @@ export function slotSignScope(node: {
     networkKey?: Uint8Array;
 }, author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
     return privileges.includes(PRIVILEGE_LINK)
-        ? transportSignScope(node.identity, node.networkKey)
+        ? linkSignScope(node.identity, node.networkKey)
         : appSignScope(node.identity, author, app);
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
