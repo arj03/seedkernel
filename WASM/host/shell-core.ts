@@ -643,16 +643,21 @@ export function createShell(opts: CreateShellOptions & {
      *  separate `route` privilege governs (§12.5), so this path reaches strictly less than
      *  the local one below.
      *
-     *  A bundle's `_`-led claim is a LOCAL service name and is refused here: no `requires`
-     *  of a remote sender's could have granted it, and the realms that serve one are
-     *  handed an app key by `callLocal` rather than a peer key, so letting a submitted
-     *  attribution in would both reach a surface no peer was ever offered and make the two
-     *  32-byte spaces indistinguishable at the claimant. A PLATFORM claim is the deliberate
-     *  exception: registering one is host code opting a name in (§12.10). */
+     *  A `_`-led claim is a LOCAL service name and is refused here, with NO exception — the
+     *  platform's own claims included, which is why the check comes first. No `requires` of
+     *  a remote sender's could have granted it, and the realms that serve one are handed an
+     *  app key by `callLocal` rather than a peer key, so letting a submitted attribution in
+     *  would both reach a surface no peer was ever offered and make the two 32-byte spaces
+     *  indistinguishable at the claimant — for a platform handler exactly as for a bundle's.
+     *
+     *  So the leading `_` means one thing everywhere and a reader needs no second rule: a
+     *  host name that peers are MEANT to reach is spelled as the ordinary id it is, and
+     *  registering it is still the deliberate act — `createShell({ claims })` is host code
+     *  either way (§12.10). */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        if (isReservedProtocol(claim)) return null;
         const platformHandler = platformClaims.get(claim);
         if (platformHandler) return platformHandler(attribution, payload);
-        if (isReservedProtocol(claim)) return null;
         return callClaimant(claim, attribution, payload);
     };
     /** The cross-realm call, from a co-resident guest. Only a reserved id is callable (the

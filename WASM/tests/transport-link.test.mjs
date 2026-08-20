@@ -703,21 +703,22 @@ await test("a decrypt failure does not advance the receive counter", async (keep
 // ── §12.10: platform handlers register exact claims ─────────────────────────────
 //
 // An inbound frame reaches the shell as the transport's `route/deliver` and goes to the
-// routing table, so a host that serves an id of its own — seedchat's `_offer`, which
+// routing table, so a host that serves an id of its own — seedchat's `offer/v1`, which
 // carries a bundle between two browsers before either has an app that could receive it —
 // needs an explicit seam. `createShell({ claims })` is it: exact names, no wildcard and no
 // fall-through. These pin both halves — a registered name wins, and an unregistered one is
-// never consulted — plus the reach that registering one is opting into (below).
+// never consulted — plus the reach an ORDINARY id carries and a reserved one does not
+// (below).
 
 await test("EXACT CLAIM: the platform answers the claim it registered", async (keep) => {
   const seen = [];
   const st = keep(await upPair(undefined, undefined, {
-    claims: { "_offer": (from, payload) => {
+    claims: { "offer/v1": (from, payload) => {
       seen.push({ from: Buffer.from(from).toString("hex"), payload });
       return Promise.resolve(Uint8Array.from([0xaa, payload.length]));
     } },
   }));
-  const resp = await st.A.request(st.B.driver.peerId, "_offer", Uint8Array.from([1, 2, 3]));
+  const resp = await st.A.request(st.B.driver.peerId, "offer/v1", Uint8Array.from([1, 2, 3]));
   assert(resp.length === 2 && resp[0] === 0xaa && resp[1] === 3,
     `the shell's own answer must reach the caller, got ${[...resp]}`);
   assert(seen.length === 1, "the hook must be consulted exactly once per inbound frame");
@@ -728,10 +729,29 @@ await test("EXACT CLAIM: the platform answers the claim it registered", async (k
   assert(inbound.length === 0, "a frame the shell answered must not also reach the app");
 });
 
+// The reach half, and the reason the rule has no host-code exception. seedchat registers
+// `_render` as a platform claim precisely BECAUSE it is local-only: a chat app's guest
+// relays its render bytes there and the shell draws them, trusting the 32 bytes it is
+// handed to be an app key. A peer reaching that name would push bytes into the iframe
+// under a peer key sitting in an app key's place — so the `_`-led refusal comes before the
+// platform table, not after it.
+await test("EXACT CLAIM: a `_`-led platform claim is local-only, like any reserved id", async (keep) => {
+  let asked = 0;
+  const st = keep(await upPair(undefined, undefined, {
+    claims: { "_render": async () => { asked++; return Uint8Array.from([1]); } },
+  }));
+  const resp = await st.A.request(st.B.driver.peerId, "_render", Uint8Array.from([1, 2, 3]));
+  assert(resp.length === 0, `a peer must not reach a reserved platform claim, got ${[...resp]}`);
+  assert(asked === 0, "…and the handler is never consulted");
+  // Not a link that stopped carrying frames: the ordinary claim still answers over it.
+  const ordinary = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([4, 5]));
+  assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
+});
+
 await test("EXACT CLAIM: unrelated traffic goes directly to its claimant", async (keep) => {
   let asked = 0;
   const st = keep(await upPair(undefined, undefined, {
-    claims: { "_offer": async () => { asked++; return new Uint8Array(0); } },
+    claims: { "offer/v1": async () => { asked++; return new Uint8Array(0); } },
   }));
   // The harness app claims PROTO, and the hook declines it — so the app answers, exactly
   // without consulting the unrelated exact platform claim.
