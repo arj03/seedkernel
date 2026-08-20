@@ -263,6 +263,39 @@ await test("the per-source cap still bites under flood", async () => {
   assert(!quiet.closed, "a different source must be unaffected by a noisy one");
 });
 
+await test("the HOST's own link table is bounded, under every tier the guest enforces", async () => {
+  // The tiers above are content policy and live in the transport guest, because "half-open"
+  // and "authenticated" are states only it can see. But a socket costs the HOST a descriptor
+  // and a link-table entry the moment it is accepted — turns before the guest forms an
+  // opinion — so a wedged or hostile occupant that never refuses anything would spend host
+  // memory the tiers cannot reach. `maxRawLinks` is the generic ceiling underneath them.
+  //
+  // Set here far BELOW the half-open budgets, so what bites is unambiguously the driver's
+  // ceiling and not a tier: an honest occupant never meets this.
+  const RAW = 6;
+  const fabric = new LoopbackChannels();
+  const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256 }, { maxRawLinks: RAW }));
+  const dials = [];
+  for (let i = 0; i < RAW * 3; i++) dials.push(silentDial(fabric, s.driver.port, `10.11.${i}.1`));
+  await sleep(300);
+  const held = dials.filter((d) => !d.closed).length;
+  note(`${RAW * 3} connections against a ${RAW}-link driver ceiling; ${held} held`);
+  // The driver REFUSES rather than evicts: eviction is a policy about which link is worth
+  // keeping, and picking one is exactly the judgement this layer does not have. A budget
+  // this far above the guest's own tiers is never the thing rationing a healthy node.
+  assert(held <= RAW, `the driver held ${held} raw links against a ceiling of ${RAW}`);
+  assert(dials.slice(0, RAW).every((d) => !d.closed), "the links inside the ceiling must be kept");
+  assert(dials.slice(RAW).every((d) => d.closed), "a connection past the ceiling must be closed, not stranded open");
+
+  // …and the ceiling is not a one-way door: a link going away frees its entry, or the
+  // first burst would blackhole the node permanently.
+  for (const d of dials.slice(0, RAW)) d.ch.close(false);
+  await sleep(200);
+  const after = silentDial(fabric, s.driver.port, "10.12.0.1");
+  await sleep(200);
+  assert(!after.closed, "a released raw link must free its slot for the next connection");
+});
+
 await test("an unverified connection is dropped on the SHORT deadline", async () => {
   // A stranger holds a slot for the unverified deadline, not the full handshake one.
   // Measured rather than restated: the constants live in the transport bundle, and a

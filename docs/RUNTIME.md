@@ -194,7 +194,9 @@ This is the chat shell's sandboxed-iframe confinement (§11) generalised: "run z
 
 - **Live timers** — a cap on how many deadlines one realm may hold at once (65536, `DEFAULT_MAX_LIVE_TIMERS`). A guest has no `setTimeout` of its own, so every armed deadline is an entry in a **host-side** table the shell keeps per realm; without a cap, an `timer/arm` loop would be a guest spending host memory it is not charged for. The table is also what makes the timer safe to hand out at all: disposing a realm cancels exactly its own deadlines first, so a fired timer can never re-enter a freed context.
 
-The first two cross every seam between the operator and the realm — CLI flag, `boot()`, `createShell`, `RealmFactory` — because a bound the shell accepts but no target can set is a bound nobody has — one the realm factory takes and nothing upstream carries is dead, since the default applies and nothing can change it. `--guest-timeout 0` reads as "no budget", so disabling one is something an operator says rather than something a missing flag does.
+The first two cross every seam between the operator and the realm — CLI flag, `boot()`, `createShell`, `LoadBundleOptions`, `RealmFactory` — because a bound the shell accepts but no target can set is a bound nobody has — one the realm factory takes and nothing upstream carries is dead, since the default applies and nothing can change it. `--guest-timeout 0` reads as "no budget", so disabling one is something an operator says rather than something a missing flag does.
+
+**And both are per slot, not per shell.** `createShell` takes this node's default; a single `loadBundleBlob` names its own, resolved as *this load's number, else the node's, else the shared one*. The distinction is not decoration: a shell hosts unrelated apps at once — a seedstore node runs the transport bundle and the storage bundle on one — so a shell-wide heap raised for the guest that streams large windows was also the heap handed to the transport sharing the shell, which needs none of it. A budget belongs to the realm it bounds, and a realm is stood per load. A replacement version therefore carries its own rather than inheriting the outgoing realm's, for the same reason its `LOCAL` does (§12.4).
 
 Execution time is the operator's number, not the author's — unlike the module memory ceiling (§4.1), which a bundle declares in its signed manifest. How long *this* node is willing to spend on one message is a property of the deployment, not of the code.
 
@@ -527,6 +529,27 @@ behaviour lives in
   refusing the message the catalog had already made expressible (§14.1). At 8 KiB against
   the 1,024 unverified budget the bound is 8 MiB, still small, and it decides nothing about
   which suites are expressible.
+
+**Underneath all of them, two bounds the host keeps for itself.** Everything above is content
+policy: "half-open", "verified" and "authenticated" are states only the occupant can see, so
+the occupant is what enforces them — and the occupant is a replaceable bundle. What the
+platform owns is cruder and comes first, since a socket costs a descriptor and a link-table
+entry the moment it is accepted, turns before the guest has formed any opinion about it. The
+same rule as the frame caps, applied to the two host-side structures a link occupies:
+
+- **`MAX_RAW_LINKS` (4096)** bounds the driver's own link table, on the single path that
+  mints a link id — a guest dial, an accepted connection, a host-managed handover. It
+  **refuses** rather than evicts, because which link is worth keeping is precisely the
+  judgement this layer does not have, and it sits well above the sum of the tiers so an
+  honest occupant never meets it. A wedged or hostile one meets it instead of the host's
+  memory (`TransportHostOptions.maxRawLinks`; `tests/transport-load.test.mjs`).
+- **`MAX_PREOPEN_QUEUE_BYTES` (1 MiB)** bounds what a channel buffers before its socket is
+  writable — the queue that exists because the transport emits its first handshake frames
+  ahead of `open`, and therefore the memory a connect that never completes gets to spend.
+  Crossing it fails the channel rather than trimming the queue: a hole in an ordered stream
+  is a link the far end waits on forever, where a dead channel is one the address book
+  redials. It is `MAX_QUEUE_BYTES` — the bundle's bound on its own pre-auth buffering —
+  pointed at the buffer on the host's side of the seam, at the same size.
 
 #### 12.6.2b One master seed, one identity
 

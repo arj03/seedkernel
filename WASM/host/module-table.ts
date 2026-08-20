@@ -15,7 +15,6 @@
 // slot construction, which is why nothing here touches crypto.
 
 import {
-  checkModuleMemory,
   DEFAULT_GUEST_DEADLINE_MS,
   DEFAULT_MAX_MODULE_MEMORY_BYTES,
   DEFAULT_SCRATCH_SIZE,
@@ -26,10 +25,12 @@ import type { ModuleResult, PureModuleLoader, PureModules } from "./bundle.js";
 
 export interface ModuleTableOptions {
   /** Ceiling on a module's declared initial *and* maximum linear memory, in bytes.
-   *  A module above it — or one declaring no maximum at all — is refused at install
-   *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES` that
-   *  `loadBundleModules` also applies; lower it to hold this target's builds to
-   *  something tighter than the bundle path requires. */
+   *  A module above it — or one declaring no maximum at all — is refused at load
+   *  (§4.3). Defaults to the shared `DEFAULT_MAX_MODULE_MEMORY_BYTES`; lower it to hold
+   *  this table to something tighter than a bundle may land.
+   *
+   *  The table DECLARES it (`PureModuleLoader.maxModuleMemoryBytes`) and `loadBundleModules`
+   *  applies it, taking the tighter of the two — see the seam in bundle.ts. */
   maxModuleMemoryBytes?: number;
   /** Bound on one module invocation — one call, and one worker load at install — in ms,
    *  for a call that carries no deadline of its own; a call from a GUEST carries that
@@ -220,8 +221,11 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
 
 export class ModuleTable implements PureModuleLoader {
 
-  /** The §4.3 memory ceiling this host holds installs to. */
-  private readonly maxModuleMemoryBytes: number;
+  /** The §4.3 memory ceiling this table holds itself to, declared through the
+   *  `PureModuleLoader` seam for the shared load path to compose (bundle.ts
+   *  `loadBundleModules`). Public, and not applied here: that is what keeps one walk of
+   *  each module's sections on the one path both targets share. */
+  readonly maxModuleMemoryBytes: number;
 
   /** The default module-call bound (ModuleTableOptions.deadlineMs). */
   private readonly deadlineMs: number;
@@ -275,13 +279,13 @@ export class ModuleTable implements PureModuleLoader {
     };
   }
 
-  /** Stand up a module's worker. The §4.3 memory ceiling is read off the bytes HERE,
-   *  before any worker exists, because instantiation is what allocates the declared initial
-   *  memory (wasm-limits.ts, which also refuses an imported or shared memory); the §4 export
-   *  checks run in the worker on the same load and report `loadError`. */
+  /** Stand up a module's worker. The §4.3 memory ceiling was applied before this by the
+   *  load path, off the bytes and before any worker exists, because instantiation is what
+   *  allocates the declared initial memory (bundle.ts `loadBundleModules`, over the
+   *  `maxModuleMemoryBytes` this table declares); the §4 export checks run in the worker on
+   *  the same load and report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
     if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
-    checkModuleMemory(wasmBytes, this.maxModuleMemoryBytes);
     const ref: WasmModuleRef = {
       wasm: wasmBytes,
       worker: null,

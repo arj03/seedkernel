@@ -42,9 +42,11 @@ export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 export const DEFAULT_MAX_LIVE_TIMERS = 1 << 16;
 
 /** Default ceiling on a module's declared linear memory. Declared here rather than in a
- *  host because `loadBundleModules` applies it on the shared admission path (§3): a host
- *  may hold its own direct builds to something tighter, but none may be looser about what
- *  a *bundle* may land. */
+ *  host because `loadBundleModules` is the one place it is applied, on the shared admission
+ *  path (§3), against the tighter of this and the ceiling the target's loader declares
+ *  (`PureModuleLoader.maxModuleMemoryBytes`). So a host may hold its own isolates to
+ *  something tighter and none can be looser about what a *bundle* may land — by
+ *  construction rather than by each loader repeating the check. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 export interface MemoryLimits {

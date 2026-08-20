@@ -179,7 +179,7 @@ export function transportPolicy(authorHex, appAuthors = []) {
 /** One transport host: a shell over a fresh identity + the transport bundle, and — unless
  *  `app: false` — the harness app that drives it. Options pass through to the shell's
  *  platform (admitPeers for the peer list, networkKey, contactSecret, channels) and to
- *  createShell (requestDeadlineMs, transportHalfOpen, linkIdleTimeoutMs).
+ *  createShell (requestDeadlineMs, transportHalfOpen, maxRawLinks, linkIdleTimeoutMs).
  *
  *  `request`/`sendNoReply`/`seen`/`peers` are each one `invoke` into the harness app, so
  *  the bytes cross exactly the seam a real app's would. */
@@ -201,6 +201,9 @@ export async function makeTransportHost(opts = {}) {
     maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
     maxHalfOpenVerified: opts.transportHalfOpen?.verified,
     maxAuthedLinks: opts.transportHalfOpen?.authed,
+    // The DRIVER's own ceiling, not one of the tiers above: `transportHalfOpen` is what the
+    // guest enforces, this is what the host holds.
+    maxRawLinks: opts.maxRawLinks,
     linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
   });
   const shell = createShell({

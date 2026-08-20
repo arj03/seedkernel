@@ -208,6 +208,16 @@ export interface PureModules {
  *  over an opaque Go-owned slot. */
 export interface PureModuleLoader {
     build(mods: { name: string; wasm: Uint8Array }[]): PureModules | Promise<PureModules>;
+    /** OPTIONAL ceiling on a module's declared linear memory this target holds its own
+     *  isolates to (§4.3), in bytes. Absent ⇒ the shared
+     *  `DEFAULT_MAX_MODULE_MEMORY_BYTES`.
+     *
+     *  DECLARED here rather than applied in the loader: `loadBundleModules` takes the
+     *  tighter of this and the shared ceiling, so "a target may hold itself to less than a
+     *  bundle may land, none may be looser" is a property of the composition rather than a
+     *  rule each loader is trusted to restate — and each module's sections are walked once,
+     *  on the one path both targets share, instead of once per side. */
+    maxModuleMemoryBytes?: number;
 }
 
 export interface VerifiedBundle {
@@ -853,8 +863,14 @@ export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundl
     // could only run after the damage. An admission rule, so §3 puts it in the one
     // implementation both targets evaluate, and every module is checked before any is
     // handed down.
+    //
+    // The number is the TIGHTER of what a bundle may land and what this loader holds its
+    // own isolates to (`PureModuleLoader.maxModuleMemoryBytes`). Composed here because this
+    // is the only call site: the loaders declare a ceiling and none applies one, so there is
+    // no second place for the rule to be got wrong and no module walked twice.
+    const maxBytes = Math.min(DEFAULT_MAX_MODULE_MEMORY_BYTES, host.maxModuleMemoryBytes ?? Infinity);
     for (const { wasm } of v.modules) {
-        checkModuleMemory(wasm, DEFAULT_MAX_MODULE_MEMORY_BYTES);
+        checkModuleMemory(wasm, maxBytes);
     }
     // One transactional call: every module stands or none does, and the target owns that
     // guarantee because it holds the half-built instances.

@@ -110,11 +110,14 @@ export interface CreateShellOptions {
      *  composed AROUND whatever is passed here (`hostGates`), so no operator posture can
      *  be a way to lose them. */
     admit?: Admit;
-    /** QuickJS heap limit for the guest realm, in bytes. Omitted ⇒
-     *  `DEFAULT_REALM_MEMORY_BYTES`. A target that streams large windows through the guest
-     *  raises it (seedstore's `realmMemoryBytes`). */
+    /** This node's DEFAULT QuickJS heap limit for a guest realm, in bytes. Omitted ⇒
+     *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI
+     *  `--guest-memory`); a single load raises or lowers it for its own realm with
+     *  `LoadBundleOptions.realmMemoryBytes`, which is where an appetite belonging to one app
+     *  rather than to the node goes. */
     realmMemoryBytes?: number;
-    /** Budget of guest execution time per entrypoint invocation, in ms. Omitted ⇒
+    /** This node's DEFAULT budget of guest execution time per entrypoint invocation, in ms.
+     *  Omitted ⇒
      *  `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. Counts time the guest is
      *  *running*, not time parked on a host seam, so it bounds a wedged guest without
      *  penalising one legitimately awaiting the network.
@@ -140,9 +143,27 @@ export interface CreateShellOptions {
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
  *  shell, which may host unrelated apps at once. The guest receives it as `LOCAL` and owns
  *  any validation or precedence between the two values. An object for the same reason
- *  `guest.config` is one: the guest reads it by name. */
+ *  `guest.config` is one: the guest reads it by name.
+ *
+ *  The realm bounds ride here for the same "the shell hosts unrelated apps" reason, one
+ *  level down: they are the operator's numbers, but they are the operator's numbers ABOUT
+ *  ONE APP. A shell-wide heap raised for a node's storage guest was handed to the transport
+ *  bundle sharing the shell as well, which needed none of it — a budget granted to whoever
+ *  happened to be loaded alongside the app that asked. */
 export interface LoadBundleOptions {
     localConfig?: JsonObject;
+    /** QuickJS heap limit for THIS load's realm, in bytes. Omitted ⇒ the shell's
+     *  `realmMemoryBytes`, and failing that `DEFAULT_REALM_MEMORY_BYTES`. What a target
+     *  streaming large windows through one guest raises (seedstore's storage bundle).
+     *
+     *  A replacement load carries its own: the bound belongs to the realm, and a realm is
+     *  stood per load, so a version installed without one is held to the node's default
+     *  rather than inheriting the outgoing realm's. */
+    realmMemoryBytes?: number;
+    /** Budget of guest execution time per entrypoint invocation for THIS load, in ms.
+     *  Omitted ⇒ the shell's `guestDeadlineMs`, and failing that
+     *  `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
+    guestDeadlineMs?: number;
 }
 
 export interface Shell {
@@ -433,8 +454,12 @@ export function createShell(opts: CreateShellOptions & {
         return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
     };
     /** Stand one candidate realm. It remains outside `slots` and `claims` until this and
-     *  the freshness write both succeed. */
-    const standRealm = async (slot: AppSlot, localConfig: JsonObject): Promise<void> => {
+     *  the freshness write both succeed.
+     *
+     *  Both bounds resolve per load: this load's number, else the node's default, else the
+     *  shared one. Never the author's — a bundle cannot ask for more of the host than the
+     *  operator gave it, which is why neither is read off the manifest. */
+    const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: LoadBundleOptions): Promise<void> => {
         const b = slot.verifiedBundle;
         // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
         // already refused any non-object).
@@ -442,8 +467,8 @@ export function createShell(opts: CreateShellOptions & {
         slot.realm = await platform.createRealm({
             source: jsonPreamble("APP", appConfig) + jsonPreamble("LOCAL", localConfig) + b.guestSource,
             hostCall: seamFor(slot),
-            memoryLimitBytes: opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-            deadlineMs: opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
+            memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+            deadlineMs: load.guestDeadlineMs ?? opts.guestDeadlineMs ?? DEFAULT_GUEST_DEADLINE_MS,
         });
     };
     /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
@@ -692,7 +717,7 @@ export function createShell(opts: CreateShellOptions & {
             // a bundle that never ran a line, putting every version an operator can reach
             // below a floor a broken upgrade raised: rollback bricked by a failed upgrade.
             try {
-                await standRealm(slot, localConfig);
+                await standRealm(slot, localConfig, loadOpts);
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.

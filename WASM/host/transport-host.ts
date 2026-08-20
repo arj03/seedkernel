@@ -62,6 +62,21 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  link that has proved an identity is not entitled to more than one still proving one. */
 export const DEFAULT_MAX_AUTHED_LINKS = 256;
 
+/** ...and the ceiling on what the DRIVER holds, underneath all of them.
+ *
+ *  The budgets above are content policy: "half-open", "verified" and "authenticated" are
+ *  states only the occupant can see, so it is the occupant that enforces them. What this
+ *  file owns is cruder and comes first — a socket costs a descriptor and a link-table entry
+ *  the moment it is accepted, turns before the guest has formed any opinion about it. A
+ *  limit protecting a resource is declared by whoever owns the resource (§1,
+ *  core/net-limits.ts), so the count of live links is bounded here rather than shipped to
+ *  the party it bounds.
+ *
+ *  Comfortably above the sum of the tiers, because it is not their backstop in the ordinary
+ *  case: an honest occupant refuses or evicts long before this, and a wedged or hostile one
+ *  meets this instead of the host's memory. */
+export const DEFAULT_MAX_RAW_LINKS = 4096;
+
 /** How long one request may take when its caller names no deadline (§12.6). Generous on
  *  purpose: it has to be right for a caller who did not think about it. Shipped to the
  *  guest at init, since the request path is entirely the guest's. */
@@ -169,6 +184,10 @@ export interface TransportHostOptions {
  *  `DEFAULT_MAX_AUTHED_LINKS`. */
   maxAuthedLinks?: number;
   linkIdleTimeoutMs?: number;
+  /** Live raw links this driver will hold at once (default `DEFAULT_MAX_RAW_LINKS`).
+ *  Unlike every budget above it, this one is enforced HERE and never shipped to the
+ *  guest — it bounds the host's own link table, not the occupant's link states. */
+  maxRawLinks?: number;
   /** The peers this node will talk to, as 32-byte channel keys. Shipped to the guest at
  *  init and applied there.
  *
@@ -385,9 +404,12 @@ export class TransportHost {
         const addr = this.addrs.get(toHex(dest));
         if (!addr) return NO_ROUTE;
         const channel = this.opts.channels.connect(addr);
-        return {
-          linkId: this.register(channel), framing: channel.framing, authority: channel.authority ?? "",
-        };
+        // A full link table reads as "no route" too: it is the same answer for the same
+        // reason — this driver cannot carry the frame — and the caller already treats one
+        // as a fabric dropping it rather than as a failure to report.
+        const linkId = this.register(channel);
+        if (linkId === 0) return NO_ROUTE;
+        return { linkId, framing: channel.framing, authority: channel.authority ?? "" };
       },
       send: (linkId, bytes) => { if (ownsBinding()) this.channels.get(linkId)?.send(bytes); },
       close: (linkId, graceful) => {
@@ -424,8 +446,18 @@ export class TransportHost {
 
   /** Mint a link id for a channel and wire its events into the transport. The callbacks
    *  fire on later turns (a socket does not deliver during the write that provoked it),
-   *  which is what lets a channel be registered from inside an op. */
+   *  which is what lets a channel be registered from inside an op.
+   *
+   *  Returns 0 — never a live id, like `NO_ROUTE`'s — when the driver already holds
+   *  `maxRawLinks`, having CLOSED the channel it refused: registration is what takes
+   *  ownership of a socket, so a refusal that left it open would strand a descriptor with
+   *  nothing holding it. Every path that mints an id goes through here, so the ceiling
+   *  covers a guest dial, an accepted connection and a host-managed handover alike. */
   private register(channel: RawLink): number {
+    if (this.channels.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
+      try { channel.close(false); } catch { /* already gone */ }
+      return 0;
+    }
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
@@ -468,6 +500,10 @@ export class TransportHost {
   openLink(opts: OpenLinkOptions): LinkHandle {
     if (!this.transportAvailable()) throw new Error("transport: no bundle owns the raw-link binding");
     const linkId = this.register(opts.channel);
+    // The channel is already closed (`register`), so this throws rather than returning a
+    // handle onto a dead socket: a host-managed transport asked to hand one over is code
+    // that can be told no, unlike the accept path below.
+    if (linkId === 0) throw new Error(`transport: raw link table is full (${this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS} links)`);
     this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
     this.announce(linkId, {
       weDialed: opts.weDialed,
@@ -523,6 +559,11 @@ export class TransportHost {
           return;
         }
         const linkId = this.register(channel);
+        // Dropped at the door, and the occupant never hears of it: the half-open tiers are
+        // policy ABOVE this table, and a connection the driver could not hold is not a link
+        // to have an opinion about. Silent, like every other pre-authentication refusal —
+        // a log line per connection would itself be the flood.
+        if (linkId === 0) return;
         this.announce(linkId, {
           weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,
         });

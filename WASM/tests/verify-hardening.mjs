@@ -19,7 +19,7 @@ const sodium = _sodium;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory } = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
+const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
 // is signed and verified with both halves of the author's key set (§12.4), so a bare
@@ -43,6 +43,15 @@ const rejects = async (p, msg) => { let threw = false; try { await p; } catch { 
 
 const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
+/** A module header plus a memory section declaring `initial`/`max` pages, and nothing else.
+ *  Enough for the bounds read, which walks section headers and deliberately does not
+ *  validate (core/wasm-limits.ts) — which is what makes an oversized declaration cheap to
+ *  state here rather than a second AssemblyScript build to maintain. */
+const memModule = (initialPages, maxPages) => {
+  const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; };
+  const body = [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]; // one memory, flags=1 (a maximum is declared)
+  return new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0, 5, body.length, ...body]);
+};
 
 console.log("\n§4.3 — declared memory is bounded before instantiation");
 {
@@ -55,22 +64,41 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkModuleMemory(withMax, 1024 * 1024), "a module above the host budget is refused");
   throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
+  // The ceiling is applied ONCE, by the shared load path, against the tighter of the shared
+  // default and the ceiling the target's loader DECLARES (bundle.ts `loadBundleModules`) —
+  // so a loader may hold itself to less than a bundle may land, and none can be looser. A
+  // stub loader is the whole fixture: under test is the composition, not an isolate.
+  const stub = (maxModuleMemoryBytes) => ({
+    maxModuleMemoryBytes,
+    build: async () => ({ call: async () => ({ bytes: null, ms: 0 }), dispose() { } }),
+  });
+  const bundleOf = (wasm) => ({ modules: [{ mod: { name: "m" }, wasm }] });
+  ok(await loadBundleModules(stub(undefined), bundleOf(withMax)) !== null,
+    "a loader declaring no ceiling of its own gets the shared one");
+  await rejects(loadBundleModules(stub(undefined), bundleOf(noMax)),
+    "an unbounded module is refused on the load path, whatever a loader would have built");
+  await rejects(loadBundleModules(stub(1024 * 1024), bundleOf(withMax)),
+    "a loader's TIGHTER ceiling is the one the load path applies");
+  // 128 MiB declared against a loader that would allow 1 GiB: the shared ceiling still wins.
+  await rejects(loadBundleModules(stub(1 << 30), bundleOf(memModule(1, 2048))),
+    "a loader's LOOSER ceiling cannot raise what a bundle may land");
+
   const host = new ModuleTable();
   const loaded = await host.build([{ name: "ok", wasm: withMax }]);
   const echoed = await loaded.call("ok", new Uint8Array());
   ok(echoed instanceof Object && echoed.bytes instanceof Uint8Array && typeof echoed.ms === "number",
     "ModuleTable builds a bounded module set (call resolves { bytes, ms })");
-  await rejects(host.build([{ name: "bad", wasm: noMax }]),
-    "ModuleTable refuses an unbounded module at install");
-  const tiny = new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 });
-  await rejects(tiny.build([{ name: "ok", wasm: withMax }]), "the budget is configurable per host");
+  ok(host.maxModuleMemoryBytes === 64 * 1024 * 1024,
+    "a table declares the shared ceiling through the loader seam by default");
+  ok(new ModuleTable({ maxModuleMemoryBytes: 1024 * 1024 }).maxModuleMemoryBytes === 1024 * 1024,
+    "the budget is configurable per host, and declared rather than applied");
 
   // The bind is all-or-none (§3.1): a bundle whose SECOND module is malformed leaves the
   // table exactly as it was. The host's guarantee, so a caller does nothing to earn it.
   const atomic = new ModuleTable();
   await rejects(atomic.build([
     { name: "first", wasm: withMax },
-    { name: "second", wasm: noMax },
+    { name: "second", wasm: new Uint8Array() },
   ]), "a bundle with one bad module is refused whole");
   loaded.dispose();
 }
@@ -283,6 +311,15 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const [appAgain, localAgain] = valuesFrom(seen[1].source);
   ok(appAgain.mode === "signed" && Object.keys(localAgain).length === 0,
     "local config is scoped to one load, not retained by the shell for another app or reload");
+  ok(seen[1]?.memoryLimitBytes === 7 * 1024 * 1024 && seen[1]?.deadlineMs === 1234,
+    "a load naming no bounds of its own falls back to the shell's");
+
+  // …and a load that names them OVERRIDES the shell's, which is the point of their being
+  // per load: one shell hosts unrelated apps, and the heap a storage guest needs is not the
+  // heap the transport bundle beside it should be handed.
+  await shell.loadBundleBlob(blob, { realmMemoryBytes: 9 * 1024 * 1024, guestDeadlineMs: 77 });
+  ok(seen.at(-1)?.memoryLimitBytes === 9 * 1024 * 1024, "a load's own realmMemoryBytes overrides the shell's");
+  ok(seen.at(-1)?.deadlineMs === 77, "a load's own guestDeadlineMs overrides the shell's");
   const cyclic = {}; cyclic.self = cyclic;
   await rejects(shell.loadBundleBlob(blob, { localConfig: cyclic }),
     "a non-JSON local value is refused instead of being silently changed during injection");
@@ -335,6 +372,35 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
+}
+
+console.log("\n§12.6 — the host's pre-open send queue is bounded");
+{
+  const { MessageChannel } = await imp("build/host/net-channel.js");
+  // A transport that never becomes writable — the state an unfinished connect leaves a
+  // channel in. Until `open` fires, everything written to it is HOST memory, spent by a
+  // peer that has proved nothing, so the queue that exists for a handshake frame or two
+  // must not be a place an occupant can put a megabyte per stalled socket.
+  const sent = [];
+  let closed = false;
+  const stuck = {
+    binaryType: "", bufferedAmount: 0,
+    send: (b) => sent.push(b),
+    close: () => { closed = true; },
+    addEventListener: () => { },
+  };
+  const ch = new MessageChannel(stuck);
+  let died = false;
+  ch.onClose(() => { died = true; });
+  const frame = new Uint8Array(64 * 1024);
+  for (let i = 0; i < 16; i++) ch.send(frame); // 1 MiB exactly — the last byte still inside
+  ok(!died && sent.length === 0, "a channel that has not opened buffers rather than writes");
+  ok(ch.buffered() === 1024 * 1024, `the queue reports its own bytes (got ${ch.buffered()})`);
+  ch.send(frame); // …and the frame that crosses it
+  // Failed, not silently trimmed: dropping a frame off an ordered stream leaves the far end
+  // waiting on a gap forever, where a dead channel is one the occupant is told about.
+  ok(died && closed, "crossing the ceiling fails the channel instead of growing the queue");
+  ok(ch.buffered() === 0, "a failed channel releases its queue rather than holding it to be collected");
 }
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
