@@ -186,6 +186,21 @@ export function isReservedProtocol(name: string): boolean {
 export function isGrant(name: string): boolean {
     return isAuthority(name) || isReservedProtocol(name);
 }
+/** The authorities that leave something behind: a durable write, or a submission that has
+ *  already reached another realm. Typed against the catalog, so renaming a name here is a
+ *  build error rather than a silently empty set. */
+const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs/delete", "route/deliver"]);
+/** Whether reaching this name outlives the realm that reached it. The shell's seam refuses
+ *  exactly these until a slot's installation commits (shell-core.ts): a candidate evaluates
+ *  its top level before the freshness mark and its claims land, and disposing that candidate
+ *  is the only undo the shell has. A reserved id is one of them — the callee has run.
+ *
+ *  Nothing else needs an entry. Reads and `crypto/*` leave nothing behind, `timer/*` is
+ *  cancelled with the realm, and `link/*` answers only the slot that owns the raw-link
+ *  binding (transport-host.ts) — which a candidate does not. */
+export function isIrreversible(name: string): boolean {
+    return IRREVERSIBLE.has(name) || isReservedProtocol(name);
+}
 /** The guest ABIs this host can run. One entry today; a host supporting two seams at
  *  once (a migration window) lists both, and the loader admits a guest declaring either.
  *  Absent from this list ⇒ the load is refused with its own error, the same legibility

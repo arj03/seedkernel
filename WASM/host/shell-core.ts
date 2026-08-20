@@ -18,7 +18,7 @@ import { createGuestSeam, slotSignScope, opCall, type SeamCrypto, type SignScope
 import type { TransportHost } from "./transport-host.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
+import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
@@ -219,6 +219,9 @@ interface AppSlot {
   fsScope?: Fs;
   signingScope: SignScope;
   realm: SafeRealm | null;
+  /** Set once this slot's freshness mark and claims have committed. Until then its seam
+   *  refuses the calls that disposing the slot could not take back (`seamFor`). */
+  active: boolean;
   /** This realm's deadlines. Per SLOT rather than per shell, because a timer is a
    *  pending re-entry into one particular realm: the cap is then one guest's to
    *  spend, and disposing that realm is what cancels exactly its own (`disposeSlot`). */
@@ -408,6 +411,7 @@ export function createShell(opts: CreateShellOptions & {
             fsScope: fs ? scopedFs(fs, appScopeFor(platform.sodium, loaded.author, loaded.manifest.app)) : undefined,
             signingScope: slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest)),
             realm: null,
+            active: false,
             timers,
         };
         return slot;
@@ -451,7 +455,7 @@ export function createShell(opts: CreateShellOptions & {
      *  cannot reach a socket descriptor because it is never handed one (§1,
      *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*`
      *  is an ordinary `"app"` authority (core/domains.ts), so every realm gets a table. */
-    const seamFor = (slot: AppSlot) => {
+    const seamFor = (slot: AppSlot): HostCall => {
         const b = slot.verifiedBundle;
         const links = hasLink(slot);
         // The 32 bytes this realm is attributed by when it calls another: the app key,
@@ -459,7 +463,7 @@ export function createShell(opts: CreateShellOptions & {
         // callee reads one field whether the caller was a peer or a co-resident app. Zero
         // is the HOST's own, and no app key derives it.
         const callerId = genesisHash(platform.sodium, enc.encode(keyOf(slot)));
-        return createGuestSeam({
+        const fullSeam = createGuestSeam({
             platform: {
                 sodium: platform.sodium,
                 identity: platform.identity,
@@ -501,6 +505,16 @@ export function createShell(opts: CreateShellOptions & {
                 call: slot.pureModules.call,
             },
         });
+        // A candidate's top level runs before its mark and claims commit, so until then the
+        // seam refuses what disposing that candidate could not take back (`isIrreversible`).
+        // Everything a guest initializes from stays open: its reads, `crypto/*` and its own
+        // modules — which is how a transport candidate reads `link/config` offside.
+        return (name, payload, budget) => {
+            if (!slot.active && isIrreversible(name)) {
+                throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
+            }
+            return fullSeam(name, payload, budget);
+        };
     };
     /** Enter a slot's guest. The null arm is reachable only from guest top-level code
      *  while its candidate realm is still being constructed. */
@@ -667,10 +681,9 @@ export function createShell(opts: CreateShellOptions & {
             };
             const key = appKeyFor(loaded.author, loaded.manifest.app);
             // Refuse a conflict already standing BEFORE the candidate's modules or guest
-            // execute. The guest's top level can use every authority its admitted manifest
-            // declares, and disposing a rejected candidate cannot undo an fs write or a raw
-            // link it opened. The second check in the synchronous commit window remains
-            // necessary: another load may take a free claim while this candidate is built.
+            // execute: a known loser is not worth a realm. The second check in the
+            // synchronous commit window remains necessary: another load may take a free
+            // claim while this candidate is built.
             refuseContested(loaded, key);
             const pureModules = await loadBundleModules(moduleLoader, v);
             const slot = newSlot(loaded, pureModules);
@@ -715,6 +728,9 @@ export function createShell(opts: CreateShellOptions & {
                 linkOwner = null;
                 netHost?.release(previous!);
             }
+            // The mark and every claim/link binding have landed, so this slot's writes and
+            // cross-realm calls are now its to make (`seamFor`).
+            slot.active = true;
             // The address book is mutable node state, not part of the candidate's static
             // `link/config` snapshot. Publish first, then replay it through the ordinary
             // host-event path. No await in between: a concurrent add is either in this

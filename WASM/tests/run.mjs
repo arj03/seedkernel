@@ -2599,6 +2599,98 @@ async function testPersistFailureRollsBack() {
   console.log("  OK\n");
 }
 
+// ─── Test: a candidate realm cannot act before its installation commits ─────
+//
+// Guest source is evaluated before the freshness mark and claim table land so it can
+// register its entrypoints. In that window the seam refuses what disposing the candidate
+// could not take back — a durable write, a call that already reached another realm — and
+// nothing else: a rejected upgrade must not leave the installed version's keyspace or its
+// neighbours touched.
+async function testCandidateRealmCannotActBeforeCommit() {
+  console.log("Test: a candidate realm cannot act before its installation commits");
+  const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE }
+    = await imp("build/host/bundle.js");
+  const { createShell: mkShell } = await imp("build/host/shell-core.js");
+  const { ModuleTable } = await imp("build/host/module-table.js");
+  const { admitAll } = await imp("build/host/policy.js");
+
+  const author = testAuthor();
+  const fs = new MemoryFs();
+  let reached = 0;
+  // The narrow transport surface the raw-link seam needs. Only `config` is exercised: it
+  // is the read the real transport's `init()` makes at top level.
+  const rawNet = {
+    config: () => Uint8Array.of(1),
+    open: () => ({ linkId: 0, framing: 0, authority: "" }),
+    send() {}, close() {}, buffered: () => 0, authenticated() {}, down() {},
+  };
+  const transport = {
+    route() {}, rawNet: () => rawNet, activate() {}, release() {}, replayAddresses() {}, close() {},
+  };
+  const guest = new TextEncoder().encode(GUEST_TEXT);
+  const blob = packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author, {
+      app: "offside", version: 1, protocols: ["offside/v1"],
+      modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
+      guest: {
+        hash: toHex(gHash(guest)), abi: GUEST_ABI_VERSION,
+        requires: ["fs/put", "link/config", "_svc"],
+      },
+    }),
+    [moduleFile("fwd")]: forwarderBytes,
+    [GUEST_FILE]: guest,
+  });
+  class FlakyStore extends FreshnessMarks {
+    fail = true;
+    persist() { if (this.fail) throw new Error("disk full"); }
+  }
+  const store = new FlakyStore();
+  const candidates = [];
+  const shell = mkShell({
+    platform: {
+      sodium, identity: generateKeyPair(), modules: new ModuleTable(), fs,
+      freshnessStore: store, transportHost: transport,
+      createRealm: async ({ hostCall }) => {
+        const refused = [];
+        for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
+          try { await hostCall(name, payload); } catch { refused.push(name); }
+        }
+        const config = await hostCall("link/config", new Uint8Array());
+        const moduleAnswer = await hostCall("fwd", Uint8Array.of(4));
+        candidates.push({ hostCall, refused, config, moduleAnswer });
+        return { call: async () => new Uint8Array(), dispose() {} };
+      },
+    },
+    // A platform claim standing in for the neighbour a candidate must not reach.
+    claims: { _svc: () => { reached++; return Promise.resolve(new Uint8Array()); } },
+    admit: admitAll,
+  });
+  const key = appKey(author.id, "offside");
+  try {
+    let rejected = false;
+    try { await shell.loadBundleBlob(blob); } catch { rejected = true; }
+    assert(rejected, "a failed freshness write rejects the candidate");
+    assertEqual(candidates[0].refused.sort(), ["_svc", "fs/put"],
+      "a candidate reaches neither a durable write nor another realm");
+    assertEqual(reached, 0, "…so the realm it called was never entered");
+    assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
+    assert(candidates[0].config.length === 1, "the reads a guest initializes from stay open");
+    assert(candidates[0].moduleAnswer[0] === 4, "…as do its own verified modules");
+    assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
+
+    store.fail = false;
+    await shell.loadBundleBlob(blob);
+    assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
+    await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
+    await candidates[1].hostCall("_svc", new Uint8Array());
+    assertEqual((await fs.stat()).used, 1, "the committed realm writes");
+    assertEqual(reached, 1, "…and reaches its neighbour");
+  } finally {
+    shell.close();
+  }
+  console.log("  OK\n");
+}
+
 // ─── Test: a failed revocation persist is a failed revocation ───────────────
 //
 // The same rule as the mark, one method over. A write that throws must not leave the key
@@ -2748,6 +2840,7 @@ await testPreRevocationStoreIsRefused();
 await testWrongTypedStoreIsRefused();
 await testAppNameLengthRefused();
 await testPersistFailureRollsBack();
+await testCandidateRealmCannotActBeforeCommit();
 await testFailedRevokePersistRollsBack();
 await testInPlaceUpgradeReleasesTheOldSlot();
 
