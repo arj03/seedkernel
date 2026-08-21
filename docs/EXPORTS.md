@@ -1,18 +1,38 @@
 # The public surface (and who consumes it)
 
-This repo is the runtime only. Every app lives outside it and reaches the runtime through the entry points in `WASM/package.json` `exports` — so **an export with no in-repo caller is not dead code**, it is surface some other repo depends on. Check this table before deleting or moving anything below.
+This repo is the runtime only. Every app lives outside it and reaches the runtime through the entry points in `WASM/package.json` `exports`, grouped below into three: an **authoring API** (build and sign the bundle format), a **runtime API** (boot a node and drive the shell), and **platform adapters** (the target-specific pieces a caller selects and hands to the runtime API) — so **an export with no in-repo caller is not dead code**, it is surface some other repo depends on. Check these tables before deleting or moving anything below.
+
+### Authoring API
+
+Building, signing, packing, and verifying the app-bundle format (§12.4) — the same toolkit seedstore's offline build and seedchat's runtime authoring both use.
+
+| Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
+| --- | :---: | :---: |
+| `./bundle` | ✓ (build-bundle, storage-bundle, tests, `verifyManifest` in p2p.html) | ✓ (chat-shell **authors and signs bundles at runtime**: `signManifest`, `packBundle`, `hybridAuthorKeysFromSeed`; smoke) |
+
+### Runtime API
+
+Booting a node and driving the shell — the ONE node-assembly (§12.9) described below.
+
+| Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
+| --- | :---: | :---: |
+| `./shell` | ✓ (`boot`/`bootRuntime`, the shell-run tests) | |
+| `./shell-core` | ✓ `bootShell`, `AppHandle`, `scopedFs` (storage-node, net.test) | ✓ `bootShell` (chat-shell, smoke) |
+| `./guest-seam` | ✓ `appSigner`/`guestSignScope` (manifest.ts), `GUEST_ABI_VERSION` (storage-bundle) | ✓ `GUEST_ABI_VERSION` (chat-shell, smoke, chat-app) |
+| `./transport-bundle` | ✓ `transportBundleBytes` (holder-guest, shell-run tests) | ✓ `transportBundleBytes` (chat-shell, smoke) |
+| `./transport-host` | ✓ (`StorageNode` type, import maps, the RTC/WS drivers) | ✓ (chat-shell constructs the adapter instance; smoke) |
+| `./module-table` | ✓ (import maps — bootShell's default module builder) | ✓ (import map only) |
+
+`GUEST_ABI_VERSION` straddles both groups — an author declares it in `guest.abi` when signing a manifest, and the shell checks it at load — but it names the *runtime* seam's version, so it lives here rather than in the authoring API.
+
+### Platform adapters
+
+Target-specific implementations a caller selects and hands to the runtime API above — a deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node-fs), not internals leaking out.
 
 | Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
 | --- | :---: | :---: |
 | `.` (Node host) | ✓ (`loadSodium` — the ML-DSA-mixed `loadCrypto`) | ✓ (`smoke.mjs`'s `loadCrypto`) |
-| `./shell` | ✓ (`boot`/`bootRuntime`, the shell-run tests) | |
-| `./shell-core` | ✓ `bootShell`, `AppHandle`, `scopedFs` (storage-node, net.test) | ✓ `bootShell` (chat-shell, smoke) |
-| `./bundle` | ✓ (build-bundle, storage-bundle, tests, `verifyManifest` in p2p.html) | ✓ (chat-shell **authors and signs bundles at runtime**: `signManifest`, `packBundle`, `hybridAuthorKeysFromSeed`; smoke) |
-| `./guest-seam` | ✓ `appSigner`/`guestSignScope` (manifest.ts), `GUEST_ABI_VERSION` (storage-bundle) | ✓ `GUEST_ABI_VERSION` (chat-shell, smoke, chat-app) |
 | `./safe-js` | ✓ (import maps; bootShell's default realm factory) | ✓ (chat-shell passes `createSafeRealm`; import map) |
-| `./transport-host` | ✓ (`StorageNode` type, import maps, the RTC/WS drivers) | ✓ (chat-shell constructs the adapter instance; smoke) |
-| `./transport-bundle` | ✓ `transportBundleBytes` (holder-guest, shell-run tests) | ✓ `transportBundleBytes` (chat-shell, smoke) |
-| `./module-table` | ✓ (import maps — bootShell's default module builder) | ✓ (import map only) |
 | `./quickjs` | ✓ (import maps + the browser-demo staging) | ✓ (import map) |
 | `./fs`, `./fs-memory`, `./fs-node` | ✓ | |
 | `./net-node`, `./net-ws` | ✓ | |
