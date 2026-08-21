@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": false
+  },
+  "files": [
+    "core/util.ts",
+    "core/domains.ts",
+    "core/wasm-limits.ts",
+    "host/bundle.ts",
+    "host/pq.ts"
+  ],
+  "include": []
+}

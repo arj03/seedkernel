@@ -14,10 +14,25 @@
 // build with a different key needs a different policy entry.
 //
 // The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65 envelope
-// (§12.4, §14.1). A PQ *identity* is as immovable as a PQ verifier: the 0x02 author id
-// is a key-set hash, so an author migrating later changes every pin and every table
-// name built on the old id. The ML-DSA half is derived from the same `--key` seed, so
-// one key file holds the whole identity.
+// (§12.4, §14.1), using host/bundle.ts's packing/signing (`packBundle`,
+// `hybridAuthorKeysFromSeed`, `signManifest`, `hybridAuthorId`) and host/pq.ts's
+// ML-DSA-65 driver — the SAME functions the runtime signs and verifies bundles with,
+// not a second copy. Those live in host/*.ts, and this script must run BEFORE the
+// project's full `tsc -p .` (host/main.ts imports this script's OWN generated output,
+// host/transport-bundle.ts, so a clean checkout cannot typecheck until this script has
+// run). That would ordinarily make host/bundle.ts and host/pq.ts unavailable here too —
+// they are typescript, not yet built — so `npm run build:transport-bundle` first runs a
+// narrow bootstrap compile (tsconfig.transport-prebuild.json) covering only the
+// import-free subgraph this script needs (core/util.ts, core/domains.ts,
+// core/wasm-limits.ts, host/bundle.ts, host/pq.ts — none of which reach host/main.ts or
+// the not-yet-generated transport-bundle.ts), and this script imports THAT output. The
+// full `build:host` compile afterward overwrites those same build/ files with identical
+// canonical output, so nothing is left half-built.
+//
+// A PQ *identity* is as immovable as a PQ verifier: the 0x02 author id is a key-set
+// hash, so an author migrating later changes every pin and every table name built on
+// the old id. The ML-DSA half is derived from the same `--key` seed, so one key file
+// holds the whole identity.
 //
 // The author key is `--key <32-byte seed hex>`, defaulting to transport/author.key —
 // generated on first run and gitignored, so a fresh clone mints its own author.
@@ -30,6 +45,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers-sumo";
 import { readGuestSource, readGuestAbi } from "./guest-source.mjs";
+import { packBundle, hybridAuthorKeysFromSeed, signManifest, hybridAuthorId, MANIFEST_FILE, GUEST_FILE, } from "../build/host/bundle.js";
+import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -42,74 +59,9 @@ const keyFlag = (() => {
 
 const toHex = (b) => Buffer.from(b).toString("hex");
 
-// FIPS 204 ML-DSA-65 field widths — the same numbers pq.ts cross-checks the module
-// against at load (`ML_DSA65_*`), restated here because this script must run before
-// build:host on a clean checkout and mirrors the build-side surface byte for byte.
-const ML_DSA65_PK_LEN = 1952;
-const ML_DSA65_SK_LEN = 4032;
-const ML_DSA65_SIG_LEN = 3309;
-const ML_DSA65_SEED_LEN = 32;
-const ML_DSA65_RND_LEN = 32;
-
-// A self-contained ML-DSA-65 driver over mldsa65.wasm, mirroring pq.ts's bump
-// allocator: every call rewinds to __heap_base, writes its inputs into linear memory,
-// runs, and reads the output back. The module never allocates and never retains
-// anything across a call, so a bump pointer is the whole memory manager.
-function makeMlDsa(wasmBytes) {
-  const e = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {}).exports;
-  const widths = [
-    ["public key", e.mldsa65_publickeybytes(), ML_DSA65_PK_LEN],
-    ["secret key", e.mldsa65_secretkeybytes(), ML_DSA65_SK_LEN],
-    ["signature", e.mldsa65_signaturebytes(), ML_DSA65_SIG_LEN],
-  ];
-  for (const [what, got, want] of widths) {
-    if (got !== want) throw new Error(`transport: mldsa65.wasm reports ${what} width ${got}, expected ${want}`);
-  }
-  const heapBase = e.__heap_base.value;
-  let top = heapBase;
-  const rewind = () => { top = heapBase; };
-  const alloc = (n) => {
-    const p = (top + 15) & ~15;
-    top = p + n;
-    const short = top - e.memory.buffer.byteLength;
-    if (short > 0) e.memory.grow(Math.ceil(short / 65536) + 1);
-    return p;
-  };
-  const bytes = () => new Uint8Array(e.memory.buffer);
-  const put = (b) => { const p = alloc(b.length); bytes().set(b, p); return p; };
-  // FIPS 204's hedging randomness, drawn here like pq.ts draws it: from the host's
-  // CSPRNG rather than from inside the module, which keeps it import-free.
-  const rnd = (n) => { const o = new Uint8Array(n); globalThis.crypto.getRandomValues(o); return o; };
-  return {
-    keypair(seed) {
-      if (seed.length !== ML_DSA65_SEED_LEN) throw new Error(`transport: ml-dsa-65 seed must be ${ML_DSA65_SEED_LEN} bytes`);
-      rewind();
-      const pkP = alloc(ML_DSA65_PK_LEN), skP = alloc(ML_DSA65_SK_LEN), seedP = put(seed);
-      if (e.mldsa65_keypair(pkP, skP, seedP) !== 1) throw new Error("transport: ml-dsa-65 keygen failed");
-      const m = bytes();
-      return {
-        publicKey: m.slice(pkP, pkP + ML_DSA65_PK_LEN),
-        privateKey: m.slice(skP, skP + ML_DSA65_SK_LEN),
-      };
-    },
-    sign(message, sk) {
-      if (sk.length !== ML_DSA65_SK_LEN) throw new Error(`transport: ml-dsa-65 secret key must be ${ML_DSA65_SK_LEN} bytes`);
-      rewind();
-      const sigP = alloc(ML_DSA65_SIG_LEN);
-      const msgP = put(message);
-      const rndP = put(rnd(ML_DSA65_RND_LEN));
-      const skP = put(sk);
-      if (e.mldsa65_sign(sigP, msgP, message.length, 0, 0, rndP, skP) !== 1) {
-        throw new Error("transport: ml-dsa-65 signing failed");
-      }
-      return bytes().slice(sigP, sigP + ML_DSA65_SIG_LEN);
-    },
-  };
-}
-
 async function main() {
   await sodiumDefault.ready;
-  const sodium = sodiumDefault;
+  let sodium = sodiumDefault;
 
   let seed;
   const keyPath = join(root, "transport", "author.key");
@@ -124,53 +76,17 @@ async function main() {
   }
   if (seed.length !== 32) throw new Error("--key must be 32 bytes of hex");
 
-  // The bundle format's build-side functions, mirrored here so this script is
-  // self-contained (it must run BEFORE build:host on a clean checkout). They
-  // match bundle.ts byte for byte: the manifest envelope is
-  // `[0x02][edPk(32)][mlDsaPk(1952)][edSig(64)][mlDsaSig(3309)][utf8 json]` over
-  // `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, and the container is
-  // `"SKB1" ‖ count u16 ‖ …`. The loader unpacks exactly what this packs.
-  const DOMAIN_MANIFEST = new TextEncoder().encode("seedkernel-manifest-sig-v1\0");
-  const DOMAIN_MANIFEST_AUTHOR = new TextEncoder().encode("seedkernel-manifest-author-v1\0");
-  const PQ_SEED_LABEL = new TextEncoder().encode("seedkernel-author-mldsa-v1");
-  const MANIFEST_FILE = "manifest.bundle";
-  const GUEST_FILE = "guest.js";
-  const concat = (parts) => {
-    let len = 0; for (const p of parts) len += p.length;
-    const out = new Uint8Array(len); let o = 0;
-    for (const p of parts) { out.set(p, o); o += p.length; }
-    return out;
-  };
-  const packBundle = (files) => {
-    const names = Object.keys(files);
-    const header = new Uint8Array(6);
-    header.set([0x53, 0x4b, 0x42, 0x31], 0);
-    new DataView(header.buffer).setUint16(4, names.length, false);
-    const parts = [header];
-    for (const name of names) {
-      const nameBytes = new TextEncoder().encode(name);
-      const data = files[name];
-      const rec = new Uint8Array(2 + nameBytes.length + 4);
-      const dv = new DataView(rec.buffer);
-      dv.setUint16(0, nameBytes.length, false);
-      rec.set(nameBytes, 2);
-      dv.setUint32(2 + nameBytes.length, data.length, false);
-      parts.push(rec, data);
-    }
-    return concat(parts);
-  };
+  // The ML-DSA-65 driver, mixed onto `sodium` (pq.ts `withMlDsa65`) so the one object
+  // satisfies both `AuthorSeedCrypto` and `ManifestCrypto` below — libsodium supplies the
+  // Ed25519 half and `crypto_generichash`, the mixin supplies the ML-DSA-65 half.
+  const mldsaInstance = new WebAssembly.Instance(
+    new WebAssembly.Module(readFileSync(join(root, "browser", "mldsa65.wasm"))), {});
+  sodium = withMlDsa65(sodium, createMlDsa65(mldsaInstance));
 
   // The author's key set: the Ed25519 key from the seed, and the ML-DSA-65 key derived
-  // from the SAME seed, so a rebuild with the same key is the same author (§12.4).
-  //
-  // A mirror of `hybridAuthorKeysFromSeed` (host/bundle.ts) only because this script must
-  // run before build:host on a clean checkout, so there is no build/ to import from. Keep
-  // the two byte-identical: a drift here does not fail, it silently re-identifies this
-  // artifact's author and invalidates every operator's pin.
-  const kp = sodium.crypto_sign_seed_keypair(seed);
-  const pqSeed = sodium.crypto_generichash(32, concat([seed, PQ_SEED_LABEL]));
-  const mldsa = makeMlDsa(readFileSync(join(root, "browser", "mldsa65.wasm")));
-  const pq = mldsa.keypair(pqSeed);
+  // from the SAME seed (host/bundle.ts `hybridAuthorKeysFromSeed`), so a rebuild with the
+  // same key is the same author (§12.4).
+  const keys = hybridAuthorKeysFromSeed(sodium, seed);
 
   const guest = readGuestSource();
   // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through the
@@ -206,15 +122,10 @@ async function main() {
       ],
     },
   };
-  const json = new TextEncoder().encode(JSON.stringify(manifest));
-  const suite = 0x02; // SUITE_MANIFEST_HYBRID_PQ: Ed25519 + ML-DSA-65, both required
-  const pre = concat([DOMAIN_MANIFEST, Uint8Array.of(suite), kp.publicKey, pq.publicKey, json]);
-  const edSig = sodium.crypto_sign_detached(pre, kp.privateKey);
-  const pqSig = mldsa.sign(pre, pq.privateKey);
-  const env = concat([Uint8Array.of(suite), kp.publicKey, pq.publicKey, edSig, pqSig, json]);
+  const env = signManifest(sodium, keys, manifest);
   // The 0x02 author id: the key-set hash policy pins, table names derive from, and
   // freshness is keyed by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`).
-  const authorId = sodium.crypto_generichash(32, concat([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(suite), kp.publicKey, pq.publicKey]));
+  const authorId = hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey);
   const blob = packBundle({ [MANIFEST_FILE]: env, [GUEST_FILE]: guest, "ws.wasm": wsWasm });
 
   writeFileSync(join(root, "build", "transport.skb"), blob);
@@ -241,7 +152,7 @@ export function transportBundleBytes() {
   writeFileSync(join(root, "host", "transport-bundle.ts"), ts);
   console.log(`  transport bundle: build/transport.skb (${blob.length} B)`);
   console.log(`  transport author: ${toHex(authorId)} (hybrid 0x02)`);
-  console.log(`  ed25519 half:     ${toHex(kp.publicKey)}`);
+  console.log(`  ed25519 half:     ${toHex(keys.ed.publicKey)}`);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
