@@ -25,13 +25,14 @@
 //
 // Authorities — the whole of what this program holds:
 //
-//   "node/sign"   msg -> 64B sig, under the scope the host chose from THIS bundle's
-//                 admission point (`link` ⇒ the network key). The host never reads the
-//                 suffix, and the channel format tag is part of msg below, so no
-//                 handshake shape is pinned into the host and no call signs raw bytes.
-//   "node/verify" [pk 32][sig 64][msg] -> [ok u8], under the SAME host-applied
-//                 scope — so this program checks a peer's transcript signature
-//                 without holding the scope it was made under.
+//   "link/sign"   msg -> 64B sig, under this slot's network scope (`DOMAIN_link_scope ‖
+//                 networkKey`) — the one thing this name ever signs under, wired only
+//                 because this bundle reaches `link`. The host never reads the suffix,
+//                 and the channel format tag is part of msg below, so no handshake shape
+//                 is pinned into the host and no call signs raw bytes.
+//   "link/verify" [pk 32][sig 64][msg] -> [ok u8], under the SAME network scope — so
+//                 this program checks a peer's transcript signature without holding the
+//                 scope it was made under.
 //   "node/random" [n u32 BE] -> n bytes            (nonces, ephemeral secrets)
 //   `link/*`      bytes over an opaque link id, opened and closed
 //   `timer/*`     deadlines, since a zero-authority realm has no setTimeout
@@ -56,8 +57,8 @@
 
 // ── capability names (must match the guest seam's dispatch table) ─────────────
 
-const N_SIGN = "node/sign";
-const N_VERIFY = "node/verify";
+const N_SIGN = "link/sign";
+const N_VERIFY = "link/verify";
 const N_RANDOM = "node/random";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
@@ -218,14 +219,13 @@ function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
 /** Ask the host to sign a tagged handshake transcript, under `DOMAIN_link_scope ‖
- *  networkKey` (the prefix is the host's, chosen from this bundle's admission point) with
- *  the node's channel key, which never enters this program.
+ *  networkKey` (the prefix is the host's, unconditional for this name) with the node's
+ *  channel key, which never enters this program.
  *
- *  `node/sign` THROWS when the bundle does not reach the authority or has no
- *  slot-derived scope (guest-seam.ts), so the `{ok}` shape is a real status: catching
- *  here lets the caller abort the link rather than unwind out of a frame-delivery
- *  callback and leave the socket open until it times out. Same idiom as `scalarmult`
- *  and `openZero`. */
+ *  `link/sign` THROWS when the bundle does not reach the authority (guest-seam.ts), so
+ *  the `{ok}` shape is a real status: catching here lets the caller abort the link
+ *  rather than unwind out of a frame-delivery callback and leave the socket open until
+ *  it times out. Same idiom as `scalarmult` and `openZero`. */
 function channelSign(root, th, id) {
   try {
     return { ok: true, sig: host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
@@ -639,13 +639,12 @@ class Link {
 
   signIdentity(th) {
     // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
-    // it and contributes the prefix it chose from this bundle's slot,
-    // `DOMAIN_link_scope ‖ networkKey` — which is why the network binding survives a
-    // transport that lies about its own root.
+    // it and prefixes with this slot's network scope, `DOMAIN_link_scope ‖ networkKey` —
+    // which is why the network binding survives a transport that lies about its own root.
     const r = channelSign(this.root, th, ownPk);
-    // The seam refused: no `node/sign` grant, or no slot-derived scope. Our own
-    // misconfiguration, never anything the peer did, so it aborts — a stall would claim
-    // this address went quiet, which is a different fact.
+    // The seam refused: no `link/sign` grant. Our own misconfiguration, never anything
+    // the peer did, so it aborts — a stall would claim this address went quiet, which is
+    // a different fact.
     if (!r.ok) { this.abort(); return null; }
     return { id: ownPk, sig: r.sig };
   }
@@ -656,7 +655,7 @@ class Link {
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
-    // node/verify applies the same host-owned scope this node signs under, so the preimage
+    // link/verify applies the same host-owned scope this node signs under, so the preimage
     // the two ends must agree on is the host's for its prefix half. The channel's format
     // tag is ours, so the two ends reconstruct that half here.
     if (!verify(id, sig, channelIdentityMessage(this.root, th, id))) return null;

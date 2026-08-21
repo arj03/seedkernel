@@ -1032,16 +1032,17 @@ async function testRequiresPickThePrivileges() {
   console.log("  OK\n");
 }
 
-// ─── Test: the signing scope follows the privilege, on EVERY load path ───────
+// ─── Test: node/sign is always the app scope; link/sign is the network scope, on
+// ─── EVERY load path — gaining `link` adds an endpoint, never changes one ───────
 //
-// `slotSignScope` is a function of admitted facts — the node's identity and the manifest —
-// which is the whole reason it cannot drift. Driven through a real shell because the
-// property is about the point where a signed manifest becomes a realm, and because the
-// path that could silently lose it is the in-place UPDATE: a transport that re-scoped
-// itself to `author ‖ app` on upgrade would keep serving while every handshake with an
+// `slotSignScopes` is a function of admitted facts — the node's identity and the
+// manifest — which is the whole reason it cannot drift. Driven through a real shell
+// because the property is about the point where a signed manifest becomes a realm, and
+// because the path that could silently lose it is the in-place UPDATE: a transport that
+// re-scoped itself on upgrade would keep serving while every handshake with an
 // un-upgraded peer failed as an authentication error with nothing naming the cause.
 async function testSigningScopeFollowsPrivilege() {
-  console.log("Test: the signing scope follows the privilege, on every load path");
+  console.log("Test: node/sign is always the app scope, link/sign is always the network scope, on every load path");
   const { createShell: mkShell } = await imp("build/host/shell-core.js");
   const { FreshnessMarks, signManifest, packBundle } = await imp("build/host/bundle.js");
   const { ModuleTable: MT } = await imp("build/host/module-table.js");
@@ -1074,26 +1075,35 @@ async function testSigningScopeFollowsPrivilege() {
   const msg = new Uint8Array([5, 4, 3]);
   const linkApp = guestSignScope(linkAuthor.id, "linkprobe");
   try {
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "link/open"]));
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "link/sign", "link/open"]));
     const v1 = await seam("node/sign", msg);
-    assert(signs(v1, DOMAIN_LINK, networkKey, msg),
-      "a slot reaching link signs under DOMAIN_link_scope ‖ networkKey");
-    assert(!signs(v1, DOMAIN_GUEST, linkApp, msg),
-      "…and never under its own author/app scope, so it cannot sign as an app");
+    assert(signs(v1, DOMAIN_GUEST, linkApp, msg),
+      "node/sign always signs under its own app scope, even for a slot that also reaches link");
+    assert(!signs(v1, DOMAIN_LINK, networkKey, msg),
+      "…and never under the network scope — gaining link never changes what node/sign means");
+    const l1 = await seam("link/sign", msg);
+    assert(signs(l1, DOMAIN_LINK, networkKey, msg),
+      "link/sign signs under DOMAIN_link_scope ‖ networkKey");
+    assert(!signs(l1, DOMAIN_GUEST, linkApp, msg),
+      "…and never under the app's own scope, so it cannot sign as the app");
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "link/open"]));
-    const v2 = await seam("node/sign", msg);
-    assert(signs(v2, DOMAIN_LINK, networkKey, msg),
-      "an in-place update of the link slot keeps the SAME scope — an upgrade cannot re-scope a node");
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "link/sign", "link/open"]));
+    const l2 = await seam("link/sign", msg);
+    assert(signs(l2, DOMAIN_LINK, networkKey, msg),
+      "an in-place update of the link slot keeps the SAME network scope — an upgrade cannot re-scope a node");
 
-    // And the other arm, on a shell that already has a link occupant.
+    // And the other arm, on a shell that already has a link occupant: an ordinary app
+    // signs under its own scope through node/sign and has no link/sign at all.
     await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node/sign"]));
     const app = await seam("node/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
       "an ordinary app signs under DOMAIN_guest ‖ author ‖ app");
     assert(!signs(app, DOMAIN_LINK, networkKey, msg),
       "…and cannot reach the link occupant's network scope");
+    let refused = false;
+    try { await seam("link/sign", msg); } catch { refused = true; }
+    assert(refused, "an app that never declared link/sign cannot reach it at all");
 
     // The two arms are the two exported constructors, so a caller building a scope by hand
     // agrees with what the slot got.

@@ -26,7 +26,7 @@
 // There is no raw module install path: signed bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScopes, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
@@ -96,7 +96,7 @@ export interface ShellPlatform {
      *  not a gate (§12.6); absent ⇒ the public network. Feeds the raw link configuration
      *  and the signing scope granted to a bundle reaching `link` (`linkSignScope`).
      *
-     *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
+     *  The scope is the load-bearing use: `link/sign` prefixes and never parses, so it is
      *  the only binding of a link occupant's signature to this node's network that the slot
      *  occupant cannot choose. Drop it from the preimage and a confined transport on one
      *  network can mint transcripts another network's verifier accepts. */
@@ -286,6 +286,10 @@ interface AppSlot {
    *  copy of it. */
   appScope: string;
   signingScope: SignScope;
+  /** This slot's network scope — present only when it reaches `link` (`slotSignScopes`,
+   *  guest-seam.ts). What `link/sign`/`link/verify` are wired to; `signingScope` above is
+   *  what `node/sign`/`node/verify` are wired to, unconditionally, regardless of this. */
+  linkSigningScope?: SignScope;
   realm: SafeRealm | null;
   /** Set once this slot's freshness mark and claims have committed. Until then its seam
    *  refuses the calls that disposing the slot could not take back (`seamFor`). */
@@ -474,12 +478,14 @@ export function createShell(opts: CreateShellOptions & {
             });
         });
         const appScope = appScopeFor(platform.sodium, loaded.author, loaded.manifest.app);
+        const scopes = slotSignScopes(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
             verifiedBundle: loaded,
             pureModules,
             fsScope: fs ? scopedFs(fs, appScope) : undefined,
             appScope,
-            signingScope: slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest)),
+            signingScope: scopes.app,
+            linkSigningScope: scopes.link,
             realm: null,
             active: false,
             timers,
@@ -548,14 +554,17 @@ export function createShell(opts: CreateShellOptions & {
                 // is one of these. `crypto/*` and the bundle's own module names are exempt:
                 // a fixed catalog and the app's own code, never grants.
                 names: new Set(b.manifest.guest.requires),
-                // What SIGN signs under was chosen with the slot, from the privilege the
-                // bundle reaches (`slotSignScope`, §12.2) — not here, and never by the
-                // guest. Both slots sign with the node's one key and the slot picks what
-                // the signature MEANS: a link occupant signs under DOMAIN_link_scope ‖
-                // networkKey, an app under DOMAIN_guest ‖ its own bundle's scope. The seam
-                // prefixes and never parses, so neither can produce the other's signature
-                // and no op signs raw bytes.
+                // What node/sign signs under: this slot's own app scope, unconditionally —
+                // gaining `link` never changes what this name means (§12.5's monotonicity:
+                // a grant only ever ADDS an endpoint, never alters an existing one). The
+                // seam prefixes and never parses, so no op signs raw bytes.
                 signScope: slot.signingScope,
+                // What link/sign signs under: the node's network scope, present only when
+                // this slot reaches `link` (`slotSignScopes`, §12.2) — a SEPARATE name from
+                // node/sign, never a second meaning for it. Both sign with the node's one
+                // key; the scope is what the name MEANS: DOMAIN_link_scope ‖ networkKey
+                // here, DOMAIN_guest ‖ the bundle's own scope for node/sign above.
+                linkSignScope: slot.linkSigningScope,
                 // Scoped to this app key, so `fs` grants reach this app's own keyspace and
                 // not the node's — the same structural ownership module names have (§5.1).
                 // Wired whenever the node has an fs at all, without consulting the

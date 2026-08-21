@@ -57,7 +57,7 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  Adding a catalog name does not change the ABI. Changing an existing name, framing or
  *  preamble meaning does. The constant lives with the suite ids so manifest verification
  *  need not import the seam implementation; guest-seam.ts re-exports it. */
-export const GUEST_ABI_VERSION = 8;
+export const GUEST_ABI_VERSION = 9;
 /** The crypto primitives this host serves through the `crypto/` prefix — the pure half of
  *  the seam, and NOT something a manifest declares: `cryptoCatalog` (guest-seam.ts) is
  *  total over this list, so a partial catalog is unrepresentable and there is nothing for a
@@ -140,6 +140,8 @@ export const AUTHORITY_CALLS = {
     "link/stat": "link",
     "link/authenticated": "link",
     "link/down": "link",
+    "link/sign": "link",
+    "link/verify": "link",
     "route/deliver": "route",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;

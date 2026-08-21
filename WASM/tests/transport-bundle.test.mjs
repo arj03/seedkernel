@@ -81,9 +81,9 @@ function transportBundleAt(version, keys, guestSource) {
       // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
       // `link` privilege the admission dispatch reads (§12.5).
       requires: [
-        "node/sign", "node/verify", "node/random",
+        "node/random",
         "link/config", "link/open", "link/send", "link/close", "link/stat",
-        "link/authenticated", "link/down", "route/deliver",
+        "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
         "timer/arm", "timer/clear",
       ],
     },

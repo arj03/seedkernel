@@ -199,9 +199,9 @@ async function main() {
       // from this same signed bundle, and the primitive catalog is total on any host with
       // a guest seam. What this program needs of them is the `abi` above (§12.1).
       requires: [
-        "node/sign", "node/verify", "node/random",
+        "node/random",
         "link/config", "link/open", "link/send", "link/close", "link/stat",
-        "link/authenticated", "link/down", "route/deliver",
+        "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
         "timer/arm", "timer/clear",
       ],
     },

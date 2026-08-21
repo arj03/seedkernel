@@ -24,10 +24,11 @@
 // `defer()` for the same reason (realm-queue.ts).
 //
 // The crypto the guest reaches is the seam's opaque primitive catalog, and the transcript
-// signature is the ordinary `node/sign`, which the seam scopes to
-// `DOMAIN_link_scope ‖ networkKey` because this slot reaches `link`. The channel format tag
-// rides inside the suffix the host never reads, so no handshake shape is pinned into the
-// core and the node's key never enters the guest.
+// signature is `link/sign`, wired only because this slot reaches `link` and scoped to
+// `DOMAIN_link_scope ‖ networkKey` unconditionally — a separate name from the ordinary
+// app-scoped `node/sign`, never a second meaning for it. The channel format tag rides
+// inside the suffix the host never reads, so no handshake shape is pinned into the core
+// and the node's key never enters the guest.
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
