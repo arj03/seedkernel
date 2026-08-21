@@ -38,7 +38,7 @@ Target-specific implementations a caller selects and hands to the runtime API ab
 | `./net-node`, `./net-ws` | ✓ | |
 | `./net-rtc` | ✓ (browser **and** console) | ✓ (`media-rtc.js`'s `RtcNetwork`) |
 | `./net-rtc-node` | ✓ | |
-| `./pq` | ✓ (p2p.html's `withMlDsa65`) | ✓ (chat-shell's `withMlDsa65`/`loadMlDsa65` — the browser's substitute for Node's `loadCrypto`) |
+| `./crypto-browser` | ✓ (`index.html`, `p2p.html` — both call `loadCrypto` directly) | ✓ (chat-shell's `loadCrypto`) |
 | `./libsodium` | ✓ | ✓ |
 | `./libsodium-core`, `./libsodium.wasm` | *(no direct importer — `libsodium-wrappers.mjs` resolves both relative to its own URL, so all three must stay in one directory, and a consumer staging one into a web root stages all three)* | |
 
@@ -54,7 +54,7 @@ The pin is ANDed onto the caller's predicate, never substituted for it: an opera
 Three traps this table exists to prevent:
 
 - **WebRTC is not chat's.** `host/net-rtc.ts` and `host/net-rtc-node.ts` are neither shared-logic (they are absent from the `build:loader-bundles` list) nor app-specific. seed store drives `RtcNetwork` from the browser (`WASM/browser/p2p.html`) *and* from the console over werift (`WASM/scripts/serve-rtc-holder.mjs`, `smoke-rtc.mjs`), so both files outlive any one app.
-- **`loadCrypto` is Node-only.** It lives in `host/crypto-node.ts` and pulls the npm package, so it is not reachable from a browser page — it is the whole reason both consumers import the bare `.` entry, and each does so only from a Node script. Browsers take `./libsodium`, both consumers do, and neither should ship a second sumo build: that export is the *same artifact* the Go loader embeds, so one crypto binary serves all three targets. Browsers take `./pq` for the ML-DSA-65 half of the same story.
+- **`loadCrypto` has a Node build and a browser build, not one shared function.** Node's (`.` / `host/crypto-node.ts`) pulls the npm package and reads both `.wasm` files off disk; the browser's (`./crypto-browser` / `host/crypto-browser.ts`) fetches them by URL onto a caller-supplied sumo instance instead. Browsers take `./libsodium`, both consumers do, and neither should ship a second sumo build: that export is the *same artifact* the Go loader embeds, so one crypto binary serves all three targets. `./pq` and `./kem` are internal-only now — both `loadCrypto`s import them by relative path.
 - **A browser consumer resolves these through an import map, and Node cannot tell you it is wrong.** Every `seedkernel-wasm/*` above is a bare specifier: Node finds it through `node_modules`, a browser page only through a hand-written `<script type="importmap">`. So an export that a consumer's *host* code starts importing is invisibly missing from its *pages* until one is loaded — the Node suite stays green throughout. Seed store's `scripts/build-browser-demo.mjs` walks each page's module graph at stage time and fails on an unmapped specifier; adding an export here is a good moment to check the consumer's map.
 
 Apps vendor the built host into their own web root and resolve `seedkernel-wasm/*` through an import map — see `WASM/browser/p2p.html` in seed store or `browser/chat-shell.html` in seedchat. Anything shipped to a browser therefore needs `npm run build:host:min` to be current; a stale `build-min` is the easiest cross-repo breakage to miss.

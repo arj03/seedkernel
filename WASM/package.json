@@ -64,9 +64,9 @@
       "types": "./build/host/transport-bundle.d.ts",
       "default": "./build/host/transport-bundle.js"
     },
-    "./pq": {
-      "types": "./build/host/pq.d.ts",
-      "default": "./build/host/pq.js"
+    "./crypto-browser": {
+      "types": "./build/host/crypto-browser.d.ts",
+      "default": "./build/host/crypto-browser.js"
     },
     "./bundle": {
       "types": "./build/host/bundle.d.ts",
