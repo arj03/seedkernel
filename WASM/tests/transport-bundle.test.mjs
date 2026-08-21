@@ -25,7 +25,7 @@ const { createShell } = await imp("build/host/shell-core.js");
 const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
-const { FreshnessMarks, signManifest, hybridAuthorId, hybridAuthorKeysFromSeed, packBundle, MANIFEST_FILE, verifyBundle } = await imp("build/host/bundle.js");
+const { FreshnessMarks, authorBundle, hybridAuthorId, hybridAuthorKeysFromSeed, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
@@ -67,29 +67,26 @@ assert(derivedTransportAuthor === transportAuthor,
 function transportBundleAt(version, keys, guestSource) {
   const guest = guestSource ?? new Uint8Array(readGuestSource());
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
-  const manifest = {
+  const { blob } = authorBundle(sodium, keys, {
     app: "transport", version,
-    modules: [{ name: "ws", hash: Buffer.from(sodium.crypto_generichash(32, wsWasm)).toString("hex") }],
     // The reserved id the transport claims (§12.10) — mirror of the artifact manifest.
     protocols: [TRANSPORT_SERVICE],
-    guest: {
-      hash: Buffer.from(sodium.crypto_generichash(32, guest)).toString("hex"),
-      // Read, never restated: a hardcoded number here would pass a test that the
-      // production loader would refuse the moment the seam revved (§12.4).
-      abi: GUEST_ABI_VERSION,
-      // Exactly the authorities the transport guest holds — a mirror of the artifact
-      // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
-      // `link` privilege the admission dispatch reads (§12.5).
-      requires: [
-        "node/random",
-        "link/config", "link/open", "link/send", "link/close", "link/stat",
-        "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
-        "timer/arm", "timer/clear",
-      ],
-    },
-  };
-  const env = signManifest(sodium, keys, manifest);
-  return packBundle({ [MANIFEST_FILE]: env, "guest.js": guest, "ws.wasm": wsWasm });
+    modules: [{ name: "ws", wasm: wsWasm }],
+    guestSource: guest,
+    // Read, never restated: a hardcoded number here would pass a test that the
+    // production loader would refuse the moment the seam revved (§12.4).
+    guestAbi: GUEST_ABI_VERSION,
+    // Exactly the authorities the transport guest holds — a mirror of the artifact
+    // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
+    // `link` privilege the admission dispatch reads (§12.5).
+    guestRequires: [
+      "node/random",
+      "link/config", "link/open", "link/send", "link/close", "link/stat",
+      "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
+      "timer/arm", "timer/clear",
+    ],
+  });
+  return blob;
 }
 
 // One app author for both nodes: each loads the echo app, so a request from either

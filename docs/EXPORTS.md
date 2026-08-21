@@ -4,11 +4,11 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 
 ### Authoring API
 
-Building, signing, packing, and verifying the app-bundle format (§12.4) — the same toolkit seedstore's offline build and seedchat's runtime authoring both use.
+Building, signing, packing, and verifying the app-bundle format (§12.4). `authorBundle` (hash, assemble, sign, pack) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side should make — both apps' offline builds author with it now, and no runtime shell signs anything, only verifies. `verifyManifest` stays exported for `p2p.html`, which fetches a bare envelope with no container to unpack. The remaining lower-level primitives stay exported for seedkernel's own hardening tests and seedchat's `smoke.mjs`, which deliberately reach below the typed wrapper — not the path an external consumer should use.
 
 | Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
 | --- | :---: | :---: |
-| `./bundle` | ✓ (build-bundle, storage-bundle, tests, `verifyManifest` in p2p.html) | ✓ (chat-shell **authors and signs bundles at runtime**: `signManifest`, `packBundle`, `hybridAuthorKeysFromSeed`; smoke) |
+| `./bundle` | ✓ (`authorBundle` in build-bundle/storage-bundle, `verifyBundle` in build-bundle reading back a prior version, `verifyManifest` in p2p.html — see above, tests reach the lower-level primitives directly) | ✓ (`authorBundle` in `scripts/build-app-bundle.mjs`, `verifyBundle` in chat-shell's `peekMeta`, `hybridAuthorId`/`hybridAuthorKeysFromSeed` for message identity, smoke signs directly with `signManifest`/`packBundle` to exercise those primitives) |
 
 ### Runtime API
 

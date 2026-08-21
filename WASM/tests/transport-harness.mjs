@@ -27,7 +27,7 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
  *  lives with the occupant and here, where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
-export const { signManifest, packBundle, genesisHash, MANIFEST_FILE, GUEST_FILE } = await imp("build/host/bundle.js");
+export const { authorBundle } = await imp("build/host/bundle.js");
 export const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
@@ -104,23 +104,18 @@ function invoke(shell, appKey, op, args = new Uint8Array(0)) {
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
 export function harnessAppBlob(author, mode = "echo") {
   const guest = new TextEncoder().encode(HARNESS_GUEST);
-  const manifest = {
+  const { blob } = authorBundle(sodium, author, {
     app: "harness",
     version: 1,
     protocols: [PROTO],
     modules: [],
-    guest: {
-      hash: Buffer.from(genesisHash(sodium, guest)).toString("hex"),
-      abi: GUEST_ABI_VERSION,
-      // The whole of what an app needs to talk to the network: the id the transport claims.
-      requires: [TRANSPORT_SERVICE],
-      config: { mode },
-    },
-  };
-  return packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author, manifest),
-    [GUEST_FILE]: guest,
+    guestSource: guest,
+    guestAbi: GUEST_ABI_VERSION,
+    // The whole of what an app needs to talk to the network: the id the transport claims.
+    guestRequires: [TRANSPORT_SERVICE],
+    guestConfig: { mode },
   });
+  return blob;
 }
 
 /** The app key the harness app binds under, for `invoke`. */

@@ -845,6 +845,60 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     }
     return result;
 }
+/** The raw materials for a NEW signed bundle — everything `authorBundle` hashes,
+ *  assembles into a manifest, signs, and packs. `verifyBundle`'s mirror image: that
+ *  unpacks and checks a blob down to `{modules: [{mod, wasm}], guestSource}`; this
+ *  builds a blob up from the same shape. `modules[].hash` and `guest.hash` are
+ *  DERIVED here, never supplied — an author states what bytes ship, not what they
+ *  hash to, so there is no way to construct a bundle whose manifest and content
+ *  disagree (§12.4). */
+export interface UnsignedBundle {
+    app: string;
+    /** Monotonic per-(author, app) freshness mark (§12.4) — the caller's to bump. */
+    version: number;
+    protocols?: string[];
+    modules: { name: string; wasm: Uint8Array }[];
+    guestSource: Uint8Array;
+    guestAbi: number;
+    guestRequires: string[];
+    guestConfig?: JsonObject;
+}
+/** What `authorBundle` returns: the packed, signed blob ready to ship, and the
+ *  manifest it signed — so a caller that logs or records what it just published
+ *  (a version number, a per-module hash) reads it off the value rather than
+ *  re-parsing the blob it just built. */
+export interface AuthoredBundle {
+    blob: Uint8Array;
+    manifest: BundleManifest;
+}
+/** Build a new signed bundle from its raw materials (§12.4): hash every module and the
+ *  guest, assemble the manifest, sign it (`signManifest`), pack the container
+ *  (`packBundle`). The one call every bundle author makes — seedstore's offline build
+ *  (`storage-bundle.mjs`) and seedchat's offline build (`scripts/build-app-bundle.mjs`)
+ *  both reduce to this, in place of each reimplementing the hash-then-sign-then-pack
+ *  sequence. The mirror of `verifyBundle`, which runs the same four steps in reverse. */
+export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, input: UnsignedBundle): AuthoredBundle {
+    const modules: BundleModule[] = input.modules.map(({ name, wasm }) => ({
+        name, hash: toHex(genesisHash(sodium, wasm)),
+    }));
+    const guest: BundleGuest = {
+        hash: toHex(genesisHash(sodium, input.guestSource)),
+        abi: input.guestAbi,
+        requires: input.guestRequires,
+        ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
+    };
+    const manifest: BundleManifest = {
+        app: input.app,
+        version: input.version,
+        ...(input.protocols !== undefined ? { protocols: input.protocols } : {}),
+        modules,
+        guest,
+    };
+    const env = signManifest(sodium, keys, manifest);
+    const files: Record<string, Uint8Array> = { [MANIFEST_FILE]: env, [GUEST_FILE]: input.guestSource };
+    for (const { name, wasm } of input.modules) files[moduleFile(name)] = wasm;
+    return { blob: packBundle(files), manifest };
+}
 /** Build a verified bundle's private module set. Any module failing releases the partial
  *  set and fails the candidate slot.
  *

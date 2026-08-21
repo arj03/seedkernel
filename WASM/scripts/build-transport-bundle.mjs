@@ -14,10 +14,10 @@
 // build with a different key needs a different policy entry.
 //
 // The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65 envelope
-// (§12.4, §14.1), using host/bundle.ts's packing/signing (`packBundle`,
-// `hybridAuthorKeysFromSeed`, `signManifest`, `hybridAuthorId`) and host/pq.ts's
-// ML-DSA-65 driver — the SAME functions the runtime signs and verifies bundles with,
-// not a second copy. Those live in host/*.ts, and this script must run BEFORE the
+// (§12.4, §14.1), using host/bundle.ts's `authorBundle` (hash, assemble, sign, pack —
+// one call), `hybridAuthorKeysFromSeed`, `hybridAuthorId`, and host/pq.ts's ML-DSA-65
+// driver — the SAME functions the runtime signs and verifies bundles with, not a
+// second copy. Those live in host/*.ts, and this script must run BEFORE the
 // project's full `tsc -p .` (host/main.ts imports this script's OWN generated output,
 // host/transport-bundle.ts, so a clean checkout cannot typecheck until this script has
 // run). That would ordinarily make host/bundle.ts and host/pq.ts unavailable here too —
@@ -45,7 +45,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers-sumo";
 import { readGuestSource, readGuestAbi } from "./guest-source.mjs";
-import { packBundle, hybridAuthorKeysFromSeed, signManifest, hybridAuthorId, MANIFEST_FILE, GUEST_FILE, } from "../build/host/bundle.js";
+import { authorBundle, hybridAuthorKeysFromSeed, hybridAuthorId } from "../build/host/bundle.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -93,40 +93,36 @@ async function main() {
   // one install path signed by this program's own author and is reached by logical name.
   // An ordinary §4 pure transform, admitted like any other module.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
-  const manifest = {
+  const { blob } = authorBundle(sodium, keys, {
     app: "transport",
     version: 1,
-    modules: [{ name: "ws", hash: toHex(sodium.crypto_generichash(32, wsWasm)) }],
     // The local service name chosen by this composition. It has no kernel semantics.
     protocols: ["_net"],
-    guest: {
-      hash: toHex(sodium.crypto_generichash(32, guest)),
-      // Read off the seam this program is compiled against, never retyped: a bundle
-      // whose declared ABI and actual ABI can differ is one that loads and then
-      // misreads its own arguments (the failure `guest.abi` exists to make loud).
-      abi: readGuestAbi(),
-      // EXACTLY the authorities this program holds, and so exactly what an operator
-      // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
-      // are the ONLY names carrying that privilege.
-      //
-      // What this program PROVIDES back is not here: it is not an authority it calls, it
-      // is the id it claims above. Its ws.wasm and its crypto are absent because neither
-      // is a grant and neither can be missing — a bare `host.call` name reaches modules
-      // from this same signed bundle, and the primitive catalog is total on any host with
-      // a guest seam. What this program needs of them is the `abi` above (§12.1).
-      requires: [
-        "node/random",
-        "link/config", "link/open", "link/send", "link/close", "link/stat",
-        "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
-        "timer/arm", "timer/clear",
-      ],
-    },
-  };
-  const env = signManifest(sodium, keys, manifest);
+    modules: [{ name: "ws", wasm: wsWasm }],
+    guestSource: guest,
+    // Read off the seam this program is compiled against, never retyped: a bundle
+    // whose declared ABI and actual ABI can differ is one that loads and then
+    // misreads its own arguments (the failure `guest.abi` exists to make loud).
+    guestAbi: readGuestAbi(),
+    // EXACTLY the authorities this program holds, and so exactly what an operator
+    // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
+    // are the ONLY names carrying that privilege.
+    //
+    // What this program PROVIDES back is not here: it is not an authority it calls, it
+    // is the id it claims above. Its ws.wasm and its crypto are absent because neither
+    // is a grant and neither can be missing — a bare `host.call` name reaches modules
+    // from this same signed bundle, and the primitive catalog is total on any host with
+    // a guest seam. What this program needs of them is the `abi` above (§12.1).
+    guestRequires: [
+      "node/random",
+      "link/config", "link/open", "link/send", "link/close", "link/stat",
+      "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
+      "timer/arm", "timer/clear",
+    ],
+  });
   // The 0x02 author id: the key-set hash policy pins, table names derive from, and
   // freshness is keyed by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`).
   const authorId = hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey);
-  const blob = packBundle({ [MANIFEST_FILE]: env, [GUEST_FILE]: guest, "ws.wasm": wsWasm });
 
   writeFileSync(join(root, "build", "transport.skb"), blob);
   const b64 = Buffer.from(blob).toString("base64");
