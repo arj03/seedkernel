@@ -56,7 +56,7 @@ Four things follow:
 
 The wire codec, the channel handshake, the record layer, link routing and the request/response frame codec are the guest program of a signed bundle, admitted by the same loader as any other app. It is a **guest** rather than a WASM module for a structural reason: a §4 module is a synchronous pure transform that imports nothing, which an AKE carrying session state cannot be. So the session state lives in the guest's own heap, keyed by a host-supplied link id, and the node key never enters it. Where a codec *is* a pure transform it ships as one — RFC 6455 is `ws.wasm`, a no-capability module of the same bundle.
 
-What this buys is that the **protocol** is replaceable without a fork: handshake, transcript, record framing and dial policy are all content, and a deployment that wants different ones ships a signed bundle and explicit `link`/`route` grants instead of a patched runtime. It can even be swapped under a running node: an update builds a complete replacement for its slot, then atomically replaces that slot, its ordinary service claim, and its raw-link binding. The new guest redials from the address book the *node* owns. Live links do not survive, since the session keys are in the outgoing guest's private memory — exactly what makes the transport confineable — so an upgrade is a **reconnect** (§12.10).
+What this buys is that the **protocol** is replaceable without a fork: handshake, transcript, record framing and dial policy are all content, and a deployment that wants different ones boots that signed bundle as its transport and grants its author `link`/`route`, instead of patching the runtime. It can even be swapped under a running node: an update builds a complete replacement for its slot, then atomically replaces that slot, its ordinary service claim, and its raw-link binding. The new guest redials from the address book the *node* owns. Live links do not survive, since the session keys are in the outgoing guest's private memory — exactly what makes the transport confineable — so an upgrade is a **reconnect** (§12.10).
 
 Two things keep that safe. Policy is keyed on the **capability** rather than on a kind of bundle, so who may *be* the network — the holder sees all plaintext and holds the session keys — is a decision the operator makes apart from who may ship an app (§12.5). And a link speaks exactly one suite, named by a byte both ends fold into what they sign, so a mixed period is a rollout rather than a corruption and an in-path downgrade is a dead link (§12.6).
 
@@ -150,14 +150,14 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,221 LOC)**
+**Shared — compiled once, run by all three targets (2,304 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 569 |
-| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 298 |
-| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 480 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 364 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 571 |
+| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 306 |
+| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 504 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 413 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 213 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 297 |
 
@@ -172,12 +172,12 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 
 | Target | What | LOC |
 | --- | --- | --- |
-| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, PQ drivers, entry points, key derivation | 1,537 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (403) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,152 Go + 496 TS |
+| **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, PQ drivers, entry points, key derivation | 1,504 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (386) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,152 Go + 479 TS |
 
-What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,372 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
+What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,373 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
-Each target therefore runs 2,221 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
+Each target therefore runs 2,304 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
 
 ## The overhead, measured
 

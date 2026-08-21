@@ -80,6 +80,15 @@
     "./libsodium-core": "./browser/libsodium-core.mjs",
     "./libsodium.wasm": "./browser/libsodium.wasm"
   },
+  "files": [
+    "build",
+    "build-min",
+    "browser",
+    "quickjs/dist",
+    "assembly/seedkernel",
+    "guest-handler.ts",
+    "native/host-shell.gen.js"
+  ],
   "scripts": {
     "build:ws": "asc assembly/ws/index.ts --config asconfig.ws.json --target release",
     "build:host": "tsc -p . && tsc -p tsconfig.check.json",

@@ -38,6 +38,13 @@ func TestPolicyRejectsForeignAuthor(t *testing.T) {
 // `guest.requires` alone decides which privileges are in play, and only in the strict
 // direction: naming any `link/*` puts `link` in the set, never takes it out.
 //
+// TWO independent things must agree before an author reaches `link`, and this proves both
+// halves refuse on their own. The operator's `grants` entry is one; the node's transport
+// AUTHOR PIN is the other — the assembly derives it from the transport blob this node
+// actually booted (`bootShell`, shell-core.ts), so the network can only ever be the
+// program the operator started the node with. A grant is therefore a veto an operator
+// holds over that blob's author, never a way to appoint a different one.
+//
 // Driven through the native loader, since `--policy` is an operator-facing surface here —
 // this is what proves it reaches that decision rather than a permissive default.
 func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
@@ -60,20 +67,16 @@ func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	// could fall through to the unprivileged base: a single `link/*` name is the whole
 	// claim, which is what the one-name bundle above already proves.
 
-	// Granting the privilege gets the same blob PAST admission, where it then fails on a
-	// node-state rule instead: this shell already booted the artifact's own transport, and
-	// the raw-link binding has ONE owner (§12.10). A different failure, from a policy edit
-	// and nothing else — which is the point. The refusal naming the binding rather than
-	// admission is exactly what proves the grant landed.
+	// The OTHER half: granting the privilege is still not enough. This node booted the
+	// artifact's own transport, so the pin names that author and no other — an operator
+	// who writes a grant for someone else has widened their own policy and changed
+	// nothing about who may be the network. Running a different transport means booting a
+	// different blob (`--transport-bundle`), which is what the pin is derived from.
 	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"],"route":["` + authorHex + `"]}}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	status := loadBundle(linkBundle)
-	if strings.Contains(status, "rejected by admission") {
-		t.Fatalf("a grants.link entry must admit its author to the transport: %s", status)
-	}
-	if !strings.Contains(status, `"link" binding is already held by`) {
-		t.Fatalf("a second link-capable bundle must be refused the binding, not take it: %s", status)
+	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
+		t.Fatalf("a grant must not appoint an author the transport pin does not name: %s", status)
 	}
 	appBundle, _ := writeTestBundle(t, author, "ordinary", 1)
 	if status := loadBundle(appBundle); !strings.Contains(status, "ordinary") {

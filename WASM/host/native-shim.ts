@@ -10,10 +10,10 @@
 // modules, assembly order included. Being TypeScript checked against the same interfaces
 // is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";
-import { appKeyFor, verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
+import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, loadedLine, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import {
-  createShell, type RealmFactory, type Shell, type ShellSodium,
+  bootShell, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
@@ -21,12 +21,10 @@ import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
-import { toHex, fromHex, fromBase64, errMessage } from "../core/util.js";
-import { isAdmissionRejected } from "./shell-core.js";
-import { TransportHost } from "./transport-host.js";
+import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
 // the signed program that IS the node's network (§12.6).
-import { TRANSPORT_BUNDLE_B64 } from "./transport-bundle.js";
+import { transportBundleBytes } from "./transport-bundle.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
  *  `null` means the call parked: Go holds the guest's Promise under `callId` and settles it
@@ -366,7 +364,7 @@ const channels: ChannelFactory = {
 /** The artifact-shipped transport bundle, as raw bytes (transport-bundle.js). */
 const embeddedTransport = (() => {
     try {
-        return fromBase64(TRANSPORT_BUNDLE_B64);
+        return transportBundleBytes();
     }
     catch {
         return null;
@@ -464,7 +462,11 @@ function theShell() {
  *  endpoint: a test standing a node up some other way is the second assembly this target
  *  exists not to have (§12.9), and when the two last diverged it surfaced as a network
  *  timeout rather than a compile error. The config is an OBJECT for the same reason — a
- *  positional signature drifting against a Go harness string is a silent break. */
+ *  positional signature drifting against a Go harness string is a silent break.
+ *
+ *  The whole node is stood up by the shared `bootShell` — this target supplies the
+ *  platform parts (Go's modules, fs, channels, realm) and bootShell does the rest, the
+ *  transport bundle's author pin included. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
     contactSecret?: Uint8Array;
@@ -479,53 +481,34 @@ async function makeTransportNode(cfg: {
     /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate. */
     networkKey?: Uint8Array;
     requestDeadlineMs?: number;
-    /** The §12.3 guest bounds, threaded through to `createShell`: a bound the shell accepts
+    /** The §12.3 guest bounds, threaded through to `bootShell`: a bound the shell accepts
      *  but no target can set is a bound nobody has. */
     guestDeadlineMs?: number;
     realmMemoryBytes?: number;
     /** A transport bundle to load instead of the artifact-shipped one (§12.6). */
     transportBundle?: Uint8Array;
 }): Promise<NodeRuntime> {
-    const transportHost = new TransportHost({
-        identity: cfg.identity,
+    const { shell, transport } = await bootShell({
+        sodium, identity: cfg.identity, modules, fs,
+        freshnessStore: new NativeFreshnessStore(storeDir),
         networkKey: cfg.networkKey,
-        contactSecret: cfg.contactSecret,
-        requestDeadlineMs: cfg.requestDeadlineMs,
-        channels,
-        listen: cfg.listen,
-        wsListen: cfg.wsListen,
-    });
-    const s = createShell({
-        platform: {
-            sodium, identity: cfg.identity, modules, fs,
-            freshnessStore: new NativeFreshnessStore(storeDir),
-            networkKey: cfg.networkKey, transportHost, createRealm,
+        transport: {
+            contactSecret: cfg.contactSecret,
+            requestDeadlineMs: cfg.requestDeadlineMs,
+            channels,
+            listen: cfg.listen,
+            wsListen: cfg.wsListen,
         },
+        transportBundle: cfg.transportBundle,
+        // The admission predicate in force (§12.5): the shell closes over this
+        // indirection rather than a fixed predicate, so trust can be narrowed or widened
+        // without restarting the node (`setPolicy`).
         admit: (v, ctx) => admissionPolicy(v, ctx),
         guestDeadlineMs: cfg.guestDeadlineMs,
         realmMemoryBytes: cfg.realmMemoryBytes,
+        createRealm,
     });
-    // The transport bundle IS the node's network: verify + govern under the policy's
-    // `link` grant, install, and the shell stands the driver up. A policy that does not
-    // grant the transport author that privilege leaves the node without a network.
-    const transport = cfg.transportBundle ?? embeddedTransport;
-    if (transport) {
-        try {
-            await s.loadBundleBlob(transport);
-        }
-        catch (err) {
-            if (!isAdmissionRejected(err)) {
-                throw err;
-            }
-            // A deliberate configuration, but indistinguishable from a broken network
-            // unless it says so.
-            bridge.log('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
-        }
-    }
-    // Listener lifecycle is host configuration, independent of service claims. With no
-    // raw-link binding owner, accepted links are closed.
-    await transportHost.start();
-    return { shell: s, transport: transportHost };
+    return { shell, transport: transport! };
 }
 /** Stand THE node up and keep it: identity, the transport bundle, the shared shell.
  *  Resolves once the listeners are bound and any cohort peers have been dialled, so

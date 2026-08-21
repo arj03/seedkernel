@@ -566,6 +566,43 @@ export function appSignScope(key: {
 }, author: Uint8Array, app: string): SignScope {
     return { domain: DOMAIN_GUEST, scope: guestSignScope(author, app), key };
 }
+/** The host-side twin of one slot's scoped SIGN/VERIFY ops (§12.2), for a host caller
+ *  that already holds the key — the storage host's descriptor signatures, which must
+ *  verify on every node running the same bundle and nowhere else.
+ *
+ *  `sign`/`verify` apply `DOMAIN_guest ‖ scope ‖ msg` exactly as the seam does
+ *  (`node/sign`/`node/verify`), from the SAME scope derivation an admitted slot gets
+ *  (`appSignScope`), so nothing here reconstructs host-owned prefix bytes. Two functions,
+ *  scoped: a host mirror that wants them needs no gate-free `createGuestSeam` over
+ *  `UNRESTRICTED_NAMES` to reach them. */
+export function appSigner(
+    sodium: SeamCrypto,
+    key: { publicKey: Uint8Array; privateKey: Uint8Array },
+    author: Uint8Array, app: string,
+): {
+    sign(msg: Uint8Array): Uint8Array;
+    /** False on a signature that does not verify under `(scope, pk)`; a `sig` or `pk`
+     *  of the wrong shape ALSO reads false (the seam's `node/verify` refuses a
+     *  mis-framed payload by throwing; a caller-facing verifier has no caller left to
+     *  explain to). */
+    verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
+} {
+    const scope = appSignScope(key, author, app);
+    const pre = (msg: Uint8Array) => concatBytes([scope.domain, scope.scope, msg]);
+    return {
+        sign(msg) {
+            return sodium.crypto_sign_detached(pre(msg), scope.key.privateKey);
+        },
+        verify(pk, sig, msg) {
+            try {
+                return sodium.crypto_sign_verify_detached(sig, pre(msg), pk);
+            }
+            catch {
+                return false;
+            }
+        },
+    };
+}
 /** The `link` capability's signing scope: `DOMAIN_link_scope ‖ networkKey`, signed by the
  *  node's identity key. The suffix is the slot occupant's business and the host does not
  *  look at it — the transport bundle tags its own handshake format inside it, so changing

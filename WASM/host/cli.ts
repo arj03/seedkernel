@@ -9,11 +9,11 @@
 // lines. Those are decisions, and a decision made twice eventually gets made differently.
 import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
-import { appKeyFor, isJsonObject, type JsonObject, type LoadedBundle } from "./bundle.js";
+import { isJsonObject, type JsonObject } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
 import type { TransportHost } from "./transport-host.js";
-import type { Shell } from "./shell-core.js";
+import type { AppHandle, Shell } from "./shell-core.js";
 
 /** Where a node's store lives when `--dir` is omitted. One value on every target, so
  *  the same command line runs the same node over the same store wherever it runs. */
@@ -234,9 +234,9 @@ function loadNodeKeys(host: CliHost, keyPath: string): NodeKeys {
  *  app key an operator would pass to `--uninstall`, and what the load CLAIMED to serve.
  *  The protocols come from the manifest, so a node that will answer nothing says so at the
  *  load rather than at the first frame. */
-export function loadedLine(b: LoadedBundle): string {
+export function loadedLine(b: AppHandle): string {
   const serves = b.manifest.protocols ?? [];
-  return `${b.manifest.app} v${b.manifest.version}  key ${appKeyFor(b.author, b.manifest.app)}` +
+  return `${b.manifest.app} v${b.manifest.version}  key ${b.key}` +
     `  serves ${serves.length ? serves.join(", ") : "(nothing — this bundle claims no protocol)"}`;
 }
 
@@ -327,7 +327,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   // load — signature, policy, freshness, integrity, binding, claiming the manifest's
   // protocol ids — is the shared shell's (§12.4, §12.10).
   if (bundlePath !== undefined) {
-    let loaded: LoadedBundle;
+    let loaded: AppHandle;
     try {
       // The file named by --app-config belongs only to this explicit load. It never
       // reaches the transport bundle stood above or another app loaded into this shell.
@@ -353,7 +353,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     // loaded too, so "the only one" is not something `--bundle` can mean.
     const op = args.get("op");
     if (op !== undefined) {
-      host.stdout(await shell.invoke(op, host.stdin(), appKeyFor(loaded.author, loaded.manifest.app)));
+      host.stdout(await loaded.invoke(op, host.stdin()));
     }
   }
 

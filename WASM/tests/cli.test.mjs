@@ -248,9 +248,10 @@ console.log("\n— the load line —");
 // tests assert on (native/testhost_test.go drives this very function).
 {
   const author = new Uint8Array(32).fill(0xab);
-  const line = loadedLine({ author, manifest: { app: "chat", version: 3, protocols: ["chat-v1", "chat-v2"] } });
-  ok(line === `chat v3  key ${toHex(author)}:chat  serves chat-v1, chat-v2`, "app, version, app key and protocols");
-  const quiet = loadedLine({ author, manifest: { app: "tool", version: 1 } });
+  const key = `${toHex(author)}:chat`;
+  const line = loadedLine({ key, author, manifest: { app: "chat", version: 3, protocols: ["chat-v1", "chat-v2"] } });
+  ok(line === `chat v3  key ${key}  serves chat-v1, chat-v2`, "app, version, app key and protocols");
+  const quiet = loadedLine({ key, author, manifest: { app: "tool", version: 1 } });
   ok(quiet.endsWith("serves (nothing — this bundle claims no protocol)"),
     "a bundle claiming no protocol says so at the load, not at the first frame");
 }

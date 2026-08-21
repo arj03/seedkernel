@@ -6,16 +6,29 @@
 // This is the ONE assemble path, and the assembly ORDER is the point: it is the last thing
 // two hosts could disagree about, so no target restates it.
 //
-//   main.ts       → boot()         → ModuleTable + NodeFs + FileFreshnessStore + NodeChannelFactory + safe-js → createShell()
-//   browser       → chat-shell.js  → ModuleTable + RtcNetwork-style openLink edges + sessionStorage freshness  → createShell()
-//   native        → native-shim.ts → Go module slots + Go Fs + Go channels + Go realm                → createShell()
-//   seedstore     → StorageNode    → { MemoryFs, FreshnessMarks }                  → createShell() + loadBundle(seedstore.skb)
+//   bootShell()   → the assembly, exported: every platform member defaulted (ModuleTable,
+//                   the fs backend, FreshnessMarks, lazy safe-js), the channel adapter
+//                   built or accepted, the transport bundle admitted under an implicit
+//                   author pin, its listeners bound, then createShell(). EVERY target
+//                   enters here — what varies is only which defaults it displaces.
+//   main.ts       → boot()         → NodeFs + FileFreshnessStore + NodeChannelFactory
+//   browser       → chat-shell.js  → an adapter instance (RtcNetwork hands channels over
+//                   openLink) + the consent gate; the transport load stays lazy so a
+//                   room-secret change can re-load it
+//   native        → native-shim.ts → Go module slots, Go fs, Go channels, the Go realm —
+//                   the target that displaces the most, and still not the assembly
+//   seedstore     → StorageNode    → MemoryFs + FreshnessMarks
+//
+// `createShell` is the seam underneath: the wired shell without the assembly's defaults,
+// load order or pin. It is what bootShell builds on and what this repo's own tests drive
+// directly; a target reaching for it is a target restating the order.
 //
 // There is no raw module install path: signed bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
+import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
-import type { TransportHost } from "./transport-host.js";
+import { TransportHost, type TransportHostOptions } from "./transport-host.js";
+import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
@@ -186,7 +199,7 @@ export interface Shell {
      *  here, so a guest that cannot compile fails the load rather than the first frame that
      *  reaches it, and the freshness mark — which records the highest version that actually
      *  RAN — is advanced last, once it has. */
-    loadBundleBlob(blob: Uint8Array, opts?: LoadBundleOptions): Promise<LoadedBundle>;
+    loadBundleBlob(blob: Uint8Array, opts?: LoadBundleOptions): Promise<AppHandle>;
     /** Uninstall the slot selected by its audit identity: drop its claims and dispose its
      *  realm, private modules, timers and scopes as one unit. */
     uninstall(appKey: string): boolean;
@@ -226,6 +239,36 @@ export interface Shell {
     close(): void;
 }
 
+/** What a load returns: the verified bundle facts PLUS the slot handle — the one object
+ *  every caller that loaded the bundle drives it through. `key` is the audit identity the
+ *  shell's `uninstall`/`revoke` address; `fs` is this app's private keyspace view (scoped
+ *  under `appScope` and key-rule-wrapped here, §12.2); `invoke` is the loopback call bound
+ *  to this slot, so the derivation and the binding arrive together rather than a call site
+ *  deriving `appKeyFor(author, app)` and passing it as `Shell.invoke`'s third argument.
+ *  Disposal is not here: `Shell.uninstall(key)` is the act, and a caller that outlives the
+ *  handle keeps the key rather than the handle.
+ *
+ *  A handle is valid until its slot is uninstalled or the shell closes; a caller holding
+ *  one past that gets a rejection naming the slot rather than a call into a freed realm. */
+export interface AppHandle extends LoadedBundle {
+    /** `<author hex>:<app>` (§12.4) — the slot's audit identity, the freshness key and
+     *  what `uninstall`/`revoke` address. */
+    key: string;
+    /** This app's fs keyspace view (§12.2): `scopedFs(backend, appScope)` already applied
+     *  by the shell, so reads/writes/lists over this handle can only reach this app's
+     *  keys. Absent on a shell with no fs. */
+    fs?: Fs;
+    /** The fs keyspace prefix this app's view is scoped under — the derivation the shell
+     *  computed (`appScopeFor`, bundle.ts). For a caller reading the raw backend COLD
+     *  (outside a running node), `scopedFs(raw, appScope)` re-derives the same view
+     *  without re-deriving the hash. */
+    appScope: string;
+    /** Loopback invoke into this app's one `handle` entrypoint — `Shell.invoke` with the
+     *  app key already bound, so "the only loaded app" is never something this caller has
+     *  to mean. */
+    invoke(op: string, payload: Uint8Array): Promise<Uint8Array>;
+}
+
 // Re-exported so a target reaches the admission constructors from the same module it gets
 // createShell from. Pure-module builders remain target implementations, not shell API.
 export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
@@ -237,6 +280,11 @@ interface AppSlot {
   verifiedBundle: LoadedBundle;
   pureModules: PureModules;
   fsScope?: Fs;
+  /** The fs keyspace prefix this slot's view is scoped under (bundle.ts `appScopeFor`) —
+   *  computed once per load and carried on the returned `AppHandle`, so a caller's cold
+   *  read of the raw backend needs the derivation the shell already did, not a second
+   *  copy of it. */
+  appScope: string;
   signingScope: SignScope;
   realm: SafeRealm | null;
   /** Set once this slot's freshness mark and claims have committed. Until then its seam
@@ -425,10 +473,12 @@ export function createShell(opts: CreateShellOptions & {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
+        const appScope = appScopeFor(platform.sodium, loaded.author, loaded.manifest.app);
         slot = {
             verifiedBundle: loaded,
             pureModules,
-            fsScope: fs ? scopedFs(fs, appScopeFor(platform.sodium, loaded.author, loaded.manifest.app)) : undefined,
+            fsScope: fs ? scopedFs(fs, appScope) : undefined,
+            appScope,
             signingScope: slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest)),
             realm: null,
             active: false,
@@ -545,6 +595,20 @@ export function createShell(opts: CreateShellOptions & {
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
         ? slot.realm.call("handle", input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
+    /** The loopback invoke, as BOTH `Shell.invoke` and an `AppHandle`'s run it: the app's
+     *  ONE entrypoint called with the host's own caller id (32 zero bytes) exactly as a
+     *  remote frame carries its peer's key, so the app reads one `handle` either way. The
+     *  envelope is written by the seam that defines it (`opCall`), never here.
+     *
+     *  The call is chained onto `inFlight` so `close()` defers realm disposal until a call
+     *  parked mid-await (a repair pass waiting out an unreachable peer) is never resumed
+     *  into a freed realm — a QuickJS use-after-free (§2.1). Every entry point into a
+     *  slot's guest goes through this one chaining, the handle's included. */
+    const invokeSlot = (slot: AppSlot, op: string, payload: Uint8Array): Promise<Uint8Array> => {
+        const call = callSlot(slot, opCall(op, payload));
+        inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
+        return call;
+    };
     netHost?.route((payload) => {
         return linkOwner ? callSlot(linkOwner, payload) : null;
     }, () => linkOwner !== null);
@@ -766,7 +830,17 @@ export function createShell(opts: CreateShellOptions & {
             // replay or is announced directly to the newly published claimant.
             if (linkOwner === slot) netHost?.replayAddresses();
             disposeSlot(previous);
-            return loaded;
+            // The handle: the verified facts plus the bound slot — the key, the scoped fs
+            // view and the loopback invoke. One object, so a caller cannot derive half of
+            // it from the manifest and half from the shell and have the two disagree.
+            const handle: AppHandle = {
+                ...loaded,
+                key,
+                fs: slot.fsScope,
+                appScope: slot.appScope,
+                invoke: (op, payload) => invokeSlot(slot, op, payload),
+            };
+            return handle;
         },
         uninstall: doUninstall,
         revoke(authorHex) {
@@ -792,13 +866,9 @@ export function createShell(opts: CreateShellOptions & {
             const slot = appKey ? findSlot(appKey) : onlyApp();
             if (!slot)
                 throw new Error(`shell: no app '${appKey}' loaded`);
-            // The loopback: the app's ONE entrypoint, called with the host's own caller id
-            // (32 zero bytes) exactly as a remote frame carries its peer's key, so the app
-            // reads one `handle` either way. The envelope is written by the seam that
-            // defines it (`opCall`), never here.
-            const call = callSlot(slot, opCall(op, payload));
-            inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
-            return call;
+            // `AppHandle.invoke` is the same call with the slot already bound — see
+            // `invokeSlot` for the framing and the close() chaining.
+            return invokeSlot(slot, op, payload);
         },
         dispatch: doDispatch,
         close() {
@@ -811,4 +881,181 @@ export function createShell(opts: CreateShellOptions & {
             inFlight.then(dispose, dispose);
         },
     };
+}
+
+/** Assemble a node on the JS targets — the ONE assembly the JS platforms run (§12.9):
+ *  every platform member defaulted (the fs backend, the freshness store, the module
+ *  builder, the realm factory), the channel adapter built from options or accepted as an
+ *  instance, the transport bundle admitted under an implicit author pin, its listeners
+ *  bound, and the shared shell handed back.
+ *
+ *  Every field but `sodium` and `identity` has a default, so a consumer states only what
+ *  it genuinely owns: a browser page passes its consent gate and its adapter, the native
+ *  loader displaces the four members Go backs, a Node node its disk-backed fs and
+ *  freshness store. `createShell` is underneath for a caller that wants the wired shell
+ *  WITHOUT the assembly — which in this repo is its own tests. */
+export interface BootShellOptions {
+    /** The crypto surface the shell needs — sumo libsodium with the ML-DSA-65 verifier
+     *  mixed in (the one thing no target can default: main.ts loads it, a browser page
+     *  readies it). */
+    sodium: ShellSodium;
+    /** The node's keypair (§12.9): its public half is this node's peer id and the one
+     *  identity every target reports through `node/identity`. */
+    identity: Keypair;
+    /** YOUR admission predicate (§12.5) — the one branch that is actually yours: an
+     *  operator's policy, a consent dialog, or `() => true` for "the bundle my operator
+     *  handed me IS the trust decision". The transport author pin is ANDed onto it here,
+     *  and the host's own gates (`hostGates`) by createShell, so no posture can lose
+     *  either — and an operator keeps the power to refuse a transport author, because
+     *  AND means both.
+     *
+     *  It is consulted for EVERY bundle, privileged ones included. A gate that only knows
+     *  how to judge apps — a consent dialog — says so by admitting anything reaching a
+     *  privilege and leaving that to the pin; it is not thereby waving through a
+     *  privilege the pin does not know, which the pin refuses on its own.
+     *
+     *  Absent ⇒ deny-all: the node boots and serves, accepts no installs. */
+    admit?: Admit;
+    /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
+     *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`. */
+    fs?: Fs;
+    /** The persisted bundle-freshness store (§12.4). Default: `FreshnessMarks`,
+     *  in-memory. */
+    freshnessStore?: FreshnessStore;
+    /** The builder for a bundle's private pure modules (§4). Default: `ModuleTable`, the
+     *  JS worker-backed builder; the native loader passes its Go-backed one. */
+    modules?: PureModuleLoader;
+    /** The confined realm factory (§12.3). Default: the lazy safe-js import — the
+     *  QuickJS engine is heavy, so it loads on the first realm, which is why realm
+     *  creation is a platform member rather than something the shared shell reaches for
+     *  itself. */
+    createRealm?: RealmFactory;
+    now?: () => number;
+    /** Platform-owned claims (see `CreateShellOptions.claims`). */
+    claims?: CreateShellOptions["claims"];
+    /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate.
+     *  Absent ⇒ the public network. */
+    networkKey?: Uint8Array;
+    guestDeadlineMs?: number;
+    realmMemoryBytes?: number;
+    /** The channel adapter. An OPTIONS object ⇒ bootShell constructs the `TransportHost`
+     *  (identity and networkKey come from the top-level fields, never restated), admits
+     *  the transport bundle under the pin, and starts its listeners. A `TransportHost`
+     *  instance ⇒ the caller owns it — and its transport-bundle load (a browser edge
+     *  loads lazily and re-loads to change its room secret), so bootShell neither loads
+     *  nor starts. `false` or absent ⇒ a shell with no network: no adapter, no pin, no
+     *  load. */
+    transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | TransportHost | false;
+    /** The transport bundle to PIN — and, in the options case, load. Default: the
+     *  artifact-shipped one (`transportBundleBytes`). */
+    transportBundle?: Uint8Array;
+}
+
+/** What `bootShell` hands back: the shell, plus the channel adapter — the one piece the
+ *  shell does not expose and a platform still has to drive (the address book, the
+ *  listeners). The SAME object the shell holds, not a copy. */
+export interface BootResult {
+    shell: Shell;
+    /** The channel adapter. Null ONLY on a node with no network (`transport` absent or
+     *  `false`) — which the overloads below say in the type, so a caller that asked for
+     *  a network does not assert its way past a null that cannot happen.
+     *
+     *  The fs backend is not here: it is `shell.fs`, whether the caller passed one or
+     *  took the default. */
+    transport: TransportHost | null;
+}
+
+export async function bootShell(
+    opts: BootShellOptions & { transport: Omit<TransportHostOptions, "identity" | "networkKey"> | TransportHost },
+): Promise<BootResult & { transport: TransportHost }>;
+export async function bootShell(opts: BootShellOptions): Promise<BootResult>;
+export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
+    const sodium = opts.sodium;
+    // The defaults are imported lazily: they are JS-target parts (a worker-backed module
+    // builder, the QuickJS realm engine), and the one target that never takes them (the
+    // native loader, which supplies Go-backed equivalents) must not pay for them.
+    const fs = opts.fs ?? new ((await import("./fs-memory.js")).MemoryFs)();
+    const modules = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
+    const createRealm = opts.createRealm
+        ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
+    const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
+    // The channel adapter: CONSTRUCTED here when given options (identity + network key
+    // are the NODE's, so they are taken from the top-level fields rather than restated),
+    // accepted as-is when given an instance (a browser edge with a getter contact
+    // secret), absent when false.
+    const transport = opts.transport instanceof TransportHost
+        ? opts.transport
+        : opts.transport
+            ? new TransportHost({ ...opts.transport, identity: opts.identity, networkKey: opts.networkKey })
+            : null;
+    // The transport bundle this node pins, and (when constructed here) loads: the
+    // caller's or the artifact-shipped one. Its author is DERIVED from the blob, never
+    // restated — the pin is the whole of "only this author may be the network" (§12.5).
+    const transportBlob = transport ? (opts.transportBundle ?? transportBundleBytes()) : null;
+    let transportAuthorHex: string | null = null;
+    if (transportBlob) {
+        try {
+            transportAuthorHex = toHex(verifyBundle(sodium, transportBlob).author);
+        }
+        catch { /* malformed blob — the load below refuses it by name */ }
+    }
+    // The implicit transport pin, composed AROUND the caller's predicate: a bundle
+    // reaching `link` or `route` must be signed by the transport bundle's own author. An
+    // operator's `policyFromJson` keeps the power to refuse a transport author — the
+    // caller's predicate still has to admit as well — and nobody can LOSE the pin by
+    // forgetting it: a caller whose admit is a plain consent gate is not also responsible
+    // for the half that protects the network.
+    //
+    // It is keyed on the privileges the manifest reaches, and it is FAIL-CLOSED on the
+    // ones it does not know. `PRIVILEGES` is derived from the capability catalog
+    // (core/domains.ts), so a privileged name added there appears here as a privilege
+    // with no branch — and a bundle reaching it is refused rather than waved through by
+    // a caller whose gate says "privileged bundles are the pin's business". A new
+    // privilege is taught to the assembly deliberately, in this one place, which is the
+    // whole reason the assembly is an export.
+    const admit: Admit = allOf(opts.admit ?? denyAll, (v, ctx) => {
+        if (ctx.privileges.length === 0) return true;
+        for (const priv of ctx.privileges) {
+            if (priv !== PRIVILEGE_LINK && priv !== PRIVILEGE_ROUTE) return false;
+        }
+        return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
+    });
+    const shell = createShell({
+        platform: {
+            sodium, identity: opts.identity, modules, fs,
+            freshnessStore, networkKey: opts.networkKey,
+            transportHost: transport ?? undefined,
+            createRealm, now: opts.now,
+        },
+        admit,
+        claims: opts.claims,
+        guestDeadlineMs: opts.guestDeadlineMs,
+        realmMemoryBytes: opts.realmMemoryBytes,
+    });
+    // The transport bundle IS the node's network (§12.6): verify + govern under the
+    // composed predicate, install, and the shell stands the driver up. A predicate that
+    // refuses the transport author leaves the node without a network, which is a
+    // deliberate configuration rather than an error. Only when bootShell constructed the
+    // adapter: a caller that handed over an instance owns its load (a browser edge loads
+    // lazily, and re-loads to change its room secret).
+    //
+    // A boot that throws returns no handle, so whatever it stood up must not leak: one
+    // teardown, the shell's — which closes the adapter it was built with.
+    try {
+        if (transport && transportBlob) {
+            try {
+                await shell.loadBundleBlob(transportBlob);
+            }
+            catch (err) {
+                if (!isAdmissionRejected(err)) throw err;
+                console.warn('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
+            }
+            await transport.start();
+        }
+        return { shell, transport };
+    }
+    catch (err) {
+        shell.close();
+        throw err;
+    }
 }

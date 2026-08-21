@@ -174,6 +174,12 @@ function authorList(value: unknown, name: string): string[] {
  *  Anything omitted means the strongest thing it can mean: nobody. A node with only
  *  `authors` runs apps and has no network, which is a deliberate configuration (§14).
  *
+ *  A grant is a VETO, not an appointment. Reaching a privilege also requires clearing the
+ *  node's transport author pin, which the assembly derives from the transport blob the
+ *  node booted (`bootShell`, shell-core.ts) — so `grants.link` decides whether that blob's
+ *  author may be the network here, and running a DIFFERENT transport means booting a
+ *  different blob, not writing another name in this file.
+ *
  *  An unknown key is refused rather than ignored, at the top level and under `grants`
  *  alike: a misspelled key would otherwise come up looking configured while holding
  *  nothing, indistinguishable from a node configured to hold nothing on purpose. */
