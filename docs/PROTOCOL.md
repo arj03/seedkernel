@@ -77,7 +77,7 @@ For AssemblyScript that requirement is one build flag, `--maximumMemory` (in pag
 
 **I/O protocol.** Before each call, the host writes the input bytes at offset `scratch` (up to the configured scratch size — default 128 KB, or the module's exported `scratchSize`). The module reads its input from `scratch`, writes its response back at `scratch` (overwriting the input is fine), and returns the number of response bytes. Return `0` for "empty response." The host reads `output_len` bytes at `scratch` after `handle` returns and does not touch the region again until the next call; a trap or a negative/oversized length is a failure the host reads as "no response."
 
-Memory outside the scratch region is the module's private state — statics, globals, whatever allocator it wants for its own bookkeeping. None of that is exposed to the host.
+Memory outside the scratch region is the module's private state — statics, globals, whatever allocator it wants for its own bookkeeping — but none of it is durable: a deadline kill discards the instance and respawns a fresh one (§4.3), so that memory is scratch or cache, never the system of record. Anything that must survive a respawn belongs in the guest or the filesystem, not module memory.
 
 ### 4.2 No imports — the pure-transform boundary
 
@@ -102,6 +102,7 @@ What a module **cannot** do, restated as guarantees:
 - **No outside-world reach.** With no imports (§4.2), a module's only effect is the bytes it returns. It cannot open a socket or a file even if compromised — not by a rule in its code, but because the capability was never imported.
 - **No cross-module corruption.** A buggy or malicious module can scribble anywhere in its own memory but cannot touch the host or another module — each runs in its own WASM instance, and the host copies bytes between scratch regions rather than sharing pointers.
 - **No pointers cross the boundary.** There is no allocator contract; the host never holds a pointer into a module's memory across a return and never writes outside the scratch region.
+- **No durable state.** A module's memory beyond scratch (§4.1) is its own, but not guaranteed to last: a deadline kill (below) respawns a fresh instance and whatever the old one held is gone. A module is a **restartable transform** — it may use its memory as scratch or cache, but a caller cannot depend on any of it surviving a respawn, and a timeout may reset any module without changing application meaning.
 
 > **Memory is bounded at admission; compute is bounded at the engine.** Two bounds, two mechanisms — a declaration read off the bytes, and a deadline the engine can land on.
 >
@@ -109,7 +110,7 @@ What a module **cannot** do, restated as guarantees:
 >
 > **Compute** is charged to the calling guest and interruptible where the guest's budget ends. A module call runs under a deadline: the calling guest's **remaining execution segment**, computed by the realm at the moment of the call, and a call that burns it is answered empty — exactly as a trap is — while the engine kills the module. How the kill lands is per-target, because no engine mechanism is shared: the JS targets run each module in its own worker, and `terminate()` destroys the isolate mid-loop if it must (the one interrupt the JS platform's WebAssembly exposes), respawning a fresh instance for the next call; the native target arms wazero's `WithCloseOnContextDone`, on by default at the guest budget and retunable (or disabled) with `SEEDKERNEL_MODULE_DEADLINE_MS`. The call is async on the guest seam (§12.2) — the guest parks on it like any other round-tripping name — so a spinning module burns one core for at most one budget and holds nothing else on the node. §14 has the exposure that remains and what a deployer does about it.
 
-**Replay and ordering are settled off the module.** A module is stateless-by-input, so it has no notion of "seen this before." Where that matters, the defence lives at the layer that owns the bytes: live-traffic replay is closed by the transport's strict per-direction counter (§12.6), and an older install is refused by bundle freshness (§12.4). An app that **relays** messages through intermediaries — where neither of those applies to the original author — adds its own per-message signature and backlink chain (§5.1, §14). None of it is the host's or the module's concern.
+**Replay and ordering are settled off the module.** A module's memory is disposable, not a system of record (above), so it has no durable notion of "seen this before." Where that matters, the defence lives at the layer that owns the bytes: live-traffic replay is closed by the transport's strict per-direction counter (§12.6), and an older install is refused by bundle freshness (§12.4). An app that **relays** messages through intermediaries — where neither of those applies to the original author — adds its own per-message signature and backlink chain (§5.1, §14). None of it is the host's or the module's concern.
 
 ---
 
