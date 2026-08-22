@@ -160,11 +160,12 @@ export function transportAuthor() {
 }
 
 /** The policy every harness node runs under: the transport author granted `link`, and
- *  whoever else is named trusted to load an ordinary app. */
+ *  whoever else is named trusted to load an ordinary app. Delivering what the link
+ *  occupant decodes is the slot's own return convention, so no second grant exists. */
 export function transportPolicy(authorHex, appAuthors = []) {
   return policyFromJson(JSON.stringify({
     authors: [authorHex, ...appAuthors],
-    grants: { link: [authorHex], route: [authorHex] },
+    grants: { link: [authorHex] },
   }));
 }
 

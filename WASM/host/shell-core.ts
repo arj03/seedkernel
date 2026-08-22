@@ -9,7 +9,7 @@ import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
+import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
@@ -353,7 +353,6 @@ function createShell(opts: CreateShellOptions & {
     const slotClaims = (slot: AppSlot) => slot.verifiedBundle.manifest.protocols ?? [];
     const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
     const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
-    const canDeliver = (slot: AppSlot) => privilegesOf(slot.verifiedBundle.manifest).includes(PRIVILEGE_ROUTE);
     /** The slot the platform's raw-link events go to. Exclusive, like a claim: the driver
      *  has ONE event sink, so two holders are not a composition — the second would take
      *  the node's sockets off the first, silently. */
@@ -472,7 +471,6 @@ function createShell(opts: CreateShellOptions & {
                 // to whoever was there first.
                 calls: { call: (id, payload) => crossRealmCall(callerId, id, payload) },
                 rawNet: links ? netHost?.rawNet(slot) : undefined,
-                delivery: canDeliver(slot) ? { deliver: (claim, attribution, payload) => deliverInbound(claim, attribution, payload) } : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
             },
@@ -507,8 +505,15 @@ function createShell(opts: CreateShellOptions & {
         return call;
     };
     netHost?.route((payload) => {
+        // The link occupant's `handle` return is the driver's to read: an inbound request
+        // the occupant decoded is returned as a delivery frame, which the driver hands to
+        // the shell's claim routing (`routeDeliver`) and answers back through `linkResp`.
         return linkOwner ? callSlot(linkOwner, payload) : null;
-    }, () => linkOwner !== null);
+    }, () => linkOwner !== null, (claim, attribution, payload) => {
+        // The driver normalizes the answer to empty before writing it back, so refusal
+        // and silence are one fact at the boundary.
+        return deliverInbound(claim, attribution, payload);
+    });
     /** Cross-realm call by reserved id. Host prepends caller's 32-byte id. */
     const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
         return callLocal(id, callerId, payload);
@@ -569,8 +574,9 @@ function createShell(opts: CreateShellOptions & {
         input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
-    /** Inbound from outside this node (`route/deliver`, `dispatch`). `_`-led claims
-     *  are local and refused here with no exception — platform claims included (§12.10). */
+    /** Inbound from outside this node (the link occupant's delivery return, `dispatch`).
+     *  `_`-led claims are local and refused here with no exception — platform claims
+     *  included (§12.10). */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
         if (isReservedProtocol(claim)) return null;
         const platformHandler = platformClaims.get(claim);
@@ -842,7 +848,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         catch { /* malformed blob — the load below refuses it by name */ }
     }
     // The implicit transport pin, composed AROUND the caller's predicate: a bundle
-    // reaching `link` or `route` must be signed by the transport bundle's own author. An
+    // reaching `link` must be signed by the transport bundle's own author. An
     // operator's `policyFromJson` keeps the power to refuse a transport author — the
     // caller's predicate still has to admit as well — and nobody can LOSE the pin by
     // forgetting it: a caller whose admit is a plain consent gate is not also responsible
@@ -858,7 +864,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const admit: Admit = allOf(opts.admit ?? denyAll, (v, ctx) => {
         if (ctx.privileges.length === 0) return true;
         for (const priv of ctx.privileges) {
-            if (priv !== PRIVILEGE_LINK && priv !== PRIVILEGE_ROUTE) return false;
+            if (priv !== PRIVILEGE_LINK) return false;
         }
         return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
     });
@@ -890,7 +896,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             }
             catch (err) {
                 if (!isAdmissionRejected(err)) throw err;
-                console.warn('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
+                console.warn('  no transport: the policy does not grant this bundle the "link" privilege');
             }
             await transport.start();
         }

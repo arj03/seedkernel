@@ -446,7 +446,20 @@ entry("linkOpen", (r) => {
 
 entry("linkBytes", (r) => {
   const link = findLink(r.u32());
-  if (link) link.onWire(r.blob());
+  return link ? link.onWire(r.blob()) || NOTHING : NOTHING;
+});
+
+/** The claim handler's answer to a delivery this program returned off a `linkBytes`
+ *  event: `[from blob][corr u32][payload]` — the authenticated sender and the wire
+ *  correlation the return carried, so the response frame echoes exactly the relation the
+ *  requester is waiting under. The host answers on a later turn of its own, never inside
+ *  a frame, so nothing here can re-enter this realm mid-record. */
+entry("linkResp", (r) => {
+  const from = r.blob();
+  const corr = r.u32();
+  const payload = r.blob();
+  const meta = reqres.redeemInbound(from, corr);
+  if (meta) reqres.respond(corr, meta.noReply, toHex(from), payload);
 });
 
 entry("linkClosed", (r) => {

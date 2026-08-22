@@ -76,8 +76,8 @@ const boot = async (cfg) => (await bootRuntime(cfg)).shell;
  *  be a seam open that the test never asked for. A test that wants a disk passes one.
  *
  *  `pinAuthor` is whose signature the TRANSPORT PIN admits (§12.5). The pin is derived
- *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` or
- *  `route` is refused before any predicate under test is consulted. So a test loading a
+ *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` is
+ *  refused before any predicate under test is consulted. So a test loading a
  *  privileged bundle names the author the pin is derived from, exactly as an operator
  *  running a transport other than the shipped one does. What it hands over is a real
  *  signed bundle of that author's, because the pin is read off a signature rather than
@@ -464,85 +464,15 @@ async function testManifestClaimIsTheRouting() {
   console.log("  OK\n");
 }
 
-// ─── Test: attributed delivery is a separately granted generic authority ──────
-//
-// `route/deliver` is the path a request from OUTSIDE the node takes, and its attribution is
-// written by whoever submits it — which is the whole reason `route` is granted apart from
-// `link`. Two properties follow and are pinned here: it reaches an ordinary claim (that is
-// the job), and it does NOT reach a bundle's `_`-led claim, which is a local service name a
-// remote sender's `requires` could never have granted. Without the second, a peer naming
-// the id the transport itself claims would be handed straight into the transport's realm.
-async function testGenericClaimDelivery() {
-  console.log("Test: route/deliver submits an opaque attribution to an exact claim");
-  const { admitAll } = await imp("build/host/policy.js");
-
-  const author = testAuthor();
-  const blob = (app, protocols, requires) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author,
-      { app, version: 1, protocols, modules: [], guest: GUEST({ requires }) }),
-    [GUEST_FILE]: GUEST_BYTES,
-  });
-  // Each load stands exactly one realm, so the seam captured after an `await` is that
-  // bundle's own `host.call` — the very function its guest would hold.
-  let lastSeam = null;
-  const realms = [];
-  const shell = await bootTestShell({
-    createRealm: async ({ hostCall }) => {
-      lastSeam = hostCall;
-      const realm = {
-        calls: [],
-        async call(entry, payload) { realm.calls.push({ entry, payload }); return new Uint8Array(); },
-        dispose() { },
-      };
-      realms.push(realm);
-      return realm;
-    },
-    // Everything admitted, `link` included: the boundary under test is the shell's claim
-    // check, and a policy refusing the privilege would hide it behind an earlier refusal.
-    // The pin is this same author's for that reason — it is the other refusal that would
-    // land first (§12.5).
-    pinAuthor: author,
-    admit: admitAll,
-  });
-  const attribution = Uint8Array.of(7, 8, 9), body = Uint8Array.of(1, 2, 3);
-  const attrHead = new Uint8Array(4); writeU32BE(attrHead, 0, attribution.length);
-  /** One `route/deliver` submission: `[claimLen u8][claim][attrLen u32][attr][payload]`. */
-  const deliver = (seam, claim) => {
-    const name = enc.encode(claim);
-    return seam("route/deliver", concatBytes([
-      Uint8Array.of(name.length), name, attrHead, attribution, body,
-    ]));
-  };
-  try {
-    await shell.loadBundleBlob(blob("wire", ["wire-v1"], []));
-    const wireRealm = realms.at(-1);
-    await shell.loadBundleBlob(blob("offer", ["_offer"], []));
-    const offerRealm = realms.at(-1);
-    await shell.loadBundleBlob(blob("router", undefined, ["route/deliver"]));
-    const routerSeam = lastSeam;
-
-    await deliver(routerSeam, "wire-v1");
-    assertEqual(wireRealm.calls.length, 1, "delivery reaches exactly the named claimant");
-    assert(bytesEqual(wireRealm.calls[0].payload, concatBytes([attribution, body])),
-      "the claimant receives opaque attribution followed by payload");
-    // The one thing this authority may NOT reach. Empty rather than an error, because a
-    // submitter learns exactly what it learns for any id nobody serves — the local service
-    // names of this node are not a namespace a peer gets to probe.
-    const local = await deliver(routerSeam, "_offer");
-    assertEqual(offerRealm.calls.length, 0,
-      "route/deliver must not reach a bundle's `_`-led LOCAL service claim");
-    assertEqual(local.length, 0, "…and says nothing more than an unclaimed id would");
-    const noClaim = await deliver(routerSeam, "_missing");
-    assertEqual(noClaim.length, 0, "an unclaimed delivery still settles asynchronously as empty");
-
-    await shell.loadBundleBlob(blob("link-only", undefined, ["link/open"]));
-    const linkSeam = lastSeam;
-    let refused = "";
-    try { await linkSeam("route/deliver", new Uint8Array()); } catch (e) { refused = String(e); }
-    assert(/not declared/.test(refused), "raw-link authority does not imply route/deliver");
-  } finally { shell.close(); }
-  console.log("  OK\n");
-}
+// ─── Test: the link slot's delivery return is the ONLY delivery path ──────────
+// Inbound attributed delivery is the link occupant's return convention, not a grant
+// (README §12.10): the one slot that sees the plaintext is the one that attributes, so
+// there is no second privilege to grant or forget. The properties that had to be pinned
+// live at the one place they can be — over the real driver, claims and transport bundle:
+// a delivery reaches exactly the named ordinary claim, it never reaches a bundle's
+// `_`-led LOCAL service claim, and a non-link app can never name a delivery path at all
+// (transport-link.test.mjs: "EXACT CLAIM", "a peer cannot reach a bundle's `_`-led local
+// claim", "CALLER BOUNDARY").
 
 // ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
 //
@@ -970,6 +900,12 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ grants: { links: [goodHex] } })); } catch { threw = true; }
   assert(threw, "a grant naming no privilege this host has is refused by name");
+  // `route` is gone: delivery is the link slot's return convention, and a policy file
+  // written for the separate grant is a file this host does not mean — refused at the
+  // boot rather than read as an empty grant.
+  threw = false;
+  try { parsePolicy(JSON.stringify({ grants: { route: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "`grants.route` is no longer a privilege key — refused by name, kept nobody");
   threw = false;
   try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
   assert(threw, "a policy listing neither authors nor grants is refused");
@@ -2886,7 +2822,6 @@ await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();
-await testGenericClaimDelivery();
 await testOneRawLinkOwner();
 await testInstallerRemove();
 await testFs();

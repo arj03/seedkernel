@@ -17,7 +17,6 @@ const N_LINK_CLOSE = "link/close";
 const N_LINK_STAT = "link/stat";
 const N_LINK_AUTHENTICATED = "link/authenticated";
 const N_LINK_DOWN = "link/down";
-const N_ROUTE_DELIVER = "route/deliver";
 
 const N_TIMER_ARM = "timer/arm";
 const N_TIMER_CLEAR = "timer/clear";
@@ -209,23 +208,24 @@ function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId],
  *  stall clock to the deadline alone. */
 function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** Hand an inbound request to whichever app claims its protocol id, and resolve with
- *  that app's answer. NOT awaited by any caller inside this realm — see the note above.
- *
- *  Delivery and the reply are ONE call: the answer is the app's own `handle` return
- *  value on a later turn, which is what an asynchronous app handler needs. */
-function hostDeliver(fromBytes, proto, payload) {
-  const attrLen = new Uint8Array(4);
-  writeU32BE(attrLen, 0, fromBytes.length);
-  return host.call(N_ROUTE_DELIVER, concatBytes([
-    Uint8Array.of(proto.length), proto, attrLen, fromBytes, payload,
-  ]));
-}
 /** A link the HOST handed us (openLink) authenticated, or tore down. Relayed so whoever
  *  passed the channel in learns its fate; a core link the guest dialed or accepted is
  *  nobody's business but ours. */
 function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
 function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
+
+/** One linkBytes invocation's delivery return: the count-prefixed list of records the
+ *  request/response layer produced, or null when this frame decoded to nothing
+ *  deliverable. The host reads the frame, routes each record through its claim table,
+ *  and answers this realm with a `linkResp` event — delivery is this slot's return
+ *  convention, not a second capability (there is one link occupant, and it is the one
+ *  that saw the plaintext). */
+function packDeliveries(records) {
+  if (!records || records.length === 0) return null;
+  const head = new Uint8Array(4);
+  writeU32BE(head, 0, records.length);
+  return concatBytes([head, ...records]);
+}
 
 /** Peer lint (§12.6): asked at msg3 when accepting, msg4 when dialing — before this
  *  end has revealed anything. A lint, not a gate: a hostile occupant still reaches
@@ -483,34 +483,49 @@ class Link {
   }
 
   /** Inbound bytes. Over-cap is a defensive abort. Framed push is async; delivery
-   *  order rides the framer's one-chunk-at-a-time read chain. */
+   *  order rides the framer's one-chunk-at-a-time read chain. Returns the delivery
+   *  frame this input produced — the count-prefixed record list, or null when none — so
+   *  the host's `linkBytes` invocation carries the return right back out of this realm.
+   *  The framer's push may complete on a later turn (a framed link whose codec runs in
+   *  a module); the promise is still the same return, resolved when the parse is. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
       // boundaries already on it, so there is no reassembly buffer of ours to bound —
       // but the two-stage cap is about how much a peer may make us HOLD, not about who
       // framed it. Without this, one huge message takes the realm down.
-      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return; }
-      this.onMessage(bytes);
-      return;
+      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return null; }
+      const d = this.onMessage(bytes);
+      return d ? packDeliveries([d]) : null;
     }
-    // A Promise on a framed link (its decode runs in the bundle's ws module, whose
-    // answer crosses an isolate since ABI 6), a plain boolean on a length-framed one.
-    void Promise.resolve(this.framer.push(bytes, (m) => this.onMessage(m))).then(
-      (ok) => { if (!ok) this.abort(true); },
-      () => { this.abort(true); },
-    );
+    const out = [];
+    const deliver = (m) => { const d = this.onMessage(m); if (d) out.push(d); };
+    try {
+      const ok = this.framer.push(bytes, deliver);
+      // The promise resolves on a later turn; it must ALWAYS yield bytes (never null),
+      // because the preamble normalizes whatever the handle returns — the empty case is
+      // "nothing deliverable", and the host reads any non-empty return as a frame.
+      return Promise.resolve(ok).then(
+        (good) => { if (!good) this.abort(true); return packDeliveries(out) ?? new Uint8Array(0); },
+        () => { this.abort(true); return new Uint8Array(0); },
+      );
+    } catch {
+      this.abort(true);
+      return new Uint8Array(0);
+    }
   }
 
   /** Route one whole link message. A message is a bare body, and which one it is follows
    *  from our role and how far the exchange has got — so the sender chooses nothing:
    *  every message has exactly one destination, the handler checks its exact width, and a
-   *  post-auth body goes to the AEAD, which fails closed. */
+   *  post-auth body goes to the AEAD, which fails closed. Returns the delivery frame a
+   *  request produced, or null for everything the handshake itself answers. */
   onMessage(m) {
-    if (this.closed) return;
-    if (this.authed) this.onRecord(m);
-    else if (this.weDialed) this.peerEph ? this.onMsg4(m) : this.onMsg2(m);
-    else this.peerEph ? this.onMsg3(m) : this.onMsg1(m);
+    if (this.closed) return null;
+    if (this.authed) return this.onRecord(m);
+    if (this.weDialed) { this.peerEph ? this.onMsg4(m) : this.onMsg2(m); }
+    else { this.peerEph ? this.onMsg3(m) : this.onMsg1(m); }
+    return null;
   }
 
   // Refuse WITHOUT saying so — every refusal funnels here, so they are
@@ -733,10 +748,10 @@ class Link {
   onRecord(body) {
     // Framed links have already been measured; this is the platform-framed one's floor,
     // stated where the record layer can see it.
-    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
-    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
+    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return null; }
+    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return null; }
     const r = aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
-    if (!r.ok) { this.abort(true); return; }
+    if (!r.ok) { this.abort(true); return null; }
     this.sawTraffic = true;
     // Advance only on success — a failed decrypt must never move the counter.
     if (++this.recvCtr >= this.rekeyAfter) {
@@ -745,8 +760,8 @@ class Link {
       this.recvCtr = 0;
     }
     // The reserved empty record: an authenticated end-of-stream.
-    if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
-    this.onFrame(this.peerId, r.pt);
+    if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return null; }
+    return this.onFrame(this.peerId, r.pt);
   }
 
   onChannelClosed() {

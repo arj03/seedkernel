@@ -103,7 +103,9 @@ async function main() {
     guestSource: guest,
     // EXACTLY the authorities this program holds, and so exactly what an operator
     // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
-    // are the ONLY names carrying that privilege.
+    // are the ONLY names carrying that privilege. Inbound attributed delivery is this
+    // slot's return convention (the `linkBytes` frame this program returns), never a
+    // second grant to declare here.
     //
     // What this program PROVIDES back is not here: it is not an authority it calls, it
     // is the id it claims above. Its ws.wasm and its crypto are absent because neither
@@ -113,7 +115,7 @@ async function main() {
     guestRequires: [
       "node/random",
       "link/config", "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
+      "link/authenticated", "link/down", "link/sign", "link/verify",
       "timer/arm", "timer/clear",
     ],
   });

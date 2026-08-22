@@ -131,7 +131,7 @@ func withTransportAuthor(tb testing.TB, policyJSON string) string {
 	}
 	authors, _ := p["authors"].([]any)
 	p["authors"] = append(authors, author)
-	p["grants"] = map[string]any{"link": []string{author}, "route": []string{author}}
+	p["grants"] = map[string]any{"link": []string{author}}
 	out, err := json.Marshal(p)
 	if err != nil {
 		tb.Fatal("policy json:", err)

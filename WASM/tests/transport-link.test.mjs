@@ -702,13 +702,13 @@ await test("a decrypt failure does not advance the receive counter", async (keep
 
 // ── §12.10: platform handlers register exact claims ─────────────────────────────
 //
-// An inbound frame reaches the shell as the transport's `route/deliver` and goes to the
-// routing table, so a host that serves an id of its own — seedchat's `offer/v1`, which
-// carries a bundle between two browsers before either has an app that could receive it —
-// needs an explicit seam. `bootShell({ claims })` is it: exact names, no wildcard and no
-// fall-through. These pin both halves — a registered name wins, and an unregistered one is
-// never consulted — plus the reach an ORDINARY id carries and a reserved one does not
-// (below).
+// An inbound frame reaches the shell as the link occupant's delivery return and goes to
+// the routing table, so a host that serves an id of its own — seedchat's `offer/v1`,
+// which carries a bundle between two browsers before either has an app that could
+// receive it — needs an explicit seam. `bootShell({ claims })` is it: exact names, no
+// wildcard and no fall-through. These pin both halves — a registered name wins, and an
+// unregistered one is never consulted — plus the reach an ORDINARY id carries and a
+// reserved one does not (below).
 
 await test("EXACT CLAIM: the platform answers the claim it registered", async (keep) => {
   const seen = [];
@@ -761,12 +761,13 @@ await test("EXACT CLAIM: unrelated traffic goes directly to its claimant", async
   assert((await st.B.seen()).length === 1, "the frame reached its app claimant");
 });
 
-// A peer names the id the TRANSPORT ITSELF claims. Nothing about `route/deliver` reads the
-// protocol bytes off the wire — that is the point of a generic authority — so the refusal
-// has to be the routing's: a bundle's `_`-led claim is a LOCAL service name (§12.10). Were
-// it reachable, this frame would land in the transport realm's own `handle` with the
-// sender's key as the caller id, which `APP_OPS` admits — `peers` would enumerate the
-// node's links and `send` would make it issue requests on the caller's behalf.
+// A peer names the id the TRANSPORT ITSELF claims. Nothing about the delivery return
+// reads the protocol bytes off the wire — the transport merely returns what it decoded —
+// so the refusal has to be the routing's: a bundle's `_`-led claim is a LOCAL service
+// name (§12.10). Were it reachable, this frame would land in the transport realm's own
+// `handle` with the sender's key as the caller id, which `APP_OPS` admits — `peers`
+// would enumerate the node's links and `send` would make it issue requests on the
+// caller's behalf.
 await test("a peer cannot reach a bundle's `_`-led local claim, the transport's included", async (keep) => {
   const st = keep(await upPair());
   const opEnvelope = (op) => {

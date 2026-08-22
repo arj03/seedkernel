@@ -43,7 +43,7 @@ async function makeNode(ws = false) {
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, appAuthorHex],
-    grants: { link: [transportAuthor], route: [transportAuthor] },
+    grants: { link: [transportAuthor] },
   }));
   const transport = new TransportHost({
     identity,

@@ -2,7 +2,7 @@
 // run as the transport bundle's guest via `link/*`. No call re-enters a live frame.
 
 
-import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
+import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { opHeader, type RawNet } from "./guest-seam.js";
@@ -106,6 +106,12 @@ class Args {
  *  go and the honest answer is to drop it. */
 export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
 
+/** The claim routing the link occupant's delivery return is handed to (§12.10). Inbound
+ *  attributed delivery is the link slot's return convention, not a grant: the occupant
+ *  that saw the plaintext is the one that attributes it, and the shell's claim table is
+ *  the single router. The answer settles the request the occupant returned. */
+export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array> | null;
+
 export interface TransportHostOptions {
   /** The channel keypair; its public half is this node's peer id. Never passed to the
  *  guest — signing is serviced host-side, scoped by the privilege (§12.6.2b). */
@@ -201,6 +207,7 @@ export class TransportHost {
   private nextLinkId = 1;
   private transport: TransportCall | null = null;
   private transportAvailable: () => boolean = () => false;
+  private deliver: TransportDeliver | null = null;
   private activeOwner: object | null = null;
   private closed = false;
 
@@ -209,11 +216,14 @@ export class TransportHost {
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Wire this platform binding once. Both callbacks resolve its capability owner
-   *  dynamically, so claim changes never reconfigure this driver. */
-  route(transport: TransportCall, available: () => boolean): void {
+  /** Wire this platform binding once. All callbacks resolve its capability owner
+   *  dynamically, so claim changes never reconfigure this driver. `deliver` is the claim
+   *  routing the link occupant's delivery return is handed to — the host must route what
+   *  the link occupant decoded, whoever the occupant is (§12.10). */
+  route(transport: TransportCall, available: () => boolean, deliver?: TransportDeliver): void {
     this.transport = transport;
     this.transportAvailable = available;
+    this.deliver = deliver ?? null;
   }
 
   /** Whether this platform binding currently has an admitted raw-link owner. */
@@ -293,6 +303,66 @@ export class TransportHost {
       if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
       console.error(`[transport] error in ${args.op}: ${String(err)}`);
     });
+  }
+
+  /** `tell`, for `linkBytes`: the invocation's return is the link occupant's delivery
+   *  frame — `[count u32][d…]`, each `d` =
+   *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payload]` —
+   *  empty when the occupant decoded nothing deliverable. The occupant that saw the
+   *  plaintext is the one that attributes it, so the driver hands the frame straight to
+   *  the claim routing wired in `route` and answers back through `linkResp`; no second
+   *  capability is granted, because the only slot that produces such a return is the one
+   *  holding the raw-link binding. */
+  private tellDeliver(args: Args): void {
+    const r = this.toTransport(args);
+    if (!r) return;
+    void r.then((ret) => {
+      if (ret.length > 0) this.deliverFrom(ret);
+    }, (err: unknown) => {
+      if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+      console.error(`[transport] error in ${args.op}: ${String(err)}`);
+    });
+  }
+
+  private static readonly dec = new TextDecoder();
+
+  /** Route one delivery frame. Each record names an exact claim, an opaque attribution
+   *  and a payload; a record nobody serves settles as an empty answer, exactly as a
+   *  request that never reached a claimant. A malformed frame is dropped: it is the
+   *  occupant's own contract with the driver, and a bogus record must not become a
+   *  partial delivery. */
+  private deliverFrom(ret: Uint8Array): void {
+    if (!this.deliver || ret.length < 4) return;
+    const dec = TransportHost.dec;
+    const count = (readU32BE(ret, 0) >>> 0);
+    let off = 4;
+    for (let i = 0; i < count; i++) {
+      if (ret.length < off + 6) return;
+      const noReply = ret[off] === 1;
+      const corr = readU32BE(ret, off + 1);
+      const claimLen = ret[off + 5];
+      if (ret.length < off + 6 + claimLen) return;
+      const claim = dec.decode(ret.slice(off + 6, off + 6 + claimLen));
+      const attrStart = off + 6 + claimLen;
+      if (ret.length < attrStart + 4) return;
+      const attrLen = readU32BE(ret, attrStart);
+      const payloadStart = attrStart + 4 + attrLen;
+      if (payloadStart > ret.length) return;
+      const attribution = ret.slice(attrStart + 4, attrStart + 4 + attrLen);
+      const payload = ret.slice(payloadStart);
+      void Promise.resolve(this.deliver(claim, attribution, payload)).then(
+        (answer: Uint8Array | null | undefined) => this.answer(noReply, attribution, corr, answer ?? EMPTY),
+        () => this.answer(noReply, attribution, corr, EMPTY),
+      );
+      off = payloadStart;
+    }
+  }
+
+  /** The claim handler's answer back to the link occupant, which frames it and writes it
+   *  on the wire. A noReply request still ran its handler but asks for no bytes back. */
+  private answer(noReply: boolean, attribution: Uint8Array, corr: number, answer: Uint8Array): void {
+    if (noReply) return;
+    this.tell(new Args("linkResp").blob(attribution).u32(corr).blob(answer));
   }
 
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims the
@@ -375,7 +445,7 @@ export class TransportHost {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
-      this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
+      this.tellDeliver(new Args("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => {
       if (!this.channels.delete(linkId)) return;

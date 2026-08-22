@@ -77,12 +77,6 @@ export interface RawNet {
     down(linkId: number, reason: number): void;
 }
 
-/** Submit a request that arrived from outside this node. Cannot reach a `_`-led
- *  local claim. */
-export interface ClaimDelivery {
-    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null;
-}
-
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
  *  itself: there is no `setTimeout` in a fresh QuickJS context. `id` is the guest's own, so
  *  the host keeps no name of its own for a deadline. The implementer bounds how many
@@ -139,8 +133,6 @@ export interface SeamGrants {
      *  that reaches the `link` privilege, so nothing else can ever reach a descriptor
      *  whatever is installed (§1, capability-by-non-wiring). */
     rawNet?: RawNet;
-    /** Separately granted delivery into the claim table. */
-    delivery?: ClaimDelivery;
     /** The platform's event loop, for a guest that declares `timer`. */
     timers?: HostTimers;
     /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
@@ -500,11 +492,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             throw new Error("guest-seam: timer.* used but no timer backend wired");
         return grants.timers;
     };
-    const delivery = () => {
-        if (!grants.delivery)
-            throw new Error("guest-seam: route/deliver used but no claim routing is wired");
-        return grants.delivery;
-    };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` with an inherited function, which the
     // dispatch below would then CALL.
@@ -640,26 +627,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             catch {
                 return ZERO;
             }
-        },
-        // [claimLen u8][claim][attributionLen u32][attribution][payload]. The router does
-        // not interpret attribution; it merely prepends it at the claimant boundary. A claim
-        // nothing wire-reachable serves — including a bundle's own `_`-led local service
-        // name, which this path may not reach (ClaimDelivery) — answers empty, the same
-        // answer a submitter gets for a protocol nobody claims.
-        "route/deliver": (payload) => {
-            const claimLen = payload[0];
-            if (payload.length < 5 + claimLen)
-                throw new Error("guest-seam: malformed route/deliver payload");
-            const claim = dec.decode(payload.slice(1, 1 + claimLen));
-            const attrLen = readU32BE(payload, 1 + claimLen);
-            const attrStart = 5 + claimLen;
-            if (payload.length < attrStart + attrLen)
-                throw new Error("guest-seam: malformed route/deliver attribution");
-            return delivery().deliver(
-                claim,
-                payload.slice(attrStart, attrStart + attrLen),
-                payload.slice(attrStart + attrLen),
-            ) ?? Promise.resolve(NONE);
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {

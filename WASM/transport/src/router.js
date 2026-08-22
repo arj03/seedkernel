@@ -57,9 +57,12 @@ class Router {
     return bytesCompare(dialer, smaller) === 0;
   }
 
+  /** One inbound, authenticated, whole message. Returns the delivery frame the request
+   *  produced (the link occupant's return convention), or null for a response or a
+   *  frame nobody is waiting on. */
   deliver(peerId, frame) {
-    if (!this.sink || peerId === this.ownId) return;
-    this.sink(peerId, frame);
+    if (!this.sink || peerId === this.ownId) return null;
+    return this.sink(peerId, frame);
   }
 
   remove(link) {
@@ -96,6 +99,10 @@ class ReqRes {
     this.timers = new Map();    // corr → timerId
     this.sent = new Map();      // peerId → bytes handed to its links, ever
     this.nextCorr = 1;
+    // Inbound requests handed to the host, keyed `peer:corr` — the correlation the
+    // response frame echoes, plus whose request it belongs to. The answer arrives as the
+    // host's `linkResp` event and this metadata is what frames it onto the wire.
+    this.pendingIn = new Map();
   }
 
   /** Settle an outstanding request and drop its bookkeeping. `ok` false ⇒ `payload` is
@@ -183,34 +190,53 @@ class ReqRes {
     // six-byte floor here would drop it and make "no app serves this protocol"
     // indistinguishable from an unreachable peer. Six is the request branch's floor (it
     // needs the protocol-id length at offset 5) and is checked there.
-    if (frame.length < 5) return;
+    if (frame.length < 5) return null;
     const kind = frame[0];
     const noReply = !!(kind & 0x80);
     const corr = readU32BE(frame, 1);
     if ((kind & 1) === 1) {
       // res = [1][corr u32][payload]
       const p = this.pending.get(corr);
-      if (!p || p.to !== from) return; // response bound to the peer it went to
+      if (!p || p.to !== from) return null; // response bound to the peer it went to
       this.finish(corr, true, frame.slice(5));
-      return;
+      return null;
     }
     if ((kind & 1) === 0) {
-      if (frame.length < 6) return; // no room for the protocol-id length byte
+      if (frame.length < 6) return null; // no room for the protocol-id length byte
       const idLen = frame[5];
-      if (frame.length < 6 + idLen) return;
+      if (frame.length < 6 + idLen) return null;
       const proto = frame.slice(6, 6 + idLen);
       const payload = frame.slice(6 + idLen);
-      // Dispatched with `.then`, never awaited: the answer comes back through this
-      // realm's queue, so a frame that awaited it would hold the queue against its own
-      // reply (realm-queue.ts).
-      hostDeliver(fromHex(from), proto, payload).then(
-        (resp) => this.respond(corr, noReply, from, resp),
-        // A protocol nobody claims, or an app whose handler threw: the request is
-        // answered with an empty body rather than discarded, so a caller learns
-        // "nothing is there" now instead of waiting out its whole deadline (§12.10).
-        () => this.respond(corr, noReply, from, EMPTY),
-      );
+      // The delivery RETURN frame, not a call: the relation here is that this program
+      // returns a request its host must route — `[noReply u8][corr u32][claimLen u8]
+      // [claim][attrLen u32][attribution][payload]` — and the answer comes back as the
+      // host's own `linkResp` event on a later turn, never re-entering this realm
+      // (realm-queue). This program is the link occupant, so it is the one that saw the
+      // plaintext and so the one that attributes the request; the host prepends that
+      // attribution to the claim handler's input. The KEY the pending answer is filed
+      // under is the authenticated sender's, so a corr collision between two peers never
+      // answers one peer with the other's response. A noReply request has nothing
+      // waiting for it on the wire, so nothing is filed — the host still delivers it and
+      // answers nothing, exactly as the request asked.
+      const head = new Uint8Array(1 + 4 + 1);
+      head[0] = noReply ? 1 : 0;
+      writeU32BE(head, 1, corr);
+      head[5] = proto.length;
+      const attrHead = new Uint8Array(4);
+      writeU32BE(attrHead, 0, PK_LEN);
+      if (!noReply) this.pendingIn.set(from + ":" + corr, { noReply });
+      return concatBytes([head, proto, attrHead, fromHex(from), payload]);
     }
+    return null;
+  }
+
+  /** Reclaim one inbound request's answer metadata by the wire correlation the answer
+   *  event carries. Gone after one use, like every pending entry. */
+  redeemInbound(fromBytes, corr) {
+    const key = toHex(fromBytes) + ":" + corr;
+    const meta = this.pendingIn.get(key);
+    if (meta) this.pendingIn.delete(key);
+    return meta || null;
   }
 
   // The response to a delivered request, addressed back to `from`. noReply ran the

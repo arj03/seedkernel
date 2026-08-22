@@ -50,7 +50,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		// makeTransportNode — the factory bootNode uses — and the policy has to admit
 		// the artifact's own transport author before either has a network at all.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor], route: [embeddedTransportAuthor] } }));
+		                           grants: { link: [embeddedTransportAuthor] } }));
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.startTest = async function () {

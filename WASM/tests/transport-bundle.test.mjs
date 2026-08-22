@@ -74,11 +74,12 @@ function transportBundleAt(version, keys, guestSource) {
     guestSource: guest,
     // Exactly the authorities the transport guest holds — a mirror of the artifact
     // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
-    // `link` privilege the admission dispatch reads (§12.5).
+    // `link` privilege the admission dispatch reads (§12.5); inbound delivery is this
+    // slot's return convention, not a name to declare.
     guestRequires: [
       "node/random",
       "link/config", "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down", "link/sign", "link/verify", "route/deliver",
+      "link/authenticated", "link/down", "link/sign", "link/verify",
       "timer/arm", "timer/clear",
     ],
   });
@@ -100,7 +101,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   const identity = generateKeyPair();
   const policy = policyFromJson(JSON.stringify({
     authors: [transportAuthor, appAuthorHex],
-    grants: { link: [transportAuthor], route: [transportAuthor] },
+    grants: { link: [transportAuthor] },
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
   // A test may pause exactly one freshly evaluated candidate before the shell publishes
