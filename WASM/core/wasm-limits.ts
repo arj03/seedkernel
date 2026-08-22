@@ -1,18 +1,5 @@
-// Pre-instantiation bounds on a module's declared linear memory (README §4.3), plus the
-// shared §12.3 guest-realm bounds and the §4.1 scratch default every host's table must
-// agree on.
-//
-// Memory cannot be bounded after instantiation: `new WebAssembly.Instance` allocates the
-// declared initial memory before any export runs, so a module declaring 4 GiB has already
-// taken the host down. The bound is read off the bytes first. The JS WebAssembly API
-// exposes no memory limits on a compiled `Module`, so this walks the binary's section
-// headers; it is a *bounds read*, not a validator, and anything it cannot parse is
-// refused. (Compute is bounded at each target's engine — module-table.ts's worker kill,
-// wazero's `WithCloseOnContextDone`.)
-//
-// Two refusals are structural rather than budgetary: an imported memory would be
-// host-supplied, the one way a pure transform could reach bytes it did not declare (§4.2),
-// and a shared one would be visible to another agent (§4.3).
+// Module memory bounds, read off the bytes before instantiation (§4.3). An imported
+// or shared memory is refused. Compute is bounded at each target's engine.
 
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
@@ -133,15 +120,9 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
   return limits;
 }
 
-/** Refuse a module whose declared memory does not fit `maxBytes` (README §4.3). The two
- *  halves fail for different reasons: `initialPages` is allocated at instantiation, so an
- *  oversized one lands the moment the module is compiled; `maxPages` bounds `memory.grow`
- *  afterwards, and a module declaring NO maximum is refused outright, since WebAssembly
- *  gives the embedder no way to impose one after instantiation — the cost of the rule is
- *  one build flag (AssemblyScript's `--maximumMemory`).
- *
- *  Returns the limits it validated, or null when the module declares no memory of its own —
- *  which the `memory` export check refuses separately. */
+/** Refuse a module whose declared memory does not fit `maxBytes` (§4.3).
+ *  An undeclared maximum is unbounded, so it is refused. Returns null when the
+ *  module declares no memory of its own. */
 export function checkModuleMemory(wasm: Uint8Array, maxBytes: number): MemoryLimits | null {
   const limits = readMemoryLimits(wasm);
   if (!limits) return null;

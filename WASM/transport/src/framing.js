@@ -1,25 +1,13 @@
-// ============================================================================
-// transport/src/framing.js — the wire framing for links the platform did not frame.
-// A browser WebSocket and an RTCDataChannel arrive with message boundaries already
-// on them; a TCP socket does not, so the host hands over bytes and a message is:
-//
-//   [len u32 BE][bytes]   one link message per record.
-//
-// The cap is two-stage, both numbers from the host at init: pre-auth the small
-// handshake bound, so a stranger who knows only host:port cannot reserve megabytes by
-// declaring a frame and then dribbling the body; raised to the full frame cap once the
-// peer is an admitted identity (§12.6.2).
-// ============================================================================
+// Wire framing for links the platform did not frame (§12.6.2). TCP is
+// [len u32 BE][bytes]; WS/RTC already have message boundaries. Two-stage cap:
+// handshake bound pre-auth, MAX_FRAME_BYTES once admitted.
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
 // A link message arrives in arbitrarily small slices, and either naive parser has a
 // failure mode a frame-size cap does not control: joining every slice onto one buffer
-// makes a dribbled full-size frame cost a quadratic number of copies, while keeping
-// every slice as it arrived costs a view and a pinned chunk buffer per byte, times the
-// half-open budget. So slices are kept, but a small one is appended into a growable
-// tail buffer whose capacity doubles: every byte moves a constant number of times, and
-// the live slice count is bounded by bytes/MERGE_BELOW.
+// Inbound reassembly: merge slices below MERGE_BELOW into a doubling buffer so a
+// dribbled frame is linear in copies, not quadratic (§12.6.2).
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {

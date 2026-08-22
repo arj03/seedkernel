@@ -1,8 +1,4 @@
-// ============================================================================
-// transport/src/router.js — the two layers above the record layer: the authenticated
-// link router, which picks the wire a frame goes out on, and the request/response
-// layer, which gives it correlation, protocol ids and deadlines.
-// ============================================================================
+// Link router + request/response layer (§12.6): correlation, protocol ids, stall clocks.
 
 // ── the router ────────────────────────────────────────────────────────────────
 
@@ -92,28 +88,8 @@ class Router {
  *  `send` op measures a caller's arguments against the frame cap before copying them. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
 
-// Correlation, the response binding, one deadline per request. An app's send arrives as
-// an ordinary invocation of `handle`, which answers with `defer()`: this layer holds the
-// deferred, matches the response frame to it by corr, and settles it. The corr is a wire
-// value only, never crossing the seam, so nothing about a request is visible outside this
-// heap. `to`/`from` are hex peer ids; proto is opaque bytes. The deadline arrives with
-// each request, since this layer cannot tell a control message from a 4 MB block.
-//
-// It is a stall clock, not a budget for the whole exchange: a request whose bytes are
-// still draining out of a backpressured socket has not finished being asked, and blaming
-// the holder for our own backlog would cancel every request in the window while the wire
-// works perfectly. So on expiry this asks whether our own request is still going out,
-// from bytes rather than traffic:
-//
-//   flushed = sent − buffered   bytes for this peer that actually left (monotone)
-//   owed                        `sent` at the moment this request was handed over
-//
-// A link is FIFO, so `flushed ≥ owed` means precisely "this request's last byte is on
-// the wire". Until then an expiry that finds `flushed` moving re-arms; after it, the
-// clock is a pure silence window. Bounding the re-arm by `owed` is what keeps it from
-// being a silence window under another name: progress measured per peer would let a
-// chatty caller's unrelated frames resurrect a stalled request, since later frames raise
-// `sent` but never this request's `owed`.
+// Stall clock (§16.1): re-arms while this request's bytes still drain
+// (`flushed < owed`); baseline on first expiry, not at send.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app

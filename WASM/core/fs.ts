@@ -1,7 +1,5 @@
-// The `fs.*` capability (exported as `seedkernel-wasm/fs`, §12.1): raw bytes under an
-// opaque, flat key — not a POSIX path (see the key rule below). Content-addressing,
-// descriptors and quota are app policy; only real platform conditions surface, so a full
-// disk makes `put` throw.
+// `fs` (§12.1): raw bytes under an opaque flat key. Content-addressing and quota are
+// app policy. Keys are filenames on both backends — charset in §16.1.
 
 export interface FsStat {
   /** Total bytes stored across all keys (best-effort). */
@@ -10,18 +8,11 @@ export interface FsStat {
   available: number;
 }
 
-/** The `available` sentinel for a backend that cannot ask the OS for free space — large
- *  enough never to read as "nearly full". Part of the seam rather than a per-backend
- *  choice, so a guest sizing its writes against `stat()` sees one answer. */
+/** Sentinel when the backend cannot ask the OS for free space. */
 export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
 
-/** The storage seam. **Every method is async as a property of the seam rather than of any
- *  backend**: a synchronous `get` is a shape no browser backend can implement (IndexedDB
- *  is async by construction, OPFS sync only inside a Worker), so a sync seam would leave
- *  the browser the one target unable to carry `fs`. A synchronous backend (`MemoryFs`)
- *  resolves in a microtask, so a guest cannot work by accident on one backend and fail on
- *  the one it ships against. ABI-visible: the `fs/*` names round-trip and a guest awaits
- *  them (§12.2). */
+/** Storage seam. Every method is async: IndexedDB/OPFS cannot be sync, so a sync
+ *  shape would drop the browser. `MemoryFs` resolves in a microtask. */
 export interface Fs {
   get(key: string): Promise<Uint8Array | null>;
   put(key: string, bytes: Uint8Array): Promise<void>;
@@ -34,22 +25,12 @@ export interface Fs {
   stat(): Promise<FsStat>;
 }
 
-// ─── what a key may be ───────────────────────────────────────────────────────
-//
-// A key is opaque to the runtime but not to the *medium*: both real backends map it to a
-// filename verbatim, so it must be flat and safe.
-//
-// It lives here because it is a consensus predicate, not a backend detail: which keys a
-// node admits decides which blocks it stores, so two nodes disagreeing about it disagree
-// about their contents. Applied once, in shared JS, over whichever backend a target
-// supplies (`validatedFs`, shell-core.ts); a backend's own path check is defence in depth.
+// Key charset is a consensus predicate (§16.1), applied once in shared JS.
 
-/** The key charset. Also the scope charset: a scope is a prefix of a key, so anything
- *  it could not be part of is not a scope either. */
+/** The key charset. Also the scope charset. */
 const SAFE_CHARS = /^[A-Za-z0-9._-]+$/;
 
-/** Names Windows resolves to a *device* before touching the filesystem. Refused on every
- *  OS, because the key space must not depend on where a node runs. */
+/** Windows device names. Refused on every OS so the key space does not depend on the host. */
 const RESERVED_DEVICE_NAMES = new Set<string>(["CON", "PRN", "AUX", "NUL"]);
 for (let i = 0; i <= 9; i++) { // COM0/LPT0 are reserved on current Windows too
   RESERVED_DEVICE_NAMES.add("COM" + i);

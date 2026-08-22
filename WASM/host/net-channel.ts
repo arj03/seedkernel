@@ -1,31 +1,11 @@
-// net-channel.ts — shared plumbing for the host socket adapters, in two parts:
-//
-// 1. RawLink over an already-ordered binary transport — WsChannel (net-ws) and RtcChannel
-//    (net-rtc). Both deliver whole messages, so this base is FRAMING.PLATFORM; a byte
-//    duplex handed to the transport bundle to frame itself does not come through here. The
-//    sinks, the `dead` flag, the pre-open send buffer (the transport emits HELLO before the
-//    socket is writable) and the teardown are written once; a subclass only wires its
-//    events to open()/deliver()/fail().
-//
-// 2. What RtcNetwork and WsNetwork share over one TransportHost: this node's id, the cohort
-//    query and the peer-edge bookkeeping.
-//
-// Host code, not core: it defines no seam. `RawLink` is the core seam (socket-seam.ts), and
-// a target with its own message transport can satisfy it without touching this file.
+// Shared host socket plumbing: FRAMING.PLATFORM RawLink base (Ws/Rtc) and the
+// bookkeeping RtcNetwork/WsNetwork share over one TransportHost.
+
 import { FRAMING, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost } from "./transport-host.js";
 
-/** Ceiling on the pre-open send queue, in bytes.
- *
- *  The queue exists for one narrow reason — the transport emits its first handshake frames
- *  before the socket is writable — and those are a handful of messages capped at
- *  `MAX_HANDSHAKE_FRAME_BYTES` each; anything approaching this number is a connect that
- *  never completed while its occupant kept writing, which is HOST memory a peer's
- *  unfinished handshake gets to spend. The transport bundle bounds its own pre-auth
- *  buffering with the same-sized `MAX_QUEUE_BYTES`; this is the same rule pointed at the
- *  buffer on this side of the seam. Overflow fails the channel rather than dropping bytes:
- *  a hole in an ordered stream is a link the far end waits on forever, where a dead channel
- *  is one the occupant notices and the address book redials. */
+/** Pre-open send queue ceiling. Overflow fails the channel rather than dropping
+ *  bytes (§16.1). */
 const MAX_PREOPEN_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export abstract class BufferedChannel {

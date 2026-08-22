@@ -440,19 +440,8 @@ function theShell() {
         throw new Error("native: bootNode has not run");
     return shell;
 }
-/** Stand a node up on this platform: a shell, the transport bundle admitted under
- *  the policy in force, and its listeners bound. Returns the shell and the driver
- *  that IS its network.
- *
- *  One of these, used by `bootNode` below and by any native test that needs a second
- *  endpoint: a test standing a node up some other way is the second assembly this target
- *  exists not to have (§12.9), and when the two last diverged it surfaced as a network
- *  timeout rather than a compile error. The config is an OBJECT for the same reason — a
- *  positional signature drifting against a Go harness string is a silent break.
- *
- *  The whole node is stood up by the shared `bootShell` — this target supplies the
- *  platform parts (Go's modules, fs, channels, realm) and bootShell does the rest, the
- *  transport bundle's author pin included. */
+/** Stand a node up on this platform via the shared `bootShell` (§12.9).
+ *  Config is an object so a positional drift against Go is a type error. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
     contactSecret?: Uint8Array;

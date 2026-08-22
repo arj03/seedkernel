@@ -1,18 +1,6 @@
-// The JS target's builder for one slot's private pure modules (README §3, §4). The native
-// target returns the same interface over an opaque wazero-owned handle.
-//
-// **A module call is bounded here, by construction.** The JS platform's WebAssembly
-// exposes no fuel or timeout, and a WASM call is one bytecode to QuickJS's interrupt
-// handler, so no budget can land *inside* a call (§4.3). The bound is structural instead:
-// each module lives in its own worker — a dedicated isolate, instantiated with the slot, so
-// statics live there — and a call carries a deadline. On expiry the host kills the worker
-// (`terminate` is the one interrupt JS exposes, and it works mid-loop), answers empty
-// exactly as a trap does, and respawns; a spinning module burns at most one core for at
-// most one budget. The native target holds the same contract at its own engine lever.
-//
-// A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global and
-// `handle(input_len)`, imports nothing, and cannot call back. The table is the host's only
-// slot construction, which is why nothing here touches crypto.
+// JS target's private pure-module builder (§3, §4). Call is bounded by worker kill;
+// native target returns the same interface over a wazero handle.
+
 
 import {
   DEFAULT_GUEST_DEADLINE_MS,
@@ -241,20 +229,8 @@ export class ModuleTable implements PureModuleLoader {
 
   // ─── installing WASM modules ─────────────────────────────────────────
 
-  /** Build one slot's modules, all or none (§3.1) — the one way code arrives, and the
-   *  only entry point that stands anything up; `dispose` on the returned value is the
-   *  only one that takes it down.
-   *
-   *  Every module is spawned, instantiated and validated BEFORE anything is written, and
-   *  the app's whole module map is built first and then assigned under its key — so the
-   *  commit is ONE assignment, with no window in which some of an app's modules are the new
-   *  version and the rest the old.
-   *
-   *  A re-install REPLACES the app's map rather than merging into it, so a bundle dropping
-   *  a module from its manifest leaves nothing of the old one behind.
-   *
-   *  Async because each module stands up a worker; this returns when every one has reported
-   *  `ready`, or throws on the first `loadError`. */
+  /** Build one slot's modules, all or none (§3.1). Commit is one assignment;
+   *  a re-install replaces the map rather than merging. */
   async build(mods: { name: string; wasm: Uint8Array }[]): Promise<PureModules> {
     const built = new Map<string, WasmModuleRef>();
     try {

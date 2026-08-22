@@ -1,11 +1,6 @@
-// transport-host.ts — the socket driver: a link table, an address book, the listeners, and
-// the links a host-managed transport hands over. Everything above it — the wire codec, the
-// handshake, the link router, the request/response layer — runs as the transport bundle's
-// zero-authority guest program (§12.6), reached through the `link/*` names.
-//
-// One invariant makes the arrangement safe: no call re-enters a live frame. A socket write
-// does not deliver during the write, an armed timer fires later, and a cross-realm call runs
-// its callee on a later turn; the transport's own answers ride `defer()` (realm-queue.ts).
+// Socket driver (§12.6): link table, address book, listeners. Wire codec/AKE/router
+// run as the transport bundle's guest via `link/*`. No call re-enters a live frame.
+
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
@@ -37,17 +32,8 @@ export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
  *  links without limit, each holding a framer, session keys, timers and buffers. */
 export const DEFAULT_MAX_AUTHED_LINKS = 256;
 
-/** ...and the ceiling on what the DRIVER holds, underneath all of them.
- *
- *  The budgets above are content policy: "half-open", "verified" and "authenticated" are
- *  states only the occupant can see, so the occupant enforces them. What this file owns is
- *  cruder and comes first — a socket costs a descriptor and a link-table entry the moment it
- *  is accepted, before the guest has formed any opinion about it — and a limit protecting a
- *  resource is declared by whoever owns the resource (core/net-limits.ts).
- *
- *  Comfortably above the sum of the tiers, because it is not their backstop in the ordinary
- *  case: an honest occupant refuses or evicts long before this, and a wedged or hostile one
- *  meets this instead of the host's memory. */
+/** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
+ *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
 export const DEFAULT_MAX_RAW_LINKS = 4096;
 
 /** How long one request may take when its caller names no deadline. Generous on purpose: it
@@ -248,17 +234,8 @@ export class TransportHost {
     this.reset();
   }
 
-  /** Link configuration: a side-effect-free read of immutable node identity and deployment
-   *  limits, so a candidate transport can initialize offside without disturbing the slot
-   *  that currently owns this raw-link binding.
-   *
-   *  The mutable address book deliberately is not here: a one-shot snapshot goes stale
-   *  between candidate construction and claim commit. It is replayed after publication
-   *  through the same `addr` event later additions use (`replayAddresses`).
-   *
-   *  Its shape is versioned by the manifest's signed `guest.abi` and nothing else, so
-   *  REMOVING or reordering a field here means bumping that (§12.4). Appending one does not:
-   *  a guest that never reads the tail cannot notice it. */
+  /** Immutable node identity and limits for a candidate transport (§12.6).
+   *  Address book is replayed after publication, not snapshotted here. */
   private configuration(): Uint8Array {
     const o = this.opts;
     const admit = new Args();

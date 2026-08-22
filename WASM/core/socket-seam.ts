@@ -1,17 +1,7 @@
-// socket-seam.ts — the socket-side types shared by the host's raw-I/O layers: bytes to and
-// from an opaque link over an already-ordered channel (README §12.1, §12.6). Everything
-// structural above — wire codec, AKE, record layer, link routing, request/response — is the
-// transport bundle's guest program, driven through host/transport-host.ts. These are the
-// shapes the socket adapters (net-node, net-ws, net-rtc, net-channel) compile against. No
-// crypto shape lives here: the handshake reaches crypto through the guest seam's `crypto/`
-// names like any other guest.
+// Socket-side types for raw I/O (§12.1, §12.6). Codec/AKE/routing live in the
+// transport bundle. A link states its `framing`; the guest branches on it.
 
-/** One link, as the platform hands it to the driver. The transport bundle never sees the
- *  object — the driver wires it to the guest by a host-supplied link id, and bytes cross as
- *  events/actions. Some transports arrive already framed (WebSocket, RTCDataChannel) and
- *  some are a byte duplex (TCP); a seam presenting one shape could hide that only by framing
- *  in the host, which is content below the seam — so the link states its `framing` and the
- *  guest branches on it. */
+/** One link as the platform hands it to the driver. States its `framing`; guest branches. */
 export interface RawLink {
   send(bytes: Uint8Array): void;
   /** Inbound bytes. `framing` says what one call means: a whole message, or an arbitrary

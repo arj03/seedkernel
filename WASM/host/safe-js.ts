@@ -1,26 +1,8 @@
-// safe-js — a zero-authority JavaScript sandbox (README §12.3): confined JS inside a
-// QuickJS interpreter compiled to WASM (quickjs-emscripten, the sync non-Asyncify build).
-// A fresh QuickJS context has *only* the ECMAScript intrinsics, so the guest cannot even
-// name `fs`/`net`/`process`/`fetch` — confinement is the default rather than something
-// locked down (which is what disqualified ShadowRealm). The single seam out is one
-// injected host function, `__host_call`, over a copy-model byte boundary.
-//
-// A round-tripping name — every `fs/*`, a cross-realm call, a module call — returns a real
-// Promise the guest builds itself (the shared preamble parks it under a `callId`); this
-// host returns `null` for "started async", then settles it with `__netResolve`/
-// `__netReject` and pumps `executePendingJobs()`. Deliberately NOT quickjs-emscripten's
-// `newPromise()` deferred: keeping the async half in plain ECMAScript is what lets this
-// host and the native loader share ONE preamble (`guestPreamble`, guest-seam.ts).
-//
-// No Asyncify and no host-driven step loop — a suspended async guest is just heap state.
-// Exactly ONE way in, `call`, serving both roles; what a synchronous second entry would
-// have given for free (one invocation running to completion before the next begins) is an
-// explicit per-realm FIFO queue instead (realm-queue.ts).
+// Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus one injected
+// `__host_call`. Async names return null and settle via `__netResolve`/`__netReject` in
+// the shared preamble — not quickjs-emscripten's `newPromise()`, so this host and the
+// native loader share one guest ABI. Invocations are serialized (realm-queue.ts).
 
-// `quickjs-emscripten-core` — the JS API layer alone, NOT the umbrella package, whose
-// value is bundling default engine variants via STATIC imports of all four Bellard
-// `@jitl/quickjs-wasmfile-*` packages. This realm supplies its own variant below, so the
-// umbrella would only pull four unused engines into every consumer's module graph.
 import {
   newQuickJSWASMModuleFromVariant,
   type QuickJSWASMModule,
@@ -59,29 +41,14 @@ export interface SafeRealmOptions {
   /** Hard cap on the realm's heap (default 64 MiB). A runaway guest hits this
    *  instead of the host's memory. */
   memoryLimitBytes?: number;
-  /** Budget of guest *execution* time per entrypoint invocation, in ms. Exceeding it
-   *  interrupts the guest, which surfaces to the caller as a thrown error.
-   *
-   *  Time the guest is actually **running**, not wall clock: the budget stops whenever the
-   *  guest is parked on a host seam (see `ExecClock`), which is what lets one number serve
-   *  both roles — an initiator spends seconds parked on the network without spending
-   *  budget, while a holder looping forever burns it in one segment.
-   *
-   *  `Infinity` disables the guard; omitting it gets the default, never unbounded. */
+  /** Guest execution budget per entrypoint, in ms. Running time, not wall clock.
+   *  `Infinity` disables; omit for default. */
   deadlineMs?: number;
 }
 
 export interface SafeRealm {
-  /** Invoke a guest entrypoint — the ONLY way into the realm, for both roles. Arg and
-   *  result cross as raw bytes; resolves when the guest promise settles, awaited host calls
-   *  included.
-   *
-   *  **Invocations are serialized per realm** (realm-queue.ts), so no two guest frames are
-   *  ever in flight and neither can observe the other's half-updated state at an await
-   *  point. The cost is real head-of-line blocking: an initiator parked on a network round
-   *  trip holds the queue. That is the price of the guarantee — the alternative is two
-   *  frames interleaving at every `await`, which a guest author cannot reason about. An app
-   *  wanting concurrency across the two roles wants two realms. */
+  /** Invoke a guest entrypoint — the only way in, for both roles. Serialized per
+   *  realm (realm-queue.ts). */
   call(entry: string, payload: Uint8Array): Promise<Uint8Array>;
   dispose(): void;
 }
@@ -98,15 +65,7 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
     : (u8.slice().buffer as ArrayBuffer);
 }
 
-/** The guest's execution-time accounting (§4.3, §12.3): a budget over *running* time,
- *  summed over the segments in which guest code holds the thread. A segment opens when the
- *  host enters the realm and closes when control returns; time between segments is the
- *  host awaiting the seam on the guest's behalf, and is nobody's budget.
- *
- *  Without the split one number cannot serve both roles: an initiator parked 2s on the
- *  network would be killed by any budget tight enough to catch a holder's infinite loop.
- *
- *  No nested-budget case — invocations are serialized, so exactly one window is open. */
+/** Guest execution-time accounting: budget over running time only (§12.3). */
 interface ExecClock {
   /** Guest code is about to run. */
   begin(): void;

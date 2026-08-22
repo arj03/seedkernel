@@ -1,55 +1,5 @@
-// ============================================================================
-// The transport bundle guest — the channel handshake (AKE + forward-secret record
-// layer), the authenticated link router, the link bookkeeping and the
-// request/response layer — as the zero-authority JS program of a signed bundle
-// reaching the raw-link capability and claiming `_net` (§12.6). The host keeps only what has no
-// endpoint substitute: the sockets, the flood caps, the node key, the entropy
-// source. Everything here is state machines.
-//
-// The program is split across transport/src/{util,ake,framing,router,core}.js and
-// CONCATENATED in that fixed order by scripts/build-transport-bundle.mjs into the
-// single guest.js the manifest hashes and the loader runs. The parts share one
-// scope, so a reference to a later part must be a runtime one, never top-level.
-//
-// The seam is one `host.call(name, bytes)` (§12.2), and the names below are
-// declared in the manifest's `guest.requires` — a host that cannot serve one
-// refuses the bundle at load. Primitives (pure transforms):
-//
-//   "crypto/blake2b-256"                bytes -> 32B                (transcript, KDF, root)
-//   "crypto/chacha20poly1305-ietf/seal" [npub 12][key 32][msg] -> ct    (record layer)
-//   "crypto/chacha20poly1305-ietf/open" [npub 12][key 32][ct] -> [ok u8][pt]
-//   "crypto/x25519/dh"                  [sk 32][pk 32] -> [ok u8][x 32] (also the
-//                                       pubkey, against the base point)
-//
-// Changing suite is changing these names: no op number, no ABI rev, no new grant.
-// Authorities — the whole of what this program holds:
-//
-//   "link/sign"   msg -> 64B sig, under this slot's network scope (`DOMAIN_link_scope ‖
-//                 networkKey`) — the one thing this name ever signs under, wired only
-//                 because this bundle reaches `link`. The host never reads the suffix,
-//                 and the channel format tag is part of msg below, so no handshake shape
-//                 is pinned into the host and no call signs raw bytes.
-//   "link/verify" [pk 32][sig 64][msg] -> [ok u8], under the SAME network scope — so
-//                 this program checks a peer's transcript signature without holding the
-//                 scope it was made under.
-//   "node/random" [n u32 BE] -> n bytes            (nonces, ephemeral secrets)
-//   `link/*`      bytes over an opaque link id, opened and closed
-//   `timer/*`     deadlines, since a zero-authority realm has no setTimeout
-//   "route/deliver" generic submission to an exact local claim
-//   "link/authenticated", "link/down" reports to this raw-link binding's owner
-//
-// Its own ws.wasm needs no grant: a bare name is a primitive, ungated like `crypto`
-// (§12.1). What the program provides back is the reserved id `_net` it CLAIMS
-// (§12.10), reached by an app calling it, with the host contributing attribution and
-// resolution only. One entrypoint, `handle`, invoked exactly as an app's is; the op
-// travels as a length-prefixed name in the payload, so an unimplemented op fails loud
-// rather than desyncing a decoder. (`timer` is every guest's, not this program's.)
-// Channels are host handles keyed by a HOST-minted link id, so all link state lives in
-// this module's heap. These parts are signed into the bundle: no imports, and they
-// must match the seam exactly — the host twin is host/transport-host.ts.
-// ============================================================================
-
-// ── capability names (must match the guest seam's dispatch table) ─────────────
+// Transport bundle guest: AKE, record layer, link router, request/response (§12.6).
+// Reached only through link/*; reaches no authority but link/*.
 
 const N_SIGN = "link/sign";
 const N_VERIFY = "link/verify";
@@ -277,16 +227,9 @@ function hostDeliver(fromBytes, proto, payload) {
 function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
 function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
-/** The peer LINT (§12.6): is this peer on the operator's list? Asked at the FIRST point
- *  the peer is known and — critically — before this end has revealed anything about
- *  itself: msg3 when accepting, msg4 when dialing. `conceal` says a refusal must be
- *  silent, which is true exactly when we have not yet sent our identity, and it is what
- *  keeps a refusal from being an oracle (§12.6.2).
- *
- *  A LINT, not a gate: what it catches is a buggy transport or an unlisted peer, both
- *  ours. Held host-side it would gate nothing either, since the key it checked would be
- *  one we supplied. What holds against a hostile occupant of this slot is that it
- *  reaches no authority but `link/*`. */
+/** Peer lint (§12.6): asked at msg3 when accepting, msg4 when dialing — before this
+ *  end has revealed anything. A lint, not a gate: a hostile occupant still reaches
+ *  only `link/*`. */
 function admits(peerBytes) {
   if (admitPeers === null) return true;
   return admitPeers.has(toHex(peerBytes));
@@ -539,15 +482,8 @@ class Link {
     else netLinkSend(this.linkId, msg);
   }
 
-  /** Inbound bytes from the host: a whole message on a framed link, an arbitrary slice
-   *  on an unframed one. An over-cap declaration is a protocol violation, so it is a
-   *  defensive abort — nothing said.
-   *
-   *  A framed link's push is async, so the abort decision lands on a later turn and the
-   *  host does not wait for it before handing over the next chunk. Delivery stays in the
-   *  order the record layer's counter requires because the framer's own read chain
-   *  (framing.js, `push`) parses one chunk at a time; `closed` gates what a delivery
-   *  arriving after an abort can still reach. */
+  /** Inbound bytes. Over-cap is a defensive abort. Framed push is async; delivery
+   *  order rides the framer's one-chunk-at-a-time read chain. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
@@ -755,22 +691,9 @@ class Link {
     this.clearEphemeral();
   }
 
-  /** Erase the handshake's private material: the X25519 ephemeral SECRET, the shared
-   *  point it produced, and our nonce.
-   *
-   *  Forward secrecy is a property of what is IN MEMORY, not of what is on the wire: an
-   *  attacker who reads this process (a core dump, a swapped page) and finds the
-   *  ephemeral secret recomputes `ee` against the peer's public ephemeral, re-runs the
-   *  KDF over the transcript, and decrypts every record the link carried.
-   *
-   *  Called at both ends of the handshake's life — the moment the session keys exist
-   *  (the common case), and again at teardown, which covers a link that DIED
-   *  mid-handshake and is exactly when the material is otherwise still live. `myEph` is
-   *  dropped rather than only zeroed, or `ensureKeys` would see an all-zero secret as a
-   *  key it had already generated.
-   *
-   *  This cannot promise the engine kept no copy (a GC that moved the buffer), only that
-   *  no live reference holds the plaintext key. */
+  /** Zero and drop the handshake's private material (ephemeral secret, `ee`, nonce).
+   *  Called when session keys exist and again at teardown. `myEph` is dropped, not
+   *  only zeroed — `ensureKeys` would treat an all-zero secret as already generated. */
   clearEphemeral() {
     if (this.myEph) {
       this.myEph.privateKey.fill(0); // the secret half only — the public one was on the wire

@@ -1,9 +1,5 @@
-// The app bundle format (§12.4): one blob holding the signed manifest envelope
-// (`manifest.bundle`), each WASM module under its manifest name (`<name>.wasm`), and the
-// zero-authority guest program (`guest.js`). No filename is ever declared — every name is
-// derived — and the manifest commits to the hash of every file it names, so a bundle is a
-// value, not a path: the same bytes load from disk, off a data channel or out of browser
-// storage. Application-neutral; seedstore fills in storage content.
+// App bundle format (§12.4): signed manifest envelope + modules + guest.js.
+// Every name is derived; the manifest commits to every file hash.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
 import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, GUEST_ABI_VERSION, AUTHORITY_CALLS, PRIVILEGES, isAuthority, isGrant, isReservedProtocol, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
@@ -60,21 +56,11 @@ export interface BundleManifest {
     /** Monotonic version of the coherent set (§12.4), enforced at load against a persisted
      *  per-`(author, app)` high-water mark. An integer, not a label. */
     version: number;
-    /** The wire protocol id(s) this app serves (§12.10) — a signed claim, and the whole of
-     *  the routing table: a load admits the code and claims these ids, an uninstall drops
-     *  them. Stated once in what the author signs, since a typo's only symptom is a node
-     *  that boots clean and answers an empty body forever.
-     *
-     *  Optional: a bundle the shell only drives as the *initiator* (§12.8) receives no
-     *  frames and claims nothing. Empty and absent mean the same thing.
-     *
-     *  A claim is not authority — it routes frames to code this node already admitted, and
-     *  one installed slot owns a claim at a time (§12.5). */
+    /** Wire protocol id(s) this app serves (§12.10). Optional: an initiator-only
+     *  bundle claims nothing. A claim is not authority. */
     protocols?: string[];
     modules: BundleModule[];
-    /** The guest program — required, because every app is a guest (§12.4): the loader
-     *  integrity-checks `guest.js` and hands the source back for the shell to run in a
-     *  confined realm. The modules are the pure transforms it drives by name, zero-to-many. */
+    /** The guest program — required. Modules are the pure transforms it drives. */
     guest: BundleGuest;
 }
 
@@ -209,14 +195,7 @@ export const MANIFEST_FILE = "manifest.bundle";
 export const GUEST_FILE = "guest.js";
 /** A module's name inside the container, derived from its logical name. */
 export function moduleFile(name: string): string { return name + ".wasm"; }
-/** An app's host-internal identity: `"<author hex>:<app>"` (§12.4) — used for freshness,
- *  scope derivation, audit output, and explicit operator selection.
- *
- *  Ownership is structural: a second author shipping an app called `chat` gets a different
- *  key and installs alongside, never over, so the loader keeps no ownership register (§12.5).
- *  The author is the full hex — a short prefix would be grindable — and fixed-length, so the
- *  two halves stay readable even when `app` contains `:`. Peers never send it: they send a
- *  protocol claim, which the receiver resolves locally. */
+/** App identity `"<author hex>:<app>"` (§12.4) — freshness, scope, uninstall/revoke. */
 export function appKeyFor(author: Uint8Array, app: string): string {
     return toHex(author) + ":" + app;
 }
@@ -282,29 +261,13 @@ const RESERVED_PROTO_RE = /^_[A-Za-z0-9._/-]{1,63}$/;
 export function encodeManifest(m: BundleManifest): Uint8Array {
     return enc.encode(JSON.stringify(m));
 }
-/** The signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`, signed by
- *  **both** keys. The domain prefix is signed but not stored; the suite byte is signed *and*
- *  stored (envelope byte 0), so a verifier reads the field widths from a byte its signature
- *  commits to and algorithm confusion with a later suite is unrepresentable (§14.1).
- *
- *  Each signature also commits to the *other* key, which is what makes the pair a pair:
- *  without it, an attacker holding one broken half could keep the sound half's key and
- *  signature and substitute its own for the broken one, and both signatures would still
- *  verify over what they signed. */
+/** Signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. Both keys
+ *  sign, and each commits to the other, so the pair cannot be taken apart. */
 function manifestPreimage(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
     return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, json]);
 }
-/** The author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)` — the only
- *  way an author id comes to exist.
- *
- *  Not the Ed25519 key alone: an attacker who eventually broke Ed25519 would forge that
- *  half, supply a freshly generated ML-DSA key for the other, and land on the author's apps
- *  with the id unchanged — hybrid signing buying nothing at exactly the moment it was
- *  supposed to pay. Hashing the whole key set makes the id unreachable without both private
- *  keys. 32 bytes because that width is load-bearing far outside this file (`appKeyFor`'s
- *  fixed-length prefix, 64-hex policy pins, routing, freshness marks), so hashing lets the
- *  key material change shape while none of that moves. The suite is fixed inside rather than
- *  a parameter — a later multi-key suite has a different key shape and writes its own. */
+/** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`.
+ *  The whole key set, so the id is unreachable without both private keys. */
 export function hybridAuthorId(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]), null);
 }
@@ -314,16 +277,7 @@ export interface AuthorSeedCrypto {
     crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
     ml_dsa65_keypair_from_seed(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
-/** An author's whole key set from one 32-byte seed: the Ed25519 half from the seed directly,
- *  the ML-DSA-65 half from `genesisHash(seed ‖ AUTHOR_MLDSA_SEED_LABEL)`.
- *
- *  Shared rather than restated in each build script: a copy that drifts fails as a *changed
- *  author id* — a bundle landing under a stranger's name and a policy pin matching nobody,
- *  which no test catches because each copy agrees with itself. One seed also keeps a rebuild
- *  byte-identical in author id, so a publisher can re-cut a bundle without every operator
- *  re-pinning.
- *
- *  Takes the 32-byte seed, not libsodium's 64-byte secret key (`sk.slice(0, 32)`). */
+/** Author key set from one 32-byte seed (§16.1). Pass the seed, not libsodium's 64-byte sk. */
 export function hybridAuthorKeysFromSeed(sodium: AuthorSeedCrypto, seed: Uint8Array): HybridAuthorKeys {
     if (seed.length !== 32) {
         throw new Error(`bundle: an author seed is 32 bytes, got ${seed.length}` +
@@ -633,14 +587,10 @@ export class FreshnessMarks {
     marks = new Map();
     /** Author keys written off (§12.5), as lowercase hex. */
     revoked = new Set();
-    /** Seed from a persisted `{ marks: { "authorHex:app": version }, revoked: [hex] }` blob.
-     *  Absent input ⇒ start empty, the first-boot case — which also means "start
-     *  unrevoked", and is why `persist` must be atomic on every target.
-     *
-     *  A store written before revocation existed — a bare `{ "authorHex:app": version }` map
-     *  — throws rather than reading as empty, which would silently discard every downgrade
-     *  guard on the one boot after a host upgrade. Other unrecognized keys are ignored:
-     *  dropping one discards nothing a guard was earned on. */
+    /** Seed from `{ marks, revoked }`. Absent input = first boot: start empty,
+     *  which is "unrevoked" — so a target's `persist` must be atomic. Bare
+     *  pre-revocation maps throw rather than reading as empty (would discard
+     *  every downgrade guard); unknown keys are ignored. */
     constructor(json?: string | null) {
         if (json) {
             let raw;
@@ -842,14 +792,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
         author: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey),
     };
 }
-/** Build a verified bundle's private module set. Any module failing releases the partial set
- *  and fails the candidate slot. Admission (§12.5) runs *before* this, so this is mechanics
- *  only, and there is no per-module callback: `modules[].hash` commits to exactly which
- *  bytes are authorized and `verifyBundle` proved they match.
- *
- *  It does not touch the freshness mark. The mark records the highest version that actually
- *  *ran*, and whether a guest runs is not known until it stands — so the shell advances it
- *  after that, as the last step of the load (shell-core.ts `commitMark`). */
+/** Build a verified bundle's private modules, all or none (§3.1). Admission already ran. */
 export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundle): Promise<PureModules> {
     // The §4.3 memory bound, read off the bytes *before* the host instantiates them —
     // instantiation is what allocates the declared initial memory, so a host-side check could

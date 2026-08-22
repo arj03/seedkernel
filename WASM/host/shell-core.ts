@@ -1,27 +1,7 @@
-// The platform-neutral shell core (§12.9): everything standing a node up involves except
-// what genuinely varies by target — pure-module construction, the guest-seam wiring, the
-// preamble assembly, the realm lifecycle, the bundle load order, the socket driver and the
-// inbound dispatch.
-//
-// `bootShell` is the ONE assembly path and the only way to a Shell — the assembly order is
-// the last thing two hosts could disagree about, so no target restates it: every platform
-// member defaulted (ModuleTable, the fs backend, FreshnessMarks, lazy safe-js), the channel
-// adapter built or accepted, the transport bundle admitted under an implicit author pin,
-// its listeners bound. Which default a target displaces is the whole of its platform half:
-//
-//   main.ts       → bootRuntime()  → NodeFs + FileFreshnessStore + NodeChannelFactory
-//   browser       → chat-shell.js  → an adapter instance (RtcNetwork hands channels over
-//                   openLink) + the consent gate; the transport load stays lazy so a
-//                   room-secret change can re-load it
-//   native        → native-shim.ts → Go module slots, Go fs, Go channels, the Go realm —
-//                   the target that displaces the most, and still not the assembly
-//   seedstore     → StorageNode    → MemoryFs + FreshnessMarks
-//
-// `createShell` below composes no pin and applies no defaults, so it is private to this
-// module: reachable, it would be a second assembly — a node constructed with the transport
-// author pin (§12.5) simply left off.
-//
-// There is no raw module install path: signed bundles are the only way slots land (§12.4).
+// Platform-neutral shell (§12.9). `bootShell` is the one assembly path — pin, defaults,
+// load order. Targets displace platform members only (main.ts, native-shim.ts, seedchat,
+// seedstore). `createShell` is private: it would skip the transport author pin. Signed
+// bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScopes, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
@@ -134,17 +114,8 @@ interface CreateShellOptions {
     claims?: PlatformClaims;
 }
 
-/** Exact platform-owned claims — e.g. seedchat's `_offer`, which carries a bundle between
- *  two browsers before either has an app that could receive it. They share lookup and
- *  conflict semantics with bundle claims; there is no wildcard path, so a name is
- *  registered or it is not.
- *
- *  Registering one is the deliberate act that makes a `_`-led name reachable from OUTSIDE
- *  the node: a bundle's reserved claim is a local service name and inbound delivery
- *  refuses it (`deliverInbound`), where host code asking for the name has said what it
- *  means. Attribution's space follows the path — a peer key inbound, a caller app key
- *  from a co-resident guest — so a handler under a reserved name must not read it as a
- *  peer id. */
+/** Exact platform-owned claims. Same lookup and conflict rules as bundle claims;
+ *  no wildcard. A `_`-led name is local-only whoever holds it (§12.10). */
 export type PlatformClaims = Readonly<Record<string, (attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array>>>;
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
@@ -202,17 +173,8 @@ export interface Shell {
      *  leaves the compromised code running. Permanent and host-local — recovery is a new
      *  author key, which derives new names and a fresh mark (§5.1), not an un-revoke. */
     revoke(authorHex: string): string[];
-    /** Invoke a loaded app's one entrypoint, `handle`, as the HOST itself: the shell writes
-     *  `[caller 32][opLen u8][op][payload]` with the host's caller id (32 zero bytes).
-     *
-     *  The op travels IN the payload, so an app has one op vocabulary whether a peer called
-     *  it or the host did; the shell never reads the name but owns the framing (the guest
-     *  half ships in the preamble, `readOp`). Addressed by app key rather than protocol id
-     *  because an initiator-only app claims no protocol — routing the loopback would force
-     *  it to expose an inbound surface merely to be locally drivable — and a caller holding
-     *  the load's {@link AppHandle} has the slot bound already. This reaches whatever
-     *  version is installed under that identity NOW, which is what an upgrade makes a
-     *  different answer from a handle's. */
+    /** Loopback into a loaded app's `handle` as the host (32 zero-byte caller id).
+     *  Addressed by app key — whatever is installed under that identity now. */
     invoke(op: string, payload: Uint8Array, appKey: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
@@ -225,15 +187,8 @@ export interface Shell {
     close(): void;
 }
 
-/** What a load returns: the verified bundle facts PLUS the slot handle — the one object
- *  every caller that loaded the bundle drives it through. `key` is the audit identity the
- *  shell's `uninstall`/`revoke` address; `fs` is this app's private keyspace view (scoped
- *  under `appScope` and key-rule-wrapped here, §12.2); `invoke` is the loopback call bound
- *  to this slot, so the derivation and the binding arrive together rather than a call site
- *  deriving `appKeyFor(author, app)` and passing it as `Shell.invoke`'s third argument.
- *  Disposal is not here: `Shell.uninstall(key)` is the act. A handle is valid until its
- *  slot is uninstalled or the shell closes; a caller holding one past that gets a
- *  rejection naming the slot rather than a call into a freed realm. */
+/** What a load returns: verified facts plus a slot-bound handle (§12.4).
+ *  `invoke` is bound to this slot; `Shell.invoke` re-resolves the key. */
 export interface AppHandle extends LoadedBundle {
     /** `<author hex>:<app>` (§12.4) — the slot's audit identity, the freshness key and
      *  what `uninstall`/`revoke` address. */
@@ -285,15 +240,7 @@ interface AppSlot {
   timers: RealmTimers;
 }
 
-/** A realm's timer table: the platform's event loop, handed to a guest that has none.
- *
- *  Everything here is the HOST's memory — a fresh QuickJS context has no `setTimeout` — so
- *  the live count is capped (an unbounded `timer/arm` loop spends host memory the guest is
- *  not charged for), and `clearAll` is not optional at teardown: a pending timeout holds a
- *  callback that re-enters the realm, so one surviving its realm's disposal is a call into
- *  a freed QuickJS context (§2.1), a crash rather than an error. Every disposal site goes
- *  through `disposeSlot`. `id` is the guest's own throughout, so an arm on a live id
- *  re-arms and `clear` is idempotent. */
+/** Per-realm timer table. Cap live count; `clearAll` before realm disposal (§2.1). */
 interface RealmTimers extends HostTimers {
   /** Cancel every live deadline. Called only from `disposeSlot`, before the realm goes. */
   clearAll(): void;
@@ -333,15 +280,8 @@ function createRealmTimers(fire: (id: number) => void, max = DEFAULT_MAX_LIVE_TI
 // The rule itself is a consensus predicate and lives in the core; the host applies it here,
 // in the two places it must, over whichever backend the target supplied.
 
-/** Apply the key rule over a backend, once, for every target.
- *
- *  A rejected key **throws** rather than reading as absent: an unrepresentable key is a
- *  caller bug, and `null`/`-1`/`false` would hide it on a read while `put` failed anyway.
- *  `list` is exempt — its argument is a prefix, and the empty prefix is exactly the call a
- *  key rule would wrongly refuse; `stat` names nothing.
- *
- *  Wrapped where a backend enters the shell, so it sits UNDER `scopedFs` and validates the
- *  composite `scope + key` the medium actually sees. */
+/** Apply the key rule over a backend. Rejected keys throw; `list`/`stat` exempt.
+ *  Sits under `scopedFs` so the composite `scope + key` is checked. */
 export function validatedFs(inner: Fs): Fs {
   const check = (key: string): string => {
     if (!isSafeFsKey(key)) throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);
@@ -359,18 +299,8 @@ export function validatedFs(inner: Fs): Fs {
   };
 }
 
-/** Scope a backend to one app's private keyspace (§12.2), so two apps granted `fs` cannot
- *  read, enumerate or delete each other's keys. Ownership becomes structural here the same
- *  way it is for table names (§5.1): by derivation, not by a rule something enforces.
- *
- *  `scope` is the opaque prefix `appScopeFor` (bundle.ts) derives from the app key. Two
- *  properties come from that derivation: it lies inside the backend's key charset
- *  (checked below), and it is fixed-length, so distinct scopes cannot overlap however an
- *  author names the app.
- *
- *  `stat()` is deliberately NOT scoped — `used`/`available` describe the physical backend,
- *  and a per-app `available` would be a fiction. An app that wants its own footprint sums
- *  `size()` over its own `list()`. */
+/** Scope a backend to one app's keyspace (§12.2). `scope` is `appScopeFor`'s
+ *  fixed-length prefix. `stat()` is not scoped — it describes the physical backend. */
 export function scopedFs(inner: Fs, scope: string): Fs {
   // The head of every key this app will ever reach, so it is checked at construction
   // rather than on the first `put`. Charset only (`isSafeFsScope`): the bare-dot and
@@ -464,10 +394,7 @@ function createShell(opts: CreateShellOptions & {
         };
         return slot;
     };
-    /** Release a slot: cancel its deadlines, THEN dispose its realm. Every teardown
-     *  path goes through this — uninstall, revoke, close, a transport handover — because
-     *  the other order leaves a `setTimeout` holding a callback into a freed QuickJS
-     *  context, which is a crash rather than an error (§2.1). */
+    /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
     const disposeSlot = (slot: AppSlot | null | undefined) => {
         slot?.timers.clearAll();
         slot?.realm?.dispose();
@@ -572,15 +499,8 @@ function createShell(opts: CreateShellOptions & {
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
         ? slot.realm.call("handle", input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
-    /** The loopback invoke, as BOTH `Shell.invoke` and an `AppHandle`'s run it: the app's
-     *  ONE entrypoint called with the host's own caller id (32 zero bytes) exactly as a
-     *  remote frame carries its peer's key, so the app reads one `handle` either way. The
-     *  envelope is written by the seam that defines it (`opCall`), never here.
-     *
-     *  The call is chained onto `inFlight` so `close()` defers realm disposal until a call
-     *  parked mid-await (a repair pass waiting out an unreachable peer) is never resumed
-     *  into a freed realm — a QuickJS use-after-free (§2.1). Every entry point into a
-     *  slot's guest goes through this one chaining, the handle's included. */
+    /** Loopback invoke with host caller id. Chained onto `inFlight` so `close()`
+     *  waits for parked calls (§2.1). */
     const invokeSlot = (slot: AppSlot, op: string, payload: Uint8Array): Promise<Uint8Array> => {
         const call = callSlot(slot, opCall(op, payload));
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
@@ -589,26 +509,12 @@ function createShell(opts: CreateShellOptions & {
     netHost?.route((payload) => {
         return linkOwner ? callSlot(linkOwner, payload) : null;
     }, () => linkOwner !== null);
-    /** The ONE cross-realm call (§12.10): a guest naming a reserved id reaches the realm
-     *  that claims it, on a later turn, and gets back what that realm's `handle` returned.
-     *  `null` when nothing claims it, which the seam reports by name. The host's whole
-     *  contribution is attribution and resolution: it prepends the CALLER's 32-byte id
-     *  exactly as `doDispatch` prepends the authenticated sender's key, and the id is
-     *  derived host-side from the admitted manifest, so it is no more forgeable than a
-     *  sender key. */
+    /** Cross-realm call by reserved id. Host prepends caller's 32-byte id. */
     const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
         return callLocal(id, callerId, payload);
     };
-    /** Refuse a candidate contesting an exclusive resource ANOTHER identity currently holds
-     *  (§12.10) — a protocol claim, or the raw-link binding. Both have one active owner,
-     *  and a load that took one over would be a route or the node's sockets changing hands
-     *  without the holder ever being uninstalled. This identity's own are not a contest —
-     *  replacing them in place is what an update is.
-     *
-     *  Asked once before candidate code can execute, then again in the synchronous commit
-     *  window. The first prevents a known loser from exercising irreversible authorities;
-     *  the second is the guarantee, because a claim taken while modules and the realm build
-     *  across yields would slip past the early decision. */
+    /** Refuse a candidate contesting a claim or the raw-link binding another identity
+     *  holds (§12.10). Asked before candidate code runs, then again in the commit window. */
     const refuseContested = (loaded: LoadedBundle, key: string) => {
         for (const claim of loaded.manifest.protocols ?? []) {
             if (platformClaims.has(claim)) {
@@ -626,12 +532,7 @@ function createShell(opts: CreateShellOptions & {
             throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkOwner)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
         }
     };
-    /** Advance the `(author, app)` freshness mark after the candidate realm stands but
-     *  before its synchronous claim commit, since it records the highest version that
-     *  actually ran while a failed write can still discard only the candidate. `prev` is
-     *  the mark this load was admitted against (`AdmissionContext.highWater`) — read once,
-     *  since nothing between there and here writes the store. A persist failure rolls the
-     *  in-memory mark back so the retry performs a fresh durable write. */
+    /** Persist freshness mark after the candidate stands, before claim commit. */
     const commitMark = (loaded: LoadedBundle, prev: number) => {
         const { author, manifest } = loaded;
         try {
@@ -659,12 +560,7 @@ function createShell(opts: CreateShellOptions & {
         disposeSlot(slot);
         return true;
     };
-    /** Hand one request to the realm claiming `claim` (§12.10): prepend the attribution,
-     *  invoke that app's one entrypoint. No branch on how the app is implemented — every
-     *  app presents the same `attribution ‖ payload` shape and one entry, its slot's realm
-     *  (`callSlot`). The answer is the realm's: a Promise the transport resumes on a later
-     *  turn rather than inline (transport-host.ts), which an asynchronous holder needs
-     *  since `fs` is async. */
+    /** Hand a request to the realm claiming `claim`. Answer is the realm's Promise. */
     const callClaimant = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
         const slot = claims.get(claim);
         if (!slot) return null;
@@ -673,20 +569,8 @@ function createShell(opts: CreateShellOptions & {
         input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
-    /** A request from OUTSIDE this node — `route/deliver` (guest-seam.ts) and the shell's
-     *  own `dispatch`. The attribution is written by whoever submits it, which is what the
-     *  separate `route` privilege governs (§12.5), so this path reaches strictly less than
-     *  the local one below.
-     *
-     *  A `_`-led claim is a LOCAL service name and is refused here, with NO exception — the
-     *  platform's own claims included, which is why the check comes first. No `requires` of
-     *  a remote sender's could have granted it, and the realms that serve one are handed an
-     *  app key by `callLocal` rather than a peer key, so letting a submitted attribution in
-     *  would both reach a surface no peer was ever offered and make the two 32-byte spaces
-     *  indistinguishable at the claimant. So the leading `_` means one thing everywhere: a
-     *  host name a peer is meant to reach is spelled as the ordinary id it is, and
-     *  registering it is still the deliberate act — `bootShell({ claims })` is host code
-     *  either way (§12.10). */
+    /** Inbound from outside this node (`route/deliver`, `dispatch`). `_`-led claims
+     *  are local and refused here with no exception — platform claims included (§12.10). */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
         if (isReservedProtocol(claim)) return null;
         const platformHandler = platformClaims.get(claim);
@@ -850,17 +734,8 @@ function createShell(opts: CreateShellOptions & {
     };
 }
 
-/** Assemble a node on the JS targets — the ONE assembly the JS platforms run (§12.9):
- *  every platform member defaulted (the fs backend, the freshness store, the module
- *  builder, the realm factory), the channel adapter built from options or accepted as an
- *  instance, the transport bundle admitted under an implicit author pin, its listeners
- *  bound, and the shared shell handed back.
- *
- *  Every field but `sodium` and `identity` has a default, so a consumer states only what
- *  it genuinely owns: a browser page passes its consent gate and its adapter, the native
- *  loader displaces the four members Go backs, a Node node its disk-backed fs and
- *  freshness store. There is no layer beneath: the pin and the load order are part of
- *  standing a node up, not a step a caller may skip. */
+/** JS-target assembly options (§12.9). Every field but `sodium` and `identity`
+ *  has a default; the pin and load order are part of standing a node up. */
 export interface BootShellOptions {
     /** The crypto surface the shell needs — sumo libsodium with the ML-DSA-65 verifier
      *  mixed in (the one thing no target can default: main.ts loads it, a browser page

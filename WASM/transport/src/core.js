@@ -464,17 +464,8 @@ register("timer", (argBytes) => {
   return NOTHING;
 });
 
-/** THE app-facing op (`APP_OPS`): `[noReply u8][deadlineMs u32][to blob][proto blob]
- *  [payload blob]` in, `[ok u8][response]` out. A `deadlineMs` of 0 takes the node's
- *  default, shipped as config at init.
- *
- *  The answer cannot be produced in this turn — the peer's response arrives as another
- *  invocation of this realm — and cannot be awaited for the same reason, so the op
- *  returns a deferred and `ReqRes` settles it. A noReply send answers immediately.
- *
- *  `caller` is unused beyond the boundary check above. It is the app's key, prepended
- *  host-side like an inbound frame's sender, and what a per-app accounting or rate limit
- *  would key on without any new seam. */
+/** App-facing send: deferred because the peer's response is another invocation
+ *  of this realm. `deadlineMs` 0 → node default. */
 entry("send", (r, caller) => {
   const noReply = r.u8() === 1;
   const deadlineMs = r.u32() || requestDeadlineMs;
