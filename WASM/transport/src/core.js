@@ -4,7 +4,7 @@
 // the state the earlier parts read at runtime.
 // ============================================================================
 
-// ── per-host state, set by EVT_INIT ───────────────────────────────────────────
+// ── per-host state, set by the `init` op ─────────────────────────────────────
 
 let ownPk = null;          // 32B node channel public key
 let ownId = "";            // its hex — the peer id
@@ -12,8 +12,8 @@ let networkKey = null;     // 32B
 let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
 let connsPerPeer = 1;
 // The operator's peer list as a Set of hex keys, or null for "admit everyone". A LINT
-// applied by `admits` (ake.js), and configuration rather than a seam: the host ships it
-// at init and never asks about a peer again.
+// applied by `admits` (ake.js), and a node fact rather than a seam: the host ships it
+// in the init payload and never asks about a peer again.
 let admitPeers = null;
 // Fallback request deadline, learned at init — the number that has to be right for a
 // caller that named none of its own.
@@ -275,45 +275,12 @@ class Core {
   }
 }
 
-// ── init ──────────────────────────────────────────────────────────────────────
-
-function init() {
-  // No version word to check: this program declares the seam it was compiled against as
-  // `guest.abi`, and a host implementing a different `link/config` shape refuses the whole
-  // bundle before this line runs (§12.4).
-  const r = new Reader(netConfig());
-  ownPk = r.blob();
-  ownId = toHex(ownPk);
-  networkKey = r.blob();
-  contactSecret = r.blob();
-  connsPerPeer = Math.max(1, r.u32());
-  maxUnverified = r.u32();
-  maxPerSource = r.u32();
-  maxVerified = r.u32();
-  maxAuthed = r.u32();
-  maxFrameBytes = r.u32();
-  maxHandshakeFrameBytes = r.u32();
-  requestDeadlineMs = r.u32();
-  linkIdleTimeoutMs = r.u32();
-  // An empty list means "admit everyone", said as a zero-length blob rather than a
-  // missing field, so there is one shape to read.
-  const peers = new Reader(r.blob());
-  admitPeers = peers.b.length > 0 ? new Set() : null;
-  while (peers.off < peers.b.length) admitPeers.add(toHex(peers.blob()));
-
-  router = new Router(ownPk, ownId);
-  reqres = new ReqRes();
-  core = new Core();
-  connected.clear();
-  reqres.attach((to, frame) => core.sendFrame(to, frame));
-  router.sink = (from, frame) => reqres.onFrame(from, frame);
-  // The cohort edges stay in this heap; the host reads them with the `peers` op rather
-  // than being told about each one.
-  router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-  router.onPeerDown = (peerId) => { connected.delete(peerId); };
-}
-
-init();
+// ── init: the host delivers this node once ───────────────────────────────────
+//
+// The shell invokes this program's `handle` with an `init` op while the slot is still
+// a candidate — the constructor's argument, delivered with the host's caller id and
+// never a name this program can go back to call. Node facts are an input, not a grant:
+// the seam's name table has no entry for them.
 
 /** Every core link, wherever it currently sits: authenticated ones live in the
  *  router's pools, pre-auth ones in the core's connecting/inbound tables, and a
@@ -337,9 +304,9 @@ function findLink(linkId) {
 // `handle` is invoked with `[caller 32][opLen u8][op][args]`. Two kinds of caller, told
 // apart by those 32 bytes and nothing else:
 //
-//   the HOST   32 zero bytes (transport-host.ts) — the platform's own events: sockets
-//              opening, bytes arriving, an address, and the two questions
-//              the operator's console asks (`ready`, `peers`).
+//   the HOST   32 zero bytes (shell-core.ts) — the platform's own events: the one-time
+//              node facts (`init`), sockets opening, bytes arriving, an address, and the
+//              two questions the operator's console asks (`ready`, `peers`).
 //   an APP     its app key, derived host-side from the admitted manifest, exactly as an
 //              inbound frame carries the authenticated sender's key. `send` is the only
 //              op an app may name; anything else is refused, because the platform's
@@ -369,6 +336,47 @@ function entry(name, fn) { ops[name] = fn; }
  *  like `ops` itself: an inherited `toString` would otherwise read as an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
+/** The host's one-time delivery of the immutable node facts to the freshly stood slot:
+ *  identity blob, network key blob, contact secret blob, the limits, the admitted-peer
+ *  list — the events below that carry the cohort stay separate (`addr`), and nothing
+ *  here may be re-read once it has run. The shape is versioned by `guest.abi`: removing
+ *  or reordering a field bumps it and appending one does not (§12.4). */
+entry("init", (r) => {
+  if (core !== null) throw new Error("transport: node facts delivered twice");
+  // No version word inside: this program declares the seam it was compiled against as
+  // `guest.abi`, and a host that feeds a different shape refuses the whole bundle before
+  // this line runs (§12.4).
+  ownPk = r.blob();
+  ownId = toHex(ownPk);
+  networkKey = r.blob();
+  contactSecret = r.blob();
+  connsPerPeer = Math.max(1, r.u32());
+  maxUnverified = r.u32();
+  maxPerSource = r.u32();
+  maxVerified = r.u32();
+  maxAuthed = r.u32();
+  maxFrameBytes = r.u32();
+  maxHandshakeFrameBytes = r.u32();
+  requestDeadlineMs = r.u32();
+  linkIdleTimeoutMs = r.u32();
+  // An empty list means "admit everyone", said as a zero-length blob rather than a
+  // missing field, so there is one shape to read.
+  const peers = new Reader(r.blob());
+  admitPeers = peers.b.length > 0 ? new Set() : null;
+  while (peers.off < peers.b.length) admitPeers.add(toHex(peers.blob()));
+
+  router = new Router(ownPk, ownId);
+  reqres = new ReqRes();
+  core = new Core();
+  connected.clear();
+  reqres.attach((to, frame) => core.sendFrame(to, frame));
+  router.sink = (from, frame) => reqres.onFrame(from, frame);
+  // The cohort edges stay in this heap; the host reads them with the `peers` op rather
+  // than being told about each one.
+  router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
+  router.onPeerDown = (peerId) => { connected.delete(peerId); };
+});
+
 register("handle", (argBytes) => {
   // Read with the preamble's own functions (guest-seam.ts) rather than open-coded, so
   // the envelope this program and the host share is described in one place.
@@ -381,6 +389,9 @@ register("handle", (argBytes) => {
   // inject a frame on any link.
   // The caller id is the host's to write, so this is a real boundary and not a hint.
   if (!APP_OPS[op] && !fromHost) throw new Error("transport: '" + op + "' is the host's, not an app's");
+  // The node facts arrive before anything else: an event with no init behind it refuses
+  // by name rather than reading a null core.
+  if (core === null && op !== "init") throw new Error("transport: node facts never arrived — '" + op + "' ran before init");
   try {
     return fn(r, caller) || NOTHING;
   } finally {

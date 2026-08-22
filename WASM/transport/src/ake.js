@@ -8,7 +8,6 @@ const N_RANDOM = "node/random";
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
 const N_WS = "ws";
 
-const N_LINK_CONFIG = "link/config";
 const N_LINK_OPEN = "link/open";
 const N_LINK_SEND = "link/send";
 const N_LINK_CLOSE = "link/close";
@@ -201,7 +200,6 @@ function netLinkOpen(destBytes) {
   };
 }
 function netLinkSend(linkId, bytes) { host.call(N_LINK_SEND, args([linkId], [], bytes)); }
-function netConfig() { return host.call(N_LINK_CONFIG, new Uint8Array(0)); }
 function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
 /** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
  *  or a channel that cannot say — both read as "nothing queued", which leaves the

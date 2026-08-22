@@ -25,7 +25,7 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 /** Guest ABI version (§12.2). Adding a catalog name does not bump it; changing a name,
  *  framing, or preamble meaning does. */
-export const GUEST_ABI_VERSION = 10;
+export const GUEST_ABI_VERSION = 11;
 /** Guest `crypto/` catalog. Total over this list; not a grant. Adding a name is the whole cost of a new algorithm. */
 export const PRIMITIVE_NAMES = [
     "blake2b-256",
@@ -63,7 +63,6 @@ export const AUTHORITY_CALLS = {
     "clock/now": "app",
     "timer/arm": "app",
     "timer/clear": "app",
-    "link/config": "link",
     "link/open": "link",
     "link/send": "link",
     "link/close": "link",

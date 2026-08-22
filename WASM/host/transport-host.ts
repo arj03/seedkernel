@@ -244,9 +244,10 @@ export class TransportHost {
     this.reset();
   }
 
-  /** Immutable node identity and limits for a candidate transport (§12.6).
-   *  Address book is replayed after publication, not snapshotted here. */
-  private configuration(): Uint8Array {
+  /** The immutable node facts a freshly stood link occupant receives once — the init
+   *  op's payload (shell-core.ts). Not re-readable afterwards, and the address book is
+   *  not here: it is mutable node state, replayed after publication as `addr` events. */
+  initialConfig(): Uint8Array {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
@@ -381,7 +382,6 @@ export class TransportHost {
   rawNet(owner: object): RawNet {
     const ownsBinding = () => this.activeOwner === owner;
     return {
-      config: () => this.configuration(),
       open: (dest) => {
         if (!ownsBinding()) return NO_ROUTE;
         // The destination is the peer's 32-byte channel key, resolved in the address book.

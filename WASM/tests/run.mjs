@@ -1936,11 +1936,11 @@ async function testModuleCallChargedToGuestBudget() {
 //
 // The number is only worth carrying if the host refuses a seam it does not implement, and
 // the case that matters is always the one just retired — the population that actually
-// exists. At ABI 7 `link/config` dropped its trailing address book, and an ABI-6 transport
-// reads that removed field off the end of the buffer as an empty one: a node with a correct
-// identity that dials nobody and reports nothing. Written against the constant, so the
-// boundary moves with it rather than pinning whichever version was current the day it was
-// written.
+// exists. At ABI 11 the node facts moved off the `link/config` name into the host's
+// one-time `init` invocation; an ABI-10 transport calls a name this host no longer has,
+// and a host that tolerated it would run a program holding different facts than the
+// numbers it was built against. Written against the constant, so the boundary moves with
+// it rather than pinning whichever version was current the day it was written.
 async function testPreviousAbiRefused() {
   const stale = GUEST_ABI_VERSION - 1;
   console.log(`Test: guest ABI ${stale} is refused at load — a retired seam is not tolerated`);
@@ -2653,7 +2653,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(guest)), abi: GUEST_ABI_VERSION,
-        requires: ["fs/put", "link/config", "_svc"],
+        requires: ["fs/put", "link/open", "_svc"],
       },
     }),
     [moduleFile("fwd")]: forwarderBytes,
@@ -2665,9 +2665,9 @@ async function testCandidateRealmCannotActBeforeCommit() {
   }
   const store = new FlakyStore();
   const candidates = [];
-  // A REAL socket-less driver (the browser-edge shape), so `link/config` is the read the
-  // transport's own `init()` makes rather than a stand-in, and the pin — this author's —
-  // is what lets a `link`-reaching candidate get as far as the seam under test.
+  // A REAL socket-less driver (the browser-edge shape), so a link read is the seam's true
+  // read through the candidate's own unpublished binding, and the pin — this author's — is
+  // what lets a `link`-reaching candidate get as far as the seam under test.
   const shell = await bootTestShell({
       fs, freshnessStore: store, pinAuthor: author,
       createRealm: async ({ hostCall }) => {
@@ -2675,9 +2675,12 @@ async function testCandidateRealmCannotActBeforeCommit() {
         for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
           try { await hostCall(name, payload); } catch { refused.push(name); }
         }
-        const config = await hostCall("link/config", new Uint8Array());
+        // The node facts are no longer a seam name a candidate reads offside — the host
+        // hands them to the freshly stood slot as its `init` op. A link READ stays open:
+        // `link/open` answers "no route" for the unpublished binding rather than throwing.
+        const openBytes = await hostCall("link/open", new Uint8Array(32));
         const moduleAnswer = await hostCall("fwd", Uint8Array.of(4));
-        candidates.push({ hostCall, refused, config, moduleAnswer });
+        candidates.push({ hostCall, refused, openBytes, moduleAnswer });
         return { call: async () => new Uint8Array(), dispose() {} };
       },
       // A platform claim standing in for the neighbour a candidate must not reach.
@@ -2693,7 +2696,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "a candidate reaches neither a durable write nor another realm");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
-    assert(candidates[0].config.length > 0, "the reads a guest initializes from stay open");
+    assertEqual(candidates[0].openBytes[0] & 0xff, 0,
+      "the reads a guest initializes from stay open — a link read answers no route");
     assert(candidates[0].moduleAnswer[0] === 4, "…as do its own verified modules");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 

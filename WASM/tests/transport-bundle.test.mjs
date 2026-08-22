@@ -78,7 +78,7 @@ function transportBundleAt(version, keys, guestSource) {
     // slot's return convention, not a name to declare.
     guestRequires: [
       "node/random",
-      "link/config", "link/open", "link/send", "link/close", "link/stat",
+      "link/open", "link/send", "link/close", "link/stat",
       "link/authenticated", "link/down", "link/sign", "link/verify",
       "timer/arm", "timer/clear",
     ],
@@ -104,9 +104,10 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     grants: { link: [transportAuthor] },
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
-  // A test may pause exactly one freshly evaluated candidate before the shell publishes
-  // it. At that point `link/config` has been read but the incumbent still owns `_net`,
-  // which exposes address-book updates in the replacement window deterministically.
+  // A test may pause a candidate right after its realm stands, before the shell publishes
+  // it. At that point the candidate's `init` op (its one-time node facts) has not yet been
+  // delivered and the incumbent still owns `_net`, which exposes address-book updates in
+  // the replacement window deterministically.
   const realmControl = { pauseNext: null };
   // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
   // but leaves the load to this test — which is the thing under test here, upgrades
@@ -177,9 +178,11 @@ const publish = new Promise((resolve) => { publishCandidate = resolve; });
 a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; };
 const upgrading = a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
 await configured;
-// The candidate has consumed its static config, but the incumbent still owns `_net`.
-// This address update must survive the commit even though its live `addr` event goes to
-// the outgoing realm. A mutable config snapshot loses it; post-publish replay does not.
+// The candidate's `init` facts were not snapped at the pause: this address update lands
+// after the pause, before the handover, while the incumbent still owns `_net` — its live
+// `addr` event goes to the outgoing realm. The address book is the NODE's, so it survives
+// the commit if and only if the host replays it to the published claimant; the facts the
+// newcomer received at init never carried it.
 aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
 publishCandidate();
 await upgrading;

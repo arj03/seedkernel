@@ -484,7 +484,9 @@ function createShell(opts: CreateShellOptions & {
         // A candidate's top level runs before its mark and claims commit, so until then the
         // seam refuses what disposing that candidate could not take back (`isIrreversible`).
         // Everything a guest initializes from stays open: its reads, `crypto/*` and its own
-        // modules — which is how a transport candidate reads `link/config` offside.
+        // modules. The node facts a link occupant needs are never read OFF this seam — the
+        // host invokes the freshly stood slot's `handle` once with them, as the `init`
+        // op's payload (initLinkSlot), before the binding is published.
         return (name, payload, budget) => {
             if (!slot.active && isIrreversible(name)) {
                 throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
@@ -503,6 +505,17 @@ function createShell(opts: CreateShellOptions & {
         const call = callSlot(slot, opCall(op, payload));
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
+    };
+    /** The one delivery of the node's immutable facts to a link occupant: an `init` op
+     *  into the freshly stood slot's `handle`, with the host's caller id, before the
+     *  binding is published and before any event. Constructor argument, not a capability:
+     *  nothing here is re-readable, and what is mutable — the address book — arrives as
+     *  `addr` events after publication. */
+    const initLinkSlot = async (slot: AppSlot): Promise<void> => {
+        const facts = netHost?.initialConfig();
+        if (!facts)
+            throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
+        await invokeSlot(slot, "init", facts);
     };
     netHost?.route((payload) => {
         // The link occupant's `handle` return is the driver's to read: an inbound request
@@ -646,6 +659,11 @@ function createShell(opts: CreateShellOptions & {
             // below a floor a broken upgrade raised: rollback bricked by a failed upgrade.
             try {
                 await standRealm(slot, localConfig, loadOpts);
+                // The host invokes the link occupant once with the node facts — an init
+                // op into its own `handle`, not a name it calls back later. A transport
+                // that refuses its own boot arguments fails the load: nothing below has
+                // been marked or claimed, so the candidate is simply disposed.
+                if (hasLink(slot)) await initLinkSlot(slot);
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
@@ -681,10 +699,10 @@ function createShell(opts: CreateShellOptions & {
             // The mark and every claim/link binding have landed, so this slot's writes and
             // cross-realm calls are now its own (`seamFor`).
             slot.active = true;
-            // The address book is mutable node state, not part of the candidate's static
-            // `link/config` snapshot. Publish first, then replay it through the ordinary
-            // host-event path. No await in between: a concurrent add is either in this
-            // replay or is announced directly to the newly published claimant.
+            // The address book is mutable node state, not part of the immutable facts the
+            // occupant received at init. Publish first, then replay it through the
+            // ordinary host-event path. No await in between: a concurrent add is either
+            // in this replay or is announced directly to the newly published claimant.
             if (linkOwner === slot) netHost?.replayAddresses();
             disposeSlot(previous);
             // The handle: the verified facts plus the bound slot — the key, the scoped fs

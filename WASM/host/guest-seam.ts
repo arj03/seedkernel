@@ -51,11 +51,11 @@ export interface SeamCalls {
 }
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id.
- *  Nothing here may re-enter the guest realm. */
+ *  Nothing here may re-enter the guest realm. The node's immutable facts never pass
+ *  this way — the host invoked the freshly stood slot once, with them, before the
+ *  binding is published (shell-core.ts), and the mutable address book arrives as
+ *  `addr` events. This is only the byte pipe. */
 export interface RawNet {
-    /** This node's link configuration. Reading it has no side effects, so a candidate
-     *  slot may initialize before it is published. */
-    config(): Uint8Array;
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
      *  host resolves the name in its own address book; the caller learns no route it could
@@ -572,8 +572,8 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` — the
         // whole of what the platform contributes to the network (§12.1). No peer, no
         // protocol id, no correlation: those are the transport's own. Inbound bytes arrive
-        // the other way, as ordinary invocations of the transport's `handle`.
-        "link/config": () => rawNet().config(),
+        // the other way, as ordinary invocations of the transport's `handle`. The node's
+        // immutable facts were delivered once at init; nothing here is re-readable.
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);
