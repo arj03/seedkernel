@@ -2,20 +2,17 @@
 // shared §12.3 guest-realm bounds and the §4.1 scratch default every host's table must
 // agree on.
 //
-// Memory cannot be bounded *after* instantiation: `new WebAssembly.Instance` allocates the
+// Memory cannot be bounded after instantiation: `new WebAssembly.Instance` allocates the
 // declared initial memory before any export runs, so a module declaring 4 GiB has already
-// taken the host down by the time module-table.ts sees it. The bound has to be read off
-// the bytes first, which is what this file is for. (Compute is bounded at each target's
-// engine instead — module-table.ts's worker kill, wazero's `WithCloseOnContextDone`.)
+// taken the host down. The bound is read off the bytes first. The JS WebAssembly API
+// exposes no memory limits on a compiled `Module`, so this walks the binary's section
+// headers; it is a *bounds read*, not a validator, and anything it cannot parse is
+// refused. (Compute is bounded at each target's engine — module-table.ts's worker kill,
+// wazero's `WithCloseOnContextDone`.)
 //
-// The JS WebAssembly API exposes no memory limits on a compiled `Module`, so this walks
-// the binary's section headers. It is a *bounds read*, not a validator — the engine still
-// validates at compile time — and anything it cannot parse is refused, because a module
-// whose sections do not parse is one whose footprint cannot be bounded either.
-//
-// Two refusals are structural rather than budgetary: an IMPORTED memory would be
+// Two refusals are structural rather than budgetary: an imported memory would be
 // host-supplied, the one way a pure transform could reach bytes it did not declare (§4.2),
-// and a SHARED one would be visible to another agent (§4.3).
+// and a shared one would be visible to another agent (§4.3).
 
 /** WebAssembly linear-memory page size. Limits are declared in pages, budgets in bytes. */
 export const WASM_PAGE_BYTES = 65536;
@@ -35,27 +32,24 @@ export const DEFAULT_REALM_MEMORY_BYTES = 64 * 1024 * 1024;
  *  any real request, and short enough that a wedged guest frees the host thread. */
 export const DEFAULT_GUEST_DEADLINE_MS = 5000;
 
-/** How many deadlines one guest realm may hold at once (§12.3). A guest cannot create a
- *  timer for itself, so every live one is an entry in a host-side table and an unbounded
- *  `timer/arm` loop would spend the host's memory rather than the guest's heap. Per realm,
- *  because the shell wires one timer table per realm. */
+/** How many deadlines one guest realm may hold at once (§12.3), enforced per realm by the
+ *  shell's one timer table per realm. A guest cannot create a timer for itself, so every
+ *  live one is a host-side entry; an unbounded `timer/arm` loop would spend the host's
+ *  memory rather than the guest's heap. */
 export const DEFAULT_MAX_LIVE_TIMERS = 1 << 16;
 
-/** Default ceiling on a module's declared linear memory. Declared here rather than in a
- *  host because `loadBundleModules` is the one place it is applied, on the shared admission
- *  path (§3), against the tighter of this and the ceiling the target's loader declares
- *  (`PureModuleLoader.maxModuleMemoryBytes`). So a host may hold its own isolates to
- *  something tighter and none can be looser about what a *bundle* may land — by
- *  construction rather than by each loader repeating the check. */
+/** Default ceiling on a module's declared linear memory, applied at the shared admission
+ *  path (§3) against the tighter of this and the target loader's own ceiling
+ *  (`PureModuleLoader.maxModuleMemoryBytes`) — so a host may hold its isolates to less and
+ *  none can be looser about what a bundle may land. */
 export const DEFAULT_MAX_MODULE_MEMORY_BYTES = 64 * 1024 * 1024; // 64 MiB
 
 export interface MemoryLimits {
-  /** Initial size in pages — allocated eagerly at instantiation, so this is the
-   *  number that decides whether instantiating the module is itself an attack. */
+  /** Initial size in pages — allocated eagerly at instantiation, so it decides whether
+   *  instantiating the module is itself an attack. */
   initialPages: number;
-  /** Declared maximum in pages, or null when the module declares none. A module with
-   *  no maximum may `memory.grow` up to whatever the engine allows, so the host cannot
-   *  bound it and refuses it (see `checkModuleMemory`). */
+  /** Declared maximum in pages, or null when the module declares none — an undeclared
+   *  maximum is an unbounded one, so the host refuses it (see `checkModuleMemory`). */
   maxPages: number | null;
 }
 
@@ -82,7 +76,7 @@ function skipName(c: Cursor): void {
   if (c.i > c.b.length) throw new Error("wasm: truncated name");
 }
 
-/** A `limits` record: a flags byte, then the initial size, then the maximum if declared.
+/** A `limits` record: flags byte, then the initial size, then the maximum if declared.
  *  Flags above 0x01 mean shared memory (0x02/0x03) or a 64-bit index type (0x04+), both
  *  outside the §4 pure-transform contract — refused by name so the message says why. */
 function readLimits(c: Cursor): MemoryLimits {
@@ -128,26 +122,23 @@ export function readMemoryLimits(wasm: Uint8Array): MemoryLimits | null {
         else throw new Error(`wasm: unknown import kind 0x${kind.toString(16)}`);
       }
     } else if (id === 5) {
-      // Memory section.
       const count = readVarU32(c);
       if (count !== 1) throw new Error(`wasm: ${count} memories declared — a module declares exactly one (§4.1)`);
       limits = readLimits(c);
     }
-    // Sections this does not read are skipped wholesale; so is any tail left inside one
-    // it does, so a future field appended to a section cannot desynchronise the walk.
+    // Sections this does not read are skipped wholesale, as is any tail left inside one it
+    // does — so a future field appended to a section cannot desynchronise the walk.
     c.i = end;
   }
   return limits;
 }
 
-/** Refuse a module whose declared memory does not fit `maxBytes` (README §4.3).
- *
- *  The two halves fail for different reasons. `initialPages` is allocated at
- *  instantiation, so an oversized one lands the moment the module is compiled. `maxPages`
- *  bounds `memory.grow` afterwards, and a module declaring NO maximum is refused outright:
- *  WebAssembly gives the embedder no way to impose one after the fact, so an undeclared
- *  maximum is an unbounded one. The cost of the rule is one build flag (AssemblyScript's
- *  `--maximumMemory`).
+/** Refuse a module whose declared memory does not fit `maxBytes` (README §4.3). The two
+ *  halves fail for different reasons: `initialPages` is allocated at instantiation, so an
+ *  oversized one lands the moment the module is compiled; `maxPages` bounds `memory.grow`
+ *  afterwards, and a module declaring NO maximum is refused outright, since WebAssembly
+ *  gives the embedder no way to impose one after instantiation — the cost of the rule is
+ *  one build flag (AssemblyScript's `--maximumMemory`).
  *
  *  Returns the limits it validated, or null when the module declares no memory of its own —
  *  which the `memory` export check refuses separately. */

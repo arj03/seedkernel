@@ -21,7 +21,7 @@ export class NodeFs implements Fs {
   /** Which keys are representable is `isSafeFsKey` (core/fs.ts), applied over every backend
    *  by `validatedFs` — not restated here, because a backend's copy of that rule is how key
    *  spaces start differing between targets. What this adds is containment: a key that got
-   *  this far still holding a separator would escape `dir`. */
+   *  this far while still holding a separator would escape `dir`. */
   private path(key: string): string {
     if (key.includes("/") || key.includes("\\") || key === "." || key === "..") {
       throw new Error(`fs: unsafe key ${JSON.stringify(key)}`);

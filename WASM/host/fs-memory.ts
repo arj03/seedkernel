@@ -1,17 +1,15 @@
-// The in-RAM `Fs` backend — the portable one, for tests and ephemeral nodes, and the
-// shape a browser backend (OPFS/IndexedDB) will mirror.
-//
-// A backend, so it sits with the others (`fs-node.ts`, Go's `native/fs.go`) rather than in
-// core. Core is the seam it satisfies and the key rule (core/fs.ts), with the wrappers that
-// apply them in shell-core.ts — those decide what an app can reach and every host must
-// agree on them. Which medium the bytes land in decides nothing.
+// The in-RAM `Fs` backend — the portable one, for tests and ephemeral nodes, and the shape
+// a browser backend (OPFS/IndexedDB) will mirror. It sits with the other backends
+// (`fs-node.ts`, Go's `native/fs.go`), not in core: core is the seam it satisfies and the
+// key rule (core/fs.ts), with the wrappers that apply them in shell-core.ts — those decide
+// what an app can reach. Which medium the bytes land in decides nothing.
 
 import { FS_AVAILABLE_UNKNOWN, type Fs, type FsStat } from "../core/fs.js";
 
 /** In-RAM Fs. Stores copies so callers can reuse their buffers.
  *
  *  Every method is `async` even though the map behind them is not: the seam is what is
- *  asynchronous, and a backend that resolved sometimes-immediately would let a caller
+ *  asynchronous, and a backend that resolved even sometimes-immediately would let a caller
  *  work by accident on this one and fail on the backend it ships against. */
 export class MemoryFs implements Fs {
   private readonly map = new Map<string, Uint8Array>();

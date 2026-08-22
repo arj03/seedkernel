@@ -1,53 +1,33 @@
-// The node's signing keypair, derived from the one stored master seed.
+// The node's signing keypair, derived from the one stored 32-byte master seed (§12.6.2b):
+// BLAKE2b-256 over `DOMAIN_subkey ‖ label ‖ master`, fed to crypto_sign_seed_keypair.
 //
-// A node holds ONE secret on disk: a 32-byte master seed. The seed itself signs nothing —
-// it only derives — and every keypair the node uses comes out of `deriveNodeKeys` under a
-// distinct, versioned label. Today there is exactly one such label, `channel`, and its
-// public half is the node's IDENTITY: the peer id, what the handshake signs with, what
-// `senderPk` carries on every dispatch, and what the guest seam's SIGN op signs with.
-//
-// WHY ONE KEY, given that purpose separation is otherwise good practice. A second `guest`
-// subkey cannot survive contact with what a signature is FOR: a signed record travels to
-// other nodes, which know the author only as a peer id, so a record signed by a sibling
-// subkey names an author no peer has heard of. Reconciling the two would mean gossiping a
-// signed guest-pk↔channel-pk binding per peer — a new protocol element bought to protect a
-// split no node could deploy, both subkeys being derived at boot from one seed the same
-// process holds.
-//
-// Cross-purpose forgery is prevented the way it is everywhere else in the tree instead:
-// every signature binds `DOMAIN_x ‖ scope ‖ msg`, the host chooses the domain from the slot
-// the asking bundle occupies, and no op ever signs raw bytes (guest-seam.ts).
-//
-// The derivation stays because it keeps the stored secret distinct from the key that signs,
-// and keeps the label versioned so the peer id can be rotated without changing the key file
-// format. It is BLAKE2b-256 over `DOMAIN_subkey ‖ label ‖ master`, fed to
-// crypto_sign_seed_keypair.
+// One key serves every purpose, and what a signature MEANS is the host's choice of
+// `DOMAIN_x ‖ scope` from the slot the asking bundle occupies (guest-seam.ts) rather than
+// the key's. The derivation stays because it keeps the stored secret distinct from the key
+// that signs, under a versioned label, so the peer id can rotate without changing the key
+// file format. Why not a second keypair, and what that would cost: CHANNEL.md §7.
 
 import { DOMAIN_SUBKEY } from "./domains.js";
 import { concatBytes, enc } from "./util.js";
 
-/** Labels are closed, literal and versioned — never built from runtime data. Adding a
- *  purpose means adding a constant here, which is the point: the set of things this
- *  node's seed can sign for is enumerable by reading one file. */
+/** Labels are closed, literal and versioned — never built from runtime data, so the set
+ *  of things this node's seed can derive for is enumerable by reading one file. */
 export const SUBKEY_CHANNEL = enc.encode("seedkernel-subkey-channel-v1\0");
 
-/** The crypto this module needs, kept narrow so subkey derivation is testable without a
- *  whole crypto backend. */
+/** Kept narrow so subkey derivation is testable without a whole crypto backend. */
 export interface SubkeyCrypto {
   crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
   crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: Uint8Array; privateKey: Uint8Array };
 }
 
-/** An Ed25519 keypair — the one name for this shape in the tree, here beside the only
- *  thing that produces one. */
+/** An Ed25519 keypair — the one name for this shape in the tree. */
 export interface Keypair {
   publicKey: Uint8Array;
   privateKey: Uint8Array;
 }
 
-/** Derive a purpose-bound Ed25519 keypair from the node's master seed. Deterministic, so a
- *  node rebuilds its keys at boot from the one secret it stores and there is nothing extra
- *  to persist. Internal: the public surface is `deriveNodeKeys`. */
+/** Deterministic, so a node rebuilds its keys at boot from the one secret it stores with
+ *  nothing extra to persist. Internal: the public surface is `deriveNodeKeys`. */
 function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Array): Keypair {
   if (master.length !== 32) throw new Error(`subkey: master seed must be 32 bytes (got ${master.length})`);
   const seed = sodium.crypto_generichash(32, concatBytes([DOMAIN_SUBKEY, label, master]), null);
@@ -56,9 +36,9 @@ function deriveSubkey(sodium: SubkeyCrypto, master: Uint8Array, label: Uint8Arra
   return kp;
 }
 
-/** Every keypair a node derives from its master seed. `channel` is the node's IDENTITY: its
- *  public half is the peer id, it is what the handshake signs with, what `senderPk` carries
- *  on every dispatch, and what an app's scoped `node/sign` signs with. */
+/** Every keypair a node derives from its master seed. `channel` is the node's identity:
+ *  its public half is the peer id, what `senderPk` carries on every dispatch, and what the
+ *  handshake and an app's scoped `node/sign` sign with. */
 export interface NodeKeys {
   channel: Keypair;
 }

@@ -105,11 +105,11 @@ export class FileFreshnessStore extends FreshnessMarks {
         renameSync(tmp, this.path);
     }
 }
-// The realm factory (§12.3) is not stated here: bootShell's default IS the lazy safe-js
-// import this platform wants — the engine is heavy, so it loads on the first realm — and
-// a second copy of it would be the drift the assembly exists to remove.
+// The realm factory (§12.3) is deliberately not stated here: bootShell's default IS the
+// lazy safe-js import this platform wants (the engine is heavy, so it loads on the first
+// realm), and a second copy of it would be the drift the assembly exists to remove.
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
- *  `bootShell` — which admits the transport bundle, the signed program that IS the node's
+ *  `bootShell` — which admits the transport bundle, the signed program that is the node's
  *  network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
 export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     const sodium = await loadCrypto();
@@ -122,10 +122,10 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     const { shell: core, transport } = await bootShell({
         sodium: sodium as unknown as ShellSodium,
         identity: opts.identity,
-        // The node's network (§12.6) — an isolation boundary, so it must reach BOTH the
+        // The node's network (§12.6): an isolation boundary, so it must reach BOTH the
         // adapter bootShell constructs and the shell's link signing scope. One field,
-        // one place, because a node that forwards it to only one of the two is a node
-        // whose links sign under a network it is not on.
+        // one place — forwarding it to only one of the two would sign links under a
+        // network the node is not on.
         networkKey: opts.networkKey,
         fs,
         freshnessStore: freshness,

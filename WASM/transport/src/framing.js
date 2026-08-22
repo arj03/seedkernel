@@ -1,32 +1,25 @@
 // ============================================================================
 // transport/src/framing.js — the wire framing for links the platform did not frame.
 // A browser WebSocket and an RTCDataChannel arrive with message boundaries already
-// on them; a TCP socket does not. Framing is content by the end-to-end argument, so
-// the host hands over bytes and what a message *is* is decided here:
+// on them; a TCP socket does not, so the host hands over bytes and a message is:
 //
 //   [len u32 BE][bytes]   one link message per record.
 //
-// The cap is two-stage, both numbers from the host at init. Pre-auth it is the small
-// handshake bound — a stranger who knows only host:port must not be able to reserve
-// megabytes by declaring a frame and then dribbling the body — and it rises to the
-// full frame cap the moment the peer becomes a known, admitted identity.
+// The cap is two-stage, both numbers from the host at init: pre-auth the small
+// handshake bound, so a stranger who knows only host:port cannot reserve megabytes by
+// declaring a frame and then dribbling the body; raised to the full frame cap once the
+// peer is an admitted identity (§12.6.2).
 // ============================================================================
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
-// A link message arrives in arbitrarily small slices, and either naive parser walks
-// into a failure mode:
-//
-//   join every slice onto one buffer — a peer dribbling a full-size frame one byte at
-//     a time costs a quadratic number of copies, which no frame-size cap controls.
-//   keep every slice as it arrived — the same dribble costs one view and one pinned
-//     chunk buffer PER BYTE, two orders of magnitude over the cap meant to bound it,
-//     times the half-open budget.
-//
-// So slices are kept, but a SMALL one is appended into a growable tail buffer whose
-// capacity doubles: every byte moves a constant number of times, and the live slice
-// count is bounded by bytes/MERGE_BELOW rather than by however many segments the peer
-// chose to send.
+// A link message arrives in arbitrarily small slices, and either naive parser has a
+// failure mode a frame-size cap does not control: joining every slice onto one buffer
+// makes a dribbled full-size frame cost a quadratic number of copies, while keeping
+// every slice as it arrived costs a view and a pinned chunk buffer per byte, times the
+// half-open budget. So slices are kept, but a small one is appended into a growable
+// tail buffer whose capacity doubles: every byte moves a constant number of times, and
+// the live slice count is bounded by bytes/MERGE_BELOW.
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {
@@ -39,8 +32,8 @@ class ByteParts {
   push(chunk) {
     if (chunk.length === 0) return;
     this.length += chunk.length;
-    // A slice big enough to carry its own overhead is kept as it arrived and ends the
-    // current accumulator — no copy at all on the path that matters.
+    // A slice big enough to carry its own overhead is kept as it arrived, and ends the
+    // current accumulator: no copy at all on the path that matters.
     if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
     if (this.tail < 0) {
       const buf = new Uint8Array(MERGE_BELOW);
@@ -86,8 +79,7 @@ class ByteParts {
     }
     this.length -= n;
     // The accumulator stops accumulating the moment it is consumed from: its start has
-    // moved, so the capacity behind it is no longer ours to append into. The next small
-    // slice opens a fresh one.
+    // moved, so the capacity behind it is no longer ours to append into.
     if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
     // Drop the consumed slices once they outnumber the live ones — a long exchange must
     // not grow the array without bound.
@@ -153,9 +145,7 @@ class LengthFramer {
 // are masked (client→server must be, server→client must not).
 //
 // Every byte transform — encode, single-frame decode, the SHA-1 + base64 accept value
-// — runs in `ws.wasm`, a module of THIS bundle reached by logical name. Holding it as
-// a module rather than as host code is what makes the framing content: same install
-// path, same author, and a fix to either half is one bundle rollout.
+// — runs in `ws.wasm`, a module of this bundle reached by logical name.
 const WS_OP_ENCODE = 1, WS_OP_DECODE_ONE = 2, WS_OP_ACCEPT = 3, WS_OP_BASE64 = 4;
 const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
 /** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
@@ -164,9 +154,9 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
 /** Run this bundle's own ws.wasm — an ordinary `host.call`. An empty answer is the
- *  module's failure signal (§4). A module call is async since ABI 6 (the module runs in
- *  its own worker on the JS targets), and `Promise.resolve` normalizes a host whose
- *  module calls are still synchronous. */
+ *  module's failure signal (§4). A module call is async (the module runs in its own
+ *  worker on the JS targets); `Promise.resolve` normalizes a host whose module calls
+ *  are still synchronous. */
 function wsCall(req) {
   return Promise.resolve(host.call(N_WS, req)).then((out) => {
     if (!out || out.length === 0) throw new Error("ws: module error");
@@ -198,12 +188,11 @@ class WsFramer {
     this.reads = Promise.resolve();
     if (this.client) {
       // The upgrade head needs two module calls (the base64 of the key, then the accept
-      // it derives), so it is computed on a later turn and put ahead of anything queued
-      // behind it. `prepared` is what upgrade() awaits before reading the reply, and it
-      // REJECTS there if the module could not produce a key: a client that never wrote
-      // its GET must abort rather than wait out the idle clock. The bare catch below only
-      // keeps a link torn down before anyone awaits it from reporting an unhandled
-      // rejection into the realm.
+      // it derives), so it is computed on a later turn, ahead of anything queued behind
+      // it. `prepared` is what upgrade() awaits before reading the reply, and it rejects
+      // there if the module could not produce a key: a client that never wrote its GET
+      // must abort rather than wait out the idle clock. The bare catch below only keeps a
+      // link torn down before anyone awaits it from reporting an unhandled rejection.
       this.prepared = (async () => {
         const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
         this.key = utf8Decode(r);
@@ -259,16 +248,12 @@ class WsFramer {
   flush() { return this.writes; }
 
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
-   *  that keeps two of them from running at once. A chunk arriving after a refusal is
-   *  still parsed — the link is closing on it, and `closed` gates what a late delivery
-   *  could reach.
-   *
-   *  Two parses over one buffer go wrong twice over. `frames()` TAKES a frame before
-   *  awaiting its decode, so a second parser reads the frame after it, and only the
-   *  module table's FIFO happens to put the decodes back in order. The cap has no such
-   *  luck: `raiseCap()` lands when msg4 is DELIVERED, so a second parser measuring the
-   *  frame that rode the same segment measures it against the pre-auth cap and refuses a
-   *  legitimate link. */
+   *  that keeps two of them from running at once, which matters twice over: `frames()`
+   *  takes a frame before awaiting its decode, so a second parser would read the frame
+   *  after it, and `raiseCap()` lands only when msg4 is delivered, so a second parser
+   *  would measure a frame riding the same segment against the pre-auth cap and refuse a
+   *  legitimate link. A chunk arriving after a refusal is still parsed — `closed` gates
+   *  what a late delivery could reach. */
   push(chunk, deliver) {
     const done = this.reads.then(() => this.read(chunk, deliver));
     this.reads = done.catch(() => {});
@@ -398,8 +383,7 @@ function headerValue(head, name) {
   return m ? m[1] : null;
 }
 
-/** How a link is framed, as the host declares it at open. The host knows only because
- *  it dialed the address; what to DO about it is entirely here. */
+/** How a link is framed, as the host declares it at open; what to do about it is here. */
 const FRAMING_PLATFORM = 0, FRAMING_LENGTH = 1, FRAMING_WS_CLIENT = 2, FRAMING_WS_SERVER = 3;
 
 function makeFramer(framing, linkId, weDialed, authority) {

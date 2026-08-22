@@ -19,15 +19,13 @@ import type { TransportHost } from "./transport-host.js";
  *
  *  The queue exists for one narrow reason — the transport emits its first handshake frames
  *  before the socket is writable — and those are a handful of messages capped at
- *  `MAX_HANDSHAKE_FRAME_BYTES` each. Anything approaching this number is instead a connect
- *  that never completed while its occupant kept writing, which is HOST memory a peer's
+ *  `MAX_HANDSHAKE_FRAME_BYTES` each; anything approaching this number is a connect that
+ *  never completed while its occupant kept writing, which is HOST memory a peer's
  *  unfinished handshake gets to spend. The transport bundle bounds its own pre-auth
- *  buffering with `MAX_QUEUE_BYTES`; this is the same rule pointed at the buffer on this
- *  side of the seam, at the same size.
- *
- *  Overflow FAILS the channel rather than dropping bytes off the queue: a hole in an ordered
- *  stream is a link the far end waits on forever, where a dead channel is one the occupant
- *  notices and the address book redials. */
+ *  buffering with the same-sized `MAX_QUEUE_BYTES`; this is the same rule pointed at the
+ *  buffer on this side of the seam. Overflow fails the channel rather than dropping bytes:
+ *  a hole in an ordered stream is a link the far end waits on forever, where a dead channel
+ *  is one the occupant notices and the address book redials. */
 const MAX_PREOPEN_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export abstract class BufferedChannel {

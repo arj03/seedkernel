@@ -1,14 +1,8 @@
-// The native loader's binding of the shared host core (README §12.9) — and the whole of
-// it. The Go loader (native/) runs this inside QuickJS, bundled with every shared module
-// it imports into native/host-shell.gen.js by scripts/bundle-loader.mjs.
-//
-// A SEAM, not an implementation: Go supplies platform *primitives* (pure modules over
-// wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm) and this file
-// adapts them to the interfaces the shared shell consumes — `PureModuleLoader`,
-// `FreshnessStore`, channel, realm and shell platform seams — then hands the
-// result to `bootShell`. Every rule above the primitives comes from those shared
-// modules, assembly order included. Being TypeScript checked against the same interfaces
-// is what makes drift a compile error.
+// The native loader's platform seam (§12.9): Go supplies primitives — pure modules over
+// wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm — and this file
+// adapts them to the interfaces `bootShell` consumes, then hands them to it. The Go loader
+// runs it inside QuickJS, bundled with every module it imports into
+// native/host-shell.gen.js by scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, loadedLine, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
@@ -22,8 +16,8 @@ import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
-// The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) —
-// the signed program that IS the node's network (§12.6).
+// The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
+// program that is the node's network (§12.6).
 import { transportBundleBytes } from "./transport-bundle.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
@@ -37,21 +31,19 @@ declare const bridge: {
   buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
   callModule(slot: string, module: string, payload: Uint8Array): ArrayBuffer | null;
   disposeModules(slot: string): number;
-  /** The process arguments after the program name, as a JSON array. JSON rather than a
-   *  joined string because an argument may legitimately contain any byte. */
+  /** Process arguments after the program name, as a JSON array — not a joined string,
+   *  because an argument may legitimately contain any byte. */
   argv(): string;
-  /** Read a whole file, or null when it is absent/unreadable — the `CliFiles` contract
-   *  (cli.ts), where "absent" is a branch (`--key` on a first boot) and not a failure. */
+  /** Read a whole file; `null` when absent/unreadable — the `CliFiles` contract (cli.ts). */
   readFile(path: string): ArrayBuffer | null;
   /** Write a whole file atomically (temp + rename). `mode` is a POSIX permission bit
    *  set, or 0 to leave the platform default. */
   writeFile(path: string, bytes: Uint8Array, mode: number): void;
-  /** One operator line on stderr. QuickJS's own `console.log` writes to a WASI stdout
-   *  wazero leaves disconnected, and stdout is the DATA channel (`stdout` below), which an
+  /** One operator line on stderr — stdout is the data channel (`stdout` below), which an
    *  operator line would corrupt. */
   log(line: string): void;
   /** One diagnostic line on stderr — where every `console.*` in this realm goes
-   *  (host/native-polyfills.ts). */
+   *  (native-polyfills.ts). */
   logErr(line: string): void;
   /** Raw bytes on stdout — `--op` writes the app's response verbatim. */
   stdout(bytes: Uint8Array): void;
@@ -67,11 +59,10 @@ declare const bridge: {
   realmDispose(realm: number): void;
 };
 
-/** Go's raw crypto primitives (native/sodium.go, plus mldsa.go and mlkem.go on the same
- *  object). Bytes come back as ArrayBuffers and a failure as `null`, because that is what
- *  the bridge can carry — every method here is one wazero or Go call and nothing more.
+/** Go's raw crypto primitives (native/sodium.go, mldsa.go, mlkem.go). Bytes cross as
+ *  ArrayBuffers and a failure as `null` — what the bridge can carry.
  *
- *  `crypto_generichash` takes its optional key so the native blake2b shim can REFUSE a
+ *  `crypto_generichash` takes its optional key so the native blake2b shim can refuse a
  *  keyed hash loudly; dropping the argument here would turn a MAC into a plain hash. */
 declare const __sodium: {
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): ArrayBuffer;
@@ -92,13 +83,10 @@ declare const __sodium: {
   ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): ArrayBuffer | null;
 };
 
-/** The crypto surface this target serves: everything the shared code consumes
- *  (`ShellSodium`), plus the two keypair producers a node's identity comes out of
- *  (`SubkeyCrypto`, core/subkeys.ts, is the narrower of the two).
- *
- *  `crypto_generichash` is restated with its key OPTIONAL, which is what satisfies both
- *  halves of `ShellSodium` at once: the loader calls it with an explicit `null` key and
- *  the guest seam calls it with two arguments. */
+/** The crypto surface this target serves: `ShellSodium` plus the two keypair producers a
+ *  node's identity comes out of. `crypto_generichash` is restated with its key optional,
+ *  which is what satisfies both halves of `ShellSodium` at once: the loader calls it with an
+ *  explicit `null` key and the guest seam calls it with two arguments. */
 export interface NativeSodium extends ShellSodium {
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): Uint8Array;
   crypto_sign_keypair(): Keypair;
@@ -107,8 +95,6 @@ export interface NativeSodium extends ShellSodium {
 
 /** libsodium, in libsodium-wrappers method names, over Go's primitives: Uint8Array
  *  results, `{publicKey, privateKey}` keypairs, and a throw where the wrappers throw.
- *  Ordinary shaping code, so it lives here as TypeScript the compiler checks rather than
- *  in Go, which keeps the byte primitives and nothing else.
  *
  *  `null` means different things on the two halves and both are preserved: libsodium's
  *  wrappers throw on a failed open or a bad scalarmult, while ML-KEM's `null` is a

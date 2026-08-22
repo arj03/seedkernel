@@ -1,15 +1,14 @@
-// Browser crypto seam — the counterpart to crypto-node.ts's loadCrypto for a target
-// with no node:fs. Same two artifacts (mldsa65.wasm, mlkem768.wasm) mixed onto one
-// caller-readied sumo libsodium instance, fetched by URL instead of read from disk.
+// Browser crypto seam — crypto-node.ts's loadCrypto for a target with no node:fs: the
+// same two artifacts (mldsa65.wasm, mlkem768.wasm) mixed onto one caller-readied sumo
+// libsodium instance, fetched by URL instead of read from disk.
 import { loadMlDsa65, withMlDsa65, type MlDsa65Signer } from "./pq.js";
 import { loadMlKem768, withMlKem768, type MlKem768 } from "./kem.js";
 
-/** Ready a caller's sumo libsodium with ML-DSA-65 + ML-KEM-768 mixed on — the
- *  browser counterpart to crypto-node.ts's Node-only `loadCrypto` (§12.1). Both,
- *  always: bootShell's verifyBundle needs the PQ half for ANY bundle, and KEM
- *  rides along so a future guest capability doesn't hit the same gap (§14.1).
- *  `baseUrl` is where the caller's own build staged both .wasm files (siblings,
- *  by convention — same as every current consumer's vendored tree). */
+/** Ready a caller's sumo libsodium with ML-DSA-65 + ML-KEM-768 mixed on — the browser
+ *  counterpart to crypto-node.ts's Node-only `loadCrypto` (§12.1). Both, always: the PQ
+ *  half is needed for ANY bundle (§12.4), and KEM rides along so a future guest capability
+ *  does not hit the same gap (§14.1). `baseUrl` is where the caller's build staged both
+ *  .wasm files, siblings by convention. */
 export async function loadCrypto<T extends { ready: Promise<void> }>(
   sodium: T, baseUrl: string | URL = "./",
 ): Promise<T & MlDsa65Signer & MlKem768> {

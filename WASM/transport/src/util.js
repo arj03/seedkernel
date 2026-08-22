@@ -1,19 +1,17 @@
 // ============================================================================
-// transport/src/util.js — the byte helpers, hex, utf8 and the seam's argument
-// codec, shared by the rest of the transport guest program. Pure transforms
-// only: no host calls, no state, no coupling to the other parts.
+// transport/src/util.js — byte helpers, hex, utf8 and the seam's argument codec
+// for the rest of the transport guest program. Pure transforms only: no host
+// calls, no state.
 //
-// This part leads the concatenation (scripts/build-transport-bundle.mjs): its
-// "use strict" directive is the first statement of the signed program, and
-// every other part is free to use what is declared here.
+// Leads the concatenation (scripts/build-transport-bundle.mjs), so its
+// "use strict" is the first statement of the signed program.
 // ============================================================================
 
 "use strict";
 
 // ── byte helpers (no TextEncoder/TextDecoder in a zero-authority realm) ───────
 
-/** The empty answer, shared: an op that reports rather than asks, a request nobody
- *  claimed, a settled-but-empty response. */
+/** The shared empty answer. */
 const EMPTY = new Uint8Array(0);
 
 function concatBytes(parts) {
@@ -90,14 +88,10 @@ function args(u32s, u8s, tail) {
 // ── inbound argument decoding ─────────────────────────────────────────────────
 
 // Each op declares its own fixed field order — u32 BE, u8, and length-prefixed blobs
-// (`[len u32 BE][bytes]`, an empty blob being length 0). There is no tag byte and no
-// shared union: the op's NAME leads the payload (`readOp`, after the 32-byte caller
-// id) and is the whole discriminator.
-//
-// The host twin is transport-host.ts's `Args`, deliberately not factored into one
-// shared source — an ENCODER and a DECODER have no common body, only the three field
-// shapes. A mismatch is not subtle either: a field written and not read desyncs the
-// whole payload, and every op-level test fails at once.
+// (`[len u32 BE][bytes]`, an empty blob being length 0). There is no tag byte: the op's
+// name leads the payload (`readOp`, after the 32-byte caller id) and is the whole
+// discriminator. The host twin is transport-host.ts's `Args`; a field written and not
+// read desyncs the whole payload.
 function Reader(b) {
   this.b = b;
   this.off = 0;

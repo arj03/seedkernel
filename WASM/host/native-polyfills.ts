@@ -1,13 +1,12 @@
-// The few Web globals the shared host code assumes and quickjs-ng does not provide —
-// the native target's, and only the native target's (a browser and Node have all of
-// them). Both of that target's realms take them from here: the host realm by evaluating
-// this module, the confined realm by evaluating the same text (native/guest.go).
+// The few Web globals the shared host code assumes and quickjs-ng does not provide — the
+// native target's and only the native target's (browser and Node have all of them). Both
+// of that target's realms take them from here: the host realm by evaluating this module,
+// the confined realm by evaluating the same text (native/guest.go).
 //
-// One text serves both realms, which is the point of the string: the host realm cannot
-// fetch it from the shell, because the shell IS what needs it (core/domains.ts builds its
-// DOMAIN constants with a `TextEncoder` at module scope), so this module is first in the
-// loader bundle and installs them on the way past. A second typed copy for the host realm
-// would be two implementations of one polyfill.
+// One text serves both realms: the host realm cannot fetch it from the shell, because the
+// shell IS what needs it (core/domains.ts builds its DOMAIN constants with a
+// `TextEncoder` at module scope), so this module is first in the loader bundle. A second
+// typed copy for the host realm would be two implementations of one polyfill.
 const POLYFILLS = `
 "use strict";
 (function () {

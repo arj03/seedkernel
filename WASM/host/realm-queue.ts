@@ -1,29 +1,20 @@
-// The per-realm serialization queue — one implementation, shared by both realm
-// factories (safe-js.ts on the JS platform, native-shim.ts over Go's quickjs-ng).
+// The per-realm serialization queue — one implementation, shared by both realm factories
+// (safe-js.ts on the JS platform, native-shim.ts over Go's quickjs-ng).
 //
-// **What it guarantees.** An invocation does not begin until the previous one has
-// settled, so no two guest frames are ever in flight in one realm.
+// An invocation does not begin until the previous one has settled, so no two guest frames
+// are ever in flight in one realm. Both roles a realm serves can yield — an initiator
+// awaits the network, a holder awaits `fs` — so ordering does not fall out of the host's
+// call stack; without the queue, a holder invoked while an initiator is parked resumes
+// interleaved with it at every `await`, in an order neither the guest author nor the host
+// chose. The cost is head-of-line blocking, and an app that wants both at once wants two
+// realms.
 //
-// **Why that needs a queue at all.** Both roles a realm serves can yield — an initiator
-// awaits the network, a holder awaits `fs` — so there is no arrangement in which ordering
-// falls out of the host's call stack. Without the queue, a holder invoked while an
-// initiator is parked runs *interleaved* with it, the two frames resuming into each other
-// at every `await` in an order neither the guest author nor the host chose. A guest
-// keeping state across an await has no way to reason about that.
-//
-// **The cost** is head-of-line blocking: a parked initiator delays an inbound request to
-// the same app. An app that wants both at once wants two realms.
-//
-// **What "in flight" means.** A frame is in flight while the guest is PARKED — suspended
-// mid-frame with local state half-updated across the await. For every ordinary guest that
+// A frame is in flight while the guest is parked mid-frame, which for an ordinary guest
 // coincides with "the invocation has not settled". It does not for a guest whose answer
 // arrives through its own realm: the transport replies to a send by reading bytes off a
 // link, and reading them is another invocation of this same realm, so waiting would hold
 // the queue against the only event that could settle it. Such a guest calls `defer()`
-// (guest-seam.ts) instead of awaiting. `Invocation` is that distinction made explicit.
-//
-// In its own file for the reason every shared rule here is: a guarantee that held on one
-// target and not the other would be a guarantee nobody has.
+// (guest-seam.ts) instead of awaiting; `Invocation` is that distinction made explicit.
 
 /** One entrypoint invocation, in the two moments that are not always the same. */
 export interface Invocation {

@@ -1,8 +1,7 @@
 // ============================================================================
 // transport/src/core.js — the link bookkeeping, the per-host state, and the
 // entrypoints the host invokes by name. Last part of the concatenation: it declares
-// the state the earlier parts read at runtime and registers the program's face to
-// the host.
+// the state the earlier parts read at runtime.
 // ============================================================================
 
 // ── per-host state, set by EVT_INIT ───────────────────────────────────────────

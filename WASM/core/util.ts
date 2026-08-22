@@ -19,12 +19,10 @@ export function fromHex(hex: string): Uint8Array {
   return out;
 }
 
-/** Whether a string is 32 bytes as lowercase hex — the shape of every key and secret
- *  an operator types. Worth checking because `fromHex` maps a non-hex pair to 0, so an
- *  unvalidated decode turns a typo into a different-but-plausible 32 bytes.
- *
- *  A manual scan rather than a regex literal, so it stays safe under the minifier
- *  (scripts/minify.mjs), which has no lexer to tell a regex from a division. */
+/** 32 bytes as lowercase hex — the shape of every key and secret an operator types.
+ *  `fromHex` maps a non-hex pair to 0, so an unvalidated decode turns a typo into a
+ *  different-but-plausible 32 bytes. Scanned by hand rather than by a regex literal: the
+ *  minifier (scripts/minify.mjs) has no lexer to tell a regex from a division. */
 export function isHex64(s: string): boolean {
   if (s.length !== 64) return false;
   for (let i = 0; i < s.length; i++) {
@@ -55,8 +53,8 @@ export function readU32BE(buf: Uint8Array, offset: number): number {
           (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
 }
 
-/** Base64 → bytes, via the platform's `atob` (browser global; present in Node ≥16
- *  and in the native shell's QuickJS). */
+/** Base64 → bytes via the platform's `atob` (a browser global; also in Node ≥16 and in
+ *  the native shell's QuickJS). */
 export function fromBase64(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -64,8 +62,6 @@ export function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
-/** The message of a thrown value: `Error.message` when present, else the value
- *  stringified. */
 export function errMessage(e: unknown): string {
   const m = (e as Error | null)?.message;
   return m == null ? String(e) : String(m);

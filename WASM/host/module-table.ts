@@ -7,7 +7,7 @@
 // each module lives in its own worker — a dedicated isolate, instantiated with the slot, so
 // statics live there — and a call carries a deadline. On expiry the host kills the worker
 // (`terminate` is the one interrupt JS exposes, and it works mid-loop), answers empty
-// exactly as a trap does, and respawns. A spinning module burns at most one core for at
+// exactly as a trap does, and respawns; a spinning module burns at most one core for at
 // most one budget. The native target holds the same contract at its own engine lever.
 //
 // A module is a PURE TRANSFORM (§4): it exports `memory`, a `scratch` global and
@@ -50,8 +50,8 @@ interface WasmModuleRef {
   worker: ModuleWorker | null;
   /** The respawn in progress, shared so concurrent callers wait on one. EVERY respawn is
    *  recorded here, including the one a deadline kill starts: a load does not adopt its
-   *  worker until it has spawned, so a second load started in that window would stand up an
-   *  orphan isolate — still spinning, which is what the bound exists to stop. */
+   *  worker until it has spawned, so a second load started in that window would stand up
+   *  an orphan isolate — still spinning, which is what the bound exists to stop. */
   spawning: Promise<void> | null;
   /** Set once the ref leaves the table (`teardown`). A load in flight then must kill what
    *  it spawned rather than adopt it onto a ref nothing holds — the worker would be

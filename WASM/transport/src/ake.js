@@ -22,7 +22,6 @@
 //                                       pubkey, against the base point)
 //
 // Changing suite is changing these names: no op number, no ABI rev, no new grant.
-//
 // Authorities — the whole of what this program holds:
 //
 //   "link/sign"   msg -> 64B sig, under this slot's network scope (`DOMAIN_link_scope ‖
@@ -40,19 +39,14 @@
 //   "link/authenticated", "link/down" reports to this raw-link binding's owner
 //
 // Its own ws.wasm needs no grant: a bare name is a primitive, ungated like `crypto`
-// (§12.1). There is no `transport` or `net` domain either — what this program
-// provides back is the reserved id `_net` it CLAIMS (§12.10), reached by an app
-// calling it, with the host contributing attribution and resolution only.
-//
-// One entrypoint, `handle`, invoked exactly as an app's is; the op travels as a
-// length-prefixed name in the payload, so an unimplemented op fails loud rather
-// than desyncing a decoder. (`timer` is every guest's, not this program's.)
-//
-// Channels are host handles keyed by a HOST-minted link id, and the table holds one
-// instance per name (§3.1), so all link state lives in this module's heap.
-//
-// These parts are signed into the bundle: they must stay self-contained (no
-// imports) and must match the seam exactly. The host twin is host/transport-host.ts.
+// (§12.1). What the program provides back is the reserved id `_net` it CLAIMS
+// (§12.10), reached by an app calling it, with the host contributing attribution and
+// resolution only. One entrypoint, `handle`, invoked exactly as an app's is; the op
+// travels as a length-prefixed name in the payload, so an unimplemented op fails loud
+// rather than desyncing a decoder. (`timer` is every guest's, not this program's.)
+// Channels are host handles keyed by a HOST-minted link id, so all link state lives in
+// this module's heap. These parts are signed into the bundle: no imports, and they
+// must match the seam exactly — the host twin is host/transport-host.ts.
 // ============================================================================
 
 // ── capability names (must match the guest seam's dispatch table) ─────────────

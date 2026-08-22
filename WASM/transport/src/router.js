@@ -1,8 +1,7 @@
 // ============================================================================
-// transport/src/router.js — the two routing layers above the record layer: the
-// authenticated link router, which picks the wire a frame goes out on, and the
-// request/response layer, which gives the wire its correlation, protocol ids and
-// deadlines.
+// transport/src/router.js — the two layers above the record layer: the authenticated
+// link router, which picks the wire a frame goes out on, and the request/response
+// layer, which gives it correlation, protocol ids and deadlines.
 // ============================================================================
 
 // ── the router ────────────────────────────────────────────────────────────────
@@ -20,9 +19,7 @@ class Router {
 
   linkCount(peerId) { const a = this.links.get(peerId); return a ? a.length : 0; }
   /** This peer's routable links, for the stall clock's backlog read. Empty for a peer
-   *  still dialing — whose frames sit in the pre-auth pool instead (Core.sendFrame),
-   *  where a handshake that never completes is the half-open deadline's business, not
-   *  this one's. */
+   *  still dialing, whose frames sit in the pre-auth pool instead (Core.sendFrame). */
   linksTo(peerId) { return this.links.get(peerId) || []; }
 
   send(to, frame) {
@@ -36,8 +33,7 @@ class Router {
 
   // Install a freshly-authenticated link: the double-connect tie-break and the up edge on
   // a peer's first link. Returns false — the link closed — when it lost the tie-break.
-  // The peer lint already ran at msg3/msg4 (`admits`, ake.js), the only place it can run
-  // without becoming an oracle.
+  // The peer lint already ran at msg3/msg4 (`admits`, ake.js).
   promote(peerId, link) {
     const pool = this.links.get(peerId) || [];
     const wasEmpty = pool.length === 0;
@@ -93,37 +89,31 @@ class Router {
 // ── the request/response layer ────────────────────────────────────────────────
 
 /** A request frame's own head: `[kind u8][corr u32][protoLen u8]`. Named because the
- *  `send` op measures a caller's arguments against the frame cap before copying them,
- *  and what a request adds to a payload is this layer's business to say. */
+ *  `send` op measures a caller's arguments against the frame cap before copying them. */
 const REQ_HEAD_LEN = 1 + 4 + 1;
 
-// Correlation, the response binding, one deadline per request — and the promise. An
-// app's send arrives as an ordinary invocation of `handle`, which answers with
-// `defer()`: this layer holds the deferred, matches the response frame to it by corr,
-// and settles it. The corr is a wire value only, never crossing the seam in either
-// direction, so nothing about a request is visible outside this heap. `to`/`from` are
-// hex peer ids; proto is opaque bytes.
+// Correlation, the response binding, one deadline per request. An app's send arrives as
+// an ordinary invocation of `handle`, which answers with `defer()`: this layer holds the
+// deferred, matches the response frame to it by corr, and settles it. The corr is a wire
+// value only, never crossing the seam, so nothing about a request is visible outside this
+// heap. `to`/`from` are hex peer ids; proto is opaque bytes. The deadline arrives with
+// each request, since this layer cannot tell a control message from a 4 MB block.
 //
-// The deadline arrives WITH each request rather than being inferred here: this layer
-// cannot tell a 200-byte control message from a 4 MB block, so anything it computed
-// would be a guess.
-//
-// It is a STALL clock, not a budget for the whole exchange. A request whose bytes are
-// still draining out of a backpressured socket has not been answered late — it has not
-// finished being asked, and blaming the holder for our own backlog cancels every
-// request in the window while the wire works perfectly. So on expiry this asks whether
-// OUR OWN request is still going out, from bytes rather than traffic:
+// It is a stall clock, not a budget for the whole exchange: a request whose bytes are
+// still draining out of a backpressured socket has not finished being asked, and blaming
+// the holder for our own backlog would cancel every request in the window while the wire
+// works perfectly. So on expiry this asks whether our own request is still going out,
+// from bytes rather than traffic:
 //
 //   flushed = sent − buffered   bytes for this peer that actually left (monotone)
 //   owed                        `sent` at the moment this request was handed over
 //
 // A link is FIFO, so `flushed ≥ owed` means precisely "this request's last byte is on
 // the wire". Until then an expiry that finds `flushed` moving re-arms; after it, the
-// clock is a pure silence window and settles on schedule.
-//
-// Bounding the re-arm by `owed` is what keeps this from being a silence window under
-// another name: progress measured per PEER would let a chatty caller's unrelated frames
-// resurrect a stalled request. Later frames raise `sent`, never this request's `owed`.
+// clock is a pure silence window. Bounding the re-arm by `owed` is what keeps it from
+// being a silence window under another name: progress measured per peer would let a
+// chatty caller's unrelated frames resurrect a stalled request, since later frames raise
+// `sent` but never this request's `owed`.
 class ReqRes {
   constructor() {
     this.pending = new Map();   // corr → {to, d} — d is the deferred answering the app
@@ -147,9 +137,8 @@ class ReqRes {
   /** Count bytes on their way to a peer — the numerator of the progress measure. */
   note(to, n) { this.sent.set(to, (this.sent.get(to) || 0) + n); }
 
-  /** Bytes of ours that have actually left for this peer: everything handed over,
-   *  less what its links are still holding. Monotone non-decreasing while the wire
-   *  moves, flat while it does not. */
+  /** Bytes of ours that have actually left for this peer: everything handed over, less
+   *  what its links are still holding. Flat while the wire is not moving. */
   flushed(to) {
     let buffered = 0;
     for (const link of router.linksTo(to)) buffered += netLinkBuffered(link.linkId);
@@ -159,20 +148,18 @@ class ReqRes {
   /** Arm one request's stall clock. `owed` is `sent` including this request's own
    *  frame — the point at which it has finished being asked. */
   armStall(corr, to, deadlineMs, owed) {
-    // The baseline is taken on the FIRST expiry, not here. A frame handed over while the
+    // The baseline is taken on the first expiry, not here: a frame handed over while the
     // peer is still being dialled routes through the pre-auth pool, where there is no
-    // link to read a backlog from — a baseline taken now would be `sent` with nothing
-    // subtracted, an over-estimate no later reading could beat, and every such request
-    // would settle on its first tick however hard the wire was working. The cost is one
-    // deadline of grace to find the link.
+    // link to read a backlog from, so a baseline taken now would be `sent` with nothing
+    // subtracted — an over-estimate no later reading could beat. The cost is one deadline
+    // of grace to find the link.
     let mark = null;
     const tick = () => {
       this.timers.delete(corr);
       if (!this.pending.has(corr)) return;
       const now = this.flushed(to);
-      // Still going out, and moving: we have not finished asking, so nothing here is
-      // late. Anything else — drained (the peer owes us an answer) or not moving (the
-      // wire is stuck) — settles.
+      // Still going out, and moving: we have not finished asking. Anything else —
+      // drained (the peer owes us an answer) or stuck (the wire is) — settles.
       if (now < owed && (mark === null || now > mark)) {
         mark = now;
         this.timers.set(corr, armTimer(deadlineMs, tick));
@@ -188,17 +175,15 @@ class ReqRes {
   }
 
   /** One request out, on behalf of an app. `d` is the deferred its `handle` invocation
-   *  returned (null for a noReply send, which nothing is waiting on); `deadlineMs` is the
-   *  caller's, already resolved against the node's default. */
+   *  returned (null for a noReply send, which carries corr 0 and nothing waits on);
+   *  `deadlineMs` is the caller's, already resolved against the node's default. */
   request(d, to, proto, payload, noReply, deadlineMs) {
     const corr = noReply ? 0 : this.nextCorr++;
     const frame = this.buildReq(corr, noReply, proto, payload);
     if (!noReply) {
-      // A noReply send carries corr 0 and never resolves — nothing is parked on its
-      // behalf, here or anywhere.
       this.pending.set(corr, { to, d });
     }
-    // Count the frame BEFORE it is handed over, so the first stall check cannot read a
+    // Count the frame before it is handed over, so the first stall check cannot read a
     // `flushed` that already includes bytes this request has not yet contributed.
     this.note(to, frame.length);
     const owed = this.sent.get(to);
@@ -217,10 +202,10 @@ class ReqRes {
   }
 
   onFrame(from, frame) {
-    // A response is `[1][corr u32][payload]`, so an EMPTY response is exactly five bytes
+    // A response is `[1][corr u32][payload]`, so an empty response is exactly five bytes
     // — the shortest legal frame, and the one a request nobody claims answers with. A
     // six-byte floor here would drop it and make "no app serves this protocol"
-    // indistinguishable from an unreachable peer. Six is the REQUEST branch's floor (it
+    // indistinguishable from an unreachable peer. Six is the request branch's floor (it
     // needs the protocol-id length at offset 5) and is checked there.
     if (frame.length < 5) return;
     const kind = frame[0];
@@ -239,7 +224,7 @@ class ReqRes {
       if (frame.length < 6 + idLen) return;
       const proto = frame.slice(6, 6 + idLen);
       const payload = frame.slice(6 + idLen);
-      // Dispatched with `.then`, never awaited: the answer comes back through THIS
+      // Dispatched with `.then`, never awaited: the answer comes back through this
       // realm's queue, so a frame that awaited it would hold the queue against its own
       // reply (realm-queue.ts).
       hostDeliver(fromHex(from), proto, payload).then(

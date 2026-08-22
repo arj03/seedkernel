@@ -27,14 +27,11 @@ import type { ModuleResult } from "./bundle.js";
  *
  *  The host PREFIXES; it does not parse. It signs `domain ‖ scope ‖ msg` with `msg` opaque,
  *  so the guarantee — this key signs one slot's data and never another's — rides entirely
- *  on the prefix. Validating the *fields* of what it signed would pin one protocol's design
- *  into the core and buy nothing: what a link occupant puts under its scope is its own
- *  format, revisable in a bundle update rather than in the kernel.
- *
- *  `key` is the node's one identity whichever slot asks (core/subkeys.ts), so a signature
- *  a peer receives verifies under the peer id the handshake authenticated. `node/verify`
- *  takes the verifying key from its arguments, so only `domain` and `scope` bind a
- *  verification — a guest checks signatures in its own namespace, never another's. */
+ *  on the prefix. What a link occupant puts under its scope is its own format, revisable
+ *  in a bundle update rather than in the kernel. `key` is the node's one identity whichever
+ *  slot asks (core/subkeys.ts), so a signature a peer receives verifies under the peer id
+ *  the handshake authenticated; `node/verify` takes the key from its arguments, so only
+ *  `domain` and `scope` bind a verification. */
 export interface SignScope {
     /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_link_scope` for the slot holding
      *  the raw-link resource. */
@@ -75,13 +72,11 @@ export interface SeamCrypto {
  *  cross-realm call, and the same mechanism the host dispatches an inbound frame with.
  *
  *  There is no transport-shaped interface here and no `net` domain: the network is a
- *  bundle serving the local service name its composition chose, reached exactly as an app
- *  claiming `chat-v1` is. The payload is opaque to the host, and the answer is whatever the
- *  callee's `handle` returned; the host contributes attribution (it prepends the CALLER's
- *  id) and resolution.
- *
- *  `null` when nothing claims the id, which the seam turns into a refusal by name rather
- *  than a promise that never settles. */
+ *  bundle serving the local service name its composition chose. The payload is opaque to
+ *  the host and the answer is whatever the callee's `handle` returned; the host
+ *  contributes attribution (the caller's id) and resolution. `null` when nothing claims
+ *  the id, which the seam turns into a refusal by name rather than a promise that never
+ *  settles. */
 export interface SeamCalls {
     call(id: string, payload: Uint8Array): Promise<Uint8Array> | null;
 }
@@ -94,8 +89,7 @@ export interface SeamCalls {
  *
  *  **Nothing here may re-enter the guest realm.** The transport calls these from inside an
  *  entrypoint, so a callback has to reach the realm on a later turn — which every
- *  implementation does anyway, a socket not delivering during the write that provoked
- *  it. */
+ *  implementation does anyway, a socket not delivering during the write that provoked it. */
 export interface RawNet {
     /** This node's link configuration. Reading it has no side effects, so a candidate
      *  slot may initialize before it is published. */
@@ -103,8 +97,8 @@ export interface RawNet {
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
      *  host resolves the name in its own address book; the caller learns no route it could
-     *  dial for itself, only which wire codec applies to the link the host has ALREADY
-     *  opened and, for a dialed WebSocket, its `Host` authority (socket-seam.ts). */
+     *  dial for itself, only which wire codec applies and, for a dialed WebSocket, its
+     *  `Host` authority (socket-seam.ts). */
     open(dest: Uint8Array): { linkId: number; framing: number; authority: string };
     /** Write whole bytes to a link. Silently dropped if the link is already gone —
      *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
@@ -127,18 +121,16 @@ export interface RawNet {
  *  `link` (§12.5): the attribution is the submitter's to write.
  *
  *  What it therefore cannot reach is a bundle's `_`-led claim, a LOCAL service name (§12.10)
- *  no remote sender's `requires` could have granted. The host resolves that, not this
- *  interface: `null` comes back as it does for a claim nobody serves. */
+ *  no remote sender's `requires` could have granted; the host resolves that. `null` comes
+ *  back as it does for a claim nobody serves. */
 export interface ClaimDelivery {
     deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
  *  itself: there is no `setTimeout` in a fresh QuickJS context. `id` is the guest's own, so
- *  the host keeps no name of its own for a deadline.
- *
- *  The implementer bounds how many deadlines a guest may hold at once — the table of live
- *  timers is its memory to spend. */
+ *  the host keeps no name of its own for a deadline. The implementer bounds how many
+ *  deadlines a guest may hold at once — the table of live timers is its memory to spend. */
 export interface HostTimers {
     /** Arm (or re-arm) `id` to fire the guest's `timer` entrypoint in `ms`. Refuse, by
      *  throwing, past whatever bound the implementation sets on live timers. */
@@ -150,8 +142,8 @@ export interface HostTimers {
  *  holds these because it is running on this node at all — so nothing here is gated. */
 export interface SeamPlatform {
     sodium: SeamCrypto;
-    /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key
-     *  SIGN uses is `grants.signScope.key`, chosen by the slot — not this. */
+    /** This node's node keypair (README §12.1): IDENTITY returns its pk. Which key SIGN
+     *  uses is `grants.signScope.key`, chosen by the slot — not this. */
     identity: {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
@@ -176,8 +168,8 @@ export interface SeamGrants {
     /** What `node/sign`/`node/verify` sign and check under — this app's own scope
      *  (`appSignScope`), unconditionally: gaining another privilege never changes what
      *  these two names mean (§12.5's monotonicity — a grant only ever ADDS an endpoint).
-     *  Without a scope both are unavailable, because guest signing and scoped
-     *  verification are never raw. */
+     *  Without a scope both are unavailable, because guest signing and scoped verification
+     *  are never raw. */
     signScope?: SignScope;
     /** What `link/sign`/`link/verify` sign and check under — this node's network scope
      *  (`linkSignScope`), wired ONLY for a bundle that reaches the `link` privilege. A
@@ -214,9 +206,9 @@ export interface SeamModules {
      *
      *  A module call is ASYNC (the JS targets run a module in its own worker, so the call
      *  crosses an isolate). `deadlineMs` is the calling guest's REMAINING execution segment
-     *  (§4.3), computed by the realm — host plumbing, never guest-supplied. The resolved
-     *  `ModuleResult` carries the module's own processing time, which is what the seam
-     *  bills to the caller's segment — see `ModuleResult` (bundle.ts). */
+     *  (§4.3), computed by the realm — never guest-supplied. The resolved `ModuleResult`
+     *  carries the module's own processing time, which is what the seam bills to the
+     *  caller's segment. */
     call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<ModuleResult> | null;
 }
 
@@ -229,16 +221,13 @@ export interface GuestSeamDeps {
 
 /** The calling guest's execution segment (§12.3), as the seam sees it — HOST plumbing,
  *  never ABI: a guest neither supplies nor observes it. It makes §4.3's "a module call is
- *  charged to the calling guest's budget" literal:
- *
- *    - `remainingMs` is what a module call runs UNDER, so a module cannot outlive the
- *      guest that asked for it;
- *    - `charge` is what it costs the guest afterwards, because the module burns time while
- *      the guest is parked and the realm's clock is closed. Without it a deadline bounds
- *      one call and nothing bounds their sequence.
- *
- *  Only calls that BURN the guest's CPU are charged: a parked `fs/*` or `_net` call is
- *  waiting, and the budget exists precisely so an initiator awaiting the network survives. */
+ *  charged to the calling guest's budget" literal: `remainingMs` is what a module call
+ *  runs UNDER, so a module cannot outlive the guest that asked for it, and `charge` is what
+ *  it costs the guest afterwards, because the module burns time while the guest is parked
+ *  and the realm's clock is closed — without it a deadline bounds one call and nothing
+ *  bounds their sequence. Only calls that burn the guest's CPU are charged: a parked
+ *  `fs/*` or `_net` call is waiting, and the budget exists precisely so an initiator
+ *  awaiting the network survives. */
 export interface CallBudget {
     /** Milliseconds left in the calling guest's segment; `Infinity` when unbudgeted. */
     remainingMs: number;
@@ -261,13 +250,12 @@ export { PRIMITIVE_NAMES } from "../core/domains.js";
  *  the vocabulary a manifest is checked against and the table the seam dispatches through
  *  cannot drift. */
 type CryptoName = `crypto/${PrimitiveName}`;
-/** The keys the dispatch table must cover. The table literal is typed against this union,
- *  so a name added to the vocabulary without a handler is a compile error, and so is a
- *  handler whose name the loader would refuse.
+/** The keys the dispatch table must cover, typed so a name added to the vocabulary without
+ *  a handler is a compile error, and so is a handler whose name the loader would refuse.
  *
- *  Every one of them contains a `/`, which is load-bearing (§12.2): module names are held
- *  to `[A-Za-z0-9_-]`, so they cannot spell one of these, which is what lets the dispatch
- *  tell host names and module names apart by the name alone. */
+ *  Every one contains a `/`, which is load-bearing (§12.2): module names are held to
+ *  `[A-Za-z0-9_-]`, so they cannot spell one of these, which is what lets the dispatch tell
+ *  host names and module names apart by the name alone. */
 type HandlerKey = CapabilityName | CryptoName;
 /** The same union as a runtime list, for the construction check below — the compiled-JS
  *  half of the one-file rule, where `HandlerKey` enforces nothing. */
@@ -349,13 +337,13 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
  *
  *  The SHELL invokes exactly two registered names: `handle` (an app's one inbound/op
  *  entrypoint, with the op travelling in the payload) and `timer` (a fired deadline). A
- *  guest registering anything else is writing an entrypoint nothing will call. The
- *  ENVELOPE is here for the same reason — the op name, the caller prefix and the host's
- *  zero id are one contract, written once here and mirrored by `opCall`/`opHeader` below.
+ *  guest registering anything else is writing an entrypoint nothing will call. The ENVELOPE
+ *  is here for the same reason — the op name, the caller prefix and the host's zero id are
+ *  one contract, written once here and mirrored by `opCall`/`opHeader` below.
  *
  *  ONE definition for every target: a bundle ships a single `guest.js` that runs
  *  byte-identical on the JS host (safe-js.ts) and in the native loader's realm (guest.go),
- *  so this is a contract between the runtime and signed content rather than a host detail.
+ *  so this is a contract between the runtime and signed content.
  *
  *  HOST CONTRACT — a host embedding this must inject one function:
  *
@@ -365,12 +353,11 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
  *  under `callId` — every `fs/*`, every `_`-led cross-realm call, every bare module name —
  *  and the guest parks a Promise the host later settles with `__netResolve(callId, bytes)`
  *  or `__netReject(callId, msg)`. `null` is RESERVED for that: a sync name returning
- *  null/undefined would be read as async and leave a Promise pending forever.
- *
- *  The async half is plain ECMAScript rather than a host-created deferred, so the seam
- *  needs no promise primitive from the embedding engine — which is what lets one preamble
- *  serve both quickjs-emscripten's `newPromise()` and quickjs-ng over wazero, which has
- *  none. `defer()` is the same idea pointed the other way. */
+ *  null/undefined would be read as async and leave a Promise pending forever. The async
+ *  half is plain ECMAScript rather than a host-created deferred, so the seam needs no
+ *  promise primitive from the embedding engine — which is what lets one preamble serve
+ *  both quickjs-emscripten's `newPromise()` and quickjs-ng over wazero, which has none.
+ *  `defer()` is the same idea pointed the other way. */
 export function guestPreamble(): string {
     return GUEST_PREAMBLE;
 }
@@ -534,24 +521,20 @@ export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
 }
 /** The authority catalog — declared in core/domains.ts, re-exported so a reader of the seam
  *  finds it beside the names it governs. A manifest's `requires` are checked against this
- *  table at load and passed to the seam as the exact set it enforces (`grants.names`).
- *  Fine-grained: "this app reaches `node/sign` + `fs/get`", not a prefix that grows with
+ *  table at load and passed to the seam as the exact set it enforces (`grants.names`);
+ *  fine-grained — "this app reaches `node/sign` + `fs/get`", not a prefix that grows with
  *  every op added under it.
  *
  *  Grants are the authorities plus the reserved ids; `crypto/*` and a bundle's own modules
- *  are not. An authority reaches something the host owns (a signing oracle, entropy, a
- *  socket); a `_`-led id reaches something another REALM owns. The `crypto/` primitives are
- *  functions of their arguments, and a bundle's own modules were installed and verified
- *  with the guest, so neither reaches anything the guest does not already hold.
- *
- *  Neither exemption parses the name for authority: the gate asks `isGrant`, which is
- *  membership in this table or the one-character reservation. */
+ *  are not: the primitives are functions of their argument bytes, and a bundle's modules
+ *  were installed and verified with the guest, so neither reaches anything the guest does
+ *  not already hold. Neither exemption parses the name for authority — `isGrant` is
+ *  membership, never a prefix. */
 export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";
 /** The host-derived scope `node/sign` binds every guest signature to (§12.2):
  *  `author_pk ‖ app_len u8 ‖ app`, from the admitted manifest. Never guest-supplied, so a
  *  guest signs only within its own bundle's namespace; every node running the same bundle
- *  derives the same bytes, which is what makes scoped signatures portable across a
- *  cohort. */
+ *  derives the same bytes, which is what makes scoped signatures portable across a cohort. */
 export function guestSignScope(author: Uint8Array, app: string): Uint8Array {
     const appBytes = enc.encode(app);
     if (appBytes.length > 255)
@@ -576,19 +559,17 @@ export function appSignScope(key: {
  *
  *  `sign`/`verify` apply `DOMAIN_guest ‖ scope ‖ msg` exactly as the seam does
  *  (`node/sign`/`node/verify`), from the SAME scope derivation an admitted slot gets
- *  (`appSignScope`), so nothing here reconstructs host-owned prefix bytes. Two functions,
- *  scoped: a host mirror that wants them needs no gate-free `createGuestSeam` over
- *  `UNRESTRICTED_NAMES` to reach them. */
+ *  (`appSignScope`), so nothing here reconstructs host-owned prefix bytes — and a host
+ *  mirror wanting them needs no gate-free `createGuestSeam` over `UNRESTRICTED_NAMES`. */
 export function appSigner(
     sodium: SeamCrypto,
     key: { publicKey: Uint8Array; privateKey: Uint8Array },
     author: Uint8Array, app: string,
 ): {
     sign(msg: Uint8Array): Uint8Array;
-    /** False on a signature that does not verify under `(scope, pk)`; a `sig` or `pk`
-     *  of the wrong shape ALSO reads false (the seam's `node/verify` refuses a
-     *  mis-framed payload by throwing; a caller-facing verifier has no caller left to
-     *  explain to). */
+    /** False on a signature that does not verify under `(scope, pk)`; a `sig` or `pk` of
+     *  the wrong shape ALSO reads false (the seam's `node/verify` refuses a mis-framed
+     *  payload by throwing; a caller-facing verifier has no caller left to explain to). */
     verify(pk: Uint8Array, sig: Uint8Array, msg: Uint8Array): boolean;
 } {
     const scope = appSignScope(key, author, app);
@@ -622,18 +603,16 @@ export function linkSignScope(key: {
  *  here rather than a second signing name or a second key. The app scope is unconditional;
  *  the link scope is additionally present when the bundle's `requires` reach the `link`
  *  privilege (`privilegesOf`, §12.5) — never a REPLACEMENT of the app scope, so gaining
- *  `link` only ever adds an endpoint (`link/sign`/`link/verify`) rather than changing what
- *  an existing one (`node/sign`/`node/verify`) means. Being a function of admitted facts is
- *  what makes both hold on every load path — boot, an operator's `--bundle`, and the
- *  in-place update that replaces a standing slot alike.
+ *  `link` only ever adds an endpoint rather than changing what an existing one means.
+ *  Being a function of admitted facts makes both hold on every load path — boot, an
+ *  operator's `--bundle`, and the in-place update that replaces a standing slot alike.
  *
  *  The inputs are the node's identity and the admitted manifest's own fields, and nothing
- *  else — deliberately. A scope is a preimage every node must agree on: fold in anything
- *  local to one deployment and a cohort's signatures stop verifying for each other
- *  (`guestSignScope`). `networkKey` is not such a value — it names a network, and nodes on
- *  different ones cannot link at all (§12.6). Nor does anything the bundle asserts about
- *  itself enter here: `protocols` claims are revisable per version, and a scope that moved
- *  with them would silently restate what already-signed records mean. */
+ *  else, deliberately: a scope is a preimage every node must agree on, so folding in
+ *  anything local to one deployment would stop a cohort's signatures verifying for each
+ *  other (`guestSignScope`). Nor does anything the bundle asserts about itself enter here —
+ *  `protocols` claims are revisable per version, and a scope that moved with them would
+ *  silently restate what already-signed records mean. */
 export function slotSignScopes(node: {
     identity: {
         publicKey: Uint8Array;
@@ -672,10 +651,8 @@ function u64be(value: number): Uint8Array {
  *  the platform and the grants. It IS the seam ABI (§12.2): the host names a guest can call
  *  are the keys of this table, no second list and no numbers. A bundle's own modules are
  *  the catalog's other source of names, resolved past the end of this table by the
- *  dispatch.
- *
- *  A function of its two arguments and nothing else, so `createGuestSeam` below is nothing
- *  but the gate in front of it.
+ *  dispatch. A function of its two arguments and nothing else, so `createGuestSeam` below
+ *  is nothing but the gate in front of it.
  *
  *  `crypto/*` reaches nothing a guest does not already hold, so it is ungated; every other
  *  name is an authority. `link/*` is the transport's alone; what the transport PROVIDES
@@ -725,12 +702,10 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         },
         // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the caller
         // supplies the key but never the scope, so a signature made under any other scope
-        // answers [0] here.
-        //
-        // A payload too short to hold both throws rather than answering [0]: that is a
-        // mis-framed call, not a signature that failed, and [0] is a verdict about bytes
-        // that were actually checked. An empty `msg` is a legitimate question, so the bound
-        // is exactly the fixed prefix.
+        // answers [0] here. A payload too short to hold both throws rather than answering
+        // [0]: that is a mis-framed call, not a signature that failed, and [0] is a verdict
+        // about bytes that were actually checked. An empty `msg` is legitimate, so the
+        // bound is exactly the fixed prefix.
         "node/verify": (payload) => {
             const s = grants.signScope;
             if (!s)
