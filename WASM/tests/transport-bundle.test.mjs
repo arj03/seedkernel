@@ -65,7 +65,7 @@ assert(derivedTransportAuthor === transportAuthor,
 // a program that cannot compile, to fail the load at the point where the DRIVER stands
 // rather than at verify.
 function transportBundleAt(version, keys, guestSource) {
-  const guest = guestSource ?? new Uint8Array(readGuestSource());
+  const guest = guestSource ?? readGuestSource();
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const { blob } = authorBundle(sodium, keys, {
     app: "transport", version,
@@ -219,7 +219,7 @@ assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
 // transport it had: every version an operator can reach would sit below a floor a bundle
 // that never executed a line raised — rollback bricked by a failed upgrade. So the mark is
 // the last step of the load, after the guest stands.
-const brokenGuest = new TextEncoder().encode("const nope = ( ;");
+const brokenGuest = "const nope = ( ;";
 let v3Failed = false;
 try { await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys, brokenGuest)); }
 catch { v3Failed = true; }

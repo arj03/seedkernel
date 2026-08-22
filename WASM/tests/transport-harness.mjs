@@ -103,13 +103,12 @@ function invoke(shell, appKey, op, args = new Uint8Array(0)) {
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
 export function harnessAppBlob(author, mode = "echo") {
-  const guest = new TextEncoder().encode(HARNESS_GUEST);
   const { blob } = authorBundle(sodium, author, {
     app: "harness",
     version: 1,
     protocols: [PROTO],
     modules: [],
-    guestSource: guest,
+    guestSource: HARNESS_GUEST,
     guestAbi: GUEST_ABI_VERSION,
     // The whole of what an app needs to talk to the network: the id the transport claims.
     guestRequires: [TRANSPORT_SERVICE],

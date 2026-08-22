@@ -29,9 +29,12 @@ export function guestSourcePaths() {
   return GUEST_PARTS.map((f) => join(wasmDir, "transport", "src", f));
 }
 
-/** The assembled guest program — the exact bytes the manifest hashes. */
+/** The assembled guest program as TEXT — the exact source the manifest hashes (as UTF-8)
+ *  and the loader runs. `authorBundle` takes this string: verification decodes the
+ *  packed guest back to text before re-checking it, so text is the only shape that can
+ *  round-trip. */
 export function readGuestSource() {
-  return Buffer.concat(guestSourcePaths().map((p) => readFileSync(p)));
+  return Buffer.concat(guestSourcePaths().map((p) => readFileSync(p))).toString();
 }
 
 /** The seam version this program is written against, read out of `core/domains.ts`.

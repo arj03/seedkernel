@@ -4,7 +4,7 @@ This repo is the runtime only. Every app lives outside it and reaches the runtim
 
 ### Authoring API
 
-Building, signing, packing, and verifying the app-bundle format (§12.4). `authorBundle` (hash, assemble, sign, pack) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side should make — both apps' offline builds author with it now, and no runtime shell signs anything, only verifies. `verifyManifest` stays exported for `p2p.html`, which fetches a bare envelope with no container to unpack. The remaining lower-level primitives stay exported for seedkernel's own hardening tests and seedchat's `smoke.mjs`, which deliberately reach below the typed wrapper — not the path an external consumer should use.
+Building, signing, packing, and verifying the app-bundle format (§12.4). `authorBundle` (hash, assemble, validate, sign, pack — the blob, manifest and derived author id on the value) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side should make: `authorBundle` runs the same checks the verifier refuses, so an unverifiable bundle cannot be shipped, and its author id is the id each caller pins. Both apps' offline builds author with it now, and no runtime shell signs anything, only verifies. `verifyManifest` stays exported for `p2p.html`, which fetches a bare envelope with no container to unpack. The remaining lower-level primitives stay exported for seedkernel's own hardening tests and seedchat's `smoke.mjs`, which deliberately reach below the typed wrapper — not the path an external consumer should use.
 
 | Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
 | --- | :---: | :---: |

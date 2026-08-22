@@ -527,6 +527,53 @@ function isValidManifest(m: unknown): m is BundleManifest {
     }
     return true;
 }
+/** The checks `verifyManifest` runs after a signature verifies and `authorBundle` runs
+ *  BEFORE signing — one copy, so the two cannot drift: what a verifier refuses is
+ *  exactly what an author refuses to sign. Shape (a duplicate module name, an
+ *  ill-formed protocol id, a non-JSON config value) and vocabulary (a `requires` name
+ *  that is neither a grant nor a well-formed reserved id, an `abi` this runtime does
+ *  not implement) are the author's to get right — a JS caller has no types, so this is
+ *  the only net. Whether THIS node grants a well-formed authority name is policy
+ *  (§12.5), which lives in the shell, not here. */
+function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
+    if (!isValidManifest(manifest))
+        throw new Error("bundle: malformed manifest");
+    // Guest ABI support (§12.2) — the same kind of check as the suite above, refused the
+    // same way, and here at the one place a manifest becomes a value the rest of the
+    // runtime trusts (one copy: the author and the verifier agree on the seam).
+    if (!SUPPORTED_GUEST_ABIS.includes(manifest.guest.abi)) {
+        throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
+    }
+    // The declared requires. The vocabulary (§12.2) is CLOSED and is the authorities
+    // alone: an unknown name — `crypto/blake2b-256` included — is a refused manifest, not
+    // a grant that quietly reaches nothing at first use.
+    //
+    // Well-formedness only: `link/open` is in the vocabulary, so a manifest naming it is
+    // well-formed, and whether this node grants it is the shell's call over
+    // `privilegesOf` (§12.5).
+    for (const r of manifest.guest.requires) {
+        // A reserved id grants over another REALM rather than over a host authority, so it
+        // is not in the catalog and only its shape can be wrong. Whether anything claims
+        // it is a question about the NODE, answered at the call (guest-seam.ts): an app
+        // may legitimately be installed before the local service that answers it.
+        if (isReservedProtocol(r)) {
+            if (!RESERVED_PROTO_RE.test(r)) {
+                throw new Error(`bundle: "${r}" is not a well-formed reserved id (manifest guest.requires; "_" then alphanumerics and ._/-, at most 64 bytes)`);
+            }
+            continue;
+        }
+        if (!isGrant(r)) {
+            // The authorities sharing the rejected name's prefix, not the whole list: a
+            // misspelled `fs/exists`, or a bare `fs`, is answered by the `fs/` names.
+            const prefix = r.includes("/") ? r.slice(0, r.indexOf("/") + 1) : r + "/";
+            const near = Object.keys(AUTHORITY_CALLS).filter((n) => n.startsWith(prefix));
+            const hint = near.length > 0
+                ? `this host grants: ${near.join(", ")}`
+                : `no authority under "${prefix}" exists — a pure name (crypto/*, or one of this bundle's own modules) is not a grant and is not declared`;
+            throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
+        }
+    }
+}
 /** Verify a manifest envelope; returns the author id + parsed manifest, or null if a
  *  signature is bad. Throws when the body is validly signed but not parseable JSON of the
  *  expected shape — a signed-but-broken manifest is a fail-loud condition, not an
@@ -581,43 +628,11 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
         && (parsed as Record<string, unknown>).guest === undefined) {
         throw new Error("bundle: this manifest declares no guest, and every app is a guest (§12.4) — the modules are the library it drives, so ship the guest that drives them");
     }
-    if (!isValidManifest(parsed))
-        throw new Error("bundle: malformed manifest");
-    // Guest ABI support (§12.2) — the same kind of check as the suite above, refused the
-    // same way, and here at the one place a manifest becomes a value the rest of the
-    // runtime trusts, so no target can forget it.
-    if (!SUPPORTED_GUEST_ABIS.includes(parsed.guest.abi)) {
-        throw new Error(`bundle: guest ABI ${parsed.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
-    }
-    // The declared requires. The vocabulary (§12.2) is CLOSED and is the authorities
-    // alone: an unknown name — `crypto/blake2b-256` included — is a refused manifest, not
-    // a grant that quietly reaches nothing at first use.
-    //
-    // Well-formedness only: `link/open` is in the vocabulary, so a manifest naming it is
-    // well-formed, and whether this node grants it is the shell's call over
-    // `privilegesOf` (§12.5).
-    for (const r of parsed.guest.requires) {
-        // A reserved id grants over another REALM rather than over a host authority, so it
-        // is not in the catalog and only its shape can be wrong. Whether anything claims
-        // it is a question about the NODE, answered at the call (guest-seam.ts): an app
-        // may legitimately be installed before the local service that answers it.
-        if (isReservedProtocol(r)) {
-            if (!RESERVED_PROTO_RE.test(r)) {
-                throw new Error(`bundle: "${r}" is not a well-formed reserved id (manifest guest.requires; "_" then alphanumerics and ._/-, at most 64 bytes)`);
-            }
-            continue;
-        }
-        if (!isGrant(r)) {
-            // The authorities sharing the rejected name's prefix, not the whole list: a
-            // misspelled `fs/exists`, or a bare `fs`, is answered by the `fs/` names.
-            const prefix = r.includes("/") ? r.slice(0, r.indexOf("/") + 1) : r + "/";
-            const near = Object.keys(AUTHORITY_CALLS).filter((n) => n.startsWith(prefix));
-            const hint = near.length > 0
-                ? `this host grants: ${near.join(", ")}`
-                : `no authority under "${prefix}" exists — a pure name (crypto/*, or one of this bundle's own modules) is not a grant and is not declared`;
-            throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
-        }
-    }
+    // Everything after the suite/legibility checks is the same vocabulary the AUTHOR
+    // checks before signing (`validateManifest`, shared with `authorBundle`): shape,
+    // the supported ABI set, the closed grants catalog. One copy, so the author's
+    // checks can't fall behind the verifier's.
+    validateManifest(parsed);
     // Reserved ids are ordinary local claims. Raw-link ownership and attributed delivery
     // are expressed by separately granted authorities, never inferred from a spelling.
     return { author, authorKeys, manifest: parsed };
@@ -846,8 +861,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     return result;
 }
 /** The raw materials for a NEW signed bundle — everything `authorBundle` hashes,
- *  assembles into a manifest, signs, and packs. `verifyBundle`'s mirror image: that
- *  unpacks and checks a blob down to `{modules: [{mod, wasm}], guestSource}`; this
+ *  assembles into a manifest, validates, signs, and packs. `verifyBundle`'s mirror image:
+ *  that unpacks and checks a blob down to `{modules: [{mod, wasm}], guestSource}`; this
  *  builds a blob up from the same shape. `modules[].hash` and `guest.hash` are
  *  DERIVED here, never supplied — an author states what bytes ship, not what they
  *  hash to, so there is no way to construct a bundle whose manifest and content
@@ -858,31 +873,46 @@ export interface UnsignedBundle {
     version: number;
     protocols?: string[];
     modules: { name: string; wasm: Uint8Array }[];
-    guestSource: Uint8Array;
+    /** The guest program's source TEXT. The manifest commits to its UTF-8 encoding, and
+     *  `verifyBundle` decodes the packed guest back to text before re-checking it, so a
+     *  string is the only shape that can be authored and also verify: arbitrary bytes
+     *  with no valid UTF-8 round-trip would be a bundle that cannot come back. */
+    guestSource: string;
     guestAbi: number;
     guestRequires: string[];
     guestConfig?: JsonObject;
 }
-/** What `authorBundle` returns: the packed, signed blob ready to ship, and the
- *  manifest it signed — so a caller that logs or records what it just published
- *  (a version number, a per-module hash) reads it off the value rather than
- *  re-parsing the blob it just built. */
+/** What `authorBundle` returns: the packed, signed blob ready to ship, the manifest it
+ *  signed, and the author id it is signed under — so a caller that logs or records what
+ *  it just published (a config value, a version number, a per-module hash, the id policy
+ *  pins) reads it off the value rather than re-parsing the blob it just built or
+ *  recomputing the id from the key halves. */
 export interface AuthoredBundle {
     blob: Uint8Array;
     manifest: BundleManifest;
+    /** The 32-byte key-set id of the signer — the one identity everything downstream reads
+     *  (`hybridAuthorId`), on the value rather than derived at each call site. */
+    author: Uint8Array;
 }
 /** Build a new signed bundle from its raw materials (§12.4): hash every module and the
- *  guest, assemble the manifest, sign it (`signManifest`), pack the container
- *  (`packBundle`). The one call every bundle author makes — seedstore's offline build
- *  (`storage-bundle.mjs`) and seedchat's offline build (`scripts/build-app-bundle.mjs`)
- *  both reduce to this, in place of each reimplementing the hash-then-sign-then-pack
- *  sequence. The mirror of `verifyBundle`, which runs the same four steps in reverse. */
+ *  guest, assemble the manifest, validate it — the one copy of the verifier's checks
+ *  (`validateManifest`), so a bundle the matching verifier would refuse fails HERE at
+ *  the author's desk with a named error rather than shipping and failing first install —
+ *  then sign (`signManifest`) and pack (`packBundle`). The one call every bundle author
+ *  makes — seedstore's offline build (`storage-bundle.mjs`) and seedchat's offline build
+ *  (`scripts/build-app-bundle.mjs`) both reduce to this, in place of each
+ *  reimplementing the hash-then-sign-then-pack sequence. The mirror of `verifyBundle`,
+ *  which runs the same steps in reverse. The author id it signs under is on the value:
+ *  the caller logs, pins and keys freshness tables off that, not off a second derivation. */
 export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, input: UnsignedBundle): AuthoredBundle {
     const modules: BundleModule[] = input.modules.map(({ name, wasm }) => ({
         name, hash: toHex(genesisHash(sodium, wasm)),
     }));
+    // The guest lives in the blob as its UTF-8 encoding; the manifest hashes those exact
+    // bytes, and `verifyBundle` decodes them back to this text before re-checking.
+    const guestBytes = enc.encode(input.guestSource);
     const guest: BundleGuest = {
-        hash: toHex(genesisHash(sodium, input.guestSource)),
+        hash: toHex(genesisHash(sodium, guestBytes)),
         abi: input.guestAbi,
         requires: input.guestRequires,
         ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
@@ -894,10 +924,15 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
         modules,
         guest,
     };
+    validateManifest(manifest);
     const env = signManifest(sodium, keys, manifest);
-    const files: Record<string, Uint8Array> = { [MANIFEST_FILE]: env, [GUEST_FILE]: input.guestSource };
+    const files: Record<string, Uint8Array> = { [MANIFEST_FILE]: env, [GUEST_FILE]: guestBytes };
     for (const { name, wasm } of input.modules) files[moduleFile(name)] = wasm;
-    return { blob: packBundle(files), manifest };
+    return {
+        blob: packBundle(files),
+        manifest,
+        author: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey),
+    };
 }
 /** Build a verified bundle's private module set. Any module failing releases the partial
  *  set and fails the candidate slot.
