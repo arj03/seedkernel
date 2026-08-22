@@ -26,12 +26,12 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
  *  lives with the occupant and here, where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
-export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
+export const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 export const { authorBundle } = await imp("build/host/bundle.js");
 export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
 
-export const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
+export const transportBlob = transportBundleBytes();
 
 /** The protocol id the harness app claims. */
 export const PROTO = "harness/v1";

@@ -130,12 +130,16 @@ async function main() {
 // A rebuild with a different key is a new author and a new policy entry; the ML-DSA half
 // is derived from the same seed, so one key file holds the whole identity.
 import { fromBase64 } from "../core/util.js";
-export const TRANSPORT_BUNDLE_B64 = "${b64}";
+const TRANSPORT_BUNDLE_B64 = "${b64}";
 let decoded: Uint8Array | null = null;
 /** The artifact-shipped transport bundle as raw bytes (§12.6) — the shape every
  *  consumer of this artifact wants, instead of the b64 string and a hand-rolled
  *  atob loop. A fresh copy per call; the blob is a value callers may hand to the
- *  bundle loader, which does not mutate it but is not relied on either. */
+ *  bundle loader, which does not mutate it but is not relied on either.
+ *
+ *  The b64 behind it is module-private on purpose: an exported const carries the
+ *  whole blob into the declaration file as a literal type, so every downstream tsc
+ *  parses 150 KB of base64 to learn one signature. */
 export function transportBundleBytes() {
     if (decoded === null) decoded = fromBase64(TRANSPORT_BUNDLE_B64);
     return decoded.slice();

@@ -25,9 +25,9 @@ const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
-const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
+const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
-const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
+const transportBlob = transportBundleBytes();
 const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 // The app that drives the transport: a request is an app calling the id the transport
 // claims, so a test that sends one has to be an app (tests/transport-harness.mjs).

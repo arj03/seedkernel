@@ -32,9 +32,9 @@ const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
 const { harnessAppBlob, appRequest } = await imp("tests/transport-harness.mjs");
-const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
+const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
-const transportBlob = Uint8Array.from(Buffer.from(TRANSPORT_BUNDLE_B64, "base64"));
+const transportBlob = transportBundleBytes();
 const { ok, summary } = testkit();
 // Report-style: a failed check is logged and counted, and the suite keeps going.
 const assert = ok;
