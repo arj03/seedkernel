@@ -24,9 +24,7 @@ The module also carries the lower-level primitives that pair is built from. They
 | `./shell` | The Node platform already assembled: `boot`/`bootRuntime` wire `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell` for you. A client that owns its own platform wiring skips this and calls `bootShell` | seedstore `WASM/tests/shell-run.test.mjs` |
 | `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. `bootShell` defaults to it; import it when you want to pass it explicitly, or to hash or inspect it | seedchat `browser/chat-shell.js` |
 | `./transport-host` | The `TransportHost` class — construct it yourself when you own the adapter's lifecycle (a browser edge that loads lazily and re-loads to change its room secret); otherwise pass `bootShell` an options object and let it build one | seedchat `browser/chat-shell.js` |
-| `./guest-seam` | `GUEST_ABI_VERSION` to stamp `guest.abi` when you author. `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | seedstore `WASM/host/manifest.ts` (the mirror), `WASM/scripts/storage-bundle.mjs` (the ABI stamp) |
-
-`GUEST_ABI_VERSION` straddles the two groups — an author declares it when signing a manifest, and the shell checks it at load — but it names the *runtime* seam's version, so it lives here.
+| `./guest-seam` | `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | seedstore `WASM/host/manifest.ts` (the mirror) |
 
 ### 3. Platform adapters — the target-specific pieces you choose and hand to §2
 

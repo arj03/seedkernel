@@ -28,8 +28,9 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, linkSignScope, UNRESTRICTED_NAMES, GUEST_ABI_VERSION, opHeader }
+const { createGuestSeam, guestSignScope, appSignScope, linkSignScope, UNRESTRICTED_NAMES, opHeader }
   = await imp("build/host/guest-seam.js");
+const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");

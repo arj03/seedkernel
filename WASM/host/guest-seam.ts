@@ -256,11 +256,7 @@ export interface CallBudget {
  *  way. */
 export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array> | Uint8Array;
 
-/** The version of the seam defined below, re-exported so a bundle builder reaches for
- *  `seedkernel-wasm/guest-seam`. Declared in domains.ts so the loader can check a
- *  manifest's `guest.abi` without importing the seam. Anything that changes what an
- *  existing name returns bumps it. */
-export { GUEST_ABI_VERSION, SUPPORTED_GUEST_ABIS, PRIMITIVE_NAMES } from "../core/domains.js";
+export { PRIMITIVE_NAMES } from "../core/domains.js";
 /** The `crypto/` members of the catalog, as a template literal over `PRIMITIVE_NAMES`, so
  *  the vocabulary a manifest is checked against and the table the seam dispatches through
  *  cannot drift. */

@@ -28,7 +28,6 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { TRANSPORT_BUNDLE_B64 } = await imp("build/host/transport-bundle.js");
 export const { authorBundle } = await imp("build/host/bundle.js");
-export const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
 
@@ -109,7 +108,6 @@ export function harnessAppBlob(author, mode = "echo") {
     protocols: [PROTO],
     modules: [],
     guestSource: HARNESS_GUEST,
-    guestAbi: GUEST_ABI_VERSION,
     // The whole of what an app needs to talk to the network: the id the transport claims.
     guestRequires: [TRANSPORT_SERVICE],
     guestConfig: { mode },

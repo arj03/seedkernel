@@ -28,7 +28,6 @@ const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, authorBundle, hybridAuthorId, hybridAuthorKeysFromSeed, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
-const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
@@ -73,9 +72,6 @@ function transportBundleAt(version, keys, guestSource) {
     protocols: [TRANSPORT_SERVICE],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // Read, never restated: a hardcoded number here would pass a test that the
-    // production loader would refuse the moment the seam revved (§12.4).
-    guestAbi: GUEST_ABI_VERSION,
     // Exactly the authorities the transport guest holds — a mirror of the artifact
     // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
     // `link` privilege the admission dispatch reads (§12.5).

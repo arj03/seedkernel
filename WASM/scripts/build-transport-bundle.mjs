@@ -45,7 +45,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers-sumo";
-import { readGuestSource, readGuestAbi } from "./guest-source.mjs";
+import { readGuestSource } from "./guest-source.mjs";
 import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
@@ -101,10 +101,6 @@ async function main() {
     protocols: ["_net"],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // Read off the seam this program is compiled against, never retyped: a bundle
-    // whose declared ABI and actual ABI can differ is one that loads and then
-    // misreads its own arguments (the failure `guest.abi` exists to make loud).
-    guestAbi: readGuestAbi(),
     // EXACTLY the authorities this program holds, and so exactly what an operator
     // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
     // are the ONLY names carrying that privilege.

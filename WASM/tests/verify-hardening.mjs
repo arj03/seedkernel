@@ -32,7 +32,8 @@ const testAuthor = () => makeAuthor(sodium);
 const { createShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createGuestSeam, UNRESTRICTED_NAMES, GUEST_ABI_VERSION } = await imp("build/host/guest-seam.js");
+const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
+const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

@@ -14,7 +14,7 @@
 //
 // The format is application-neutral; seedstore fills in storage content.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, SUPPORTED_GUEST_ABIS, AUTHORITY_CALLS, PRIVILEGES, isAuthority, isGrant, isReservedProtocol, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, GUEST_ABI_VERSION, AUTHORITY_CALLS, PRIVILEGES, isAuthority, isGrant, isReservedProtocol, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -541,8 +541,8 @@ function validateManifest(manifest: unknown): asserts manifest is BundleManifest
     // Guest ABI support (§12.2) — the same kind of check as the suite above, refused the
     // same way, and here at the one place a manifest becomes a value the rest of the
     // runtime trusts (one copy: the author and the verifier agree on the seam).
-    if (!SUPPORTED_GUEST_ABIS.includes(manifest.guest.abi)) {
-        throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${SUPPORTED_GUEST_ABIS.join(", ")})`);
+    if (manifest.guest.abi !== GUEST_ABI_VERSION) {
+        throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${GUEST_ABI_VERSION})`);
     }
     // The declared requires. The vocabulary (§12.2) is CLOSED and is the authorities
     // alone: an unknown name — `crypto/blake2b-256` included — is a refused manifest, not
@@ -878,7 +878,6 @@ export interface UnsignedBundle {
      *  string is the only shape that can be authored and also verify: arbitrary bytes
      *  with no valid UTF-8 round-trip would be a bundle that cannot come back. */
     guestSource: string;
-    guestAbi: number;
     guestRequires: string[];
     guestConfig?: JsonObject;
 }
@@ -913,7 +912,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     const guestBytes = enc.encode(input.guestSource);
     const guest: BundleGuest = {
         hash: toHex(genesisHash(sodium, guestBytes)),
-        abi: input.guestAbi,
+        abi: GUEST_ABI_VERSION,
         requires: input.guestRequires,
         ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
     };

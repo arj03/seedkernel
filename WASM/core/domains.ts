@@ -205,11 +205,6 @@ const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs
 export function isIrreversible(name: string): boolean {
     return IRREVERSIBLE.has(name) || isReservedProtocol(name);
 }
-/** The guest ABIs this host can run. One entry today; a host supporting two seams at
- *  once (a migration window) lists both, and the loader admits a guest declaring either.
- *  Absent from this list ⇒ the load is refused with its own error, the same legibility
- *  failure as an unsupported manifest suite (§12.4). */
-export const SUPPORTED_GUEST_ABIS: readonly number[] = [GUEST_ABI_VERSION];
 // ── The manifest suite ──────────────────────────────────────────────────────────
 //
 // A suite id is the first byte of the structure it governs *and* part of what that
