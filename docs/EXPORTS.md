@@ -1,60 +1,74 @@
-# The public surface (and who consumes it)
+# Writing a client on seedkernel
 
-This repo is the runtime only. Every app lives outside it and reaches the runtime through the entry points in `WASM/package.json` `exports`, grouped below into three: an **authoring API** (build and sign the bundle format), a **runtime API** (boot a node and drive the shell), and **platform adapters** (the target-specific pieces a caller selects and hands to the runtime API) — so **an export with no in-repo caller is not dead code**, it is surface some other repo depends on. Check these tables before deleting or moving anything below.
+This repo is the **runtime**. Every app lives outside it and reaches the runtime only through the entry points in `WASM/package.json` `exports` — that list is the whole API, and a bare `seedkernel-wasm/*` specifier is the only way in. Two clients exist today and are the worked examples: **[seed store](https://github.com/arj03/seedstore)**, a p2p storage node with a Node CLI, a browser page and an offline bundle build, and **[seedchat](https://github.com/arj03/seedchat)**, a browser chat shell with consent-gated app install. Every file named below is in one of those two.
 
-### Authoring API
+A client does three things, in this order: **author** the signed bundle that carries its app, **boot** a node and load it, and select the **platform adapters** for the target it runs on — which is how the tables are grouped.
 
-Building, signing, packing, and verifying the app-bundle format (§12.4). `authorBundle` (hash, assemble, validate, sign, pack — the blob, manifest and derived author id on the value) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side should make: `authorBundle` runs the same checks the verifier refuses, so an unverifiable bundle cannot be shipped, and its author id is the id each caller pins. Both apps' offline builds author with it now, and no runtime shell signs anything, only verifies. `verifyManifest` stays exported for `p2p.html`, which fetches a bare envelope with no container to unpack. The remaining lower-level primitives stay exported for seedkernel's own hardening tests and seedchat's `smoke.mjs`, which deliberately reach below the typed wrapper — not the path an external consumer should use.
+### 1. Authoring — build and sign the bundle format (§12.4)
 
-| Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
-| --- | :---: | :---: |
-| `./bundle` | ✓ (`authorBundle` in build-bundle/storage-bundle, `verifyBundle` in build-bundle reading back a prior version, `verifyManifest` in p2p.html — see above, tests reach the lower-level primitives directly) | ✓ (`authorBundle` in `scripts/build-app-bundle.mjs`, `verifyBundle` in chat-shell's `peekMeta`, `hybridAuthorId`/`hybridAuthorKeysFromSeed` for message identity, smoke signs directly with `signManifest`/`packBundle` to exercise those primitives) |
+`authorBundle` (hash, assemble, validate, sign, pack — the blob, the manifest and the derived author id all come back on the value) and its mirror `verifyBundle` (unpack, verify, hash-check) are the one call each side, and the only two an app should make. `authorBundle` runs the same checks the verifier refuses, so an unverifiable bundle cannot be shipped, and the author id it returns is the id every consumer of your app pins. No runtime shell signs anything; a shell only verifies.
 
-### Runtime API
+| Entry point | What you import it for | Where to look |
+| --- | --- | --- |
+| `./bundle` | `authorBundle` at build time; `verifyBundle` wherever a blob arrives — a build reading back a prior version, a page reading a fetched `.skb`; `hybridAuthorKeysFromSeed` and `hybridAuthorId` for the author identity you pin, `genesisHash` for content ids, `moduleFile` for a module's name inside the container | authoring: seedstore `WASM/scripts/storage-bundle.mjs`, seedchat `scripts/build-app-bundle.mjs` — verifying: seedstore `WASM/browser/p2p.html` (reads the cohort's author off the staged `./seedstore.skb`), seedchat `browser/chat-shell.js` |
 
-Booting a node and driving the shell — the ONE node-assembly (§12.9) described below.
+The module also carries the lower-level primitives that pair is built from. They stay exported for the runtime's own hardening tests and for a consumer that deliberately forges or tampers with a bundle to prove the verifier rejects it — not a path a client should take. Author with `authorBundle`, verify with `verifyBundle`.
 
-| Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
-| --- | :---: | :---: |
-| `./shell` | ✓ (`boot`/`bootRuntime`, the shell-run tests) | |
-| `./shell-core` | ✓ `bootShell`, `AppHandle`, `scopedFs` (storage-node, net.test) | ✓ `bootShell` (chat-shell, smoke) |
-| `./guest-seam` | ✓ `appSigner`/`guestSignScope` (manifest.ts), `GUEST_ABI_VERSION` (storage-bundle) | ✓ `GUEST_ABI_VERSION` (chat-shell, smoke, chat-app) |
-| `./transport-bundle` | ✓ `transportBundleBytes` (holder-guest, shell-run tests) | ✓ `transportBundleBytes` (chat-shell, smoke) |
-| `./transport-host` | ✓ (`StorageNode` type, import maps, the RTC/WS drivers) | ✓ (chat-shell constructs the adapter instance; smoke) |
-| `./module-table` | ✓ (import maps — bootShell's default module builder) | ✓ (import map only) |
+### 2. Runtime — boot a node and drive the shell
 
-`GUEST_ABI_VERSION` straddles both groups — an author declares it in `guest.abi` when signing a manifest, and the shell checks it at load — but it names the *runtime* seam's version, so it lives here rather than in the authoring API.
+`bootShell` is the ONE node-assembly (§12.9) and the one entry a client uses; everything else here is something you hand it or something it hands back.
 
-### Platform adapters
+| Entry point | What you import it for | Where to look |
+| --- | --- | --- |
+| `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`policyFromJson`, `admitAll`, `authorAllowlist`, `allOf`, …) are re-exported here too, so your `admit` comes from the same module | seedchat `browser/chat-shell.js` (a consent gate, an adapter instance it owns), seedstore `WASM/host/storage-node.ts` (a whole node wrapped as a class) |
+| `./shell` | The Node platform already assembled: `boot`/`bootRuntime` wire `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell` for you. A client that owns its own platform wiring skips this and calls `bootShell` | seedstore `WASM/tests/shell-run.test.mjs` |
+| `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. `bootShell` defaults to it; import it when you want to pass it explicitly, or to hash or inspect it | seedchat `browser/chat-shell.js` |
+| `./transport-host` | The `TransportHost` class — construct it yourself when you own the adapter's lifecycle (a browser edge that loads lazily and re-loads to change its room secret); otherwise pass `bootShell` an options object and let it build one | seedchat `browser/chat-shell.js` |
+| `./guest-seam` | `GUEST_ABI_VERSION` to stamp `guest.abi` when you author. `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | seedstore `WASM/host/manifest.ts` (the mirror), `WASM/scripts/storage-bundle.mjs` (the ABI stamp) |
 
-Target-specific implementations a caller selects and hands to the runtime API above — a deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node-fs), not internals leaking out.
+`GUEST_ABI_VERSION` straddles the two groups — an author declares it when signing a manifest, and the shell checks it at load — but it names the *runtime* seam's version, so it lives here.
 
-| Entry point | [seed store](https://github.com/arj03/seedstore) | [seedchat](https://github.com/arj03/seedchat) |
-| --- | :---: | :---: |
-| `.` (Node host) | ✓ (`loadSodium` — the ML-DSA-mixed `loadCrypto`) | ✓ (`smoke.mjs`'s `loadCrypto`) |
-| `./safe-js` | ✓ (import maps; bootShell's default realm factory) | ✓ (chat-shell passes `createSafeRealm`; import map) |
-| `./quickjs` | ✓ (import maps + the browser-demo staging) | ✓ (import map) |
-| `./fs`, `./fs-memory`, `./fs-node` | ✓ | |
-| `./net-node`, `./net-ws` | ✓ | |
-| `./net-rtc` | ✓ (browser **and** console) | ✓ (`media-rtc.js`'s `RtcNetwork`) |
-| `./net-rtc-node` | ✓ | |
-| `./crypto-browser` | ✓ (`index.html`, `p2p.html` — both call `loadCrypto` directly) | ✓ (chat-shell's `loadCrypto`) |
-| `./libsodium` | ✓ | ✓ |
-| `./libsodium-core`, `./libsodium.wasm` | *(no direct importer — `libsodium-wrappers.mjs` resolves both relative to its own URL, so all three must stay in one directory, and a consumer staging one into a web root stages all three)* | |
+### 3. Platform adapters — the target-specific pieces you choose and hand to §2
 
-**The assembly is an export.** `bootShell` (`./shell-core`) is the ONE node-assembly (§12.9): platform members defaulted (module-table, an in-memory fs and freshness store, lazy safe-js), the channel adapter built from options or accepted as an instance, the transport bundle admitted under an **implicit author pin** derived from the blob itself — so the pin and the load order are the assembly's, not a consumer's to restate. All four targets enter here — Node, browser, native loader, seed store — and differ only in which defaults they displace; `createShell` underneath is the wired shell without the assembly, which in practice only this repo's tests drive. A load returns an **`AppHandle`** — the app key, the app's fs scope and the scoped view over it, and a bound `invoke` — so a caller drives the slot through the derivations shell-core already made. `appSigner` (`./guest-seam`) is one slot's scoped sign/verify pair for a host-side mirror; `transportBundleBytes` (`./transport-bundle`) is the shipped transport artifact as bytes.
+A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node-fs), not internals leaking out.
 
-The pin is ANDed onto the caller's predicate, never substituted for it: an operator's `policyFromJson` still has to admit, so a deny-all node has no network, and a consent dialog that admits anything privileged defers to the pin rather than waving it through. That makes an operator's `grants.link` a veto over the blob the node booted rather than an appointment — running a different transport means passing a different `transportBundle`, which is what the pin is derived from. The pin is **fail-closed on a privilege it does not know** — `PRIVILEGES` is derived from the capability catalog, so a privileged name added to `core/domains.ts` appears here as a privilege with no branch and its bundles are refused until the assembly is taught about it. That is what makes "privileged bundles are the pin's business" safe for a consumer to write, and it is the one place a new privilege is taught.
+| Entry point | What you import it for | Where to look |
+| --- | --- | --- |
+| `.` (root) | Node's `loadCrypto` — sumo libsodium with ML-DSA-65 and ML-KEM-768 mixed in, read off disk. The `sodium` every other call takes | seedstore `WASM/host/sodium.ts`, `WASM/scripts/build-bundle.mjs` |
+| `./crypto-browser` | The browser's `loadCrypto` — the same mix, fetched by URL onto a sumo instance you supply | seedstore `WASM/browser/index.html` and `p2p.html`, seedchat `browser/chat-shell.js` |
+| `./libsodium` | That sumo instance: the runtime's own prebuilt browser libsodium. Do not ship a second one — this is the same binary the Go loader embeds | the three pages above |
+| `./quickjs` | Nothing you call. It is the QuickJS engine `safe-js` names by bare specifier, so a **browser** client must carry it in its import map even though its own code never mentions it | the import map in seedstore `WASM/browser/p2p.html` |
+| `./fs`, `./fs-memory`, `./fs-node` | The `Fs` interface, and the two backends: in-memory (`bootShell`'s default) or a directory on disk | seedstore `WASM/host/storage-node.ts`, `WASM/tests/bench-holder.mjs` |
+| `./net-node` | `NodeChannelFactory` — TCP over `node:net`, plus the peer-spec parsers | seedstore `WASM/tests/net.test.mjs` |
+| `./net-ws` | `WsNetwork` — dial known, natively-reachable nodes straight at their `--ws-listen` port; no relay, no STUN | seedstore `WASM/scripts/p2p-cli.mjs`, `WASM/browser/p2p.html` |
+| `./net-rtc` | `RtcNetwork` and `relaySignaling` — WebRTC with a signaling rendezvous. Browser **and** Node | seedstore `WASM/browser/p2p.html`, seedchat `browser/media-rtc.js` (subclassed for audio/video) |
+| `./net-rtc-node` | `weriftPeerConnectionFactory` — the peer-connection implementation that lets `RtcNetwork` run on the console | seedstore `WASM/scripts/serve-rtc-holder.mjs` |
 
-**Two reaches are not exports and cannot be**, so `files` is what keeps them working: `build`, `build-min`, `browser`, `quickjs/dist`, `assembly/seedkernel`, `guest-handler.ts`, `native/host-shell.gen.js`. **Before adding an export, check the file it points at is covered; before adding a path a consumer reads off disk, add it to `files` in the same change.**
+**The WebRTC seam is the runtime's, not any one app's.** seed store drives `RtcNetwork` from a browser page *and* from the console over werift; seedchat subclasses it to carry live media. Treat it as a first-class adapter on either target, and subclass it rather than fork it when you need more than raw bytes.
 
-- `seedkernel-wasm/guest-handler` — the guest half of the module ABI (§4), imported by chat's AssemblyScript. asc (0.28) resolves a bare specifier by joining the subpath and ignores `exports` entirely, so an entry point cannot serve it: what serves it is the root-level `guest-handler.ts` shim, shipped under `files`. There is no `./guest-handler` export — an entry changes nothing for asc, and hands a JS consumer a subpath resolving to `i32`-typed source it cannot parse.
-- `seedkernel-wasm/build-min/**` — the minified host, vendored into a web root by *both* consumers (`seedstore/WASM/scripts/build-browser-demo.mjs`, `seedchat/scripts/vendor.mjs`). A dependency on *output*: `build-min` is gitignored, so a consumer that has never run `npm run build:host:min` in this repo stages nothing.
+**`loadCrypto` has a Node build and a browser build, not one shared function.** Node's (`.`) pulls the npm package and reads both PQ `.wasm` files off disk; the browser's (`./crypto-browser`) fetches them by URL onto a caller-supplied sumo instance instead. A browser client takes that instance from `./libsodium` and should not ship a second sumo build. `./pq` and `./kem` are internal — both `loadCrypto`s reach them relatively, and an app gets their primitives through the capability catalog, never by importing them.
 
-Three traps this table exists to prevent:
+## The assembly is an export
 
-- **WebRTC is not chat's.** `host/net-rtc.ts` and `host/net-rtc-node.ts` are neither shared-logic (they are absent from the `build:loader-bundles` list) nor app-specific. seed store drives `RtcNetwork` from the browser (`WASM/browser/p2p.html`) *and* from the console over werift (`WASM/scripts/serve-rtc-holder.mjs`, `smoke-rtc.mjs`), so both files outlive any one app.
-- **`loadCrypto` has a Node build and a browser build, not one shared function.** Node's (`.` / `host/crypto-node.ts`) pulls the npm package and reads both `.wasm` files off disk; the browser's (`./crypto-browser` / `host/crypto-browser.ts`) fetches them by URL onto a caller-supplied sumo instance instead. Browsers take `./libsodium`, both consumers do, and neither should ship a second sumo build: that export is the *same artifact* the Go loader embeds, so one crypto binary serves all three targets. `./pq` and `./kem` are internal-only now — both `loadCrypto`s import them by relative path.
-- **A browser consumer resolves these through an import map, and Node cannot tell you it is wrong.** Every `seedkernel-wasm/*` above is a bare specifier: Node finds it through `node_modules`, a browser page only through a hand-written `<script type="importmap">`. So an export that a consumer's *host* code starts importing is invisibly missing from its *pages* until one is loaded — the Node suite stays green throughout. Seed store's `scripts/build-browser-demo.mjs` walks each page's module graph at stage time and fails on an unmapped specifier; adding an export here is a good moment to check the consumer's map.
+`bootShell` (`./shell-core`) is the ONE node-assembly (§12.9), and entering it is how a client gets a node that is correct by construction. Every field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. One default is a decision rather than a convenience: `admit` absent is **deny-all** — the node boots and serves but installs nothing, the transport bundle included, so a client that states no gate has no network. All four targets enter here (Node, browser, the native loader, seed store) and differ only in which defaults they displace.
 
-Apps vendor the built host into their own web root and resolve `seedkernel-wasm/*` through an import map — see `WASM/browser/p2p.html` in seed store or `browser/chat-shell.html` in seedchat. Anything shipped to a browser therefore needs `npm run build:host:min` to be current; a stale `build-min` is the easiest cross-repo breakage to miss.
+Two things it does *for* you, which is why you should not try to reproduce them:
+
+- **The transport author pin is ANDed onto your predicate, never substituted for it.** The transport bundle is admitted under a pin derived from the blob itself, so "only this author may be the network" is the assembly's business, not something you can lose by forgetting it. Your `admit` still has to admit as well — a deny-all node has no network, and an operator keeps the power to refuse a transport author, because AND means both. Running a different transport means passing a different `transportBundle`, which is what the pin is derived from.
+- **It is fail-closed on a privilege it does not know.** `PRIVILEGES` is derived from the capability catalog, so a privileged name added to `core/domains.ts` appears here as a privilege with no branch, and bundles reaching it are refused until the assembly is taught about it. That is what makes "privileged bundles are the pin's business" a safe thing for your consent dialog to assume.
+
+A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
+
+## Two reaches that are not exports
+
+Both are real, both are used by both clients, and neither can be an entry point — so `files` is what keeps them working: `build`, `build-min`, `browser`, `quickjs/dist`, `assembly/seedkernel`, `guest-handler.ts`, `native/host-shell.gen.js`.
+
+- `seedkernel-wasm/guest-handler` — the guest half of the module ABI (§4), imported by an AssemblyScript app (seedchat `assembly/chat-app-v2/index.ts`). asc (0.28) resolves a bare specifier by joining the subpath and ignores `exports` entirely, so an entry point cannot serve it; the root-level `guest-handler.ts` shim, shipped under `files`, is what does. There is deliberately no `./guest-handler` export — it would change nothing for asc and would hand a JS consumer `i32`-typed source it cannot parse.
+- `seedkernel-wasm/build-min/**` — the minified browser host, vendored into a web root by both clients (seedstore `WASM/scripts/build-browser-demo.mjs`, seedchat `scripts/vendor.mjs`). This is a dependency on *output*: `build-min` is gitignored, so a checkout of this repo that has never run `npm run build:host:min` stages nothing.
+
+## Two traps a browser client hits
+
+- **Bare specifiers resolve through a hand-written import map, and Node cannot tell you it is wrong.** Node finds `seedkernel-wasm/*` through `node_modules`; a browser page finds it only through `<script type="importmap">`. So an entry point your *host* code starts importing is invisibly missing from your *pages* until one is loaded — your Node suite stays green throughout. Map only what your graph actually names: `bootShell` pulls its module table and its safe-js realm in by relative import, so neither needs an entry, while `safe-js.js` names `seedkernel-wasm/quickjs` and does. seedstore's `WASM/scripts/build-browser-demo.mjs` walks each page's real module graph at stage time and exits non-zero on an unmapped specifier — worth copying.
+- **A stale `build-min` is the easiest cross-repo breakage to miss.** The browser runs the minified tree; Node tests run `build/`. When `build:host` reruns and `build:host:min` does not, the two diverge silently: tests pass against fresh code while the page serves old code. Anything you ship to a browser needs `npm run build:host:min` here to be current, and a staging step is the right place to assert it (seedstore's does, for both repos).
+
+Both clients vendor the built host into their own web root and resolve `seedkernel-wasm/*` from there — see `WASM/browser/p2p.html` in seed store or `browser/chat-shell.html` in seedchat for a map to start from.

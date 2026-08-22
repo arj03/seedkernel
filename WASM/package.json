@@ -36,10 +36,6 @@
       "types": "./build/host/fs-node.d.ts",
       "default": "./build/host/fs-node.js"
     },
-    "./safe-js": {
-      "types": "./build/host/safe-js.d.ts",
-      "default": "./build/host/safe-js.js"
-    },
     "./guest-seam": {
       "types": "./build/host/guest-seam.d.ts",
       "default": "./build/host/guest-seam.js"
@@ -51,10 +47,6 @@
     "./shell-core": {
       "types": "./build/host/shell-core.d.ts",
       "default": "./build/host/shell-core.js"
-    },
-    "./module-table": {
-      "types": "./build/host/module-table.d.ts",
-      "default": "./build/host/module-table.js"
     },
     "./transport-host": {
       "types": "./build/host/transport-host.d.ts",
@@ -76,9 +68,7 @@
       "types": "./quickjs/dist/variant.d.mts",
       "default": "./quickjs/dist/variant.mjs"
     },
-    "./libsodium": "./browser/libsodium-wrappers.mjs",
-    "./libsodium-core": "./browser/libsodium-core.mjs",
-    "./libsodium.wasm": "./browser/libsodium.wasm"
+    "./libsodium": "./browser/libsodium-wrappers.mjs"
   },
   "files": [
     "build",
