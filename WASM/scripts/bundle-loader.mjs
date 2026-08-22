@@ -10,7 +10,7 @@
 // limited by accidental name choices rather than by dependency. Here the only names
 // that cross a module boundary are the ones it `export`s:
 //
-//   let toHex, Transport, createShell, …;                 // every exported name
+//   let toHex, Transport, bootShell, …;                   // every exported name
 //   ({ toHex, fromHex } = (function () { …util.js…; return { toHex, fromHex }; })());
 //
 // The destructuring assignment targets the OUTER bindings while `return { … }`

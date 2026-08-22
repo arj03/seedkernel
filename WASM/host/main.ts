@@ -1,8 +1,8 @@
 // seedkernel-shell — the NODE platform (README §12).
 //
-// `boot()` assembles a node out of this platform's parts — `NodeFs` on a data directory,
-// a `node:net` channel factory, a file-backed freshness store — and hands them to the
-// shared `bootShell`, which is the assembly (§12.9). It knows nothing about any app:
+// `bootRuntime()` assembles a node out of this platform's parts — `NodeFs` on a data
+// directory, a `node:net` channel factory, a file-backed freshness store — and hands them
+// to the shared `bootShell`, which is the assembly (§12.9). It knows nothing about any app:
 // everything arrives as a signed bundle (§12.4) whose author must clear the policy gate.
 //
 // The operator's side — flags, defaults, boot sequence, console lines — is `cli.ts`, which
@@ -145,8 +145,8 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     const shell: Shell = {
         resolve: core.resolve,
         routes: core.routes,
-        // boot() always supplies an fs (Node always has a filesystem), so the optional
-        // seam member is non-null here.
+        // This platform always supplies an fs (Node always has a filesystem), so the
+        // optional seam member is non-null here.
         fs: core.fs!,
         sodium: core.sodium,
         loadBundleBlob: core.loadBundleBlob,
@@ -162,12 +162,3 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     return { shell, transport };
 }
 
-/** Assemble a Node shell. Callers that also operate the concrete channel adapter use
- *  {@link bootRuntime}; ordinary shell callers do not receive host integration state. */
-export async function boot(opts: ShellOptions): Promise<Shell> {
-    return (await bootRuntime(opts)).shell;
-}
-// Re-exported so a caller gets the assembly and this platform's wrapper from one import.
-// `createShell` is deliberately NOT re-exported: the seam under the assembly is not a
-// thing a target should reach for, and reaching it means restating the load order.
-export { bootShell } from "./shell-core.js";

@@ -16,6 +16,9 @@ const {
   loadCrypto,
 } = await imp("build/host/crypto-node.js");
 const { ModuleTable: JsModuleLoader } = await imp("build/host/module-table.js");
+const { bootShell } = await imp("build/host/shell-core.js");
+const { bootRuntime } = await imp("build/host/main.js");
+const { TransportHost } = await imp("build/host/transport-host.js");
 
 // The host's already-readied instance rather than our own copy: libsodium-wrappers-sumo
 // declares separate "import" and "require" conditions pointing at different builds, so a
@@ -40,7 +43,7 @@ const { toHex, fromHex, concatBytes, writeU32BE } = await imp("build/core/util.j
 import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
-const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId,
+const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMarks,
          signManifest, verifyManifest, verifyBundle, loadBundleModules, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
@@ -60,6 +63,47 @@ const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI
  *  app keys, freshness marks) and hand the whole object to `signManifest`, so none can
  *  pin half an identity. */
 const testAuthor = () => makeAuthor(sodium);
+
+/** A NODE-platform node for one test: `bootRuntime` (main.ts) minus the channel
+ *  adapter, which these tests do not drive. The disk-backed platform — NodeFs on a data
+ *  directory, a file-backed freshness store — is the point of reaching for it over
+ *  {@link bootTestShell}, which stands a node with no disk. */
+const boot = async (cfg) => (await bootRuntime(cfg)).shell;
+
+/** A node for ONE test, through the one assembly (`bootShell`, §12.9). The platform
+ *  members are stated flat, as the assembly takes them, and `fs` defaults to `false`:
+ *  most bundles here declare no `fs` cap, and handing them the in-memory backend would
+ *  be a seam open that the test never asked for. A test that wants a disk passes one.
+ *
+ *  `pinAuthor` is whose signature the TRANSPORT PIN admits (§12.5). The pin is derived
+ *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` or
+ *  `route` is refused before any predicate under test is consulted. So a test loading a
+ *  privileged bundle names the author the pin is derived from, exactly as an operator
+ *  running a transport other than the shipped one does. What it hands over is a real
+ *  signed bundle of that author's, because the pin is read off a signature rather than
+ *  off a name; the socket-less driver beside it is the browser-edge shape (§12.6), which
+ *  is what makes a link-privileged bundle admissible without giving this node sockets. */
+async function bootTestShell({ pinAuthor, ...opts } = {}) {
+  const identity = opts.identity ?? generateKeyPair();
+  const pinned = pinAuthor ? {
+    transport: new TransportHost({ identity }),
+    transportBundle: packBundle({
+      [MANIFEST_FILE]: signManifest(sodium, pinAuthor,
+        { app: "pin", version: 1, modules: [], guest: GUEST() }),
+      [GUEST_FILE]: GUEST_BYTES,
+    }),
+  } : {};
+  const { shell } = await bootShell({
+    sodium,
+    modules: new JsModuleLoader(),
+    freshnessStore: new FreshnessMarks(),
+    fs: false,
+    ...pinned,
+    ...opts,
+    identity,
+  });
+  return shell;
+}
 
 /** The admission context a bundle with no history lands under: an ordinary app, never
  *  loaded here before, from a key nobody has written off. The shell reads these off its
@@ -334,9 +378,7 @@ async function testDerivedNamesKeepAuthorsApart() {
 // claims atomically, while a different bundle cannot silently displace it.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
-  const { FreshnessMarks, verifyManifest } = await imp("build/host/bundle.js");
+  const { verifyManifest } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -353,13 +395,10 @@ async function testManifestClaimIsTheRouting() {
     [GUEST_FILE]: GUEST_BYTES,
   });
   let realmBuilds = 0;
-  const shell = mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async () => {
-        realmBuilds++;
-        return { call: async () => new Uint8Array(), dispose() {} };
-      },
+  const shell = await bootTestShell({
+    createRealm: async () => {
+      realmBuilds++;
+      return { call: async () => new Uint8Array(), dispose() {} };
     },
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
   });
@@ -435,9 +474,6 @@ async function testManifestClaimIsTheRouting() {
 // the id the transport itself claims would be handed straight into the transport's realm.
 async function testGenericClaimDelivery() {
   console.log("Test: route/deliver submits an opaque attribution to an exact claim");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
-  const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -450,22 +486,22 @@ async function testGenericClaimDelivery() {
   // bundle's own `host.call` — the very function its guest would hold.
   let lastSeam = null;
   const realms = [];
-  const shell = mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async ({ hostCall }) => {
-        lastSeam = hostCall;
-        const realm = {
-          calls: [],
-          async call(entry, payload) { realm.calls.push({ entry, payload }); return new Uint8Array(); },
-          dispose() { },
-        };
-        realms.push(realm);
-        return realm;
-      },
+  const shell = await bootTestShell({
+    createRealm: async ({ hostCall }) => {
+      lastSeam = hostCall;
+      const realm = {
+        calls: [],
+        async call(entry, payload) { realm.calls.push({ entry, payload }); return new Uint8Array(); },
+        dispose() { },
+      };
+      realms.push(realm);
+      return realm;
     },
     // Everything admitted, `link` included: the boundary under test is the shell's claim
     // check, and a policy refusing the privilege would hide it behind an earlier refusal.
+    // The pin is this same author's for that reason — it is the other refusal that would
+    // land first (§12.5).
+    pinAuthor: author,
     admit: admitAll,
   });
   const attribution = Uint8Array.of(7, 8, 9), body = Uint8Array.of(1, 2, 3);
@@ -516,9 +552,6 @@ async function testGenericClaimDelivery() {
 // contested claim — and the incumbent's OWN next version still replaces it in place.
 async function testOneRawLinkOwner() {
   console.log("Test: a second link-capable identity is refused the raw-link binding (§12.10)");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
-  const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -527,11 +560,11 @@ async function testOneRawLinkOwner() {
       { app, version, protocols: undefined, modules: [], guest: GUEST({ requires }) }),
     [GUEST_FILE]: GUEST_BYTES,
   });
-  const shell = mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async () => ({ async call() { return new Uint8Array(); }, dispose() { } }),
-    },
+  // Both candidates are this author's, so the pin admits both and what refuses the
+  // second is the binding rule under test rather than an earlier gate.
+  const shell = await bootTestShell({
+    createRealm: async () => ({ async call() { return new Uint8Array(); }, dispose() { } }),
+    pinAuthor: author,
     admit: admitAll,
   });
   try {
@@ -952,13 +985,10 @@ async function testPolicy() {
 // so the most permissive `authors` list expressible here (`admitAll`) still buys an
 // author no sockets. Otherwise every policy test above is a lock on an open door.
 //
-// Driven through createShell, because the derivation is the shell's — the policy tests
+// Driven through the assembly, because the derivation is the shell's — the policy tests
 // above compose verifyBundle → admit → installBundle by hand and would not see it.
 async function testRequiresPickThePrivileges() {
   console.log("Test: guest.requires decides which privileges a bundle must be granted");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
-  const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -976,11 +1006,11 @@ async function testRequiresPickThePrivileges() {
   });
   // ONE predicate, with the capability set as an argument (`byPrivilege`) rather than a
   // choice between predicates the runtime holds.
-  const mkTestShell = (base, link) => mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
-    },
+  // The pin names this author, so every candidate below reaches the predicate whose
+  // choice is being counted — the pin refusing first would make every count zero.
+  const mkTestShell = (base, link) => bootTestShell({
+    createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
+    pinAuthor: author,
     admit: byPrivilege({ base, grants: { link } }),
   });
   const load = async (shell, requires) => {
@@ -993,7 +1023,7 @@ async function testRequiresPickThePrivileges() {
   //    cannot do.
   {
     let appAsked = 0, transportAsked = 0;
-    const shell = mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
+    const shell = await mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
     try {
       await load(shell, ["fs/get", "clock/now"]);
       assert(appAsked === 1 && transportAsked === 0, "a bundle reaching no privilege is governed by the base predicate");
@@ -1006,7 +1036,7 @@ async function testRequiresPickThePrivileges() {
   // 2. The direction that matters: admitAll for apps, denyAll for the transport. An
   //    author trusted for every app there is still cannot land raw links.
   {
-    const shell = mkTestShell(admitAll, denyAll);
+    const shell = await mkTestShell(admitAll, denyAll);
     try {
       const err = await load(shell, ["link/open"]);
       assert(err !== null && /rejected by admission/.test(err),
@@ -1022,7 +1052,7 @@ async function testRequiresPickThePrivileges() {
   {
     for (const requires of [["link/stat"], ["fs/get", "link/open"]]) {
       let appAsked = 0, linkAsked = 0;
-      const shell = mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
+      const shell = await mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
       try {
         await load(shell, requires);
         assert(linkAsked === 1 && appAsked === 0,
@@ -1044,22 +1074,20 @@ async function testRequiresPickThePrivileges() {
 // un-upgraded peer failed as an authentication error with nothing naming the cause.
 async function testSigningScopeFollowsPrivilege() {
   console.log("Test: node/sign is always the app scope, link/sign is always the network scope, on every load path");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { FreshnessMarks, signManifest, packBundle } = await imp("build/host/bundle.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
   const { byPrivilege, admitAll } = await imp("build/host/policy.js");
   const linkAuthor = testAuthor(), appAuthor = testAuthor();
   const identity = generateKeyPair();
   const networkKey = new Uint8Array(32).fill(0x7a);
   let seam;
-  const shell = mkShell({
-    platform: {
-      sodium, identity, networkKey, modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async ({ hostCall }) => {
-        seam = hostCall;
-        return { call: async () => new Uint8Array(), dispose() {} };
-      },
+  // The pin is `linkAuthor`'s: it is the only author here whose bundle reaches `link`,
+  // and the app author's never does, so one pin covers both loads.
+  const shell = await bootTestShell({
+    identity, networkKey,
+    createRealm: async ({ hostCall }) => {
+      seam = hostCall;
+      return { call: async () => new Uint8Array(), dispose() {} };
     },
+    pinAuthor: linkAuthor,
     admit: byPrivilege({ base: admitAll, grants: { link: admitAll } }),
   });
   const blob = (author, app, version, requires) => packBundle({
@@ -1240,7 +1268,6 @@ async function testSlotFreshness() {
 
 async function testShellBoot() {
   console.log("Test: seedkernel-shell boots under a policy and wires its capability backends");
-  const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -1271,7 +1298,6 @@ async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
   const { signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
-  const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -1371,7 +1397,6 @@ async function testGuestBundleAndArchive() {
   const { signManifest, verifyManifest, verifyBundle,
           packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
-  const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -2357,7 +2382,6 @@ async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
   const { signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
     = await imp("build/host/bundle.js");
-  const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -2426,7 +2450,6 @@ async function testBundleCorruptNewerRollback() {
 async function testAuthorRevocation() {
   console.log("Test: revoking an author key refuses its bundles and tears down what it landed");
   const { signManifest, packBundle, MANIFEST_FILE, moduleFile } = await imp("build/host/bundle.js");
-  const { boot } = await imp("build/host/main.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -2480,16 +2503,11 @@ async function testAuthorRevocation() {
     //     its consent dialog there (§12.4), and prompting a user to approve a bundle this
     //     host has already decided to refuse is the wrong order to ask in.
     {
-      const { createShell: mkShell } = await imp("build/host/shell-core.js");
-      const { ModuleTable: KH } = await imp("build/host/module-table.js");
-      const { FreshnessMarks } = await imp("build/host/bundle.js");
       const store = new FreshnessMarks();
       let admitCalls = 0;
-      const probe = mkShell({
-        platform: {
-          sodium, identity, modules: new KH(), freshnessStore: store,
-          createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
-        },
+      const probe = await bootTestShell({
+        identity, freshnessStore: store,
+        createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
         admit: () => { admitCalls++; return true; },
       });
       probe.revoke(authorHex);
@@ -2631,9 +2649,6 @@ async function testAppNameLengthRefused() {
 // the retry a no-op against a store that still lacks it.
 async function testPersistFailureRollsBack() {
   console.log("Test: a failed freshness persist fails the load — nothing is kept, the mark is rolled back");
-  const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
-    = await imp("build/host/bundle.js");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
   const { ModuleTable } = await imp("build/host/module-table.js");
   const { admitAll } = await imp("build/host/policy.js");
 
@@ -2656,16 +2671,14 @@ async function testPersistFailureRollsBack() {
   // guest stands, so the write it rolls back is one that was about to record a version
   // that really ran.
   const host = testHost(new ModuleTable());
-  const shellOver = (freshnessStore) => mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: host, freshnessStore,
-      createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
-    },
+  const shellOver = (freshnessStore) => bootTestShell({
+    modules: host, freshnessStore,
+    createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     admit: admitAll,
   });
 
   const broken = new BrokenStore();
-  const brokenShell = shellOver(broken);
+  const brokenShell = await shellOver(broken);
   let msg = "";
   try { await brokenShell.loadBundleBlob(blob); } catch (e) { msg = e.message; }
   assert(msg.includes("could not be persisted"), "a failed persist fails the load");
@@ -2676,7 +2689,7 @@ async function testPersistFailureRollsBack() {
   // A retry against a healthy store completes cleanly: the rollback is what makes
   // it persist a FRESH advance rather than no-op'ing against the stale mark.
   const healthy = new FreshnessMarks();
-  const healthyShell = shellOver(healthy);
+  const healthyShell = await shellOver(healthy);
   await healthyShell.loadBundleBlob(blob);
   assert(healthyShell.uninstall(key), "the retry lands");
   assertEqual(healthy.get(author.id, "persist"), 1, "…and persists its mark");
@@ -2692,25 +2705,11 @@ async function testPersistFailureRollsBack() {
 // neighbours touched.
 async function testCandidateRealmCannotActBeforeCommit() {
   console.log("Test: a candidate realm cannot act before its installation commits");
-  const { FreshnessMarks, signManifest, packBundle, MANIFEST_FILE, GUEST_FILE }
-    = await imp("build/host/bundle.js");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable } = await imp("build/host/module-table.js");
   const { admitAll } = await imp("build/host/policy.js");
 
   const author = testAuthor();
   const fs = new MemoryFs();
   let reached = 0;
-  // The narrow transport surface the raw-link seam needs. Only `config` is exercised: it
-  // is the read the real transport's `init()` makes at top level.
-  const rawNet = {
-    config: () => Uint8Array.of(1),
-    open: () => ({ linkId: 0, framing: 0, authority: "" }),
-    send() {}, close() {}, buffered: () => 0, authenticated() {}, down() {},
-  };
-  const transport = {
-    route() {}, rawNet: () => rawNet, activate() {}, release() {}, replayAddresses() {}, close() {},
-  };
   const guest = new TextEncoder().encode(GUEST_TEXT);
   const blob = packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author, {
@@ -2730,10 +2729,11 @@ async function testCandidateRealmCannotActBeforeCommit() {
   }
   const store = new FlakyStore();
   const candidates = [];
-  const shell = mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new ModuleTable(), fs,
-      freshnessStore: store, transportHost: transport,
+  // A REAL socket-less driver (the browser-edge shape), so `link/config` is the read the
+  // transport's own `init()` makes rather than a stand-in, and the pin — this author's —
+  // is what lets a `link`-reaching candidate get as far as the seam under test.
+  const shell = await bootTestShell({
+      fs, freshnessStore: store, pinAuthor: author,
       createRealm: async ({ hostCall }) => {
         const refused = [];
         for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
@@ -2744,10 +2744,9 @@ async function testCandidateRealmCannotActBeforeCommit() {
         candidates.push({ hostCall, refused, config, moduleAnswer });
         return { call: async () => new Uint8Array(), dispose() {} };
       },
-    },
-    // A platform claim standing in for the neighbour a candidate must not reach.
-    claims: { _svc: () => { reached++; return Promise.resolve(new Uint8Array()); } },
-    admit: admitAll,
+      // A platform claim standing in for the neighbour a candidate must not reach.
+      claims: { _svc: () => { reached++; return Promise.resolve(new Uint8Array()); } },
+      admit: admitAll,
   });
   const key = appKey(author.id, "offside");
   try {
@@ -2758,7 +2757,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "a candidate reaches neither a durable write nor another realm");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
-    assert(candidates[0].config.length === 1, "the reads a guest initializes from stay open");
+    assert(candidates[0].config.length > 0, "the reads a guest initializes from stay open");
     assert(candidates[0].moduleAnswer[0] === 4, "…as do its own verified modules");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
@@ -2815,9 +2814,6 @@ async function testFailedRevokePersistRollsBack() {
 // running `timer` turns — re-arming more, and holding ~1.2 MB of engine per upgrade.
 async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("Test: an in-place upgrade disposes the realm and deadlines it replaces");
-  const { createShell: mkShell } = await imp("build/host/shell-core.js");
-  const { ModuleTable: MT } = await imp("build/host/module-table.js");
-  const { FreshnessMarks } = await imp("build/host/bundle.js");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
 
   const author = testAuthor();
@@ -2841,16 +2837,13 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const realms = [];
   let failNextRealm = false;
   const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
-  const shell = mkShell({
-    platform: {
-      sodium, identity: generateKeyPair(), modules: new MT(), freshnessStore: new FreshnessMarks(),
-      createRealm: async (o) => {
-        if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-        const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
-        realms.push(r);
-        await o.hostCall("timer/arm", arm(1, 200));
-        return r;
-      },
+  const shell = await bootTestShell({
+    createRealm: async (o) => {
+      if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
+      const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+      realms.push(r);
+      await o.hostCall("timer/arm", arm(1, 200));
+      return r;
     },
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
   });

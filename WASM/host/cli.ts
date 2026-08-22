@@ -92,7 +92,7 @@ export interface CliHost extends CliFiles {
   stdin(): Uint8Array;
   /** Entropy + the subkey derivation's crypto (§12.9). */
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
-  /** Assemble a node on this platform: the platform seam, `createShell`, and the
+  /** Assemble a node on this platform: the platform seam, `bootShell`, and the
    *  transport bundle that is its network. */
   standUp(cfg: NodeSetup): Promise<NodeRuntime>;
 }

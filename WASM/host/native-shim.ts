@@ -6,7 +6,7 @@
 // wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm) and this file
 // adapts them to the interfaces the shared shell consumes — `PureModuleLoader`,
 // `FreshnessStore`, channel, realm and shell platform seams — then hands the
-// result to `createShell`. Every rule above the primitives comes from those shared
+// result to `bootShell`. Every rule above the primitives comes from those shared
 // modules, assembly order included. Being TypeScript checked against the same interfaces
 // is what makes drift a compile error.
 import { policyFromJson } from "./policy.js";

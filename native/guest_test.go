@@ -40,7 +40,7 @@ register("get", async (id) => {
   return r.slice(1);
 });
 register("probe", () => {
-  const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "createShell", "process", "Bun"];
+  const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process", "Bun"];
   const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
   return new TextEncoder().encode(leaked.join(","));
 });

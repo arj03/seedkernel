@@ -29,7 +29,7 @@ withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.w
 /** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
  *  identity policy pins and app keys lead with. `ed` doubles as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
-const { createShell, scopedFs } = await imp("build/host/shell-core.js");
+const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
@@ -255,8 +255,8 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 {
   // A bound can be declared on every interface between the operator and the realm and
-  // passed by none of them, so this drives createShell with a stub realm factory and
-  // asserts the numbers arrive.
+  // passed by none of them, so this boots a node onto a stub realm factory and asserts
+  // the numbers arrive. No transport, so nothing here may reach a privilege.
   const kp = testAuthor();
   const guestSrc = 'register("handle", () => new Uint8Array([1]));';
   const guestBytes = new TextEncoder().encode(guestSrc);
@@ -274,23 +274,21 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   });
 
   const seen = [];
-  const shell = createShell({
-    platform: {
-      sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
-      freshnessStore: new FreshnessMarks(),
-      createRealm: async (o) => {
-        seen.push(o);
-        return { call: async () => new Uint8Array(), dispose() {} };
-      },
+  const { shell } = await bootShell({
+    sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
+    freshnessStore: new FreshnessMarks(),
+    createRealm: async (o) => {
+      seen.push(o);
+      return { call: async () => new Uint8Array(), dispose() {} };
     },
     admit: admitAll,
     guestDeadlineMs: 1234,
     realmMemoryBytes: 7 * 1024 * 1024,
   });
-  await shell.loadBundleBlob(blob, {
+  const probe = await shell.loadBundleBlob(blob, {
     localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
   });
-  await shell.invoke("probe", new Uint8Array());
+  await probe.invoke("probe", new Uint8Array());
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
   ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
@@ -357,19 +355,17 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // Omitted ⇒ the SHARED defaults arrive at the seam (core/wasm-limits.ts), not undefined
   // and not "unbounded". The shell resolves them so no factory owns the numbers.
   let seen2 = null;
-  const bare = createShell({
-    platform: {
-      sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
-      freshnessStore: new FreshnessMarks(),
-      createRealm: async (o) => {
-        seen2 = o;
-        return { call: async () => new Uint8Array(), dispose() {} };
-      },
+  const { shell: bare } = await bootShell({
+    sodium, identity: kp.ed, modules: new ModuleTable(), fs: new MemoryFs(),
+    freshnessStore: new FreshnessMarks(),
+    createRealm: async (o) => {
+      seen2 = o;
+      return { call: async () => new Uint8Array(), dispose() {} };
     },
     admit: admitAll,
   });
-  await bare.loadBundleBlob(blob);
-  await bare.invoke("probe", new Uint8Array());
+  const bareProbe = await bare.loadBundleBlob(blob);
+  await bareProbe.invoke("probe", new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
@@ -437,38 +433,39 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
       [GUEST_FILE]: guestBytes,
     });
   };
-  const newShell = () => createShell({
-    platform: {
-      sodium, identity: kp.ed, modules: new ModuleTable(),
-      freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
-    },
+  // `fs: false` said rather than omitted: these bundles declare no `fs` cap, and the
+  // in-memory default would hand this node a backend it is not meant to have.
+  const newShell = async () => (await bootShell({
+    sodium, identity: kp.ed, modules: new ModuleTable(),
+    freshnessStore: new FreshnessMarks(), createRealm: createSafeRealm,
+    fs: false,
     admit: admitAll,
-  });
+  })).shell;
 
-  const shell = newShell();
-  await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await shell.invoke("arm", new Uint8Array([7, 5]));    // arm: id 7, in 5ms
+  const shell = await newShell();
+  const ticker = await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  await ticker.invoke("arm", new Uint8Array([7, 5]));    // arm: id 7, in 5ms
   await sleep(80);
-  const fired = await shell.invoke("fired", new Uint8Array());
+  const fired = await ticker.invoke("fired", new Uint8Array());
   ok(fired.length === 1 && fired[0] === 7,
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
   // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
   // it back: the id is the GUEST's throughout, so the host keeps no second name for it.
-  await shell.invoke("arm", new Uint8Array([9, 5]));
-  await shell.invoke("arm", new Uint8Array([9, 5]));
-  await shell.invoke("clear", new Uint8Array([9]));
+  await ticker.invoke("arm", new Uint8Array([9, 5]));
+  await ticker.invoke("arm", new Uint8Array([9, 5]));
+  await ticker.invoke("clear", new Uint8Array([9]));
   await sleep(80);
-  const after = await shell.invoke("fired", new Uint8Array());
+  const after = await ticker.invoke("fired", new Uint8Array());
   ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
   shell.close();
 
   // The gate is still the manifest: a bundle that did not declare `timer/arm` is refused
   // by NAME at the seam, not handed a table because the shell has one to give.
-  const ungated = newShell();
-  await ungated.loadBundleBlob(mkBlob([]));
+  const ungated = await newShell();
+  const ungatedApp = await ungated.loadBundleBlob(mkBlob([]));
   let refused = false;
-  try { await ungated.invoke("arm", new Uint8Array([1, 1])); } catch { refused = true; }
+  try { await ungatedApp.invoke("arm", new Uint8Array([1, 1])); } catch { refused = true; }
   ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
   ungated.close();
 
@@ -478,16 +475,15 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   // invoked — which a real realm would report only by crashing, or not at all.
   let armed = null;
   const entries = [];
-  const stub = createShell({
-    platform: {
-      sodium, identity: kp.ed, modules: new ModuleTable(),
-      freshnessStore: new FreshnessMarks(),
-      createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
-    },
+  const { shell: stub } = await bootShell({
+    sodium, identity: kp.ed, modules: new ModuleTable(),
+    freshnessStore: new FreshnessMarks(),
+    fs: false,
+    createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
     admit: admitAll,
   });
-  await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await stub.invoke("arm", new Uint8Array([0, 0]));
+  const stubApp = await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  await stubApp.invoke("arm", new Uint8Array([0, 0]));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
   ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");

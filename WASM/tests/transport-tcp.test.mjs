@@ -18,7 +18,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
-const { createShell } = await imp("build/host/shell-core.js");
+const { bootShell } = await imp("build/host/shell-core.js");
 const { NodeChannelFactory } = await imp("build/host/net-node.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
@@ -52,14 +52,16 @@ async function makeNode(ws = false) {
     ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
     requestDeadlineMs: 2000,
   });
-  const shell = createShell({
-    platform: {
-      sodium, identity,
-      modules: new ModuleTable(),
-      freshnessStore: new FreshnessMarks(),
-      transportHost: transport,
-      createRealm: async (o) => createSafeRealm(o),
-    },
+  // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
+  // but leaves the load and the listeners to this test, which starts them by hand below.
+  const { shell } = await bootShell({
+    sodium, identity,
+    modules: new ModuleTable(),
+    freshnessStore: new FreshnessMarks(),
+    fs: false,
+    transport,
+    transportBundle: transportBlob,
+    createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
   await shell.loadBundleBlob(transportBlob);

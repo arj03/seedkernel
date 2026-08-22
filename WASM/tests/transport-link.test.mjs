@@ -705,7 +705,7 @@ await test("a decrypt failure does not advance the receive counter", async (keep
 // An inbound frame reaches the shell as the transport's `route/deliver` and goes to the
 // routing table, so a host that serves an id of its own — seedchat's `offer/v1`, which
 // carries a bundle between two browsers before either has an app that could receive it —
-// needs an explicit seam. `createShell({ claims })` is it: exact names, no wildcard and no
+// needs an explicit seam. `bootShell({ claims })` is it: exact names, no wildcard and no
 // fall-through. These pin both halves — a registered name wins, and an unregistered one is
 // never consulted — plus the reach an ORDINARY id carries and a reserved one does not
 // (below).

@@ -109,7 +109,7 @@ func invokeBundle(appKey string, payload []byte) ([]byte, error) {
 }
 
 // bootShell stands a whole node up exactly as the binary does — bootRealm, then
-// bootNode inside the realm (identity, network, createShell over this platform).
+// bootNode inside the realm (identity, network, bootShell over this platform).
 // `listen` is nil for a node that only initiates; policyJSON "" is the deny-all
 // default (README §14). Returns what the realm reported: the peer id and the ports
 // actually bound.
@@ -242,7 +242,7 @@ func guestSeamRealm(tb testing.TB) {
 // (createRealm, host/native-shim.ts) over a seam the caller has already installed at
 // `__guestSeam`, and parks it at `__realm`. `source` is fronted with the shared guest
 // preamble, the given signed APP fixture and an empty LOCAL value, mirroring what
-// createShell composes for a real bundle's guest.
+// the shell composes for a real bundle's guest.
 func newTestRealm(tb testing.TB, appJSON, source string) {
 	tb.Helper()
 	newTestRealmBudget(tb, appJSON, source, 0)

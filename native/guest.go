@@ -1,6 +1,6 @@
 // guest.go — the confined guest realm (README §12.3 / §12.8): this target's version of
 // the seam safe-js.ts is on the JS targets, exposed to the shell as `createRealm`
-// (host/native-shim.ts) so `createShell` drives either without knowing which it holds.
+// (host/native-shim.ts) so the shell drives either without knowing which it holds.
 //
 // A realm is a second, zero-authority QuickJS runtime holding only the ECMAScript
 // intrinsics, so the guest cannot even *name* sodium / fs / net. Its single seam is

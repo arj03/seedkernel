@@ -14,7 +14,7 @@ import (
 // Serving (README §12.8, §12.10): the protocol id off the wire is resolved to the
 // installed app whose manifest claims it, and that app answers. There is no native
 // dispatch, which is what these pin — they drive the real boot path (boot → bootNode →
-// loadBundle → serve), so what runs is createShell's `dispatch`, the same function the
+// loadBundle → serve), so what runs is the shell's `dispatch`, the same function the
 // Node and browser shells use.
 
 // The holder guest: type 1 = STORE (payload already framed for fs/put), type 2 = FETCH

@@ -15,7 +15,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 export const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 export const sodium = await loadCrypto();
-export const { createShell } = await imp("build/host/shell-core.js");
+export const { bootShell } = await imp("build/host/shell-core.js");
 export const { createSafeRealm } = await imp("build/host/safe-js.js");
 export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
@@ -169,9 +169,9 @@ export function transportPolicy(authorHex, appAuthors = []) {
 }
 
 /** One transport host: a shell over a fresh identity + the transport bundle, and — unless
- *  `app: false` — the harness app that drives it. Options pass through to the shell's
- *  platform (admitPeers for the peer list, networkKey, contactSecret, channels) and to
- *  createShell (requestDeadlineMs, transportHalfOpen, maxRawLinks, linkIdleTimeoutMs).
+ *  `app: false` — the harness app that drives it. Options pass through to the driver
+ *  this harness constructs (admitPeers for the peer list, networkKey, contactSecret,
+ *  channels, requestDeadlineMs, transportHalfOpen, maxRawLinks, linkIdleTimeoutMs).
  *
  *  `request`/`sendNoReply`/`seen`/`peers` are each one `invoke` into the harness app, so
  *  the bytes cross exactly the seam a real app's would. */
@@ -198,20 +198,28 @@ export async function makeTransportHost(opts = {}) {
     maxRawLinks: opts.maxRawLinks,
     linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
   });
-  const shell = createShell({
-    platform: {
-      sodium: opts.sodium ?? sodium,
-      identity,
-      modules: new ModuleTable(),
-      freshnessStore: new FreshnessMarks(),
-      networkKey: opts.networkKey,
-      transportHost: driver,
-      createRealm: async (o) => createSafeRealm(o),
-    },
+  // A DRIVER INSTANCE, so bootShell wires it and composes the pin but neither loads the
+  // transport bundle nor starts the listeners — this harness owns both, because a test
+  // wants the load observable (and sometimes refused). `transportBundle` is still stated:
+  // it is what the pin is derived from, so the blob loaded below and the blob the pin
+  // admits are one fact rather than two that can drift.
+  const blob = opts.transportBlob ?? transportBlob;
+  const shell = await bootShell({
+    sodium: opts.sodium ?? sodium,
+    identity,
+    modules: new ModuleTable(),
+    freshnessStore: new FreshnessMarks(),
+    // No disk: nothing here declares `fs`, and the in-memory default would be a backend
+    // these tests never meant to hand out.
+    fs: false,
+    networkKey: opts.networkKey,
+    transport: driver,
+    transportBundle: blob,
+    createRealm: async (o) => createSafeRealm(o),
     admit: policy,
     claims: opts.claims,
-  });
-  await shell.loadBundleBlob(opts.transportBlob ?? transportBlob);
+  }).then((r) => r.shell);
+  await shell.loadBundleBlob(blob);
   const node = { shell, driver, identity, appAuthor };
   if (opts.app === false) return node;
   const appKey = `${appAuthorHex}:harness`;

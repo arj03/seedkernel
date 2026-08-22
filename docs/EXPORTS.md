@@ -21,7 +21,7 @@ The module also carries the lower-level primitives that pair is built from. They
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
 | `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`policyFromJson`, `admitAll`, `authorAllowlist`, `allOf`, …) are re-exported here too, so your `admit` comes from the same module | seedchat `browser/chat-shell.js` (a consent gate, an adapter instance it owns), seedstore `WASM/host/storage-node.ts` (a whole node wrapped as a class) |
-| `./shell` | The Node platform already assembled: `boot`/`bootRuntime` wire `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell` for you. A client that owns its own platform wiring skips this and calls `bootShell` | seedstore `WASM/tests/shell-run.test.mjs` |
+| `./shell` | The Node platform already assembled: `bootRuntime` wires `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell` for you, and hands back the shell and the channel adapter. A client that owns its own platform wiring skips this and calls `bootShell` | seedstore `WASM/tests/shell-run.test.mjs` |
 | `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. `bootShell` defaults to it; import it when you want to pass it explicitly, or to hash or inspect it | seedchat `browser/chat-shell.js` |
 | `./transport-host` | The `TransportHost` class — construct it yourself when you own the adapter's lifecycle (a browser edge that loads lazily and re-loads to change its room secret); otherwise pass `bootShell` an options object and let it build one | seedchat `browser/chat-shell.js` |
 | `./guest-seam` | `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | seedstore `WASM/host/manifest.ts` (the mirror) |
@@ -57,11 +57,12 @@ Two things it does *for* you, which is why you should not try to reproduce them:
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
-## Two reaches that are not exports
+The handle's `invoke` is bound to the slot this load stood, while `Shell.invoke(op, payload, appKey)` re-resolves the key. The difference shows up on an upgrade: a replacement load stands a NEW slot under the same key, so a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. Drive an app you just loaded through its handle; hold the key and call `Shell.invoke` when you mean whatever is installed under that identity now. The key is always stated — a node hosts unrelated apps, so there is no "the only loaded app" to default to.
 
-Both are real, both are used by both clients, and neither can be an entry point — so `files` is what keeps them working: `build`, `build-min`, `browser`, `quickjs/dist`, `assembly/seedkernel`, `guest-handler.ts`, `native/host-shell.gen.js`.
+## One reach that is not an export
 
-- `seedkernel-wasm/guest-handler` — the guest half of the module ABI (§4), imported by an AssemblyScript app (seedchat `assembly/chat-app-v2/index.ts`). asc (0.28) resolves a bare specifier by joining the subpath and ignores `exports` entirely, so an entry point cannot serve it; the root-level `guest-handler.ts` shim, shipped under `files`, is what does. There is deliberately no `./guest-handler` export — it would change nothing for asc and would hand a JS consumer `i32`-typed source it cannot parse.
+It is real and both clients use it, and it cannot be an entry point — so `files` is what keeps it working: `build`, `build-min`, `browser`, `quickjs/dist`, `native/host-shell.gen.js`.
+
 - `seedkernel-wasm/build-min/**` — the minified browser host, vendored into a web root by both clients (seedstore `WASM/scripts/build-browser-demo.mjs`, seedchat `scripts/vendor.mjs`). This is a dependency on *output*: `build-min` is gitignored, so a checkout of this repo that has never run `npm run build:host:min` stages nothing.
 
 ## Two traps a browser client hits

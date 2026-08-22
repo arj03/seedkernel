@@ -21,7 +21,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 
 const { loadCrypto, generateKeyPair } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
-const { createShell } = await imp("build/host/shell-core.js");
+const { bootShell } = await imp("build/host/shell-core.js");
 const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
@@ -107,18 +107,22 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   // it. At that point `link/config` has been read but the incumbent still owns `_net`,
   // which exposes address-book updates in the replacement window deterministically.
   const realmControl = { pauseNext: null };
-  const shell = createShell({
-    platform: {
-      sodium, identity,
-      modules: new ModuleTable(),
-      freshnessStore,
-      transportHost: transport,
-      createRealm: async (o) => {
-        const realm = await createSafeRealm(o);
-        const pause = realmControl.pauseNext;
-        if (pause) { realmControl.pauseNext = null; await pause(); }
-        return realm;
-      },
+  // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
+  // but leaves the load to this test — which is the thing under test here, upgrades
+  // included. Every candidate below is signed by the shipped blob's own author, so the
+  // pin admits them and what each load exercises is the freshness rule, not the pin.
+  const { shell } = await bootShell({
+    sodium, identity,
+    modules: new ModuleTable(),
+    freshnessStore,
+    fs: false,
+    transport,
+    transportBundle: transportBlob,
+    createRealm: async (o) => {
+      const realm = await createSafeRealm(o);
+      const pause = realmControl.pauseNext;
+      if (pause) { realmControl.pauseNext = null; await pause(); }
+      return realm;
     },
     admit: policy,
   });
