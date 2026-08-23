@@ -4,10 +4,8 @@
 
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
-// A link message arrives in arbitrarily small slices, and either naive parser has a
-// failure mode a frame-size cap does not control: joining every slice onto one buffer
-// Inbound reassembly: merge slices below MERGE_BELOW into a doubling buffer so a
-// dribbled frame is linear in copies, not quadratic (§12.6.2).
+// A link message arrives in arbitrarily small slices. Merge slices below MERGE_BELOW
+// into a doubling buffer, so a dribbled frame costs linear copies, not quadratic.
 const MERGE_BELOW = 8 * 1024;
 
 class ByteParts {
@@ -20,8 +18,8 @@ class ByteParts {
   push(chunk) {
     if (chunk.length === 0) return;
     this.length += chunk.length;
-    // A slice big enough to carry its own overhead is kept as it arrived, and ends the
-    // current accumulator: no copy at all on the path that matters.
+    // A slice big enough to carry its own overhead is kept as it arrived and ends the
+    // accumulator: no copy on the path that matters.
     if (chunk.length >= MERGE_BELOW) { this.parts.push(chunk); this.tail = -1; return; }
     if (this.tail < 0) {
       const buf = new Uint8Array(MERGE_BELOW);
@@ -66,11 +64,10 @@ class ByteParts {
       else { out.set(p.subarray(0, need), off); this.parts[this.head] = p.subarray(need); off = n; }
     }
     this.length -= n;
-    // The accumulator stops accumulating the moment it is consumed from: its start has
-    // moved, so the capacity behind it is no longer ours to append into.
+    // The accumulator stops accumulating once its start is consumed from: the capacity
+    // behind it is no longer ours to append into.
     if (this.tail >= 0 && this.tail <= this.head) this.tail = -1;
-    // Drop the consumed slices once they outnumber the live ones — a long exchange must
-    // not grow the array without bound.
+    // Drop the consumed slices once they outnumber the live ones.
     if (this.head >= 8 && this.head * 2 >= this.parts.length) {
       this.parts = this.parts.slice(this.head);
       if (this.tail >= 0) this.tail -= this.head;
@@ -128,12 +125,9 @@ class LengthFramer {
 // ── RFC 6455, for the browser edge ────────────────────────────────────────────
 //
 // WebSocket exists here only because browsers cannot open raw TCP: an HTTP upgrade,
-// then length-delimited frames with a masking rule that depends on which end you are.
-// Both ends run this one class, differing in who speaks first and in whether frames
-// are masked (client→server must be, server→client must not).
-//
-// Every byte transform — encode, single-frame decode, the SHA-1 + base64 accept value
-// — runs in `ws.wasm`, a module of this bundle reached by logical name.
+// then length-delimited frames, masked client→server and not server→client. Both ends
+// run this one class. Every byte transform — encode, single-frame decode, the SHA-1 +
+// base64 accept value — runs in `ws.wasm`, a module of this bundle.
 const WS_OP_ENCODE = 1, WS_OP_DECODE_ONE = 2, WS_OP_ACCEPT = 3, WS_OP_BASE64 = 4;
 const WS_OP_CONT = 0x0, WS_OP_BINARY = 0x2, WS_OP_CLOSE = 0x8, WS_OP_PING = 0x9, WS_OP_PONG = 0xa;
 /** RFC 6455 status 1000 (normal closure), big-endian, as a close-frame payload. */
@@ -142,9 +136,8 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
 /** Run this bundle's own ws.wasm — an ordinary `host.call`. An empty answer is the
- *  module's failure signal (§4). A module call is async (the module runs in its own
- *  worker on the JS targets); `Promise.resolve` normalizes a host whose module calls
- *  are still synchronous. */
+ *  module's failure signal (§4). Module calls are async on the JS targets (the module
+ *  runs in its own worker); `Promise.resolve` normalizes a sync host. */
 function wsCall(req) {
   return Promise.resolve(host.call(N_WS, req)).then((out) => {
     if (!out || out.length === 0) throw new Error("ws: module error");
@@ -169,18 +162,15 @@ class WsFramer {
     // call can never let a later frame overtake an earlier one — the record layer
     // above relies on the byte order.
     this.writes = Promise.resolve();
-    // Inbound order, for the same reason: push() awaits module calls, and the host hands
-    // over a chunk per socket read without waiting for the previous one to be parsed. The
-    // record layer above counts nonces, so a message delivered out of order is a decrypt
-    // failure and a dead link.
+    // Inbound order, for the same reason: the record layer counts nonces, so a message
+    // delivered out of order is a decrypt failure and a dead link.
     this.reads = Promise.resolve();
     if (this.client) {
-      // The upgrade head needs two module calls (the base64 of the key, then the accept
-      // it derives), so it is computed on a later turn, ahead of anything queued behind
-      // it. `prepared` is what upgrade() awaits before reading the reply, and it rejects
-      // there if the module could not produce a key: a client that never wrote its GET
-      // must abort rather than wait out the idle clock. The bare catch below only keeps a
-      // link torn down before anyone awaits it from reporting an unhandled rejection.
+      // The upgrade head needs two module calls, so it is computed on a later turn,
+      // ahead of anything queued behind it. `prepared` is what upgrade() awaits; it
+      // rejects there if the module could not produce a key — a client that never wrote
+      // its GET must abort rather than wait out the idle clock. The bare catch only keeps
+      // a link torn down before anyone awaits it from reporting an unhandled rejection.
       this.prepared = (async () => {
         const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
         this.key = utf8Decode(r);
@@ -219,29 +209,27 @@ class WsFramer {
   }
 
   send(msg) {
-    // The transport emits its HELLO the moment the link exists — before the upgrade
-    // has finished — so frames queue until the channel opens.
+    // The transport emits its HELLO before the upgrade finishes, so frames queue until
+    // the channel opens.
     if (!this.open) { this.queue.push(msg); return; }
     this.enqueue(WS_OP_BINARY, msg);
   }
 
-  /** The close frame rides the same byte stream as the end-of-stream record just
-   *  written, so it cannot overtake it — which is the ordering that record depends on. */
+  /** The close frame rides the same byte stream after the end-of-stream record just
+   *  written, so it cannot overtake it — the ordering that record depends on. */
   goodbye() {
     if (this.open) this.enqueue(WS_OP_CLOSE, WS_CLOSE_NORMAL);
   }
 
-  /** Wait for every pending write. close() uses this so the EOS record and the close
-   *  frame land on the wire before the host channel closes. */
+  /** Wait for every pending write; used so the EOS record and the close frame land on
+   *  the wire before the host channel closes. */
   flush() { return this.writes; }
 
   /** One chunk in, in arrival order. The parse itself is `read` below; this is the chain
-   *  that keeps two of them from running at once, which matters twice over: `frames()`
-   *  takes a frame before awaiting its decode, so a second parser would read the frame
-   *  after it, and `raiseCap()` lands only when msg4 is delivered, so a second parser
-   *  would measure a frame riding the same segment against the pre-auth cap and refuse a
-   *  legitimate link. A chunk arriving after a refusal is still parsed — `closed` gates
-   *  what a late delivery could reach. */
+   *  that keeps two parses from running at once, which matters twice: `frames()` takes a
+   *  frame before awaiting its decode, so a second parser would read the frame after it;
+   *  and `raiseCap()` lands only when msg4 is delivered, so a second parser would measure
+   *  a frame riding the same segment against the pre-auth cap. */
   push(chunk, deliver) {
     const done = this.reads.then(() => this.read(chunk, deliver));
     this.reads = done.catch(() => {});
@@ -270,8 +258,8 @@ class WsFramer {
     if (sep < 0) return -1;
     const head = utf8Decode(this.parts.peek(sep));
     if (this.client) {
-      // Sec-WebSocket-Accept is base64 and case-significant, so compare the exact
-      // header value byte for byte rather than lowercasing both sides.
+      // Sec-WebSocket-Accept is base64 and case-significant — compare it byte for byte
+      // rather than lowercasing both sides.
       if (!/HTTP\/1\.1 101/.test(head) || headerValue(head, "sec-websocket-accept") !== this.expectAccept) {
         throw new Error("ws: upgrade refused");
       }

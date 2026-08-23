@@ -1,5 +1,4 @@
 // Transport bundle guest: AKE, record layer, link router, request/response (§12.6).
-// Reached only through link/*; reaches no authority but link/*.
 
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
@@ -25,16 +24,13 @@ const P_SEAL = "crypto/chacha20poly1305-ietf/seal";
 const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
 
-// The X25519 base point: `crypto/x25519/dh(sk, BASEPOINT)` is the public-key
-// derivation, so the catalog needs no keygen entry (and stays purely functional) while
-// the ephemeral secret comes from node/random.
+// The X25519 base point: `dh(sk, BASEPOINT)` IS the public-key derivation, so the
+// catalog needs no keygen entry while the secret comes from node/random.
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-// Kinds of link, as the host's `linkOpen` declares them: 0 = the routing core's own
-// (an accepted socket; dial/accept bookkeeping and the half-open limiter apply);
-// 1 = a host-managed transport (WebRTC / browser WS) that opened the socket itself and
-// handed it over. A core link we DIALED never arrives this way.
+// Link kinds as the host's `linkOpen` declares them: 0 = an accepted socket (half-open
+// limiter applies), 1 = a host-managed transport that opened the socket itself.
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
@@ -61,26 +57,14 @@ const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 
 // The one suite this transport speaks, and the bundle's own number: a channel suite is
 // read by the AKE, which is entirely this program, so it lives here rather than in the
-// host's core (§14.1 — the manifest suite is the host's for the opposite reason, the
-// loader reads it before anything is trusted).
-//
-// A suite byte is not negotiated: it makes the wire self-describing, and because it
+// host's core (§14.1). Not negotiated: it makes the wire self-describing, and because it
 // sits inside every signed transcript half, an in-path attacker who flips it only makes
-// the two ends sign different bytes (§12.6, §14.1).
-//
-// `0x03` moved the channel's format tag out of the host's signing prefix and into the
-// identity payload this program assembles (`channelIdentityMessage`), which changes what
-// both ends sign. It is a new byte for the reason every suite change is: a node that
-// speaks the old preimage must fail at msg1, by a suite it does not know, rather than
-// authenticate its way to a signature mismatch it cannot explain. 0x02 was removed, not
-// disabled — a node accepting both would take the concealment of the weaker one.
+// the two ends sign different bytes (§12.6).
 const SUITE_BYTE = new Uint8Array([SUITE_CHANNEL_CONCEALED]);
 
 const ZERO_NPUB = new Uint8Array(NPUB_LEN);
 
-// Directional session-key labels and the ratchet label — same family discipline as
-// every domain prefix: distinct, versioned, trailing NUL so no member is a prefix of
-// another. This bundle's wire contract, never seen by the host.
+// Directional session-key labels and the ratchet label — distinct, versioned, trailing NUL.
 const LABEL_REKEY = utf8Encode("seedkernel-session-rekey-v1\0");
 const LABEL_PROBE = utf8Encode("seedkernel-c-probe-v1\0");
 const LABEL_M2 = utf8Encode("seedkernel-c-msg2-v1\0");
@@ -89,15 +73,12 @@ const LABEL_M4 = utf8Encode("seedkernel-c-msg4-v1\0");
 const LABEL_I2R = utf8Encode("seedkernel-session-i->r-v1\0");
 const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 
-// This channel format tag seeds the session root AND prefixes every identity-signature
-// payload below. It is transport CONTENT, not a kernel signing domain — which is what lets
-// this program change its handshake format in a bundle update: the host contributes only
-// the opaque scope it chose for this slot (`DOMAIN_link_scope ‖ networkKey` — what THIS
-// slot's `node/sign` signs under) and reads nothing inside.
+// This channel format tag seeds the session root and prefixes every identity-signature
+// payload. Transport CONTENT, not a kernel signing domain — which is how a bundle update
+// changes the handshake format: the host supplies only the opaque scope. (§12.6.2b)
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
-// Per-suite wire lengths. A later suite changes these and the byte it is keyed by; the
-// host never reads them.
+// Per-suite policy constants, keyed by the suite byte; the host never reads them.
 const REKEY_AFTER_FRAMES = 1 << 24;  // frames per direction before the key ratchets
 const REJECT_AFTER_EPOCHS = 1 << 16; // ratchets per direction before the link retires
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -141,33 +122,28 @@ function scalarmult(sk, pk) {
   const out = new Uint8Array(64);
   out.set(sk, 0); out.set(pk, 32);
   const r = host.call(P_DH, out);
-  // The argument buffer held a COPY of the private scalar. Erasing the key on the
-  // link (Link.clearEphemeral) is worth nothing if the call that used it leaves a
-  // second copy on the heap for a memory-image attacker to find.
+  // The buffer held a COPY of the private scalar; zero it, or the call leaves a second
+  // copy on the heap for a memory-image attacker to find.
   out.fill(0);
   return r[0] === 1 ? { ok: true, x: r.subarray(1) } : { ok: false, x: null };
 }
-/** An ephemeral X25519 pair: entropy from the host (an authority), the public half
- *  derived with the same DH primitive against the base point (a pure transform). */
+/** An ephemeral X25519 pair: entropy from the host, the public half through the DH
+ *  primitive against the base point. */
 function boxKeypair() {
   const sk = randomBytes(32);
   const r = scalarmult(sk, X25519_BASEPOINT);
   if (!r.ok) throw new Error("transport: ephemeral keygen failed");
   return { publicKey: r.x, privateKey: sk };
 }
-/** Assemble the channel's tagged identity-signature format. The host treats this whole
- *  value as an opaque suffix, while still prefixing the scope it chose for this slot. */
+/** The channel's tagged identity-signature format — the host's slot scope, prefixed by
+ *  the HOST, wraps this whole value as an opaque suffix. */
 function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
-/** Ask the host to sign a tagged handshake transcript, under `DOMAIN_link_scope ‖
- *  networkKey` (the scope the HOST chose for this slot — what this name signs under) with
- *  the node's channel key, which never enters this program.
- *
- *  `node/sign` THROWS when the bundle does not reach the authority (guest-seam.ts), so
- *  the `{ok}` shape is a real status: catching here lets the caller abort the link
- *  rather than unwind out of a frame-delivery callback and leave the socket open until
- *  it times out. Same idiom as `scalarmult` and `openZero`. */
+/** Ask the host to sign under `DOMAIN_link_scope ‖ networkKey` with the node's channel
+ *  key, which never enters this program. `node/sign` THROWS when the authority is not
+ *  reached, so the `{ok}` shape is a real status: catching here lets the caller abort the
+ *  link rather than unwind out of a frame-delivery callback. */
 function channelSign(root, th, id) {
   try {
     return { ok: true, sig: host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
@@ -178,16 +154,10 @@ function channelSign(root, th, id) {
 
 // ── calling out: the ops, each one argument-encoded and issued immediately ────
 //
-// There is no action buffer and no batch — accumulating orders into a response the host
-// decodes afterwards would be a second host↔module ABI. Every call below is an ordinary
-// `host.call` through the one seam (§12.2).
-//
-// The arrangement rests on the host's rule that NO OP RE-ENTERS THIS REALM, so nothing
-// below can call back into a frame still on the stack. The corollary, and why this
-// program never uses `await`: an answer arriving through this realm cannot be awaited
-// from inside it, since the invocation carrying it would queue behind the frame doing
-// the awaiting (realm-queue.ts). So an inbound request is dispatched with `.then`, and
-// an app's send is answered with `defer()`.
+// No action buffer and no batch — accumulating orders would be a second host↔module ABI.
+// The arrangement rests on the host's rule that no op re-enters this realm, so nothing
+// below can call back into a frame still on the stack. Hence no `await`: an inbound
+// request is dispatched with `.then`, and an app's send is answered with `defer()`.
 
 /** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
 function netLinkOpen(destBytes) {
@@ -206,25 +176,17 @@ function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId],
  *  stall clock to the deadline alone. */
 function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** A link the HOST handed us (openLink) authenticated, or tore down. Relayed so whoever
- *  passed the channel in learns its fate; a core link the guest dialed or accepted is
- *  nobody's business but ours. */
+/** A link the HOST handed us (openLink) changed state — relayed so whoever passed the
+ *  channel in learns its fate. A core link's fate is ours alone. */
 function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
 function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
 /** One linkBytes invocation's delivery return: `[count u32]` then that many records
  *  from the request/response layer (`ReqRes.onFrame`), each one
  *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`,
- *  or null when this frame decoded to nothing deliverable. The host reads the frame,
- *  routes each record through its claim table, and answers this realm with a `linkResp`
- *  event — delivery is this slot's return convention, not a second capability (there is
- *  one link occupant, and it is the one that saw the plaintext).
- *
- *  Several records is the ordinary case, not an edge one: a single socket read carries
- *  whatever the peer pipelined into it, and the framer delivers every whole message in
- *  the chunk before this return is built. Every field a record holds is therefore
- *  length-prefixed — the payload too — so record boundaries never depend on where the
- *  frame ends. */
+ *  or null when this frame decoded to nothing deliverable — a host reads any non-empty
+ *  return as a frame, so the empty case is a real signal. Several records is the
+ *  ordinary case, which is why every field is length-prefixed. */
 function packDeliveries(records) {
   if (!records || records.length === 0) return null;
   const head = new Uint8Array(4);
@@ -243,9 +205,8 @@ function admits(peerBytes) {
 // ── timers ────────────────────────────────────────────────────────────────────
 
 // `timer/arm` is the host's table and the host's cap (DEFAULT_MAX_LIVE_TIMERS), so a
-// realm that has spent it gets a THROW here rather than a return code. The entry is
-// dropped again before the throw escapes: a caller that retries must not accumulate
-// callbacks for deadlines the host never armed and will never fire back.
+// realm that has spent it gets a THROW here. The entry is dropped before the throw
+// escapes so a retrying caller does not accumulate callbacks for an unarmed deadline.
 function armTimer(ms, fn) {
   const id = nextTimerId++;
   timers.set(id, fn);
@@ -267,15 +228,14 @@ function fireTimer(id) {
 
 // ── the link ─────────────────────────────────────────────────────────────────
 
-// One host-managed channel, addressed by the HOST-SUPPLIED link id. All session state
+// One host-managed channel, addressed by the host-supplied link id. All session state
 // lives in this heap, keyed by that id.
 
 class Link {
   constructor(spec) {
     this.linkId = spec.linkId;
-    // How this link is framed. PLATFORM means the transport under us already has
-    // message boundaries (a browser WebSocket, an RTCDataChannel) and the host still
-    // owns its cap; anything else is a byte duplex we frame ourselves.
+    // PLATFORM means the transport under us already has message boundaries (a browser
+    // WebSocket, an RTCDataChannel); anything else is a byte duplex we frame ourselves.
     this.framer = makeFramer(spec.framing, spec.linkId, spec.weDialed, spec.authority);
     this.weDialed = spec.weDialed;
     this.expectPeerId = spec.expectPeerId;   // 32B or null
@@ -285,10 +245,8 @@ class Link {
     this.onClose = spec.onClose;
     this.handshakeTimeoutMs = spec.handshakeTimeoutMs;
     this.rekeyAfter = spec.rekeyAfterFrames || REKEY_AFTER_FRAMES;
-    // The secret this link opens under: THE PEER's on a dial (carried by the address),
-    // OURS on an accept — the host delivers the current one per link at open, so the gate
-    // changes with the node's secret and not with a re-install (§12.6.3). The init-time
-    // node facts are the fallback; an empty field means open (zero secret).
+    // The secret this link opens under: THE PEER's on a dial, OURS on an accept — carried
+    // per link at open, so the gate tracks the node's secret (§12.6.3).
     this.contactSecret = spec.linkSecret || contactSecret;
     this.root = hash(DOMAIN_CHANNEL, spec.networkKey || networkKey);
 
@@ -308,7 +266,7 @@ class Link {
     this.slot = null;
     this.deadline = null;
     this.idle = null;         // the post-auth idle clock (armIdle)
-    this.sawTraffic = false;  // ...and whether anything crossed since it last ticked
+    this.sawTraffic = false;  // whether anything crossed since it last ticked
     this.sendKey = null;
     this.recvKey = null;
     this.sendEpoch = 0;
@@ -318,9 +276,8 @@ class Link {
     this.th = null;
     this.ee = null;
 
-    // Half-open slot BEFORE any key material — the cap's point is that a refused
-    // connection costs a map lookup, not a keypair. Teardown of an over-budget link is
-    // deferred so the constructor never notifies synchronously (see deferTeardown).
+    // Half-open slot BEFORE any key material — a refused connection costs a map lookup,
+    // not a keypair. Teardown of an over-budget link is deferred (see deferTeardown).
     if (spec.limiter) {
       this.slot = spec.limiter.acquire(this.source, () => this.abort());
       if (!this.slot) {
@@ -329,16 +286,12 @@ class Link {
       }
     }
 
-    // Only a dialer speaks unprompted; an accepting link says nothing until a msg1
-    // opens under the contact secret, and a responder generates no key material before
-    // that proof (§12.6.2).
+    // Only a dialer speaks unprompted; an accepting link says nothing until a msg1 opens
+    // under the contact secret (§12.6.2).
     //
-    // Everything from here on can THROW: `armDeadline` crosses to the host, and
-    // `timer/arm` refuses once the realm's live-timer table is full — a cap a
-    // CO-RESIDENT app can reach on its own. A throw escaping the constructor would leave
-    // the slot acquired and the host channel open with no Link built to close either, so
-    // an app sitting on the timer cap would make every inbound connection a permanent
-    // leak. Hence the same deferred teardown the refused slot takes.
+    // Everything from here on can THROW (`timer/arm`'s cap is a co-resident app's to
+    // spend), so a throw escaping the constructor would leak the slot and the host
+    // channel. Hence the same deferred teardown the refused slot takes.
     try {
       if (this.weDialed) {
         this.ensureKeys();
@@ -348,10 +301,8 @@ class Link {
         this.armDeadline(this.handshakeTimeoutMs || UNVERIFIED_TIMEOUT_MS);
       }
     } catch {
-      // The slot first and on its own: it is the resource with a hard cap and releasing
-      // it touches nothing outside this module, whereas the rest of the tidying crosses
-      // to the host again and so may fail again. A failure to tidy must not cost the
-      // slot, nor the close and notify below.
+      // The slot first and on its own: it is the resource with a hard cap, and releasing
+      // it touches nothing outside this module; a failure to tidy must not cost the slot.
       this.releaseSlot();
       try { this.teardown(); } catch { /* the host has evidently lost the timer anyway */ }
       this.deferTeardown();
@@ -359,9 +310,8 @@ class Link {
   }
 
   /** Close the host channel and notify, but AFTER the current event: the caller's
-   *  bookkeeping (core.openLink's pools, entry("openLink")'s `openLinks`) runs once the
-   *  constructor returns, so a synchronous onClose would undo what it has not yet
-   *  done. */
+   *  bookkeeping (core.openLink's pools, entry "openLink"'s `openLinks`) runs once the
+   *  constructor returns. */
   deferTeardown() {
     this.closed = true;
     this.closedLocally = true;
@@ -389,13 +339,12 @@ class Link {
   }
 
   /** The post-auth idle clock, which the handshake deadline hands over to: a peer that
-   *  opens links and then goes quiet is the cheapest way to spend our budget of sockets,
-   *  slots and sessions. Retired with the authenticated goodbye, since that is a
-   *  deliberate shutdown and the address book redials on the next send.
+   *  opens links and goes quiet is the cheapest way to spend our budget of sockets and
+   *  slots. Retired with the authenticated goodbye.
    *
-   *  Two ticks rather than a timestamp, because a zero-authority realm has no clock —
-   *  "idle" is "a whole window passed with nothing seen", so the effective window is
-   *  between one and two `linkIdleTimeoutMs`. */
+   *  Two ticks rather than a timestamp: a zero-authority realm has no clock, so "idle"
+   *  is "a whole window passed with nothing seen" — the effective window is one to two
+   *  `linkIdleTimeoutMs`. */
   armIdle() {
     if (linkIdleTimeoutMs <= 0) return;
     this.sawTraffic = false;
@@ -415,8 +364,7 @@ class Link {
   send(frame) {
     if (this.closed) return;
     // Refuse a frame that would seal to an over-cap wire record: the receiver would
-    // reject it on its length prefix and tear the link down. The cap is the host's,
-    // learned at INIT.
+    // reject it on the length prefix and tear the link down. The cap is the host's.
     if (frame.length > maxFrameBytes - TAG_LEN) return;
     // An empty record is the authenticated end-of-stream marker, never app data.
     if (frame.length === 0) return;
@@ -442,15 +390,14 @@ class Link {
       try {
         this.wire(this.seal(new Uint8Array(0)));
         // A codec with its own end-of-stream signal says it too, on the same byte
-        // stream and after our record, so the peer reads one clean shutdown.
+        // stream after our record, so the peer reads one clean shutdown.
         if (this.framer && this.framer.goodbye) this.framer.goodbye();
         saidGoodbye = true;
       } catch { /* the channel is already gone */ }
     }
     this.teardown();
-    // The goodbye records above are QUEUED, not yet on the wire — the module calls
-    // framing them answer on a later turn. Closing only once the framer's last write has
-    // landed is what makes the peer read a clean shutdown rather than a truncation.
+    // The goodbye record is QUEUED, not yet on the wire; only closing once the framer's
+    // last write has landed lets the peer read a clean shutdown, not a truncation.
     const flushed = (this.framer && this.framer.flush ? this.framer.flush() : Promise.resolve()).catch(() => {});
     void flushed.then(() => {
       try { netLinkClose(this.linkId, saidGoodbye); } catch { /* already gone */ }
@@ -458,9 +405,8 @@ class Link {
     });
   }
 
-  // Every failure path uses abort(), never close(): only close() emits the
-  // authenticated end-of-stream record, so "the peer said goodbye" always means "the
-  // peer chose to stop".
+  // Every failure path uses abort(), never close(): only close() emits the authenticated
+  // end-of-stream record, so "the peer said goodbye" means "the peer chose to stop".
   abort(defensive) {
     if (this.closed) return;
     this.closed = true;
@@ -491,16 +437,13 @@ class Link {
 
   /** Inbound bytes. Over-cap is a defensive abort. Framed push is async; delivery
    *  order rides the framer's one-chunk-at-a-time read chain. Returns the delivery
-   *  frame this input produced — the count-prefixed record list, or null when none — so
-   *  the host's `linkBytes` invocation carries the return right back out of this realm.
-   *  The framer's push may complete on a later turn (a framed link whose codec runs in
-   *  a module); the promise is still the same return, resolved when the parse is. */
+   *  frame this input produced — the count-prefixed record list, or null when none. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
-      // boundaries already on it, so there is no reassembly buffer of ours to bound —
-      // but the two-stage cap is about how much a peer may make us HOLD, not about who
-      // framed it. Without this, one huge message takes the realm down.
+      // boundaries already on it — but the two-stage cap is about how much a peer may
+      // make us HOLD, not about who framed it. Without this, one huge message takes the
+      // realm down.
       if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return null; }
       const d = this.onMessage(bytes);
       return d ? packDeliveries([d]) : null;
@@ -509,9 +452,8 @@ class Link {
     const deliver = (m) => { const d = this.onMessage(m); if (d) out.push(d); };
     try {
       const ok = this.framer.push(bytes, deliver);
-      // The promise resolves on a later turn; it must ALWAYS yield bytes (never null),
-      // because the preamble normalizes whatever the handle returns — the empty case is
-      // "nothing deliverable", and the host reads any non-empty return as a frame.
+      // The promise must ALWAYS yield bytes (never null): the empty case is "nothing
+      // deliverable", and the host reads any non-empty return as a frame.
       return Promise.resolve(ok).then(
         (good) => { if (!good) this.abort(true); return packDeliveries(out) ?? new Uint8Array(0); },
         () => { this.abort(true); return new Uint8Array(0); },
@@ -522,11 +464,11 @@ class Link {
     }
   }
 
-  /** Route one whole link message. A message is a bare body, and which one it is follows
-   *  from our role and how far the exchange has got — so the sender chooses nothing:
-   *  every message has exactly one destination, the handler checks its exact width, and a
-   *  post-auth body goes to the AEAD, which fails closed. Returns the delivery frame a
-   *  request produced, or null for everything the handshake itself answers. */
+  /** Route one whole link message. A message is a bare body — the sender chooses
+   *  nothing: which one it is follows from our role and how far the exchange got, each
+   *  handler checks its exact width, and a post-auth body goes to the AEAD, which fails
+   *  closed (see §12.6). Returns the delivery frame a request produced, or null for
+   *  everything the handshake itself answers. */
   onMessage(m) {
     if (this.closed) return null;
     if (this.authed) return this.onRecord(m);
@@ -542,15 +484,12 @@ class Link {
   becomeAuthed() {
     this.authed = true;
     // The slot is NOT released — it moves to the authed tier and is held until the link
-    // dies. Released, the budget would bound only how many peers are GETTING IN at once:
-    // past the door anyone able to complete a handshake could open links without limit,
-    // each with its own framer, keys, timers and buffers.
+    // dies, so the budget bounds how many peers may be IN rather than how many got in.
     if (this.slot && !this.slot.limiter.hold(this.slot)) { this.abort(); return; }
     this.clearDeadline();
     this.armIdle();
-    // A known, admitted identity may send full-size frames; a stranger may not. A
-    // platform-framed link has no framer to raise — for it, `authed` (set above) is what
-    // raises the cap, in onWire.
+    // A known, admitted identity may send full-size frames; a platform-framed link has
+    // no framer to raise — for it, `authed` is what raises the cap, in onWire.
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
@@ -559,7 +498,7 @@ class Link {
     this.queuedBytes = 0;
   }
 
-  // ── the concealed-identity handshake (suite 0x02, §12.6.2) ──────────────────
+  // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
 
   // BLAKE2b-256 over the concatenation — the one system hash.
   h() {
@@ -591,12 +530,11 @@ class Link {
 
   signIdentity(th) {
     // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
-    // it and prefixes this slot's network scope, `DOMAIN_link_scope ‖ networkKey` —
-    // which is why the network binding survives a transport that lies about its own root.
+    // it and prefixes this slot's network scope — which is why the network binding
+    // survives a transport that lies about its own root.
     const r = channelSign(this.root, th, ownPk);
-    // The seam refused: no `node/sign` grant. Our own misconfiguration, never anything
-    // the peer did, so it aborts — a stall would claim this address went quiet, which is
-    // a different fact.
+    // The seam refused: our own misconfiguration, never the peer's doing, so it aborts —
+    // a stall would claim this address went quiet, which is a different fact.
     if (!r.ok) { this.abort(); return null; }
     return { id: ownPk, sig: r.sig };
   }
@@ -607,9 +545,9 @@ class Link {
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
-    // node/verify applies the same host-owned scope this node signs under, so the preimage
-    // the two ends must agree on is the host's for its prefix half. The channel's format
-    // tag is ours, so the two ends reconstruct that half here.
+    // node/verify applies the same host-owned scope this node signs under, so the
+    // preimage the two ends must agree on is the host's for its prefix half. The channel
+    // format tag is ours, so the two ends reconstruct that half here.
     if (!verify(id, sig, channelIdentityMessage(this.root, th, id))) return null;
     if (bytesCompare(id, ownPk) === 0) return null; // our own traffic reflected
     return id;
@@ -670,9 +608,7 @@ class Link {
     const peerId = toHex(idI);
     // The peer lint runs HERE: after decryption and signature, never on a claimed key,
     // and before msg4 puts our identity on the wire. A refusal is silence, so being
-    // turned away is indistinguishable from a msg3 that never arrived — the whole point
-    // of the second round trip (§12.6.2). At becomeAuthed() it would be one message
-    // too late.
+    // turned away is indistinguishable from a msg3 that never arrived (§12.6.2).
     if (!admits(idI)) { this.stall(); return; }
     this.peerPubkey = idI; this.peerId = peerId;
 
@@ -691,11 +627,11 @@ class Link {
     const idR = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M4), w4, this.th);
     if (!idR) { this.stall(); return; }
     const peerId = toHex(idR);
-    // A mismatch here is a local fault, not a probe to hide from — we already
-    // revealed ourselves at msg3 — so it aborts rather than stalls.
+    // A mismatch here is a local fault, not a probe to hide from — we already revealed
+    // ourselves at msg3 — so it aborts rather than stalls.
     if (this.expectPeerId && peerId !== toHex(this.expectPeerId)) { this.abort(); return; }
     // The peer lint, on the end that dialed. Not concealed: we named ourselves at
-    // msg3, so there is nothing left to hide from this peer and an abort is honest.
+    // msg3, so an abort here is honest rather than a probe.
     if (!admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
     this.th = this.h(this.th, w4);
@@ -708,14 +644,14 @@ class Link {
     const kR2I = this.kdf([this.ee], this.th, LABEL_R2I);
     this.sendKey = this.weDialed ? kI2R : kR2I;
     this.recvKey = this.weDialed ? kR2I : kI2R;
-    // Every input that produced the session can now only be used to RE-derive it, which
-    // is the point at which forward secrecy is either real or a claim (clearEphemeral).
+    // Every input that produced the session can now only be used to RE-derive it — the
+    // point at which forward secrecy is either real or a claim (clearEphemeral).
     this.clearEphemeral();
   }
 
   /** Zero and drop the handshake's private material (ephemeral secret, `ee`, nonce).
-   *  Called when session keys exist and again at teardown. `myEph` is dropped, not
-   *  only zeroed — `ensureKeys` would treat an all-zero secret as already generated. */
+   *  Called when session keys exist and again at teardown. `myEph` is dropped, not only
+   *  zeroed — `ensureKeys` would treat an all-zero secret as already generated. */
   clearEphemeral() {
     if (this.myEph) {
       this.myEph.privateKey.fill(0); // the secret half only — the public one was on the wire
@@ -753,8 +689,7 @@ class Link {
   // or injection either way. The one receive path that SPEAKS: concealment is owed to
   // strangers, and this peer proved who it is.
   onRecord(body) {
-    // Framed links have already been measured; this is the platform-framed one's floor,
-    // stated where the record layer can see it.
+    // Framed links were measured on arrival; this is the platform-framed link's floor.
     if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return null; }
     if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return null; }
     const r = aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);

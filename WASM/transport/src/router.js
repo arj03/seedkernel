@@ -100,8 +100,7 @@ class ReqRes {
     this.sent = new Map();      // peerId → bytes handed to its links, ever
     this.nextCorr = 1;
     // Inbound requests handed to the host, keyed `peer:corr` — the correlation the
-    // response frame echoes, plus whose request it belongs to. The answer arrives as the
-    // host's `linkResp` event and this metadata is what frames it onto the wire.
+    // response frame echoes, plus whose request it belongs to.
     this.pendingIn = new Map();
   }
 
@@ -129,20 +128,20 @@ class ReqRes {
   }
 
   /** Arm one request's stall clock. `owed` is `sent` including this request's own
-   *  frame — the point at which it has finished being asked. */
+   *  frame — the point at which it has finished being asked.
+   *
+   *  The baseline is taken on the first expiry, not here: a frame handed over while the
+   *  peer is still being dialled routes through the pre-auth pool, where there is no link
+   *  to read a backlog from, so a baseline taken now would be an over-estimate no later
+   *  reading could correct. The cost is one deadline of grace to find the link. */
   armStall(corr, to, deadlineMs, owed) {
-    // The baseline is taken on the first expiry, not here: a frame handed over while the
-    // peer is still being dialled routes through the pre-auth pool, where there is no
-    // link to read a backlog from, so a baseline taken now would be `sent` with nothing
-    // subtracted — an over-estimate no later reading could beat. The cost is one deadline
-    // of grace to find the link.
     let mark = null;
     const tick = () => {
       this.timers.delete(corr);
       if (!this.pending.has(corr)) return;
       const now = this.flushed(to);
       // Still going out, and moving: we have not finished asking. Anything else —
-      // drained (the peer owes us an answer) or stuck (the wire is) — settles.
+      // drained (the peer owes us an answer) or stuck (the wire is one) — settles.
       if (now < owed && (mark === null || now > mark)) {
         mark = now;
         this.timers.set(corr, armTimer(deadlineMs, tick));
@@ -185,11 +184,10 @@ class ReqRes {
   }
 
   onFrame(from, frame) {
-    // A response is `[1][corr u32][payload]`, so an empty response is exactly five bytes
-    // — the shortest legal frame, and the one a request nobody claims answers with. A
-    // six-byte floor here would drop it and make "no app serves this protocol"
-    // indistinguishable from an unreachable peer. Six is the request branch's floor (it
-    // needs the protocol-id length at offset 5) and is checked there.
+    // A response is `[1][corr u32][payload]`, so an empty response is exactly five
+    // bytes — the shortest legal frame, and the one a request nobody claims answers
+    // with. Six, the request branch's floor, would drop it and make "no app serves
+    // this protocol" indistinguishable from an unreachable peer.
     if (frame.length < 5) return null;
     const kind = frame[0];
     const noReply = !!(kind & 0x80);
@@ -207,23 +205,17 @@ class ReqRes {
       if (frame.length < 6 + idLen) return null;
       const proto = frame.slice(6, 6 + idLen);
       const payload = frame.slice(6 + idLen);
-      // The delivery RETURN frame, not a call: the relation here is that this program
-      // returns a request its host must route — `[noReply u8][corr u32][claimLen u8]
-      // [claim][attrLen u32][attribution][payloadLen u32][payload]` — and the answer
-      // comes back as the host's own `linkResp` event on a later turn, never re-entering
-      // this realm (realm-queue). This program is the link occupant, so it is the one
-      // that saw the plaintext and so the one that attributes the request; the host
-      // prepends that attribution to the claim handler's input. The KEY the pending
-      // answer is filed under is the authenticated sender's, so a corr collision between
-      // two peers never answers one peer with the other's response. A noReply request has
-      // nothing waiting for it on the wire, so nothing is filed — the host still delivers
-      // it and answers nothing, exactly as the request asked.
+      // The delivery RETURN frame, not a call: this program returns a request its host
+      // must route — `[noReply u8][corr u32][claimLen u8][claim][attrLen u32]
+      // [attribution][payloadLen u32][payload]` — and the answer comes back as the host's
+      // own `linkResp` event on a later turn. This program is the link occupant, so it
+      // is the one that attributes the request. The pending key is the AUTHENTICATED
+      // sender's, so a corr collision between two peers can never answer one with the
+      // other's response. A noReply request files nothing.
       //
-      // EVERY variable field is length-prefixed, the payload included: one socket read can
-      // carry several whole requests, so `packDeliveries` returns several of these records
-      // in one frame. A record whose last field ran to the end of the frame would make the
-      // NEXT record's claim and attribution readable out of this one's remote-controlled
-      // payload — a peer choosing whom its own bytes are attributed to.
+      // EVERY variable field is length-prefixed, the payload included: one socket read
+      // can carry several whole requests (packDeliveries), and a record whose last field
+      // ran to the frame end would let a peer choose whom its own bytes are attributed to.
       const head = new Uint8Array(1 + 4 + 1);
       head[0] = noReply ? 1 : 0;
       writeU32BE(head, 1, corr);
@@ -262,8 +254,7 @@ class ReqRes {
   close() {
     for (const t of this.timers.values()) clearTimer(t);
     this.timers.clear();
-    // Settle rather than drop: every one of these is an app parked on a `_net` call,
-    // and a realm going away must not leave it waiting forever.
+    // Settle rather than drop: every one of these is an app parked on a `_net` call.
     for (const corr of [...this.pending.keys()]) this.finish(corr, false, EMPTY);
     this.pending.clear();
   }

@@ -88,10 +88,9 @@ function args(u32s, u8s, tail) {
 // ── inbound argument decoding ─────────────────────────────────────────────────
 
 // Each op declares its own fixed field order — u32 BE, u8, and length-prefixed blobs
-// (`[len u32 BE][bytes]`, an empty blob being length 0). There is no tag byte: the op's
-// name leads the payload (`readOp`, after the 32-byte caller id) and is the whole
-// discriminator. The host twin is transport-host.ts's `Args`; a field written and not
-// read desyncs the whole payload.
+// (`[len u32 BE][bytes]`, an empty blob being length 0). No tag byte: the op NAME leads
+// the payload (`readOp`) and is the whole discriminator. The host twin is
+// transport-host.ts's `Args`; a field written and not read desyncs the whole payload.
 function Reader(b) {
   this.b = b;
   this.off = 0;
@@ -112,11 +111,9 @@ Reader.prototype.blob = function () {
 // ── the caller prefix and the op envelope ──────────────────────────────────────
 //
 // The kernel's inbound shape is `handle([caller 32][body …])`: attribution only. What
-// this program does with the bytes after the caller is ITS format, so the helpers HERE
-// are this bundle's own spellings (the host twin, transport-host.ts, is content paired
-// with this bundle like the wire codec) — not a kernel ABI. The op is a NAME, never a
-// tag byte: collapsing many events onto one call must not smuggle in a number two sides
-// have to agree on, so an unimplemented op fails loud.
+// this program does with the bytes after the caller is ITS format, so the helpers here are
+// this bundle's own spellings (paired with transport-host.ts), not a kernel ABI. The op
+// is a NAME, never a tag byte — an unimplemented op fails loud.
 
 /** The two kinds of caller, told apart by those 32 bytes and nothing else: the HOST
  *  proper (`[0x00 × 32]`, platform events and loopbacks — a fired deadline re-enters this
@@ -136,8 +133,7 @@ function callerOf(arg) {
 }
 
 /** `[opLen u8][op ascii][args …]` — this bundle's one envelope. Malformed framing
- *  throws rather than yielding a truncated name that would then read as an
- *  unimplemented op. */
+ *  throws rather than yielding a truncated name that reads as an unimplemented op. */
 function readOp(body) {
   const n = body.length > 0 ? body[0] : -1;
   if (n < 0 || body.length < 1 + n) throw new Error("transport: malformed op envelope");
