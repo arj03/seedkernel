@@ -301,8 +301,19 @@ function findLink(linkId) {
 // ── the one entrypoint ────────────────────────────────────────────────────────
 //
 // This program is reached exactly as an app is: the manifest claims `_net` (§12.10) and
-// `handle` is invoked with `[caller 32][opLen u8][op][args]`. Two kinds of caller, told
-// apart by those 32 bytes and nothing else:
+// `handle` is invoked with `[caller 32][body …]`. Two things follow the caller:
+//
+//   a fired deadline — the HOST's own re-entry (its `TIMER_CALLER_ID`), body `[id u32]`,
+//   and no op because it is not a call at all: it is the shell's per-realm timer table
+//   re-entering the realm that armed the deadline (shell-core.ts), the same shape every
+//   guest declaring `timer/*` gets.
+//   an op — `[opLen u8][op][args]`, THIS bundle's envelope (util.js `readOp`), which is
+//   how `send`/`peers`/`ready` from an app and the host's own events land on one
+//   entrypoint. The op is a NAME, not a tag byte: collapsing many events onto one call
+//   must not smuggle in a number two sides have to agree on, so an unimplemented op
+//   fails loud. The framing is content: it belongs to this bundle and its driver.
+//
+// Two kinds of caller, told apart by those 32 bytes and nothing else:
 //
 //   the HOST   32 zero bytes (shell-core.ts) — the platform's own events: the one-time
 //              node facts (`init`), sockets opening, bytes arriving, an address, and the
@@ -312,21 +323,30 @@ function findLink(linkId) {
 //              op an app may name; anything else is refused, because the platform's
 //              events are not an app's to fake.
 //
-// The op is a NAME, not a tag byte: collapsing many entrypoints onto one call must not
-// smuggle in a number two sides have to agree on, so an unimplemented op fails loud.
-//
 // Most ops answer with `NOTHING` and do their work by calling out. Three have an answer:
 // `send` (the peer's response), `ready` (the cohort arrived) and `peers`. The first two
 // cannot be answered in the same turn, and cannot be AWAITED either — the events that
 // settle them arrive as further invocations of this realm, which would queue behind the
-// frame doing the awaiting (realm-queue.ts). They use `defer()`.
+// frame doing the awaiting (realm-queue.ts). They use `defer()` (below).
 //
-// A deferred teardown (Link's over-budget path) is flushed at the end of whichever op
+// A deferred teardown (Link's over-budget path) is flushed at the end of whichever event
 // provoked it, so a link's bookkeeping is never undone by an onClose that ran before its
 // caller finished.
 
 const NOTHING = new Uint8Array(0);
 const ZERO32 = new Uint8Array(32);
+
+// Answer on a later turn without holding the realm's queue: the events that settle the
+// answer (the peer's response, the link row's up edge) arrive as further invocations of
+// THIS realm, and awaiting inside the frame would hold the queue against the only thing
+// that could settle it. The kernel supplies the release marker (`__deferred`);
+// everything else is ours.
+const defer = () => {
+  let settle, fail;
+  const promise = new Promise((res, rej) => { settle = res; fail = rej; });
+  globalThis.__deferred = true;
+  return { promise, settle, fail };
+};
 
 const ops = Object.create(null);
 function entry(name, fn) { ops[name] = fn; }
@@ -377,28 +397,35 @@ entry("init", (r) => {
   router.onPeerDown = (peerId) => { connected.delete(peerId); };
 });
 
-register("handle", (argBytes) => {
-  // Read with the preamble's own functions (guest-seam.ts) rather than open-coded, so
-  // the envelope this program and the host share is described in one place.
-  const { fromHost, caller, body } = callerOf(argBytes);
-  const { op, args } = readOp(body);
-  const r = new Reader(args);
-  const fn = ops[op];
-  if (!fn) throw new Error("transport: no op '" + op + "'");
-  // The platform's events are the host's alone: an app that could spell `linkBytes` could
-  // inject a frame on any link.
-  // The caller id is the host's to write, so this is a real boundary and not a hint.
-  if (!APP_OPS[op] && !fromHost) throw new Error("transport: '" + op + "' is the host's, not an app's");
-  // The node facts arrive before anything else: an event with no init behind it refuses
-  // by name rather than reading a null core.
-  if (core === null && op !== "init") throw new Error("transport: node facts never arrived — '" + op + "' ran before init");
+/**
+ * The one entrypoint. The kernel's part of the argument is exactly the 32-byte caller;
+ * everything after it is this bundle's format (util.js `callerOf`/`readOp`).
+ */
+function handle(argBytes) {
+  const { fromHost, fromTimer, caller, body } = callerOf(argBytes);
   try {
+    // A fired deadline the host is delivering: `[id u32]`, never an op.
+    if (fromTimer) {
+      fireTimer(readU32BE(body, 0));
+      return NOTHING;
+    }
+    const { op, args } = readOp(body);
+    const r = new Reader(args);
+    const fn = ops[op];
+    if (!fn) throw new Error("transport: no op '" + op + "'");
+    // The platform's events are the host's alone: an app that could spell `linkBytes` could
+    // inject a frame on any link.
+    // The caller id is the host's to write, so this is a real boundary and not a hint.
+    if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
+    // The node facts arrive before anything else: an event with no init behind it refuses
+    // by name rather than reading a null core.
+    if (core === null && op !== "init") throw new Error("transport: node facts never arrived — '" + op + "' ran before init");
     return fn(r, caller) || NOTHING;
   } finally {
     const deferred = deferQueue.splice(0);
     for (const f of deferred) { try { f(); } catch { /* teardown of a gone link */ } }
   }
-});
+}
 
 /** A link the HOST opened: an accepted socket (kind CORE), or one a host-managed
  *  transport handed over (kind OPEN, either direction). A core link we dialed never
@@ -478,15 +505,8 @@ entry("linkClosed", (r) => {
   if (link) link.onChannelClosed();
 });
 
-// A fired deadline, and the ONE other entrypoint this program registers. Not an op on
-// `handle` because it is not a call: it is the shell's per-realm timer table re-entering
-// the realm that armed it (shell-core.ts), and every guest declaring `timer/*` has it.
-register("timer", (argBytes) => {
-  fireTimer(readU32BE(argBytes, 0));
-  const deferred = deferQueue.splice(0);
-  for (const f of deferred) { try { f(); } catch { /* teardown of a gone link */ } }
-  return NOTHING;
-});
+// A fired deadline is handled by `handle` itself, off the caller tag — there is no
+// second entrypoint and no second invocation shape to keep in step with ops above.
 
 /** App-facing send: deferred because the peer's response is another invocation
  *  of this realm. `deadlineMs` 0 → node default. */

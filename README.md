@@ -150,15 +150,15 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,365 LOC)**
+**Shared — compiled once, run by all three targets (2,332 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 617 |
-| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 349 |
-| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 478 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 415 |
-| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 213 |
+| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 354 |
+| Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 431 |
+| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 417 |
+| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 220 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite ids, the primitive catalog | `core/*.ts` (7 files) | 293 |
 
 **Four reasons a row is shared**, and which reason applies decides whether it could ever leave the set:
@@ -173,11 +173,11 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, PQ drivers, entry points, key derivation | 1,545 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (386) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,152 Go + 479 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (398) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 2,151 Go + 491 TS |
 
-What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,397 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
+What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,418 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
-Each target therefore runs 2,365 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
+Each target therefore runs 2,332 shared lines over roughly 1,500–2,500 of its own plumbing, and nothing on the wire is any of it. Three wasm binaries are shared the same way and for the same reason — `libsodium.wasm`, `mldsa65.wasm` (the `0x02` manifest verifier) and `mlkem768.wasm` (the catalog's KEM) — byte-identical on every target, because a verifier two nodes disagree about is a bundle one admits and the other refuses ([RUNTIME §10.2](docs/RUNTIME.md) for their sizes). The Go platform is the larger of the two only because it has no npm: it embeds its own QuickJS, owns an event loop, and drives libsodium over wazero, where the JS targets get all three for free. It is a bridge, not a second runtime — no manifest verification, no routing and no policy logic lives in Go.
 
 ## The overhead, measured
 

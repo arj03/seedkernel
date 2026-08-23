@@ -175,11 +175,15 @@ func realmString(expr string) string {
 
 // The stub guest every test bundle that does not exercise the guest declares: every
 // app is a guest (§12.4), so the one app shape ships a guest program even when the
-// test's point is elsewhere (policy, freshness, suite admission…).
-const stubGuestSrc = `register("handle", async (arg) => {
-	const { body } = callerOf(arg);
-	return host.call("fwd", readOp(body).args);
-});`
+// test's point is elsewhere (policy, freshness, suite admission…). It reads the payload
+// after the kernel's 32-byte caller with ITS OWN framing (the op-lead shape the test
+// harness composes around invokeApp) and forwards the arguments to its one module.
+const stubGuestSrc = `function handle(arg) {
+	const n = arg.length > 32 ? arg[32] : -1;
+	let op = "";
+	for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+	return host.call("fwd", arg.subarray(33 + n));
+}`
 
 // writeTestBundle assembles a minimal signed bundle FILE (README §12.4) in a fresh temp
 // dir: one forwarder module + a stub guest with no requires, under an author-signed manifest
@@ -350,18 +354,35 @@ func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, gues
 // deployment uses, end to end.
 //
 // One guest serves both ends. `handle` echoes what it was given, and for a local loopback
-// the `send` op is one request out. The envelope is read and written with the preamble's
-// own callerOf/readOp/writeOp, so the probe carries the call shape a real app does.
+// the `send` op is one request out. The envelope after the kernel's 32-byte caller is
+// read and written with THIS probe's own copies, so the probe carries the call shape a
+// real app does — content, not a kernel ABI.
 const probeGuestSource = `
-	register("handle", (arg) => {
-	  const { fromHost, body } = callerOf(arg);
-	  if (fromHost) {
-	    const { op, args } = readOp(body);
-	    if (op === "send") return host.call("_net", writeOp("send", args));
-	    return new Uint8Array(0);
-	  }
-	  return body;
-	});
+  function readOp(b) {
+    const n = b.length > 0 ? b[0] : -1;
+    if (n < 0 || b.length < 1 + n) throw new Error("probe: malformed op");
+    let op = "";
+    for (let i = 0; i < n; i++) op += String.fromCharCode(b[1 + i]);
+    return { op, args: b.subarray(1 + n) };
+  }
+  function writeOp(op, args) {
+    const out = new Uint8Array(1 + op.length + args.length);
+    out[0] = op.length;
+    for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 255;
+    out.set(args, 1 + op.length);
+    return out;
+  }
+  function handle(arg) {
+    let fromHost = true;
+    for (let i = 0; i < 32; i++) { if (arg[i] !== 0) { fromHost = false; break; } }
+    const body = arg.subarray(32);
+    if (fromHost) {
+      const { op, args } = readOp(body);
+      if (op === "send") return host.call("_net", writeOp("send", args));
+      return new Uint8Array(0);
+    }
+    return body;
+  }
 `
 
 // probeSendArgs encodes the `send` op's arguments:

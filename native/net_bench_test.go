@@ -41,21 +41,38 @@ const benchProto = "netbench"
 //	         UPLOAD-shaped (a 1-byte ack folding in the length and last byte, so the
 //	         bench can prove the payload arrived whole), and anything else echoes — the
 //	         control-plane round trip. A local loopback (the host's zero caller id) carries
-//	         an op NAME: `send` is the transport's send op behind the name this side writes,
-//	         `echo` is the bare realm hop.
+//	         this app's own op framing: `send` is the transport's send op behind the name
+//	         this side writes, `echo` is the bare realm hop. The framing is content — the
+//	         kernel never reads it.
 const netBenchGuestSource = `
-	const block64k = new Uint8Array(65536); block64k.fill(0x5a);
-	register("handle", (arg) => {
-	  const { fromHost, body: p } = callerOf(arg);
-	  if (fromHost) {
-	    const { op, args } = readOp(p);
-	    if (op === "send") return host.call("_net", writeOp("send", args));
-	    return args;
-	  }
-	  if (p.length > 0 && p[0] === 7) return block64k;
-	  if (p.length > 0 && p[0] === 9) return new Uint8Array([(p.slice(1).length ^ p[p.length - 1]) & 255]);
-	  return p;
-	});
+  function readOp(b) {
+    const n = b.length > 0 ? b[0] : -1;
+    let op = "";
+    for (let i = 0; i < n; i++) op += String.fromCharCode(b[1 + i]);
+    return { op, args: b.subarray(1 + n) };
+  }
+  function writeOp(op, args) {
+    const out = new Uint8Array(1 + op.length + args.length);
+    out[0] = op.length;
+    for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 255;
+    out.set(args, 1 + op.length);
+    return out;
+  }
+  const block64k = new Uint8Array(65536); block64k.fill(0x5a);
+  function handle(arg) {
+    const c = arg.subarray(0, 32);
+    let fromHost = true;
+    for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
+    const p = arg.subarray(32);
+    if (fromHost) {
+      const { op, args } = readOp(p);
+      if (op === "send") return host.call("_net", writeOp("send", args));
+      return args;
+    }
+    if (p.length > 0 && p[0] === 7) return block64k;
+    if (p.length > 0 && p[0] === 9) return new Uint8Array([(p.slice(1).length ^ p[p.length - 1]) & 255]);
+    return p;
+  }
 `
 
 // netBenchHarness wires two nodes in one realm: A listens and answers, B requests. Both
@@ -104,10 +121,19 @@ const netBenchHarness = `
 	    u32(payload.length); out.set(payload, off);
 	    return out;
 	  };
+	  // The lane's own op framing: the app's handle reads [opLen][op][args] after the
+	  // shell's caller id - the shell never interprets it.
+	  const opFrame = (name, args) => {
+	    const out = new Uint8Array(1 + name.length + args.length);
+	    out[0] = name.length;
+	    for (let i = 0; i < name.length; i++) out[1 + i] = name.charCodeAt(i);
+	    out.set(args, 1 + name.length);
+	    return out;
+	  };
 	  // One request out of B, answered by A's app. The [ok u8][response] answer shape is
 	  // the transport's; a 0 means unreachable, a deadline, or a refusal.
 	  const req = async (args) => {
-	    const r = await b.shell.invoke("send", args, __appKey);
+	    const r = await b.shell.invoke(opFrame("send", args), __appKey);
 	    if (r[0] !== 1) throw new Error("net: request failed");
 	    return r.slice(1);
 	  };
@@ -125,7 +151,7 @@ const netBenchHarness = `
 	  // receiver's), so it is what says whether a round-trip number is the wire or the
 	  // guest boundary.
 	  const localArg = new Uint8Array(34);
-	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.shell.invoke("echo", localArg, __appKey); return new Uint8Array(0); };
+	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.shell.invoke(opFrame("echo", localArg), __appKey); return new Uint8Array(0); };
 	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 	})();
 `

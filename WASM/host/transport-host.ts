@@ -5,7 +5,7 @@
 import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
-import { opHeader, type RawNet } from "./guest-seam.js";
+import { type RawNet } from "./guest-seam.js";
 
 /** Link kinds, as `linkOpen` declares them: CORE is the routing core's own (accepted through
  *  the channel factory, so dial bookkeeping and the half-open limiter apply); OPEN is a
@@ -47,15 +47,30 @@ export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
  *  let a peer fill it and sit there. Generous — it is not a liveness probe. */
 export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 
-/** `[caller 32][nameLen u8][name utf8]` for one op, memoized: the layout is the seam's
- *  (`opHeader`), but the header is rebuilt on the inbound frame path, once per socket read
- *  per link. Sharing is safe because nothing mutates a header — `Args` only pushes it into a
- *  parts list that `build()` copies out of. The leading 32 bytes stay zero: "the host". */
+// ── the driver's own event header ──────────────────────────────────────────────
+//
+// Every payload the driver hands the transport has a `[opLen u8][op]` head. That
+// framing is the TRANSPORT BUNDLE's format (its own `readOp`, transport/src/util.js) —
+// content paired with this driver like the wire codec — NOT a kernel ABI: the kernel's
+// only obligation in front of it is the 32-byte caller id, added by the shell
+// (shell-core.ts `hostCallSlot`). A field written here and not read there desyncs the
+// payload, which is what forces the pair to move in one artifact.
+
+/** `[opLen u8][op]` for one op, memoized: the header is rebuilt on the inbound frame
+ *  path, once per socket read per link. Sharing is safe because nothing mutates a
+ *  header — `Args` only pushes it into a parts list that `build()` copies out of. */
 const OP_HEADERS = new Map<string, Uint8Array>();
 function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
   if (h === undefined) {
-    h = opHeader(op);
+    // ASCII only: the bundle reads it back with charCodeAt, and a length in BYTES that
+    // a JS length in UTF-16 units would break on its first non-ASCII op.
+    const name = enc.encode(op);
+    if (name.length !== op.length || name.length > 255)
+      throw new Error(`transport: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
+    h = new Uint8Array(1 + name.length);
+    h[0] = name.length;
+    h.set(name, 1);
     OP_HEADERS.set(op, h);
   }
   return h;
@@ -64,8 +79,7 @@ function hostOpHeader(op: string): Uint8Array {
 /** Op-argument encoder: the op NAME first as the discriminator, then u32 BE / u8 /
  *  length-prefixed blob fields in the order the op declares. The guest twin is `Reader`
  *  (transport/src/util.js); a field written and not read desyncs the payload rather than
- *  degrading quietly. */
-class Args {
+ *  degrading quietly. */class Args {
   /** The op this payload is for, or `""` for a nested blob. Read back by `tell`. */
   readonly op: string;
   private readonly parts: Uint8Array[] = [];
@@ -244,14 +258,15 @@ export class TransportHost {
     this.reset();
   }
 
-  /** The immutable node facts a freshly stood link occupant receives once — the init
-   *  op's payload (shell-core.ts). Not re-readable afterwards, and the address book is
-   *  not here: it is mutable node state, replayed after publication as `addr` events. */
+  /** The immutable node facts a freshly stood link occupant receives once — the `init`
+   *  event of this bundle's format (hostOpHeader + fields). Not re-readable afterwards,
+   *  and the address book is not here: it is mutable node state, replayed after
+   *  publication as `addr` events. The shell prepends the host's caller id. */
   initialConfig(): Uint8Array {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    return new Args()
+    return new Args("init")
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -285,8 +300,8 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
 
-  /** Call the transport. The op name and the 32-byte caller id are already the head of
-   *  `args`, so the payload the guest reads is exactly what `build()` returns.
+  /** Call the transport. `args.build()` is the bundle's own event framing; the shell
+   *  prepends the host's caller id at the realm call (shell-core.ts `hostCallSlot`).
    *
    *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
    *  so bytes arriving on one link reach the occupant in arrival order. */

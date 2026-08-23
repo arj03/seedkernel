@@ -31,7 +31,7 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES, opHeader }
+const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
   = await imp("build/host/guest-seam.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
@@ -54,7 +54,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Every app is a guest (§12.4), so every bundle a test builds declares one. The stub
 // used by tests that do not exercise the guest is the same minimal program throughout.
-const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
+const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
 
@@ -311,7 +311,7 @@ async function testBundleRefusesNonModule() {
   // hash-match their manifest entry but will not instantiate. With a two-phase install, a
   // module failing phase 1 must fail the whole load — nothing lands.
   const notAModule = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
-  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestText = "function handle() { return new Uint8Array([1]); }";
   const guestBytes = new TextEncoder().encode(guestText);
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
@@ -1087,7 +1087,7 @@ async function testGuestAbi() {
   console.log("Test: a guest declares the host ABI it was written against");
 
   const author = testAuthor();
-  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestText = "function handle() { return new Uint8Array([1]); }";
   const guestBytes = new TextEncoder().encode(guestText);
   const mk = (guest) => signManifest(sodium, author,
     { app: "abi", version: 1, modules: [], guest });
@@ -1251,7 +1251,7 @@ async function testBundle() {
     // no bind name and names no file: they are `<name>.wasm` and `guest.js`.
     const { host: h } = await makeHost();
     const testKey = appKey(author.id, "test");
-    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
@@ -1292,7 +1292,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
+    assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
     // set to 1 by the load above.
@@ -1432,7 +1432,7 @@ async function testSafeJs() {
   {
     const DANGER = ["Bun", "process", "require", "fetch", "Buffer", "WebAssembly", "globalThis"];
     const probeSrc = `
-      register("probe", () => {
+      function handle() {
         const names = ${JSON.stringify(DANGER)};
         const out = new Uint8Array(names.length);
         for (let i = 0; i < names.length; i++) {
@@ -1440,10 +1440,10 @@ async function testSafeJs() {
           catch { out[i] = 2; }
         }
         return out;
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: probeSrc, hostCall: async () => new Uint8Array() });
-    const res = await realm.call("probe", new Uint8Array());
+    const res = await realm.call(new Uint8Array());
     for (let i = 0; i < DANGER.length - 1; i++) {
       assertEqual(res[i], 0, `${DANGER[i]} is unreachable in the realm`);
     }
@@ -1452,13 +1452,13 @@ async function testSafeJs() {
   }
   {
     const src = `
-      register("tryImport", async () => {
+      async function handle() {
         try { await import("node:fs"); return new Uint8Array([1]); }
         catch { return new Uint8Array([0]); }
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall: async () => new Uint8Array() });
-    const res = await realm.call("tryImport", new Uint8Array());
+    const res = await realm.call(new Uint8Array());
     assertEqual(res[0], 0, "import('node:fs') rejects — no path out of the realm");
     realm.dispose();
   }
@@ -1474,17 +1474,22 @@ async function testSafeJs() {
       return new Uint8Array();
     };
     const src = `
-      register("sync", (arg) => host.call("inc", arg));                  // sync name: host.call returns bytes, no await
-      register("net", async (arg) => { return await host.call("slow", arg); });  // net-like name: a genuinely awaited Promise
+      function handle(a) {
+        const sel = a[0], arg = a.subarray(1);
+        if (sel === 1) return host.call("inc", arg);                  // sync name: host.call returns bytes, no await
+        if (sel === 2) return (async () => await host.call("slow", arg))();  // net-like name: a genuinely awaited Promise
+        throw new Error("no such sel " + sel);
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall });
     const input = new Uint8Array([0, 1, 2, 254, 255]);
-    const sync = await realm.call("sync", input);
+    const U = (...xs) => new Uint8Array(xs);
+    const sync = await realm.call(U(1, ...input));
     assertEqual([...sync], [1, 2, 3, 255, 0], "sync name: bytes crossed in and back with no promise");
-    const asyncR = await realm.call("net", input);
+    const asyncR = await realm.call(U(2, ...input));
     assertEqual([...asyncR], [1, 2, 3, 255, 0], "net-like name: await host.call resolves the real Promise");
     assert(hostCalls === 2, "the host seam was invoked for each call");
-    const again = await realm.call("sync", new Uint8Array([10]));
+    const again = await realm.call(U(1, 10));
     assertEqual([...again], [11], "realm is reusable across calls");
     realm.dispose();
   }
@@ -1500,7 +1505,7 @@ async function testSafeJs() {
       return new Uint8Array();
     };
     const src = `
-      register("orchestrate", async (arg) => {
+      async function handle(arg) {
         const count = arg[0], peerCount = arg[1];
         // Fan out OFFERs concurrently — the guest's own Promise.all, no host sendMany.
         const offers = await Promise.all(
@@ -1515,10 +1520,10 @@ async function testSafeJs() {
         );
         const holders = haves.filter((h) => h[0] === 1).length;
         return new Uint8Array([placed.length, holders, ...placed]);
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall });
-    const res = await realm.call("orchestrate", new Uint8Array([3, 10]));
+    const res = await realm.call(new Uint8Array([3, 10]));
     assertEqual(res[0], 3, "loop placed exactly `count` blocks on distinct peers");
     assertEqual([...res.slice(2)], [0, 2, 4], "placement followed peer order and the accept rule");
     assertEqual(res[1], 4, "concurrent have/want fan-out (Promise.all) collected the right holders");
@@ -1528,15 +1533,15 @@ async function testSafeJs() {
   // 4. Realm isolation: a poisoned guest cannot reach a sibling's global.
   {
     const a = await createSafeRealm({
-      source: `globalThis.SECRET = 42; register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
+      source: `globalThis.SECRET = 42; function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
     const b = await createSafeRealm({
-      source: `register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
+      source: `function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
-    const ra = await a.call("leak", new Uint8Array());
-    const rb = await b.call("leak", new Uint8Array());
+    const ra = await a.call(new Uint8Array());
+    const rb = await b.call(new Uint8Array());
     assertEqual(ra[0], 42, "realm A sees its own global");
     assertEqual(rb[0], 0, "realm B does not see realm A's global");
     a.dispose();
@@ -1561,12 +1566,12 @@ async function testRealmSerialization() {
     let calls = 0;
     const hostCall = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
     const realm = await createSafeRealm({
-      source: `register("inc", (arg) => host.call("inc", arg));`,
+      source: `function handle(arg) { return host.call("inc", arg); }`,
       hostCall,
     });
-    const out = await realm.call("inc", new Uint8Array([0, 9, 255]));
+    const out = await realm.call(new Uint8Array([0, 9, 255]));
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
-    assertEqual([...(await realm.call("inc", new Uint8Array([41])))], [42], "the realm is reusable across calls");
+    assertEqual([...(await realm.call(new Uint8Array([41])))], [42], "the realm is reusable across calls");
     assertEqual(calls, 2, "the synchronous seam was invoked once per call");
     realm.dispose();
   }
@@ -1583,13 +1588,16 @@ async function testRealmSerialization() {
       return new Uint8Array();
     };
     const realm = await createSafeRealm({
-      source: `register("init", async () => host.call("park", new Uint8Array()));
-               register("hold", (arg) => host.call("inc", arg));`,
+      source: `function handle(a) {
+                 if (a[0] === 1) return (async () => await host.call("park", new Uint8Array()))();
+                 if (a[0] === 2) return host.call("inc", a.subarray(1)); // sync — holder path
+                 throw new Error("no such sel " + a[0]);
+               }`,
       hostCall,
     });
     const order = [];
-    const initP = realm.call("init", new Uint8Array()).then((r) => { order.push("init"); return r; });
-    const heldP = realm.call("hold", new Uint8Array([7])).then((r) => { order.push("hold"); return r; });
+    const initP = realm.call(new Uint8Array([1])).then((r) => { order.push("init"); return r; });
+    const heldP = realm.call(new Uint8Array([2, 7])).then((r) => { order.push("hold"); return r; });
 
     // Give the holder every chance to jump the queue before the initiator is released.
     for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -1605,10 +1613,10 @@ async function testRealmSerialization() {
   // 3. Still airtight — the one seam is the same zero-authority sandbox.
   {
     const realm = await createSafeRealm({
-      source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
+      source: `function handle() { return new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]); }`,
       hostCall: async () => new Uint8Array(),
     });
-    const r = await realm.call("probe", new Uint8Array());
+    const r = await realm.call(new Uint8Array());
     assertEqual([...r], [0, 0], "process / fetch are unreachable from an entrypoint");
     realm.dispose();
   }
@@ -1622,10 +1630,10 @@ async function testRealmSerialization() {
   //    Hence the deferred teardown, pinned here: a regression is a host crash.
   {
     const realm = await createSafeRealm({
-      source: `register("park", async () => await host.call("park", new Uint8Array()));`,
+      source: `async function handle() { await host.call("park", new Uint8Array()); }`,
       hostCall: (name) => (name === "park" ? new Promise(() => {}) : new Uint8Array()),  // never settles
     });
-    const parked = realm.call("park", new Uint8Array());
+    const parked = realm.call(new Uint8Array());
     for (let i = 0; i < 10; i++) await Promise.resolve();   // let it reach its await
     realm.dispose();
 
@@ -1633,16 +1641,16 @@ async function testRealmSerialization() {
     try { await parked; } catch (e) { msg = e.message; }
     assertEqual(msg, "guest realm disposed", "the parked invocation is failed by dispose, not stranded");
     let after = "";
-    try { await realm.call("park", new Uint8Array()); } catch (e) { after = e.message; }
+    try { await realm.call(new Uint8Array()); } catch (e) { after = e.message; }
     assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
 
     // A realm built after the deferred teardown has run proves the module survived it.
     await sleep(1);
     const next = await createSafeRealm({
-      source: `register("ping", (arg) => arg);`,
+      source: `function handle(arg) { return arg; }`,
       hostCall: async () => new Uint8Array(),
     });
-    assertEqual([...(await next.call("ping", new Uint8Array([7])))], [7],
+    assertEqual([...(await next.call(new Uint8Array([7])))], [7],
       "the engine is still alive after the parked realm's context was freed");
     next.dispose();
   }
@@ -1886,16 +1894,16 @@ async function testModuleCallChargedToGuestBudget() {
   // The realm's budget is 5 s, but the guest burns most of it before calling the module:
   // the call must then be killed near what remains, not at the table's 60 s.
   const realm = await createSafeRealm({
-    source: `register("go", async () => {
+    source: `async function handle() {
       const t0 = Date.now();
       while (Date.now() - t0 < 4900) { /* burn the segment */ }
       return await host.call("spin", new Uint8Array());
-    });`,
+    }`,
     hostCall: seam,
     deadlineMs: 5000,
   });
   const t0 = Date.now();
-  const out = await realm.call("go", new Uint8Array());
+  const out = await realm.call(new Uint8Array());
   const spent = Date.now() - t0;
   realm.dispose();
   assert(out !== null && out.length === 0, "the module answered empty at the guest's deadline");
@@ -1911,15 +1919,15 @@ async function testModuleCallChargedToGuestBudget() {
   // microseconds per turn, and QuickJS's interrupt is consulted per bytecode, of which
   // this guest executes almost none between parks.
   const looper = await createSafeRealm({
-    source: `register("go", async () => {
+    source: `async function handle() {
       for (;;) await host.call("spin", new Uint8Array());
-    });`,
+    }`,
     hostCall: seam,
     deadlineMs: 1000,
   });
   const t1 = Date.now();
   let killed = "";
-  try { await looper.call("go", new Uint8Array()); }
+  try { await looper.call(new Uint8Array()); }
   catch (e) { killed = e.message; }
   const looped = Date.now() - t1;
   looper.dispose();
@@ -1973,13 +1981,13 @@ async function testSafeRealmConcurrency() {
   // evalCode, so a second call staging __arg can never corrupt the first's captured arg —
   // no host-side serialization needed.
   const realm = await createSafeRealm({
-    source: `register("echo", async (a) => await host.call("echo", a));`,
+    source: `async function handle(a) { return await host.call("echo", a); }`,
     hostCall: (_name, p) => sleep(10).then(() => p),
   });
   try {
     const [r1, r2] = await Promise.all([
-      realm.call("echo", new Uint8Array([1])),
-      realm.call("echo", new Uint8Array([2])),
+      realm.call(new Uint8Array([1])),
+      realm.call(new Uint8Array([2])),
     ]);
     assertEqual([...r1], [1], "first concurrent call returns its own bytes");
     assertEqual([...r2], [2], "second concurrent call returns its own bytes");
@@ -2330,7 +2338,7 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = (version) => ({
       app: "rollback", version,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
@@ -2781,7 +2789,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-      const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+      const r = { calls: [], disposed: false, call: async (p) => { r.calls.push(p.length > 0 && p[0] === 1 ? "timer" : "invoke"); return new Uint8Array(); }, dispose() { r.disposed = true; } };
       realms.push(r);
       await o.hostCall("timer/arm", arm(1, 200));
       return r;
@@ -2790,7 +2798,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   });
   try {
     await shell.loadBundleBlob(blob(1));
-    await shell.invoke("ping", new Uint8Array(), key);
+    await shell.invoke(new Uint8Array(), key);
     assertEqual(realms.length, 1, "the first slot stands one realm");
 
     failNextRealm = true;
@@ -2802,7 +2810,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
     await shell.loadBundleBlob(blob(2));
     assert(realms[0].disposed, "the upgrade disposed the realm it replaced");
-    await shell.invoke("ping", new Uint8Array(), key);
+    await shell.invoke(new Uint8Array(), key);
     assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
     assert(!realms[1].disposed, "…which is the one left standing");
 

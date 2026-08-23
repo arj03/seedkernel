@@ -260,7 +260,19 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 		`(async () => {
 			globalThis.__realm = await createRealm({ source: __src, hostCall: __guestSeam,
 				deadlineMs: __deadlineMs || undefined });
-			globalThis.__realmCall = (entry, arg) => __realm.call(entry, new Uint8Array(arg));
+			// The test driver's twin of the shell's callSlot: the host's 32 zero-byte
+			// caller id in front of the guest's own op framing (composed here, since the
+			// kernel writing it would learn the guest's vocabulary).
+			globalThis.__realmCall = (op, arg) => {
+			  const body = new Uint8Array(arg);
+			  const framed = new Uint8Array(1 + op.length + body.length);
+			  framed[0] = op.length;
+			  for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
+			  framed.set(body, 1 + op.length);
+			  const input = new Uint8Array(32 + framed.length);
+			  input.set(framed, 32);
+			  return __realm.call(input);
+			};
 			return new Uint8Array(0);
 		})`,
 		10*time.Second,
@@ -269,10 +281,11 @@ func newTestRealmBudget(tb testing.TB, appJSON, source string, deadlineMs int) {
 	}
 }
 
-// realmCall invokes an entrypoint on the realm newTestRealm parked, as the initiator,
-// driving the loop until it settles — the guest may await net on the way. Go stages the
-// payload as an ArrayBuffer, so the view SafeRealm.call is declared to take is made in
-// the expression rather than by widening the shared signature.
+// realmCall invokes the realm newTestRealm parked, as the initiator — the same shape
+// the shell uses, with the 32 zero-byte caller id + the guest's own op framing composed
+// by __realmCall — driving the loop until it settles; the guest may await net on the way.
+// Go stages the payload as an ArrayBuffer, so the view SafeRealm.call is declared to
+// take is made in the expression rather than by widening the shared signature.
 func realmCall(entry string, payload []byte) ([]byte, error) {
 	return callRealm("__realmCall", 30*time.Second, qc.NewString(entry), qc.NewArrayBuffer(payload))
 }

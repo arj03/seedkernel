@@ -108,3 +108,47 @@ Reader.prototype.blob = function () {
   this.off += n;
   return s;
 };
+
+// ── the caller prefix and the op envelope ──────────────────────────────────────
+//
+// The kernel's inbound shape is `handle([caller 32][body …])`: attribution only. What
+// this program does with the bytes after the caller is ITS format, so the helpers HERE
+// are this bundle's own spellings (the host twin, transport-host.ts, is content paired
+// with this bundle like the wire codec) — not a kernel ABI. The op is a NAME, never a
+// tag byte: collapsing many events onto one call must not smuggle in a number two sides
+// have to agree on, so an unimplemented op fails loud.
+
+/** The three kinds of caller, told apart by those 32 bytes and nothing else:
+ *  the HOST proper (`[0x00 × 32]`, platform events and loopbacks), a fired TIMER
+ *  (`[0x01][0x00 × 31]`, the host's own re-entry for a deadline this program armed),
+ *  and an APP (its app key, derived host-side from the admitted manifest, exactly as an
+ *  inbound frame carries the authenticated sender's key). */
+function callerOf(arg) {
+  const caller = arg.subarray(0, 32);
+  let fromHost = true;
+  let fromTimer = false;
+  for (let i = 0; i < 32; i++) {
+    if (caller[i] !== 0) { fromHost = false; if (i === 0 && caller[i] === 1) fromTimer = true; break; }
+  }
+  return { fromHost, fromTimer, caller, body: arg.subarray(32) };
+}
+
+/** `[opLen u8][op ascii][args …]` — this bundle's one envelope. Malformed framing
+ *  throws rather than yielding a truncated name that would then read as an
+ *  unimplemented op. */
+function readOp(body) {
+  const n = body.length > 0 ? body[0] : -1;
+  if (n < 0 || body.length < 1 + n) throw new Error("transport: malformed op envelope");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
+  return { op, args: body.subarray(1 + n) };
+}
+
+/** The same, written — an app's or the host's payload, handed over as-is. */
+function writeOp(op, args) {
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(args, 1 + op.length);
+  return out;
+}

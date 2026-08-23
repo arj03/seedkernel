@@ -101,12 +101,12 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if g == nil {
 			return nil, fmt.Errorf("realmCall: no such realm")
 		}
-		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
+		payload, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return nil, err
 		}
 		deferred := 0
-		if g.call(t.Args()[1].String(), payload, t.Args()[3], t.Args()[4]) {
+		if g.call(payload, t.Args()[2], t.Args()[3]) {
 			deferred = 1
 		}
 		return t.Context().NewInt64(int64(deferred)), nil
@@ -259,7 +259,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 }
 
 // hostGuestPreamble asks the host realm for guestPreamble() — the guest-side ABI
-// (host.call over the single seam, register/__invoke for dispatch). Fetched rather than
+// (host.call over the one seam, and the one `handle` entrypoint). Fetched rather than
 // restated because a bundle ships one guest.js that runs byte-identical here and on the
 // node/browser host: the preamble is a contract with signed content, not a per-target
 // detail. Go's side of it is the __host_call above plus settleNet.
@@ -285,14 +285,14 @@ func hostFnString(hostQc *qjs.Context, name string) string {
 	return v.String()
 }
 
-// call invokes an entrypoint as the *initiator*: it may await net, so there is no result
-// to return — onDone/onFail (host-realm functions settling the shim's Promise) fire when
-// the entrypoint's own promise settles.
+// call invokes the realm's one handle entrypoint as the *initiator*: it may await net,
+// so there is no result to return — onDone/onFail (host-realm functions settling the
+// shim's Promise) fire when the entrypoint's own promise settles.
 //
 // It reports one thing synchronously: whether the entrypoint DEFERRED its answer (the
-// preamble's defer()), which tells the shim's queue the realm is free again even though
-// nothing has settled. __start returns the flag; this only carries it back.
-func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Value) bool {
+// guest's deferred marker), which tells the shim's queue the realm is free again even
+// though nothing has settled. __start returns the flag; this only carries it back.
+func (g *guestRealm) call(payload []byte, onDone, onFail *qjs.Value) bool {
 	if err := g.checkAlive(); err != nil {
 		// Settle in the HOST realm, which is a different runtime and still alive.
 		g.reportCall(onFail.Dup(), g.hostQc.NewString(err.Error()))
@@ -301,12 +301,11 @@ func (g *guestRealm) call(entry string, payload []byte, onDone, onFail *qjs.Valu
 	g.callSeq++
 	id := g.callSeq
 	g.calls[id] = &initiatorCall{onDone: onDone.Dup(), onFail: onFail.Dup()}
-	entryV, argV := g.qc.NewString(entry), g.qc.NewArrayBuffer(payload)
+	argV := g.qc.NewArrayBuffer(payload)
 	g.consumed = 0 // one top-level entrypoint invocation, one budget
 	res, err := g.within(func() (*qjs.Value, error) {
-		return g.qc.Invoke(g.start, g.qc.NewUndefined(), g.qc.NewInt64(id), entryV, argV)
+		return g.qc.Invoke(g.start, g.qc.NewUndefined(), g.qc.NewInt64(id), argV)
 	})
-	entryV.Free()
 	argV.Free()
 	deferred := false
 	if res != nil {
@@ -400,18 +399,7 @@ func (g *guestRealm) settleAll(msg string) {
 	}
 }
 
-// pump drains this realm's job queue under its execution budget.
-//
-// The loop calls it instead of Context.Pump because a queued job IS guest code: the
-// continuation after `await Promise.resolve()` never passes through settleNet, so pumping
-// the context directly would run it outside every guard the realm has — one await would
-// buy an unbounded loop. A dead realm is skipped; markDead already settled its callers.
-//
-// A pump that FAILS wakes the loop, which is load-bearing for the budget: the interrupt
-// unwinds as a throw that rejects the entrypoint's promise, and delivering that rejection
-// is itself more queued work after this round has drained. A guest spinning on its own
-// generates no I/O, so without the nudge the caller waits out its whole timeout for a
-// call the engine already stopped. A clean pump wakes nobody.
+// pump drains this realm's job queue under its execution budget.statements
 func (g *guestRealm) pump() {
 	if g.rt == nil || g.dead || !g.rt.Alive() {
 		return

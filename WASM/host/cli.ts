@@ -109,6 +109,18 @@ export interface CliResult {
 const utf8 = new TextDecoder();
 const utf8enc = new TextEncoder();
 
+/** The op frame the operator's surface composes: `[opLen u8][op utf8][stdin]`. This
+ *  file writes it, the invoked app's own `handle` reads it with its own code, and the
+ *  shell passes it through unread — the op's MEANING is a contract between the operator
+ *  and that one app, never the kernel's. */
+function opInput(op: string, body: Uint8Array): Uint8Array {
+  const out = new Uint8Array(1 + op.length + body.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(body, 1 + op.length);
+  return out;
+}
+
 /** Split `--name value` / `--name=value` pairs, refusing anything else: an unknown flag is
  *  an error rather than an ignored token, and a flag without a value is an error rather
  *  than a `true` that later reads as a path. */
@@ -344,16 +356,16 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
     // ONE one-shot op through the loaded guest — "the shell runs the app" as the
     // *initiator* (§12.8). `handle`'s ABI and nothing more (§12.2): stdin is the argument,
-    // stdout is the response, and the op name is passed through unread. Nothing here
-    // decodes or knows an app's argument shape, which a flag per operation could not
-    // avoid.
+    // stdout is the response, and the op name is framed here with the app's own
+    // convention and passed through unread. Nothing here decodes or knows an app's
+    // argument shape, which a flag per operation could not avoid.
     //
     // Addressed to the app THIS flow loaded, by the key its load returned, rather than
     // left to `invoke`'s "the only app" default: a node with a network has the transport
     // loaded too, so "the only one" is not something `--bundle` can mean.
     const op = args.get("op");
     if (op !== undefined) {
-      host.stdout(await loaded.invoke(op, host.stdin()));
+      host.stdout(await loaded.invoke(opInput(op, host.stdin())));
     }
   }
 

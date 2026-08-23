@@ -239,8 +239,10 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
         },
     };
 }
-/** Guest preamble: `host.call`, `register`/`__invoke`, `callerOf`/`readOp`/`writeOp`.
- *  `__host_call` → bytes (sync) or `null` (async under `callId`). `null` is reserved. */
+/** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
+ *  kernel's whole inbound vocabulary is the entrypoint's argument `[caller 32][body …]`:
+ *  attribution only. What follows the 32 bytes is the callee's own format; the kernel
+ *  never reads it, so it never grows a language. */
 export function guestPreamble(): string {
     return GUEST_PREAMBLE;
 }
@@ -275,42 +277,12 @@ globalThis.host = {
     return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net / fs
   },
 };
-globalThis.__entries = Object.create(null);
-globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
-// handle(arg) = [caller 32][body …]. 32 zero bytes = the host itself.
-globalThis.callerOf = (arg) => {
-  const caller = arg.subarray(0, 32);
-  let fromHost = true;
-  for (let i = 0; i < 32; i++) { if (caller[i] !== 0) { fromHost = false; break; } }
-  return { fromHost, caller, body: arg.subarray(32) };
-};
-// [opLen u8][op ascii][args …]. Malformed framing throws rather than a truncated name.
-globalThis.readOp = (body) => {
-  const n = body.length > 0 ? body[0] : -1;
-  if (n < 0 || body.length < 1 + n) throw new Error("guest: malformed op envelope");
-  let op = "";
-  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
-  return { op, args: body.subarray(1 + n) };
-};
-// The same, written. charCodeAt: a fresh realm is not guaranteed a TextEncoder.
-globalThis.writeOp = (op, args) => {
-  const out = new Uint8Array(1 + op.length + args.length);
-  out[0] = op.length;
-  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
-  out.set(args, 1 + op.length);
-  return out;
-};
-// Set by defer() and read by the host once the invocation's synchronous segment ends —
-// see the note on defer below. Cleared per invocation, never by the guest.
+// The answer-to-a-later-turn marker. The guest sets it (its own helper, content) and the
+// invocation's queue spot frees at the end of the synchronous segment even though nothing
+// has settled (realm-queue.ts). The one ABI bit beyond handle returning bytes: without
+// it, a guest whose answer arrives as another invocation of its own realm would hold the
+// queue against the only event that could settle it.
 globalThis.__deferred = false;
-// Answer on a later turn without holding the realm. The transport uses this: its
-// reply arrives as another invocation of the same realm. Asserts the guest never parks.
-globalThis.defer = () => {
-  let settle, fail;
-  const promise = new Promise((res, rej) => { settle = res; fail = rej; });
-  globalThis.__deferred = true;
-  return { promise, settle, fail };
-};
 function __norm(out) {
   if (out instanceof ArrayBuffer) return out;
   if (out instanceof Uint8Array) {
@@ -318,58 +290,35 @@ function __norm(out) {
   }
   throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
 }
-globalThis.__invoke = (name, argBuf) => {
-  const fn = globalThis.__entries[name];
-  if (typeof fn !== "function") throw new Error("guest: no entrypoint '" + name + "'");
+globalThis.__invoke = (argBuf) => {
+  if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
   // Cleared HERE rather than by the host, so the flag describes exactly this
   // invocation and a guest cannot leave it set for the next one.
   globalThis.__deferred = false;
   // A synchronous entrypoint returns bytes; an async one returns a guest promise the host
   // settles. __norm normalizes both to an ArrayBuffer.
-  const out = fn(new Uint8Array(argBuf));
+  const out = globalThis.handle(new Uint8Array(argBuf));
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
-// ── the call envelope, host side ────────────────────────────────────────────
+// ── the attribution prefix, host side ────────────────────────────────────────
 //
-// The mirror of `callerOf`/`readOp` in the preamble above, deliberately in the same file:
-// these two functions and those three write and read the SAME bytes, so a layout change is
-// one edit rather than a search for everyone who open-coded it.
+// The ONLY bytes the host puts in front of a callee's format. An app's own format and a
+// transport's event framing are content; this prefix is what the host can be asked for,
+// one 32-byte id, unforgeable by a guest. Two ids are the host's own: the zero id (whose
+// events and loopback calls the host writes) and the timer id (a fired deadline, the one
+// re-entry the host owns). Everything else non-zero is a peer or a co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
-/** `[caller 32][opLen u8][op]` — the header of one call, without its arguments. For a
- *  caller that concatenates its own fields behind it and would otherwise copy the whole
- *  payload a second time to put a header in front (transport-host.ts `Args`, which
- *  builds this once per op and reuses it on the inbound frame path). */
-export function opHeader(op: string, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
-    const name = enc.encode(op);
-    // ASCII: the guest reads it back with charCodeAt, and a length in BYTES that a guest
-    // counts in UTF-16 code units is a framing bug waiting for its first non-ASCII op.
-    if (name.length !== op.length || name.length > 255)
-        throw new Error(`guest-seam: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
-    const out = new Uint8Array(caller.length + 1 + name.length);
-    out.set(caller, 0);
-    out[caller.length] = name.length;
-    out.set(name, caller.length + 1);
-    return out;
-}
-/** `[caller 32][opLen u8][op][args]` — one whole call, as an app's `handle` reads it
- *  (`callerOf` then `readOp`). The default caller is the host's own id, which is what
- *  `Shell.invoke` writes; the transport driver passes its own. */
-export function opCall(op: string, args: Uint8Array, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
-    const head = opHeader(op, caller);
-    return concatBytes([head, args]);
-}
+/** A fired deadline's caller id: `[0x01][0x00 …]` — not the host-proper (an app must not
+ *  read a timer entry as host authority), but never derived, so it reads to the callee as
+ *  "the host, tag timer". The payload behind it is the timer id. */
+export const TIMER_CALLER_ID = new Uint8Array(32);
+TIMER_CALLER_ID[0] = 1;
 /** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`, for
  *  host code reading an op envelope a guest wrote. Same bytes, same failure: malformed
  *  framing throws rather than yielding a truncated name that the caller would then see
  *  reported as an unimplemented op. */
-export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
-    const n = payload.length > 0 ? payload[0] : -1;
-    if (n < 0 || payload.length < 1 + n)
-        throw new Error("guest-seam: malformed op envelope");
-    return { op: dec.decode(payload.subarray(1, 1 + n)), args: payload.subarray(1 + n) };
-}
 /** Authority catalog, re-exported from core/domains.ts. Grants are these names
  *  plus reserved ids; `crypto/*` and the bundle's own modules are not. */
 export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";

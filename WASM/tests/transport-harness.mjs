@@ -50,13 +50,32 @@ export const PROTO = "harness/v1";
  *           own, so a refusal is the transport's.
  *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`. */
 const HARNESS_GUEST = `
+// This app's own copies of the shape it shares with whatever it calls (its own format
+// after the kernel's 32-byte caller prefix): a local op is [opLen u8][op][args], and
+// the transport's app contract (the id this app calls) is spelled the same way. The
+// kernel never reads any of it.
+function readOp(b) {
+  const n = b.length > 0 ? b[0] : -1;
+  if (n < 0 || b.length < 1 + n) throw new Error("harness: malformed op");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(b[1 + i]);
+  return { op, args: b.subarray(1 + n) };
+}
+function writeOp(op, args) {
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(args, 1 + op.length);
+  return out;
+}
 const seen = [];
-register("handle", (arg) => {
-  // The preamble's own envelope readers (guest-seam.ts) — one shape for the host's
-  // loopback and the transport's ops alike, so this harness reads what a real app reads.
-  const { fromHost, body: p } = callerOf(arg);
+function handle(arg) {
+  const c = arg.subarray(0, 32);
+  let fromHost = true;
+  for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
+  const p = arg.subarray(32);
   // A LOCAL call from the host (caller = 32 zero bytes): the op NAME picks the local op,
-  // the same one-vocabulary shape the transport's own handle reads.
+  // the one-vocabulary shape the transport's own handle reads.
   if (fromHost) {
     const { op, args } = readOp(p);
     if (op === "send") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, writeOp("send", args));
@@ -88,16 +107,21 @@ register("handle", (arg) => {
     return out;
   }
   return p;
-});
+}
 `;
 
 /** The harness app's local op names — the one op vocabulary its `handle` reads. */
 const OP = { SEND: "send", RAW: "op", SEEN: "seen" };
 
-/** One local op into the harness app: `shell.invoke` loops back through `handle`, writing
- *  the host's caller id and the op envelope; the NAME is the app's own vocabulary. */
+/** One local op into the harness app: `shell.invoke` loops back through `handle`, with the
+ *  host's caller id in front of THIS app's own op framing — the name is the app's
+ *  vocabulary and the shell never reads it. */
 function invoke(shell, appKey, op, args = new Uint8Array(0)) {
-  return shell.invoke(op, args, appKey);
+  const b = new Uint8Array(1 + op.length + args.length);
+  b[0] = op.length;
+  for (let i = 0; i < op.length; i++) b[1 + i] = op.charCodeAt(i) & 0xff;
+  b.set(args, 1 + op.length);
+  return shell.invoke(b, appKey);
 }
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */

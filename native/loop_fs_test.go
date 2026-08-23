@@ -36,22 +36,23 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 			for (let j = 0; j < s.length; j++) b[j] = s.charCodeAt(j);
 			return b;
 		}
-			register("chain", async (arg) => {
-				const n = arg[0];
-				let seen = 0;
-				for (let i = 0; i < n; i++) {
-					const k = keyBytes(i);
-					const body = new Uint8Array(4 + k.length + 16);
-					// [klen u32 BE][key][bytes]
-					body[0] = 0; body[1] = 0; body[2] = (k.length >>> 8) & 255; body[3] = k.length & 255;
-					body.set(k, 4);
-					await host.call("fs/put", body);
-					const got = await host.call("fs/get", k);
-					if (got[0] === 1) seen++;
-					await host.call("fs/size", k);
-				}
-				return new Uint8Array([seen]);
-			});
+		async function handle(arg) {
+			// The mock composes this guest's local "chain" op; the payload is one byte.
+			const n = arg[33 + arg[32]];
+			let seen = 0;
+			for (let i = 0; i < n; i++) {
+				const k = keyBytes(i);
+				const body = new Uint8Array(4 + k.length + 16);
+				// [klen u32 BE][key][bytes]
+				body[0] = 0; body[1] = 0; body[2] = (k.length >>> 8) & 255; body[3] = k.length & 255;
+				body.set(k, 4);
+				await host.call("fs/put", body);
+				const got = await host.call("fs/get", k);
+				if (got[0] === 1) seen++;
+				await host.call("fs/size", k);
+			}
+			return new Uint8Array([seen]);
+		}
 	`)
 
 	const blocks = 24

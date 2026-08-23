@@ -4,13 +4,13 @@
 // bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, TIMER_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
-import { enc, fromHex, toHex, writeU32BE, errMessage } from "../core/util.js";
+import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -174,8 +174,9 @@ export interface Shell {
      *  author key, which derives new names and a fresh mark (§5.1), not an un-revoke. */
     revoke(authorHex: string): string[];
     /** Loopback into a loaded app's `handle` as the host (32 zero-byte caller id).
-     *  Addressed by app key — whatever is installed under that identity now. */
-    invoke(op: string, payload: Uint8Array, appKey: string): Promise<Uint8Array>;
+     *  Addressed by app key — whatever is installed under that identity now. The payload
+     *  is the app's OWN format: the shell prefixes attribution and reads no further. */
+    invoke(payload: Uint8Array, appKey: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
      *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
@@ -207,7 +208,7 @@ export interface AppHandle extends LoadedBundle {
      *  so a handle taken before it keeps naming the version it was handed, and rejects
      *  once that slot is disposed. A caller meaning "whatever is installed now" holds the
      *  key and calls `Shell.invoke`. */
-    invoke(op: string, payload: Uint8Array): Promise<Uint8Array>;
+    invoke(payload: Uint8Array): Promise<Uint8Array>;
 }
 
 // Re-exported so a target reaches the admission constructors from the same module it gets
@@ -371,10 +372,12 @@ function createShell(opts: CreateShellOptions & {
         const timers = createRealmTimers((id) => {
             const args = new Uint8Array(4);
             writeU32BE(args, 0, id);
-            // A guest that arms a deadline without registering `timer` is refused by its
-            // own realm, and an app's `timer` may legitimately throw. Neither has a caller
-            // left to reject — the arming call returned turns ago — so report and swallow.
-            void slot.realm?.call("timer", args).catch((err: unknown) => {
+            // The one entrypoint, with the TIMER caller id: a fired deadline is an event
+            // the host delivers into the guest, not a host authority — the callee reads
+            // the tag from the caller prefix (guest-seam.ts). A guest's `handle` may throw
+            // on it; there is no caller left to reject — the arming call returned turns
+            // ago — so report and swallow.
+            void slot.realm?.call(concatBytes([TIMER_CALLER_ID, args])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
@@ -488,34 +491,40 @@ function createShell(opts: CreateShellOptions & {
             return fullSeam(name, payload, budget);
         };
     };
-    /** Enter a slot's guest. The null arm is reachable only from guest top-level code
-     *  while its candidate realm is still being constructed. */
+    /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
+     *  prefix, never the guest's own spelling. The null arm is reachable only from guest
+     *  top-level code while its candidate realm is still being constructed. */
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
-        ? slot.realm.call("handle", input)
+        ? slot.realm.call(input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
+    /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
+     *  caller id the shell holds (loopback, init, and socket/addrs events). */
+    const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
+        callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
     /** Loopback invoke with host caller id. Chained onto `inFlight` so `close()`
      *  waits for parked calls (§2.1). */
-    const invokeSlot = (slot: AppSlot, op: string, payload: Uint8Array): Promise<Uint8Array> => {
-        const call = callSlot(slot, opCall(op, payload));
+    const invokeSlot = (slot: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
+        const call = hostCallSlot(slot, payload);
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
-    /** The one delivery of the node's immutable facts to a link occupant: an `init` op
-     *  into the freshly stood slot's `handle`, with the host's caller id, before the
-     *  binding is published and before any event. Constructor argument, not a capability:
-     *  nothing here is re-readable, and what is mutable — the address book — arrives as
-     *  `addr` events after publication. */
+    /** The one delivery of the node's immutable facts to a link occupant: a host-proper
+     *  event into the freshly stood slot's `handle`, before the binding is published and
+     *  before any event. Constructor argument, not a capability: nothing here is
+     *  re-readable, and what is mutable — the address book — arrives as `addr` events
+     *  after publication. The body is the driver's own framing (transport-host.ts), which
+     *  is a contract with the pinned bundle, not a kernel ABI. */
     const initLinkSlot = async (slot: AppSlot): Promise<void> => {
         const facts = netHost?.initialConfig();
         if (!facts)
             throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
-        await invokeSlot(slot, "init", facts);
+        await invokeSlot(slot, facts);
     };
     netHost?.route((payload) => {
         // The link occupant's `handle` return is the driver's to read: an inbound request
         // the occupant decoded is returned as a delivery frame, which the driver hands to
         // the shell's claim routing (`routeDeliver`) and answers back through `linkResp`.
-        return linkOwner ? callSlot(linkOwner, payload) : null;
+        return linkOwner ? hostCallSlot(linkOwner, payload) : null;
     }, () => linkOwner !== null, (claim, attribution, payload) => {
         // The driver normalizes the answer to empty before writing it back, so refusal
         // and silence are one fact at the boundary.
@@ -707,7 +716,7 @@ function createShell(opts: CreateShellOptions & {
                 key,
                 fs: slot.fsScope,
                 appScope: slot.appScope,
-                invoke: (op, payload) => invokeSlot(slot, op, payload),
+                invoke: (payload) => invokeSlot(slot, payload),
             };
             return handle;
         },
@@ -731,13 +740,13 @@ function createShell(opts: CreateShellOptions & {
             }
             return gone;
         },
-        async invoke(op, payload, appKey) {
+        async invoke(payload, appKey) {
             const slot = findSlot(appKey);
             if (!slot)
                 throw new Error(`shell: no app '${appKey}' loaded`);
             // `AppHandle.invoke` is the same call with the slot already bound — see
             // `invokeSlot` for the framing and the close() chaining.
-            return invokeSlot(slot, op, payload);
+            return invokeSlot(slot, payload);
         },
         dispatch: doDispatch,
         close() {

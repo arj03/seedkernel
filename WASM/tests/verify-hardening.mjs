@@ -187,12 +187,12 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   // A holder that loops forever is interrupted rather than wedging the host thread.
   const spinner = await createSafeRealm({
-    source: 'register("handle", () => { for(;;){} });',
+    source: 'function handle() { for(;;){} }',
     hostCall: noop, deadlineMs: 300,
   });
   const t0 = Date.now();
   let interrupted = false;
-  try { await spinner.call("handle", new Uint8Array()); } catch { interrupted = true; }
+  try { await spinner.call(new Uint8Array()); } catch { interrupted = true; }
   const spent = Date.now() - t0;
   ok(interrupted, "an infinite loop in a holder entrypoint is interrupted");
   ok(spent < 3000, `it is interrupted near its budget, not eventually (${spent}ms)`);
@@ -205,10 +205,10 @@ console.log("\n§4.3 — the guest realm has an execution budget");
     ? new Promise((r) => setTimeout(() => r(new Uint8Array([1])), 400))
     : new Uint8Array();
   const waiter = await createSafeRealm({
-    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); });',
+    source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([9]); }',
     hostCall: slowSeam, deadlineMs: 200,
   });
-  const out = await waiter.call("go", new Uint8Array());
+  const out = await waiter.call(new Uint8Array());
   ok(out.length === 1 && out[0] === 9, "an initiator parked 400ms on a 200ms budget still completes");
   waiter.dispose();
 
@@ -217,12 +217,11 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // than on what the initiator left (§12.3).
   const order = [];
   const both = await createSafeRealm({
-    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });'
-          + 'register("handle", () => new Uint8Array([2]));',
+    source: 'async function handle(a) { if (a[0] === 1) { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); } return new Uint8Array([2]); }',
     hostCall: slowSeam, deadlineMs: 200,
   });
-  const parked = both.call("go", new Uint8Array()).then((r) => { order.push("initiator"); return r; });
-  const holder = both.call("handle", new Uint8Array()).then((r) => { order.push("holder"); return r; });
+  const parked = both.call(new Uint8Array([1])).then((r) => { order.push("initiator"); return r; });
+  const holder = both.call(new Uint8Array([2])).then((r) => { order.push("holder"); return r; });
   ok((await holder)[0] === 2, "a holder queued behind a parked initiator still runs");
   ok((await parked)[0] === 1, "and the initiator completes on its own budget");
   ok(order[0] === "initiator" && order[1] === "holder",
@@ -232,21 +231,21 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   // The queue does not strand callers on dispose: one still in it fails rather than
   // entering a torn-down realm, which is what aborts the whole wasm module.
   const closing = await createSafeRealm({
-    source: 'register("go", async () => { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); });',
+    source: 'async function handle() { await host.call("slow", new Uint8Array()); return new Uint8Array([1]); }',
     hostCall: slowSeam, deadlineMs: 5000,
   });
-  const first = closing.call("go", new Uint8Array()).catch(() => "failed");
-  const queued = closing.call("go", new Uint8Array()).catch(() => "failed");
+  const first = closing.call(new Uint8Array()).catch(() => "failed");
+  const queued = closing.call(new Uint8Array()).catch(() => "failed");
   closing.dispose();
   ok(await first === "failed", "a parked call is failed by dispose rather than left pending");
   ok(await queued === "failed", "and so is one still waiting in the queue");
 
   // The default is a real number, so forgetting the field bounds the guest rather than
   // unbounding it — the same posture as the seam gates above.
-  const defaulted = await createSafeRealm({ source: 'register("handle", () => { for(;;){} });', hostCall: noop });
+  const defaulted = await createSafeRealm({ source: 'function handle() { for(;;){} }', hostCall: noop });
   let defaultInterrupted = false;
   const t1 = Date.now();
-  try { await defaulted.call("handle", new Uint8Array()); } catch { defaultInterrupted = true; }
+  try { await defaulted.call(new Uint8Array()); } catch { defaultInterrupted = true; }
   ok(defaultInterrupted, "with no deadlineMs configured the 5s default still interrupts");
   ok(Date.now() - t1 >= 4000, "the default budget is the documented 5s, not something tighter");
   defaulted.dispose();
@@ -258,7 +257,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   // passed by none of them, so this boots a node onto a stub realm factory and asserts
   // the numbers arrive. No transport, so nothing here may reach a privilege.
   const kp = testAuthor();
-  const guestSrc = 'register("handle", () => new Uint8Array([1]));';
+  const guestSrc = 'function handle() { return new Uint8Array([1]); }';
   const guestBytes = new TextEncoder().encode(guestSrc);
   const signedConfig = JSON.parse('{"mode":"signed","nested":[true,null,{"n":3}],"__proto__":{"kept":"data"}}');
   const manifest = {
@@ -288,13 +287,13 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const probe = await shell.loadBundleBlob(blob, {
     localConfig: { mode: "local", localOnly: { quota: 7 }, flags: [false, true] },
   });
-  await probe.invoke("probe", new Uint8Array());
+  await probe.invoke(new Uint8Array());
   ok(seen.length === 1, "the shell created a realm for the loaded guest");
   ok(seen[0]?.deadlineMs === 1234, `guestDeadlineMs reaches the realm factory (got ${seen[0]?.deadlineMs})`);
   ok(seen[0]?.memoryLimitBytes === 7 * 1024 * 1024, "realmMemoryBytes reaches the realm factory");
 
   // APP and LOCAL are two provenance-preserving values, not one host-side merge. Evaluate
-  // only the two generated preamble lines (the guest body expects register to exist).
+  // only the two generated preamble lines (the guest body is self-contained).
   const valuesFrom = (source) => Function(
     source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
   )();
@@ -365,7 +364,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
     admit: admitAll,
   });
   const bareProbe = await bare.loadBundleBlob(blob);
-  await bareProbe.invoke("probe", new Uint8Array());
+  await bareProbe.invoke(new Uint8Array());
   ok(seen2 && seen2.deadlineMs === 5000, "an unset budget arrives as the shared default (5000 ms)");
   ok(seen2 && seen2.memoryLimitBytes === 64 * 1024 * 1024, "an unset heap cap arrives as the shared default (64 MiB)");
   bare.close();
@@ -410,17 +409,21 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    // handle reads [caller 32][opLen u8][op][args] through the preamble's callerOf/readOp;
-    // the ops are this app's own vocabulary. timer is the deadline callback, reached by
-    // the shell rather than by invoke.
-    register("handle", (arg) => {
-      const { op, args: p } = readOp(callerOf(arg).body);
+    // handle reads [caller 32][body]: ONE entrypoint, and the body is this app's own
+    // op framing ([opLen u8][op][args]). The TIMER caller id ([1][00...]) carries a bare
+    // [id u32] instead — a deadline the host delivers, reached from the shell rather
+    // than by invoke.
+    function handle(arg) {
+      const c = arg.subarray(0, 32);
+      let fromHost = true, fromTimer = false;
+      for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; if (i === 0 && c[i] === 1) fromTimer = true; break; } }
+      if (fromTimer) { fired.push((arg[32] << 24 | arg[33] << 16 | arg[34] << 8 | arg[35]) >>> 0); return new Uint8Array(0); }
+      const n = arg[32], op = String.fromCharCode(...arg.subarray(33, 33 + n)), p = arg.subarray(33 + n);
       if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
       if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
       if (op === "fired") return new Uint8Array(fired);
       return new Uint8Array(0);
-    });
-    register("timer", (a) => { fired.push(a[3]); return new Uint8Array(0); });
+    }
   `;
   const guestBytes = new TextEncoder().encode(guestSrc);
   const mkBlob = (requires) => {
@@ -444,19 +447,28 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 
   const shell = await newShell();
   const ticker = await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await ticker.invoke("arm", new Uint8Array([7, 5]));    // arm: id 7, in 5ms
+  // The op frame is this app's own format (its `handle` reads it); the invoke below
+  // passes bytes the shell never interprets.
+  const opInput = (op, p = new Uint8Array(0)) => {
+    const out = new Uint8Array(1 + op.length + p.length);
+    out[0] = op.length;
+    for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+    out.set(p, 1 + op.length);
+    return out;
+  };
+  await ticker.invoke(opInput("arm", new Uint8Array([7, 5])));    // arm: id 7, in 5ms
   await sleep(80);
-  const fired = await ticker.invoke("fired", new Uint8Array());
+  const fired = await ticker.invoke(opInput("fired"));
   ok(fired.length === 1 && fired[0] === 7,
     `an app with no transport arms a deadline and its timer entrypoint fires (got [${[...fired]}])`);
 
   // Re-arming a live id replaces the deadline rather than adding one, and `clear` takes
   // it back: the id is the GUEST's throughout, so the host keeps no second name for it.
-  await ticker.invoke("arm", new Uint8Array([9, 5]));
-  await ticker.invoke("arm", new Uint8Array([9, 5]));
-  await ticker.invoke("clear", new Uint8Array([9]));
+  await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
+  await ticker.invoke(opInput("arm", new Uint8Array([9, 5])));
+  await ticker.invoke(opInput("clear", new Uint8Array([9])));
   await sleep(80);
-  const after = await ticker.invoke("fired", new Uint8Array());
+  const after = await ticker.invoke(opInput("fired"));
   ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
   shell.close();
 
@@ -465,7 +477,7 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const ungated = await newShell();
   const ungatedApp = await ungated.loadBundleBlob(mkBlob([]));
   let refused = false;
-  try { await ungatedApp.invoke("arm", new Uint8Array([1, 1])); } catch { refused = true; }
+  try { await ungatedApp.invoke(opInput("arm", new Uint8Array([1, 1]))); } catch { refused = true; }
   ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
   ungated.close();
 
@@ -479,11 +491,11 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
     sodium, identity: kp.ed, modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    createRealm: async (o) => { armed = o.hostCall; return { call: async (n) => { entries.push(n); return new Uint8Array(); }, dispose() {} }; },
+    createRealm: async (o) => { armed = o.hostCall; return { call: async (p) => { entries.push(p.length > 0 && p[0] === 1 ? "timer" : "invoke"); return new Uint8Array(); }, dispose() {} }; },
     admit: admitAll,
   });
   const stubApp = await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
-  await stubApp.invoke("arm", new Uint8Array([0, 0]));
+  await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
   ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");
