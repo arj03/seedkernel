@@ -1,8 +1,8 @@
 // Transport bundle guest: AKE, record layer, link router, request/response (§12.6).
 // Reached only through link/*; reaches no authority but link/*.
 
-const N_SIGN = "link/sign";
-const N_VERIFY = "link/verify";
+const N_SIGN = "node/sign";
+const N_VERIFY = "node/verify";
 const N_RANDOM = "node/random";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
@@ -92,8 +92,8 @@ const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 // This channel format tag seeds the session root AND prefixes every identity-signature
 // payload below. It is transport CONTENT, not a kernel signing domain — which is what lets
 // this program change its handshake format in a bundle update: the host contributes only
-// the opaque scope it chose for this slot (`DOMAIN_link_scope ‖ networkKey`) and reads
-// nothing inside.
+// the opaque scope it chose for this slot (`DOMAIN_link_scope ‖ networkKey` — what THIS
+// slot's `node/sign` signs under) and reads nothing inside.
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
 // Per-suite wire lengths. A later suite changes these and the byte it is keyed by; the
@@ -161,10 +161,10 @@ function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
 /** Ask the host to sign a tagged handshake transcript, under `DOMAIN_link_scope ‖
- *  networkKey` (the prefix is the host's, unconditional for this name) with the node's
- *  channel key, which never enters this program.
+ *  networkKey` (the scope the HOST chose for this slot — what this name signs under) with
+ *  the node's channel key, which never enters this program.
  *
- *  `link/sign` THROWS when the bundle does not reach the authority (guest-seam.ts), so
+ *  `node/sign` THROWS when the bundle does not reach the authority (guest-seam.ts), so
  *  the `{ok}` shape is a real status: catching here lets the caller abort the link
  *  rather than unwind out of a frame-delivery callback and leave the socket open until
  *  it times out. Same idiom as `scalarmult` and `openZero`. */
@@ -582,10 +582,10 @@ class Link {
 
   signIdentity(th) {
     // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
-    // it and prefixes with this slot's network scope, `DOMAIN_link_scope ‖ networkKey` —
+    // it and prefixes this slot's network scope, `DOMAIN_link_scope ‖ networkKey` —
     // which is why the network binding survives a transport that lies about its own root.
     const r = channelSign(this.root, th, ownPk);
-    // The seam refused: no `link/sign` grant. Our own misconfiguration, never anything
+    // The seam refused: no `node/sign` grant. Our own misconfiguration, never anything
     // the peer did, so it aborts — a stall would claim this address went quiet, which is
     // a different fact.
     if (!r.ok) { this.abort(); return null; }
@@ -598,7 +598,7 @@ class Link {
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
     const sig = plain.slice(PK_LEN, PK_LEN + SIG_LEN);
-    // link/verify applies the same host-owned scope this node signs under, so the preimage
+    // node/verify applies the same host-owned scope this node signs under, so the preimage
     // the two ends must agree on is the host's for its prefix half. The channel's format
     // tag is ours, so the two ends reconstruct that half here.
     if (!verify(id, sig, channelIdentityMessage(this.root, th, id))) return null;

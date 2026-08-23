@@ -69,8 +69,6 @@ export const AUTHORITY_CALLS = {
     "link/stat": "link",
     "link/authenticated": "link",
     "link/down": "link",
-    "link/sign": "link",
-    "link/verify": "link",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
 /** Whether a name is one of the host's own authorities — membership in the table above,

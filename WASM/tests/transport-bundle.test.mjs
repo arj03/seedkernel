@@ -78,8 +78,9 @@ function transportBundleAt(version, keys, guestSource) {
     // slot's return convention, not a name to declare.
     guestRequires: [
       "node/random",
+      "node/sign", "node/verify",
       "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down", "link/sign", "link/verify",
+      "link/authenticated", "link/down",
       "timer/arm", "timer/clear",
     ],
   });

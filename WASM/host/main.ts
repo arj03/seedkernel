@@ -123,9 +123,9 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
         sodium: sodium as unknown as ShellSodium,
         identity: opts.identity,
         // The node's network (§12.6): an isolation boundary, so it must reach BOTH the
-        // adapter bootShell constructs and the shell's link signing scope. One field,
-        // one place — forwarding it to only one of the two would sign links under a
-        // network the node is not on.
+        // adapter bootShell constructs and the link slot's signing scope (what the
+        // link occupant's node/sign binds to). One field, one place — forwarding it to
+        // only one of the two would sign links under a network the node is not on.
         networkKey: opts.networkKey,
         fs,
         freshnessStore: freshness,

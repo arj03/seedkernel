@@ -114,8 +114,9 @@ async function main() {
     // a guest seam. What this program needs of them is the `abi` above (§12.1).
     guestRequires: [
       "node/random",
+      "node/sign", "node/verify",
       "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down", "link/sign", "link/verify",
+      "link/authenticated", "link/down",
       "timer/arm", "timer/clear",
     ],
   });

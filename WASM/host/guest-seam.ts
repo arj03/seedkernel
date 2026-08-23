@@ -10,11 +10,11 @@ import type { ModuleResult } from "./bundle.js";
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
 export interface SignScope {
-    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_link_scope` for the slot holding
-     *  the raw-link resource. */
+    /** Domain tag — `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the slot
+     *  holding the raw-link resource. */
     domain: Uint8Array;
-    /** Scope bytes under the domain: `author ‖ app` for an app, the network key for the
-     *  link slot. */
+    /** Scope bytes under the domain: `author ‖ app` for an app slot, the network key for
+     *  the link slot. */
     scope: Uint8Array;
     /** The keypair that signs. */
     key: {
@@ -115,17 +115,12 @@ export interface SeamGrants {
      *  authorities (`isGrant`) pass regardless. Required — pass `UNRESTRICTED_NAMES` to
      *  opt out deliberately. */
     names: Iterable<string> | typeof UNRESTRICTED_NAMES;
-    /** What `node/sign`/`node/verify` sign and check under — this app's own scope
-     *  (`appSignScope`), unconditionally: gaining another privilege never changes what
-     *  these two names mean (§12.5's monotonicity — a grant only ever ADDS an endpoint).
-     *  Without a scope both are unavailable, because guest signing and scoped verification
-     *  are never raw. */
+    /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
+     *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
+     *  the link slot gets `DOMAIN_link_scope ‖ network_key`. The host always chooses
+     *  domain ‖ scope; the guest never supplies either. Without a scope both names are
+     *  unavailable, because guest signing and scoped verification are never raw. */
     signScope?: SignScope;
-    /** What `link/sign`/`link/verify` sign and check under — this node's network scope
-     *  (`linkSignScope`), wired ONLY for a bundle that reaches the `link` privilege. A
-     *  distinct name from `signScope` rather than a second meaning for it, so a slot that
-     *  gains `link` gets a new endpoint, not a changed one. */
-    linkSignScope?: SignScope;
     /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
      *  (`scopedFs`). Optional: a node that only initiates never reads it. */
     fs?: Fs;
@@ -439,20 +434,22 @@ export function linkSignScope(key: {
 }, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_LINK_SCOPE, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
 }
-/** The scopes a slot gets — app always, link additionally when `requires` reach `link`.
- *  A function of admitted facts only: nothing local, and nothing from `protocols`,
- *  which move per version and would silently restate what signed records mean. */
-export function slotSignScopes(node: {
+/** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
+ *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope ‖
+ *  networkKey` for the slot reaching `link` — the network binding of the channel AUTH is a
+ *  fact of the slot, not a second name. A function of admitted facts only: nothing local,
+ *  and nothing from `protocols`, which move per version and would silently restate what
+ *  signed records mean. */
+export function slotSignScope(node: {
     identity: {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
     networkKey?: Uint8Array;
-}, author: Uint8Array, app: string, privileges: readonly Privilege[]): { app: SignScope; link?: SignScope } {
-    return {
-        app: appSignScope(node.identity, author, app),
-        link: privileges.includes(PRIVILEGE_LINK) ? linkSignScope(node.identity, node.networkKey) : undefined,
-    };
+}, author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
+    return privileges.includes(PRIVILEGE_LINK)
+        ? linkSignScope(node.identity, node.networkKey)
+        : appSignScope(node.identity, author, app);
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
@@ -501,10 +498,11 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // resolved past the end of this table.
         ...cryptoCatalog(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
-        // node/sign and node/verify are scoped, never raw, and always to THIS app's own
-        // scope (see `SignScope`) — unconditionally, whatever else the slot reaches, so a
-        // guest checks signatures without ever reconstructing host-owned bytes and without
-        // another grant ever changing what these two names mean.
+        // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope
+        // (see `SignScope`) — derived at load: an app slot's own `DOMAIN_guest ‖ author ‖
+        // app`, the link slot's `DOMAIN_link_scope ‖ network_key`. The host chooses what
+        // the name signs under, so the guest never reconstructs host-owned bytes and never
+        // picks a namespace for itself.
         "node/sign": (payload) => {
             const s = grants.signScope;
             if (!s)
@@ -604,29 +602,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         "link/down": (payload) => {
             rawNet().down(readU32BE(payload, 0), payload[4]);
             return NONE;
-        },
-        // link/sign and link/verify are node/sign and node/verify's twins, scoped to the
-        // NETWORK rather than the app: `DOMAIN_link_scope ‖ networkKey`, wired only for a
-        // slot reaching `link`. A distinct name rather than a second meaning for node/sign,
-        // so a slot that gains `link` gains an endpoint, never a changed one.
-        "link/sign": (payload) => {
-            const s = grants.linkSignScope;
-            if (!s)
-                throw new Error("guest-seam: link/sign needs the link-privileged slot's network scope (signing is never raw)");
-            return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
-        },
-        "link/verify": (payload) => {
-            const s = grants.linkSignScope;
-            if (!s)
-                throw new Error("guest-seam: link/verify needs the link-privileged slot's network scope (verification is never raw)");
-            if (payload.length < 96)
-                throw new Error("guest-seam: link/verify takes [pk 32][sig 64][msg ..]");
-            try {
-                return sodium.crypto_sign_verify_detached(payload.slice(32, 96), concatBytes([s.domain, s.scope, payload.slice(96)]), payload.slice(0, 32)) ? ONE : ZERO;
-            }
-            catch {
-                return ZERO;
-            }
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {
