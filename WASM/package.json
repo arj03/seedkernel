@@ -28,6 +28,10 @@
       "types": "./build/core/fs.d.ts",
       "default": "./build/core/fs.js"
     },
+    "./op-frame": {
+      "types": "./build/core/op-frame.d.ts",
+      "default": "./build/core/op-frame.js"
+    },
     "./fs-memory": {
       "types": "./build/host/fs-memory.d.ts",
       "default": "./build/host/fs-memory.js"
