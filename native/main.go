@@ -1,11 +1,8 @@
-// seedkernel native shell. The shell itself — verify/admit/install, the guest seam,
-// the confined guest's lifecycle, protocol dispatch, and the operator flow (host/cli.ts)
-// — is the shared host TS, embedded as host-shell.gen.js and run in QuickJS (README §12.9).
-//
-// This Go layer is the bridge and only the bridge: the module table (§3), the crypto,
-// the fs backend, the sockets, the second QuickJS realm, and the process's own
-// facilities (argv, files, stdout). Nothing here decides anything an operator can see.
-// Pure Go, no cgo (QuickJS is quickjs-ng wasm over qjs/) → one static binary.
+// seedkernel native shell. The shell itself — verify/admit/install, the guest seam, and
+// the operator flow (host/cli.ts) — is the shared host TS, embedded as host-shell.gen.js
+// and run in QuickJS (README §12.9). The Go layer is only the bridge: module table (§3),
+// crypto, fs, sockets, the second QuickJS realm (guest.go). Pure Go, no cgo → one static
+// binary.
 package main
 
 import (
@@ -27,11 +24,9 @@ import (
 	"github.com/tetratelabs/wazero/api"
 )
 
-// hostShellJS is the shared shell plus the native platform binding over it
-// (host/native-shim.ts) — the same compiled TS the Node shell runs, so no rule of the
-// protocol is re-derived in a second language (README §12.9). Bundled from
-// build/host/*.js by scripts/bundle-loader.mjs: regenerate with
-// `npm run build:loader-bundles`, never hand-edit.
+// hostShellJS is the shared shell plus the native platform binding (host/native-shim.ts)
+// — the same TS the Node shell runs, so no rule of the protocol is re-derived in a second
+// language (README §12.9). Bundled by scripts/bundle-loader.mjs, never hand-edited.
 //
 //go:embed host-shell.gen.js
 var hostShellJS string
@@ -46,28 +41,19 @@ type boundModule struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// defaultModuleCallDeadline bounds one module invocation (PROTOCOL §4.3, SECURITY §14).
-// The number is the shared guest budget (core/wasm-limits.ts DEFAULT_GUEST_DEADLINE_MS):
-// a module call is charged to the calling guest's segment (§12.3), so a looser bound
-// would be one the guest budget already made unreachable.
-//
-// Arming it costs ~1.1–1.2x on the paths modules sit on (module_bound_bench_test.go,
-// SECURITY §14) — a termination check compiled into every loop of every module on the
-// runtime, and those numbers need the patched wazero in the go.mod replace.
-// SEEDKERNEL_MODULE_DEADLINE_MS overrides; 0 means no bound and leaves the runtime
-// unarmed, so turning the lever off stops paying the checks too.
+// defaultModuleCallDeadline bounds one module invocation (§4.3, SECURITY §14). It is the
+// shared guest budget (DEFAULT_GUEST_DEADLINE_MS); arming the termination check costs
+// ~1.1–1.2x on module paths (module_bound_bench_test.go). SEEDKERNEL_MODULE_DEADLINE_MS
+// overrides; 0 means no bound and no arming.
 const defaultModuleCallDeadline = 5 * time.Second
 
 var (
 	ctx = context.Background()
-	// rt holds every installed app module and the env shims they import. This is the
-	// runtime the module-call bound arms (boot): its modules are the untrusted code the
-	// bound exists for.
+	// rt holds every installed app module and the env shims they import: the untrusted
+	// code the module-call bound arms (boot).
 	rt wazero.Runtime
-	// rtCore is the TCB's own runtime — libsodium, ML-DSA, ML-KEM — deliberately NOT
-	// armed. A wedged libsodium is a host bug, not a confinement breach, and the
-	// termination check is not free (see defaultModuleCallDeadline), so the bound is
-	// billed to app modules rather than to the crypto every node runs.
+	// rtCore is the TCB's own runtime (libsodium, ML-DSA, ML-KEM), deliberately not armed:
+	// a wedged libsodium is a host bug, not a confinement breach.
 	rtCore wazero.Runtime
 	qc     *qjs.Context
 	qrt    *qjs.Runtime
@@ -88,10 +74,8 @@ var (
 // DEFAULT_SCRATCH_SIZE) with every slot build, so Go owns no copy that could drift from
 // the JS table's. A module needing more exports a `scratchSize` global.
 
-// replaceModuleSlot replaces one opaque handle's whole module set. Also the one place a
-// displaced instance is closed:
-// wazero frees neither the instance nor its compiled code, so dropping the map value
-// alone leaks a linear memory + its JITed code per re-install.
+// replaceModuleSlot replaces one opaque handle's whole module set. wazero frees neither
+// instances nor compiled code, so dropping the map value alone leaks per re-install.
 func replaceModuleSlot(slot string, mods map[string]*boundModule) {
 	disposeModuleSlot(slot)
 	moduleSlots[slot] = mods
@@ -116,25 +100,22 @@ func disposeModuleSlot(slot string) int {
 	return len(mods)
 }
 
-// callModule invokes one app's module by its logical name (README §4), returning its
-// response or nil if nothing is bound there or the module produced nothing. The one way
-// into an installed module, for the shell and for the guest seam's bare-name calls
-// (§12.2). Modules are pure transforms and cannot call back, so there is no re-entrancy
-// to guard.
+// callModule invokes one app's module by logical name (README §4), returning its response
+// or nil if nothing is bound there. Modules are pure transforms and cannot call back, so
+// there is no re-entrancy to guard.
 func callModule(slot, module string, payload []byte) []byte {
 	w := moduleSlots[slot][module]
 	if w == nil {
 		return nil
 	}
-	// §4: write input at the scratch offset, call handle(input_len), read the response
-	// back from the same offset. Both copies are clamped to what the module reserved
-	// (§4.1) — writing past it would scribble whatever it keeps beyond scratch.
+	// §4: write input at scratch, call handle(input_len), read the response back. Both
+	// copies are clamped to what the module reserved (§4.1) — writing past it would
+	// scribble whatever it keeps beyond scratch.
 	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
 		return nil
 	}
-	// The runtime is armed with WithCloseOnContextDone, so this deadline is what gives
-	// the §4.3 bound teeth: a module that never returns is interrupted at its next loop
-	// back-edge rather than holding the thread forever.
+	// The runtime is armed with WithCloseOnContextDone, which is what gives the §4.3
+	// bound teeth: a module that never returns is interrupted at its next loop back-edge.
 	callCtx, cancel := ctx, func() {}
 	if moduleCallDeadline > 0 {
 		callCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
@@ -142,18 +123,17 @@ func callModule(slot, module string, payload []byte) []byte {
 	r, err := w.fn.Call(callCtx, uint64(len(payload)))
 	cancel()
 	if err != nil {
-		// A trap leaves the module alive and a later call retries; a context-done
-		// termination CLOSED it. Evict the wedged one so the app stops silently
-		// answering empty and a reinstall recovers it.
+		// A trap leaves the module alive (retriable); a context-done termination closed
+		// it. Evict the wedged one so a reinstall recovers it.
 		if w.mod.IsClosed() {
 			closeModule(w)
 			delete(moduleSlots[slot], module)
 		}
 		return nil
 	}
-	// handle returns output_len ≥ 0 (README §4), so only a trap (above) or a negative
-	// length is a failure. A 0-length result is a valid EMPTY response and returns a
-	// non-nil slice, which is how a caller tells it from "no module / trap" (nil).
+	// handle returns output_len ≥ 0 (README §4); a 0-length result is a valid EMPTY
+	// response and returns a non-nil slice, which is how a caller distinguishes it from
+	// "no module / trap" (nil).
 	if len(r) == 0 {
 		return nil
 	}
@@ -163,8 +143,8 @@ func callModule(slot, module string, payload []byte) []byte {
 	}
 	out := make([]byte, outLen)
 	if len(out) > 0 {
-		// A length past the module's own memory is as bogus as an oversized payload
-		// above — fail rather than return zero-filled bytes.
+		// A length past the module's memory is as bogus as an oversized payload — fail
+		// rather than return zero-filled bytes.
 		b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
 		if !ok {
 			return nil
@@ -174,12 +154,9 @@ func callModule(slot, module string, payload []byte) []byte {
 	return out
 }
 
-// buildModuleSlot constructs one opaque slot's modules, all or none (README §3.1) —
-// reached from JS as bridge.buildModules.
-//
-// The transaction is HERE rather than in the loader because this is the side holding the
-// half-built instances: a bundle rejected at its third module has to close the first
-// two, and a caller that forgot would leak a linear memory plus its JITed code.
+// buildModuleSlot constructs one opaque slot's modules, all or none (README §3.1),
+// reached from JS as bridge.buildModules. The transaction is here because this is the
+// side holding the half-built instances, which a rejected bundle must close itself.
 func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault uint32) error {
 	built := make(map[string]*boundModule, len(wasms))
 	for i, wasm := range wasms {
@@ -205,10 +182,9 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
 	modSeq++
-	// Under the same bound as a call: instantiation RUNS the module's start section, so
-	// an initializer that never returns wedges the host at BIND — the one place the
-	// call-time deadline cannot reach (module-table.ts bounds its load for the same
-	// reason). Cancelled on return: the context bounds this invocation, not the module.
+	// Instantiation runs the module's start section, so a never-returning initializer
+	// is bound at BIND the same way module-table.ts bounds its load, at the one place a
+	// call-time deadline cannot reach. The context bounds only this invocation.
 	instCtx, cancel := ctx, func() {}
 	if moduleCallDeadline > 0 {
 		instCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
@@ -231,9 +207,9 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 	if g == nil || fn == nil || m.Memory() == nil {
 		return nil, fmt.Errorf("missing exports: memory=%v scratch=%v handle=%v", m.Memory() != nil, g != nil, fn != nil)
 	}
-	// §4.1: the module reserves [scratch, scratch+size), and MAY export `scratchSize` to
-	// declare more than the default — honored only if it names real, in-bounds memory and
-	// never below the default. A negative i32 arrives as a huge uint32 the bounds refuse.
+	// §4.1: the module reserves [scratch, scratch+size); an exported `scratchSize` is
+	// honored only if in-bounds and never below the default. A negative i32 arrives as a
+	// huge uint32 the bounds refuse.
 	mem, s := uint64(m.Memory().Size()), uint32(g.Get())
 	if s == 0 || uint64(s)+uint64(scratchDefault) > mem {
 		return nil, fmt.Errorf("scratch offset %d out of bounds (mem %d)", s, mem)
@@ -256,9 +232,8 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
 // moduleDeadlineFromEnv resolves the module-call bound, falling back to the armed
-// default. Native-only configuration (like GOMAXPROCS): the JS targets reach the same
-// bound through their own lever, so there is no shared knob or CLI flag for it. 0 means
-// no bound and no arming, which is the way to turn the default off.
+// default; 0 means no bound and no arming. Native-only configuration: the JS targets
+// reach the same bound through their own lever.
 func moduleDeadlineFromEnv() (time.Duration, error) {
 	v := os.Getenv("SEEDKERNEL_MODULE_DEADLINE_MS")
 	if v == "" {
@@ -272,12 +247,8 @@ func moduleDeadlineFromEnv() (time.Duration, error) {
 }
 
 // boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
-// event loop, the platform primitives, and then the ONE shared bundle. No node yet and
-// not even a data directory — `--dir` is the operator's, so host/cli.ts reads it and
-// calls `__fs.open` on its way to standing a node up.
-//
-// Idempotent: the tests boot repeatedly in one process, and each boot releases the
-// previous one's engines.
+// event loop, the platform primitives, then the ONE shared bundle. No node yet — `--dir`
+// is the operator's (§12.9). Idempotent: each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
 	var err error
@@ -294,16 +265,9 @@ func boot() error {
 	// ML-KEM-768 for the primitive catalog (§14.1) — provisioned ahead of any caller,
 	// because a primitive is the one thing a bundle cannot deliver (mlkem.go).
 	mk = bootMlKem(rtCore)
-	// The only host imports an installed module takes are its language runtime's shims —
-	// for AssemblyScript the three below, exactly the set the JS host resolves
-	// (WASM/host/module-table.ts). Resolving a subset would make "does this module load"
-	// a property of which target it landed on. There is no dispatch callback: a module is
-	// a pure transform (README §4) and cannot call out.
-	//
-	// All three are inert, which is what keeps them shims rather than a seam. `seed` is a
-	// constant, not the clock (§4.2 — entropy arrives in the input); `trace` drops its
-	// arguments, so a module's only effect stays the bytes it returns (§4.3); `abort`
-	// need not trap, since AS emits `unreachable` right after the call.
+	// AssemblyScript's three imports, exactly the set the JS host resolves (a subset would
+	// make "does this module load" a property of the target). All inert — `seed` is a
+	// constant (§4.2), `trace` drops args (§4.3), `abort` need not trap.
 	env := rt.NewHostModuleBuilder("env")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module, uint32, uint32, uint32, uint32) {}).Export("abort")
 	env.NewFunctionBuilder().WithFunc(func(context.Context, api.Module) float64 { return 0 }).Export("seed")
@@ -317,10 +281,8 @@ func boot() error {
 	}
 	qc = qrt.Context()
 	el = newEventLoop(qc)
-	// The shared bundle is evaluated LAST: its module scope reaches for some of the
-	// primitives below (the console sink, the ws codec backend) straight away. The Web
-	// globals it also needs at load time come from its own first module,
-	// host/native-polyfills.ts — which is why nothing installs them from here.
+	// The shared bundle evaluates LAST: its module scope already reaches for the
+	// primitives above, and its load-time Web globals come from host/native-polyfills.ts.
 	exposeSodium(qc, sd)
 	exposeFs(qc)
 	nh := exposeNet(qc, el)
@@ -409,9 +371,8 @@ func exposeBridge(qc *qjs.Context) {
 	}))
 
 	// ── the operator's world (host/cli.ts) ──
-	// Files, arguments and stdout, and not one of them decides anything: which files get
-	// read, what the flags are called, and what gets printed in what order is the shared
-	// CLI's, the same module the Node shell runs.
+	// Files, arguments and stdout: which files get read and what gets printed is the
+	// shared CLI's, the same module the Node shell runs.
 	b.SetPropertyStr("argv", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		// JSON rather than a joined string: an argument may contain any byte, including
 		// whatever separator a join would pick.
@@ -424,8 +385,7 @@ func exposeBridge(qc *qjs.Context) {
 	b.SetPropertyStr("readFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		fb, err := os.ReadFile(argString(t, 0))
 		if err != nil {
-			// null is "absent", a branch the CLI takes (a --key file on a first boot),
-			// not a failure to report from here.
+			// null is "absent" (a --key file on a first boot), not a failure to report.
 			return t.Context().NewNull(), nil
 		}
 		return t.Context().NewArrayBuffer(fb), nil
@@ -435,20 +395,16 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		// Atomic for every caller: a truncated freshness file reads back as "no marks"
-		// (silently dropping every downgrade guard), and a truncated key file is a node
-		// whose identity changed.
+		// Atomic for every caller: a truncated freshness file reads back as "no marks",
+		// silently dropping every downgrade guard.
 		if err := writeFileAtomic(argString(t, 0), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
 			return nil, err
 		}
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("log", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		// The realm's own console.log writes to a WASI stdout wazero leaves
-		// disconnected, so operator output comes back out through here — to STDERR,
-		// because stdout is the data channel (`--op` writes an app's raw response bytes
-		// there, which an interleaved line would corrupt). The Node target uses
-		// console.error for the same reason.
+		// The realm's console.log writes to a WASI stdout wazero leaves disconnected, so
+		// operator output returns via stderr — stdout is `--op`'s raw data channel.
 		fmt.Fprintln(os.Stderr, argString(t, 0))
 		return t.Context().NewUndefined(), nil
 	}))
@@ -467,9 +423,8 @@ func exposeBridge(qc *qjs.Context) {
 		return t.Context().NewUndefined(), nil
 	}))
 	b.SetPropertyStr("stdin", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		// `--op`'s argument, read whole. cli.ts calls this lazily, so a node that boots
-		// and serves never waits on a stdin nobody will write to. A read error is the
-		// same answer as an empty pipe: this op takes no argument.
+		// `--op`'s argument, read whole; cli.ts calls this lazily, so a serving node never
+		// waits on stdin. A read error answers the same as an empty pipe.
 		bytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			bytes = nil
@@ -483,10 +438,9 @@ func exposeBridge(qc *qjs.Context) {
 
 // ───────────────────────── driving the shell ─────────────────────────
 
-// callRealm drives one of the shim's entry points (host/native-shim.ts) to completion:
-// it stages the arguments as __a0…__aN in the host realm, evaluates `name(__a0, …)`, and
-// pumps the loop until the returned promise settles. Every Go→shell call goes through
-// here, so no call site has to splice a value into JS source.
+// callRealm drives one of the shim's entry points (host/native-shim.ts): it stages the
+// arguments as __a0…__aN, evaluates `name(__a0, …)`, and pumps the loop until the
+// promise settles. Every Go→shell call goes through here.
 func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, error) {
 	if qc == nil {
 		return nil, errors.New("seedkernel: boot has not run")
@@ -504,8 +458,7 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 	}
 	defer func() {
 		// Release the staged arguments: SetPropertyStr took their references and a slot
-		// is only re-set by the NEXT callRealm, so a process that never calls again (the
-		// one-shot --op) would leave every payload rooted on the global object.
+		// is only re-set by the next callRealm, so a one-shot --op would leak payloads.
 		undef := qc.NewUndefined()
 		for _, slot := range slots {
 			qc.Global().SetPropertyStr(slot, undef)
@@ -524,20 +477,12 @@ func callRealm(name string, timeout time.Duration, args ...*qjs.Value) ([]byte, 
 // ───────────────────────── entry ─────────────────────────
 
 // main is the whole of this target's startup: stand the engines up, evaluate the one
-// shared bundle, and run the operator flow inside it.
-//
-// There is no CLI here. The flags, their defaults, the order a node does things in and
-// the lines it prints are host/cli.ts — the same module the Node shell runs. Native is an
-// embedding, so the only decision left below is Go's alone: whether to keep the event
-// loop running, which is what `serving` answers.
+// shared bundle, run the operator flow inside it. No CLI — the flags and the lines it
+// prints are host/cli.ts. The only Go decision is whether to keep the loop running.
 func main() {
-	// One P by default: every QuickJS/wasm instruction already runs on the single
-	// event-loop goroutine, so extra Ps serve only the socket goroutines — and cost
-	// idle-P wakeups and cross-CPU migrations on every message. Measured on real cohorts:
-	// bulk PUT/GET ties the multi-P default, request round-trip latency halves, and 2–3
-	// Ps (the Go default on a small VPS, the typical holder box) is the pathological
-	// setting, +30–50% and erratic. An explicit GOMAXPROCS still wins — this is a
-	// default, not a cap.
+	// One P by default: all QuickJS/wasm work already runs on the event-loop goroutine,
+	// so extra Ps serve only socket goroutines and cost idle-P wakeups per message (2–3
+	// Ps is the pathological setting, +30–50% on measured cohorts). Not a cap.
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(1)
 	}
@@ -545,14 +490,9 @@ func main() {
 		fatal("boot", err)
 		return
 	}
-	// runMain resolves once the node is up, the remedies are applied, the bundle is loaded
-	// and any --op has run. Anything the operator got wrong arrives here as an error and
-	// is fatal: a script driving the loader must see it rather than watch a node come up
-	// as a silent bundle-less relay.
-	//
-	// No watchdog (timeout 0): the steps that can genuinely hang carry their own deadlines,
-	// so an outer cap would only add a way to fail an `--op` that was merely slow — and
-	// the Node shell is unbounded here too.
+	// runMain resolves once the node is up and any `--op` has run; operator errors arrive
+	// here as errors a driving script must see. No watchdog (timeout 0): the hanging steps
+	// carry their own deadlines, and the Node shell is unbounded here too.
 	out, err := callRealm("runMain", 0)
 	if err != nil {
 		fatal("seedkernel", err)

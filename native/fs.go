@@ -1,7 +1,6 @@
 // fs.go — the Go target's `fs.*` platform primitive: raw bytes under an opaque flat key,
-// one file per key under the data directory `__fs.open` names. Content-addressing and
-// quota are the storage guest's business, layered on top. Mirrors host/fs-node.ts
-// (NodeFs), so a Go node's on-disk store behaves like a Bun node's.
+// one file per key under the data directory `__fs.open` names. Mirrors host/fs-node.ts
+// (NodeFs), so a Go node's store behaves like a Bun node's.
 package main
 
 import (
@@ -13,29 +12,18 @@ import (
 	"seedloader/qjs"
 )
 
-// fsKeySafe is the BACKSTOP, not the rule: which keys are legal is `isSafeFsKey` in
-// WASM/core/fs.ts, applied over this backend by `validatedFs` before a key reaches Go. It
-// lives there because it is a consensus predicate — which keys a node admits decides which
-// blocks it stores and advertises, so a rule invented here is how a Go node and a Bun node
-// come to disagree about their contents.
-//
-// A key becomes a filename verbatim under f.dir, so this transcribes the SAME predicate
-// rather than approximating it: a laxer backstop protects against nothing (the previous
-// one passed "CON" and "NUL.txt", so a regression in `validatedFs` would have let a
-// Windows fs.get open the console device and hang the event loop). Drift is bounded by
-// direction — this side may only be as strict or stricter, so a divergence refuses a key
-// the shared rule admits rather than admitting one it refuses.
-//
-// The empty key matters for a reason of this layer's own: filepath.Join(dir, "") is the
-// DATA DIRECTORY, so an unchecked "" would make delete("") an os.Remove of the store. The
-// charset's exclusion of '\n' also carries list()'s serialization.
+// fsKeySafe is the BACKSTOP, not the rule: which keys are legal is `isSafeFsKey`
+// (WASM/core/fs.ts, a consensus predicate) over this backend. It transcribes that
+// predicate only ever as strict or stricter, so a divergence refuses a key the shared
+// rule admits rather than admitting one it refuses (a laxer backstop once passed "CON".
+// It covers "" because filepath.Join(dir, "") is the data directory itself, and '\n'
+// because list() serializes on newlines.
 func fsKeySafe(k string) bool {
 	if k == "" || k == "." || k == ".." {
 		return false
 	}
-	// SAFE_CHARS byte-wise: every legal character is ASCII, so a byte outside the set —
-	// including every byte of a multi-byte rune — refuses the key, exactly as the shared
-	// regex refuses a non-ASCII code point.
+	// SAFE_CHARS byte-wise: every legal character is ASCII, so any byte outside the set
+	// (including multi-byte runes) refuses the key, as the shared regex does.
 	for i := 0; i < len(k); i++ {
 		c := k[i]
 		ok := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
@@ -48,8 +36,8 @@ func fsKeySafe(k string) bool {
 }
 
 // reservedDeviceNames are the names Windows resolves to a DEVICE before the request
-// reaches a filesystem. Refused on every OS, because the key space must not depend on
-// where a node runs (core/fs.ts RESERVED_DEVICE_NAMES).
+// reaches a filesystem. Refused on every OS — the key space must not depend on where a
+// node runs (core/fs.ts RESERVED_DEVICE_NAMES).
 var reservedDeviceNames = func() map[string]bool {
 	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
 	for i := '0'; i <= '9'; i++ { // COM0/LPT0 are reserved on current Windows too
@@ -60,8 +48,7 @@ var reservedDeviceNames = func() map[string]bool {
 }()
 
 // reservedDeviceName mirrors core/fs.ts isReservedDeviceName: Windows ignores the
-// extension, so the stem before the FIRST '.' decides it — "NUL.txt" is still NUL.
-// ToUpper is applied to a string the charset above has already proved ASCII.
+// extension, so the stem before the first '.' decides it ("NUL.txt" is still NUL).
 func reservedDeviceName(k string) bool {
 	stem := k
 	if d := strings.IndexByte(k, '.'); d >= 0 {
@@ -70,14 +57,13 @@ func reservedDeviceName(k string) bool {
 	return reservedDeviceNames[strings.ToUpper(stem)]
 }
 
-// fsTmpPrefix marks the scratch files put() writes before renaming onto a key. Its '~' is
-// forbidden by the shared key charset, so a temp name can never collide with a real key,
-// and list()/scanUsed() skip it so an orphaned temp is never mistaken for a stored block.
+// fsTmpPrefix marks put()'s scratch files before the rename onto a key: its '~' is
+// forbidden by the shared key charset, so a temp can never collide with a real key.
 const fsTmpPrefix = "~put-"
 
-// nodeFs is driven only from the event-loop goroutine, so `used` needs no
-// synchronization. It is the live total size of all regular files, seeded by one scan at
-// open and kept current by put/delete so stat() is O(1).
+// nodeFs is driven only from the event-loop goroutine, so `used` needs no lock: it is the
+// live total size of all regular files, seeded at open, kept current by put/delete, so
+// stat() is O(1).
 type nodeFs struct {
 	dir  string
 	used int64
@@ -93,7 +79,7 @@ func newNodeFs(dir string) (*nodeFs, error) {
 }
 
 // scanUsed sums the size of every regular file in the data dir — the one full walk, at
-// open, to seed the cached counter.
+// open, to seed the cached counter. Reclaims temp files orphaned by an earlier crash.
 func (f *nodeFs) scanUsed() (used int64) {
 	entries, _ := os.ReadDir(f.dir)
 	for _, e := range entries {
@@ -113,9 +99,7 @@ func (f *nodeFs) scanUsed() (used int64) {
 
 // path is the one place a key becomes a filename, so it is also where the CLOSED store is
 // refused: `f` is nil until `__fs.open` names a directory, and a nil receiver turns every
-// get/size/delete into the miss they answer for an unsafe key. Refusing at the join means
-// no future caller reaches the disk by forgetting a guard — a nil `f.dir` would otherwise
-// join to the key alone, i.e. the process's working directory.
+// get/size/delete into a miss instead of joining to the working directory.
 func (f *nodeFs) path(key string) (string, bool) {
 	if f == nil || !fsKeySafe(key) {
 		return "", false
@@ -151,11 +135,9 @@ func (f *nodeFs) put(key string, b []byte) error {
 	if fi, err := os.Stat(p); err == nil {
 		old = fi.Size()
 	}
-	// Atomic: a crash mid-write must not leave a short block that size() ≥ 0 still reports
-	// as held, which the node would advertise and then fail the verification-fetch on. At
-	// worst a crash orphans the temp, which scanUsed reclaims at open. No fsync — the
-	// property needed is crash-atomicity, not power-loss durability (a lost block is
-	// content-addressed and re-fetched), and an fsync per put would tax the hot path.
+	// Atomic: a crash mid-write must not leave a short block size() still reports as held.
+	// No fsync — the property needed is crash-atomicity, not durability (a lost block is
+	// content-addressed and re-fetched), and fsync per put would tax the hot path.
 	if err := writeFileAtomic(p, b, fsTmpPrefix, 0o644); err != nil {
 		return err
 	}
@@ -169,8 +151,7 @@ func (f *nodeFs) put(key string, b []byte) error {
 
 // writeFileAtomic writes b to path via a sibling temp file + rename, so a reader (or a
 // crash) sees only the old or the complete new contents. mode 0 keeps CreateTemp's 0600
-// (the freshness store); otherwise the temp is chmod'd before the rename. Every error path
-// closes the handle before removing the temp, so no descriptor leaks.
+// (the freshness store); otherwise the temp is chmod'd before the rename.
 func writeFileAtomic(path string, b []byte, tmpPrefix string, mode os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), tmpPrefix+"*")
 	if err != nil {
@@ -254,8 +235,8 @@ func (f *nodeFs) delete(key string) bool {
 	return true
 }
 
-// stat returns the cached used-bytes total, avoiding the O(N) directory walk the storage
-// guest's per-offer admission check would otherwise pay. A closed store holds nothing.
+// stat returns the cached used-bytes total, avoiding the O(N) walk the storage guest's
+// per-offer admission check would otherwise pay. A closed store holds nothing.
 func (f *nodeFs) stat() int64 {
 	if f == nil {
 		return 0
@@ -263,13 +244,10 @@ func (f *nodeFs) stat() int64 {
 	return f.used
 }
 
-// exposeFs installs `__fs` into the realm: Go byte primitives, ArrayBuffer in and out.
-// Shaping them into the async core/fs.ts `Fs` seam is host/native-shim.ts, and the key
-// rule is applied above that by the shell (`validatedFs`).
-//
-// The backend starts CLOSED until `__fs.open` names a directory — the operator's `--dir`,
-// read by host/cli.ts. Until then every read answers empty and every write refuses, rather
-// than a half-configured node quietly storing blocks somewhere nobody asked for.
+// exposeFs installs `__fs` into the realm: Go byte primitives, ArrayBuffer in and out;
+// shaping them into the async core/fs.ts `Fs` seam is host/native-shim.ts. The backend
+// starts CLOSED until `__fs.open` names the operator's `--dir`: a half-configured node
+// must not quietly store blocks somewhere nobody asked for.
 func exposeFs(qc *qjs.Context) {
 	var fs *nodeFs
 	o := qc.NewObject()
@@ -309,9 +287,8 @@ func exposeFs(qc *qjs.Context) {
 		if len(t.Args()) > 0 && !t.Args()[0].IsUndefined() && !t.Args()[0].IsNull() {
 			prefix = argString(t, 0)
 		}
-		// One \n-joined string, split back by the shim: building a JS array here costs an
-		// engine call plus a C string per key, so a store with tens of thousands of blocks
-		// paid that many crossings per listing. The shared key charset forbids '\n'.
+		// One \n-joined string, split back by the shim: building a JS array here would
+		// cost an engine call plus a C string per key. The charset forbids '\n'.
 		return t.Context().NewString(strings.Join(fs.list(prefix), "\n")), nil
 	}))
 	o.SetPropertyStr("delete", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
@@ -320,14 +297,12 @@ func exposeFs(qc *qjs.Context) {
 	o.SetPropertyStr("stat", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		s := t.Context().NewObject()
 		s.SetPropertyStr("used", t.Context().NewInt64(fs.stat()))
-		// -1: no portable free-disk figure. The shim maps it to the seam's sentinel
-		// (FS_AVAILABLE_UNKNOWN, core/fs.ts), so Go holds no copy of that value.
+		// -1: no portable free-disk figure; the shim maps it to FS_AVAILABLE_UNKNOWN
+		// (core/fs.ts), so Go holds no copy of that value.
 		s.SetPropertyStr("available", t.Context().NewInt64(-1))
 		return s, nil
 	}))
 	qc.Global().SetPropertyStr("__fs", o)
 }
 
-// Go stops at the primitive. The shaping — get's null/Uint8Array, list's \n-joined string
-// back into a string[] — and the wrap presenting it as the async `Fs` seam both live in
-// host/native-shim.ts: adaptation rather than platform.
+// Go stops at the primitive; the shaping and the async `Fs` wrap live in host/native-shim.ts.

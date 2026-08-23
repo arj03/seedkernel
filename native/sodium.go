@@ -1,24 +1,13 @@
 // sodium.go — the Go target's crypto *primitive*: the same browser/libsodium.wasm, driven
-// over wazero. The point is interop — a Go node's sealed boxes, ed25519→curve25519
-// conversions and xchacha20 blocks must be byte-identical to a Bun node's, which only the
-// exact same binary guarantees. This file is the FFI seam over the emscripten ABI plus a
-// `sodium` object carrying libsodium-wrappers method names, so the shared host JS calls
-// `sodium.*` unchanged.
-//
-// Two primitives run on native Go instead, under the native fast-path rule (§12.9). Which
-// took it and what pins them:
-//
-//   - genericHash — BLAKE2b-256, the content-address block-id hash. Pinned by
-//     TestSodiumGenericHash. Every block is hashed on PUT and verified on bulk receive
-//     (§12.6), and it is the one hash wazero runs slower than V8 (~390 vs ~600 MB/s).
-//
-//   - the ChaCha20-Poly1305-IETF record layer (RFC 8439). Pinned by TestSodiumAead,
-//     captured from this build's own binary. Every post-AUTH frame is a seal or an open
-//     (§12.6); native runs it ~8× faster and, needing no scratch arena, takes no lock.
-//
-// Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm on the rule's third condition,
-// not on speed: a verifier's accept/reject boundary is consensus. X25519/scalarmult stays
-// wasm because there is nothing to win — handshake-only, amortized over the link.
+// over wazero, so this file is the FFI seam over the emscripten ABI plus a `sodium` object
+// carrying libsodium-wrappers method names — the shared host JS calls `sodium.*` unchanged
+// and a Go node's output is byte-identical to a Bun node's. Under the native fast-path
+// rule (§12.9), genericHash (BLAKE2b-256, pinned by TestSodiumGenericHash — the one hash
+// wazero runs slower than V8) and the ChaCha20-Poly1305-IETF record layer (RFC 8439,
+// pinned by TestSodiumAead from this build's own binary; ~8× faster, no scratch lock) run
+// on native Go. Ed25519 and ML-DSA-65 (mldsa.go) stay on the shared wasm: a verifier's
+// accept/reject boundary is consensus, and X25519 is handshake-only, amortized over the
+// link.
 package main
 
 import (
@@ -41,21 +30,20 @@ import (
 var sodiumWasm []byte
 
 // libsodium drives the embedded emscripten build. Its exports are minified; the
-// real-name → minified-export map (and the two EM_JS entropy code addresses below)
-// are read from browser/libsodium-core.mjs. Re-derive both if libsodium.wasm is
-// ever rebuilt (`<name>=A.<minified>` for the funcs; `d={<addr>:…}` for entropy).
+// real-name → minified-export map (and the two EM_JS entropy code addresses below) are
+// read from browser/libsodium-core.mjs — re-derive both if libsodium.wasm is rebuilt.
 type libsodium struct {
 	mod api.Module
 	mem api.Memory
 	fns map[string]api.Function
 	// One shared scratch heap and allocator, so an op is a malloc/call/read sequence that
-	// must not interleave with another — and sign/verify are driven from per-connection
-	// goroutines. Held for one op only, never across a callback into JS or Go.
+	// must not interleave with another (sign/verify run on per-connection goroutines).
+	// Held for one op only, never across a callback into JS or Go.
 	mu sync.Mutex
 
-	// Scratch arena reused across ops, replacing the 2–4 malloc/free pairs each one made.
-	// Every op is serialized by mu and needs only its own buffers live, so one
-	// grow-on-demand block with a per-op bump allocator suffices. Guarded by mu.
+	// Scratch arena reused across ops, replacing the 2–4 malloc/free pairs each one made:
+	// ops are serialized by mu, so one grow-on-demand block with a per-op bump allocator
+	// suffices.
 	arena    uint32 // wasm ptr to the scratch block (0 until first grown)
 	arenaCap int    // its size in bytes; grows to the high-water op need, never shrinks
 	bump     int    // next free offset within the arena, rewound to 0 per op
@@ -91,13 +79,13 @@ var sodiumExports = map[string]string{
 	"crypto_box_seal_open":                 "hb",
 	// One export covers the §12.6 AKE's X25519: the transport bundle reaches scalarmult
 	// through the guest seam's `x25519/dh` and derives its ephemeral PUBLIC key with the
-	// same entry against the base point, so there is no keypair primitive to export.
+	// same entry against the base point — no keypair primitive to export.
 	"crypto_scalarmult": "Dg",
 }
 
 // EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes routes
-// through the asm-const import `a.b`, and these two are the only snippets in this build.
-// Satisfied from crypto/rand — the entropy source need not match across nodes.
+// through the asm-const import `a.b`, and these are the only two snippets in this build,
+// satisfied from crypto/rand (the source need not match across nodes).
 const (
 	sodiumRandU32  = 40712 // ()->u32: one random word
 	sodiumRandInit = 40748 // ()->void: lazy RNG init (a no-op here)
@@ -114,8 +102,8 @@ func bootSodium(rt wazero.Runtime) *libsodium {
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) {
 		panic("libsodium: assertion failed")
 	}).Export("a")
-	// a.b — _emscripten_asm_const_int(code,sig,args): the EM_JS dispatcher, which in this
-	// build only ever runs the two entropy snippets, both argument-free.
+	// a.b — _emscripten_asm_const_int: the EM_JS dispatcher, which in this build only
+	// ever runs the two argument-free entropy snippets.
 	a.NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, code, _, _ uint32) uint32 {
 		switch code {
 		case sodiumRandU32:
@@ -180,9 +168,9 @@ func (s *libsodium) malloc(n int) uint32 {
 
 func (s *libsodium) free(p uint32) { s.fns["free"].Call(ctx, uint64(p)) }
 
-// arenaReset ensures the arena can hold total bytes and rewinds the bump allocator. Call
-// once at the top of an op with its total need — Σ alignUp(each buffer) — then take/takeIn
-// the buffers: growing happens only here, never mid-op, so pointers cannot dangle.
+// arenaReset ensures the arena can hold total bytes and rewinds the bump allocator: call
+// once at the top of an op with Σ alignUp(each buffer), then take/takeIn the buffers —
+// growing happens only here, never mid-op, so pointers cannot dangle.
 func (s *libsodium) arenaReset(total int) {
 	if total > s.arenaCap {
 		if s.arena != 0 {

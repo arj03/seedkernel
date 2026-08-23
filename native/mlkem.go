@@ -4,15 +4,14 @@
 // Like mldsa.go this is deliberately NOT a Go implementation; it drives
 // wasm/mlkem768.wasm through wazero. The argument is weaker than ML-DSA's, and worth
 // stating so it is not mistaken for the same one: a KEM is not a verifier, so its
-// accept/reject boundary is not consensus, and implementations disagreeing at the edges
-// only fail to agree on a key. Still a bug found in production rather than at build time,
-// with no capability gained by a second implementation.
+// accept/reject boundary is not consensus — implementations disagreeing at the edges only
+// fail to agree on a key. Still a bug found in production rather than at build time, with
+// no capability gained by a second implementation.
 //
 // It is here before anything calls it: a bundle is replaceable and the vocabulary it draws
-// on is not, so a core primitive is provisioned ahead of need or not at all (§14.1).
-//
-// Like mldsa65.wasm the module has NO imports — the coins are an argument, which is also
-// what keeps the catalog entries pure functions — so instantiation is the whole wiring.
+// on is not, so a core primitive is provisioned ahead of need or not at all (§14.1). The
+// module has NO imports — the coins are an argument, which is what keeps the catalog
+// entries pure functions — so instantiation is the whole wiring.
 
 package main
 
@@ -122,9 +121,9 @@ func (m *mlkem) encapsulate(pk, coins []byte) (ct, ss []byte, ok bool) {
 }
 
 // decapsulate returns ok=false only when the SECRET KEY fails the hash check of FIPS 203
-// §7.3 — never for a bad ciphertext. ML-KEM answers those with a shared secret derived
-// from the key's own z, in constant time, and reporting that apart from success is exactly
-// the oracle implicit rejection exists to deny.
+// §7.3 — never for a bad ciphertext. ML-KEM answers bad ciphertexts with a shared secret
+// derived from the key's own z, in constant time, and reporting that apart from success is
+// exactly the oracle implicit rejection exists to deny.
 func (m *mlkem) decapsulate(sk, ct []byte) (ss []byte, ok bool) {
 	if len(sk) != mlkemSkBytes || len(ct) != mlkemCtBytes {
 		return nil, false

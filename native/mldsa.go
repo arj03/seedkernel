@@ -1,14 +1,12 @@
 // mldsa.go — ML-DSA-65 (FIPS 204) for the native loader: the PQ half of manifest suite
 // 0x02 (§12.4, §14.1).
 //
-// Deliberately NOT a Go implementation. It drives wasm/mldsa65.wasm — the same artifact
-// the browser fetches and Node reads — through wazero, for the reason sodium.go's header
-// gives for keeping Ed25519 on wasm: a verifier's accept/reject boundary is consensus, and
-// two independent implementations of a lattice scheme can disagree at the edges (malformed
-// encodings, hint bounds, out-of-range z) while both pass their own test suites.
-//
-// Unlike libsodium.wasm this module has NO imports — randomness is an argument and there
-// is no libc — so instantiation is the whole wiring.
+// Deliberately NOT a Go implementation. It drives wasm/mldsa65.wasm — the same artifact the
+// browser fetches and Node reads — through wazero, for the reason sodium.go's header gives
+// for keeping Ed25519 on wasm: a verifier's accept/reject boundary is consensus, and two
+// independent implementations of a lattice scheme can disagree at the edges while both pass
+// their own test suites. Unlike libsodium.wasm this module has NO imports — randomness is
+// an argument — so instantiation is the whole wiring.
 
 package main
 
@@ -56,11 +54,9 @@ func bootMlDsa(rt wazero.Runtime) *mldsa {
 
 // verifyDetached reports whether sig is a valid ML-DSA-65 signature over msg under pk,
 // with an empty FIPS 204 context — the runtime's only mode, since domain separation is the
-// DOMAIN_manifest prefix inside the preimage (§16.1).
-//
-// Wrong-width inputs are `false`, not an error: that is what crypto_sign_verify_detached
-// answers, and one suite must not report a structural failure through a different channel
-// than the other.
+// DOMAIN_manifest prefix inside the preimage (§16.1). Wrong-width inputs are `false`, not
+// an error: that is what crypto_sign_verify_detached answers, and one suite must not report
+// a structural failure through a different channel than the other.
 func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 	if len(sig) != mldsaSigBytes || len(pk) != mldsaPkBytes {
 		return false

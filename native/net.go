@@ -1,9 +1,6 @@
-// net.go — the Go target's TCP socket primitive: a raw byte duplex (rawChannel) over a
-// socket, with no message boundaries of its own.
-//
-// This is the only networking in Go. Everything structural — the wire codec imposing
-// those boundaries, the PeerLink handshake, the routing table, request/response — is the
-// transport bundle's guest program (transport/src, driven by host/transport-host.ts)
+// net.go — the Go target's TCP socket primitive: a raw byte duplex (rawChannel), with no
+// message boundaries of its own. This is the only networking in Go; the wire codec, the
+// PeerLink handshake and routing are the transport bundle's guest program (transport/src)
 // running in QuickJS over this via __net (sock.go).
 package main
 
@@ -18,44 +15,32 @@ import (
 // sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
 // protocol acks even bulk chunks, so a healthy link's queue stays a few messages deep;
 // hitting the cap means the peer has stopped draining, and the channel fails rather than
-// buffering without bound. 2× core/net-limits.ts's MAX_FRAME_BYTES so a single max-size
-// frame always fits — not a copy of that constant, since Go imposes no frame boundaries
-// and has nothing to enforce it on.
+// buffering without bound. 2× core/net-limits.ts's MAX_FRAME_BYTES so one max-size frame
+// always fits.
 const sendQueueLimit = 4 << 20
 
 // closeGrace bounds how long a deliberate close() lets the writer flush queued sends (a
-// PeerLink rejection, a WS close frame), so closing a channel to a wedged peer cannot pin
-// its writer forever.
+// PeerLink rejection, a WS close frame), so a wedged peer cannot pin the writer forever.
 const closeGrace = 5 * time.Second
 
-// tcpKeepAlive is how long a connection may be idle before the kernel probes it. Set
-// explicitly on both the dial and listen paths because it is the only thing that reclaims
-// a socket whose peer VANISHED — a NAT rebinding, a yanked cable or a killed VM sends no
-// FIN, so without probes the read blocks forever and the channel's goroutines, buffer and
-// n.chans slot are held until the process exits. A present but silent peer is
-// silentReadTimeout's business.
+// tcpKeepAlive is how long a connection may be idle before the kernel probes it, set on
+// both the dial and the listen path: it is the only thing that reclaims a socket whose
+// peer VANISHED (no FIN on a NAT rebind or a killed VM), while a present-but-silent peer
+// is silentReadTimeout's business.
 const tcpKeepAlive = 30 * time.Second
 
-// silentReadTimeout bounds a connection that has never delivered a BYTE. Accepting a
-// socket costs two goroutines, a 64 KiB read buffer and a channel id before anything about
-// the far end has been proved, and the cheapest attack on that is to connect and say
-// nothing: no handshake starts, so none of the transport guest's deadlines arm, and
-// keepalive probes are answered by a peer that is present and merely mute.
-//
-// Armed before the first read and CLEARED by it, deliberately not an idle deadline: once
-// bytes flow, whether a quiet link may be held belongs to the transport guest, which knows
-// whether the link is authenticated (linkIdleTimeoutMs, transport-host.ts). Generous,
-// because a real peer's HELLO follows its SYN.
-//
-// A var, not a const, only so a test can shrink it.
+// silentReadTimeout bounds a connection that has never delivered a BYTE — the cheapest
+// attack is to connect and say nothing, since no handshake starts so none of the
+// transport's deadlines arm. Armed before the first read and CLEARED by it, deliberately
+// not an idle deadline: once bytes flow, whether a quiet link may be held belongs to the
+// authenticated transport guest (linkIdleTimeoutMs). A var, not a const, so a test can
+// shrink it.
 var silentReadTimeout = 30 * time.Second
 
-// Socket buffers are deliberately left at kernel defaults — do NOT set SO_RCVBUF/
-// SO_SNDBUF. An explicit value is clamped to net.core.{r,w}mem_max (208 KiB on stock
-// Linux) and LOCKS the buffer, disabling the autotuning that would grow it to
-// tcp_{r,w}mem[2] (~6 MB) as a bulk transfer ramps. A fixed 4 MiB set pre-handshake once
-// pinned every holder connection on an untuned box to a ~64 KiB receive window (2.5 MB/s
-// at 26 ms RTT) — the very stall it was meant to fix.
+// Socket buffers stay at kernel defaults — an explicit SO_RCVBUF/SO_SNDBUF is clamped to
+// net.core.{r,w}mem_max and LOCKS the buffer, disabling the autotuning that grows it to
+// ~6 MB as a bulk transfer ramps (a fixed 4 MiB once pinned holder connections to a
+// ~64 KiB receive window, the very stall it was meant to fix).
 
 // dialTCP dials with default socket options (see the note above).
 func dialTCP(addr string) (net.Conn, error) {
@@ -67,10 +52,9 @@ func dialTCP(addr string) (net.Conn, error) {
 
 // rawChannel delivers bytes as they arrive (core/socket-seam.ts RawLink): one delivery is
 // an arbitrary slice of the stream and implies no boundary, which the transport bundle's
-// framer imposes at the far side of __net. A channel owns one socket, one read goroutine
-// and one writer goroutine. send only queues — safe from any goroutine, never blocks on
-// the socket — and takes ownership of its slice; onMsg likewise hands the callee a fresh
-// slice it owns, so neither boundary needs a defensive copy.
+// framer imposes on the far side of __net. A channel owns one socket, one read goroutine
+// and one writer goroutine. send only queues — safe from any goroutine — and takes
+// ownership of its slice; onMsg likewise hands the callee a fresh slice it owns.
 type rawChannel interface {
 	send(bytes []byte)
 	close()
@@ -78,17 +62,12 @@ type rawChannel interface {
 
 // ── sockChannel: the connection core ───────────────────────────────────────────
 //
-// One socket: the writer goroutine and its bounded queue, the dead lifecycle, and the
-// close vs fail split.
-//
-// Writes never run on the caller's goroutine. The caller is the event-loop goroutine
+// Writes never run on the caller's goroutine: the caller is the event-loop goroutine
 // (sock.go N.send), which owns ALL QuickJS execution, so a peer that stops draining must
-// not block it: a synchronous conn.Write would freeze every timer — including the JS
-// Transport request timeouts meant to bound exactly this — and every other channel until
-// that one peer drained. node:net, which the shared JS was written against, has the same
-// shape. The queue doubles as the pre-connect buffer, and one writer draining one FIFO is
-// what keeps a later message from overtaking an earlier one (PeerLink's HELLO, a WS
-// client's upgrade request).
+// not block it — a synchronous conn.Write would freeze every timer, including the JS
+// transport timeouts meant to bound exactly this (node:net has the same shape). The queue
+// doubles as the pre-connect buffer, and one writer draining one FIFO keeps later
+// messages from overtaking earlier ones (PeerLink's HELLO, a WS upgrade request).
 type sockChannel struct {
 	onMsg   func([]byte)
 	onClose func()
@@ -135,9 +114,9 @@ func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockC
 }
 
 // send queues bytes for the writer goroutine and returns immediately, never touching the
-// socket. It takes ownership of bytes (sock.go's N.send hands over a fresh
-// JsTypedArrayToGo copy), so nothing is copied here. A send on a dead channel is dropped
-// silently, like a node:net write after destroy.
+// socket. It takes ownership of bytes (sock.go hands over a fresh JsTypedArrayToGo copy),
+// so nothing is copied here. A send on a dead channel is dropped silently, like a
+// node:net write after destroy.
 func (c *sockChannel) send(bytes []byte) {
 	c.mu.Lock()
 	if c.dead {
@@ -147,8 +126,8 @@ func (c *sockChannel) send(bytes []byte) {
 	if c.queued+len(bytes) > sendQueueLimit {
 		c.mu.Unlock()
 		// The peer has stopped draining: fail rather than buffer forever. On its own
-		// goroutine because send runs on the loop goroutine and fail's onClose posts to
-		// el.tasks — which can be full, and only the loop drains it.
+		// goroutine, because send runs on the loop goroutine and fail's onClose posts to
+		// the possibly-full el.tasks, which only the loop drains.
 		go c.fail()
 		return
 	}
@@ -156,16 +135,14 @@ func (c *sockChannel) send(bytes []byte) {
 	c.queued += len(bytes)
 	c.mu.Unlock()
 	c.signal()
-	// Hand the processor to the freshly-woken writer (it sits in this P's runnext slot) so
-	// the frame hits the wire now, overlapping the rest of the sender's JS turn instead of
-	// waiting for the loop goroutine to park — worth ~10% round-trip latency and upload
-	// throughput on the Net benches. A hint only: correctness never depends on it.
+	// Hand the processor to the freshly-woken writer (sitting in this P's runnext slot) so
+	// the frame hits the wire now, overlapping the sender's JS turn — ~10% round-trip
+	// latency on the Net benches. A hint only: correctness never depends on it.
 	runtime.Gosched()
 }
 
-// signal nudges the writer without blocking: the cap-1 buffer coalesces bursts, and
-// the writer re-checks queue+dead under mu after every wake, so a coalesced or
-// spurious signal is harmless.
+// signal nudges the writer without blocking: the cap-1 buffer coalesces bursts, and the
+// writer re-checks queue+dead under mu after every wake, so a spurious one is harmless.
 func (c *sockChannel) signal() {
 	select {
 	case c.wake <- struct{}{}:
@@ -174,10 +151,9 @@ func (c *sockChannel) signal() {
 }
 
 // writeLoop is the channel's sole writer: it pops sends in FIFO order and writes on this
-// goroutine, so a stalled conn.Write blocks only this channel. It exits (closing the
-// socket) once the channel is dead AND the queue is empty: fail() empties the queue itself,
-// while a deliberate close() leaves it for the writer to flush under the closeGrace write
-// deadline.
+// goroutine, so a stalled conn.Write blocks only this channel. It exits once the channel
+// is dead AND the queue is empty: fail() empties the queue itself, while a deliberate
+// close() leaves it for the writer to flush under the closeGrace deadline.
 func (c *sockChannel) writeLoop() {
 	for {
 		c.mu.Lock()
@@ -207,13 +183,9 @@ func (c *sockChannel) writeLoop() {
 }
 
 // close is the deliberate teardown: it does NOT fire onClose (the owner asked for it), and
-// a fail() racing behind it stays silent because dead is already set. A live-channel error
-// must still reach onClose, or the owning PeerLink is never forgotten and the peer is
-// blackholed.
-//
-// Queued sends still flush, because the JS side sends-then-closes (a PeerLink handshake
-// rejection, a WS close frame). closeGrace bounds the flush; the writer owns the actual
-// conn.Close.
+// a fail() racing behind it stays silent because dead is set. Queued sends still flush,
+// because the JS side sends-then-closes (a PeerLink rejection, a WS close frame); closeGrace
+// bounds the flush, and the writer owns the actual conn.Close.
 func (c *sockChannel) close() {
 	c.mu.Lock()
 	if c.dead {
@@ -231,8 +203,8 @@ func (c *sockChannel) close() {
 }
 
 // fail is the error teardown: close the socket and fire onClose so the owner drops the
-// channel. Queued messages are dropped — the link is broken. Idempotent against close()
-// and a second fail() via the dead flag.
+// channel; queued messages are dropped, since the link is broken. Idempotent via the dead
+// flag.
 func (c *sockChannel) fail() {
 	c.mu.Lock()
 	if c.dead {
@@ -262,7 +234,7 @@ func (c *sockChannel) readLoop() {
 	chunk := make([]byte, 64<<10)
 	conn := c.conn // set strictly before the read loop starts
 	// Armed for the first read and dropped by it, so it bounds a peer that never speaks
-	// without ever bounding one that has (see silentReadTimeout).
+	// without ever bounding one that has.
 	conn.SetReadDeadline(time.Now().Add(silentReadTimeout))
 	spoke := false
 	for {

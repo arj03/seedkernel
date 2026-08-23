@@ -1,13 +1,9 @@
 // sock.go — the TCP socket primitive exposed to QuickJS as `__net`: open a socket, hand
-// its bytes to JS, send, close. No message boundaries here — the wire codec, the PeerLink
-// handshake, routing and request/response run as the transport bundle's guest program
-// (transport/src) over the unframed RawLink shape this module hands it.
-//
-// Bytes cross the Go↔JS boundary only on the event-loop goroutine: reader goroutines hand
-// each message to el.post, and the loop delivers it into JS through the retained
-// __netDeliver/__netClosed/__netAccept dispatchers, then pumps. The shared shim
-// (host/native-shim.ts) defines those dispatchers; `netHost.retain` picks them up once the
-// bundle is up.
+// its bytes to JS, send, close. No message boundaries here — the transport bundle's guest
+// program (transport/src) runs over the unframed RawLink shape this module hands it. Bytes
+// cross the Go↔JS boundary only on the event-loop goroutine: reader goroutines hand each
+// message to el.post, and the loop delivers it through the retained __netDeliver/
+// __netClosed/__netAccept dispatchers defined in host/native-shim.ts.
 package main
 
 import (
@@ -22,20 +18,15 @@ import (
 	"seedloader/qjs"
 )
 
-// maxLiveChannels caps how many sockets this host holds at once. Accepting is the one
-// thing here that happens without anyone asking, and each accepted socket costs two
-// goroutines, a 64 KiB read buffer and a map entry BEFORE the transport guest has looked
-// at it. The guest's own link budgets (transport-host.ts) are the policy; this sits an
-// order of magnitude above their sum so it never fires in normal operation, and bounds the
-// window they cannot — a flood arriving faster than the loop drains its posted accepts, or
-// a guest that has stopped refusing at all.
-//
-// A var, not a const, only so a test can shrink it.
+// maxLiveChannels caps how many sockets this host holds at once: accepting happens without
+// anyone asking, and each accepted socket costs two goroutines, a 64 KiB buffer and a map
+// entry BEFORE the transport guest has looked at it. This bounds the flood window the
+// guest's link budgets (transport-host.ts) cannot reach — a var only so a test can shrink
+// it.
 var maxLiveChannels = 4096
 
-// acceptErrBackoff paces the accept loop after a non-fatal error. EMFILE makes Accept fail
-// immediately and repeatedly; returning would kill serving for good over a transient
-// condition, and retrying flat out would spin a core.
+// acceptErrBackoff paces the accept loop after a non-fatal error: EMFILE makes Accept fail
+// immediately and repeatedly, and retrying flat out would spin a core.
 const acceptErrBackoff = 20 * time.Millisecond
 
 type netHost struct {
@@ -86,9 +77,8 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
-			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without
-			// another. It only queues — the write happens on the channel's writer
-			// goroutine, never here on the loop goroutine (net.go writeLoop).
+			// b is a fresh copy (JsTypedArrayToGo), so send takes ownership without another. It
+			// only queues — the write happens on the channel's writer goroutine (net.go writeLoop).
 			if b, err := qjs.JsTypedArrayToGo(t.Args()[1]); err == nil {
 				ch.send(b)
 			}
@@ -103,12 +93,11 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		if len(t.Args()) < 1 {
 			return nil, nil
 		}
-		// A deliberate close() sets dead WITHOUT firing onClose (net.go), and the readLoop
-		// error chasing it short-circuits in fail() — so the onClose registry-drop below
-		// never runs for a local close. Dropping the entry here instead is what keeps every
-		// local close (the guest closes on each rejected handshake, and on a duplicate-dial
-		// resolution) from leaking its n.chans slot: attacker-triggerable memory
-		// exhaustion. The JS shim deletes from its own chans Map for the same reason.
+		// A deliberate close() sets dead WITHOUT firing onClose, so the readLoop error
+		// chasing it never runs the onClose registry-drop. Dropping the entry here keeps
+		// every local close (each rejected handshake, each duplicate dial) from leaking its
+		// n.chans slot — attacker-triggerable memory exhaustion; the JS shim deletes from
+		// its own Map for the same reason.
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
 			ch.close()
@@ -123,16 +112,15 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 }
 
 // retain picks up the three dispatchers the shared shim defines at module scope
-// (host/native-shim.ts), which runs when host-shell.gen.js is evaluated — after exposeNet
-// installed `__net`, and before any socket delivers.
+// (host/native-shim.ts) when host-shell.gen.js is evaluated — after exposeNet installed
+// `__net`, before any socket delivers.
 func (n *netHost) retain() error {
 	g := n.qc.Global()
 	n.fnDeliver = g.GetPropertyStr("__netDeliver")
 	n.fnClosed = g.GetPropertyStr("__netClosed")
 	n.fnAccept = g.GetPropertyStr("__netAccept")
-	// IsUndefined, not nil: a missing property is a *Value wrapping JS_UNDEFINED and
-	// GetPropertyStr never returns Go nil (qjs/value.go), so a nil check would compile,
-	// never fire, and turn this named boot error into "not a function" at the first frame.
+	// IsUndefined, not nil: GetPropertyStr never returns Go nil (qjs/value.go), so a nil
+	// check would compile, never fire, and turn this boot error into "not a function".
 	if n.fnDeliver.IsUndefined() || n.fnClosed.IsUndefined() || n.fnAccept.IsUndefined() {
 		return fmt.Errorf("net: __netDeliver/__netClosed/__netAccept not defined (host/native-shim.ts)")
 	}
@@ -154,8 +142,7 @@ func (n *netHost) alloc() int64 {
 
 // allocInbound is alloc for a socket nobody asked for: it refuses once the host holds
 // maxLiveChannels. The count is read under the same lock that hands out the id, so the
-// only slack is between here and the caller's insert — at most one connection per accept
-// goroutine, which is why the cap sits far above the guest's link budgets.
+// only slack is at most one connection per accept goroutine.
 func (n *netHost) allocInbound() (int64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -166,9 +153,8 @@ func (n *netHost) allocInbound() (int64, bool) {
 	return n.nextID, true
 }
 
-// dial opens an outbound byte duplex. It connects in the background and buffers
-// pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately;
-// the JS channel is registered in the same JS turn, before the loop can process a frame.
+// dial opens an outbound byte duplex: it connects in the background and buffers
+// pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately.
 func (n *netHost) dial(addr string) int64 {
 	id := n.alloc()
 	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id))
@@ -179,12 +165,12 @@ func (n *netHost) dial(addr string) int64 {
 }
 
 // listen accepts inbound byte duplexes. The read goroutine starts only inside the posted
-// task, AFTER __netAccept created the JS channel — otherwise it could deliver a frame
-// before JS has a channel to route it to.
+// task, after __netAccept created the JS channel — otherwise it could deliver a frame
+// before JS has one to route it to.
 func (n *netHost) listen(host string, port int) (int, error) {
 	// No buffer options: an explicit SO_RCVBUF pre-bind locks out receive autotuning (see
-	// the note above dialTCP in net.go). KeepAlive is explicit so an accepted socket whose
-	// peer vanishes without a FIN is reclaimed (tcpKeepAlive).
+	// net.go). KeepAlive is explicit so an accepted socket whose peer vanishes without a
+	// FIN is reclaimed (tcpKeepAlive).
 	lc := net.ListenConfig{KeepAlive: tcpKeepAlive}
 	ln, err := lc.Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
@@ -201,9 +187,8 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				if errors.Is(err, net.ErrClosed) {
 					return // listener closed (closeListeners) — release the goroutine
 				}
-				// Anything else is this process's condition, not the listener's end (a
-				// descriptor exhaustion, a socket reset between SYN and accept): pause and
-				// keep serving rather than retiring the port.
+			// Anything else is this process's condition (descriptor exhaustion, a reset
+			// between SYN and accept): pause and keep serving, not retire the port.
 				time.Sleep(acceptErrBackoff)
 				continue
 			}
@@ -226,9 +211,8 @@ func (n *netHost) listen(host string, port int) (int, error) {
 	return bound, nil
 }
 
-// closeListeners closes every bound listener, so each accept goroutine's ln.Accept()
-// errors and exits, releasing the fd and the goroutine. Wired to the driver's
-// channels.close (native-shim.ts) so a network teardown leaks neither.
+// closeListeners closes every bound listener, so each accept goroutine's Accept() errors
+// and exits, releasing the fd. Wired to the driver's channels.close (native-shim.ts).
 func (n *netHost) closeListeners() {
 	n.mu.Lock()
 	lns := n.listeners
@@ -259,10 +243,9 @@ func (n *netHost) onMsg(id int64) func([]byte) {
 func (n *netHost) onClose(id int64) func() {
 	return func() {
 		n.el.post(func() {
-			// Drop the channel before notifying JS. onClose only fires from fail(), which
-			// has already closed the socket, so there is no fd to release here — and
-			// deleting up front makes an N.close(id) from the JS onClose handler a clean
-			// no-op rather than a re-close. The JS shim does the same.
+			// Drop the channel before notifying JS: onClose only fires from fail() (socket
+			// already closed, no fd to release), and deleting up front makes an N.close(id)
+			// from the JS onClose handler a clean no-op rather than a re-close.
 			n.mu.Lock()
 			delete(n.chans, id)
 			n.mu.Unlock()
@@ -282,5 +265,5 @@ func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 	}
 }
 
-// The ChannelFactory over these primitives, and the transport driver built on it, live in
-// host/native-shim.ts. Go's networking stops at the socket.
+// The ChannelFactory over these primitives lives in host/native-shim.ts; Go's networking
+// stops at the socket.
