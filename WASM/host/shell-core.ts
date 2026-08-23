@@ -4,13 +4,13 @@
 // bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScopes, opCall, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, TIMER_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, PRIVILEGE_ROUTE, type Privilege } from "../core/domains.js";
-import { enc, fromHex, toHex, writeU32BE, errMessage } from "../core/util.js";
+import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
+import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
@@ -71,9 +71,9 @@ interface ShellPlatform {
     now?: () => number;
     /** Which network this node belongs to — an isolation boundary, not a gate (§12.6);
      *  absent ⇒ the public network. Feeds the raw link configuration and the signing scope
-     *  granted to a bundle reaching `link` (`linkSignScope`).
+     *  of the slot reaching `link` (`slotSignScope`).
      *
-     *  The scope is the load-bearing use: `link/sign` prefixes and never parses, so it is
+     *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
      *  the only binding of a link occupant's signature to this node's network that the
      *  slot occupant cannot choose. Drop it from the preimage and a transport on one
      *  network can mint transcripts another's verifier accepts. */
@@ -174,8 +174,9 @@ export interface Shell {
      *  author key, which derives new names and a fresh mark (§5.1), not an un-revoke. */
     revoke(authorHex: string): string[];
     /** Loopback into a loaded app's `handle` as the host (32 zero-byte caller id).
-     *  Addressed by app key — whatever is installed under that identity now. */
-    invoke(op: string, payload: Uint8Array, appKey: string): Promise<Uint8Array>;
+     *  Addressed by app key — whatever is installed under that identity now. The payload
+     *  is the app's OWN format: the shell prefixes attribution and reads no further. */
+    invoke(payload: Uint8Array, appKey: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
      *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
@@ -207,7 +208,7 @@ export interface AppHandle extends LoadedBundle {
      *  so a handle taken before it keeps naming the version it was handed, and rejects
      *  once that slot is disposed. A caller meaning "whatever is installed now" holds the
      *  key and calls `Shell.invoke`. */
-    invoke(op: string, payload: Uint8Array): Promise<Uint8Array>;
+    invoke(payload: Uint8Array): Promise<Uint8Array>;
 }
 
 // Re-exported so a target reaches the admission constructors from the same module it gets
@@ -225,11 +226,11 @@ interface AppSlot {
    *  computed once per load and carried on the returned `AppHandle`, so a caller's cold
    *  read of the raw backend needs the derivation the shell already did. */
   appScope: string;
+  /** THE one scope this slot's `node/sign`/`node/verify` are wired to (`slotSignScope`,
+   *  guest-seam.ts): the slot's own `DOMAIN_guest ‖ author ‖ app` when it is an ordinary
+   *  app, its `DOMAIN_link_scope ‖ networkKey` when it reaches `link` — a fact of the
+   *  slot, not a second name. */
   signingScope: SignScope;
-  /** This slot's network scope — present only when it reaches `link` (`slotSignScopes`,
-   *  guest-seam.ts). What `link/sign`/`link/verify` are wired to; `signingScope` above is
-   *  what `node/sign`/`node/verify` are wired to, unconditionally. */
-  linkSigningScope?: SignScope;
   realm: SafeRealm | null;
   /** Set once this slot's freshness mark and claims have committed; until then its seam
    *  refuses the calls disposing the slot could not take back (`seamFor`). */
@@ -353,7 +354,6 @@ function createShell(opts: CreateShellOptions & {
     const slotClaims = (slot: AppSlot) => slot.verifiedBundle.manifest.protocols ?? [];
     const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
     const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
-    const canDeliver = (slot: AppSlot) => privilegesOf(slot.verifiedBundle.manifest).includes(PRIVILEGE_ROUTE);
     /** The slot the platform's raw-link events go to. Exclusive, like a claim: the driver
      *  has ONE event sink, so two holders are not a composition — the second would take
      *  the node's sockets off the first, silently. */
@@ -372,22 +372,23 @@ function createShell(opts: CreateShellOptions & {
         const timers = createRealmTimers((id) => {
             const args = new Uint8Array(4);
             writeU32BE(args, 0, id);
-            // A guest that arms a deadline without registering `timer` is refused by its
-            // own realm, and an app's `timer` may legitimately throw. Neither has a caller
-            // left to reject — the arming call returned turns ago — so report and swallow.
-            void slot.realm?.call("timer", args).catch((err: unknown) => {
+            // The one entrypoint, with the TIMER caller id: a fired deadline is an event
+            // the host delivers into the guest, not a host authority — the callee reads
+            // the tag from the caller prefix (guest-seam.ts). A guest's `handle` may throw
+            // on it; there is no caller left to reject — the arming call returned turns
+            // ago — so report and swallow.
+            void slot.realm?.call(concatBytes([TIMER_CALLER_ID, args])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
         const appScope = appScopeFor(platform.sodium, loaded.author, loaded.manifest.app);
-        const scopes = slotSignScopes(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
+        const scope = slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
             verifiedBundle: loaded,
             pureModules,
             fsScope: fs ? scopedFs(fs, appScope) : undefined,
             appScope,
-            signingScope: scopes.app,
-            linkSigningScope: scopes.link,
+            signingScope: scope,
             realm: null,
             active: false,
             timers,
@@ -449,17 +450,12 @@ function createShell(opts: CreateShellOptions & {
                 // is one of these. `crypto/*` and the bundle's own module names are exempt:
                 // a fixed catalog and the app's own code, never grants.
                 names: new Set(b.manifest.guest.requires),
-                // What node/sign signs under: this slot's own app scope, unconditionally —
-                // gaining `link` never changes what this name means (§12.5's monotonicity:
-                // a grant only ever ADDS an endpoint, never alters an existing one). The
-                // seam prefixes and never parses, so no op signs raw bytes.
+                // What node/sign signs under: this slot's ONE scope, derived at load —
+                // an ordinary app's own `DOMAIN_guest ‖ author ‖ app`, the link slot's
+                // `DOMAIN_link_scope ‖ networkKey` (§12.2). The host chooses what the
+                // name means; the seam prefixes and never parses, so no op signs raw
+                // bytes.
                 signScope: slot.signingScope,
-                // What link/sign signs under: the node's network scope, present only when
-                // this slot reaches `link` — a SEPARATE name from node/sign, never a
-                // second meaning for it. Both sign with the node's one key; the scope is
-                // what the name means: DOMAIN_link_scope ‖ networkKey here,
-                // DOMAIN_guest ‖ the bundle's own scope for node/sign above.
-                linkSignScope: slot.linkSigningScope,
                 // Scoped to this app key, so `fs` grants reach this app's own keyspace, not
                 // the node's — the same structural ownership module names have (§5.1).
                 // Wired whenever the node has an fs at all, without consulting the
@@ -472,7 +468,6 @@ function createShell(opts: CreateShellOptions & {
                 // to whoever was there first.
                 calls: { call: (id, payload) => crossRealmCall(callerId, id, payload) },
                 rawNet: links ? netHost?.rawNet(slot) : undefined,
-                delivery: canDeliver(slot) ? { deliver: (claim, attribution, payload) => deliverInbound(claim, attribution, payload) } : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
             },
@@ -486,7 +481,9 @@ function createShell(opts: CreateShellOptions & {
         // A candidate's top level runs before its mark and claims commit, so until then the
         // seam refuses what disposing that candidate could not take back (`isIrreversible`).
         // Everything a guest initializes from stays open: its reads, `crypto/*` and its own
-        // modules — which is how a transport candidate reads `link/config` offside.
+        // modules. The node facts a link occupant needs are never read OFF this seam — the
+        // host invokes the freshly stood slot's `handle` once with them, as the `init`
+        // op's payload (initLinkSlot), before the binding is published.
         return (name, payload, budget) => {
             if (!slot.active && isIrreversible(name)) {
                 throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
@@ -494,21 +491,45 @@ function createShell(opts: CreateShellOptions & {
             return fullSeam(name, payload, budget);
         };
     };
-    /** Enter a slot's guest. The null arm is reachable only from guest top-level code
-     *  while its candidate realm is still being constructed. */
+    /** Enter a slot's guest. `input` is `[caller 32][body …]` — the host's attribution
+     *  prefix, never the guest's own spelling. The null arm is reachable only from guest
+     *  top-level code while its candidate realm is still being constructed. */
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
-        ? slot.realm.call("handle", input)
+        ? slot.realm.call(input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
+    /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
+     *  caller id the shell holds (loopback, init, and socket/addrs events). */
+    const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
+        callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
     /** Loopback invoke with host caller id. Chained onto `inFlight` so `close()`
      *  waits for parked calls (§2.1). */
-    const invokeSlot = (slot: AppSlot, op: string, payload: Uint8Array): Promise<Uint8Array> => {
-        const call = callSlot(slot, opCall(op, payload));
+    const invokeSlot = (slot: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
+        const call = hostCallSlot(slot, payload);
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
+    /** The one delivery of the node's immutable facts to a link occupant: a host-proper
+     *  event into the freshly stood slot's `handle`, before the binding is published and
+     *  before any event. Constructor argument, not a capability: nothing here is
+     *  re-readable, and what is mutable — the address book — arrives as `addr` events
+     *  after publication. The body is the driver's own framing (transport-host.ts), which
+     *  is a contract with the pinned bundle, not a kernel ABI. */
+    const initLinkSlot = async (slot: AppSlot): Promise<void> => {
+        const facts = netHost?.initialConfig();
+        if (!facts)
+            throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
+        await invokeSlot(slot, facts);
+    };
     netHost?.route((payload) => {
-        return linkOwner ? callSlot(linkOwner, payload) : null;
-    }, () => linkOwner !== null);
+        // The link occupant's `handle` return is the driver's to read: an inbound request
+        // the occupant decoded is returned as a delivery frame, which the driver hands to
+        // the shell's claim routing (`routeDeliver`) and answers back through `linkResp`.
+        return linkOwner ? hostCallSlot(linkOwner, payload) : null;
+    }, () => linkOwner !== null, (claim, attribution, payload) => {
+        // The driver normalizes the answer to empty before writing it back, so refusal
+        // and silence are one fact at the boundary.
+        return deliverInbound(claim, attribution, payload);
+    });
     /** Cross-realm call by reserved id. Host prepends caller's 32-byte id. */
     const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
         return callLocal(id, callerId, payload);
@@ -569,8 +590,9 @@ function createShell(opts: CreateShellOptions & {
         input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
-    /** Inbound from outside this node (`route/deliver`, `dispatch`). `_`-led claims
-     *  are local and refused here with no exception — platform claims included (§12.10). */
+    /** Inbound from outside this node (the link occupant's delivery return, `dispatch`).
+     *  `_`-led claims are local and refused here with no exception — platform claims
+     *  included (§12.10). */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
         if (isReservedProtocol(claim)) return null;
         const platformHandler = platformClaims.get(claim);
@@ -640,6 +662,11 @@ function createShell(opts: CreateShellOptions & {
             // below a floor a broken upgrade raised: rollback bricked by a failed upgrade.
             try {
                 await standRealm(slot, localConfig, loadOpts);
+                // The host invokes the link occupant once with the node facts — an init
+                // op into its own `handle`, not a name it calls back later. A transport
+                // that refuses its own boot arguments fails the load: nothing below has
+                // been marked or claimed, so the candidate is simply disposed.
+                if (hasLink(slot)) await initLinkSlot(slot);
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
@@ -675,10 +702,10 @@ function createShell(opts: CreateShellOptions & {
             // The mark and every claim/link binding have landed, so this slot's writes and
             // cross-realm calls are now its own (`seamFor`).
             slot.active = true;
-            // The address book is mutable node state, not part of the candidate's static
-            // `link/config` snapshot. Publish first, then replay it through the ordinary
-            // host-event path. No await in between: a concurrent add is either in this
-            // replay or is announced directly to the newly published claimant.
+            // The address book is mutable node state, not part of the immutable facts the
+            // occupant received at init. Publish first, then replay it through the
+            // ordinary host-event path. No await in between: a concurrent add is either
+            // in this replay or is announced directly to the newly published claimant.
             if (linkOwner === slot) netHost?.replayAddresses();
             disposeSlot(previous);
             // The handle: the verified facts plus the bound slot — the key, the scoped fs
@@ -689,7 +716,7 @@ function createShell(opts: CreateShellOptions & {
                 key,
                 fs: slot.fsScope,
                 appScope: slot.appScope,
-                invoke: (op, payload) => invokeSlot(slot, op, payload),
+                invoke: (payload) => invokeSlot(slot, payload),
             };
             return handle;
         },
@@ -713,13 +740,13 @@ function createShell(opts: CreateShellOptions & {
             }
             return gone;
         },
-        async invoke(op, payload, appKey) {
+        async invoke(payload, appKey) {
             const slot = findSlot(appKey);
             if (!slot)
                 throw new Error(`shell: no app '${appKey}' loaded`);
             // `AppHandle.invoke` is the same call with the slot already bound — see
             // `invokeSlot` for the framing and the close() chaining.
-            return invokeSlot(slot, op, payload);
+            return invokeSlot(slot, payload);
         },
         dispatch: doDispatch,
         close() {
@@ -842,7 +869,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         catch { /* malformed blob — the load below refuses it by name */ }
     }
     // The implicit transport pin, composed AROUND the caller's predicate: a bundle
-    // reaching `link` or `route` must be signed by the transport bundle's own author. An
+    // reaching `link` must be signed by the transport bundle's own author. An
     // operator's `policyFromJson` keeps the power to refuse a transport author — the
     // caller's predicate still has to admit as well — and nobody can LOSE the pin by
     // forgetting it: a caller whose admit is a plain consent gate is not also responsible
@@ -858,7 +885,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const admit: Admit = allOf(opts.admit ?? denyAll, (v, ctx) => {
         if (ctx.privileges.length === 0) return true;
         for (const priv of ctx.privileges) {
-            if (priv !== PRIVILEGE_LINK && priv !== PRIVILEGE_ROUTE) return false;
+            if (priv !== PRIVILEGE_LINK) return false;
         }
         return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
     });
@@ -890,7 +917,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             }
             catch (err) {
                 if (!isAdmissionRejected(err)) throw err;
-                console.warn('  no transport: the policy does not grant this bundle all required privileges ("link" and "route")');
+                console.warn('  no transport: the policy does not grant this bundle the "link" privilege');
             }
             await transport.start();
         }

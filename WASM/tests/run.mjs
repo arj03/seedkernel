@@ -31,7 +31,7 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, linkSignScope, UNRESTRICTED_NAMES, opHeader }
+const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
   = await imp("build/host/guest-seam.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
@@ -54,7 +54,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Every app is a guest (§12.4), so every bundle a test builds declares one. The stub
 // used by tests that do not exercise the guest is the same minimal program throughout.
-const GUEST_TEXT = "register('ping', () => new Uint8Array([1]));";
+const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
 
@@ -76,8 +76,8 @@ const boot = async (cfg) => (await bootRuntime(cfg)).shell;
  *  be a seam open that the test never asked for. A test that wants a disk passes one.
  *
  *  `pinAuthor` is whose signature the TRANSPORT PIN admits (§12.5). The pin is derived
- *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` or
- *  `route` is refused before any predicate under test is consulted. So a test loading a
+ *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` is
+ *  refused before any predicate under test is consulted. So a test loading a
  *  privileged bundle names the author the pin is derived from, exactly as an operator
  *  running a transport other than the shipped one does. What it hands over is a real
  *  signed bundle of that author's, because the pin is read off a signature rather than
@@ -311,7 +311,7 @@ async function testBundleRefusesNonModule() {
   // hash-match their manifest entry but will not instantiate. With a two-phase install, a
   // module failing phase 1 must fail the whole load — nothing lands.
   const notAModule = new Uint8Array([0, 1, 2, 3, 4]);   // not even valid wasm
-  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestText = "function handle() { return new Uint8Array([1]); }";
   const guestBytes = new TextEncoder().encode(guestText);
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
@@ -464,85 +464,15 @@ async function testManifestClaimIsTheRouting() {
   console.log("  OK\n");
 }
 
-// ─── Test: attributed delivery is a separately granted generic authority ──────
-//
-// `route/deliver` is the path a request from OUTSIDE the node takes, and its attribution is
-// written by whoever submits it — which is the whole reason `route` is granted apart from
-// `link`. Two properties follow and are pinned here: it reaches an ordinary claim (that is
-// the job), and it does NOT reach a bundle's `_`-led claim, which is a local service name a
-// remote sender's `requires` could never have granted. Without the second, a peer naming
-// the id the transport itself claims would be handed straight into the transport's realm.
-async function testGenericClaimDelivery() {
-  console.log("Test: route/deliver submits an opaque attribution to an exact claim");
-  const { admitAll } = await imp("build/host/policy.js");
-
-  const author = testAuthor();
-  const blob = (app, protocols, requires) => packBundle({
-    [MANIFEST_FILE]: signManifest(sodium, author,
-      { app, version: 1, protocols, modules: [], guest: GUEST({ requires }) }),
-    [GUEST_FILE]: GUEST_BYTES,
-  });
-  // Each load stands exactly one realm, so the seam captured after an `await` is that
-  // bundle's own `host.call` — the very function its guest would hold.
-  let lastSeam = null;
-  const realms = [];
-  const shell = await bootTestShell({
-    createRealm: async ({ hostCall }) => {
-      lastSeam = hostCall;
-      const realm = {
-        calls: [],
-        async call(entry, payload) { realm.calls.push({ entry, payload }); return new Uint8Array(); },
-        dispose() { },
-      };
-      realms.push(realm);
-      return realm;
-    },
-    // Everything admitted, `link` included: the boundary under test is the shell's claim
-    // check, and a policy refusing the privilege would hide it behind an earlier refusal.
-    // The pin is this same author's for that reason — it is the other refusal that would
-    // land first (§12.5).
-    pinAuthor: author,
-    admit: admitAll,
-  });
-  const attribution = Uint8Array.of(7, 8, 9), body = Uint8Array.of(1, 2, 3);
-  const attrHead = new Uint8Array(4); writeU32BE(attrHead, 0, attribution.length);
-  /** One `route/deliver` submission: `[claimLen u8][claim][attrLen u32][attr][payload]`. */
-  const deliver = (seam, claim) => {
-    const name = enc.encode(claim);
-    return seam("route/deliver", concatBytes([
-      Uint8Array.of(name.length), name, attrHead, attribution, body,
-    ]));
-  };
-  try {
-    await shell.loadBundleBlob(blob("wire", ["wire-v1"], []));
-    const wireRealm = realms.at(-1);
-    await shell.loadBundleBlob(blob("offer", ["_offer"], []));
-    const offerRealm = realms.at(-1);
-    await shell.loadBundleBlob(blob("router", undefined, ["route/deliver"]));
-    const routerSeam = lastSeam;
-
-    await deliver(routerSeam, "wire-v1");
-    assertEqual(wireRealm.calls.length, 1, "delivery reaches exactly the named claimant");
-    assert(bytesEqual(wireRealm.calls[0].payload, concatBytes([attribution, body])),
-      "the claimant receives opaque attribution followed by payload");
-    // The one thing this authority may NOT reach. Empty rather than an error, because a
-    // submitter learns exactly what it learns for any id nobody serves — the local service
-    // names of this node are not a namespace a peer gets to probe.
-    const local = await deliver(routerSeam, "_offer");
-    assertEqual(offerRealm.calls.length, 0,
-      "route/deliver must not reach a bundle's `_`-led LOCAL service claim");
-    assertEqual(local.length, 0, "…and says nothing more than an unclaimed id would");
-    const noClaim = await deliver(routerSeam, "_missing");
-    assertEqual(noClaim.length, 0, "an unclaimed delivery still settles asynchronously as empty");
-
-    await shell.loadBundleBlob(blob("link-only", undefined, ["link/open"]));
-    const linkSeam = lastSeam;
-    let refused = "";
-    try { await linkSeam("route/deliver", new Uint8Array()); } catch (e) { refused = String(e); }
-    assert(/not declared/.test(refused), "raw-link authority does not imply route/deliver");
-  } finally { shell.close(); }
-  console.log("  OK\n");
-}
+// ─── Test: the link slot's delivery return is the ONLY delivery path ──────────
+// Inbound attributed delivery is the link occupant's return convention, not a grant
+// (README §12.10): the one slot that sees the plaintext is the one that attributes, so
+// there is no second privilege to grant or forget. The properties that had to be pinned
+// live at the one place they can be — over the real driver, claims and transport bundle:
+// a delivery reaches exactly the named ordinary claim, it never reaches a bundle's
+// `_`-led LOCAL service claim, and a non-link app can never name a delivery path at all
+// (transport-link.test.mjs: "EXACT CLAIM", "a peer cannot reach a bundle's `_`-led local
+// claim", "CALLER BOUNDARY").
 
 // ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
 //
@@ -970,6 +900,12 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ grants: { links: [goodHex] } })); } catch { threw = true; }
   assert(threw, "a grant naming no privilege this host has is refused by name");
+  // `route` is gone: delivery is the link slot's return convention, and a policy file
+  // written for the separate grant is a file this host does not mean — refused at the
+  // boot rather than read as an empty grant.
+  threw = false;
+  try { parsePolicy(JSON.stringify({ grants: { route: [goodHex] } })); } catch { threw = true; }
+  assert(threw, "`grants.route` is no longer a privilege key — refused by name, kept nobody");
   threw = false;
   try { parsePolicy(JSON.stringify({})); } catch { threw = true; }
   assert(threw, "a policy listing neither authors nor grants is refused");
@@ -1063,18 +999,19 @@ async function testRequiresPickThePrivileges() {
   console.log("  OK\n");
 }
 
-// ─── Test: node/sign is always the app scope; link/sign is the network scope, on
-// ─── EVERY load path — gaining `link` adds an endpoint, never changes one ───────
+// ─── Test: node/sign is the one sign name; its scope is the slot's — the app scope for ──
+// ─── an app slot, the network scope for the link slot, on EVERY load path ──────────────
 //
-// `slotSignScopes` is a function of admitted facts — the node's identity and the
-// manifest — which is the whole reason it cannot drift. Driven through a real shell
-// because the property is about the point where a signed manifest becomes a realm, and
-// because the path that could silently lose it is the in-place UPDATE: a transport that
-// re-scoped itself on upgrade would keep serving while every handshake with an
-// un-upgraded peer failed as an authentication error with nothing naming the cause.
-async function testSigningScopeFollowsPrivilege() {
-  console.log("Test: node/sign is always the app scope, link/sign is always the network scope, on every load path");
+// `slotSignScope` is a function of admitted facts — the node's identity, the manifest and
+// the privileges it reaches — which is the whole reason it cannot drift. Driven through a
+// real shell because the property is about the point where a signed manifest becomes a
+// realm, and because the path that could silently lose it is the in-place UPDATE: a
+// transport that re-scoped itself on upgrade would keep serving while every handshake with
+// an un-upgraded peer failed as an authentication error with nothing naming the cause.
+async function testSigningScopeFollowsSlot() {
+  console.log("Test: node/sign is the slot's scope — app scope for an app, network scope for the link slot, on every load path");
   const { byPrivilege, admitAll } = await imp("build/host/policy.js");
+  const { slotSignScope } = await imp("build/host/guest-seam.js");
   const linkAuthor = testAuthor(), appAuthor = testAuthor();
   const identity = generateKeyPair();
   const networkKey = new Uint8Array(32).fill(0x7a);
@@ -1104,42 +1041,42 @@ async function testSigningScopeFollowsPrivilege() {
   const msg = new Uint8Array([5, 4, 3]);
   const linkApp = guestSignScope(linkAuthor.id, "linkprobe");
   try {
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "link/sign", "link/open"]));
+    // The link slot's one scope is the NETWORK scope: the channel AUTH is a fact of the
+    // slot, not a second name.
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "node/verify", "link/open"]));
     const v1 = await seam("node/sign", msg);
-    assert(signs(v1, DOMAIN_GUEST, linkApp, msg),
-      "node/sign always signs under its own app scope, even for a slot that also reaches link");
-    assert(!signs(v1, DOMAIN_LINK, networkKey, msg),
-      "…and never under the network scope — gaining link never changes what node/sign means");
-    const l1 = await seam("link/sign", msg);
-    assert(signs(l1, DOMAIN_LINK, networkKey, msg),
-      "link/sign signs under DOMAIN_link_scope ‖ networkKey");
-    assert(!signs(l1, DOMAIN_GUEST, linkApp, msg),
-      "…and never under the app's own scope, so it cannot sign as the app");
+    assert(signs(v1, DOMAIN_LINK, networkKey, msg),
+      "the link slot's node/sign signs under DOMAIN_link_scope ‖ networkKey");
+    assert(!signs(v1, DOMAIN_GUEST, linkApp, msg),
+      "…and never under the transport author's app scope — the slot's scope is what the name means");
+    assertEqual((await seam("node/verify", concatBytes([identity.publicKey, v1, msg])))[0], 1,
+      "node/verify on the link slot checks under the same network scope");
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "link/sign", "link/open"]));
-    const l2 = await seam("link/sign", msg);
-    assert(signs(l2, DOMAIN_LINK, networkKey, msg),
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "node/verify", "link/open"]));
+    const v2 = await seam("node/sign", msg);
+    assert(signs(v2, DOMAIN_LINK, networkKey, msg),
       "an in-place update of the link slot keeps the SAME network scope — an upgrade cannot re-scope a node");
 
     // And the other arm, on a shell that already has a link occupant: an ordinary app
-    // signs under its own scope through node/sign and has no link/sign at all.
-    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node/sign"]));
+    // signs under its own scope, and there is only one pair of sign names — nothing under
+    // a second name to reach.
+    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node/sign", "node/verify"]));
     const app = await seam("node/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
-      "an ordinary app signs under DOMAIN_guest ‖ author ‖ app");
+      "an ordinary app's node/sign signs under DOMAIN_guest ‖ author ‖ app");
     assert(!signs(app, DOMAIN_LINK, networkKey, msg),
-      "…and cannot reach the link occupant's network scope");
+      "…and cannot reach the link slot's network scope");
     let refused = false;
     try { await seam("link/sign", msg); } catch { refused = true; }
-    assert(refused, "an app that never declared link/sign cannot reach it at all");
+    assert(refused, "there is no link/sign name — the sign pair is one names pair per slot");
 
-    // The two arms are the two exported constructors, so a caller building a scope by hand
+    // The two arms are the one exported constructor, so a caller building a scope by hand
     // agrees with what the slot got.
-    assert(bytesEqual(linkSignScope(identity, networkKey).scope, networkKey),
-      "linkSignScope scopes to the network key");
-    assert(bytesEqual(appSignScope(identity, appAuthor.id, "plainapp").scope,
-      guestSignScope(appAuthor.id, "plainapp")), "appSignScope scopes to author ‖ app");
+    assert(bytesEqual(slotSignScope({ identity, networkKey }, linkAuthor.id, "linkprobe", ["link"]).scope, networkKey),
+      "slotSignScope gives the link slot the network scope");
+    assert(bytesEqual(slotSignScope({ identity, networkKey }, appAuthor.id, "plainapp", []).scope,
+      guestSignScope(appAuthor.id, "plainapp")), "slotSignScope gives an app slot author ‖ app");
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -1150,7 +1087,7 @@ async function testGuestAbi() {
   console.log("Test: a guest declares the host ABI it was written against");
 
   const author = testAuthor();
-  const guestText = "register('ping', () => new Uint8Array([1]));";
+  const guestText = "function handle() { return new Uint8Array([1]); }";
   const guestBytes = new TextEncoder().encode(guestText);
   const mk = (guest) => signManifest(sodium, author,
     { app: "abi", version: 1, modules: [], guest });
@@ -1314,7 +1251,7 @@ async function testBundle() {
     // no bind name and names no file: they are `<name>.wasm` and `guest.js`.
     const { host: h } = await makeHost();
     const testKey = appKey(author.id, "test");
-    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = {
       app: "test", version: 1,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
@@ -1355,7 +1292,7 @@ async function testBundle() {
       dir: pjoin(dir, "_data"), identity,
     });
     const loaded = await shell.loadBundle(bundlePath);
-    assert(loaded.guestSource.includes("register('ping'"), "guest source loaded + integrity-checked");
+    assert(loaded.guestSource.includes("function handle"), "guest source loaded + integrity-checked");
 
     // Freshness (§12.4): version is an enforced monotonic high-water per (author, app),
     // set to 1 by the load above.
@@ -1495,7 +1432,7 @@ async function testSafeJs() {
   {
     const DANGER = ["Bun", "process", "require", "fetch", "Buffer", "WebAssembly", "globalThis"];
     const probeSrc = `
-      register("probe", () => {
+      function handle() {
         const names = ${JSON.stringify(DANGER)};
         const out = new Uint8Array(names.length);
         for (let i = 0; i < names.length; i++) {
@@ -1503,10 +1440,10 @@ async function testSafeJs() {
           catch { out[i] = 2; }
         }
         return out;
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: probeSrc, hostCall: async () => new Uint8Array() });
-    const res = await realm.call("probe", new Uint8Array());
+    const res = await realm.call(new Uint8Array());
     for (let i = 0; i < DANGER.length - 1; i++) {
       assertEqual(res[i], 0, `${DANGER[i]} is unreachable in the realm`);
     }
@@ -1515,13 +1452,13 @@ async function testSafeJs() {
   }
   {
     const src = `
-      register("tryImport", async () => {
+      async function handle() {
         try { await import("node:fs"); return new Uint8Array([1]); }
         catch { return new Uint8Array([0]); }
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall: async () => new Uint8Array() });
-    const res = await realm.call("tryImport", new Uint8Array());
+    const res = await realm.call(new Uint8Array());
     assertEqual(res[0], 0, "import('node:fs') rejects — no path out of the realm");
     realm.dispose();
   }
@@ -1537,17 +1474,22 @@ async function testSafeJs() {
       return new Uint8Array();
     };
     const src = `
-      register("sync", (arg) => host.call("inc", arg));                  // sync name: host.call returns bytes, no await
-      register("net", async (arg) => { return await host.call("slow", arg); });  // net-like name: a genuinely awaited Promise
+      function handle(a) {
+        const sel = a[0], arg = a.subarray(1);
+        if (sel === 1) return host.call("inc", arg);                  // sync name: host.call returns bytes, no await
+        if (sel === 2) return (async () => await host.call("slow", arg))();  // net-like name: a genuinely awaited Promise
+        throw new Error("no such sel " + sel);
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall });
     const input = new Uint8Array([0, 1, 2, 254, 255]);
-    const sync = await realm.call("sync", input);
+    const U = (...xs) => new Uint8Array(xs);
+    const sync = await realm.call(U(1, ...input));
     assertEqual([...sync], [1, 2, 3, 255, 0], "sync name: bytes crossed in and back with no promise");
-    const asyncR = await realm.call("net", input);
+    const asyncR = await realm.call(U(2, ...input));
     assertEqual([...asyncR], [1, 2, 3, 255, 0], "net-like name: await host.call resolves the real Promise");
     assert(hostCalls === 2, "the host seam was invoked for each call");
-    const again = await realm.call("sync", new Uint8Array([10]));
+    const again = await realm.call(U(1, 10));
     assertEqual([...again], [11], "realm is reusable across calls");
     realm.dispose();
   }
@@ -1563,7 +1505,7 @@ async function testSafeJs() {
       return new Uint8Array();
     };
     const src = `
-      register("orchestrate", async (arg) => {
+      async function handle(arg) {
         const count = arg[0], peerCount = arg[1];
         // Fan out OFFERs concurrently — the guest's own Promise.all, no host sendMany.
         const offers = await Promise.all(
@@ -1578,10 +1520,10 @@ async function testSafeJs() {
         );
         const holders = haves.filter((h) => h[0] === 1).length;
         return new Uint8Array([placed.length, holders, ...placed]);
-      });
+      }
     `;
     const realm = await createSafeRealm({ source: src, hostCall });
-    const res = await realm.call("orchestrate", new Uint8Array([3, 10]));
+    const res = await realm.call(new Uint8Array([3, 10]));
     assertEqual(res[0], 3, "loop placed exactly `count` blocks on distinct peers");
     assertEqual([...res.slice(2)], [0, 2, 4], "placement followed peer order and the accept rule");
     assertEqual(res[1], 4, "concurrent have/want fan-out (Promise.all) collected the right holders");
@@ -1591,15 +1533,15 @@ async function testSafeJs() {
   // 4. Realm isolation: a poisoned guest cannot reach a sibling's global.
   {
     const a = await createSafeRealm({
-      source: `globalThis.SECRET = 42; register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
+      source: `globalThis.SECRET = 42; function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
     const b = await createSafeRealm({
-      source: `register("leak", () => new Uint8Array([globalThis.SECRET ?? 0]));`,
+      source: `function handle() { return new Uint8Array([globalThis.SECRET ?? 0]); }`,
       hostCall: async () => new Uint8Array(),
     });
-    const ra = await a.call("leak", new Uint8Array());
-    const rb = await b.call("leak", new Uint8Array());
+    const ra = await a.call(new Uint8Array());
+    const rb = await b.call(new Uint8Array());
     assertEqual(ra[0], 42, "realm A sees its own global");
     assertEqual(rb[0], 0, "realm B does not see realm A's global");
     a.dispose();
@@ -1624,12 +1566,12 @@ async function testRealmSerialization() {
     let calls = 0;
     const hostCall = (name, payload) => { calls++; return name === "inc" ? payload.map((b) => (b + 1) & 0xff) : new Uint8Array(); };
     const realm = await createSafeRealm({
-      source: `register("inc", (arg) => host.call("inc", arg));`,
+      source: `function handle(arg) { return host.call("inc", arg); }`,
       hostCall,
     });
-    const out = await realm.call("inc", new Uint8Array([0, 9, 255]));
+    const out = await realm.call(new Uint8Array([0, 9, 255]));
     assertEqual([...out], [1, 10, 0], "sync host.call round-trips through the copy boundary");
-    assertEqual([...(await realm.call("inc", new Uint8Array([41])))], [42], "the realm is reusable across calls");
+    assertEqual([...(await realm.call(new Uint8Array([41])))], [42], "the realm is reusable across calls");
     assertEqual(calls, 2, "the synchronous seam was invoked once per call");
     realm.dispose();
   }
@@ -1646,13 +1588,16 @@ async function testRealmSerialization() {
       return new Uint8Array();
     };
     const realm = await createSafeRealm({
-      source: `register("init", async () => host.call("park", new Uint8Array()));
-               register("hold", (arg) => host.call("inc", arg));`,
+      source: `function handle(a) {
+                 if (a[0] === 1) return (async () => await host.call("park", new Uint8Array()))();
+                 if (a[0] === 2) return host.call("inc", a.subarray(1)); // sync — holder path
+                 throw new Error("no such sel " + a[0]);
+               }`,
       hostCall,
     });
     const order = [];
-    const initP = realm.call("init", new Uint8Array()).then((r) => { order.push("init"); return r; });
-    const heldP = realm.call("hold", new Uint8Array([7])).then((r) => { order.push("hold"); return r; });
+    const initP = realm.call(new Uint8Array([1])).then((r) => { order.push("init"); return r; });
+    const heldP = realm.call(new Uint8Array([2, 7])).then((r) => { order.push("hold"); return r; });
 
     // Give the holder every chance to jump the queue before the initiator is released.
     for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -1668,10 +1613,10 @@ async function testRealmSerialization() {
   // 3. Still airtight — the one seam is the same zero-authority sandbox.
   {
     const realm = await createSafeRealm({
-      source: `register("probe", () => new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]));`,
+      source: `function handle() { return new Uint8Array([typeof globalThis.process === "undefined" ? 0 : 1, typeof globalThis.fetch === "undefined" ? 0 : 1]); }`,
       hostCall: async () => new Uint8Array(),
     });
-    const r = await realm.call("probe", new Uint8Array());
+    const r = await realm.call(new Uint8Array());
     assertEqual([...r], [0, 0], "process / fetch are unreachable from an entrypoint");
     realm.dispose();
   }
@@ -1685,10 +1630,10 @@ async function testRealmSerialization() {
   //    Hence the deferred teardown, pinned here: a regression is a host crash.
   {
     const realm = await createSafeRealm({
-      source: `register("park", async () => await host.call("park", new Uint8Array()));`,
+      source: `async function handle() { await host.call("park", new Uint8Array()); }`,
       hostCall: (name) => (name === "park" ? new Promise(() => {}) : new Uint8Array()),  // never settles
     });
-    const parked = realm.call("park", new Uint8Array());
+    const parked = realm.call(new Uint8Array());
     for (let i = 0; i < 10; i++) await Promise.resolve();   // let it reach its await
     realm.dispose();
 
@@ -1696,16 +1641,16 @@ async function testRealmSerialization() {
     try { await parked; } catch (e) { msg = e.message; }
     assertEqual(msg, "guest realm disposed", "the parked invocation is failed by dispose, not stranded");
     let after = "";
-    try { await realm.call("park", new Uint8Array()); } catch (e) { after = e.message; }
+    try { await realm.call(new Uint8Array()); } catch (e) { after = e.message; }
     assertEqual(after, "guest realm disposed", "a call accepted after dispose is refused, not run");
 
     // A realm built after the deferred teardown has run proves the module survived it.
     await sleep(1);
     const next = await createSafeRealm({
-      source: `register("ping", (arg) => arg);`,
+      source: `function handle(arg) { return arg; }`,
       hostCall: async () => new Uint8Array(),
     });
-    assertEqual([...(await next.call("ping", new Uint8Array([7])))], [7],
+    assertEqual([...(await next.call(new Uint8Array([7])))], [7],
       "the engine is still alive after the parked realm's context was freed");
     next.dispose();
   }
@@ -1949,16 +1894,16 @@ async function testModuleCallChargedToGuestBudget() {
   // The realm's budget is 5 s, but the guest burns most of it before calling the module:
   // the call must then be killed near what remains, not at the table's 60 s.
   const realm = await createSafeRealm({
-    source: `register("go", async () => {
+    source: `async function handle() {
       const t0 = Date.now();
       while (Date.now() - t0 < 4900) { /* burn the segment */ }
       return await host.call("spin", new Uint8Array());
-    });`,
+    }`,
     hostCall: seam,
     deadlineMs: 5000,
   });
   const t0 = Date.now();
-  const out = await realm.call("go", new Uint8Array());
+  const out = await realm.call(new Uint8Array());
   const spent = Date.now() - t0;
   realm.dispose();
   assert(out !== null && out.length === 0, "the module answered empty at the guest's deadline");
@@ -1974,15 +1919,15 @@ async function testModuleCallChargedToGuestBudget() {
   // microseconds per turn, and QuickJS's interrupt is consulted per bytecode, of which
   // this guest executes almost none between parks.
   const looper = await createSafeRealm({
-    source: `register("go", async () => {
+    source: `async function handle() {
       for (;;) await host.call("spin", new Uint8Array());
-    });`,
+    }`,
     hostCall: seam,
     deadlineMs: 1000,
   });
   const t1 = Date.now();
   let killed = "";
-  try { await looper.call("go", new Uint8Array()); }
+  try { await looper.call(new Uint8Array()); }
   catch (e) { killed = e.message; }
   const looped = Date.now() - t1;
   looper.dispose();
@@ -2000,11 +1945,12 @@ async function testModuleCallChargedToGuestBudget() {
 //
 // The number is only worth carrying if the host refuses a seam it does not implement, and
 // the case that matters is always the one just retired — the population that actually
-// exists. At ABI 7 `link/config` dropped its trailing address book, and an ABI-6 transport
-// reads that removed field off the end of the buffer as an empty one: a node with a correct
-// identity that dials nobody and reports nothing. Written against the constant, so the
-// boundary moves with it rather than pinning whichever version was current the day it was
-// written.
+// exists. A guest written against the previous seam calls names this host no longer has,
+// or reads a shape it no longer sends; tolerating it would run a program against a
+// contract neither side agreed to, and the failure that follows is silent (a name that
+// answers nothing, a field read at the wrong offset). Written against the constant, so
+// the boundary moves with the seam rather than pinning whichever version was current the
+// day this was written.
 async function testPreviousAbiRefused() {
   const stale = GUEST_ABI_VERSION - 1;
   console.log(`Test: guest ABI ${stale} is refused at load — a retired seam is not tolerated`);
@@ -2036,13 +1982,13 @@ async function testSafeRealmConcurrency() {
   // evalCode, so a second call staging __arg can never corrupt the first's captured arg —
   // no host-side serialization needed.
   const realm = await createSafeRealm({
-    source: `register("echo", async (a) => await host.call("echo", a));`,
+    source: `async function handle(a) { return await host.call("echo", a); }`,
     hostCall: (_name, p) => sleep(10).then(() => p),
   });
   try {
     const [r1, r2] = await Promise.all([
-      realm.call("echo", new Uint8Array([1])),
-      realm.call("echo", new Uint8Array([2])),
+      realm.call(new Uint8Array([1])),
+      realm.call(new Uint8Array([2])),
     ]);
     assertEqual([...r1], [1], "first concurrent call returns its own bytes");
     assertEqual([...r2], [2], "second concurrent call returns its own bytes");
@@ -2393,7 +2339,7 @@ async function testBundleCorruptNewerRollback() {
   let shell;
   try {
     const { host: h } = await makeHost();
-    const guestText = "register('ping', () => new Uint8Array([1]));";
+    const guestText = "function handle() { return new Uint8Array([1]); }";
     const manifest = (version) => ({
       app: "rollback", version,
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
@@ -2717,7 +2663,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(guest)), abi: GUEST_ABI_VERSION,
-        requires: ["fs/put", "link/config", "_svc"],
+        requires: ["fs/put", "link/open", "_svc"],
       },
     }),
     [moduleFile("fwd")]: forwarderBytes,
@@ -2729,9 +2675,9 @@ async function testCandidateRealmCannotActBeforeCommit() {
   }
   const store = new FlakyStore();
   const candidates = [];
-  // A REAL socket-less driver (the browser-edge shape), so `link/config` is the read the
-  // transport's own `init()` makes rather than a stand-in, and the pin — this author's —
-  // is what lets a `link`-reaching candidate get as far as the seam under test.
+  // A REAL socket-less driver (the browser-edge shape), so a link read is the seam's true
+  // read through the candidate's own unpublished binding, and the pin — this author's — is
+  // what lets a `link`-reaching candidate get as far as the seam under test.
   const shell = await bootTestShell({
       fs, freshnessStore: store, pinAuthor: author,
       createRealm: async ({ hostCall }) => {
@@ -2739,9 +2685,12 @@ async function testCandidateRealmCannotActBeforeCommit() {
         for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
           try { await hostCall(name, payload); } catch { refused.push(name); }
         }
-        const config = await hostCall("link/config", new Uint8Array());
+        // The node facts are no longer a seam name a candidate reads offside — the host
+        // hands them to the freshly stood slot as its `init` op. A link READ stays open:
+        // `link/open` answers "no route" for the unpublished binding rather than throwing.
+        const openBytes = await hostCall("link/open", new Uint8Array(32));
         const moduleAnswer = await hostCall("fwd", Uint8Array.of(4));
-        candidates.push({ hostCall, refused, config, moduleAnswer });
+        candidates.push({ hostCall, refused, openBytes, moduleAnswer });
         return { call: async () => new Uint8Array(), dispose() {} };
       },
       // A platform claim standing in for the neighbour a candidate must not reach.
@@ -2757,7 +2706,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "a candidate reaches neither a durable write nor another realm");
     assertEqual(reached, 0, "…so the realm it called was never entered");
     assertEqual((await fs.stat()).used, 0, "…and it left nothing on disk");
-    assert(candidates[0].config.length > 0, "the reads a guest initializes from stay open");
+    assertEqual(candidates[0].openBytes[0] & 0xff, 0,
+      "the reads a guest initializes from stay open — a link read answers no route");
     assert(candidates[0].moduleAnswer[0] === 4, "…as do its own verified modules");
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
@@ -2840,7 +2790,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-      const r = { calls: [], disposed: false, call: async (op) => { r.calls.push(op); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+      const r = { calls: [], disposed: false, call: async (p) => { r.calls.push(p.length > 0 && p[0] === 1 ? "timer" : "invoke"); return new Uint8Array(); }, dispose() { r.disposed = true; } };
       realms.push(r);
       await o.hostCall("timer/arm", arm(1, 200));
       return r;
@@ -2849,7 +2799,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   });
   try {
     await shell.loadBundleBlob(blob(1));
-    await shell.invoke("ping", new Uint8Array(), key);
+    await shell.invoke(new Uint8Array(), key);
     assertEqual(realms.length, 1, "the first slot stands one realm");
 
     failNextRealm = true;
@@ -2861,7 +2811,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
 
     await shell.loadBundleBlob(blob(2));
     assert(realms[0].disposed, "the upgrade disposed the realm it replaced");
-    await shell.invoke("ping", new Uint8Array(), key);
+    await shell.invoke(new Uint8Array(), key);
     assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
     assert(!realms[1].disposed, "…which is the one left standing");
 
@@ -2886,7 +2836,6 @@ await testDenyAllPolicyRejects();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();
-await testGenericClaimDelivery();
 await testOneRawLinkOwner();
 await testInstallerRemove();
 await testFs();
@@ -2894,7 +2843,7 @@ await testFsKeyRule();
 await testGuestSeam();
 await testPolicy();
 await testRequiresPickThePrivileges();
-await testSigningScopeFollowsPrivilege();
+await testSigningScopeFollowsSlot();
 await testGuestAbi();
 await testSlotFreshness();
 await testShellBoot();

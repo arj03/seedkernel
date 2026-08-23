@@ -42,7 +42,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		// policy has to name the artifact's own transport author before either node
 		// stands up. The id is read from the realm, never restated.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor], route: [embeddedTransportAuthor] } }));
+		                           grants: { link: [embeddedTransportAuthor] } }));
 		globalThis.__setup = (async () => {
 		  const a = await makeTransportNode({ identity: idA, listen: { host: "127.0.0.1", port: 0 }, timeoutMs: 2000 });
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 2000 });
@@ -56,12 +56,18 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  // name: a co-resident realm reaches it and a peer does not (§12.10), and
 		  // dispatch is the peer's door. This seam is hand-built rather than a loaded
 		  // slot, so the host loopback stands in for the cross-realm call — the same
-		  // slot, the same entrypoint, the same [opLen u8][op][args] envelope.
+		  // slot, the same entrypoint, the app's own op framing recomposed here (the
+		  // shell passes bytes and never reads them).
 		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => {
 		    const n = payload[0];
 		    let op = "";
 		    for (let i = 0; i < n; i++) op += String.fromCharCode(payload[1 + i]);
-		    return b.shell.invoke(op, payload.slice(1 + n), b.shell.resolve(id));
+		    const args = payload.slice(1 + n);
+		    const framed = new Uint8Array(1 + op.length + args.length);
+		    framed[0] = op.length;
+		    for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
+		    framed.set(args, 1 + op.length);
+		    return b.shell.invoke(framed, b.shell.resolve(id));
 		  } });
 		})();
 	`, hex.EncodeToString(sender.id())))); err != nil {
@@ -90,16 +96,22 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
 		  return out;
 		}
-		register("ask", async (msg) => {
+		// handle reads [caller 32][this app's op framing]: the local "ask" op (the mock
+		// realm composes it around the test payload) builds the transport's send op and
+		// awaits the response. The await is the whole point — it suspends until the host
+		// realm's socket round-trip settles and the loop resolves the guest's promise.
+		function handle(arg) {
+		  const n = arg[32];
+		  const msg = arg.subarray(33 + n);
 		  const peer = fromHex(APP.peer);                       // A's 32-byte public key
 		  const proto = new TextEncoder().encode("probe");      // the app A claims
 		  // [opLen u8]["send"] then the op's args:
 		  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
-		  const op = "send";
-		  const req = new Uint8Array(1 + op.length + 1 + 4 + 4 + 32 + 4 + proto.length + 4 + msg.length);
-		  req[0] = op.length;
-		  for (let i = 0; i < op.length; i++) req[1 + i] = op.charCodeAt(i);
-		  let off = 1 + op.length;
+		  const opName = "send";
+		  const req = new Uint8Array(1 + opName.length + 1 + 4 + 4 + 32 + 4 + proto.length + 4 + msg.length);
+		  req[0] = opName.length;
+		  for (let i = 0; i < opName.length; i++) req[1 + i] = opName.charCodeAt(i);
+		  let off = 1 + opName.length;
 		  const dv = new DataView(req.buffer);
 		  req[off++] = 0;                       // noReply
 		  dv.setUint32(off, 0); off += 4;       // deadline: the node's default
@@ -109,10 +121,11 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  req.set(proto, off); off += proto.length;
 		  dv.setUint32(off, msg.length); off += 4;
 		  req.set(msg, off);
-		  const r = await host.call("_net", req);               // [ok u8][resp]
-		  if (r[0] !== 1) throw new Error("net send failed");
-		  return r.slice(1);
-		});
+		  return host.call("_net", req).then((r) => {   // [ok u8][resp]
+		    if (r[0] !== 1) throw new Error("net send failed");
+		    return r.slice(1);
+		  });
+		}
 	`
 	aIdHex := mustEvalString(t, qc, `aId`)
 	newTestRealm(t, fmt.Sprintf(`{"peer":%q}`, aIdHex), askGuestSource)

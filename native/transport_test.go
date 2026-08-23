@@ -50,7 +50,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		// makeTransportNode — the factory bootNode uses — and the policy has to admit
 		// the artifact's own transport author before either has a network at all.
 		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
-		                           grants: { link: [embeddedTransportAuthor], route: [embeddedTransportAuthor] } }));
+		                           grants: { link: [embeddedTransportAuthor] } }));
 		globalThis.__probe = null;
 		globalThis.loadProbe = (bytes) => { globalThis.__probe = new Uint8Array(bytes); };
 		globalThis.startTest = async function () {
@@ -64,8 +64,9 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  await b.shell.loadBundleBlob(__probe);
 		  b.transport.addPeerAddr(aId, { host: "127.0.0.1", port: a.transport.%s, transport: "%s" });
 		  // The send op's own argument order (transport/src/core.js):
-		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME and
-		  // the caller id are the shell's framing (invoke), never written here.
+		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME that
+		  // leads it is the APP's framing, composed here (the shell passes bytes unread;
+		  // the caller id is the shell's).
 		  const proto = new TextEncoder().encode("probe");
 		  const payload = new Uint8Array([10, 20, 30]);
 		  const args = new Uint8Array(1 + 4 + 4 + 32 + 4 + proto.length + 4 + payload.length);
@@ -78,7 +79,14 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  args.set(proto, off); off += proto.length;
 		  dv.setUint32(off, payload.length); off += 4;
 		  args.set(payload, off);
-		  const r = await b.shell.invoke("send", args, %q);
+		  const opFrame = (name, b) => {
+		    const out = new Uint8Array(1 + name.length + b.length);
+		    out[0] = name.length;
+		    for (let i = 0; i < name.length; i++) out[1 + i] = name.charCodeAt(i);
+		    out.set(b, 1 + name.length);
+		    return out;
+		  };
+		  const r = await b.shell.invoke(opFrame("send", args), %q);
 		  if (r[0] !== 1) throw new Error("net: request failed");
 		  return r.slice(1);
 		};

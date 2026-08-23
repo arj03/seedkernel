@@ -10,11 +10,11 @@ import type { ModuleResult } from "./bundle.js";
 /** What a scoped SIGN/VERIFY name signs under (§12.2). The host prefixes
  *  `domain ‖ scope ‖ msg` and never parses `msg`. `key` is the node's one identity. */
 export interface SignScope {
-    /** Domain tag — `DOMAIN_guest` for an app, `DOMAIN_link_scope` for the slot holding
-     *  the raw-link resource. */
+    /** Domain tag — `DOMAIN_guest` for an app slot, `DOMAIN_link_scope` for the slot
+     *  holding the raw-link resource. */
     domain: Uint8Array;
-    /** Scope bytes under the domain: `author ‖ app` for an app, the network key for the
-     *  link slot. */
+    /** Scope bytes under the domain: `author ‖ app` for an app slot, the network key for
+     *  the link slot. */
     scope: Uint8Array;
     /** The keypair that signs. */
     key: {
@@ -51,11 +51,11 @@ export interface SeamCalls {
 }
 
 /** Raw-link capability (§12.1): bytes over an opaque host-minted link id.
- *  Nothing here may re-enter the guest realm. */
+ *  Nothing here may re-enter the guest realm. The node's immutable facts never pass
+ *  this way — the host invoked the freshly stood slot once, with them, before the
+ *  binding is published (shell-core.ts), and the mutable address book arrives as
+ *  `addr` events. This is only the byte pipe. */
 export interface RawNet {
-    /** This node's link configuration. Reading it has no side effects, so a candidate
-     *  slot may initialize before it is published. */
-    config(): Uint8Array;
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
      *  host resolves the name in its own address book; the caller learns no route it could
@@ -75,12 +75,6 @@ export interface RawNet {
     /** Report the fate of a platform-owned link back to the binding that supplied it. */
     authenticated(linkId: number, peer: Uint8Array): void;
     down(linkId: number, reason: number): void;
-}
-
-/** Submit a request that arrived from outside this node. Cannot reach a `_`-led
- *  local claim. */
-export interface ClaimDelivery {
-    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -121,17 +115,12 @@ export interface SeamGrants {
      *  authorities (`isGrant`) pass regardless. Required — pass `UNRESTRICTED_NAMES` to
      *  opt out deliberately. */
     names: Iterable<string> | typeof UNRESTRICTED_NAMES;
-    /** What `node/sign`/`node/verify` sign and check under — this app's own scope
-     *  (`appSignScope`), unconditionally: gaining another privilege never changes what
-     *  these two names mean (§12.5's monotonicity — a grant only ever ADDS an endpoint).
-     *  Without a scope both are unavailable, because guest signing and scoped verification
-     *  are never raw. */
+    /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
+     *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
+     *  the link slot gets `DOMAIN_link_scope ‖ network_key`. The host always chooses
+     *  domain ‖ scope; the guest never supplies either. Without a scope both names are
+     *  unavailable, because guest signing and scoped verification are never raw. */
     signScope?: SignScope;
-    /** What `link/sign`/`link/verify` sign and check under — this node's network scope
-     *  (`linkSignScope`), wired ONLY for a bundle that reaches the `link` privilege. A
-     *  distinct name from `signScope` rather than a second meaning for it, so a slot that
-     *  gains `link` gets a new endpoint, not a changed one. */
-    linkSignScope?: SignScope;
     /** Raw-byte fs backend, already scoped to this app's keyspace by the shell
      *  (`scopedFs`). Optional: a node that only initiates never reads it. */
     fs?: Fs;
@@ -139,8 +128,6 @@ export interface SeamGrants {
      *  that reaches the `link` privilege, so nothing else can ever reach a descriptor
      *  whatever is installed (§1, capability-by-non-wiring). */
     rawNet?: RawNet;
-    /** Separately granted delivery into the claim table. */
-    delivery?: ClaimDelivery;
     /** The platform's event loop, for a guest that declares `timer`. */
     timers?: HostTimers;
     /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
@@ -252,8 +239,10 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
         },
     };
 }
-/** Guest preamble: `host.call`, `register`/`__invoke`, `callerOf`/`readOp`/`writeOp`.
- *  `__host_call` → bytes (sync) or `null` (async under `callId`). `null` is reserved. */
+/** Guest preamble: `host.call` and the one entrypoint, `handle` — nothing else. The
+ *  kernel's whole inbound vocabulary is the entrypoint's argument `[caller 32][body …]`:
+ *  attribution only. What follows the 32 bytes is the callee's own format; the kernel
+ *  never reads it, so it never grows a language. */
 export function guestPreamble(): string {
     return GUEST_PREAMBLE;
 }
@@ -288,42 +277,12 @@ globalThis.host = {
     return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net / fs
   },
 };
-globalThis.__entries = Object.create(null);
-globalThis.register = (name, fn) => { globalThis.__entries[name] = fn; };
-// handle(arg) = [caller 32][body …]. 32 zero bytes = the host itself.
-globalThis.callerOf = (arg) => {
-  const caller = arg.subarray(0, 32);
-  let fromHost = true;
-  for (let i = 0; i < 32; i++) { if (caller[i] !== 0) { fromHost = false; break; } }
-  return { fromHost, caller, body: arg.subarray(32) };
-};
-// [opLen u8][op ascii][args …]. Malformed framing throws rather than a truncated name.
-globalThis.readOp = (body) => {
-  const n = body.length > 0 ? body[0] : -1;
-  if (n < 0 || body.length < 1 + n) throw new Error("guest: malformed op envelope");
-  let op = "";
-  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
-  return { op, args: body.subarray(1 + n) };
-};
-// The same, written. charCodeAt: a fresh realm is not guaranteed a TextEncoder.
-globalThis.writeOp = (op, args) => {
-  const out = new Uint8Array(1 + op.length + args.length);
-  out[0] = op.length;
-  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
-  out.set(args, 1 + op.length);
-  return out;
-};
-// Set by defer() and read by the host once the invocation's synchronous segment ends —
-// see the note on defer below. Cleared per invocation, never by the guest.
+// The answer-to-a-later-turn marker. The guest sets it (its own helper, content) and the
+// invocation's queue spot frees at the end of the synchronous segment even though nothing
+// has settled (realm-queue.ts). The one ABI bit beyond handle returning bytes: without
+// it, a guest whose answer arrives as another invocation of its own realm would hold the
+// queue against the only event that could settle it.
 globalThis.__deferred = false;
-// Answer on a later turn without holding the realm. The transport uses this: its
-// reply arrives as another invocation of the same realm. Asserts the guest never parks.
-globalThis.defer = () => {
-  let settle, fail;
-  const promise = new Promise((res, rej) => { settle = res; fail = rej; });
-  globalThis.__deferred = true;
-  return { promise, settle, fail };
-};
 function __norm(out) {
   if (out instanceof ArrayBuffer) return out;
   if (out instanceof Uint8Array) {
@@ -331,58 +290,31 @@ function __norm(out) {
   }
   throw new Error("guest: entrypoint must return Uint8Array | ArrayBuffer");
 }
-globalThis.__invoke = (name, argBuf) => {
-  const fn = globalThis.__entries[name];
-  if (typeof fn !== "function") throw new Error("guest: no entrypoint '" + name + "'");
+globalThis.__invoke = (argBuf) => {
+  if (typeof globalThis.handle !== "function") throw new Error("guest: no entrypoint 'handle'");
   // Cleared HERE rather than by the host, so the flag describes exactly this
   // invocation and a guest cannot leave it set for the next one.
   globalThis.__deferred = false;
   // A synchronous entrypoint returns bytes; an async one returns a guest promise the host
   // settles. __norm normalizes both to an ArrayBuffer.
-  const out = fn(new Uint8Array(argBuf));
+  const out = globalThis.handle(new Uint8Array(argBuf));
   return out && typeof out.then === "function" ? out.then(__norm) : __norm(out);
 };
 `;
-// ── the call envelope, host side ────────────────────────────────────────────
+// ── the attribution prefix, host side ────────────────────────────────────────
 //
-// The mirror of `callerOf`/`readOp` in the preamble above, deliberately in the same file:
-// these two functions and those three write and read the SAME bytes, so a layout change is
-// one edit rather than a search for everyone who open-coded it.
+// The ONLY bytes the host puts in front of a callee's format. An app's own format and a
+// transport's event framing are content; this prefix is what the host can be asked for,
+// one 32-byte id, unforgeable by a guest. Two ids are the host's own: the zero id (whose
+// events and loopback calls the host writes) and the timer id (a fired deadline, the one
+// re-entry the host owns). Everything else non-zero is a peer or a co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
-/** `[caller 32][opLen u8][op]` — the header of one call, without its arguments. For a
- *  caller that concatenates its own fields behind it and would otherwise copy the whole
- *  payload a second time to put a header in front (transport-host.ts `Args`, which
- *  builds this once per op and reuses it on the inbound frame path). */
-export function opHeader(op: string, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
-    const name = enc.encode(op);
-    // ASCII: the guest reads it back with charCodeAt, and a length in BYTES that a guest
-    // counts in UTF-16 code units is a framing bug waiting for its first non-ASCII op.
-    if (name.length !== op.length || name.length > 255)
-        throw new Error(`guest-seam: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
-    const out = new Uint8Array(caller.length + 1 + name.length);
-    out.set(caller, 0);
-    out[caller.length] = name.length;
-    out.set(name, caller.length + 1);
-    return out;
-}
-/** `[caller 32][opLen u8][op][args]` — one whole call, as an app's `handle` reads it
- *  (`callerOf` then `readOp`). The default caller is the host's own id, which is what
- *  `Shell.invoke` writes; the transport driver passes its own. */
-export function opCall(op: string, args: Uint8Array, caller: Uint8Array = HOST_CALLER_ID): Uint8Array {
-    const head = opHeader(op, caller);
-    return concatBytes([head, args]);
-}
-/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`, for
- *  host code reading an op envelope a guest wrote. Same bytes, same failure: malformed
- *  framing throws rather than yielding a truncated name that the caller would then see
- *  reported as an unimplemented op. */
-export function readOp(payload: Uint8Array): { op: string; args: Uint8Array } {
-    const n = payload.length > 0 ? payload[0] : -1;
-    if (n < 0 || payload.length < 1 + n)
-        throw new Error("guest-seam: malformed op envelope");
-    return { op: dec.decode(payload.subarray(1, 1 + n)), args: payload.subarray(1 + n) };
-}
+/** A fired deadline's caller id: `[0x01][0x00 …]` — not the host-proper (an app must not
+ *  read a timer entry as host authority), but never derived, so it reads to the callee as
+ *  "the host, tag timer". The payload behind it is the timer id. */
+export const TIMER_CALLER_ID = new Uint8Array(32);
+TIMER_CALLER_ID[0] = 1;
 /** Authority catalog, re-exported from core/domains.ts. Grants are these names
  *  plus reserved ids; `crypto/*` and the bundle's own modules are not. */
 export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";
@@ -447,20 +379,22 @@ export function linkSignScope(key: {
 }, networkKey?: Uint8Array): SignScope {
     return { domain: DOMAIN_LINK_SCOPE, scope: (networkKey ?? new Uint8Array(32)).slice(), key };
 }
-/** The scopes a slot gets — app always, link additionally when `requires` reach `link`.
- *  A function of admitted facts only: nothing local, and nothing from `protocols`,
- *  which move per version and would silently restate what signed records mean. */
-export function slotSignScopes(node: {
+/** The one scope a slot's SIGN/VERIFY signs under — derived once at load (§12.2):
+ *  `DOMAIN_guest ‖ author ‖ app` for an ordinary app slot, `DOMAIN_link_scope ‖
+ *  networkKey` for the slot reaching `link` — the network binding of the channel AUTH is a
+ *  fact of the slot, not a second name. A function of admitted facts only: nothing local,
+ *  and nothing from `protocols`, which move per version and would silently restate what
+ *  signed records mean. */
+export function slotSignScope(node: {
     identity: {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
     networkKey?: Uint8Array;
-}, author: Uint8Array, app: string, privileges: readonly Privilege[]): { app: SignScope; link?: SignScope } {
-    return {
-        app: appSignScope(node.identity, author, app),
-        link: privileges.includes(PRIVILEGE_LINK) ? linkSignScope(node.identity, node.networkKey) : undefined,
-    };
+}, author: Uint8Array, app: string, privileges: readonly Privilege[]): SignScope {
+    return privileges.includes(PRIVILEGE_LINK)
+        ? linkSignScope(node.identity, node.networkKey)
+        : appSignScope(node.identity, author, app);
 }
 // ── Opting out of gating, explicitly ────────────────────────────────────────
 //
@@ -500,11 +434,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             throw new Error("guest-seam: timer.* used but no timer backend wired");
         return grants.timers;
     };
-    const delivery = () => {
-        if (!grants.delivery)
-            throw new Error("guest-seam: route/deliver used but no claim routing is wired");
-        return grants.delivery;
-    };
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` with an inherited function, which the
     // dispatch below would then CALL.
@@ -514,10 +443,11 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // resolved past the end of this table.
         ...cryptoCatalog(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
-        // node/sign and node/verify are scoped, never raw, and always to THIS app's own
-        // scope (see `SignScope`) — unconditionally, whatever else the slot reaches, so a
-        // guest checks signatures without ever reconstructing host-owned bytes and without
-        // another grant ever changing what these two names mean.
+        // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope
+        // (see `SignScope`) — derived at load: an app slot's own `DOMAIN_guest ‖ author ‖
+        // app`, the link slot's `DOMAIN_link_scope ‖ network_key`. The host chooses what
+        // the name signs under, so the guest never reconstructs host-owned bytes and never
+        // picks a namespace for itself.
         "node/sign": (payload) => {
             const s = grants.signScope;
             if (!s)
@@ -585,8 +515,8 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` — the
         // whole of what the platform contributes to the network (§12.1). No peer, no
         // protocol id, no correlation: those are the transport's own. Inbound bytes arrive
-        // the other way, as ordinary invocations of the transport's `handle`.
-        "link/config": () => rawNet().config(),
+        // the other way, as ordinary invocations of the transport's `handle`. The node's
+        // immutable facts were delivered once at init; nothing here is re-readable.
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);
@@ -617,49 +547,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         "link/down": (payload) => {
             rawNet().down(readU32BE(payload, 0), payload[4]);
             return NONE;
-        },
-        // link/sign and link/verify are node/sign and node/verify's twins, scoped to the
-        // NETWORK rather than the app: `DOMAIN_link_scope ‖ networkKey`, wired only for a
-        // slot reaching `link`. A distinct name rather than a second meaning for node/sign,
-        // so a slot that gains `link` gains an endpoint, never a changed one.
-        "link/sign": (payload) => {
-            const s = grants.linkSignScope;
-            if (!s)
-                throw new Error("guest-seam: link/sign needs the link-privileged slot's network scope (signing is never raw)");
-            return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
-        },
-        "link/verify": (payload) => {
-            const s = grants.linkSignScope;
-            if (!s)
-                throw new Error("guest-seam: link/verify needs the link-privileged slot's network scope (verification is never raw)");
-            if (payload.length < 96)
-                throw new Error("guest-seam: link/verify takes [pk 32][sig 64][msg ..]");
-            try {
-                return sodium.crypto_sign_verify_detached(payload.slice(32, 96), concatBytes([s.domain, s.scope, payload.slice(96)]), payload.slice(0, 32)) ? ONE : ZERO;
-            }
-            catch {
-                return ZERO;
-            }
-        },
-        // [claimLen u8][claim][attributionLen u32][attribution][payload]. The router does
-        // not interpret attribution; it merely prepends it at the claimant boundary. A claim
-        // nothing wire-reachable serves — including a bundle's own `_`-led local service
-        // name, which this path may not reach (ClaimDelivery) — answers empty, the same
-        // answer a submitter gets for a protocol nobody claims.
-        "route/deliver": (payload) => {
-            const claimLen = payload[0];
-            if (payload.length < 5 + claimLen)
-                throw new Error("guest-seam: malformed route/deliver payload");
-            const claim = dec.decode(payload.slice(1, 1 + claimLen));
-            const attrLen = readU32BE(payload, 1 + claimLen);
-            const attrStart = 5 + claimLen;
-            if (payload.length < attrStart + attrLen)
-                throw new Error("guest-seam: malformed route/deliver attribution");
-            return delivery().deliver(
-                claim,
-                payload.slice(attrStart, attrStart + attrLen),
-                payload.slice(attrStart + attrLen),
-            ) ?? Promise.resolve(NONE);
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {

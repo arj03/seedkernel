@@ -22,14 +22,14 @@ import (
 // (§12.2). A holder is therefore an ordinary async entrypoint like an initiator, and
 // the realm serializes the two rather than running one inside the other's parked window.
 const holderGuestSource = `
-	register("handle", async (arg) => {
+	async function handle(arg) {
 	  const sender = arg.slice(0, 32);
 	  const type = arg[32];
 	  const payload = arg.slice(33);
 	  if (type === 1) { await host.call("fs/put", payload); return new Uint8Array([1]); }
 	  if (type === 2) { return await host.call("fs/get", payload); }
 	  return new Uint8Array(0);
-	});
+	}
 `
 
 // The echo guest: forwards its input to the bundle's own "fwd" module by its bare name
@@ -37,7 +37,7 @@ const holderGuestSource = `
 // module-only apps are retired (§12.4): inbound delivery reaches the guest, and the guest
 // drives its module library.
 const echoGuestSource = `
-	register("handle", (arg) => host.call("fwd", arg));
+	function handle(arg) { return host.call("fwd", arg); }
 `
 
 // requesterJS stands a second, bundle-less node up in the same realm — just a network
@@ -71,9 +71,14 @@ globalThis.__requester = null;
 // the id the transport claims, so there is nothing host-side to call instead.
 globalThis.loadIntoRequester = (bytes) => __requesterNode.shell.loadBundleBlob(new Uint8Array(bytes));
 globalThis.ask = async (appKey, sendArgs) => {
-  // The op is a NAME the shell frames (invoke, shell-core.ts) — the probe app's own
-  // local vocabulary, which the shell passes through without reading.
-  const r = await __requesterNode.shell.invoke("send", new Uint8Array(sendArgs), appKey);
+  // The op is a NAME of the probe app's own vocabulary (the shell passes bytes unread;
+  // this file composes the frame the app's handle reads).
+  const op = "send", args = new Uint8Array(sendArgs);
+  const framed = new Uint8Array(1 + op.length + args.length);
+  framed[0] = op.length;
+  for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
+  framed.set(args, 1 + op.length);
+  const r = await __requesterNode.shell.invoke(framed, appKey);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 };

@@ -16,7 +16,8 @@ import (
 
 // A minimal content-addressed store guest, the essence of seedstore's local path:
 // put hashes the data (crypto/blake2b-256, by name) and stores it under that id
-// (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals.
+// (fs/put); get fetches by id (fs/get). `probe` reports any leaked host globals. One
+// entrypoint, and the ops are the guest's own framing after the caller id.
 const storeGuestSource = `
 function hex(u8) { let s = ""; for (let i = 0; i < u8.length; i++) s += u8[i].toString(16).padStart(2, "0"); return s; }
 function fsPutArg(key, bytes) {
@@ -27,23 +28,30 @@ function fsPutArg(key, bytes) {
   out.set(k, 4); out.set(bytes, 4 + k.length);
   return out;
 }
-register("put", async (data) => {
-  // A primitive is reached BY NAME through the crypto/ prefix — the name is the
-  // seam, not an op number — and it resolves synchronously like every primitive.
-  const id = host.call("crypto/blake2b-256", data);
-  await host.call("fs/put", fsPutArg(hex(id), data));
-  return id;
-});
-register("get", async (id) => {
-  const r = await host.call("fs/get", new TextEncoder().encode(hex(id)));
-  if (r.length < 1 || r[0] !== 1) throw new Error("not found");
-  return r.slice(1);
-});
-register("probe", () => {
-  const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process", "Bun"];
-  const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
-  return new TextEncoder().encode(leaked.join(","));
-});
+function handle(arg) {
+  const n = arg[32];
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+  const data = arg.subarray(33 + n);
+  if (op === "put") {
+    // A primitive is reached BY NAME through the crypto/ prefix — the name is the
+    // seam, not an op number — and it resolves synchronously like every primitive.
+    const id = host.call("crypto/blake2b-256", data);
+    return host.call("fs/put", fsPutArg(hex(id), data)).then(() => id);
+  }
+  if (op === "get") {
+    return host.call("fs/get", new TextEncoder().encode(hex(data))).then((r) => {
+      if (r.length < 1 || r[0] !== 1) throw new Error("not found");
+      return r.slice(1);
+    });
+  }
+  if (op === "probe") {
+    const names = ["sodium", "fs", "__net", "__guestSeam", "__callSeam", "bridge", "bootShell", "process", "Bun"];
+    const leaked = names.filter((n) => typeof globalThis[n] !== "undefined");
+    return new TextEncoder().encode(leaked.join(","));
+  }
+  return new Uint8Array(0);
+}
 `
 
 func TestGuestPutGetAndConfinement(t *testing.T) {
@@ -109,8 +117,13 @@ func TestGuestRealmHeapCapped(t *testing.T) {
 	// Twice the shared 64 MiB default (core/wasm-limits.ts DEFAULT_REALM_MEMORY_BYTES,
 	// resolved by the shim) — mirrored here because the runtime no longer owns a copy.
 	src := fmt.Sprintf(`
-		register("ok",  () => new Uint8Array(1 << 20));  // well under the cap
-		register("hog", () => new Uint8Array(%d));       // twice the cap
+		function handle(arg) {
+		  const n = arg[32];
+		  let op = "";
+		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+		  if (op === "ok") return new Uint8Array(1 << 20);   // well under the cap
+		  return new Uint8Array(%d);                        // twice the cap
+		}
 	`, 2*(64<<20))
 	newTestRealm(t, "{}", src)
 
@@ -145,8 +158,13 @@ func TestGuestRealmExecutionBudget(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		register("ok",   () => new Uint8Array([7]));
-		register("spin", () => { for (;;) {} });
+		function handle(arg) {
+		  const n = arg[32];
+		  let op = "";
+		  for (let i = 0; i < n; i++) op += String.fromCharCode(arg[33 + i]);
+		  if (op === "ok") return new Uint8Array([7]);
+		  for (;;) {}
+		}
 	`, 300)
 
 	out, err := realmCall("ok", nil)
@@ -191,21 +209,11 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	}
 
 	newTestRealmBudget(t, fmt.Sprintf(`{"peer":%q}`, mustEvalString(t, qc, `__peer`)), `
-		function fromHex(h) {
-		  const out = new Uint8Array(h.length / 2);
-		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
-		  return out;
-		}
-		register("park", async () => {
-		  const peer = fromHex(APP.peer);
-		  const proto = [0x74, 0x65, 0x73, 0x74];
-		  const req = new Uint8Array(32 + 1 + proto.length);
-		  req.set(peer, 0);
-		  req[32] = proto.length;
-		  req.set(proto, 33);
-		  await host.call("_net", req);
+		async function handle() {
+		  // the mock composes this guest's op framing; the local op is "park"
+		  await host.call("_net", new Uint8Array(0));
 		  for (;;) {}                 // burn the budget in the CONTINUATION
-		});
+		}
 	`, 300)
 
 	start := time.Now()
@@ -235,10 +243,10 @@ func TestGuestRealmBudgetCoversPumpedContinuations(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 	newTestRealmBudget(t, "{}", `
-		register("park", async () => {
+		async function handle() {
 			await Promise.resolve();   // resumes via pumpAll, not settleNet
 			for (;;) {}
-		});
+		}
 	`, 300)
 
 	start := time.Now()
@@ -274,7 +282,7 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		  for (let i = 0; i < out.length; i++) out[i] = parseInt(h.substr(i * 2, 2), 16);
 		  return out;
 		}
-		register("park", async () => {
+		async function handle() {
 		  const peer = fromHex(APP.peer);
 		  const proto = [0x74, 0x65, 0x73, 0x74];
 		  const req = new Uint8Array(32 + 1 + proto.length);
@@ -283,11 +291,11 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 		  req.set(proto, 33);
 		  await host.call("_net", req);
 		  return new Uint8Array([1]);
-		});
+		}
 	`, 0)
 
 	if _, err := qc.Eval("close.js", qjs.Code(`
-		__realm.call("park", new Uint8Array(0)).then(
+		__realm.call(new Uint8Array(0)).then(
 			() => { globalThis.__outcome = "resolved"; },
 			(e) => { globalThis.__outcome = "rejected: " + (e && e.message || e); });
 		__realm.dispose();

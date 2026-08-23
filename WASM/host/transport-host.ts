@@ -2,10 +2,10 @@
 // run as the transport bundle's guest via `link/*`. No call re-enters a live frame.
 
 
-import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
+import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
-import { opHeader, type RawNet } from "./guest-seam.js";
+import { type RawNet } from "./guest-seam.js";
 
 /** Link kinds, as `linkOpen` declares them: CORE is the routing core's own (accepted through
  *  the channel factory, so dial bookkeeping and the half-open limiter apply); OPEN is a
@@ -47,15 +47,30 @@ export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
  *  let a peer fill it and sit there. Generous — it is not a liveness probe. */
 export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 
-/** `[caller 32][nameLen u8][name utf8]` for one op, memoized: the layout is the seam's
- *  (`opHeader`), but the header is rebuilt on the inbound frame path, once per socket read
- *  per link. Sharing is safe because nothing mutates a header — `Args` only pushes it into a
- *  parts list that `build()` copies out of. The leading 32 bytes stay zero: "the host". */
+// ── the driver's own event header ──────────────────────────────────────────────
+//
+// Every payload the driver hands the transport has a `[opLen u8][op]` head. That
+// framing is the TRANSPORT BUNDLE's format (its own `readOp`, transport/src/util.js) —
+// content paired with this driver like the wire codec — NOT a kernel ABI: the kernel's
+// only obligation in front of it is the 32-byte caller id, added by the shell
+// (shell-core.ts `hostCallSlot`). A field written here and not read there desyncs the
+// payload, which is what forces the pair to move in one artifact.
+
+/** `[opLen u8][op]` for one op, memoized: the header is rebuilt on the inbound frame
+ *  path, once per socket read per link. Sharing is safe because nothing mutates a
+ *  header — `Args` only pushes it into a parts list that `build()` copies out of. */
 const OP_HEADERS = new Map<string, Uint8Array>();
 function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
   if (h === undefined) {
-    h = opHeader(op);
+    // ASCII only: the bundle reads it back with charCodeAt, and a length in BYTES that
+    // a JS length in UTF-16 units would break on its first non-ASCII op.
+    const name = enc.encode(op);
+    if (name.length !== op.length || name.length > 255)
+      throw new Error(`transport: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
+    h = new Uint8Array(1 + name.length);
+    h[0] = name.length;
+    h.set(name, 1);
     OP_HEADERS.set(op, h);
   }
   return h;
@@ -105,6 +120,12 @@ class Args {
  *  node whose transport bundle has been uninstalled, where a socket event has nowhere to
  *  go and the honest answer is to drop it. */
 export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
+
+/** The claim routing the link occupant's delivery return is handed to (§12.10). Inbound
+ *  attributed delivery is the link slot's return convention, not a grant: the occupant
+ *  that saw the plaintext is the one that attributes it, and the shell's claim table is
+ *  the single router. The answer settles the request the occupant returned. */
+export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
   /** The channel keypair; its public half is this node's peer id. Never passed to the
@@ -201,6 +222,7 @@ export class TransportHost {
   private nextLinkId = 1;
   private transport: TransportCall | null = null;
   private transportAvailable: () => boolean = () => false;
+  private deliver: TransportDeliver | null = null;
   private activeOwner: object | null = null;
   private closed = false;
 
@@ -209,11 +231,14 @@ export class TransportHost {
     this.peerId = toHex(opts.identity.publicKey);
   }
 
-  /** Wire this platform binding once. Both callbacks resolve its capability owner
-   *  dynamically, so claim changes never reconfigure this driver. */
-  route(transport: TransportCall, available: () => boolean): void {
+  /** Wire this platform binding once. All callbacks resolve its capability owner
+   *  dynamically, so claim changes never reconfigure this driver. `deliver` is the claim
+   *  routing the link occupant's delivery return is handed to — the host must route what
+   *  the link occupant decoded, whoever the occupant is (§12.10). */
+  route(transport: TransportCall, available: () => boolean, deliver?: TransportDeliver): void {
     this.transport = transport;
     this.transportAvailable = available;
+    this.deliver = deliver ?? null;
   }
 
   /** Whether this platform binding currently has an admitted raw-link owner. */
@@ -234,13 +259,15 @@ export class TransportHost {
     this.reset();
   }
 
-  /** Immutable node identity and limits for a candidate transport (§12.6).
-   *  Address book is replayed after publication, not snapshotted here. */
-  private configuration(): Uint8Array {
+  /** The immutable node facts a freshly stood link occupant receives once — the `init`
+   *  event of this bundle's format (hostOpHeader + fields). Not re-readable afterwards,
+   *  and the address book is not here: it is mutable node state, replayed after
+   *  publication as `addr` events. The shell prepends the host's caller id. */
+  initialConfig(): Uint8Array {
     const o = this.opts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    return new Args()
+    return new Args("init")
       .blob(o.identity.publicKey)
       .blob(o.networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
@@ -274,8 +301,8 @@ export class TransportHost {
 
   // ── reaching the transport ──────────────────────────────────────────────────
 
-  /** Call the transport. The op name and the 32-byte caller id are already the head of
-   *  `args`, so the payload the guest reads is exactly what `build()` returns.
+  /** Call the transport. `args.build()` is the bundle's own event framing; the shell
+   *  prepends the host's caller id at the realm call (shell-core.ts `hostCallSlot`).
    *
    *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
    *  so bytes arriving on one link reach the occupant in arrival order. */
@@ -295,6 +322,76 @@ export class TransportHost {
     });
   }
 
+  /** `tell`, for `linkBytes`: the invocation's return is the link occupant's delivery
+   *  frame — `[count u32][d…]`, each `d` =
+   *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`
+   *  — empty when the occupant decoded nothing deliverable. The occupant that saw the
+   *  plaintext is the one that attributes it, so the driver hands the frame straight to
+   *  the claim routing wired in `route` and answers back through `linkResp`; no second
+   *  capability is granted, because the only slot that produces such a return is the one
+   *  holding the raw-link binding. */
+  private tellDeliver(args: Args): void {
+    const r = this.toTransport(args);
+    if (!r) return;
+    void r.then((ret) => {
+      if (ret.length > 0) this.deliverFrom(ret);
+    }, (err: unknown) => {
+      if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+      console.error(`[transport] error in ${args.op}: ${String(err)}`);
+    });
+  }
+
+  private static readonly dec = new TextDecoder();
+
+  /** Route one delivery frame. Each record names an exact claim, an opaque attribution
+   *  and a payload; a record nobody serves settles as an empty answer, exactly as a
+   *  request that never reached a claimant. A malformed frame is dropped: it is the
+   *  occupant's own contract with the driver, and a bogus record must not become a
+   *  partial delivery.
+   *
+   *  EVERY variable field is read by its own length, the payload included. One socket
+   *  read can carry several whole requests, so a record that ran to the end of the frame
+   *  would put the NEXT record's claim and attribution inside this one's payload — bytes
+   *  a peer wrote, letting it attribute its own request to any key it names. Nothing is
+   *  delivered past the first record that does not fit. */
+  private deliverFrom(ret: Uint8Array): void {
+    if (!this.deliver || ret.length < 4) return;
+    const dec = TransportHost.dec;
+    const count = (readU32BE(ret, 0) >>> 0);
+    let off = 4;
+    for (let i = 0; i < count; i++) {
+      if (ret.length < off + 6) return;
+      const noReply = ret[off] === 1;
+      const corr = readU32BE(ret, off + 1);
+      const claimLen = ret[off + 5];
+      if (ret.length < off + 6 + claimLen) return;
+      const claim = dec.decode(ret.slice(off + 6, off + 6 + claimLen));
+      const attrStart = off + 6 + claimLen;
+      if (ret.length < attrStart + 4) return;
+      const attrLen = readU32BE(ret, attrStart) >>> 0;
+      const lenStart = attrStart + 4 + attrLen;
+      if (lenStart + 4 > ret.length) return;
+      const payloadLen = readU32BE(ret, lenStart) >>> 0;
+      const payloadStart = lenStart + 4;
+      const next = payloadStart + payloadLen;
+      if (next > ret.length) return;
+      const attribution = ret.slice(attrStart + 4, lenStart);
+      const payload = ret.slice(payloadStart, next);
+      void Promise.resolve(this.deliver(claim, attribution, payload)).then(
+        (answer: Uint8Array | null | undefined) => this.answer(noReply, attribution, corr, answer ?? EMPTY),
+        () => this.answer(noReply, attribution, corr, EMPTY),
+      );
+      off = next;
+    }
+  }
+
+  /** The claim handler's answer back to the link occupant, which frames it and writes it
+   *  on the wire. A noReply request still ran its handler but asks for no bytes back. */
+  private answer(noReply: boolean, attribution: Uint8Array, corr: number, answer: Uint8Array): void {
+    if (noReply) return;
+    this.tell(new Args("linkResp").blob(attribution).u32(corr).blob(answer));
+  }
+
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims the
    *  binding — a node with no transport bundle is a legitimate configuration, so it has to
    *  be an answer rather than a promise that never settles. */
@@ -311,7 +408,6 @@ export class TransportHost {
   rawNet(owner: object): RawNet {
     const ownsBinding = () => this.activeOwner === owner;
     return {
-      config: () => this.configuration(),
       open: (dest) => {
         if (!ownsBinding()) return NO_ROUTE;
         // The destination is the peer's 32-byte channel key, resolved in the address book.
@@ -375,7 +471,7 @@ export class TransportHost {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
-      this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
+      this.tellDeliver(new Args("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => {
       if (!this.channels.delete(linkId)) return;

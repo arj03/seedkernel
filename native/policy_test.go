@@ -72,7 +72,7 @@ func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	// who writes a grant for someone else has widened their own policy and changed
 	// nothing about who may be the network. Running a different transport means booting a
 	// different blob (`--transport-bundle`), which is what the pin is derived from.
-	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"],"route":["` + authorHex + `"]}}`); err != nil {
+	if err := applyPolicy(`{"authors":["` + authorHex + `"],"grants":{"link":["` + authorHex + `"]}}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
 	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {

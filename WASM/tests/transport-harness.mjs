@@ -48,15 +48,40 @@ export const PROTO = "harness/v1";
  *    op   — an already-framed `[opLen u8][op][args]` handed to `_net` verbatim, for the
  *           tests whose subject is WHICH ops an app may name. It writes no name of its
  *           own, so a refusal is the transport's.
- *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`. */
+ *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`.
+ *    from — who each of those was attributed to, `[pk 32]…`, in step with `seen`. */
 const HARNESS_GUEST = `
+// This app's own copies of the shape it shares with whatever it calls (its own format
+// after the kernel's 32-byte caller prefix): a local op is [opLen u8][op][args], and
+// the transport's app contract (the id this app calls) is spelled the same way. The
+// kernel never reads any of it.
+function readOp(b) {
+  const n = b.length > 0 ? b[0] : -1;
+  if (n < 0 || b.length < 1 + n) throw new Error("harness: malformed op");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(b[1 + i]);
+  return { op, args: b.subarray(1 + n) };
+}
+function writeOp(op, args) {
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
+  out.set(args, 1 + op.length);
+  return out;
+}
 const seen = [];
-register("handle", (arg) => {
-  // The preamble's own envelope readers (guest-seam.ts) — one shape for the host's
-  // loopback and the transport's ops alike, so this harness reads what a real app reads.
-  const { fromHost, body: p } = callerOf(arg);
+// Who each inbound frame was ATTRIBUTED to, in step with \`seen\`: the shell puts the
+// authenticated sender in front of the payload, so this is what a delivery claims about
+// its own origin. Recorded separately because a test about attribution must be able to
+// read it back without the payload tests changing shape.
+const from = [];
+function handle(arg) {
+  const c = arg.subarray(0, 32);
+  let fromHost = true;
+  for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; break; } }
+  const p = arg.subarray(32);
   // A LOCAL call from the host (caller = 32 zero bytes): the op NAME picks the local op,
-  // the same one-vocabulary shape the transport's own handle reads.
+  // the one-vocabulary shape the transport's own handle reads.
   if (fromHost) {
     const { op, args } = readOp(p);
     if (op === "send") return host.call(${JSON.stringify(TRANSPORT_SERVICE)}, writeOp("send", args));
@@ -73,10 +98,17 @@ register("handle", (arg) => {
       }
       return out;
     }
+    if (op === "from") {
+      const out = new Uint8Array(from.length * 32);
+      for (let i = 0; i < from.length; i++) out.set(from[i], i * 32);
+      return out;
+    }
     return new Uint8Array(0);
   }
-  // A remote peer's frame: record it, then echo it (or hang, or generate).
+  // A remote peer's frame: record it and who it came from, then echo it (or hang, or
+  // generate).
   seen.push(p);
+  from.push(c.slice());
   if (APP.mode === "hang") return new Promise(() => {});
   // A GENERATOR request, for the reassembly tests: [0xff][len u32][mul u8] asks for
   // len bytes where out[i] = (i * mul) & 255 — a response far larger than anything
@@ -88,16 +120,21 @@ register("handle", (arg) => {
     return out;
   }
   return p;
-});
+}
 `;
 
 /** The harness app's local op names — the one op vocabulary its `handle` reads. */
-const OP = { SEND: "send", RAW: "op", SEEN: "seen" };
+const OP = { SEND: "send", RAW: "op", SEEN: "seen", FROM: "from" };
 
-/** One local op into the harness app: `shell.invoke` loops back through `handle`, writing
- *  the host's caller id and the op envelope; the NAME is the app's own vocabulary. */
+/** One local op into the harness app: `shell.invoke` loops back through `handle`, with the
+ *  host's caller id in front of THIS app's own op framing — the name is the app's
+ *  vocabulary and the shell never reads it. */
 function invoke(shell, appKey, op, args = new Uint8Array(0)) {
-  return shell.invoke(op, args, appKey);
+  const b = new Uint8Array(1 + op.length + args.length);
+  b[0] = op.length;
+  for (let i = 0; i < op.length; i++) b[1 + i] = op.charCodeAt(i) & 0xff;
+  b.set(args, 1 + op.length);
+  return shell.invoke(b, appKey);
 }
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
@@ -160,11 +197,12 @@ export function transportAuthor() {
 }
 
 /** The policy every harness node runs under: the transport author granted `link`, and
- *  whoever else is named trusted to load an ordinary app. */
+ *  whoever else is named trusted to load an ordinary app. Delivering what the link
+ *  occupant decodes is the slot's own return convention, so no second grant exists. */
 export function transportPolicy(authorHex, appAuthors = []) {
   return policyFromJson(JSON.stringify({
     authors: [authorHex, ...appAuthors],
-    grants: { link: [authorHex], route: [authorHex] },
+    grants: { link: [authorHex] },
   }));
 }
 
@@ -274,15 +312,26 @@ export async function makeTransportHost(opts = {}) {
     }
     return out;
   };
+  /** Who this node's app was told each inbound frame came from, in step with `seen` —
+   *  the attribution the shell put in front of the payload, as hex. */
+  node.from = async () => {
+    const b = await invoke(shell, appKey, OP.FROM);
+    const out = [];
+    for (let off = 0; off + 32 <= b.length; off += 32) out.push(Buffer.from(b.slice(off, off + 32)).toString("hex"));
+    return out;
+  };
   node.peers = () => driver.linkedPeers();
   return node;
 }
 
-/** Await a condition with a deadline — the tests' tick, bounded. */
+/** Await a condition with a deadline — the tests' tick, bounded. The predicate is
+ *  AWAITED, so an async one is polled on its resolved value: a promise object is truthy
+ *  on the first tick, which would return immediately and make the whole wait a silent
+ *  no-op. A sync predicate costs one microtask per tick and reads the same. */
 export async function until(fn, ms = 3000, what = "condition") {
   const start = Date.now();
   for (;;) {
-    if (fn()) return;
+    if (await fn()) return;
     if (Date.now() - start > ms) throw new Error("timeout waiting for " + what);
     await new Promise((r) => setTimeout(r, 2));
   }

@@ -12,6 +12,7 @@ import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
+import { writeOp } from "../core/op-frame.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, Shell } from "./shell-core.js";
 
@@ -344,16 +345,18 @@ export async function runCli(host: CliHost): Promise<CliResult> {
 
     // ONE one-shot op through the loaded guest — "the shell runs the app" as the
     // *initiator* (§12.8). `handle`'s ABI and nothing more (§12.2): stdin is the argument,
-    // stdout is the response, and the op name is passed through unread. Nothing here
-    // decodes or knows an app's argument shape, which a flag per operation could not
-    // avoid.
+    // stdout is the response, and the op name is framed here with the app's own
+    // convention (`writeOp`, core/op-frame.ts — the kernel's spelling of that convention,
+    // shipped as content) and passed through unread. Nothing here decodes or knows an
+    // app's argument shape, which a flag per operation could not avoid. A name too long
+    // or not ASCII is refused there rather than truncated into a different frame.
     //
     // Addressed to the app THIS flow loaded, by the key its load returned, rather than
     // left to `invoke`'s "the only app" default: a node with a network has the transport
     // loaded too, so "the only one" is not something `--bundle` can mean.
     const op = args.get("op");
     if (op !== undefined) {
-      host.stdout(await loaded.invoke(op, host.stdin()));
+      host.stdout(await loaded.invoke(writeOp(op, host.stdin())));
     }
   }
 

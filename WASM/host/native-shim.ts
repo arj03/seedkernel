@@ -14,6 +14,7 @@ import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../cor
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
+import { writeOp } from "../core/op-frame.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
@@ -50,10 +51,9 @@ declare const bridge: {
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
   createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
-  /** Invoke an entrypoint. Returns 1 when the guest handed its answer to a later turn
-   *  (the preamble's `defer()`), which frees the realm for the next invocation before
-   *  this one settles — realm-queue.ts's `Invocation.released`; 0 otherwise. */
-  realmCall(realm: number, entry: string, payload: Uint8Array,
+  /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
+   *  later turn (the `__deferred` marker), 0 otherwise. */
+  realmCall(realm: number, payload: Uint8Array,
             onOk: (bytes: Uint8Array) => void, onErr: (msg: string) => void): number;
   realmSettle(realm: number, callId: number, bytes: Uint8Array | null, err: string | null): void;
   realmDispose(realm: number): void;
@@ -404,12 +404,12 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         // contract (realm-queue.ts) is what keeps the two targets from differing about
         // when a second entrypoint may begin.
         call: serializeCalls(
-            (entry: string, payload: Uint8Array) => {
+            (payload: Uint8Array) => {
                 // The executor runs synchronously, so `deferred` carries Go's answer by
                 // the time the return statement reads it.
                 let deferred = false;
                 const result = new Promise<Uint8Array>((resolve, reject) => {
-                    deferred = bridge.realmCall(realm, entry, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg))) === 1;
+                    deferred = bridge.realmCall(realm, payload, (bytes: Uint8Array) => resolve(new Uint8Array(bytes)), (msg: string) => reject(new Error(msg))) === 1;
                 });
                 return { result, released: deferred ? Promise.resolve() : result.catch(() => { }) };
             },
@@ -525,9 +525,11 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
 }
 
 /** Native test seam: drive a slot through the host invocation path. Pure modules stay
- *  private; no module lookup crosses this boundary. */
+ *  private; no module lookup crosses this boundary. The "test" op frame is THIS test
+ *  surface's own spelling (the shell passes bytes unread) — what the probe guests parse,
+ *  composed with the one definition of that convention (core/op-frame.ts). */
 const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) =>
-    theShell().invoke("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload), appKey);
+    theShell().invoke(writeOp("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload)), appKey);
 
 // ── the operator flow ────────────────────────────────────────────────────────
 /** This platform, as `cli.ts` needs it: files, a console line, raw stdout, entropy, and
@@ -595,16 +597,27 @@ function guestDriver(): string {
 }
 const GUEST_DRIVER = `
 "use strict";
-// Returns 1 when the entrypoint handed its answer to a later turn (the preamble's
-// defer()) — Go's signal that the realm is free for the next invocation even though this
-// one has not settled (realm-queue.ts's Invocation.released). Read after __invoke's
-// synchronous segment, and __invoke cleared the flag on entry, so it describes exactly
-// this invocation.
-globalThis.__start = function (id, entry, arg) {
+// Returns 1 when the entrypoint handed its answer to a later turn (the guest's own
+// deferred marker) — Go's signal that the realm is free for the next invocation even
+// though this one has not settled (realm-queue.ts's Invocation.released). Read after
+// __invoke's synchronous segment, and __invoke cleared the flag on entry, so it
+// describes exactly this invocation.
+globalThis.__start = function (id, arg) {
   try {
-    Promise.resolve(__invoke(entry, arg)).then(
-      (v) => __callDone(id, v),
-      (e) => __callFail(id, String(e && e.message || e)));
+    const out = __invoke(arg);
+    // A synchronous answer reports WITHOUT a microtask: the guest's job queue is only
+    // pumped by the loop (guest.go pump), and this __start can run inside a host-
+    // realm eval's own drain, where the loop cannot turn — a then() would leave the
+    // caller parked until the drain ends, and the drain ends only when the caller
+    // settles. An ASYNC entrypoint really is parked (its promise settles on a later
+    // turn), so it keeps the then() path.
+    if (out && typeof out.then === "function") {
+      out.then(
+        (v) => __callDone(id, v),
+        (e) => __callFail(id, String(e && e.message || e)));
+    } else {
+      __callDone(id, out);
+    }
   } catch (e) {
     __callFail(id, String(e && e.message || e));
   }

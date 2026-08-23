@@ -33,8 +33,7 @@ import { serializeCalls, type Invocation } from "./realm-queue.js";
 export type { HostCall };
 
 export interface SafeRealmOptions {
-  /** Guest source. Runs in the sandbox; registers entrypoints via the injected
-   *  `register(name, fn)` (see the preamble below). */
+  /** Guest source. Runs in the sandbox; must declare the one `handle(arg)` entrypoint. */
   source: string;
   /** The seam this realm calls out through — its whole view of the host. */
   hostCall: HostCall;
@@ -47,9 +46,9 @@ export interface SafeRealmOptions {
 }
 
 export interface SafeRealm {
-  /** Invoke a guest entrypoint — the only way in, for both roles. Serialized per
-   *  realm (realm-queue.ts). */
-  call(entry: string, payload: Uint8Array): Promise<Uint8Array>;
+  /** Invoke the guest's one `handle` entrypoint with `[caller 32][body …]` — the only
+   *  way in, for both roles. Serialized per realm (realm-queue.ts). */
+  call(payload: Uint8Array): Promise<Uint8Array>;
   dispose(): void;
 }
 
@@ -144,7 +143,7 @@ function takeBytes(ctx: QuickJSContext, handle: QuickJSHandle): Uint8Array {
   }
 }
 
-const invokeSrc = (entry: string): string => `__invoke(${JSON.stringify(entry)}, __arg)`;
+const invokeSrc = `__invoke(__arg)`;
 
 /** Release a settled `resolvePromise` result (a `DisposableResult` carrying a dup'd
  *  handle) that no invocation will ever consume. Best-effort: the handle may already
@@ -334,7 +333,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
    *
    *  Not `async`: the queue needs the `Invocation` — and with it the release signal —
    *  the moment the synchronous segment ends, which is before the answer exists. */
-  const invoke = (entry: string, payload: Uint8Array): Invocation => {
+  const invoke = (payload: Uint8Array): Invocation => {
     // Safe unconditionally because the queue guarantees nothing else is RUNNING. A deferred
     // entrypoint has already ended its segment by the time the next one resets, so what it
     // spends settling later is charged to whichever window is open — which is whose turn
@@ -351,7 +350,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     let settledNative: Promise<unknown> | undefined;
     clock.begin();
     try {
-      evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc(entry), "safe-js-invoke.js"));
+      evalResult = ctx.unwrapResult(ctx.evalCode(invokeSrc, "safe-js-invoke.js"));
       settledNative = ctx.resolvePromise(evalResult) as Promise<unknown>;
       pumpJobs();
     } finally {

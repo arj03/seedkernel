@@ -24,8 +24,11 @@ export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 /** Author ML-DSA seed label (§16.1). KDF tag, not a signing prefix — frozen. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
 /** Guest ABI version (§12.2). Adding a catalog name does not bump it; changing a name,
- *  framing, or preamble meaning does. */
-export const GUEST_ABI_VERSION = 9;
+ *  framing, or preamble meaning does — and neither does the callee's own format after
+ *  the caller id, which is content. A guest declares `handle` and reads
+ *  `[caller 32][body …]`; everything past the caller is its own, so no further inbound
+ *  vocabulary grows here. */
+export const GUEST_ABI_VERSION = 12;
 /** Guest `crypto/` catalog. Total over this list; not a grant. Adding a name is the whole cost of a new algorithm. */
 export const PRIMITIVE_NAMES = [
     "blake2b-256",
@@ -63,16 +66,12 @@ export const AUTHORITY_CALLS = {
     "clock/now": "app",
     "timer/arm": "app",
     "timer/clear": "app",
-    "link/config": "link",
     "link/open": "link",
     "link/send": "link",
     "link/close": "link",
     "link/stat": "link",
     "link/authenticated": "link",
     "link/down": "link",
-    "link/sign": "link",
-    "link/verify": "link",
-    "route/deliver": "route",
 } as const;
 export type CapabilityName = keyof typeof AUTHORITY_CALLS;
 /** Whether a name is one of the host's own authorities — membership in the table above,
@@ -89,11 +88,10 @@ export const PRIVILEGES: readonly Privilege[] = [
 ];
 /** Raw links — the privilege the node's transport is built out of (§12.6). Named so the
  *  shell can wire the socket driver to whatever holds it; admission treats it as one key
- *  among `PRIVILEGES`. */
+ *  among `PRIVILEGES`. The link occupant is the attributer: inbound delivery of a request
+ *  the occupant decoded off its links is that slot's return convention, never a second
+ *  privilege. */
 export const PRIVILEGE_LINK = "link" satisfies Privilege;
-/** Submission to the local claim router. Separate from raw links: possessing a link does
- *  not entitle a guest to invent attributed inbound requests. */
-export const PRIVILEGE_ROUTE = "route" satisfies Privilege;
 // Reserved `_`-led ids: local cross-realm calls (§12.10). A claim cannot be `_`-led
 // (bundle.ts). Callable, granted in `requires`, invoked on a later turn.
 /** A reserved id — routed between local realms, never from remote delivery. */
@@ -108,7 +106,7 @@ export function isGrant(name: string): boolean {
 }
 /** The authorities that leave something behind. Typed against the catalog, so renaming a
  *  name here is a build error rather than a silently empty set. */
-const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs/delete", "route/deliver"]);
+const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs/delete"]);
 /** Names that leave something behind. Refused until the slot commits (§3.1). Reserved
  *  ids included. Reads, `crypto/*`, `timer/*`, `link/*` are not. */
 export function isIrreversible(name: string): boolean {

@@ -34,17 +34,17 @@ export interface Invocation {
  *  `dispose`, and entering a torn-down realm is what aborts the whole wasm module. It
  *  returns the error to fail with, or `null` to proceed. */
 export function serializeCalls(
-  invoke: (entry: string, payload: Uint8Array) => Invocation,
+  invoke: (payload: Uint8Array) => Invocation,
   notReady: () => Error | null,
-): (entry: string, payload: Uint8Array) => Promise<Uint8Array> {
+): (payload: Uint8Array) => Promise<Uint8Array> {
   // The tail of the chain accepted so far. A new call attaches to it and becomes the
   // new tail.
   let tail: Promise<unknown> = Promise.resolve();
-  return (entry, payload) => {
+  return (payload) => {
     const started = tail.then(() => {
       const err = notReady();
       if (err) throw err;
-      return invoke(entry, payload);
+      return invoke(payload);
     });
     // Both outcomes swallowed, load-bearing twice: a failed invocation must not poison
     // every later one, and an unhandled rejection on this internal chain would be reported
