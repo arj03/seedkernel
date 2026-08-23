@@ -1,20 +1,8 @@
-// bench-module-call.mjs — the §4.3 module-call path, measured the same way the native
-// target's bound is measured: the same workload on the same module, with and without
-// the interrupt mechanism in the path, as a ratio.
-//
-// The native cost it mirrors (SECURITY §14.1) is MULTIPLICATIVE — wazero's
-// WithCloseOnContextDone compiles a termination check into every loop of every module:
-// 2.8x RS encode, 4.8x RS decode, 2.6x XChaCha20, 1.65x Ed25519 verify.
-//
-// The JS worker model is ADDITIVE instead: the module runs at full engine speed in its own
-// worker and the cost is a fixed isolate round-trip per call. This quantifies that hop on
-// the one module this repo ships — ws.wasm, the transport's per-frame hot path — at the
-// record-layer payload sizes:
-//
-//   baseline = same module, same op, called in-thread (the pre-worker table)
-//   worker   = the same call through the worker-per-module table (§4.3)
-//
-// Run: node tests/bench-module-call.mjs   (after `npm run build`)
+// bench-module-call.mjs — the §4.3 module-call path, measured the way the native target's
+// bound is: same workload, with and without the interrupt mechanism, as a ratio. Native
+// cost (SECURITY §14.1) is MULTIPLICATIVE (a termination check per loop: 2.8x RS encode,
+// 4.8x decode, 2.6x XChaCha20, 1.65x Ed25519); the JS worker model is ADDITIVE — one
+// fixed isolate round-trip per call, quantified here on ws.wasm. Run after `npm run build`.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

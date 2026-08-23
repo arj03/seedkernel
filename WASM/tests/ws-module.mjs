@@ -1,14 +1,9 @@
-// A test-only driver for ws.wasm's 4-op ABI (assembly/ws/index.ts).
-//
-// RFC 6455 framing is content, so the codec runs in the transport bundle's guest over
-// this module, reached by its bare name. What is reachable from the host side is the
-// module itself, and its conformance is worth testing directly rather than only through
-// a live link — a bad mask direction or a fragmented control frame is far easier to
-// provoke here than over a socket.
-//
-// This is deliberately the whole driver: stage a request at `scratch`, call
-// handle(len), read the response back. It is the §4 module ABI, so the host drives
-// it identically in production.
+// Test-only driver for ws.wasm's 4-op ABI (assembly/ws/index.ts). RFC 6455 framing is
+// content, so the codec runs in the transport bundle's guest over this module, reached by
+// its bare name; its conformance is worth testing directly — a bad mask direction or a
+// fragmented control frame is far easier to provoke here than over a socket. This is the
+// whole driver, and it is the §4 module ABI the host drives identically in production:
+// stage a request at `scratch`, call handle(len), read the response back.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";

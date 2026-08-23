@@ -1,13 +1,9 @@
-// Two nodes over REAL node:net sockets — the path the loopback fabric cannot reach.
-//
-// Everything else in the suite drives the transport over LoopbackChannels, a *framed*
-// link where one send is one delivery. A TCP socket is not: it reaches the bundle as an
-// unframed RawLink (socket-seam.ts), so the guest's length framer, its two-stage pre-auth
-// cap and the reassembly of a message split across segments are exercised only here.
-//
-// So is the graceful close, which the loopback fabric cannot get wrong: the end-of-stream
-// record must be flushed before FIN, or a clean shutdown reads at the far end as the
-// truncation that record exists to rule out.
+// Two nodes over REAL node:net sockets — the path the loopback fabric cannot reach. A TCP
+// socket reaches the bundle as an UNframed RawLink (socket-seam.ts), where the loopback
+// fabric is a framed link (one send = one delivery), so the guest's length framer, its
+// two-stage pre-auth cap and the reassembly of a message split across segments are
+// exercised only here — as is the graceful close (the end-of-stream record must flush
+// before FIN, or a clean shutdown reads as the truncation that record exists to rule out).
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { testkit } from "./testkit.mjs";
@@ -114,9 +110,9 @@ await bNet.close();
 
 // ── the same thing over RFC 6455 ──────────────────────────────────────────────
 // The browser edge, minus the browser: a node dialing another's --ws-listen endpoint runs
-// the guest's WsFramer at BOTH ends — the client half sending the upgrade and masking its
-// frames, the server half computing the accept value through the bundle's own ws.wasm and
-// refusing unmasked client frames. None of it is host code.
+// the guest's WsFramer at BOTH ends — client half masking its frames, server half computing
+// the accept value through the bundle's own ws.wasm and refusing unmasked client frames.
+// None of it is host code.
 console.log("\nTest: the same links framed as RFC 6455 (ws.wasm as a bundle module)");
 
 const c = await makeNode(true);
@@ -142,11 +138,10 @@ let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }
 assert(wsIntact, "every byte survived WS framing + reassembly");
 
-// Many requests in flight at once — the pipelining case, which is what puts several
-// chunks on the socket in one turn. Decoding a WS frame is a module call, so a push
-// parks, and the host hands over the next chunk without waiting for it: what keeps the
-// two parses from running over one reassembly buffer is the framer's read chain
-// (framing.js `push`). Each answer must be the one its own request asked for.
+// Many requests in flight at once — the pipelining case, which puts several chunks on the
+// socket in one turn. Decoding a WS frame is a module call, so a push parks and the host
+// hands over the next chunk without waiting for it: what keeps the two parses from running
+// over one reassembly buffer is the framer's read chain (framing.js `push`).
 const burst = await Promise.all(
   Array.from({ length: 12 }, (_, i) => appRequest(c.shell, appKey, d.transport.peerId, generatorRequest(1024 + i, 11 + i))));
 let burstIntact = burst.length === 12;

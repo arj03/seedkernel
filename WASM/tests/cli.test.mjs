@@ -1,14 +1,8 @@
-// The operator flow (host/cli.ts): the flag set, the defaults, the key file, the order
-// a node does things in, and the lines it prints.
-//
-// Covered here rather than per target on purpose: there is one implementation, so there
-// is one place to test it, and the native target inherits every case below by running the
-// same module. A second copy accumulates drift invisibly, since each target's tests only
-// ever exercise their own.
-//
-// `standUp` is stubbed. What is under test is the flow — which files are read, in what
-// order things happen, what the console says — not the assembly of a node, which
-// transport.test.mjs and the Go suite both drive for real.
+// The operator flow (host/cli.ts): the flag set, defaults, key file, the order a node
+// does things in, and the lines it prints. One implementation = one place to test it; the
+// native target inherits every case by running the same module. `standUp` is stubbed —
+// under test is the flow, not the assembly of a node (transport.test.mjs and the Go
+// suite drive that for real).
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";

@@ -1,15 +1,9 @@
-// testkit.mjs — the assertion/reporting/teardown skeleton the standalone test files
-// share. A test file takes the flavor it wants:
-//
-//   throw-based:  `test(name, fn)` + `assert(c, m)`  — a failed assertion stops that
-//                 test; the wrapper reports it and moves to the next.
-//   report-based: `ok(c, m)` / `throws(fn, m)`       — a failed check is logged and
-//                 counted, but the file keeps running.
-//
-// `keep(o)` hands a created node/shell to the wrapper, which closes everything kept so
-// far after each test; `summary()` prints the score and owns the exit code, so a test
-// file never touches process.exit itself. `testkit({ verbose: false })` silences the
-// per-check `ok:` lines.
+// testkit.mjs — the assertion/reporting/teardown skeleton the standalone test files share.
+// throw-based flavor: `test(name, fn)` + `assert(c, m)` — a failed assertion stops that
+// test, the wrapper reports it and moves on. report-based: `ok(c, m)` / `throws(fn, m)` —
+// a failed check is logged and counted, the file keeps going. `keep(o)` closes everything
+// kept so far after each test; `summary()` owns the exit code, so a test file never calls
+// process.exit itself. `testkit({ verbose: false })` silences the per-check `ok:` lines.
 
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -64,20 +58,11 @@ export function testkit({ verbose = true } = {}) {
 const { hybridAuthorId, hybridAuthorKeysFromSeed } = await import(
   pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle.js")).href);
 
-/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
- *  two derive. `signManifest` takes the whole object and everything the runtime keys by an
- *  author takes `.id`, so no test can pin half an identity.
- *
- *  Built through the SHIPPED seed→key-set derivation, so a suite that signs a bundle
- *  exercises the rule real publishers use.
- *
- *  Takes the caller's own `sodium` — the test files reach the crypto differently, and it
- *  must be the SAME instance the test verifies with, or the id is hashed by one
- *  implementation and checked by another. ML-DSA-65 must already be mixed in
- *  (`withMlDsa65`), or a manifest cannot be signed at all.
- *
- *  Fresh keys per call: freshness is keyed by `(author, app)`, so tests sharing an author
- *  would inherit each other's high-water marks. */
+/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
+ *  the two derive — built through the SHIPPED seed→key-set derivation, so a suite that
+ *  signs a bundle exercises the rule real publishers use. Takes the caller's own
+ *  `sodium` — it must be the SAME instance the test verifies with. Fresh keys per call:
+ *  freshness is keyed by (author, app), so shared authors would inherit high-water marks. */
 export function makeAuthor(sodium) {
   const keys = hybridAuthorKeysFromSeed(sodium, sodium.randombytes_buf(32));
   return { ...keys, id: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey) };

@@ -1,14 +1,7 @@
-// The §4.3 compute residual, made physical: a minimal WASM module — hand-assembled,
-// no build step — whose `handle` never returns. Hand bytes rather than an AssemblyScript
-// fixture because this is the one module that must not link the AS runtime at all: an
-// infinite `br 0` loop is all there is to it.
-//
-//   (module
-//     (memory (export "memory") 3 256)   ;; 3 pages: room for the 128 KiB scratch (§4.1)
-//     (global (export "scratch") i32 (i32.const 8))
-//     (func (export "handle") (param i32) (result i32)
-//       (loop (br 0))   ;; never returns
-//       (unreachable))) ;; keeps the body well-typed
+// The §4.3 compute residual, made physical: a minimal hand-assembled WASM module (no
+// build step — this is the one module that must not link the AssemblyScript runtime at
+// all) whose `handle` never returns: 3 pages of memory (room for the 128 KiB scratch,
+// §4.1), the scratch global at 8, and an infinite br 0 loop.
 export const SPIN_WASM = new Uint8Array([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
   0x01, 0x06, 0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f, // type: (i32) -> (i32)

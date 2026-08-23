@@ -1,8 +1,6 @@
-// Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and
-// seam gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each
-// block is a tight loop over one seam; run.mjs covers the same ground end-to-end.
-//
-// Run: node tests/verify-hardening.mjs   (after `npm run build`)
+// Focused checks for the hardening changes (§4.3 memory bounds, §12.2 scoping and seam
+// gates, §12.3 realm budgets, §12.4 guest-only apps). Standalone because each block is a
+// tight loop over one seam; run.mjs covers the same ground end-to-end. Run after `npm run build`.
 
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -47,8 +45,7 @@ const withMax = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")))
 const noMax = new Uint8Array(readFileSync(join(root, "build/forwarder-nomax.wasm")));
 /** A module header plus a memory section declaring `initial`/`max` pages, and nothing else.
  *  Enough for the bounds read, which walks section headers and deliberately does not
- *  validate (core/wasm-limits.ts) — which is what makes an oversized declaration cheap to
- *  state here rather than a second AssemblyScript build to maintain. */
+ *  validate (core/wasm-limits.ts) — so an oversized declaration is cheap to state here. */
 const memModule = (initialPages, maxPages) => {
   const leb = (n) => { const out = []; do { let b = n & 0x7f; n >>>= 7; if (n) b |= 0x80; out.push(b); } while (n); return out; };
   const body = [0x01, 0x01, ...leb(initialPages), ...leb(maxPages)]; // one memory, flags=1 (a maximum is declared)
@@ -67,9 +64,9 @@ console.log("\n§4.3 — declared memory is bounded before instantiation");
   throws(() => checkModuleMemory(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1 << 20), "a non-wasm blob is refused");
 
   // The ceiling is applied ONCE, by the shared load path, against the tighter of the shared
-  // default and the ceiling the target's loader DECLARES (bundle.ts `loadBundleModules`) —
-  // so a loader may hold itself to less than a bundle may land, and none can be looser. A
-  // stub loader is the whole fixture: under test is the composition, not an isolate.
+  // default and the ceiling the target's loader declares (bundle.ts `loadBundleModules`) —
+  // so a loader may hold itself to less than a bundle may land, and none can be looser.
+  // A stub loader is the whole fixture: under test is the composition, not an isolate.
   const stub = (maxModuleMemoryBytes) => ({
     maxModuleMemoryBytes,
     build: async () => ({ call: async () => ({ bytes: null, ms: 0 }), dispose() { } }),
@@ -254,9 +251,9 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");
 {
-  // A bound can be declared on every interface between the operator and the realm and
-  // passed by none of them, so this boots a node onto a stub realm factory and asserts
-  // the numbers arrive. No transport, so nothing here may reach a privilege.
+  // A bound can be declared on every interface between the operator and the realm and be
+  // passed by none of them, so this boots a node onto a stub realm factory and asserts the
+  // numbers arrive. No transport, so nothing here may reach a privilege.
   const kp = testAuthor();
   const guestSrc = 'function handle() { return new Uint8Array([1]); }';
   const guestBytes = new TextEncoder().encode(guestSrc);
@@ -375,9 +372,9 @@ console.log("\n§12.6 — the host's pre-open send queue is bounded");
 {
   const { MessageChannel } = await imp("build/host/net-channel.js");
   // A transport that never becomes writable — the state an unfinished connect leaves a
-  // channel in. Until `open` fires, everything written to it is HOST memory, spent by a
-  // peer that has proved nothing, so the queue that exists for a handshake frame or two
-  // must not be a place an occupant can put a megabyte per stalled socket.
+  // channel in. Until `open` fires, everything written is HOST memory spent by a peer that
+  // has proved nothing, so the queue a handshake frame or two needs must not be a place an
+  // occupant can put a megabyte per stalled socket.
   const sent = [];
   let closed = false;
   const stuck = {
@@ -403,8 +400,8 @@ console.log("\n§12.6 — the host's pre-open send queue is bounded");
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
   // The catalog calls `timer` an app service (core/domains.ts), so what is under test is
-  // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring
-  // it off the transport driver would admit such an app and then fail it at its first
+  // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring it
+  // off the transport driver would admit such an app and then fail it at its first
   // `host.call` — a manifest the loader accepted naming a backend nothing wired.
   const kp = testAuthor();
   const guestSrc = `
@@ -481,9 +478,7 @@ ${guestOpFraming()}
   // Uninstall CANCELS: a pending setTimeout holds a callback that re-enters the realm, so
   // one outliving its realm is a call into a freed QuickJS context (§2.1) rather than an
   // error. Through a stub realm, since what must be observed is the entrypoint NOT being
-  // invoked — which a real realm would report only by crashing, or not at all. The fired
-  // deadline and the ordinary `arm` invoke both arrive with the SAME zero caller id, so
-  // the stub tells them apart by the op NAME in the body, never by a caller byte.
+  // invoked — which a real realm would report only by crashing, or not at all.
   let armed = null;
   const entries = [];
   const { shell: stub } = await bootShell({
@@ -515,13 +510,11 @@ ${guestOpFraming()}
 }
 
 // ── §12.2 — the host's one caller id is matched whole, never by prefix ──────────
-//
-// There is exactly ONE host caller id — 32 zero bytes, matched over the WHOLE 32 bytes.
-// Every other caller id is an app key or a peer key — a hash of facts its author picks,
-// so any BYTE of it is grindable: an author retries app names until the digest starts
-// how it likes, which costs ~256 tries for one byte. A reader that stopped at the first
-// zero byte would hand the "this is the host proper" verdict to whoever wants it, which
-// is why the match runs the whole prefix rather than a shortcut over its lead byte.
+// There is exactly ONE host caller id — 32 zero bytes — matched over the WHOLE 32 bytes.
+// Every other caller id is an app key or peer key: a hash of facts its author picks, so
+// ANY byte of it is grindable (~256 tries per byte). A reader stopping at the first zero
+// byte would hand the "host proper" verdict to whoever wants it, so the match runs the
+// whole prefix rather than a shortcut over its lead byte.
 console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not by its prefix");
 {
   const body = new Uint8Array([9, 9, 9, 9]);

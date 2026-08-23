@@ -1,11 +1,8 @@
-// Smoke test: the transport bundle stands up as a shell's network over the
-// in-process loopback fabric; two nodes complete the AKE and exchange a typed
-// request/response through it. Everything after boot is the bundle's code.
-//
-// The second half is the claim the whole arrangement rests on: a node **replaces its
-// `_net` claimant while running**, while the concrete channel adapter stays on the same
-// port. That is what "the protocol is replaceable without a fork" means in
-// practice.
+// Smoke test: the transport bundle stands up as a shell's network over the in-process
+// loopback fabric; two nodes complete the AKE and exchange a typed request/response
+// through it. The second half is the claim the whole arrangement rests on: a node replaces
+// its `_net` claimant while running, with the concrete channel adapter on the same port —
+// "the protocol is replaceable without a fork", in practice.
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
@@ -42,16 +39,15 @@ const assert = ok;
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
-// The artifact is PQ-signed (§14.1) — there is one suite and it is hybrid, so the id
-// policy pins is a key-set hash and both keys are on the verified result.
+// The artifact is PQ-signed (§14.1): one hybrid suite, and the id policy pins is a key-set
+// hash, so both keys are on the verified result.
 assert(transportVerified.authorKeys.mlDsa !== undefined,
   "the shipped transport bundle carries the ML-DSA-65 public key of its signing key set");
 
-// The build script must derive the author's key set with its OWN copy of that derivation,
-// since it runs before build/ exists, so this pins the copy against
-// `hybridAuthorKeysFromSeed` — the one every other publisher calls. A drift fails no
-// build: it silently re-identifies this artifact's author and invalidates every
-// operator's pinned id. The seed is per-clone and gitignored, written by the build.
+// The build script derives the author's key set with its OWN copy of that derivation, so
+// this pins it against `hybridAuthorKeysFromSeed` — the one every other publisher calls. A
+// drift fails no build but silently re-identifies this artifact's author, invalidating
+// every operator's pinned id. The seed is per-clone, gitignored, written by the build.
 const transportSeed = Uint8Array.from(Buffer.from(
   readFileSync(join(root, "transport", "author.key"), "utf8").trim(), "hex"));
 const transportKeys = hybridAuthorKeysFromSeed(sodium, transportSeed);
@@ -73,10 +69,10 @@ function transportBundleAt(version, keys, guestSource) {
     services: [TRANSPORT_SERVICE],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // Exactly the services the transport guest holds — a mirror of the artifact
-    // manifest (scripts/build-transport-bundle.mjs). `link` is what carries the
-    // `link` privilege the admission dispatch reads (§12.5); inbound delivery is this
-    // slot's return convention, not a name to declare.
+    // Exactly the services the transport guest holds — a mirror of the artifact manifest
+    // (scripts/build-transport-bundle.mjs). `link` is what carries the `link` privilege
+    // the admission dispatch reads (§12.5); inbound delivery is this slot's return
+    // convention, not a name to declare.
     guestRequires: ["node", "link", "timer"],
   });
   return blob;
@@ -101,14 +97,13 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   }));
   const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
   // A test may pause a candidate right after its realm stands, before the shell publishes
-  // it. At that point the candidate's `init` op (its one-time node facts) has not yet been
-  // delivered and the incumbent still owns `_net`, which exposes address-book updates in
-  // the replacement window deterministically.
+  // it: the candidate's `init` op has not yet been delivered and the incumbent still owns
+  // `_net`, which exposes address-book updates in the replacement window deterministically.
   const realmControl = { pauseNext: null };
   // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
-  // but leaves the load to this test — which is the thing under test here, upgrades
-  // included. Every candidate below is signed by the shipped blob's own author, so the
-  // pin admits them and what each load exercises is the freshness rule, not the pin.
+  // but leaves the load to this test — the thing under test, upgrades included. Every
+  // candidate below is signed by the shipped blob's own author, so the pin admits them
+  // and each load exercises the freshness rule, not the pin.
   const { shell } = await bootShell({
     sodium, identity,
     modules: new ModuleTable(),
@@ -160,8 +155,7 @@ const resp = await request(b.shell, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through the record layer");
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
-//
-// An update replaces its own complete slot atomically. The claim and host adapter stay
+// An update replaces its own complete slot atomically: the claim and host adapter stay
 // stable while the realm and its private session state are replaced.
 console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
@@ -175,10 +169,9 @@ a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; }
 const upgrading = a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
 await configured;
 // The candidate's `init` facts were not snapped at the pause: this address update lands
-// after the pause, before the handover, while the incumbent still owns `_net` — its live
-// `addr` event goes to the outgoing realm. The address book is the NODE's, so it survives
-// the commit if and only if the host replays it to the published claimant; the facts the
-// newcomer received at init never carried it.
+// after it, before the handover, while the incumbent still owns `_net`. The address book
+// is the NODE's, so it survives the commit iff the host replays it to the published
+// claimant; the facts the newcomer received at init never carried it.
 aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
 publishCandidate();
 await upgrading;
@@ -215,10 +208,8 @@ assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
 
 // ── A version that never ran must not consume the claim ──────────────────────────
 // Every app's guest is STOOD at load (shell-core.ts), so a v3 that cannot compile dies
-// there. A mark advanced on the way in would leave the node unable to reinstall the
-// transport it had: every version an operator can reach would sit below a floor a bundle
-// that never executed a line raised — rollback bricked by a failed upgrade. So the mark is
-// the last step of the load, after the guest stands.
+// there. If the mark advanced on the way in, the node could not reinstall the transport
+// it had — rollback bricked by a failed upgrade. So the mark is the last step of the load.
 const brokenGuest = "const nope = ( ;";
 let v3Failed = false;
 try { await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys, brokenGuest)); }

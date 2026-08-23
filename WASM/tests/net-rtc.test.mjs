@@ -1,13 +1,8 @@
-// net-rtc.test.mjs — RtcNetwork's speculative-entry cap (§12.6.1).
-//
-// The relay can force a node to allocate peer entries by naming arbitrary `from` values
-// in hellos AND in SDP offers, and every entry carries an RTCPeerConnection (ICE agents,
-// sockets) — so every path that CREATES an entry must answer to the same
-// MAX_UNAUTHED_PEERS bound. Pinned with a stub connection factory and a stub driver:
-// net-rtc is browser-native, but its browser globals are referenced only inside methods,
-// so it runs under Node.
-//
-// Run: node tests/net-rtc.test.mjs   (after `npm run build`)
+// net-rtc.test.mjs — RtcNetwork's speculative-entry cap (§12.6.1). The relay can force
+// entries by naming arbitrary `from` values in hellos AND in SDP offers, and every entry
+// carries an RTCPeerConnection — so every path that CREATES one answers to the same
+// MAX_UNAUTHED_PEERS bound. Pinned with stubs: the browser globals are referenced only
+// inside methods, so net-rtc runs under Node. Run after `npm run build`.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";

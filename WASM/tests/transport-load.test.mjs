@@ -1,23 +1,12 @@
-// Load behaviour of the half-open budgets (§12.6.2 §6.5, §11.4).
-//
-// The concealed handshake refuses strangers by SILENCE: a caller that cannot produce a
-// msg1 opening under the contact secret is left to time out rather than closed on, since
-// an immediate close is an oracle ("I am a seedkernel node and that is not the key"). So
-// an unproven connection occupies a socket for as long as the deadline allows, and the
-// budgets become the thing standing between a stranger and the node. Three questions:
-//
-//   1. What does an unproven connection actually COST us?
-//   2. Can a flood from outside the contact secret stop members from getting in?
-//   3. Do the budgets and deadlines behave as the constants claim?
-//
-// Entirely over the in-process channel fabric, so the numbers are about cryptographic and
-// allocation cost per connection rather than kernel socket limits — the socket ceiling is
-// an operator's `ulimit` question, while what the protocol controls is how much work a
-// stranger can buy from us.
-//
-// The limiter lives inside the transport guest, so every assertion here is on OBSERVABLE
-// behaviour rather than a counter: whether a dialer's socket is evicted or refused, and
-// whether a member still completes its handshake.
+// Load behaviour of the half-open budgets (§12.6.2 §6.5, §11.4). The concealed handshake
+// refuses strangers by SILENCE (an immediate close is an oracle), so an unproven connection
+// occupies a socket for the whole deadline, and these budgets are what stand between a
+// stranger and the node. Three questions: what an unproven connection costs us, whether a
+// flood from outside the contact secret can stop members getting in, and whether the
+// budgets behave as the constants claim. Entirely over the in-process fabric, so the
+// numbers cover crypto/alloc cost per connection, not kernel socket limits. The limiter
+// lives inside the transport guest, so every assertion is on OBSERVABLE behaviour — is a
+// socket evicted or refused, does a member still complete its handshake — never a counter.
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, until,
@@ -26,11 +15,10 @@ import { testkit } from "./testkit.mjs";
 
 const CONTACT = new Uint8Array(32).fill(3);
 
-/** The node's sodium, wrapped to charge the asymmetric operations to a counter.
- *  The guest reaches all of these through the guest seam's primitive catalog, so this
- *  is the real bill for a connection — including the ephemeral keypair, which is
- *  `RANDOM(32)` followed by an `x25519/dh` against the base point and therefore shows
- *  up as a scalarmult. */
+/** The node's sodium, wrapped to charge the asymmetric operations to a counter. The guest
+ *  reaches these through the guest seam's primitive catalog, so this is the real bill for a
+ *  connection — including the ephemeral keypair, which is `RANDOM(32)` + an x25519/dh
+ *  against the base point and so shows up as a scalarmult. */
 function countingSodium(base) {
   const ops = { scalarmult: 0, sign: 0, verify: 0, aead: 0 };
   const charge = {
@@ -186,13 +174,10 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
 });
 
 await test("a leaked contact secret cannot lock members out of the verified budget", async () => {
-  // The same failure one tier up. If the address leaks, an attacker can produce a valid
-  // msg1, promote into the verified tier, then stall — and a promote() that merely REFUSED
-  // when full would let a few hundred of those shut every real member out. The verified
-  // tier evicts too.
-  //
-  // The attacker is a real node holding the secret whose socket drops everything after
-  // msg1: it promotes, then goes quiet.
+  // The same failure one tier up: an attacker holding the leaked address can promote into
+  // the verified tier and stall, so a promote() that merely REFUSED when full would let a
+  // few hundred shut every real member out — the verified tier evicts too. The attacker is
+  // a real node holding the secret whose socket drops everything after msg1.
   const VER = 6;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: VER }));
@@ -226,11 +211,9 @@ await test("a leaked contact secret cannot lock members out of the verified budg
 
 await test("the budget bounds links PAST the handshake, not just into it", async () => {
   // The tiers above bound who is getting IN. Releasing the slot at authentication would
-  // let anyone who can complete a handshake — every admitted peer, and on an open node
-  // every stranger — hold links without limit, each with its own framer, session keys,
-  // timers and buffers. The slot is held for the link's life, in a third tier that evicts
-  // its stalest occupant like the other two: newcomers still get in, the total stays
-  // bounded.
+  // let anyone who can complete a handshake hold links without limit, each with its own
+  // framer, session keys, timers and buffers. The slot is held for the link's life, in a
+  // third tier that evicts its stalest occupant like the other two.
   const AUTHED = 3;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256, authed: AUTHED }));
@@ -264,14 +247,12 @@ await test("the per-source cap still bites under flood", async () => {
 });
 
 await test("the HOST's own link table is bounded, under every tier the guest enforces", async () => {
-  // The tiers above are content policy and live in the transport guest, because "half-open"
-  // and "authenticated" are states only it can see. But a socket costs the HOST a descriptor
-  // and a link-table entry the moment it is accepted — turns before the guest forms an
-  // opinion — so a wedged or hostile occupant that never refuses anything would spend host
-  // memory the tiers cannot reach. `maxRawLinks` is the generic ceiling underneath them.
-  //
-  // Set here far BELOW the half-open budgets, so what bites is unambiguously the driver's
-  // ceiling and not a tier: an honest occupant never meets this.
+  // The tiers above are content policy living in the transport guest, because only it can
+  // see "half-open" and "authenticated". But a socket costs the HOST a descriptor and a
+  // table entry the moment it is accepted — before the guest forms an opinion — so a
+  // wedged or hostile occupant that never refuses would spend host memory the tiers cannot
+  // reach. `maxRawLinks` is the ceiling underneath them, set here far BELOW the budgets so
+  // what bites is unambiguously the driver's ceiling and not a tier.
   const RAW = 6;
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 1024, perSource: 1024, verified: 256 }, { maxRawLinks: RAW }));
@@ -297,8 +278,8 @@ await test("the HOST's own link table is bounded, under every tier the guest enf
 });
 
 await test("an unverified connection is dropped on the SHORT deadline", async () => {
-  // A stranger holds a slot for the unverified deadline, not the full handshake one.
-  // Measured rather than restated: the constants live in the transport bundle, and a
+  // A stranger holds a slot for the unverified deadline, not the full handshake one —
+  // measured rather than restated, since the constants live in the transport bundle and a
   // number copied out of it here would be drift waiting to happen.
   const fabric = new LoopbackChannels();
   const s = keep(await server(fabric, { unverified: 8, perSource: 8, verified: 8 }));
@@ -314,8 +295,8 @@ await test("an unverified connection is dropped on the SHORT deadline", async ()
 
 await test("sustained-rate headroom", async () => {
   // What the constants actually buy, stated as a rate rather than a count: a flood must
-  // exceed this to keep the unverified budget saturated, and even then the eviction
-  // tests above say members are unaffected.
+  // exceed this to keep the unverified budget saturated, and even then eviction (above)
+  // says members are unaffected.
   const { DEFAULT_MAX_HALF_OPEN_UNVERIFIED, DEFAULT_MAX_HALF_OPEN_VERIFIED }
     = await import("../build/host/transport-host.js");
   const deadlineMs = globalThis.__unverifiedMs ?? 2000;

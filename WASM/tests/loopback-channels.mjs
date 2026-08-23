@@ -1,15 +1,12 @@
 // loopback-channels.mjs — the in-process socket fabric the transport tests run over.
-// Test infrastructure rather than runtime, so it stays out of the shared bundle every
-// target ships. Tests drive the transport driver through this ChannelFactory the way a
-// node drives it through real sockets: `listen` registers a listener per port and
-// `connect` opens a microtask-delivered pipe pair into it.
+// Test infrastructure, so it stays out of the shared bundle every target ships: tests
+// drive the transport through this ChannelFactory the way a node drives real sockets.
 
 import { FRAMING } from "../build/core/socket-seam.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
- *  mirroring a real socket; closing one end fires the other's onClose — the
- *  close semantics of BufferedChannel's fail() path, which is how a real channel
- *  reports the far side going away. */
+ *  mirroring a real socket; closing one end fires the other's onClose — the close
+ *  semantics of BufferedChannel's fail() path on a real channel. */
 class LoopbackChannel {
   /** A socket pair with `send` as the boundary: one send is one delivery. */
   framing = FRAMING.PLATFORM;
@@ -53,9 +50,9 @@ class LoopbackChannel {
   }
 }
 
-/** In-process socket fabric for the transport driver. The fabric is SHARED by
- *  every driver in a process (like a real network), so closing one driver only
- *  clears the listeners — it does not poison the fabric for the others. */
+/** In-process socket fabric for the transport driver. The fabric is SHARED by every
+ *  driver in a process (like a real network), so closing one driver only clears its
+ *  own listeners — a per-node `view()` handles that. */
 export class LoopbackChannels {
   listeners = new Map();
   nextPort = 10000;
@@ -102,12 +99,9 @@ export class LoopbackChannels {
   }
 
   /** A per-node view of this fabric: it dials and listens through the same registry, but
-   *  its `close` unbinds only the ports *it* bound.
-   *
-   *  Sharing one `LoopbackChannels` between nodes is a test convenience (in production
-   *  each shell holds its own `NodeChannelFactory`), and the whole-fabric `close` above is
-   *  right only for teardown. An in-place transport upgrade closes the outgoing driver and
-   *  re-binds its port, which on the shared object would unbind every other node. */
+   *  its `close` unbinds only the ports *it* bound — the whole-fabric `close` above is
+   *  right only for teardown. (An in-place transport upgrade re-binds the driver's port,
+   *  which on the shared object would unbind every other node.) */
   view() {
     const fabric = this;
     const mine = [];

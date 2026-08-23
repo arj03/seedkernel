@@ -20,11 +20,10 @@ const { bootShell } = await imp("build/host/shell-core.js");
 const { bootRuntime } = await imp("build/host/main.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
 
-// The host's already-readied instance rather than our own copy: libsodium-wrappers-sumo
-// declares separate "import" and "require" conditions pointing at different builds, so a
-// require() here returns a SECOND instance with its own wasm heap that nothing awaits
-// .ready on — leaving every crypto_* symbol undefined at call time. One shared instance
-// is the rule (§12.1) and these tests follow it like any other consumer.
+// The host's already-readied instance rather than our own copy:
+// libsodium-wrappers-sumo declares separate "import" and "require" conditions pointing at
+// different builds, so a require() here returns a SECOND instance with its own wasm heap
+// that nothing awaits .ready on. One shared instance is the rule (§12.1).
 const sodium = await loadCrypto();
 
 // One contact secret for the whole harness. In production each node has its own and
@@ -59,10 +58,10 @@ const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
 const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
 
-/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
- *  the two derive. Tests name `a.id` wherever the runtime names an author (policy pins,
- *  app keys, freshness marks) and hand the whole object to `signManifest`, so none can
- *  pin half an identity. */
+/** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
+ *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins, app
+ *  keys, freshness marks) and hand the whole object to `signManifest`, so none can pin
+ *  half an identity. */
 const testAuthor = () => makeAuthor(sodium);
 
 /** A NODE-platform node for one test: `bootRuntime` (main.ts) minus the channel
@@ -72,18 +71,15 @@ const testAuthor = () => makeAuthor(sodium);
 const boot = async (cfg) => (await bootRuntime(cfg)).shell;
 
 /** A node for ONE test, through the one assembly (`bootShell`, §12.9). The platform
- *  members are stated flat, as the assembly takes them, and `fs` defaults to `false`:
- *  most bundles here declare no `fs` cap, and handing them the in-memory backend would
- *  be a seam open that the test never asked for. A test that wants a disk passes one.
+ *  members are stated flat, as the assembly takes them; `fs` defaults to `false` — most
+ *  bundles here declare no `fs` cap, and handing them the in-memory backend would be a
+ *  seam open the test never asked for.
  *
  *  `pinAuthor` is whose signature the TRANSPORT PIN admits (§12.5). The pin is derived
  *  from a blob, and with no blob it is fail-closed — every bundle reaching `link` is
- *  refused before any predicate under test is consulted. So a test loading a
- *  privileged bundle names the author the pin is derived from, exactly as an operator
- *  running a transport other than the shipped one does. What it hands over is a real
+ *  refused before any predicate under test is consulted. What is handed over is a real
  *  signed bundle of that author's, because the pin is read off a signature rather than
- *  off a name; the socket-less driver beside it is the browser-edge shape (§12.6), which
- *  is what makes a link-privileged bundle admissible without giving this node sockets. */
+ *  off a name; the socket-less driver beside it is the browser-edge shape (§12.6). */
 async function bootTestShell({ pinAuthor, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const pinned = pinAuthor ? {
@@ -176,12 +172,10 @@ const { readFileSync } = await import("node:fs");
 const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.wasm")));
 
 // ML-DSA-65 onto the test instance exactly as a target does at its crypto seam — the
-// hybrid manifest suite is "a sodium that knows this method" (§12.4), over the same
-// browser/mldsa65.wasm the browser fetches and the Go loader embeds.
+// hybrid manifest suite is "a sodium that knows this method" (§12.4).
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
 // And ML-KEM-768, the catalog primitive the same seam mixes in: a manifest is checked
-// against PRIMITIVE_NAMES, so those methods have to be on the object every target hands
-// the guest seam.
+// against PRIMITIVE_NAMES, so those methods must be on the object handed to the seam.
 withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm"))));
 
 // Install one verified module as the whole of `appKey`'s module set. Async: a bind stands
@@ -373,10 +367,9 @@ async function testDerivedNamesKeepAuthorsApart() {
 }
 
 // ─── Test: the manifest's claim IS the routing (§12.10) ──────────────────────
-//
-// A bundle declares the protocol ids it serves and the load claims them: one act, no
+// The bundle declares the protocol ids it serves and the load claims them: one act, no
 // operator step in between. Claims have one active owner: an update replaces its own
-// claims atomically, while a different bundle cannot silently displace it.
+// claims atomically, and a different bundle cannot silently displace it.
 async function testManifestClaimIsTheRouting() {
   console.log("Test: the manifest's claim IS the routing (§12.10)");
   const { verifyManifest } = await imp("build/host/bundle.js");
@@ -502,13 +495,11 @@ async function testManifestClaimIsTheRouting() {
 // (README §12.10): the one slot that sees the plaintext is the one that attributes, so
 // there is no second privilege to grant or forget. The properties that had to be pinned
 // live at the one place they can be — over the real driver, claims and transport bundle:
-// a delivery reaches exactly the named ordinary claim, it never reaches a bundle's
-// `services` LOCAL claim, and a non-link app can never name a delivery path at all
-// (transport-link.test.mjs: "EXACT CLAIM", "a peer cannot reach a bundle's local service
-// claim", "CALLER BOUNDARY").
+// a delivery reaches exactly the named ordinary claim, never a `services` LOCAL claim,
+// and a non-link app can never name a delivery path at all (transport-link.test.mjs:
+// "EXACT CLAIM", "a peer cannot reach a bundle's local service claim", "CALLER BOUNDARY").
 
 // ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
-//
 // The driver has one event sink, so a second link-capable slot cannot be a composition: it
 // would take the node's sockets while the incumbent kept its claims and its realm, leaving
 // a node that looks installed and answers nothing. Refused instead, on the same rule as a
@@ -659,11 +650,10 @@ async function testFs() {
 }
 
 // ─── Test: the fs key space is ONE rule, shared by every target ──────────
-//
 // Which keys a node admits decides which blocks it stores and advertises, so it is a
 // consensus predicate: a Go node and a Bun node that disagree about it disagree about
-// their contents. The rule therefore lives in shared JS (core/fs.ts `isSafeFsKey`),
-// applied over whatever backend a target supplies (`validatedFs`, shell-core.ts).
+// their contents. The rule lives in shared JS (core/fs.ts `isSafeFsKey`), applied over
+// whatever backend a target supplies (`validatedFs`, shell-core.ts).
 
 async function testFsKeyRule() {
   console.log("Test: fs key space is one rule — isSafeFsKey over any backend (validatedFs)");
@@ -717,11 +707,9 @@ async function testFsKeyRule() {
 }
 
 // ─── Test: guest-side fan-out over the cross-realm call (Promise.all) ────────────
-//
 // Fan-out is not a host op: with real promises at the seam, a confined guest scatters a
 // distinct request per peer itself with Promise.all over `_net`. Driven here through the
-// seam's single-peer cross-realm call, concurrently, so the round trips genuinely
-// overlap in one realm.
+// seam's single-peer cross-realm call, concurrently, so the round trips overlap in one realm.
 
 async function testGuestSeam() {
   console.log("Test: guest seam — generic primitive capabilities, no app vocabulary (step 7)");
@@ -736,9 +724,8 @@ async function testGuestSeam() {
   const calls = { call: (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null) };
   // THIS realm's declared local services (§12.10) — what tells them apart from a bare
   // module name at the dispatch, independent of `names` (which opts out of gating below
-  // via UNRESTRICTED_NAMES and so cannot be read for this). `chat/v1` is here because a
-  // local service id is an ordinary claim: it may carry a `/` exactly like a wire
-  // protocol id, and the declaration is what the dispatch asks first.
+  // via UNRESTRICTED_NAMES). `chat/v1` is here because a local service id is an ordinary
+  // claim: it may carry a `/` exactly like a wire protocol id.
   const localServices = new Set(["_net", "_nobody", "chat/v1"]);
 
   // A module reachable by name, for the catalog's app-module half.
@@ -849,8 +836,8 @@ async function testGuestSeam() {
 
     // The CROSS-REALM call: a name in THIS realm's declared local services is another
     // realm, reached on a later turn, so it is a Promise like fs. There is no `net`
-    // domain — the network is a bundle that declares the service `_net`, and this
-    // seam's routing answers it (§12.10).
+    // domain — the network is a bundle that declares the service `_net`, and this seam's
+    // routing answers it (§12.10).
     const crossed = seam("_net", U(1, 2, 3));
     assert(crossed instanceof Promise, "a local service id returns a Promise (the callee runs on a later turn)");
     assertEqual([...await crossed], [9, 9], "…and resolves with what the callee's handle returned");
@@ -960,15 +947,13 @@ async function testPolicy() {
 }
 
 // ─── Test: the requires decide which privileges are in play (§12.5) ────────
-//
-// There is one install path and no `role` field, so what a bundle must be granted is read
-// off `guest.requires` alone. What has to hold is that the derivation cannot be pushed
-// the wrong way: naming a `link/*` name puts `link` in the set and nothing takes it out,
-// so the most permissive `authors` list expressible here (`admitAll`) still buys an
-// author no sockets. Otherwise every policy test above is a lock on an open door.
-//
-// Driven through the assembly, because the derivation is the shell's — the policy tests
-// above compose verifyBundle → admit → installBundle by hand and would not see it.
+// One install path, no `role` field: what a bundle must be granted is read off
+// `guest.requires` alone. The derivation cannot be pushed the wrong way — naming a
+// `link/*` name puts `link` in the set and nothing takes it out — so the most permissive
+// `authors` list expressible (`admitAll`) still buys an author no sockets; otherwise every
+// policy test above is a lock on an open door. Driven through the assembly, because the
+// derivation is the shell's — the policy tests above compose verifyBundle → admit →
+// installBundle by hand and would not see it.
 async function testRequiresPickThePrivileges() {
   console.log("Test: guest.requires decides which privileges a bundle must be granted");
   const { admitAll, denyAll, byPrivilege } = await imp("build/host/policy.js");
@@ -987,9 +972,8 @@ async function testRequiresPickThePrivileges() {
     [GUEST_FILE]: GUEST_BYTES,
   });
   // ONE predicate, with the capability set as an argument (`byPrivilege`) rather than a
-  // choice between predicates the runtime holds.
-  // The pin names this author, so every candidate below reaches the predicate whose
-  // choice is being counted — the pin refusing first would make every count zero.
+  // choice between predicates. The pin names this author, so every candidate reaches the
+  // predicate whose choice is being counted — a pin refusing first would zero every count.
   const mkTestShell = (base, link) => bootTestShell({
     createRealm: async () => ({ call: async () => new Uint8Array(), dispose() {} }),
     pinAuthor: author,
@@ -1028,7 +1012,7 @@ async function testRequiresPickThePrivileges() {
   }
 
   // 3. A privilege is ONE thing, so there are no halves to claim: `link` beside ordinary
-  //    app services is still governed by the `link` grant alone, never by the base.
+  //    app services is still governed by the `link` grant alone, never the base.
   //    Otherwise a bundle could reach sockets while falling through to the unprivileged
   //    list by mixing in an ordinary service.
   {
@@ -1046,13 +1030,12 @@ async function testRequiresPickThePrivileges() {
 
 // ─── Test: node/sign is the one sign name; its scope is the slot's — the app scope for ──
 // ─── an app slot, the network scope for the link slot, on EVERY load path ──────────────
-//
 // `slotSignScope` is a function of admitted facts — the node's identity, the manifest and
 // the privileges it reaches — which is the whole reason it cannot drift. Driven through a
 // real shell because the property is about the point where a signed manifest becomes a
 // realm, and because the path that could silently lose it is the in-place UPDATE: a
-// transport that re-scoped itself on upgrade would keep serving while every handshake with
-// an un-upgraded peer failed as an authentication error with nothing naming the cause.
+// transport that re-scoped itself on upgrade would keep serving while every handshake
+// with an un-upgraded peer failed as an authentication error naming nothing.
 async function testSigningScopeFollowsSlot() {
   console.log("Test: node/sign is the slot's scope — app scope for an app, network scope for the link slot, on every load path");
   const { byPrivilege, admitAll } = await imp("build/host/policy.js");
@@ -1163,10 +1146,10 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
-  // `requires` speaks at SERVICE granularity (§12.2): a finer method name is now a
-  // refused manifest, since the seam gates a `host.call` by the method's service, never
-  // by the exact method, and a manifest naming one would be asking for a grant finer
-  // than the seam can enforce.
+  // Requires speak at SERVICE granularity (§12.2): a finer method name is a refused
+  // manifest, since the seam gates a `host.call` by the method's service, never by the
+  // exact method — a manifest naming one would ask for a grant finer than the seam can
+  // enforce.
   {
     let refused = "";
     try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs/get"] })); }
@@ -1224,9 +1207,9 @@ async function testSlotFreshness() {
   });
   // The load path as the shell composes it: the host's gates read the store into an
   // `AdmissionContext` and answer once, installBundle lands the modules, and the mark is
-  // advanced last — after the guest stands, which is the shell's job and is why the mark
-  // is written here rather than inside installBundle. The predicate never touches the
-  // store, so "who refuses a downgrade" is one place.
+  // advanced last — after the guest stands, which is the shell's job and why the mark is
+  // written here rather than inside installBundle. The predicate never touches the store,
+  // so "who refuses a downgrade" is one place.
   const land = async (host, freshness, author, version) => {
     const v = verifyBundle(sodium, blobFrom(author, version));
     await hostGates(v, {
@@ -1393,11 +1376,10 @@ async function testBundle() {
 }
 
 // ─── Test: every app is a guest (§12.4) + the verify/install split ────
-//
-// A chat-style app is a guest plus its module, and since requires live inside `guest`, an
+// A chat-style app is a guest plus its module; since requires live inside `guest`, an
 // empty list IS declaring zero authority. Covers the one app shape (guestSource
 // round-trips), a bundle blob round-tripping as one value, and `verifyBundle`
-// authenticating + integrity-checking WITHOUT a host or a policy — the seam the browser
+// authenticating + integrity-checking WITHOUT a host or policy — the seam the browser
 // shell peeks a received Offer through before asking for consent.
 async function testGuestBundleAndArchive() {
   console.log("Test: every app is a guest — bundle blob + verify/install split");
@@ -1489,10 +1471,9 @@ async function testGuestBundleAndArchive() {
 }
 
 // ─── Test: safe-js zero-authority JS confinement (§2.1) ─────────────────
-//
-// Run zero-authority guest JS over a single host-call seam. Three load-bearing
-// properties, over stand-in seams: airtight by construction, the async seam + byte
-// boundary, and realm isolation.
+// Run zero-authority guest JS over a single host-call seam. Three load-bearing properties,
+// over stand-in seams: airtight by construction, the async seam + byte boundary, and realm
+// isolation.
 
 async function testSafeJs() {
   console.log("Test: safe-js — zero-authority JS confinement (§2.1)");
@@ -1622,7 +1603,6 @@ async function testSafeJs() {
 }
 
 // ─── Test: one entry seam, serialized per realm (§12.3) ─────────────────
-//
 // One way in, `call`, which may yield. That one invocation runs to completion before the
 // next begins is the realm's own FIFO queue (host/realm-queue.ts) rather than a property
 // of the host's call stack — which is what a synchronous entry used to give for free.
@@ -1692,12 +1672,11 @@ async function testRealmSerialization() {
   }
 
   // 4. Disposing a realm while an invocation is parked mid-await — the ordinary state of
-  //    a node whose initiator is waiting on the network — fails the parked caller and
-  //    frees the context WITHOUT taking the wasm module with it. The engine asserts an
-  //    empty gc object list when a runtime is freed, and a parked call releases its handle
-  //    from a `finally` that runs as a microtask after dispose() returns, so freeing the
-  //    context in the same turn aborts the whole module — every realm in the process.
-  //    Hence the deferred teardown, pinned here: a regression is a host crash.
+  //    a node whose initiator waits on the network — fails the parked caller and frees
+  //    the context WITHOUT taking the wasm module with it: the engine asserts an empty gc
+  //    object list when a runtime is freed, and a parked call releases its handle from a
+  //    `finally` that runs as a microtask after dispose() returns, so freeing the context
+  //    in the same turn aborts the whole module. Hence the deferred teardown, pinned here.
   {
     const realm = await createSafeRealm({
       source: `async function handle() { await host.call("park", new Uint8Array()); }`,
@@ -1842,12 +1821,11 @@ async function testCallModuleGuards() {
 }
 
 // ─── Test: a module call is bounded — the §4.3 compute residual, closed ──────────
-//
 // The JS platform's WebAssembly exposes no fuel or timeout, so a module call in the host
-// thread that never returned would wedge the node with no way to interrupt it — and a
-// restart would re-trigger it from the same inbound frame. That is what the
-// worker-per-module table closes: a spinning module answers EMPTY at its deadline, the
-// host thread stays alive throughout, and a fresh instance serves the next call.
+// thread that never returned would wedge the node irrecoverably — a restart would
+// re-trigger it from the same inbound frame. The worker-per-module table closes that: a
+// spinning module answers EMPTY at its deadline, the host thread stays alive, and a fresh
+// instance serves the next call.
 async function testModuleCallBound() {
   console.log("Test: a spinning module is killed at its deadline and respawned (§4.3)");
 
@@ -1898,12 +1876,10 @@ async function testModuleCallBound() {
   assert(a === null && b === null,
     "both spins answered like traps, at their own deadlines");
   assert(serial >= 140 && serial < 5000, `the two calls ran one after the other (${serial}ms)`);
-  // …and the module still answers after two kills in a row, on ONE worker. The respawn a
+  // …and the module still answers after two kills in a row, on ONE worker: the respawn a
   // kill starts and the respawn the queued call would start are the same load
-  // (`ModuleTable.respawn`); two loads there would leak an idle, never-terminated worker
-  // per kill. That leak is invisible from the process (an unref'd worker is absent from
-  // `getActiveResourcesInfo`), so what is asserted is the behaviour it rides on: one live
-  // worker across the kills, so the next call lands.
+  // (`ModuleTable.respawn`), and two loads per kill would leak an idle never-terminated
+  // worker (invisible: an unref'd worker is absent from `getActiveResourcesInfo`).
   await host2.bindAll(spinKey, [{ name: "spin", wasm: forwarderBytes }]);
   const after = await host2.callModule(spinKey, "spin", new Uint8Array([3]), 1000);
   assertEqual([...after], [3], "the module answers on its one respawned worker after two kills");

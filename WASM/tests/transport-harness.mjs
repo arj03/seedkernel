@@ -1,10 +1,8 @@
-// transport-harness.mjs — shared plumbing for the transport-bundle tests.
-//
-// The transport is a signed bundle whose guest program holds the AKE, record
-// layer, routing and request/response layer. Tests drive it through the real
-// host stack — shell → driver (TransportHost) → guest realm — with in-process
-// channel pairs standing in for sockets, so the properties pinned here are
-// properties of the shipped bundle, not of a parallel reimplementation.
+// transport-harness.mjs — shared plumbing for the transport-bundle tests. The transport
+// is a signed bundle whose guest holds the AKE, record layer, routing and request/response
+// layer; these tests drive it through the real host stack — shell → driver (TransportHost)
+// → guest realm — with in-process channel pairs for sockets, so the properties pinned
+// here are the shipped bundle's, not a parallel reimplementation's.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -37,19 +35,12 @@ export const transportBlob = transportBundleBytes();
 export const PROTO = "harness/v1";
 
 /** The harness APP — a real signed bundle, since an app reaches the network by calling the
- *  id the transport claims (`_net`) and is reached by the id it claims itself. A test that
- *  drives the transport therefore has to be an app, which is what makes these tests
- *  exercise the same path a deployment does.
- *
- *  ONE entrypoint, and a mode chosen at load through the manifest's `config`. `handle` is
- *  reached by `dispatch` (a remote peer's frame, echoed) and by the host's `invoke`
- *  loopback (the 32 zero-byte caller id, the op envelope in the payload), whose ops are:
+ *  id the transport claims (`_net`) and is reached by the id it claims itself. ONE
+ *  entrypoint, with the mode chosen at load through the manifest's `config`:
  *    send — one request out; answers `[ok u8][response]` straight through from `_net`.
  *    op   — an already-framed `[opLen u8][op][args]` handed to `_net` verbatim, for the
- *           tests whose subject is WHICH ops an app may name. It writes no name of its
- *           own, so a refusal is the transport's.
- *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`.
- *    from — who each of those was attributed to, `[pk 32]…`, in step with `seen`. */
+ *           tests whose subject is WHICH ops an app may name (no name of its own).
+ *    seen/from — everything `handle` was handed INBOUND, and who it was attributed to. */
 const HARNESS_GUEST = `
 // This app's own copies of the shape it shares with whatever it calls (its own format
 // after the kernel's 32-byte caller prefix): a local op is [opLen u8][op][args], and
@@ -208,11 +199,10 @@ export function transportPolicy(authorHex, appAuthors = []) {
 
 /** One transport host: a shell over a fresh identity + the transport bundle, and — unless
  *  `app: false` — the harness app that drives it. Options pass through to the driver
- *  this harness constructs (admitPeers for the peer list, networkKey, contactSecret,
- *  channels, requestDeadlineMs, transportHalfOpen, maxRawLinks, linkIdleTimeoutMs).
- *
- *  `request`/`sendNoReply`/`seen`/`peers` are each one `invoke` into the harness app, so
- *  the bytes cross exactly the seam a real app's would. */
+ *  (admitPeers, networkKey, contactSecret, channels, requestDeadlineMs, transportHalfOpen,
+ *  maxRawLinks, linkIdleTimeoutMs). `request`/`sendNoReply`/`peers`/`seen`/`from`/`op` are
+ *  each a single `invoke` into the harness app, so the bytes cross exactly the seam a real
+ *  app's would. */
 export async function makeTransportHost(opts = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
@@ -237,10 +227,9 @@ export async function makeTransportHost(opts = {}) {
     linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
   });
   // A DRIVER INSTANCE, so bootShell wires it and composes the pin but neither loads the
-  // transport bundle nor starts the listeners — this harness owns both, because a test
-  // wants the load observable (and sometimes refused). `transportBundle` is still stated:
-  // it is what the pin is derived from, so the blob loaded below and the blob the pin
-  // admits are one fact rather than two that can drift.
+  // transport bundle nor starts the listeners — this harness owns the load because a test
+  // wants it observable (sometimes refused). `transportBundle` is still stated: the blob
+  // loaded below and the blob the pin admits are one fact, not two that can drift.
   const blob = opts.transportBlob ?? transportBlob;
   const shell = await bootShell({
     sodium: opts.sodium ?? sodium,
@@ -324,9 +313,8 @@ export async function makeTransportHost(opts = {}) {
 }
 
 /** Await a condition with a deadline — the tests' tick, bounded. The predicate is
- *  AWAITED, so an async one is polled on its resolved value: a promise object is truthy
- *  on the first tick, which would return immediately and make the whole wait a silent
- *  no-op. A sync predicate costs one microtask per tick and reads the same. */
+ *  AWAITED: an async one is polled on its resolved value, where a bare promise object
+ *  would be truthy on the first tick and make the wait a silent no-op. */
 export async function until(fn, ms = 3000, what = "condition") {
   const start = Date.now();
   for (;;) {

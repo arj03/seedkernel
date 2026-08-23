@@ -1,9 +1,8 @@
-// The ws.wasm module's RFC 6455 conformance, plus peer-address parsing.
-//
-// The framing STATE MACHINE — the residual buffer, the two-stage cap, fragment
-// reassembly — is the transport guest's (transport/src/framing.js `WsFramer`), covered
-// end to end by transport-tcp.test.mjs. What is tested here is the module those framers
-// call: one whole frame in, one decoded frame out, and the refusals it owes its callers.
+// The ws.wasm module's RFC 6455 conformance, plus peer-address parsing. The framing STATE
+// MACHINE (residual buffer, two-stage cap, fragment reassembly) is the transport guest's
+// (transport/src/framing.js `WsFramer`), covered end to end by transport-tcp.test.mjs; what
+// is tested here is the module those framers call — one frame in, one decoded frame out,
+// and the refusals it owes its callers.
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
 import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
@@ -63,12 +62,10 @@ test("a truncated frame decodes to nothing rather than reading past its end", ()
   assert(decodeOne(f.subarray(0, f.length - 10), false) === null, "short frame");
 });
 
-// The one cross-artifact coupling in the frame path, checked rather than documented.
-// `MAX_FRAME_BYTES` is the host's number (core/net-limits.ts), but this module must STAGE
-// a whole frame in the scratch it allocates at instantiation, so its compiled-in capacity
-// is a floor under the cap. Raising the cap past it fails nothing at build time: TCP keeps
-// carrying the frame while WS tears the link down on the first big one, reading as a WS
-// bug. Red here instead, naming the rebuild.
+// The one cross-artifact coupling in the frame path, checked rather than documented:
+// `MAX_FRAME_BYTES` (host, core/net-limits.ts) is a floor under the module's compiled
+// scratch, and raising the cap past it fails nothing at build time — TCP keeps carrying
+// the frame while WS tears the link down on the first big one. Red here, naming the rebuild.
 test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () => {
   // The encoder's own ceiling: header (10) + mask (4) ≤ the 16 bytes abi.ts holds back.
   assert(MAX_FRAME_BYTES + 16 <= SCRATCH_SIZE,
@@ -81,9 +78,9 @@ test("ws.wasm's compiled scratch still fits a whole MAX_FRAME_BYTES frame", () =
 });
 
 // ── peer specs ───────────────────────────────────────────────────────────────
-// Both transports carry the same address shape, `pk[.secret]@where`, and the secret is
-// the PEER's. Getting this wrong is silent: a dial sealed under the wrong secret simply
-// draws no response, which is indistinguishable from the peer being down.
+// Same address shape on both transports, `pk[.secret]@where`, and the secret is the
+// PEER's — getting this wrong is silent: a dial sealed under the wrong secret draws no
+// response, indistinguishable from the peer being down.
 const PK = "aa".repeat(32), SEC = "bb".repeat(32);
 
 test("peer specs: the optional contact secret parses on both transports", () => {
