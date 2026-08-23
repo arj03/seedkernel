@@ -17,7 +17,8 @@
 
 import {
   makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until, PROTO,
-  authorBundle,
+  authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
+  transportBlob, transportAuthor, transportPolicy,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -511,6 +512,102 @@ await test("CONTACT SECRET: it is the RECEIVER's, and only the receiver's", asyn
   await settle();
   assert(chans[1].sent.length === 0, `another node's secret drew ${chans[1].sent.length} message(s)`);
   assert(!st2.a.authed && !st2.b.authed, "another node's secret must not authenticate");
+});
+
+/** One transport host whose contact secret is a LIVE getter — the shape a platform with a
+ *  rotating gate has (§12.6.3). Deliberately parallels makeTransportHost (harness) in the
+ *  pieces a test needs: an options object's value would be copied at construction, and the
+ *  point of this host is that the driver RE-READS the secret when it opens a link. */
+async function makeTransportHostWithGetter(getSecret) {
+  const identity = generateKeyPair();
+  const driver = new TransportHost({
+    identity,
+    channels: new LoopbackChannels(),
+    get contactSecret() { return getSecret(); },
+  });
+  const { shell } = await bootShell({
+    sodium, identity, modules: new ModuleTable(), freshnessStore: new FreshnessMarks(),
+    fs: false, transport: driver, transportBundle: transportBlob,
+    createRealm: async (o) => createSafeRealm(o), admit: transportPolicy(transportAuthor()),
+  });
+  await shell.loadBundleBlob(transportBlob);
+  return { shell, driver, identity };
+}
+
+/** One host-managed link opened from both ends, with the dialer's presented secret.
+ *  Takes the NODES (harness shape) so the pair sits symmetric with `linked()`. */
+function openPair(A, B, chans, dialSecret) {
+  const st = { a: { authed: false, closed: false, reason: null }, b: { authed: false, closed: false, reason: null } };
+  A.driver.openLink({
+    channel: chans[0], weDialed: true, expectPeerId: B.driver.peerId,
+    contactSecret: dialSecret, source: chans[0].remoteAddr,
+    onAuth: () => { st.a.authed = true; },
+    onClose: (_id, reason) => { st.a.closed = true; st.a.reason = reason; },
+  });
+  B.driver.openLink({
+    channel: chans[1], weDialed: false, source: chans[1].remoteAddr,
+    onAuth: () => { st.b.authed = true; },
+    onClose: (_id, reason) => { st.b.closed = true; st.b.reason = reason; },
+  });
+  return st;
+}
+
+await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation has no re-install", async (keep) => {
+  // The driver re-reads its contact secret when it opens a link and delivers it per link in
+  // `linkOpen`, so rotating the GETTER rotates the accept gate instantly; the guest's boot-
+  // time init facts are only the fallback. Before this, the gate was the boot-time snapshot
+  // and a rotation cost a transport re-load, killing every live link for a credential
+  // change.
+  const secretB = new Uint8Array(32).fill(11);
+  const secretC = new Uint8Array(32).fill(22);
+  let current = secretB;
+  const A = await makeTransportHost({ channels: new LoopbackChannels(), contactSecret: CONTACT });
+  const B = await makeTransportHostWithGetter(() => current);
+  keep(async () => { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } });
+  // A spy for "the bundle was never re-loaded": the rotation below must not reach it.
+  let loads = 0;
+  const origLoad = B.shell.loadBundleBlob;
+  B.shell.loadBundleBlob = async (blob, opts) => { loads++; return origLoad(blob, opts); };
+
+  // The boot-time secret opens the door.
+  const c1 = wirePair();
+  const s1 = openPair(A, B, c1, secretB);
+  await until(() => s1.a.authed && s1.b.authed, 4000, "boot-time secret");
+
+  // Rotate. The OLD secret is now a wrong secret: the responder says nothing at all.
+  current = secretC;
+  const c2 = wirePair();
+  const s2 = openPair(A, B, c2, secretB);
+  await settle();
+  assert(c2[1].sent.length === 0, `the stale secret drew ${c2[1].sent.length} message(s)`);
+  assert(!s2.a.authed && !s2.b.authed, "the stale secret must not authenticate");
+
+  // The NEW secret opens — and the guest never re-loaded to get it.
+  const c3 = wirePair();
+  const s3 = openPair(A, B, c3, secretC);
+  await until(() => s3.a.authed && s3.b.authed, 4000, "rotated secret");
+  assert(loads === 0, `a secret rotation must not re-load the transport (loaded ${loads} times)`);
+  // The link that authenticated under the old secret is untouched by a rotation.
+  assert(s1.a.authed && s1.b.authed, "a live link must not be torn down by a rotation");
+});
+
+await test("SEVER: driver.reset() kills live links and keeps the binding owned", async (keep) => {
+  // The platform's room/secret switch closes every live socket (a rotation is a rotation:
+  // links authenticated under the old value go). The bundle occupant is NOT replaced —
+  // this is the operation a slot handover arrives at, run directly — so afterwards a new
+  // link opens and authenticates without a re-install, and the driver still answers.
+  const st = keep(await upPair());
+  const chans = st.chans;
+  st.A.driver.reset();
+  await until(() => st.b.closed, 3000, "the far end hears the links die");
+  await settle();
+  assert(chans[0].dead && chans[1].dead, "both sockets must be closed at the driver level");
+  assert(st.A.driver.available(), "the raw-link binding must still be owned after a sever");
+
+  const c2 = wirePair();
+  const s2 = openPair(st.A, st.B, c2, CONTACT);
+  await until(() => s2.a.authed && s2.b.authed, 4000, "re-link after a sever");
+  assert(st.B.driver.available(), "the acceptor's binding must also still be owned");
 });
 
 await test("CONTACT SECRET: it never appears on the wire", async (keep) => {

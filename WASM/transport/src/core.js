@@ -174,7 +174,7 @@ class Core {
         authority,
         weDialed: true,
         expectPeerId: fromHex(peerId),
-        dialSecret: this.addrs.get(peerId),
+        linkSecret: this.addrs.get(peerId),
         limiter: null,
         dialedPeerId: peerId,
       });
@@ -189,7 +189,7 @@ class Core {
       authority: spec.authority,
       weDialed: spec.weDialed,
       expectPeerId: spec.expectPeerId,
-      dialSecret: spec.dialSecret,
+      linkSecret: spec.linkSecret,
       source: spec.source,
       limiter: spec.limiter,
       handshakeTimeoutMs: spec.handshakeTimeoutMs,
@@ -425,7 +425,10 @@ function handle(argBytes) {
 
 /** A link the HOST opened: an accepted socket (kind CORE), or one a host-managed
  *  transport handed over (kind OPEN, either direction). A core link we dialed never
- *  arrives here — `Core.dial` opens those itself through the raw capability. */
+ *  arrives here — `Core.dial` opens those itself through the raw capability. The
+ *  `linkSecret` field is the secret THIS link opens under: the peer's on a dial, the
+ *  host's own current one on an accept — the driver re-reads its options at open time,
+ *  so an accept gates on the secret now and not on the one the guest init saw. */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
   const weDialed = r.u8() === 1;
@@ -435,13 +438,13 @@ entry("linkOpen", (r) => {
   const handshakeTimeoutMs = r.u32();
   const rekeyAfterFrames = r.u32();
   const expectPeerId = r.blob();
-  const dialSecret = r.blob();
+  const linkSecret = r.blob();
   const source = r.blob();
   const spec = {
     linkId, weDialed, framing,
     authority: authority.length > 0 ? utf8Decode(authority) : "",
     expectPeerId: expectPeerId.length > 0 ? expectPeerId.slice() : null,
-    dialSecret: dialSecret.length > 0 ? dialSecret.slice() : null,
+    linkSecret: linkSecret.length > 0 ? linkSecret.slice() : null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
     handshakeTimeoutMs: handshakeTimeoutMs > 0 ? handshakeTimeoutMs : undefined,
     rekeyAfterFrames: rekeyAfterFrames > 0 ? rekeyAfterFrames : undefined,

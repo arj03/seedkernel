@@ -285,9 +285,11 @@ class Link {
     this.onClose = spec.onClose;
     this.handshakeTimeoutMs = spec.handshakeTimeoutMs;
     this.rekeyAfter = spec.rekeyAfterFrames || REKEY_AFTER_FRAMES;
-    // Dialing: the secret gating the far end is THEIRS, carried by the address;
-    // accepting: OURS (§12.6.3).
-    this.contactSecret = spec.dialSecret || contactSecret;
+    // The secret this link opens under: THE PEER's on a dial (carried by the address),
+    // OURS on an accept — the host delivers the current one per link at open, so the gate
+    // changes with the node's secret and not with a re-install (§12.6.3). The init-time
+    // node facts are the fallback; an empty field means open (zero secret).
+    this.contactSecret = spec.linkSecret || contactSecret;
     this.root = hash(DOMAIN_CHANNEL, spec.networkKey || networkKey);
 
     this.peerPubkey = null;

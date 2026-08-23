@@ -186,8 +186,10 @@ export interface OpenLinkOptions {
   /** For an outbound dial, the peerId we expect to reach (hex) — the handshake is
  *  rejected if the far end presents a different key. */
   expectPeerId?: PeerId;
-  /** THE PEER's contact secret for a dial (from the address); absent on accept, where
- *  the guest uses ours. Absent on a dial ⇒ the peer is open (zero secret). */
+  /** THE PEER's contact secret for a dial (from the address); absent on a dial ⇒ the
+   *  peer is open (zero secret). Absent on an accept: the driver seals the accept under
+   *  ITS OWN current contact secret (§12.6.3), read at announce time — so a getter-backed
+   *  value changes the gate with no transport reload — and the init facts are the fallback. */
   contactSecret?: Uint8Array;
   /** Transport-supplied far-end identifier (an IP), for the half-open buckets. */
   source?: string;
@@ -285,7 +287,10 @@ export class TransportHost {
   }
 
   /** Release link state owned by a departing link-capable slot, retaining listeners and
-   *  the address book for a replacement. */
+   *  the address book for a replacement. Also the platform's own "sever": closing every
+   *  live socket without moving the binding — the occupant hears one `linkClosed` per
+   *  link, and the node keeps its listeners and address book (both are the node's, not
+   *  the occupant's). */
   reset(): void {
     const channels = [...this.channels.values()];
     this.channels.clear();
@@ -487,7 +492,7 @@ export class TransportHost {
     linkId: number,
     spec: {
       weDialed: boolean; kind: number; framing: Framing; authority?: string; expectPeerId?: Uint8Array;
-      dialSecret?: Uint8Array; source?: string; handshakeTimeoutMs?: number;
+      linkSecret?: Uint8Array; source?: string; handshakeTimeoutMs?: number;
       rekeyAfterFrames?: number;
     },
   ): void {
@@ -500,7 +505,7 @@ export class TransportHost {
       .u32(spec.handshakeTimeoutMs ?? 0)
       .u32(spec.rekeyAfterFrames ?? 0)
       .blob(spec.expectPeerId ?? EMPTY)
-      .blob(spec.dialSecret ?? EMPTY)
+      .blob(spec.linkSecret ?? EMPTY)
       .blob(enc.encode(spec.source ?? "")));
   }
 
@@ -520,9 +525,11 @@ export class TransportHost {
       framing: opts.channel.framing,
       authority: opts.channel.authority,
       expectPeerId: opts.expectPeerId ? fromHex(opts.expectPeerId) : undefined,
-      // A dial gates on THE PEER's secret (from the address), an open peer on the zero
-      // secret said explicitly; an accept gates on ours (guest init).
-      dialSecret: opts.weDialed ? (opts.contactSecret ?? ZERO32) : undefined,
+      // The secret THIS link opens under: the peer's on a dial (an open peer = the zero
+      // secret said explicitly); OURS on an accept, re-read NOW from the options — a
+      // getter-backed contact secret gates this node's accepting side with no transport
+      // reload (§12.6.3). The guest falls back to its init facts if the field is empty.
+      linkSecret: opts.weDialed ? (opts.contactSecret ?? ZERO32) : (this.opts.contactSecret ?? ZERO32),
       source: opts.source,
       handshakeTimeoutMs: opts.handshakeTimeoutMs,
       rekeyAfterFrames: opts.rekeyAfterFrames,
@@ -575,6 +582,9 @@ export class TransportHost {
         if (linkId === 0) return;
         this.announce(linkId, {
           weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,
+          // An accept gates on OUR current secret, read at accept time, exactly like a
+          // host-managed open — the node facts stay only the fallback, not the truth.
+          linkSecret: this.opts.contactSecret ?? ZERO32,
         });
       },
     );

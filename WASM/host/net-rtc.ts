@@ -176,7 +176,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
         const handle = this.driver.openLink({
             channel: new RtcChannel(dc),
             weDialed,
-            // Dialing gates on THEIR secret; accepting gates on ours (the driver's).
+            // Dialing gates on THEIR secret; accepting gates on OURS — and the driver
+            // seals an accept by itself, reading its contact secret at announce time, so
+            // nothing is supplied here for a link we did not dial.
             contactSecret: weDialed ? this.opts.peerContactFor?.(peerId) : undefined,
             expectPeerId: peerId, // the transport pins the far key to who signaling said it is
             onAuth: () => { e.authed = true; this.peerUp(peerId); },

@@ -857,6 +857,11 @@ export interface BootShellOptions {
      *  lazily and re-loads to change its room secret), so bootShell neither loads nor
      *  starts. `false` or absent ⇒ a shell with no network: no adapter, no pin, no load. */
     transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | TransportHost | false;
+    /** Boot auto-load of the pinned transport bundle, for the OPTIONS case only (an
+     *  instance's load is its owner's). Default true. `false` ⇒ bootShell constructs the
+     *  adapter but leaves the load to the caller — the same lazy-first-connect shape an
+     *  instance gives, with no adapter to construct. */
+    transportLoad?: boolean;
     /** The transport bundle to PIN — and, in the options case, load. Default: the
      *  artifact-shipped one (`transportBundleBytes`). */
     transportBundle?: Uint8Array;
@@ -948,13 +953,14 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // composed predicate, install, and the shell stands the driver up. A predicate that
     // refuses the transport author leaves the node without a network, which is a
     // deliberate configuration rather than an error. Only when bootShell constructed the
-    // adapter: a caller that handed over an instance owns its load (a browser edge loads
-    // lazily, and re-loads to change its room secret).
+    // adapter and the caller did not defer the load: an instance's load is its owner's (a
+    // browser edge loads lazily at first relay connect), and `transportLoad: false` asks
+    // for the same laziness while still letting bootShell own the adapter.
     //
     // A boot that throws returns no handle, so whatever it stood up must not leak: one
     // teardown, the shell's — which closes the adapter it was built with.
     try {
-        if (ownAdapter && transport && transportBlob) {
+        if (ownAdapter && transport && transportBlob && opts.transportLoad !== false) {
             try {
                 await shell.loadBundleBlob(transportBlob);
             }
