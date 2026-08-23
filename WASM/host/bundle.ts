@@ -5,10 +5,9 @@ import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
-    /** Logical name: both the module's file in the container (`<name>.wasm`) and the key
-     *  the guest addresses it by through `host.call`. Unique within a manifest; NAME_RE
-     *  below keeps it from spelling a host method (§12.2), and `validateManifest` refuses
-     *  a `requires` entry that collides with one. */
+    /** Logical name: the file `<name>.wasm` and the key the guest addresses it by through
+     *  `host.call`. Unique within a manifest; `NAME_RE` keeps it from spelling a host method
+     *  (§12.2). */
     name: string;
     /** genesisHash(wasm) hex — content integrity for the module bytes (§12.4). */
     hash: string;
@@ -22,8 +21,8 @@ export interface JsonObject {
 }
 
 /** The crypto a bundle load needs, in libsodium-wrappers method names so a raw libsodium
- *  satisfies it directly. Identical to `ManifestVerifier` today; kept separate because call
- *  sites are written against "what a *load* needs", not "what a *manifest* needs". */
+ *  satisfies it directly. Identical to `ManifestVerifier` today; separated so call sites are
+ *  written against "what a *load* needs", not "what a *manifest* needs". */
 export interface BundleCrypto extends ManifestVerifier {
 }
 
@@ -33,25 +32,22 @@ export interface BundleCrypto extends ManifestVerifier {
 export interface BundleGuest {
     /** genesisHash(utf8(source)) hex of `guest.js`. */
     hash: string;
-    /** Which host seam this guest was written against (`GUEST_ABI_VERSION`, §12.2).
-     *  Required, not optional-with-a-default: the default would have to be the oldest ABI,
-     *  exactly the population a bump exists to catch. */
+    /** Which host seam this guest was written against (`GUEST_ABI_VERSION`, §12.2). Required:
+     *  a default would have to be the oldest ABI, exactly the population a bump exists to
+     *  catch. */
     abi: number;
-    /** Exactly the SERVICES this guest is granted (`HOST_SERVICES`, core/domains.ts) plus
-     *  the local service ids it calls (§12.10) — one flat list, since both are reached by
-     *  the same `host.call` and both are closed at load: a service this host does not grant
-     *  is a refused manifest, not a requirement that quietly grants nothing at first use. A
-     *  method name (`fs/get`) is refused here too — the unit a manifest declares is the
-     *  service, never the finer-grained call. `crypto/*` and the bundle's own module names
-     *  are not declarable, so the list an operator reads is the bundle's whole reach. Empty
-     *  is the common case. */
+    /** Exactly the SERVICES this guest is granted (`HOST_SERVICES`) plus the local service ids
+     *  it calls (§12.10) — one flat list, since both are reached by the same `host.call` and
+     *  both are closed at load: a service this host does not grant is a refused manifest, not
+     *  a requirement that quietly grants nothing at first use. A method name (`fs/get`) is
+     *  refused too — the unit a manifest declares is the service. `crypto/*` and the bundle's
+     *  own module names are not declarable, so the list an operator reads is the whole reach. */
     requires: string[];
     /** The app's signed configuration, injected unchanged into the guest preamble as
-     *  `const APP`. Its schema is the app's alone; the one shape the runtime insists on is
-     *  an object, since a guest reads config by name and a signed scalar would leave every
-     *  `APP.x` undefined at run time instead of failing the load. Absent ≡ `{}`. Nothing
-     *  the runtime already derives belongs here: identity is read through the seam
-     *  (`node/identity`) and the signing namespace is applied host-side (§12.4). */
+     *  `const APP`. Its schema is the app's alone; the one shape the runtime insists on is an
+     *  object — a guest reads config by name, so a signed scalar would leave every `APP.x`
+     *  undefined at run time instead of failing the load. Nothing the runtime derives belongs
+     *  here (§12.4). */
     config?: JsonObject;
 }
 
@@ -61,13 +57,11 @@ export interface BundleManifest {
      *  per-`(author, app)` high-water mark. An integer, not a label. */
     version: number;
     /** Wire protocol id(s) this app serves — the names a PEER may send to this slot
-     *  (§12.10). Optional: an initiator-only bundle claims nothing. A claim is not
-     *  authority. */
+     *  (§12.10). Optional: an initiator-only bundle claims nothing. A claim is not authority. */
     protocols?: string[];
     /** Local service id(s) this app serves — the names a CO-RESIDENT guest may reach with
-     *  `host.call` (§12.10), never a peer. Optional; disjoint from `protocols`, since a
-     *  name in both would be ambiguous about which reach it grants. A claim is not
-     *  authority here either. */
+     *  `host.call` (§12.10), never a peer. Optional; disjoint from `protocols`, since a name
+     *  in both would be ambiguous about which reach it grants. */
     services?: string[];
     modules: BundleModule[];
     /** The guest program — required. Modules are the pure transforms it drives. */
@@ -75,16 +69,15 @@ export interface BundleManifest {
 }
 
 /** The surface *verifying* a manifest needs (a subset of libsodium). Separate from
- *  `ManifestCrypto` so a loader is handed no way to sign — which is also what lets a
- *  verify-only realm (the native loader, §12.9) run the shared loader below. */
+ *  `ManifestCrypto` so a loader is handed no way to sign — which also lets a verify-only
+ *  realm (the native loader, §12.9) run the shared loader below. */
 export interface ManifestVerifier {
     crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
     /** The genesis hash — content integrity, and the author id (`hybridAuthorId`). */
     crypto_generichash(hashLength: number, message: Uint8Array, key: Uint8Array | null): Uint8Array;
-    /** ML-DSA-65 verify (FIPS 204), the PQ half of the manifest suite (§14.1). Required:
-     *  the suite is hybrid, so a host without it cannot check any manifest at all.
-     *  `verifyManifest` re-checks at runtime for the untyped caller with a partial
-     *  libsodium, and refuses rather than falling back to the Ed25519 half alone. */
+    /** ML-DSA-65 verify (FIPS 204), the PQ half of the manifest suite (§14.1). The suite is
+     *  hybrid, so a host without it cannot check any manifest at all — `verifyManifest` refuses
+     *  rather than falling back to the Ed25519 half alone. */
     ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
 }
 
@@ -116,9 +109,9 @@ export interface ManifestAuthorKeys {
 }
 
 /** What a verified envelope yields. `author` is the 32-byte derived key-set id
- *  (`hybridAuthorId`), the one kind of identity everything downstream reads; `authorKeys`
- *  is for the caller that cares *which keys* signed — a shell showing an operator what it
- *  is being asked to admit. */
+ *  (`hybridAuthorId`), the one identity everything downstream reads; `authorKeys` is for
+ *  the caller that cares *which keys* signed — a shell showing an operator what it is being
+ *  asked to admit. */
 export interface VerifiedManifest {
     author: Uint8Array;
     authorKeys: ManifestAuthorKeys;
@@ -135,14 +128,13 @@ export interface FreshnessStore {
     set(author: Uint8Array, app: string, version: number): void;
     /** Has this author key been written off (§12.5)? Checked on every load. */
     isRevoked(author: Uint8Array): boolean;
-    /** Write off an author key permanently. Monotonic like the marks: nothing in the
-     *  runtime removes a key from this set, so an author re-added to the policy allowlist
-     *  stays refused. Undoing it is an out-of-band edit of the store file. */
+    /** Write off an author key permanently. Monotonic like the marks: nothing in the runtime
+     *  removes a key from this set, so an author re-added to the policy allowlist stays
+     *  refused. */
     revoke(author: Uint8Array): void;
     /** Roll a mark back to a captured previous value — the one legal rewind, for the load
      *  that raised the mark and then failed to persist it, so in-memory state matches the
-     *  store the retry will persist against. `previous` is what `get` returned before the
-     *  load (−Infinity when unmarked). */
+     *  store the retry will persist against. */
     resetMark(author: Uint8Array, app: string, previous: number): void;
 }
 
@@ -218,19 +210,17 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
  *  services it names (`HOST_SERVICES`), read off the table and never off a prefix parsed
  *  out of a name. Empty ⇒ an ordinary app; local service ids contribute none.
  *
- *  Not folded into `verifyManifest`: a manifest naming `link` is well-formed, and
- *  whether this node grants it is policy, decided where the policy is in hand (shell-core). */
+ *  Not folded into `verifyManifest`: a manifest naming `link` is well-formed, and whether
+ *  this node grants it is policy, decided where the policy is in hand (shell-core). */
 export function privilegesOf(manifest: BundleManifest): Privilege[] {
     const reached = manifest.guest.requires.filter(isService).map((s) => HOST_SERVICES[s].privilege);
     return PRIVILEGES.filter((p) => reached.includes(p));
 }
 /** The fs keyspace prefix for one app (§12.2). A hash of the app key rather than the key
  *  itself, because it must double as a *filename* component: both fs backends restrict keys
- *  to `[A-Za-z0-9._-]`, which the colons fail and an author-chosen `app` cannot be trusted
- *  to satisfy. Fixed-length hex also means no prefix can extend another.
- *
- *  128 bits: this separates namespaces, it does not authenticate them — reaching another
- *  app's data still requires forging its author key, which is what holds the boundary. */
+ *  to `[A-Za-z0-9._-]`, which an author-chosen `app` cannot be trusted to satisfy. 128 bits
+ *  fixed-length hex also means no prefix can extend another — this separates namespaces, it
+ *  does not authenticate them. */
 export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: string): string {
     const key = enc.encode(appKeyFor(author, app));
     return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
@@ -255,17 +245,15 @@ const OFF_JSON = OFF_ML_SIG + ML_DSA_SIG_LEN;
 /** Module names double as filenames and as the guest's module keys, so they are held to an
  *  unambiguous charset — and, since one `host.call` name is either a host method or a bare
  *  name, to a first character that cannot start one: a `/` would spell a host method. A
- *  module name colliding with a declared local service id is a different question, checked
- *  by content at `validateManifest` — the dispatch resolves a declared local service before
- *  this bundle's modules, so a collision would silently shadow the module. */
+ *  collision with a declared local service id is checked by the call site (`validateManifest`),
+ *  since the dispatch resolves a local service before this bundle's modules. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 /** The claim charset (§12.10): shared by `protocols`, `services`, and a local service id in
- *  `requires` — one shape for every name a manifest signs outside its module table.
- *  Alphanumeric-or-`_` first, then alphanumerics and `._/-`, at most 64 bytes. A leading `_`
- *  is admitted like any other character: it is a spelling convention this repo's own bundles
- *  use for a local-only name (`_net`), never a kernel-known reservation. These travel on the
- *  wire (`protocols`) or name a local call graph edge (`services`, `requires`), so the
- *  whitespace, control and lookalike characters an operator could not tell apart are out. */
+ *  `requires` — one shape for every name a manifest signs outside its module table. A leading
+ *  `_` is admitted like any other character: it is a spelling convention this repo's own
+ *  bundles use for a local-only name (`_net`), never a kernel-known reservation. These travel
+ *  on the wire (`protocols`) or name a local call graph edge, so the whitespace, control and
+ *  lookalike characters an operator could not tell apart are out. */
 const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 /** Canonical manifest bytes. The signed envelope carries these verbatim and the verifier
  *  parses the exact bytes it checked, so there is no separate canonicalisation step — the
@@ -273,13 +261,13 @@ const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 export function encodeManifest(m: BundleManifest): Uint8Array {
     return enc.encode(JSON.stringify(m));
 }
-/** Signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. Both keys
- *  sign, and each commits to the other, so the pair cannot be taken apart. */
+/** Signed preimage: `DOMAIN_manifest ‖ suite ‖ edPk ‖ mlDsaPk ‖ json`. Both keys sign, and
+ *  each commits to the other, so the pair cannot be taken apart. */
 function manifestPreimage(edPk: Uint8Array, mlDsaPk: Uint8Array, json: Uint8Array): Uint8Array {
     return concatBytes([DOMAIN_MANIFEST, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk, json]);
 }
-/** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`.
- *  The whole key set, so the id is unreachable without both private keys. */
+/** Author id: `genesisHash(DOMAIN_manifest_author ‖ suite ‖ edPk ‖ mlDsaPk)`. The whole key
+ *  set, so the id is unreachable without both private keys. */
 export function hybridAuthorId(sodium: ManifestVerifier, edPk: Uint8Array, mlDsaPk: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, concatBytes([DOMAIN_MANIFEST_AUTHOR, Uint8Array.of(SUITE_MANIFEST_HYBRID_PQ), edPk, mlDsaPk]), null);
 }
@@ -342,8 +330,7 @@ function isJsonValueAt(value: unknown, ancestors: Set<object>): value is JsonVal
 
 /** True for exactly the values the signed manifest JSON can carry. Cycles, exotic prototypes
  *  and non-finite numbers are refused rather than silently changed by `JSON.stringify`. The
- *  prototype test is *this* realm's, so a value parsed in another realm is refused too — an
- *  embedder holding one re-parses it here. */
+ *  prototype test is *this* realm's, so a value parsed in another realm is refused too. */
 export function isJsonValue(value: unknown): value is JsonValue {
     try {
         return isJsonValueAt(value, new Set());
@@ -359,29 +346,27 @@ export function isJsonObject(value: unknown): value is JsonObject {
     return isJsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Structural check on a parsed manifest, run only *after* the signature verified — so not a
+/** Structural check on a parsed manifest, run only *after* the signature verified — not a
  *  security boundary: it turns a manifest the author signed but got wrong into a loud
- *  rejection instead of a TypeError deep in the loader. Shape only; whether this host
- *  *implements* the declared `abi`, or serves a required name, is `validateManifest`'s. */
+ *  rejection instead of a TypeError deep in the loader. Whether this host implements the
+ *  declared `abi`, or serves a required name, is `validateManifest`'s. */
 function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof m !== "object" || m === null || Array.isArray(m))
         return false;
     const o = m as Record<string, unknown>;
     // appSignScope encodes the app name in one length byte, so a name over 255 UTF-8 bytes
-    // would verify and install but throw on the guest's first call — refused here, where
-    // the error names the rule.
+    // would verify and install but throw on the guest's first call.
     if (typeof o.app !== "string" || o.app.length === 0)
         return false;
     if (enc.encode(o.app).length > 255)
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
         return false;
-    // The claimed names (§12.10): `protocols` is what a PEER may reach, `services` is what
-    // a CO-RESIDENT guest may reach with `host.call`. Checked like the module names below
-    // and for the same reason — they are keys, so a duplicate is ambiguous rather than
-    // merely redundant — and checked across BOTH lists into one set, so a name in both is
-    // refused too: it would be ambiguous which reach it grants. Absent is legal on either
-    // (an initiator-only app claims nothing, publicly or locally), as is `[]`.
+    // The claimed names (§12.10): `protocols` is what a PEER may reach, `services` what a
+    // CO-RESIDENT guest may reach with `host.call`. Checked like the module names and for the
+    // same reason — they are keys, so a duplicate is ambiguous rather than redundant — and
+    // across BOTH lists into one set, so a name in both is refused too. Absent is legal on
+    // either, as is `[]`.
     const claimed = new Set<string>();
     for (const list of [o.protocols, o.services]) {
         if (list === undefined)
@@ -433,28 +418,28 @@ function isValidManifest(m: unknown): m is BundleManifest {
 /** The checks `verifyManifest` runs after a signature verifies and `authorBundle` runs
  *  *before* signing — one copy, so what a verifier refuses is exactly what an author refuses
  *  to sign. Shape and vocabulary only; whether *this* node grants a well-formed authority
- *  name is policy (§12.5), which lives in the shell. */
+ *  name is policy (§12.5). */
 function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
     if (!isValidManifest(manifest))
         throw new Error("bundle: malformed manifest");
-    // Guest ABI support (§12.2) — the same kind of check as the suite, refused the same way,
-    // at the one place a manifest becomes a value the rest of the runtime trusts.
+    // Guest ABI support (§12.2) — refused the same way as a bad suite, at the one place a
+    // manifest becomes a value the rest of the runtime trusts.
     if (manifest.guest.abi !== GUEST_ABI_VERSION) {
         throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${GUEST_ABI_VERSION})`);
     }
-    // The declared requires. The vocabulary (§12.2) is closed and is the SERVICES alone,
-    // plus this bundle's own local service ids: an unknown service — `crypto/*` and a
-    // finer-grained method name (`fs/get`) included — is a refused manifest, not a grant
-    // that quietly reaches nothing at first use. Well-formedness only: `link` is in the
-    // vocabulary, and whether this node grants it is the shell's call (§12.5).
+    // The declared requires. The vocabulary (§12.2) is closed and is the SERVICES alone, plus
+    // this bundle's own local service ids: an unknown service — `crypto/*` and a finer-grained
+    // method name (`fs/get`) included — is a refused manifest, not a grant that quietly
+    // reaches nothing at first use. Well-formedness only: `link` is in the vocabulary, and
+    // whether this node grants it is the shell's call (§12.5).
     const moduleNames = new Set(manifest.modules.map((m) => m.name));
     for (const r of manifest.guest.requires) {
         if (isService(r))
             continue;
         // A name whose head, up to the first "/", is a known SERVICE is a method name a
         // manifest can no longer declare at that granularity — refused explicitly, with the
-        // fix, rather than read as an (unreachable) local service id that happens to share
-        // a host service's spelling.
+        // fix, rather than read as an (unreachable) local service id that happens to share a
+        // host service's spelling.
         const slash = r.indexOf("/");
         const head = slash < 0 ? r : r.slice(0, slash);
         if (slash >= 0 && isService(head)) {
@@ -463,8 +448,8 @@ function validateManifest(manifest: unknown): asserts manifest is BundleManifest
         // Otherwise a LOCAL service id: another realm, reached over the same call
         // (core/domains.ts). Only its shape and its non-collision with this bundle's own
         // modules can be wrong — whether anything claims it is answered at the call
-        // (guest-seam.ts), since an app may legitimately be installed before the local
-        // service that answers it.
+        // (guest-seam.ts), since an app may be installed before the local service that
+        // answers it.
         if (!CLAIM_RE.test(r)) {
             throw new Error(`bundle: "${r}" is not a well-formed local service id (manifest guest.requires; alphanumeric-or-"_" first, then alphanumerics and ._/-, at most 64 bytes)`);
         }
@@ -484,16 +469,16 @@ export function verifyManifest(sodium: ManifestVerifier, env: Uint8Array): Verif
     // Suite before offsets: another suite's keys and signatures are other widths, so parsing
     // first would read its bytes at this suite's positions. A legibility failure ("this
     // bundle wants a host I am not"), not an authenticity verdict, so it throws rather than
-    // sending the operator after a bad signature. The suite byte is attacker-chosen and
-    // public, so the distinction reveals nothing. The retired Ed25519-only suite is refused
-    // here as a suite this host lacks (§14.1).
+    // sending the operator after a bad signature. The suite byte is public, so the
+    // distinction reveals nothing. The retired Ed25519-only suite is refused here as a suite
+    // this host lacks (§14.1).
     const suite = env[0];
     if (suite !== SUITE_MANIFEST_HYBRID_PQ) {
         throw new Error(`bundle: unsupported manifest suite 0x${suite.toString(16).padStart(2, "0")}`);
     }
-    // A host with no PQ verifier cannot form an opinion, so it says so. What it must not do
-    // is read "I cannot check the PQ half" as "the PQ half is fine" and fall back to the
-    // Ed25519 signature alone — the downgrade the suite exists to prevent (§14.1).
+    // A host with no PQ verifier cannot form an opinion, so it says so — it must not read
+    // "I cannot check the PQ half" as "the PQ half is fine" and fall back to the Ed25519
+    // signature alone, the downgrade the suite exists to prevent (§14.1).
     if (!sodium.ml_dsa65_verify_detached) {
         throw new Error("bundle: unsupported manifest suite 0x02 — this host has no ML-DSA-65 verifier");
     }
@@ -594,7 +579,7 @@ export function unpackBundle(blob: Uint8Array): Record<string, Uint8Array> {
  *  inside it — an `fs`-capable guest writes files inside the dir, so a mark kept there would
  *  be a downgrade guard the guarded party can edit. Shared rather than restated per target,
  *  because two hosts computing it differently would put a node's marks where its next boot
- *  does not look, which reads as "no marks": every guard silently dropped. */
+ *  does not look. */
 export function freshnessPathFor(dir: string): string {
     return dir.replace(/[/\\]+$/, "") + ".freshness.json";
 }
@@ -606,10 +591,9 @@ export class FreshnessMarks {
     marks = new Map();
     /** Author keys written off (§12.5), as lowercase hex. */
     revoked = new Set();
-    /** Seed from `{ marks, revoked }`. Absent input = first boot: start empty,
-     *  which is "unrevoked" — so a target's `persist` must be atomic. Bare
-     *  pre-revocation maps throw rather than reading as empty (would discard
-     *  every downgrade guard); unknown keys are ignored. */
+    /** Seed from `{ marks, revoked }`. Absent input = first boot: start empty, which is
+     *  "unrevoked" — so a target's `persist` must be atomic. Bare pre-revocation maps throw
+     *  rather than reading as empty (would discard every downgrade guard). */
     constructor(json?: string | null) {
         if (json) {
             let raw;
@@ -627,9 +611,8 @@ export class FreshnessMarks {
                         "or delete it to start from no marks.");
                 }
                 // The legacy guard above catches only the old shape; a new-shaped store with
-                // wrong-typed fields (`{"marks":"garbage"}`) would read as "no marks,
-                // nothing revoked" just as silently. Guard data that exists but cannot be
-                // read is a corrupt store, not an empty one.
+                // wrong-typed fields would read as "no marks, nothing revoked" just as
+                // silently. Guard data that exists but cannot be read is a corrupt store.
                 const marks = raw.marks;
                 if (marks !== undefined) {
                     if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
@@ -637,8 +620,7 @@ export class FreshnessMarks {
                     }
                     for (const [k, v] of Object.entries(marks)) {
                         // Versions are manifest-verified integers; anything else silently
-                        // changes what a downgrade check means (a float 2.5 re-prices every
-                        // version below it).
+                        // changes what a downgrade check means.
                         if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
                             throw new Error(`freshness store: corrupt file — mark "${k}" is not a non-negative integer version (got ${JSON.stringify(v)})`);
                         }
@@ -698,9 +680,9 @@ export class FreshnessMarks {
             return;
         this.revoked.add(hex);
         // Same rule as a mark that could not be persisted: in-memory state mirrors the store.
-        // Keeping the key revoked in memory looks safer, but it makes the retry a silent
-        // no-op (the early return above) while nothing ever reaches disk, and the next boot
-        // admits the author anyway. Rolling back keeps `revoke` retryable.
+        // Keeping the key revoked in memory would make the retry a silent no-op (the early
+        // return above) while nothing reaches disk, and the next boot admits the author
+        // anyway. Rolling back keeps `revoke` retryable.
         try {
             this.persist(this.serialize());
         }
@@ -736,9 +718,8 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
         modules: v.manifest.modules.map((mod) => ({ mod, wasm: read(moduleFile(mod.name)) })),
         guestSource: dec.decode(read(GUEST_FILE)),
     };
-    // Inside verifyBundle rather than a separate step: the manifest hashes are the definitive
-    // declaration of what the author authorized, so a verified signature over unchecked
-    // hashes is not yet a verified bundle.
+    // The manifest hashes are the definitive declaration of what the author authorized, so a
+    // verified signature over unchecked hashes is not yet a verified bundle.
     for (const { mod, wasm } of result.modules) {
         if (!contentMatches(wasm, mod.hash, (b) => genesisHash(sodium, b))) {
             throw new Error(`bundle: ${mod.name} content hash mismatch`);
@@ -750,9 +731,9 @@ export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBu
     return result;
 }
 /** The raw materials for a new signed bundle — everything `authorBundle` hashes, assembles
- *  into a manifest, validates, signs and packs. `verifyBundle`'s mirror image.
- *  `modules[].hash` and `guest.hash` are *derived* here, never supplied, so there is no way
- *  to construct a bundle whose manifest and content disagree (§12.4). */
+ *  into a manifest, validates, signs and packs. `modules[].hash` and `guest.hash` are
+ *  *derived* here, never supplied, so there is no way to construct a bundle whose manifest
+ *  and content disagree (§12.4). */
 export interface UnsignedBundle {
     app: string;
     /** Monotonic per-(author, app) freshness mark (§12.4) — the caller's to bump. */
@@ -760,17 +741,15 @@ export interface UnsignedBundle {
     protocols?: string[];
     services?: string[];
     modules: { name: string; wasm: Uint8Array }[];
-    /** The guest program's source *text*: the manifest commits to its UTF-8 encoding (see
-     *  `authorBundle`), so a string is the only shape that can be authored and also verify —
-     *  arbitrary bytes with no valid UTF-8 round-trip would be a bundle that cannot come
-     *  back. */
+    /** The guest program's source *text*. The manifest commits to its UTF-8 encoding (see
+     *  `authorBundle`), so a string is the only shape that can be authored and also verify. */
     guestSource: string;
     guestRequires: string[];
     guestConfig?: JsonObject;
 }
 /** What `authorBundle` returns: the packed signed blob, the manifest it signed, and the
  *  author id it is signed under — so a caller that logs or records what it just published
- *  reads it off the value rather than re-parsing the blob or recomputing the id. */
+ *  reads it off the value rather than re-parsing the blob. */
 export interface AuthoredBundle {
     blob: Uint8Array;
     manifest: BundleManifest;
@@ -786,8 +765,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     const modules: BundleModule[] = input.modules.map(({ name, wasm }) => ({
         name, hash: toHex(genesisHash(sodium, wasm)),
     }));
-    // The guest lives in the blob as its UTF-8 encoding; the manifest hashes those exact
-    // bytes, and `verifyBundle` decodes them back to this text before re-checking.
+    // The guest lives in the blob as its UTF-8 encoding; the manifest hashes those bytes.
     const guestBytes = enc.encode(input.guestSource);
     const guest: BundleGuest = {
         hash: toHex(genesisHash(sodium, guestBytes)),
@@ -821,7 +799,7 @@ export async function loadBundleModules(host: PureModuleLoader, v: VerifiedBundl
     //
     // The number is the tighter of what a bundle may land and what this loader holds its own
     // isolates to (`PureModuleLoader.maxModuleMemoryBytes`), composed here because this is
-    // the only call site: no second place for the rule to be got wrong, no module walked twice.
+    // the only call site: no second place for the rule to be got wrong.
     const maxBytes = Math.min(DEFAULT_MAX_MODULE_MEMORY_BYTES, host.maxModuleMemoryBytes ?? Infinity);
     for (const { wasm } of v.modules) {
         checkModuleMemory(wasm, maxBytes);

@@ -22,7 +22,7 @@ const sodium = sodiumDefault as unknown as typeof import("libsodium-wrappers-sum
 // and the Go loader embeds, so the three targets share one verifier and cannot drift on
 // which manifests they admit (§12.4, §14.1). Both are mixed in at the one crypto seam: a
 // catalog name advertised at load and unserveable at call time would pass the manifest
-// check and fail the guest mid-run.
+// check and fail the guest mid-run — the whole surface is readied together.
 const MLDSA_WASM = new URL("../../browser/mldsa65.wasm", import.meta.url);
 const MLKEM_WASM = new URL("../../browser/mlkem768.wasm", import.meta.url);
 let pqReady: Promise<void> | null = null;
@@ -37,8 +37,7 @@ function ensurePq(): Promise<void> {
 }
 
 // Every half of the crypto surface, always together: a caller that awaited only libsodium
-// would get a host that silently refuses manifest suite 0x02 as unsupported — a readiness
-// bug wearing the costume of a policy decision.
+// would get a host that silently refuses manifest suite 0x02 as unsupported.
 export async function ensureCrypto(): Promise<void> {
   await Promise.all([sodium.ready, ensurePq()]);
 }

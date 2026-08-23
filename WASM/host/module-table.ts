@@ -36,14 +36,12 @@ interface WasmModuleRef {
   wasm: Uint8Array;
   /** The live worker, or null while a killed module respawns. */
   worker: ModuleWorker | null;
-  /** The respawn in progress, shared so concurrent callers wait on one. EVERY respawn is
-   *  recorded here, including the one a deadline kill starts: a load does not adopt its
-   *  worker until it has spawned, so a second load started in that window would stand up
-   *  an orphan isolate — still spinning, which is what the bound exists to stop. */
+  /** The respawn in progress, shared so concurrent callers wait on one. Every respawn is
+   *  recorded here, including the one a deadline kill starts — a second load started in
+   *  that window would stand up an orphan isolate, still spinning. */
   spawning: Promise<void> | null;
   /** Set once the ref leaves the table (`teardown`). A load in flight then must kill what
-   *  it spawned rather than adopt it onto a ref nothing holds — the worker would be
-   *  unreachable and unkillable. */
+   *  it spawned rather than adopt it onto a ref nothing holds. */
   dead: boolean;
   /** One in-flight call per module (§3's "one transform at a time"): calls chain on this,
    *  so a spinning module burns at most one core for at most one bound. */
@@ -68,25 +66,22 @@ interface ModuleWorker {
   onError(cb: (err: unknown) => void): void;
   post(msg: object, transfer?: ArrayBuffer[]): void;
   /** Hold the host's event loop open, or stop holding it. An idle worker must never keep a
-   *  process alive (a Node CLI that installed a bundle would never exit), but one with a
-   *  call in flight must: an unbounded call arms no timer, so the process would exit
-   *  mid-transform with its caller's promise unsettled. Node's ref/unref; a no-op in the
-   *  browser. */
+   *  process alive, but one with a call in flight must: an unbounded call arms no timer,
+   *  so the process would exit mid-transform with its caller's promise unsettled. */
   keepAlive(on: boolean): void;
   kill(): void;
 }
 
-/** The worker script, one copy per module. It is the module's whole world: instantiate
- *  on `load`, run `handle` on `call`, post the response back. The §4 ABI validation runs
- *  HERE, in the isolate that holds the instance — a module that fails it reports
- *  `loadError` and the bind refuses the whole app (§3.1). */
+/** The worker script, one copy per module. It is the module's whole world: instantiate on
+ *  `load`, run `handle` on `call`, post the response back. The §4 ABI validation runs HERE,
+ *  in the isolate that holds the instance — a module that fails it reports `loadError` and
+ *  the bind refuses the whole app (§3.1). */
 const moduleWorkerSrc = (): string => `"use strict";
-// The §4 ABI instance, one per worker: this is where the module's statics live, which
-// is what a kill-and-respawn resets (§4.3).
+// The §4 ABI instance, one per worker: where the module's statics live, which is what a
+// kill-and-respawn resets (§4.3).
 let memory = null, scratch = 0, scratchSize = ${DEFAULT_SCRATCH_SIZE}, handle = null;
-// Node's eval:true workers expose no Web globals — the port is parentPort, reached
-// through require. A browser worker is a normal dedicated worker, where self is the
-// port. One line, both platforms.
+// Node's eval:true workers expose no Web globals — the port is parentPort, reached through
+// require. A browser worker is a normal dedicated worker, where self is the port.
 const port = (typeof require === "function" ? require("node:worker_threads").parentPort : null) ?? self;
 const fail = (message) => port.postMessage({ type: "loadError", message: String(message) });
 port.onmessage = (e) => {
@@ -95,10 +90,9 @@ port.onmessage = (e) => {
     let instance;
     try {
       const mod = new WebAssembly.Module(m.wasm);
-      // The three AssemblyScript runtime shims and nothing else — the same set every
-      // other target resolves (native/main.go), so "does this module load" never depends
-      // on which target it landed on. All three are inert: \`seed\` is a constant, because
-      // a pure transform reaches no clock (§4.2), and \`trace\` drops its arguments.
+      // The three AssemblyScript runtime shims and nothing else — the same set every other
+      // target resolves, so "does this module load" never depends on which target it landed
+      // on. \`seed\` is a constant (a pure transform reaches no clock, §4.2), \`trace\` drops.
       instance = new WebAssembly.Instance(mod, {
         env: {
           abort: (_m, _f, l, c) => { throw new Error("dynamic module abort at " + l + ":" + c); },
@@ -128,12 +122,10 @@ port.onmessage = (e) => {
     return;
   }
   if (m.type === "call") {
-    // A trap, an oversized result, a negative length — all the same empty answer, the
-    // shape a caller downstream already reads for a failed transform. ms is this
-    // worker's own time inside handle — the module's actual compute, excluding however
-    // long this call sat queued behind earlier ones on the same worker. That is what
-    // the caller's execution budget is billed (§12.3), so a burst of fire-and-forget
-    // module calls costs their real work, not their wait.
+    // A trap, an oversized result, a negative length — all the same empty answer, the shape
+    // a caller downstream already reads for a failed transform. ms is this worker's own
+    // time inside handle — the module's actual compute, excluding queue wait — which is what
+    // the caller's execution budget is billed (§12.3).
     let bytes = null;
     const t0 = performance.now();
     try {
@@ -179,8 +171,8 @@ async function spawnWorker(src: string): Promise<ModuleWorker> {
   if (typeof browserCtor === "function") {
     const url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
     const w = new browserCtor(url);
-    // The worker has its script, and the URL is a document-lifetime blob-registry entry
-    // nothing else revokes — a leak that would grow one entry per deadline kill.
+    // The URL is a document-lifetime blob-registry entry nothing else revokes — a leak that
+    // would grow one entry per deadline kill.
     URL.revokeObjectURL(url);
     return {
       onMessage: (cb) => { w.onmessage = (e) => cb(e.data as WorkerMsg); },
@@ -256,10 +248,9 @@ export class ModuleTable implements PureModuleLoader {
   }
 
   /** Stand up a module's worker. The §4.3 memory ceiling was applied before this by the
-   *  load path, off the bytes and before any worker exists, because instantiation is what
-   *  allocates the declared initial memory (bundle.ts `loadBundleModules`, over the
-   *  `maxModuleMemoryBytes` this table declares); the §4 export checks run in the worker on
-   *  the same load and report `loadError`. */
+   *  load path, off the bytes and before any worker exists (instantiation allocates the
+   *  declared initial memory); the §4 export checks run in the worker on the same load and
+   *  report `loadError`. */
   private async spawn(wasmBytes: Uint8Array): Promise<WasmModuleRef> {
     if (wasmBytes.length === 0) throw new Error("table: empty wasm bytes");
     const ref: WasmModuleRef = {
@@ -280,9 +271,8 @@ export class ModuleTable implements PureModuleLoader {
    *  install. */
   private async load(ref: WasmModuleRef): Promise<void> {
     const worker = await spawnWorker(moduleWorkerSrc());
-    // The ref may have left its set while this was spawning (a disposed slot, a refused
-    // bundle). Adopting the worker now would leave it unreachable,
-    // unkillable, and still running whatever it was given.
+    // The ref may have left its set while this was spawning. Adopting the worker now would
+    // leave it unreachable, unkillable, and still running whatever it was given.
     if (ref.dead) { worker.kill(); throw new Error("table: module was released while it loaded"); }
     ref.worker = worker;
     // A load holds the loop open for the same reason a call does: an unbounded table arms
@@ -342,8 +332,7 @@ export class ModuleTable implements PureModuleLoader {
     // After the load settles, an engine crash — not a wasm trap, which the worker catches
     // and reports as a null result — fails the in-flight call with the same empty answer
     // and leaves the module to respawn.
-    worker.onError(() => {
-      if (ref.worker !== worker) return;
+    worker.onError(() => {      if (ref.worker !== worker) return;
       for (const settle of ref.pending.values()) settle({ bytes: null, ms: 0 });
       ref.pending.clear();
       ref.worker = null;
@@ -355,11 +344,9 @@ export class ModuleTable implements PureModuleLoader {
   /** Invoke one module in this private set, returning its response bytes or null. The
    *  scratch-region contract (§4) writes input at scratch, calls handle, and reads the
    *  response back. The set itself is the scope, so no app key participates in lookup.
-   *
-   *  Async (a call crosses an isolate) and BOUNDED: `deadlineMs` is the call's whole
-   *  budget, and exceeding it answers empty with the worker killed and respawned, so a
-   *  module that never returns fails like a trap instead of holding the node's thread. A
-   *  guest's call carries its own remaining segment (§4.3). */
+   *  BOUNDED: `deadlineMs` is the call's whole budget, and exceeding it answers empty with
+   *  the worker killed and respawned — a module that never returns fails like a trap instead
+   *  of holding the node's thread. A guest's call carries its own remaining segment (§4.3). */
   private async callModule(modules: Map<string, WasmModuleRef>, module: string, payload: Uint8Array, deadlineMs?: number): Promise<ModuleResult> {
     const w = modules.get(module);
     if (!w) return { bytes: null, ms: 0 };
@@ -372,9 +359,9 @@ export class ModuleTable implements PureModuleLoader {
     return started;
   }
 
-  /** Run one call on a module's worker, under `bound`. Never rejects: every failure —
-   *  a dead worker, a respawn that could not stand up, a worker killed at the deadline
-   *  — is the same empty answer a trap produces today, so nothing downstream changes. */
+  /** Run one call on a module's worker, under `bound`. Never rejects: every failure — a
+   *  dead worker, a respawn that could not stand up, a worker killed at the deadline — is
+   *  the same empty answer a trap produces, so nothing downstream changes. */
   private async call(w: WasmModuleRef, payload: Uint8Array, bound: number): Promise<ModuleResult> {
     // The previous call may have killed the worker; run on the fresh instance the kill
     // asked for, whose statics are gone — which is the point.
@@ -395,11 +382,10 @@ export class ModuleTable implements PureModuleLoader {
       });
       if (Number.isFinite(bound)) {
         timer = setTimeout(() => {
-          // The module did not return within its bound. Kill the isolate — the engine's
-          // one interrupt, which works even mid-loop — answer empty, and respawn. It
-          // burned the full bound before the kill, so THAT is what the caller's segment
-          // is billed (the worker never got to report its own time): a guest looping on
-          // a wedged module must exhaust its budget rather than spin forever free.
+          // The module did not return within its bound. Kill the isolate — the engine's one
+          // interrupt, which works even mid-loop — answer empty, and respawn. It burned the
+          // full bound, so THAT is what the caller's segment is billed: a guest looping on a
+          // wedged module must exhaust its budget rather than spin forever free.
           w.pending.delete(id);
           resolve({ bytes: null, ms: bound });
           if (w.worker === worker) {
@@ -423,8 +409,8 @@ export class ModuleTable implements PureModuleLoader {
   private respawn(w: WasmModuleRef): Promise<void> {
     if (w.spawning === null) {
       // A load that failed leaves no usable worker behind (every failure path inside it
-      // kills what it spawned), so the ref goes back to "no worker" and the next call
-      // asks again.
+      // kills what it spawned), so the ref goes back to "no worker" and the next call asks
+      // again.
       const done: Promise<void> = this.load(w)
         .catch(() => { w.worker = null; })
         .then(() => { if (w.spawning === done) w.spawning = null; });
@@ -433,8 +419,8 @@ export class ModuleTable implements PureModuleLoader {
     return w.spawning;
   }
 
-  /** Kill a module's worker and settle everything waiting on it as empty — the module
-   *  is gone, and no caller may hang on a promise nothing can settle. */
+  /** Kill a module's worker and settle everything waiting on it as empty — the module is
+   *  gone, and no caller may hang on a promise nothing can settle. */
   private teardown(ref: WasmModuleRef): void {
     // Marked first: a respawn may be mid-flight, and the load that finishes after this
     // returns has to kill what it spawned rather than adopt it onto a departed ref.

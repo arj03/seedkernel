@@ -23,9 +23,8 @@
 //   OP_BASE64     (4) args [bytes]       → base64(bytes)
 
 // The ABI ops, handshake GUID and scratch caps live beside this module in
-// assembly/ws/abi.ts. SCRATCH_SIZE fits the largest transport message (MAX_FRAME_BYTES,
-// net-limits.ts) in one WS frame plus header and mask overhead — the two codecs must cap
-// identically, or a message that crosses a length-framed link tears down a WS one.
+// assembly/ws/abi.ts (sized to MAX_FRAME_BYTES from net-limits.ts plus header/mask
+// overhead — the two codecs must cap identically).
 import { OP_ENCODE, OP_DECODE_ONE, OP_ACCEPT, OP_BASE64, WS_GUID, SCRATCH_SIZE, MAX_FRAME_PAYLOAD } from "./abi";
 
 const PRIV_SIZE: i32 = 1 << 16;                // handshake scratch (sha1 + base64)
@@ -38,9 +37,9 @@ const PRIV_DIGEST_OFF: i32 = 4096;  // 20-byte sha1
 const PRIV_WORK_OFF: i32 = 8192;    // sha1 padded message + W[80]
 
 export let scratch: i32 = 0;
-/** How much I/O space the host may stage at `scratch` (§4.1). Declared because one WS
- *  frame here may be a whole MAX_FRAME_BYTES message, which the host's 128 KB default
- *  would refuse to stage — as the transport's first bulk response would discover. */
+/** How much I/O space the host may stage at `scratch` (§4.1). One WS frame here may be
+ *  a whole MAX_FRAME_BYTES message, which the host's 128 KB default would refuse to
+ *  stage — as the transport's first bulk response would discover. */
 export const scratchSize: i32 = SCRATCH_SIZE;
 let priv: i32 = 0;
 scratch = heap.alloc(SCRATCH_SIZE) as i32;
@@ -128,7 +127,7 @@ function opEncode(input_len: i32): i32 {
   const maskFlag = (load<u8>(scratch + 2) as i32) != 0;
   const inMaskLen = maskFlag ? 4 : 0;
   if (input_len < 3 + inMaskLen) return 0;
-  // Read the mask into locals before any move overwrites it.
+  // Read the mask into locals before the move overwrites it.
   let m0: i32 = 0, m1: i32 = 0, m2: i32 = 0, m3: i32 = 0;
   if (maskFlag) {
     m0 = load<u8>(scratch + 3) as i32; m1 = load<u8>(scratch + 4) as i32;
@@ -216,7 +215,7 @@ function opDecodeOne(input_len: i32): i32 {
   const totalFrame = headerLen + maskLen + payloadLen;
   if (bufLen < totalFrame) { store<u8>(scratch, 0); return 1; }
 
-  // Read mask into locals before moving the payload over the header region.
+  // Read the mask into locals before the payload moves over the header region.
   let m0: i32 = 0, m1: i32 = 0, m2: i32 = 0, m3: i32 = 0;
   if (masked) {
     m0 = load<u8>(bufPtr + headerLen) as i32; m1 = load<u8>(bufPtr + headerLen + 1) as i32;

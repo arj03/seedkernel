@@ -1,11 +1,11 @@
-// The node's signing keypair, derived from the one stored 32-byte master seed (§12.6.2b):
+// The node's signing keypair, derived from its one stored 32-byte master seed (§12.6.2b):
 // BLAKE2b-256 over `DOMAIN_subkey ‖ label ‖ master`, fed to crypto_sign_seed_keypair.
 //
-// One key serves every purpose, and what a signature MEANS is the host's choice of
-// `DOMAIN_x ‖ scope` from the slot the asking bundle occupies (guest-seam.ts) rather than
-// the key's. The derivation stays because it keeps the stored secret distinct from the key
-// that signs, under a versioned label, so the peer id can rotate without changing the key
-// file format. Why not a second keypair, and what that would cost: CHANNEL.md §7.
+// The derivation keeps the stored secret distinct from the key that signs, under a
+// versioned label, so the peer id can rotate without changing the key file format. One key
+// serves every purpose — what a signature MEANS is the host's choice of domain/scope from
+// the slot the asking bundle occupies (guest-seam.ts), not the key's. Why not a second
+// keypair: CHANNEL.md §7.
 
 import { DOMAIN_SUBKEY } from "./domains.js";
 import { concatBytes, enc } from "./util.js";

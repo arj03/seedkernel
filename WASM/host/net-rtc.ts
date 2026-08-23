@@ -5,16 +5,14 @@
 // the routing — is the transport bundle's, identical to the TCP path.
 //
 // Raw I/O only. Anything a peer connection can carry BESIDES bytes (live audio/video)
-// belongs to the app, which subclasses RtcNetwork and works against the PeerEntry `pc`;
-// media never enters the runtime.
+// belongs to the app, which subclasses RtcNetwork and works against the PeerEntry `pc`.
 //
 // Identity is proved by the transport's AUTH challenge INSIDE the channel, not by an
-// SDP-fingerprint assertion at the signaling layer: a MITM relay can splice SDP and bring
-// up DTLS to itself, but it can never complete AUTH without the peer's private key, so the
-// link never authenticates and never delivers a byte.
+// SDP-fingerprint assertion: a MITM relay can splice SDP and bring up DTLS to itself, but it
+// can never complete AUTH without the peer's private key, so the link never authenticates.
 //
-// Browser-native, but the globals are referenced only inside RtcNetwork / relaySignaling,
-// so importing this under Node is safe — a console peer joins the same mesh with a
+// Browser-native, but the globals are referenced only inside RtcNetwork / relaySignaling, so
+// importing this under Node is safe — a console peer joins the same mesh with a
 // werift-backed `peerConnectionFactory` (./net-rtc-node).
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { type PeerId } from "../core/socket-seam.js";

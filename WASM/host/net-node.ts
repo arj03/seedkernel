@@ -1,7 +1,7 @@
 // The Node platform binding for the TCP/WS socket seam: a `ChannelFactory`
 // (core/socket-seam.ts) that opens node:net sockets and wraps them as RawLinks, and
-// nothing else. The handshake, link routing and request/response layer run in the
-// transport bundle's guest, driven by TransportHost.
+// nothing else. The handshake, link routing and request/response layer run in the transport
+// bundle's guest, driven by TransportHost.
 //
 // WebSocket is handled as a wire codec *over a raw TCP listener*: this file binds the
 // listener and says which codec applies, while the RFC 6455 handshake and framing run in
@@ -27,8 +27,8 @@ function nodeRawStream(socket: Socket, framing: Framing, authority?: string): Ra
         framing,
         authority,
         // The peer's IP, for the per-source half-open cap only (§12.6.1) — unauthenticated
-        // and never an identity. Captured now because `socket.remoteAddress` reads
-        // undefined once destroyed, and the limiter must release the bucket it took.
+        // and never an identity. Captured now because `socket.remoteAddress` reads undefined
+        // once destroyed, and the limiter must release the bucket it took.
         remoteAddr: socket.remoteAddress ?? undefined,
         send: (bytes: Uint8Array) => { socket.write(bytes); },
         onData: (cb: (chunk: Uint8Array) => void) => { socket.on("data", (chunk: Uint8Array) => cb(new Uint8Array(chunk))); },
@@ -36,8 +36,8 @@ function nodeRawStream(socket: Socket, framing: Framing, authority?: string): Ra
         onClose: (cb: () => void) => { socket.on("close", cb); socket.on("error", cb); },
         // A graceful stop must FLUSH: `destroy()` drops the write buffer, so the
         // end-of-stream record the transport just wrote is discarded and the peer reads a
-        // clean shutdown as a truncation. `end()` writes the queued bytes then FINs, and
-        // the linger timer is the backstop for a peer that never FINs back.
+        // clean shutdown as a truncation. `end()` writes the queued bytes then FINs; the
+        // linger timer is the backstop for a peer that never FINs back.
         close: (graceful?: boolean) => {
             if (!graceful) { socket.destroy(); return; }
             try {

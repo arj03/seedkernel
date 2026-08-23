@@ -58,9 +58,7 @@ export interface SeamCalls {
 export interface RawNet {
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
-     *  host resolves the name in its own address book; the caller learns no route it could
-     *  dial for itself, only which wire codec applies and, for a dialed WebSocket, its
-     *  `Host` authority (socket-seam.ts). */
+     *  caller learns no route it could dial for itself, only which wire codec applies. */
     open(dest: Uint8Array): { linkId: number; framing: number; authority: string };
     /** Write whole bytes to a link. Silently dropped if the link is already gone —
      *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
@@ -112,18 +110,15 @@ export interface SeamPlatform {
 export interface SeamGrants {
     /** EXACTLY the manifest's declared `guest.requires` (§12.2) — service names and local
      *  service ids together, as signed. A `host.call` naming a host method is refused unless
-     *  the method's SERVICE (`serviceOf`) is a member of this set; `crypto/*`, a bare module
-     *  name and a declared local service pass regardless — none of them names a host
-     *  service, so a local service id sitting unused in this set for that check is harmless.
-     *  Required — pass `UNRESTRICTED_NAMES` to opt out deliberately. */
+     *  the method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
+     *  declared local service pass regardless. Required — pass `UNRESTRICTED_NAMES` to opt
+     *  out deliberately. */
     names: Iterable<string> | typeof UNRESTRICTED_NAMES;
     /** THIS realm's declared local service ids — the `guest.requires` entries that are not
-     *  host services (bundle.ts validates their shape and their non-collision with this
-     *  bundle's own module names at load). What tells a bare `host.call` name apart from one
-     *  of this bundle's own modules (§12.10): declared here, it is a cross-realm call
-     *  (`calls`, below); otherwise it is a module. Explicit rather than inferred from `names`
-     *  so the rule holds under `UNRESTRICTED_NAMES` too, where there is no name set to infer
-     *  it from. Absent or empty for a bundle that calls no local service. */
+     *  host services. What tells a bare `host.call` name apart from one of this bundle's own
+     *  modules (§12.10): declared here, it is a cross-realm call; otherwise it is a module.
+     *  Explicit rather than inferred from `names` so the rule holds under
+     *  `UNRESTRICTED_NAMES` too. */
     localServices?: ReadonlySet<string>;
     /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
      *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
@@ -147,10 +142,8 @@ export interface SeamGrants {
 }
 
 /** Per-APP: this bundle's OWN WASM modules, by the logical names its manifest declared.
- *
- *  Not a grant and not gated — the code was installed and verified with the guest, so
- *  calling one reaches nothing the guest does not already hold. The slot wires this
- *  private value directly, so there is no wider module namespace to scope. */
+ *  Not a grant and not gated — calling one reaches nothing the guest does not already hold.
+ *  The slot wires this private value directly, so there is no wider module namespace. */
 export interface SeamModules {
     names: ReadonlySet<string>;
     /** Reach one of this app's modules by bare name. Async; `deadlineMs` is the
@@ -187,11 +180,11 @@ type CryptoName = `crypto/${PrimitiveName}`;
  *  a handler is a compile error, and so is a handler whose name the loader would refuse.
  *
  *  Every one contains a `/`, which is load-bearing (§12.2): module names are held to
- *  `[A-Za-z0-9_-]`, so they cannot spell one of these, which is what lets the dispatch tell
+ *  `[A-Za-z0-9_-]`, so they cannot spell one of these — that is what lets the dispatch tell
  *  host names and module names apart by the name alone. */
 type HandlerKey = CapabilityName | CryptoName;
 /** The same union as a runtime list, for the construction check below — the compiled-JS
- *  half of the one-file rule, where `HandlerKey` enforces nothing. */
+ *  half of the one-file rule. */
 const HANDLER_KEYS: readonly string[] = [
     ...AUTHORITY_CALLS,
     ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
@@ -313,12 +306,11 @@ globalThis.__invoke = (argBuf) => {
 `;
 // ── the attribution prefix, host side ────────────────────────────────────────
 //
-// The ONLY bytes the host puts in front of a callee's format. An app's own format and a
-// transport's event framing are content; this prefix is what the host can be asked for,
-// one 32-byte id, unforgeable by a guest. There is exactly ONE host id: the zero id,
-// whose events and loopback calls the host writes — a fired deadline re-enters this way
-// too, as an ordinary loopback naming a "timer" op, so a second host id was never needed
-// to tell one from another. Everything else non-zero is a peer or a co-resident app key.
+// The ONLY bytes the host puts in front of a callee's format: one 32-byte id, unforgeable
+// by a guest. There is exactly ONE host id — the zero id, whose events and loopback calls
+// the host writes (a fired deadline re-enters as an ordinary loopback naming a "timer" op,
+// so a second host id was never needed). Everything else non-zero is a peer or a
+// co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 /** Method catalog, re-exported from core/domains.ts. A grant is a SERVICE name
@@ -445,19 +437,15 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         return grants.timers;
     };
     // Null-prototype, so the table holds exactly what is written here: a plain object
-    // literal would answer `handlers["toString"]` with an inherited function, which the
-    // dispatch below would then CALL.
+    // literal would answer `handlers["toString"]` with an inherited function.
     const handlers: Record<string, SeamHandler> = Object.assign(Object.create(null), {
         // ── the primitive seam (§12.1): functions of bytes the guest already holds, so
-        // there is nothing to grant. The bundle's own modules are the other ungated half,
-        // resolved past the end of this table.
+        // there is nothing to grant. The bundle's own modules are the other ungated half.
         ...cryptoCatalog(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
-        // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope
-        // (see `SignScope`) — derived at load: an app slot's own `DOMAIN_guest ‖ author ‖
-        // app`, the link slot's `DOMAIN_link_scope ‖ network_key`. The host chooses what
-        // the name signs under, so the guest never reconstructs host-owned bytes and never
-        // picks a namespace for itself.
+        // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope,
+        // derived at load: an app slot's own `DOMAIN_guest ‖ author ‖ app`, the link
+        // slot's `DOMAIN_link_scope ‖ network_key`. The guest never picks a namespace.
         "node/sign": (payload) => {
             const s = grants.signScope;
             if (!s)
@@ -465,10 +453,9 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             return sodium.crypto_sign_detached(concatBytes([s.domain, s.scope, payload]), s.key.privateKey);
         },
         // node/verify — [pk 32][sig 64][msg …] → [ok u8]. Scoped like node/sign: the caller
-        // supplies the key but never the scope, so a signature made under any other scope
-        // answers [0] here. A payload too short to hold both throws rather than answering
-        // [0]: that is a mis-framed call, not a signature that failed, and [0] is a verdict
-        // about bytes that were actually checked. An empty `msg` is legitimate, so the
+        // supplies the key but never the scope, so a signature under any other scope answers
+        // [0]. A payload too short to hold both throws rather than answering [0] — that is a
+        // mis-framed call, not a signature that failed. An empty `msg` is legitimate, so the
         // bound is exactly the fixed prefix.
         "node/verify": (payload) => {
             const s = grants.signScope;
@@ -522,11 +509,9 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         "fs/stat": () => fs().stat().then((s) => concatBytes([u64be(s.used), u64be(s.available)])),
         // ── clock ─────────────────────────────────────────────────────────────────
         "clock/now": () => u64be(now()),
-        // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` — the
-        // whole of what the platform contributes to the network (§12.1). No peer, no
-        // protocol id, no correlation: those are the transport's own. Inbound bytes arrive
-        // the other way, as ordinary invocations of the transport's `handle`. The node's
-        // immutable facts were delivered once at init; nothing here is re-readable.
+        // ── raw net: bytes over an opaque link id, the socket-side twin of `fs` (§12.1).
+        // No peer, no protocol id, no correlation: those are the transport's own. Inbound
+        // bytes arrive the other way, as ordinary invocations of the transport's `handle`.
         "link/open": (payload) => {
             const link = rawNet().open(payload);
             const authority = enc.encode(link.authority);
@@ -572,12 +557,10 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     } satisfies Record<HandlerKey, SeamHandler>);
     // The one-file rule, checked at construction: every name here is a host method the
     // loader knows or a primitive, and every name contains a `/` — the namespace invariant
-    // the dispatch below relies on to tell a host method from a bundle's own module (a
-    // bare `"ping"` here would shadow every app's module of that name).
-    //
-    // The `satisfies` above is the compile-time half; this walk is the runtime half, which
-    // holds on the COMPILED JS the native target evaluates (§12.9), and is the one check a
-    // typo'd EXTRA key trips.
+    // the dispatch relies on to tell a host method from a bundle's own module (a bare
+    // `"ping"` here would shadow every app's module of that name). The `satisfies` above is
+    // the compile-time half; this walk is the runtime half, which holds on the COMPILED JS
+    // the native target evaluates (§12.9).
     for (const name of Object.keys(handlers)) {
         if (!HANDLER_KEYS.includes(name)) {
             throw new Error(`guest-seam: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no primitive (PRIMITIVE_NAMES)`);
@@ -609,9 +592,8 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // asking the declaration before the charset is what keeps one vocabulary from
         // becoming two. It can never shadow a host method — the loader refuses a
         // `requires` entry whose head is a known service (bundle.ts). The callee answers
-        // on a later turn, never inside this guest's frame, which is what keeps the call
-        // graph a graph, and an id nothing claims is refused by name rather than parked
-        // on a promise no one will settle.
+        // on a later turn, never inside this guest's frame; an id nothing claims is refused
+        // by name rather than parked on a promise no one will settle.
         if (localServices.has(name)) {
             if (!grants.calls)
                 throw new Error("guest-seam: " + name + " is a cross-realm call and this seam has no routing wired");
@@ -622,12 +604,10 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         }
         // A `/` says a host method: the table lookup IS the dispatch, gated by the
         // method's SERVICE — an undeclared `node/identity` is refused even beside a
-        // declared `node/sign`, because the unit a manifest grants is the SERVICE, and
-        // `node/sign` and `node/identity` are the same service under two calls. What
-        // counts as a service is `serviceOf` — a table lookup on the text before the
-        // first `/`, never a semantic parse of the rest of the name. An unknown name (or
-        // a primitive this host does not carry) reads `undefined` and is refused
-        // regardless of the gate.
+        // declared `node/sign`, because the unit a manifest grants is the SERVICE.
+        // `serviceOf` is a table lookup on the text before the first `/`, never a semantic
+        // parse. An unknown name (or a primitive this host does not carry) reads
+        // `undefined` and is refused regardless of the gate.
         if (name.includes("/")) {
             const svc = serviceOf(name);
             if (allowed && svc && !allowed.has(svc)) {
@@ -638,12 +618,10 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
                 throw new Error("guest-seam: no such name " + name);
             return fn(payload);
         }
-        // Any other name is one of THIS slot's private modules, by its manifest name.
-        // The slot wired this value directly, so no name can reach another app. Ungated
-        // like `crypto/*`.
-        //
-        // A name the app never installed is a typo, refused by name like an unknown host
-        // name. A module that runs and FAILS is a different event and answers empty bytes.
+        // Any other name is one of THIS slot's private modules, by its manifest name. The
+        // slot wired this value directly, so no name can reach another app. Ungated like
+        // `crypto/*`. A name the app never installed is a typo, refused by name; a module
+        // that runs and FAILS is a different event and answers empty bytes.
         if (!modules.names.has(name))
             throw new Error("guest-seam: no such name " + name + " (this bundle installs no module by that name)");
         // Module call charged to caller's segment (§4.3). Refuse if nothing left —
@@ -654,11 +632,10 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         if (r !== null && typeof (r as Promise<ModuleResult>).then === "function") {
             return (r as Promise<ModuleResult>).then(({ bytes, ms }) => {
                 // Bill the module's OWN processing time (measured on the worker that ran
-                // it), never the issue-to-settle wall clock: a burst of fire-and-forget
+                // it), never the issue-to-settle wall clock — a burst of fire-and-forget
                 // module calls serialized through one worker would otherwise charge their
-                // queue wait quadratically, killing a busy-but-honest guest mid-window.
-                // Only the parked path is charged: a module answering synchronously ran
-                // inside the guest's own open segment, which the realm's clock counted.
+                // queue wait quadratically. Only the parked path is charged: a module
+                // answering synchronously ran inside the guest's open segment.
                 budget?.charge(ms);
                 return bytes ?? NONE;
             });

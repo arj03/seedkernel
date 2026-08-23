@@ -1,8 +1,8 @@
 // The native loader's platform seam (§12.9): Go supplies primitives — pure modules over
 // wazero, libsodium, an `fs` directory, TCP sockets, a second QuickJS realm — and this file
-// adapts them to the interfaces `bootShell` consumes, then hands them to it. The Go loader
-// runs it inside QuickJS, bundled with every module it imports into
-// native/host-shell.gen.js by scripts/bundle-loader.mjs.
+// adapts them to the interfaces `bootShell` consumes, then hands them to it. Go runs it
+// inside QuickJS, bundled with every module it imports into native/host-shell.gen.js by
+// scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
 import { runCli, loadedLine, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
@@ -146,17 +146,17 @@ export const sodium: NativeSodium = wrapNativeSodium(__sodium);
  *  to hand back anyway. The seam the shared code consumes is async (`Fs`, core/fs.ts), so
  *  the adaptation happens here — Go grows with primitives, never with logic. */
 declare const __fs: {
-  /** Point the backend at a data directory, creating it if needed. Late-bound because
-   *  which directory is the operator's `--dir`, which Go does not read. Until this is
-   *  called the store answers as empty and refuses writes. */
+  /** Point the backend at a data directory, creating it if needed. Late-bound because which
+   *  directory is the operator's `--dir`, which Go does not read; until called the store
+   *  answers as empty and refuses writes. */
   open(dir: string): void;
   get(key: string): ArrayBuffer | null;
   put(key: string, bytes: Uint8Array): void;
   size(key: string): number;
-  /** One `\n`-joined string, not an array: building a JS array on the Go side costs an
-   *  engine call (plus a C string) per key, so a content store with tens of thousands of
-   *  blocks paid tens of thousands of crossings per listing. A key may not contain `\n`
-   *  (`isSafeFsKey`, core/fs.ts), so the join is unambiguous. */
+  /** One `\n`-joined string, not an array: a JS array would cost an engine call per key, so
+   *  a content store with tens of thousands of blocks would pay tens of thousands of
+   *  crossings per listing. A key may not contain `\n` (`isSafeFsKey`), so the join is
+   *  unambiguous. */
   list(prefix?: string): string;
   delete(key: string): boolean;
   stat(): { used: number; available: number };
@@ -174,18 +174,15 @@ export const fs: Fs = {
   // An empty listing arrives as "", which must map to [] — split would yield [""].
   async list(prefix) { const s = __fs.list(prefix); return s === "" ? [] : s.split("\n"); },
   async delete(key) { return __fs.delete(key); },
-  // Go answers -1 when it cannot ask the OS for free space; the sentinel a guest reads
-  // is the seam's (core/fs.ts), so it cannot differ by backend.
+  // Go answers -1 when it cannot ask the OS for free space; the sentinel a guest reads is
+  // the seam's (core/fs.ts), so it cannot differ by backend.
   async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
 /** Go's socket byte primitives (native/sock.go): a raw byte duplex and nothing else. The
- *  whole networking seam — the wire codec, the handshake, the routing and the
- *  request/response layer are the transport bundle's, over the same primitive every target
- *  hands it.
- *
- *  A link arrives WITHOUT a `framing`: which codec applies follows from the address, which
- *  is this file's to read and never Go's. */
+ *  whole networking seam — wire codec, handshake, routing — is the transport bundle's, over
+ *  the same primitive every target hands it. A link arrives WITHOUT a `framing`: which codec
+ *  applies follows from the address, which is this file's to read and never Go's. */
 type GoLink = Omit<RawLink, "framing">;
 declare const __net: {
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
@@ -273,12 +270,11 @@ const modules: PureModuleLoader = {
         bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE);
         return {
             call(module, payload, _deadlineMs) {
-                // The bridge call runs the module synchronously inside the Go event loop,
-                // so the wall clock around it IS the module's own compute — nothing sits
-                // queued behind earlier calls (the native target serializes per slot in
-                // Go). Return it as `ms` so the seam bills actual work, matching the JS
-                // worker's report (ModuleResult, bundle.ts). `performance` is a JS-target
-                // global; the quickjs-ng host realm has Date, so fall back when absent.
+                // The bridge call runs the module synchronously inside the Go event loop, so
+                // the wall clock around it IS the module's own compute — nothing sits queued
+                // behind earlier calls (the native target serializes per slot in Go). Return
+                // it as `ms` so the seam bills actual work, matching the JS worker's report.
+                // `performance` is a JS-target global; the quickjs-ng host realm has Date.
                 const clock = (typeof performance === "object" && typeof performance.now === "function")
                     ? () => performance.now()
                     : () => Date.now();
@@ -322,9 +318,9 @@ class NativeFreshnessStore extends FreshnessMarks {
     persist(json: string) {
         if (this.path === null) return;
         // Fatal, deliberately: `FreshnessMarks` reads a throw here as "the write did not
-        // land", which is what rolls a revocation back and un-binds a load whose mark
-        // could not be raised. Swallowing it would report both as successes while the next
-        // boot re-admits the revoked author. 0600 — a node's own downgrade guard.
+        // land", which is what rolls a revocation back and un-binds a load whose mark could
+        // not be raised — swallowing it would report both as successes while the next boot
+        // re-admits the revoked author. 0600, a node's own downgrade guard.
         bridge.writeFile(this.path, utf8.encode(json), 0o600);
     }
 }
@@ -370,26 +366,23 @@ const embeddedTransportAuthor = (() => {
     }
 })();
 /** This target's realm factory (§12.3): a second, zero-authority quickjs-ng realm driven by
- *  Go's event loop, presenting the same `SafeRealm` safe-js.ts does.
+ *  Go's event loop, presenting the same `SafeRealm` safe-js.ts does. The promise plumbing
+ *  stays here rather than in Go: `nativeCall` closes over this realm, so a settled op routes
+ *  to the realm that parked it structurally, and Go needs no promise primitive of its own.
  *
- *  The promise plumbing stays here rather than in Go: `nativeCall` closes over this realm,
- *  so a settled op routes to the realm that parked it structurally, and Go needs no promise
- *  primitive of its own. */
-// `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers and
-// not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds.
-//
-// The native realm does NOT enforce it through QuickJS — New_QJS's maxExecutionTime is
-// inert in the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes
-// a budget kill fatal to the realm rather than a catchable JS error (qjs.Runtime.Budget).
+ *  `deadlineMs` crosses with one sentinel encoding, because the bridge carries numbers and
+ *  not `undefined`/`Infinity`: negative means Infinity, everything else is milliseconds. The
+ *  native realm does NOT enforce it through QuickJS — New_QJS's maxExecutionTime is inert in
+ *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
+ *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-    // Assigned before any guest code can call back: bridge.createRealm evaluates the
-    // guest, whose top-level can only reach sync names (a Promise it could not await).
+    // Assigned before any guest code can call back: bridge.createRealm evaluates the guest,
+    // whose top-level can only reach sync names (no Promise it could await).
     let realm: number;
-    // No `CallBudget` crosses here: this realm's segment lives in the engine, not in JS,
-    // so there is nothing on this side to read a remainder from or bill a module's burn
-    // back to. The module bound this target enforces is Go's own
-    // (`SEEDKERNEL_MODULE_DEADLINE_MS`), which is why the seam takes the budget as
-    // optional.
+    // No `CallBudget` crosses here: this realm's segment lives in the engine, not in JS, so
+    // there is nothing on this side to read a remainder from or bill a module's burn back
+    // to. The module bound this target enforces is Go's own
+    // (`SEEDKERNEL_MODULE_DEADLINE_MS`), which is why the seam takes the budget as optional.
     const nativeCall: NativeHostCall = (name, payload, callId) => {
         const r = hostCall(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
         if (!r || typeof (r as Promise<Uint8Array>).then !== "function")

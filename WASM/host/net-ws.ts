@@ -4,11 +4,9 @@
 //
 // The browser end of the socket seam and nothing more: it opens platform WebSockets and
 // hands them to the driver's `openLink()`. Everything above — the handshake, the record
-// layer, the routing — is the transport bundle's, identical to the TCP path.
-//
-// The WebSocket global is touched only inside a dial (or an injected factory), so importing
-// this where WebSocket is absent is safe.
-
+// layer, the routing — is the transport bundle's, identical to the TCP path. The WebSocket
+// global is touched only inside a dial (or an injected factory), so importing it where
+// WebSocket is absent is safe.
 import type { PeerId } from "../core/socket-seam.js";
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { parsePeerRef } from "./cli.js";

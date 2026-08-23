@@ -116,9 +116,8 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
     // ── Node platform seam ─────────────────────────────────────────────────────
     const fs = new NodeFs(opts.dir);
     const freshness = new FileFreshnessStore(freshnessPathFor(opts.dir));
-    // Everything a boot can fail on — a bundle that does not verify, a listener whose
-    // port is taken — happens inside bootShell, which tears down what it stood up when
-    // it throws, so this function has no partial state to clean.
+    // Everything a boot can fail on happens inside bootShell, which tears down what it stood
+    // up when it throws, so this function has no partial state to clean.
     const { shell: core, transport } = await bootShell({
         sodium: sodium as unknown as ShellSodium,
         identity: opts.identity,

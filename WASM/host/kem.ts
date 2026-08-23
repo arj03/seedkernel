@@ -1,29 +1,20 @@
-// kem.ts — ML-KEM-768 (FIPS 203) for the primitive catalog (§12.2, §14.1), driven
-// from browser/mlkem768.wasm and exposed under `sodium`-shaped method names so it
-// mixes straight into the object the guest seam already consumes, exactly as pq.ts
-// does for ML-DSA-65.
+// kem.ts — ML-KEM-768 (FIPS 203) for the primitive catalog (§12.2, §14.1), driven from
+// browser/mlkem768.wasm and exposed under `sodium`-shaped method names so it mixes straight
+// into the object the guest seam already consumes, exactly as pq.ts does for ML-DSA-65.
 //
-// Host code, not core, on the same grounds as pq.ts: the JS targets' driver for
-// mlkem768.wasm, twin of native/mlkem.go. What is core is the catalog NAME a guest reaches
-// (`ml-kem-768/*`, core/domains.ts), not which driver serves it.
+// Host code, not core, on the same grounds as pq.ts: what is core is the catalog NAME a
+// guest reaches (`ml-kem-768/*`, core/domains.ts), not which driver serves it.
 //
-// **Here before anything asks for it.** A bundle is replaceable; the vocabulary it draws
-// on is not. The channel's post-quantum suite is content — a signed transport bundle and a
+// **Here before anything asks for it.** A bundle is replaceable; the vocabulary it draws on
+// is not. The channel's post-quantum suite is content — a signed transport bundle and a
 // policy entry — but only once the primitive exists on all three targets, and a primitive
-// cannot be delivered as a bundle. So a core vocabulary is provisioned ahead of need or
-// not at all (§14.1); nothing in the tree calls this yet, and that is the point.
+// cannot be delivered as a bundle. Nothing in the tree calls this yet, and that is the point
+// (§14.1).
 //
-// **One artifact, three targets** (pq/mlkem-native, pinned; scripts/build-mlkem.mjs). The
-// reason is weaker than ML-DSA's, a KEM not being a verifier, but the conclusion is the
-// same: two implementations that disagree on a rejected encoding fail to share a key.
-//
-// **Nothing here draws entropy.** Every operation takes its coins as an argument, because a
-// catalog entry is a pure function of its argument bytes: a guest draws randomness from
-// `node/random`, an authority it was granted, and hands it in. Keeping the grant out of the
-// primitive is what makes the primitive free to call.
-//
-// **This file imports nothing**, for the reason pq.ts states — which is also why the bump
-// arena below is repeated rather than shared.
+// **Nothing here draws entropy.** Every operation takes its coins as an argument: a guest
+// draws randomness from `node/random`, an authority it was granted, and hands it in — which
+// is what keeps the primitive free to call. **This file imports nothing**, for the reason
+// pq.ts states, which is why the bump arena below is repeated rather than shared.
 
 /** FIPS 203 ML-KEM-768 field widths. Fixed by the parameter set, and cross-checked
  *  against the module's own exports at load (`createMlKem768`). */

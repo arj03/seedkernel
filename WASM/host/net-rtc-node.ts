@@ -2,7 +2,7 @@
 //
 // net-rtc.ts is browser-native; this is the Node side of that swap, in pure JS with werift
 // (no native addon, so it also bundles into the `bun --compile` shell), wired through the
-// single `peerConnectionFactory` seam RtcNetwork exposes.
+// single `peerConnectionFactory` seam RtcNetwork exposes:
 //
 //   browser tab  ──RTCDataChannel──┐
 //                                  ├── relay (signaling only) ── same room
@@ -10,13 +10,12 @@
 //
 // The whole job is an impedance match: werift speaks an rxjs-style `.subscribe()` API,
 // delivers Buffers, wants explicit createOffer/createAnswer and exposes no `binaryType`,
-// where net-rtc.ts drives the W3C surface. The facade below means net-rtc.ts needs zero
+// where net-rtc.ts drives the W3C surface. The facade means net-rtc.ts needs zero
 // werift-specific code. The transport's in-channel handshake still does the real
 // authentication; werift's DTLS only has to bring up *a* channel.
 //
-// Node/Bun only (it imports werift and node:Buffer). The browser resolves
-// `seedkernel-wasm/net-rtc` instead, and the minifier copies this without bundling werift,
-// so a stray copy in a browser dir stays inert.
+// Node/Bun only (it imports werift and node:Buffer); the browser resolves
+// `seedkernel-wasm/net-rtc` instead.
 import { RTCPeerConnection as WeriftPeerConnection } from "werift";
 import type { RTCDataChannel as WeriftDataChannel, PeerConfig as WeriftPeerConfig } from "werift";
 // RtcNetwork/RtcChannel only ever addEventListener (never remove), so a type→listeners map
@@ -66,7 +65,7 @@ export class WeriftRtcDataChannel extends Emitter {
         dc.error.subscribe(() => this.dispatch("error"));
         // A channel received via ondatachannel can already be "open" before we subscribe;
         // surface that on a microtask so RtcChannel, constructed right after us, has its
-        // "open" listener registered before it fires.
+        // "open" listener registered first.
         if (dc.readyState === "open")
             queueMicrotask(() => this.markOpen());
     }
@@ -102,8 +101,7 @@ class WeriftRtcPeerConnection extends Emitter {
     }
     // The W3C "implicit" form RtcNetwork relies on. werift needs the description spelled
     // out, so pick offer vs answer from the signaling state.
-    async setLocalDescription() {
-        const desc = this.pc.signalingState === "have-remote-offer"
+    async setLocalDescription() {        const desc = this.pc.signalingState === "have-remote-offer"
             ? await this.pc.createAnswer()
             : await this.pc.createOffer();
         await this.pc.setLocalDescription(desc as never);

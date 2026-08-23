@@ -24,9 +24,8 @@ export const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // must cap identically, or a message that succeeds over TCP tears down a WS link.
 //
 // **Keep this in step with MAX_FRAME_BYTES: it is the FLOOR on that cap.** The scratch is
-// allocated at module init and the module ships in the transport bundle, so every shell
-// pays it, TCP-only nodes included. A host may lower its own `maxFrameBytes` below this,
-// but raising it above what is compiled in here would hand this module a frame it has no
-// room to stage.
+// allocated at module init and ships in the transport bundle, so every shell pays it, and
+// a host raising `maxFrameBytes` above the compiled-in size would hand this module a frame
+// it has no room to stage.
 export const SCRATCH_SIZE = (2 << 20) + (1 << 12); // 2 MB + 4 KB overhead slack
 export const MAX_FRAME_PAYLOAD = SCRATCH_SIZE - 16;

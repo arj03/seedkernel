@@ -1,12 +1,10 @@
-// cli.ts — the operator's side of a node, written once for every target: what an operator
-// types, what each flag defaults to, what order the node does things in, and what it
-// prints. A `CliHost` names the few things that genuinely differ by target — files, a log
-// line, raw stdout, entropy, and "stand a node up here".
-//
-// Tokenizing `--name value` is not what is shared; everything downstream of the split is:
-// the flag SET, the defaults, the deny-all reading of an absent `--policy` (§14), the
-// order (remedies before the bundle, §12.5), which failures are fatal, and the console
-// lines. Those are decisions, and a decision made twice eventually gets made differently.
+// cli.ts — the operator's side of a node, written once for every target. A `CliHost`
+// names the few things that genuinely differ by target — files, a log line, raw stdout,
+// entropy, and "stand a node up here". Tokenizing `--name value` is not what is shared;
+// everything downstream of the split is: the flag SET, the defaults, the deny-all reading
+// of an absent `--policy` (§14), the order (remedies before the bundle, §12.5), which
+// failures are fatal, and the console lines. Those are decisions, and a decision made twice
+// eventually gets made differently.
 import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
 import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
@@ -87,9 +85,9 @@ export interface CliHost extends CliFiles {
    *  through `log`, and `log` must not go to stdout either (both targets send it to
    *  stderr: a diagnostic interleaved into a response corrupts it). */
   stdout(bytes: Uint8Array): void;
-  /** Raw bytes from stdin — `--op`'s argument, verbatim; empty when nothing is piped in,
-   *  which is how an op that takes no argument is spelled. A function rather than a field
-   *  so a node that boots and serves never blocks on a stdin nobody will write to. */
+  /** Raw bytes from stdin — `--op`'s argument, verbatim; empty when nothing is piped in.
+   *  A function rather than a field so a node that boots and serves never blocks on a
+   *  stdin nobody will write to. */
   stdin(): Uint8Array;
   /** Entropy + the subkey derivation's crypto (§12.9). */
   sodium: SubkeyCrypto & { randombytes_buf(n: number): Uint8Array };
@@ -166,14 +164,10 @@ export function parseHex32(hex: string, label: string): Uint8Array {
 
 /** The credential half of a peer spec — `pk[.secret]` — plus whatever followed the `@`.
  *  `pk` names WHO lives there and keys the address book; the optional `.secret` is THAT
- *  PEER's contact secret, the gate our opening message must be sealed under — which is
- *  what makes an address a credential rather than a location.
- *
- *  Where a peer LIVES differs by transport (a `host:port`, a whole `ws://` URL), so
- *  `location` comes back unparsed for each caller to read its own form out of.
- *
- *  Every check here is syntax, so nothing about admission or trust would change if a
- *  target hand-rolled its own parser. */
+ *  PEER's contact secret, what makes an address a credential rather than a location.
+ *  Where a peer LIVES differs by transport, so `location` comes back unparsed. Every
+ *  check here is syntax, so nothing about admission or trust changes if a target
+ *  hand-rolled its own parser. */
 export function parsePeerRef(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; location: string } {
   const at = spec.indexOf("@");
   if (at < 0) throw new Error(`bad peer spec (want pk[.secret]@location): ${spec}`);

@@ -134,11 +134,9 @@ export class MessageChannel extends BufferedChannel {
  *  edges.
  *
  *  The edges are kept HERE rather than asked of the driver, because these classes hand the
- *  sockets over (`openLink`) and hear back per link — so "this peer's first link came up"
- *  and "its last went down" is a count this class already has everything to keep, where a
- *  host-side mirror of the transport's peer set would be two copies of one fact.
- *  `linkedPeers()` is the transport's own answer, for a caller that wants the whole set
- *  rather than the transitions. */
+ *  sockets over (`openLink`) and hear back per link — so "this peer's first link came up" and
+ *  "its last went down" is a count this class already has everything to keep, where a
+ *  host-side mirror of the transport's peer set would be two copies of one fact. */
 export abstract class SingleIdentityNetwork {
     protected readonly driver: TransportHost;
     protected readonly ownId: PeerId;

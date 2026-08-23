@@ -8,30 +8,23 @@ export interface RawLink {
    *  slice of a stream with no boundary implied. */
   onData(cb: (bytes: Uint8Array) => void): void;
   onClose(cb: () => void): void;
-  /** Tear the link down. `graceful` asks the transport to flush already-written bytes first;
-   *  the guest passes true only after writing its end-of-stream record, because a transport
-   *  that discards that write turns a clean close into exactly the truncation the record
-   *  exists to rule out. */
+  /** Tear the link down. `graceful` asks the transport to flush already-written bytes;
+   *  the guest passes true only after writing its end-of-stream record. */
   close(graceful?: boolean): void;
-  /** Bytes written to this link but not yet on the wire — what distinguishes a slow exchange
-   *  from a stalled one. The bundle's stall clock polls it (link/stat) rather than timing
-   *  from when a request was queued, which would measure our own upload and cancel healthy
-   *  requests under backpressure. Optional: a transport that cannot say leaves the clock a
-   *  plain deadline. */
+  /** Bytes written but not yet on the wire — what distinguishes a slow exchange from a
+   *  stalled one; the bundle's stall clock polls this (link/stat) rather than timing from
+   *  queue. Optional: a transport that cannot say leaves the clock a plain deadline. */
   buffered?(): number;
   /** Optional transport-supplied identifier for the far end (an IP, say), used only to
    *  bucket the per-source half-open cap — enforced in the transport bundle. NEVER an
    *  identity. */
   readonly remoteAddr?: string;
   /** How this link is framed: `FRAMING.PLATFORM` when the transport already has message
-   *  boundaries (a browser WebSocket, an RTCDataChannel), else which wire codec the bundle
-   *  must run over the byte duplex. The host knows only because it dialed the address; what
-   *  to do about it is entirely the bundle's. */
+   *  boundaries, else which wire codec the bundle must run over the byte duplex. */
   readonly framing: Framing;
   /** The `host:port` this link was dialed at — the one thing a wire codec needs that only
-   *  the address knows (a WebSocket client's `Host` header). Set on dialed WS links and
-   *  nowhere else: the authority of a link the host has ALREADY opened, never a route the
-   *  bundle could dial for itself. */
+   *  the address knows. Set on dialed WS links and nowhere else, never a route the bundle
+   *  could dial for itself. */
   readonly authority?: string;
 }
 

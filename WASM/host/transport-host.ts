@@ -56,9 +56,8 @@ export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 // (shell-core.ts `hostCallSlot`). A field written here and not read there desyncs the
 // payload, which is what forces the pair to move in one artifact.
 
-/** `[opLen u8][op]` for one op, memoized: the header is rebuilt on the inbound frame
- *  path, once per socket read per link. Sharing is safe because nothing mutates a
- *  header — `Args` only pushes it into a parts list that `build()` copies out of. */
+/** `[opLen u8][op]` for one op, memoized: the header is rebuilt on the inbound frame path,
+ *  once per socket read per link. Sharing is safe — nothing mutates a header. */
 const OP_HEADERS = new Map<string, Uint8Array>();
 function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
@@ -122,9 +121,8 @@ class Args {
 export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
 
 /** The claim routing the link occupant's delivery return is handed to (§12.10). Inbound
- *  attributed delivery is the link slot's return convention, not a grant: the occupant
- *  that saw the plaintext is the one that attributes it, and the shell's claim table is
- *  the single router. The answer settles the request the occupant returned. */
+ *  attributed delivery is the link slot's return convention, not a grant: the occupant that
+ *  saw the plaintext is the one that attributes it. */
 export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
@@ -209,9 +207,8 @@ export interface OpenLinkOptions {
  *  object is reached by an app.
  *
  *  There is no link handover across a transport update: the driver holds the link ids and
- *  the address book, both the NODE's rather than the bundle's, but live links cannot survive
- *  — the session keys are in the outgoing guest's private memory (§4.3) — so an upgrade is a
- *  reconnect from this address book. */
+ *  the address book, both the NODE's, but live links cannot survive — the session keys are
+ *  in the outgoing guest's private memory (§4.3) — so an upgrade is a reconnect. */
 export class TransportHost {
   readonly peerId: PeerId;
   port = 0;
@@ -331,10 +328,9 @@ export class TransportHost {
    *  frame — `[count u32][d…]`, each `d` =
    *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`
    *  — empty when the occupant decoded nothing deliverable. The occupant that saw the
-   *  plaintext is the one that attributes it, so the driver hands the frame straight to
-   *  the claim routing wired in `route` and answers back through `linkResp`; no second
-   *  capability is granted, because the only slot that produces such a return is the one
-   *  holding the raw-link binding. */
+   *  plaintext is the one that attributes it, so the driver hands the frame straight to the
+   *  claim routing wired in `route`; no second capability is granted, because the only slot
+   *  that produces such a return is the one holding the raw-link binding. */
   private tellDeliver(args: Args): void {
     const r = this.toTransport(args);
     if (!r) return;
@@ -348,17 +344,15 @@ export class TransportHost {
 
   private static readonly dec = new TextDecoder();
 
-  /** Route one delivery frame. Each record names an exact claim, an opaque attribution
-   *  and a payload; a record nobody serves settles as an empty answer, exactly as a
-   *  request that never reached a claimant. A malformed frame is dropped: it is the
-   *  occupant's own contract with the driver, and a bogus record must not become a
-   *  partial delivery.
+  /** Route one delivery frame. Each record names an exact claim, an opaque attribution and a
+   *  payload; a record nobody serves settles as an empty answer. A malformed frame is
+   *  dropped: it is the occupant's own contract with the driver.
    *
-   *  EVERY variable field is read by its own length, the payload included. One socket
-   *  read can carry several whole requests, so a record that ran to the end of the frame
-   *  would put the NEXT record's claim and attribution inside this one's payload — bytes
-   *  a peer wrote, letting it attribute its own request to any key it names. Nothing is
-   *  delivered past the first record that does not fit. */
+   *  EVERY variable field is read by its own length, the payload included. One socket read
+   *  can carry several whole requests, so a record that ran to the end of the frame would
+   *  put the NEXT record's claim and attribution inside this one's payload — bytes a peer
+   *  wrote, letting it attribute its own request to any key it names. Nothing is delivered
+   *  past the first record that does not fit. */
   private deliverFrom(ret: Uint8Array): void {
     if (!this.deliver || ret.length < 4) return;
     const dec = TransportHost.dec;
@@ -466,8 +460,7 @@ export class TransportHost {
    *
    *  Returns 0 — never a live id — when the driver already holds `maxRawLinks`, having CLOSED
    *  the channel it refused: registration is what takes ownership of a socket, so a refusal
-   *  that left it open would strand a descriptor. Every path that mints an id comes through
-   *  here, so the ceiling covers a guest dial, an accept and a handover alike. */
+   *  that left it open would strand a descriptor. */
   private register(channel: RawLink): number {
     if (this.channels.size >= (this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS)) {
       try { channel.close(false); } catch { /* already gone */ }
@@ -526,7 +519,7 @@ export class TransportHost {
       authority: opts.channel.authority,
       expectPeerId: opts.expectPeerId ? fromHex(opts.expectPeerId) : undefined,
       // The secret THIS link opens under: the peer's on a dial (an open peer = the zero
-      // secret said explicitly); OURS on an accept, re-read NOW from the options — a
+      // secret said explicitly); OURS on an accept, read NOW from the options, so a
       // getter-backed contact secret gates this node's accepting side with no transport
       // reload (§12.6.3). The guest falls back to its init facts if the field is empty.
       linkSecret: opts.weDialed ? (opts.contactSecret ?? ZERO32) : (this.opts.contactSecret ?? ZERO32),
@@ -577,8 +570,7 @@ export class TransportHost {
         const linkId = this.register(channel);
         // Dropped at the door, and the occupant never hears of it: the half-open tiers are
         // policy ABOVE this table, so a connection the driver could not hold is not a link
-        // to have an opinion about. Silent like every other pre-authentication refusal — a
-        // log line per connection would itself be the flood.
+        // to have an opinion about. Silent like every other pre-authentication refusal.
         if (linkId === 0) return;
         this.announce(linkId, {
           weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,

@@ -53,9 +53,9 @@ const POLYFILLS = `
     };
   }
 
-  // atob — the embedded transport bundle is inlined as base64 and decoded at module
-  // scope. Without this the decode threw, the blob read as ABSENT, and the node came up
-  // with no network — which is also what a deliberate deny-all policy looks like.
+  // atob — the embedded transport bundle is inlined as base64 and decoded at module scope.
+  // Without this the blob read as ABSENT and the node came up with no network — which is
+  // also what a deliberate deny-all policy looks like.
   if (typeof globalThis.atob === "undefined") {
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     globalThis.atob = function (b64) {
@@ -82,17 +82,14 @@ const POLYFILLS = `
     globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
   }
 
-  // console — quickjs-ng's own has \`log\` and nothing else, written to a WASI stdout
-  // wazero leaves disconnected. So console.log was discarded and console.error threw a
-  // TypeError *inside* the handler that reports a wedged transport guest: the one
-  // diagnostic saying the network is stuck was invisible twice over.
+  // console — quickjs-ng's own has \`log\` and nothing else, written to a WASI stdout wazero
+  // leaves disconnected: console.log was discarded and console.error threw a TypeError
+  // *inside* the handler that reports a wedged transport guest.
   //
   // Everything here goes to STDERR through the bridge, because stdout is the operator's
-  // channel — it carries \`bridge.log\` and, for --op, the app's raw response bytes, which
-  // an interleaved diagnostic would corrupt.
-  //
-  // Guarded on the bridge, so only the HOST realm gets it. A confined guest keeps quickjs's
-  // discarding console, which matches the JS target's realm holding no console at all.
+  // channel — it carries \`bridge.log\` and, for --op, the app's raw response bytes. Guarded
+  // on the bridge, so only the HOST realm gets it; a confined guest keeps quickjs's
+  // discarding console, matching the JS target's realm holding no console at all.
   if (typeof bridge !== "undefined" && typeof bridge.logErr === "function") {
     const show = (a) => {
       if (typeof a === "string") return a;

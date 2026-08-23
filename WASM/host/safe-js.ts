@@ -76,12 +76,11 @@ interface ExecClock {
    *  and carried as a module call's deadline, so a module runs under the budget of the
    *  segment that called it (§4.3). Infinity for an unbounded realm. */
   remaining(): number;
-  /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module
-   *  call, whose time is the guest's by §4.3 but is burned while the segment is closed.
-   *  Without it a deadline bounds one call and nothing bounds the sequence: a guest looping
+  /** Add CPU the host burned ON THE GUEST'S BEHALF to this segment's spend — a module call,
+   *  whose time is the guest's by §4.3 but is burned while the segment is closed. Without it
+   *  a deadline bounds one call and nothing bounds the sequence: a guest looping
    *  `await host.call("spinner")` advances its own clock by microseconds per turn and draws
-   *  a fresh full budget each time. Charged time depletes the same `consumedMs` the
-   *  interrupt handler reads. A parked `fs/*` or `_net` call is NOT charged — that is
+   *  a fresh full budget each time. A parked `fs/*` or `_net` call is NOT charged — that is
    *  waiting, and charging it would kill the initiator the split exists to protect. */
   charge(ms: number): void;
 }
@@ -95,9 +94,8 @@ function configureRealm(ctx: QuickJSContext, opts: SafeRealmOptions): ExecClock 
   let running = false;
   // Installed only when there is a budget to enforce: the handler crosses out of wasm into
   // JS every few thousand bytecodes, so one that can never return true is a real cost paid
-  // for a guard nobody armed. An unbounded realm is unbounded by the handler's ABSENCE.
-  //
-  // While installed it reads `running`, so a parked initiator is never interrupted.
+  // for a guard nobody armed. While installed it reads `running`, so a parked initiator is
+  // never interrupted.
   if (Number.isFinite(budgetMs)) {
     ctx.runtime.setInterruptHandler(
       () => running && consumedMs + (Date.now() - segmentStart) > budgetMs,
@@ -159,12 +157,11 @@ const disposeDisposableResult = (result: unknown): void => {
 };
 
 /** A realm's QuickJS **runtime** is created separately from its context, so `dispose()` can
- *  free both in the required order: the context first, its runtime in the same deferred
- *  turn. `JS_FreeRuntime` asserts an empty GC object list, so any object still referenced —
- *  an undisposed host handle, or a context still alive — aborts the whole wasm module and
- *  every other realm in the process with it. Deferring one macrotask lets a parked
- *  invocation's rejection continuation run first, after which nothing can re-enter (the
- *  queue fails on `disposed`) and the realm is quiescent when it dies. */
+ *  free both in the required order: the context first, its runtime in the same deferred turn.
+ *  `JS_FreeRuntime` asserts an empty GC object list, so any object still referenced — an
+ *  undisposed host handle, or a live context — aborts the whole wasm module and every other
+ *  realm with it. Deferring one macrotask lets a parked invocation's rejection continuation
+ *  run first, after which nothing can re-enter (the queue fails on `disposed`). */
 const newRuntime = (mod: QuickJSWASMModule): QuickJSRuntime => mod.newRuntime();
 
 export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm> {
@@ -176,12 +173,9 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const ctx: QuickJSContext = runtime.newContext();
   // Contexts quickjs-emscripten creates from a contextPointer that READ as undefined — the
   // phantom in `pumpJobs` below. Tracked from after the realm's own context, so that one is
-  // not one of them.
-  //
-  // The test is `options` present with `contextPointer` undefined, not `options?.`: the
-  // phantom arises from `?? newContext({ contextPointer: ctxPtr })`, so it always arrives
-  // WITH an options object, while a call passing no options at all is `getSystemContext()`,
-  // which CACHES its context on the runtime — disposing that would be a use-after-free.
+  // not one of them. The test is `options` present with `contextPointer` undefined, not
+  // `options?.`: passing no options at all is `getSystemContext()`, which CACHES its context
+  // on the runtime — disposing that would be a use-after-free.
   const phantoms = new Set<QuickJSContext>();
   {
     const newContext = runtime.newContext.bind(runtime);
@@ -194,12 +188,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const clock = configureRealm(ctx, opts);
   let disposed = false;
 
-  // Drain the guest's job queue, surfacing a failure as a thrown error.
-  //
-  // `executePendingJobs` does NOT throw — it *returns* a result whose `error` is a live
-  // QuickJS handle. Both consequences bit: an interrupted continuation (the budget firing
-  // inside a queued job) was silently swallowed, and the undisposed error handle later
-  // aborted the wasm module at dispose() time on the empty-GC-list assertion.
+  // Drain the guest's job queue, surfacing a failure as a thrown error. `executePendingJobs`
+  // does NOT throw — it *returns* a result whose `error` is a live QuickJS handle. Both
+  // consequences bit: an interrupted continuation (the budget firing inside a queued job) was
+  // silently swallowed, and the undisposed error handle later aborted the wasm module at
+  // dispose() on the empty-GC-list assertion.
   const pumpJobs = (): void => {
     const res = ctx.runtime.executePendingJobs();
     try {
@@ -221,13 +214,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // quickjs-emscripten's executePendingJobs can create a context nothing will dispose:
       // when the wasm heap grows mid-call its ctxPtrOut view detaches, ctxPtr reads
       // undefined, and the `?? newContext({contextPointer})` fallback fires. Such a context
-      // keeps GC objects alive, aborting the module at runtime free.
-      //
-      // **After the error handle, not before**, which is why this is a `finally` around the
-      // block above: when a job throws in the same call that grew the heap, `res.error` is
-      // a handle the phantom minted, so freeing the context first turns the release above
-      // into a throw on a dead Lifetime — losing the guest's real error and leaking the
-      // very handle this exists to return.
+      // keeps GC objects alive, aborting the module at runtime free. After the error handle,
+      // not before: when a job throws in the same call that grew the heap, `res.error` is a
+      // handle the phantom minted, so freeing the context first would turn the release above
+      // into a throw on a dead Lifetime.
       for (const phantom of phantoms) {
         if (phantom.alive) {
           try { phantom.dispose(); } catch { /* already gone */ }
@@ -241,7 +231,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   // settled from *inside* the realm, so anything that stops the realm mid-flight — a budget
   // interrupt during a continuation, or dispose() while a call is parked — leaves it
   // permanently pending. A bound that turns a runaway guest into a hung host is not much of
-  // a bound, so the realm tracks who is waiting and fails them explicitly.
+  // a bound, so the realm fails them explicitly.
   const pending = new Set<(err: Error) => void>();
   const failPending = (err: Error): void => {
     for (const reject of [...pending]) {
@@ -255,13 +245,10 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const settleNet = (fn: "__netResolve" | "__netReject", callId: number, arg: QuickJSHandle): void => {
     const settler = ctx.getProp(ctx.global, fn);
     const id = ctx.newNumber(callId);
-    // The continuation of a parked `await` is guest code, so it runs on the guest's budget
-    // — resumed here and suspended again when the job queue drains.
-    //
+    // The continuation of a parked `await` is guest code, so it runs on the guest's budget.
     // Every handle is released in `finally`, which is load-bearing rather than tidy: this
-    // call can be interrupted mid-flight by the budget, and a runtime freed with live
-    // handles aborts the whole wasm module at dispose() time. A leak on the interrupt path
-    // is a crash, not a leak.
+    // call can be interrupted mid-flight by the budget, and a runtime freed with live handles
+    // aborts the whole wasm module at dispose() time.
     clock.begin();
     try {
       const res = ctx.unwrapResult(ctx.callFunction(settler, ctx.undefined, id, arg));
@@ -286,9 +273,9 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
-    // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment
-    // is live, and is what a module call runs under; `charge` bills a module's burn back
-    // once it settles, since the segment is closed by then (§4.3).
+    // Host plumbing, not ABI (`CallBudget`): `remainingMs` is read HERE while the segment is
+    // live — what a module call runs under; `charge` bills a module's burn once it settles,
+    // since the segment is closed by then (§4.3).
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
     const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), budget);
     if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
@@ -340,12 +327,12 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // the guest code actually runs on.
     clock.reset();
     stageArg(ctx, payload);
-    // evalCode runs the entrypoint synchronously up to its first await; the completion
-    // value is either the bytes (sync entrypoint) or a pending guest promise (async
-    // entrypoint). resolvePromise normalizes both to a native promise, but it settles
-    // only once the job queue is pumped — hence resolvePromise → executePendingJobs →
-    // await, in that order (awaiting before the first pump would stall a sync entrypoint).
-    // Awaits are then driven by each deferred's own executePendingJobs on settle.
+    // evalCode runs the entrypoint synchronously up to its first await; the completion value
+    // is either the bytes (sync entrypoint) or a pending guest promise (async entrypoint).
+    // resolvePromise normalizes both to a native promise, but it settles only once the job
+    // queue is pumped — hence resolvePromise → executePendingJobs → await, in that order
+    // (awaiting before the first pump would stall a sync entrypoint). Awaits are then driven
+    // by each deferred's own executePendingJobs on settle.
     let evalResult: QuickJSHandle | undefined;
     let settledNative: Promise<unknown> | undefined;
     clock.begin();
@@ -361,8 +348,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // pumpJobs throws, or it aborts the module at runtime free.
       evalResult?.dispose();
     }
-    // Read before anything awaits, so no later invocation's `__invoke` can have cleared
-    // it. The realm is free from here for a deferred entrypoint.
+    // Read before anything awaits, so no later invocation's `__invoke` can have cleared it.
     const deferred = wasDeferred();
     const result = (async () => {
       let rejectThis!: (err: Error) => void;
@@ -376,9 +362,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       } finally {
         pending.delete(rejectThis);
         // An invocation that lost the race to failPending has no consumer for the settled
-        // result, so if the guest promise still settles afterwards its dup'd handle would
-        // be orphaned and abort the module at runtime free. Release it when it lands.
-        // `consumed` is set by the await continuation above, which always runs first.
+        // result, so if the guest promise still settles afterwards its dup'd handle would be
+        // orphaned and abort the module at runtime free. Release it when it lands.
         if (!consumed) {
           void (settledNative as Promise<unknown>).then(disposeDisposableResult);
         }
@@ -400,8 +385,8 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       failPending(new Error("guest realm disposed"));
       // ...but the engine must NOT die in the same turn: a parked invocation's rejection
       // continuation runs as a microtask after failPending, and a handle released after its
-      // context died would abort the whole wasm module. See `newRuntime` above for the
-      // ordering this deferral buys.
+      // context died would abort the whole wasm module. See `newRuntime` for the ordering
+      // this deferral buys.
       const timer = setTimeout(() => {
         if (disposed && ctx.alive) {
           ctx.dispose();

@@ -11,13 +11,12 @@ export interface FsStat {
 /** Sentinel when the backend cannot ask the OS for free space. */
 export const FS_AVAILABLE_UNKNOWN = Number.MAX_SAFE_INTEGER;
 
-/** Storage seam. Every method is async: IndexedDB/OPFS cannot be sync, so a sync
- *  shape would drop the browser. `MemoryFs` resolves in a microtask. */
+/** Storage seam. Every method is async: IndexedDB/OPFS cannot be sync, so a sync shape
+ *  would drop the browser. */
 export interface Fs {
   get(key: string): Promise<Uint8Array | null>;
   put(key: string, bytes: Uint8Array): Promise<void>;
-  /** Byte length of the value under `key`, or -1 if absent — existence is `size ≥ 0`, and
-   *  there is no separate `has`. */
+  /** Byte length, or -1 if absent — existence is `size ≥ 0`; there is no `has`. */
   size(key: string): Promise<number>;
   list(prefix?: string): Promise<string[]>;
   /** true if a value was removed, false if the key was already absent. */

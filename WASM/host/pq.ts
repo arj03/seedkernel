@@ -1,23 +1,21 @@
-// pq.ts — the post-quantum half of the hybrid manifest suite (§12.4, §14.1):
-// ML-DSA-65 (FIPS 204), driven from browser/mldsa65.wasm and exposed in
-// libsodium-wrappers-shaped method names so it mixes straight into the `sodium`
-// object the shared loader already consumes.
+// pq.ts — the post-quantum half of the hybrid manifest suite (§12.4, §14.1): ML-DSA-65
+// (FIPS 204), driven from browser/mldsa65.wasm and exposed in libsodium-wrappers-shaped
+// method names so it mixes straight into the `sodium` object the shared loader already
+// consumes.
 //
-// Host code, not core: a *driver* — a bump arena over a wasm module's linear memory —
-// where what is core is the vocabulary (core/domains.ts) and the manifest suite that names
-// ML-DSA-65. The field widths below are format constants of that suite, kept here only
-// because the driver cross-checks them at load.
+// Host code, not core: a *driver* — a bump arena over a wasm module's linear memory — where
+// what is core is the vocabulary (core/domains.ts) and the manifest suite that names
+// ML-DSA-65. The field widths below are format constants of that suite (bundle.ts keeps its
+// copy of them), kept here only because the driver cross-checks them at load.
 //
 // **One implementation, three targets.** The wasm is built from mldsa-native (pinned;
 // scripts/build-mldsa.mjs) and the same bytes are instantiated by the browser, by Node and
-// by wazero (native/mldsa.go). A verifier's accept/reject boundary is consensus — a bundle
-// one node admits, every node must admit — and two independent implementations of a
-// lattice scheme can disagree at the edges (malformed encodings, hint bounds, out-of-range
-// z) while both pass their own tests.
+// by wazero (native/mldsa.go). A verifier's accept/reject boundary is consensus — two
+// independent lattice implementations can disagree at the edges while both pass their own
+// tests.
 //
 // **This file imports nothing** — a caller hands it an instantiated module — which is what
-// lets it load as plain ESM in the browser and be evaluated in QuickJS natively, where a
-// bare specifier would not resolve.
+// lets it load as plain ESM in the browser and be evaluated in QuickJS natively.
 
 /** FIPS 204 ML-DSA-65 field widths. The manifest envelope is fixed-width per suite
  *  (§12.4), so these are format constants, not hints. They are cross-checked
@@ -80,8 +78,7 @@ export function createMlDsa65(instance: WebAssembly.Instance): MlDsa65Signer {
   const heapBase = e.__heap_base.value as number;
   let top = heapBase;
   // A bump allocator over the module's own heap, rewound before every call: the module
-  // never allocates and retains nothing across a call, so a bump pointer is the whole
-  // memory manager and there is no free list to corrupt.
+  // never allocates and retains nothing across a call, so there is no free list to corrupt.
   const rewind = () => { top = heapBase; };
   const alloc = (n: number): number => {
     const p = (top + 15) & ~15;
@@ -108,8 +105,7 @@ export function createMlDsa65(instance: WebAssembly.Instance): MlDsa65Signer {
       rewind();
       const sigP = put(sig), msgP = put(message), pkP = put(pk);
       // ctx = (0, 0): the runtime always signs with an empty FIPS 204 context, because its
-      // domain separation is DOMAIN_manifest inside the preimage (§16.1) and must not be
-      // split across two mechanisms.
+      // domain separation is DOMAIN_manifest inside the preimage (§16.1).
       return e.mldsa65_verify(sigP, msgP, message.length, 0, 0, pkP) === 1;
     },
 
