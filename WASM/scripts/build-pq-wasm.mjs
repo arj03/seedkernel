@@ -1,22 +1,13 @@
-// build-pq-wasm.mjs — the shared half of build-mlkem.mjs / build-mldsa.mjs. Both
-// PQ artifacts are the same shape of build: one C source from a pinned submodule
-// in pq/, a config header redirecting memcpy/memset/zeroize (and any libc the PQ
-// library expects) to local definitions, and a shim, compiled freestanding to
-// wasm32 with the same flag set. The only things that differ are those four paths
-// and the output name, so the flag list lives once here.
+// Shared half of build-mlkem.mjs / build-mldsa.mjs: one C source from a pinned pq/
+// submodule, a config header redirecting memcpy/memset/zeroize to local definitions, and
+// a shim — only those paths and the output name differ, so the flag list lives once here.
 //
-// The module has NO imports. Randomness is an argument (the shim), any context is
-// an argument, memcpy/memset are compiled in, and there is no libc: a freestanding
-// wasm32 build needs no WASI, no emscripten, and no per-target glue for a host to
-// satisfy differently from another host.
+// The wasm has NO imports: randomness and context are shim arguments, memcpy/memset are
+// compiled in, no libc — so no WASI, no emscripten, no per-host glue.
 //
-// Requires clang (>= 15, any build with the wasm32 target — `apt install clang lld`
-// suffices; no sysroot, no emsdk). Run `git submodule update --init` first.
-//
-// On Windows the compiler is expected to live in WSL, as `native/gorun.sh` expects the
-// Go toolchain: installing one natively would be a second way to produce an artifact
-// that must be byte-identical everywhere (§12.4). So the build shells out through
-// `wsl`, with paths translated. Set CC to use a native compiler instead.
+// Requires clang with a wasm32 target (no sysroot/emsdk; `apt install clang lld`).
+// On Windows the compiler lives in WSL (as native/gorun.sh expects the Go toolchain) —
+// one artifact must be byte-identical everywhere (§12.4). Set CC to use a native compiler.
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -26,25 +17,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
 const pq = resolve(root, "pq");
 
-/** `C:\dir\file` → `/mnt/c/dir/file`, wherever it appears inside an argument.
- *
- *  Per-occurrence rather than per-argument because a path is not always the whole
- *  argument: `-I<path>` prefixes one and the config define wraps one in quotes the C
- *  preprocessor needs (`-DMLD_CONFIG_FILE="…"`), so those quotes stop the match. */
+/** `C:\dir\file` → `/mnt/c/dir/file`, anywhere inside an argument (paths can be
+ *  prefixed like `-I<path>` or wrapped in quotes, so replacement is per-occurrence). */
 const toWslPath = (arg) =>
   arg.replace(/([A-Za-z]):\\([^"]*)/g,
     (_, drive, rest) => `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, "/")}`);
 
-/** @param {object} cfg
- *  @param {string} cfg.submodule   pq/<name> submodule dir (e.g. "mlkem-native")
- *  @param {string} cfg.marker      a file inside the submodule whose absence means
- *                                  the submodule was never checked out
- *  @param {string} cfg.cSource     the submodule-relative C source to compile
- *  @param {string} cfg.incDir      the submodule-relative include dir
- *  @param {string} cfg.configDefine the -D name pointing at the pq/ config header
- *  @param {string} cfg.configHeader  pq/<file> — the memcpy/memset/zeroize config
- *  @param {string} cfg.shim        pq/<file> — the exported-API shim
- *  @param {string} cfg.out         browser/<file>.wasm output */
+/** @param {object} cfg  build inputs: pq submodule + marker (presence = checked out),
+ *  cSource/incDir, the config define/header (memcpy/memset/zeroize redirect), shim, out. */
 export function buildPqWasm(cfg) {
   const src = resolve(pq, cfg.submodule);
   const out = resolve(root, cfg.out);

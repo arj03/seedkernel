@@ -1,7 +1,6 @@
-// Copy the WASM artifacts the Go loader embeds (//go:embed wasm/*.wasm) from their
-// canonical build outputs into ../native/wasm/. go:embed cannot reach across the
-// native/ module boundary to WASM/build or WASM/browser, hence the copy; all of them
-// are built from this repo's source and gitignored there.
+// Copy the WASM artifacts from their canonical build outputs into ../native/wasm/ so the
+// Go loader can embed them (go:embed cannot cross the native/ module boundary). All of
+// them are built from this repo's source and gitignored where they live.
 
 import { copyFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";

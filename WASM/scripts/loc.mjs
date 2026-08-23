@@ -1,22 +1,8 @@
-// The LOC figures in README §"One implementation, three targets", computed rather
-// than remembered.
-//
-//   npm run loc            print the table and check the README against it (exit 1 on drift)
-//   npm run loc -- --write rewrite the README's numbers to match
-//
-// Those counts carry an argument — that the shared set is small and each target's
-// plumbing is the larger, replaceable part — so a wrong one is a claim the repo cannot
-// support, and they are the most drift-prone text in the file: every refactor
-// invalidates them and none of them fails a test.
-//
-// The counting rule is the README's own sentence: "lines of code — non-test sources
-// with blank lines and comments excluded."
-//
-// The shared set is DERIVED, not listed: `build:loader-bundles` names the files
-// compiled into `host-shell.gen.js`, and the README says that list *is* the shared set,
-// so it is read from package.json and reconciled against the rows below. A wrong number
-// misinforms, but a file that quietly entered the trusted shared set and appears in no
-// row is invisible — so that fails the script too.
+// Computes the README's LOC figures ("one implementation, three targets") rather than
+// remembering them: `npm run loc` drifts → exit 1, `--write` rewrites the README.
+// Counted per the README's own rule (non-test sources, no blanks/comments), and the
+// shared set is DERIVED from build:loader-bundles and reconciled against the rows, so a
+// shared file appearing in no row fails too.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -48,11 +34,8 @@ const sharedSet = new Set(
         .map((p) => "WASM/" + p.replace(/^build\//, "").replace(/\.js$/, ".ts")));
 
 // ── the rows, exactly as the README groups them ──────────────────────────────
-//
-// `find` is the README line this row's number lives on, matched on the row's file
-// cell rather than its prose, so re-wording a row does not silently orphan its count.
-// `sharedFiles` are the shared-set members a row accounts for; `--write` puts
-// `render(n)` back into the row's last cell.
+// `find` matches the row's file cell rather than its prose (re-wording can't orphan a
+// count); `--write` puts `render(n)` back into the row's last cell.
 const cell = (n) => `| ${fmt(n)} |`;
 
 const sharedRows = [
@@ -70,10 +53,9 @@ const sharedRows = [
       files: [...sharedSet].filter((f) => f.startsWith("WASM/core/")) },
 ];
 
-// These ride in the shared bundle but are counted elsewhere on purpose: the first two are
-// the Go target's own (a per-target row), and transport-bundle.ts is one line holding the
-// signed blob's base64, which is content rather than host code. Named here so the
-// reconciliation below can tell "counted elsewhere" from "counted nowhere".
+// Ride in the shared bundle but counted elsewhere on purpose (the Go target's own;
+// transport-bundle.ts is one line of signed blob base64, content not host code) — named
+// so reconciliation can tell them from "counted nowhere".
 const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
 const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
 
@@ -156,11 +138,9 @@ for (const { file, re } of inlineChecks) {
     }
 }
 
-// Figures the README states in PROSE rather than in a table cell — same discipline as the
-// rows above, matched on the words either side so the number is the only thing rewritten.
-// The two shared totals are one claim stated twice, 30 lines apart, so both are checked;
-// the guest is one row's worth of files summed from the assembler (guest-source.mjs), so a
-// part added to it is counted without touching this file.
+// Prose figures (not cells): matched on the words either side, so the number is the only
+// thing rewritten. The shared total is one claim stated twice — both are checked — and
+// the guest figure is summed from guest-source.mjs.
 const proseFigures = [
     ["shared total (heading)", /(all three targets \()[\d,]+( LOC\))/, sharedTotal],
     ["shared total (prose)", /(therefore runs )[\d,]+( shared lines)/, sharedTotal],

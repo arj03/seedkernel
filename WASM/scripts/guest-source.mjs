@@ -1,20 +1,8 @@
-// The transport bundle's guest program, as an ordered list of its parts.
-//
-// The guest is not one file on disk: it is the concatenation of transport/src/*.js in a
-// fixed order (util → ake → framing → router → core), assembled at build time into the
-// single program the manifest hashes and the loader runs. Order is load-bearing —
-// util.js leads the program, since its "use strict" is the first statement — and the
-// parts share one scope, so a part may depend on an earlier one at runtime but never at
-// top level.
-//
-// The order lives HERE and only here, because three callers must agree on it and two
-// sign over the result: build-transport-bundle.mjs (the shipped artifact),
-// tests/transport-bundle.test.mjs (its own upgrade bundles) and loc.mjs (the README
-// row). A second copy would sign a different program than production the moment the
-// split moved, surfacing as a hash mismatch rather than as the drift it was.
-//
-// Deliberately dependency-free: loc.mjs should not load a crypto library to learn five
-// filenames.
+// The transport bundle's guest program: transport/src/*.js concatenated in a FIXED order
+// (util → ake → framing → router → core). Order is load-bearing (parts share one scope,
+// "use strict" leads), and the parts live ONLY here — three callers must agree on them,
+// or a second copy would sign a different program than production. Dependency-free so
+// loc.mjs can use it.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -29,10 +17,8 @@ export function guestSourcePaths() {
   return GUEST_PARTS.map((f) => join(wasmDir, "transport", "src", f));
 }
 
-/** The assembled guest program as TEXT — the exact source the manifest hashes (as UTF-8)
- *  and the loader runs. `authorBundle` takes this string: verification decodes the
- *  packed guest back to text before re-checking it, so text is the only shape that can
- *  round-trip. */
+/** The assembled guest program as text — the shape the manifest hashes; verification
+ *  decodes the packed guest back to text, so text is the only shape that round-trips. */
 export function readGuestSource() {
   return Buffer.concat(guestSourcePaths().map((p) => readFileSync(p))).toString();
 }

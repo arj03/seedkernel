@@ -1,45 +1,15 @@
-// Build the transport bundle — the signed artifact the host ships and loads at boot
-// (§12.6). Assembles the guest from its parts (scripts/guest-source.mjs), signs a
-// transport manifest with the transport author key, packs the container, and writes:
+// Builds the transport bundle — the signed artifact the host ships and loads at boot
+// (§12.6): guest parts + ws.wasm, signed under suite 0x02 (Ed25519 + ML-DSA-65, §12.4,
+// §14.1) with host/bundle.ts's own authorBundle — the same functions the runtime signs
+// and verifies with, not a second copy. Writes build/transport.skb and
+// host/transport-bundle.ts (b64 inline; both gitignored — host/main.ts imports the
+// latter, hence the narrow prebuild compile before the full tsc, see npm scripts).
 //
-//   build/transport.skb        the bundle blob (--transport for the CLI)
-//   host/transport-bundle.ts   base64 inline for the JS targets
-//
-// Both outputs are generated and gitignored. host/main.ts imports the second, so a
-// clean checkout cannot typecheck until this script has run — hence `build` and
-// `build:loader` sequencing it ahead of tsc.
-//
-// It also prints the author id, WHICH IS WHAT POLICY PINS: the node admits the
-// transport only when the operator's `grants.link` lists it (§12.5), so a different
-// build with a different key needs a different policy entry.
-//
-// The manifest is signed under suite `0x02`, the hybrid Ed25519 + ML-DSA-65 envelope
-// (§12.4, §14.1), using host/bundle.ts's `authorBundle` (hash, assemble, validate, sign,
-// pack — one call, carrying the derived author id), `hybridAuthorKeysFromSeed`, and
-// host/pq.ts's ML-DSA-65 driver — the SAME functions the runtime signs and verifies
-// bundles with, not a second copy. Those live in host/*.ts, and this script must run
-// BEFORE the project's full `tsc -p .` (host/main.ts imports this script's OWN
-// generated output,
-// host/transport-bundle.ts, so a clean checkout cannot typecheck until this script has
-// run). That would ordinarily make host/bundle.ts and host/pq.ts unavailable here too —
-// they are typescript, not yet built — so `npm run build:transport-bundle` first runs a
-// narrow bootstrap compile (tsconfig.transport-prebuild.json) covering only the
-// import-free subgraph this script needs (core/util.ts, core/domains.ts,
-// core/wasm-limits.ts, host/bundle.ts, host/pq.ts — none of which reach host/main.ts or
-// the not-yet-generated transport-bundle.ts), and this script imports THAT output. The
-// full `build:host` compile afterward overwrites those same build/ files with identical
-// canonical output, so nothing is left half-built.
-//
-// A PQ *identity* is as immovable as a PQ verifier: the 0x02 author id is a key-set
-// hash, so an author migrating later changes every pin and every table name built on
-// the old id. The ML-DSA half is derived from the same `--key` seed, so one key file
-// holds the whole identity.
-//
-// The author key is `--key <32-byte seed hex>`, defaulting to transport/author.key —
-// generated on first run and gitignored, so a fresh clone mints its own author.
-// Nothing in-repo pins a fixed id: a policy entry is derived from the built artifact
-// (`verifyBundle(blob).author`), as the tests do. This is a well-known developer
-// identity, not a trust boundary; the operator's pin is the trust decision.
+// The author key is `--key <seed>` or transport/author.key (generated, gitignored), so a
+// fresh clone mints its own author and nothing in-repo pins an id. The printed author id
+// is what policy pins (§12.5): a rebuild with a different key is a new author needing a
+// new grants.link entry. The 0x02 id is a key-set hash, so the ML-DSA half derives from
+// the same seed — one key file holds the whole identity.
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -103,17 +73,9 @@ async function main() {
     services: ["_net"],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // EXACTLY the services this program holds, and so exactly what an operator agrees to
-    // in granting it `link`. `link` — the sockets behind opaque link ids — is the ONLY
-    // service carrying that privilege. Inbound attributed delivery is this slot's return
-    // convention (the `linkBytes` frame this program returns), never a second grant to
-    // declare here.
-    //
-    // What this program PROVIDES back is not here: it is not a service it calls, it is
-    // the id it claims above. Its ws.wasm and its crypto are absent because neither is a
-    // grant and neither can be missing — a bare `host.call` name reaches modules from
-    // this same signed bundle, and the primitive catalog is total on any host with a
-    // guest seam. What this program needs of them is the `abi` above (§12.1).
+    // Exactly the services this program holds — `link` is the ONLY one carrying a
+    // privilege grant (inbound delivery is this slot's return convention, not a grant).
+    // What it provides back is the id it claims above, not a service (§12.1).
     guestRequires: ["node", "link", "timer"],
   });
   // The 0x02 author id: the key-set hash policy pins, table names derive from, and

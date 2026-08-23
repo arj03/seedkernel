@@ -1,30 +1,11 @@
-// bundle-loader.mjs — assemble shared host modules into one global-script JS the
-// native loader can eval inside QuickJS (which has no module loader for the
-// sandboxed FS). The compiled host modules (build/host/*.js, tsc output) are plain
-// ESM with single-line relative imports and `export class/function/const` decls, so
-// no parser is needed: drop the import lines, give each module its own scope, and
-// publish the names it exports into one shared scope the later modules read from.
-//
-// Each module keeps its own scope on purpose: a flat concat would put every module's
-// *private* top-level name in one namespace, so what a bundle may contain would be
-// limited by accidental name choices rather than by dependency. Here the only names
-// that cross a module boundary are the ones it `export`s:
-//
-//   let toHex, Transport, bootShell, …;                   // every exported name
-//   ({ toHex, fromHex } = (function () { …util.js…; return { toHex, fromHex }; })());
-//
-// The destructuring assignment targets the OUTER bindings while `return { … }`
-// reads the module's own — which is why the exports are handed out rather than
-// assigned from inside. Two modules exporting the same name is a real conflict and
-// fails the build loudly.
-//
-// One rule this imposes on the shared sources: **no aliased imports**. A name crosses
-// a module boundary as the name it was exported under, so `import { X as Y }` compiles
-// and typechecks fine and then throws `ReferenceError: Y is not defined` inside
-// QuickJS — a break only the native target sees. Import the plain name.
+// bundle-loader.mjs — assemble tsc-built host modules into one global script the native
+// loader can eval inside QuickJS (no module loader there). Each module keeps its own
+// scope; only `export`ed names cross it, handed out via destructuring into outer lets —
+// two modules exporting the same name fails the build. One rule for the shared sources:
+// **no aliased imports** (`import { X as Y }` throws ReferenceError inside QuickJS,
+// failing silently except on the native target). Files must be given in dependency order.
 //
 // Usage: node bundle-loader.mjs <out.js> <Export1,Export2,...> <file1.js> <file2.js> ...
-// Files must be given in dependency order (a module before the ones importing it).
 import { readFileSync, writeFileSync } from "node:fs";
 
 const [, , out, exportsCsv, ...files] = process.argv;
@@ -34,10 +15,8 @@ if (!out || files.length === 0) {
 }
 const exportNames = (exportsCsv || "").split(",").map((s) => s.trim()).filter(Boolean);
 
-/** The value names a compiled module exports. tsc elides type-only exports, so what
- *  is left is `export <decl> NAME` and the bare `export { A, B };` list. A
- *  re-export (`export { A } from "./x.js"`) names something another module in this
- *  bundle already defines, so it contributes nothing here. */
+/** Exported names a compiled module declares (tsc elides type-only exports); re-export
+ *  lines `export { A } from "./x.js"` contribute nothing — another module defines them. */
 function exportsOf(src) {
   const names = [];
   for (const m of src.matchAll(/^export\s+(?:async\s+function|function|class|const|let|var)\s+([A-Za-z_$][\w$]*)/gm)) {
@@ -56,8 +35,8 @@ const declared = new Map(); // exported name -> the file that defines it
 let body = "";
 for (const f of files) {
   let src = readFileSync(f, "utf8");
-  src = src.replace(/^\s*import\s[^\n]*$/gm, "");                 // drop ESM imports
-  src = src.replace(/^\/\/#\s*sourceMappingURL=.*$/gm, "");        // drop sourcemap refs
+  src = src.replace(/^\s*import\s[^\n]*$/gm, "");
+  src = src.replace(/^\/\/#\s*sourceMappingURL=.*$/gm, "");
   const names = exportsOf(src);
   for (const n of names) {
     if (declared.has(n)) {
@@ -66,10 +45,8 @@ for (const f of files) {
     }
     declared.set(n, f);
   }
-  // Drop re-export lines (`export { A, B } from "./x.js";`): the names are defined by
-  // another module in this bundle, so the binding already exists and only the
-  // (QuickJS-invalid) export syntax would survive. Then un-export the local decls —
-  // they are handed out through the returned object instead.
+  // Drop re-export lines (`export { A, B } from "./x.js";` — the binding already exists
+  // elsewhere) and un-export local decls, which are handed out via the returned object.
   src = src.replace(/^\s*export\s*\{[^}]*\}\s*from\s*['"][^'"]+['"]\s*;?\s*$/gm, "");
   src = src.replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm, "");
   src = src.replace(/^export\s+(async\s+function|function|class|const|let|var)\b/gm, "$1");
