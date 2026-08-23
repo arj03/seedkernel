@@ -34,6 +34,7 @@ const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
   = await imp("build/host/guest-seam.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
+const { readOp } = await imp("build/core/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
@@ -454,11 +455,43 @@ async function testManifestClaimIsTheRouting() {
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
       assert(threw, `a manifest claiming ${JSON.stringify(bad)} is refused as malformed`);
     }
-    // Every `_`-led spelling is an ordinary local service claim. No legacy name carries a
-    // transport role or privilege in the verifier.
-    for (const claim of ["_offer", "_host", "_net"]) {
+    // No spelling is reserved to the kernel: a `_`-led name is legal in either claim
+    // list, and it is the LIST — never the spelling — that decides who may reach it.
+    for (const claim of ["_offer", "_host", "_net", "plain"]) {
       verifyManifest(sodium, signManifest(sodium, author,
         { app: "reserved", version: 1, protocols: [claim], modules: [], guest: GUEST() }));
+      verifyManifest(sodium, signManifest(sodium, author,
+        { app: "reserved", version: 1, services: [claim], modules: [], guest: GUEST() }));
+    }
+    // The same name in both lists would be ambiguous about which reach it grants, so it
+    // is refused as malformed rather than admitted under either.
+    {
+      let threw = false;
+      try {
+        verifyManifest(sodium, signManifest(sodium, author,
+          { app: "ambiguous", version: 1, protocols: ["dual"], services: ["dual"], modules: [], guest: GUEST() }));
+      } catch (e) { threw = /malformed manifest/.test(String(e)); }
+      assert(threw, "a name claimed in both `protocols` and `services` is refused");
+    }
+    // The property that actually matters: a name in `services` is unreachable from a
+    // PEER while the SAME bundle's `protocols` name is — checked through the real
+    // delivery path (`shell.dispatch`) rather than by inspecting the claim table.
+    {
+      const pub = "reach/public", priv = "_reach-private";
+      const reachKey = appKey(author.id, "reach");
+      await shell.loadBundleBlob(packBundle({
+        [MANIFEST_FILE]: signManifest(sodium, author,
+          { app: "reach", version: 1, protocols: [pub], services: [priv], modules: [], guest: GUEST() }),
+        [GUEST_FILE]: GUEST_BYTES,
+      }));
+      const senderHex = "11".repeat(32);
+      const payload = new Uint8Array([1, 2, 3]);
+      const publicAnswer = shell.dispatch(senderHex, pub, payload);
+      assert(publicAnswer !== null, "a name in `protocols` is reachable by a peer");
+      await publicAnswer;
+      assert(shell.dispatch(senderHex, priv, payload) === null,
+        "the same bundle's `services` name is unreachable by a peer, however it is spelled");
+      shell.uninstall(reachKey);
     }
   } finally { shell.close(); }
   console.log("  OK\n");
@@ -470,8 +503,8 @@ async function testManifestClaimIsTheRouting() {
 // there is no second privilege to grant or forget. The properties that had to be pinned
 // live at the one place they can be — over the real driver, claims and transport bundle:
 // a delivery reaches exactly the named ordinary claim, it never reaches a bundle's
-// `_`-led LOCAL service claim, and a non-link app can never name a delivery path at all
-// (transport-link.test.mjs: "EXACT CLAIM", "a peer cannot reach a bundle's `_`-led local
+// `services` LOCAL claim, and a non-link app can never name a delivery path at all
+// (transport-link.test.mjs: "EXACT CLAIM", "a peer cannot reach a bundle's local service
 // claim", "CALLER BOUNDARY").
 
 // ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
@@ -498,21 +531,21 @@ async function testOneRawLinkOwner() {
     admit: admitAll,
   });
   try {
-    await shell.loadBundleBlob(blob("transport", 1, ["link/open"]));
+    await shell.loadBundleBlob(blob("transport", 1, ["link"]));
     // A link-capable bundle that claims nothing — the initiator shape. Same privilege, so
     // the same binding, so it must not land quietly.
     let refused = "";
-    try { await shell.loadBundleBlob(blob("dialer", 1, ["link/open"])); } catch (e) { refused = String(e); }
+    try { await shell.loadBundleBlob(blob("dialer", 1, ["link"])); } catch (e) { refused = String(e); }
     assert(/binding is already held by/.test(refused),
       `a second link-capable identity is refused: ${refused || "no error"}`);
     // A bundle reaching no `link` name is unaffected — the binding is the privilege's, not
     // a global lock on loading.
-    await shell.loadBundleBlob(blob("app", 1, ["clock/now"]));
+    await shell.loadBundleBlob(blob("app", 1, ["clock"]));
     // The holder's own next version replaces it in place: an upgrade is not a contest.
-    await shell.loadBundleBlob(blob("transport", 2, ["link/open"]));
+    await shell.loadBundleBlob(blob("transport", 2, ["link"]));
     // And uninstalling the holder frees it for anyone.
     shell.uninstall(appKey(author.id, "transport"));
-    await shell.loadBundleBlob(blob("dialer", 1, ["link/open"]));
+    await shell.loadBundleBlob(blob("dialer", 1, ["link"]));
   } finally { shell.close(); }
   console.log("  OK\n");
 }
@@ -696,10 +729,17 @@ async function testGuestSeam() {
   const id = generateKeyPair();
   const otherKey = generateKeyPair();
   const fs = new MemoryFs();
-  // The routing a `_`-led name resolves through — the shell's job in production, a stub
-  // here so the seam is tested for what it does: gate the name, then hand the payload to
-  // whatever claims the id. `_net` is claimed; `_nobody` is not.
-  const calls = { call: (idName) => (idName === "_net" ? Promise.resolve(U(9, 9)) : null) };
+  // The routing a local service id resolves through — the shell's job in production, a
+  // stub here so the seam is tested for what it does: gate the name, then hand the
+  // payload to whatever claims the id. `_net` and `chat/v1` are claimed; `_nobody` is not.
+  const claimed = new Set(["_net", "chat/v1"]);
+  const calls = { call: (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null) };
+  // THIS realm's declared local services (§12.10) — what tells them apart from a bare
+  // module name at the dispatch, independent of `names` (which opts out of gating below
+  // via UNRESTRICTED_NAMES and so cannot be read for this). `chat/v1` is here because a
+  // local service id is an ordinary claim: it may carry a `/` exactly like a wire
+  // protocol id, and the declaration is what the dispatch asks first.
+  const localServices = new Set(["_net", "_nobody", "chat/v1"]);
 
   // A module reachable by name, for the catalog's app-module half.
   const { host } = await makeHost();
@@ -712,7 +752,7 @@ async function testGuestSeam() {
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const seam = createGuestSeam({
     platform: { sodium, identity: id },
-    grants: { names: UNRESTRICTED_NAMES, signScope, fs, calls },
+    grants: { names: UNRESTRICTED_NAMES, localServices, signScope, fs, calls },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
@@ -807,15 +847,21 @@ async function testGuestSeam() {
     assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
     assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise (fs round-trips)");
 
-    // The CROSS-REALM call: a `_`-led name is another realm, reached on a later turn, so
-    // it is a Promise like fs. There is no `net` domain — the network is a bundle that
-    // claims `_net`, and this seam's routing answers it (§12.10).
+    // The CROSS-REALM call: a name in THIS realm's declared local services is another
+    // realm, reached on a later turn, so it is a Promise like fs. There is no `net`
+    // domain — the network is a bundle that declares the service `_net`, and this
+    // seam's routing answers it (§12.10).
     const crossed = seam("_net", U(1, 2, 3));
-    assert(crossed instanceof Promise, "a reserved id returns a Promise (the callee runs on a later turn)");
+    assert(crossed instanceof Promise, "a local service id returns a Promise (the callee runs on a later turn)");
     assertEqual([...await crossed], [9, 9], "…and resolves with what the callee's handle returned");
     let unclaimed = false;
     try { await seam("_nobody", U()); } catch { unclaimed = true; }
-    assert(unclaimed, "a reserved id no realm claims is refused by name, not left pending");
+    assert(unclaimed, "a local service id no realm claims is refused by name, not left pending");
+    // The declaration is asked BEFORE the charset, so an id spelled with a `/` — legal
+    // for any claim (§12.10) — reaches the routing rather than the host table, where it
+    // would have died as an unknown host name.
+    assertEqual([...await seam("chat/v1", U(1))], [9, 9],
+      "a declared local service id carrying a `/` still routes to the claiming realm");
 
     // A bare name reaches this app's module by its LOGICAL name, in the same `host.call`
     // shape as every other name (§12.2). The app key is the seam's, never the caller's.
@@ -843,7 +889,7 @@ async function testPolicy() {
     const host = testHost(new ModuleTable());
     const manifest = { app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST({ requires: links ? ["link/open"] : [] }) };
+      guest: GUEST({ requires: links ? ["link"] : [] }) };
     const manifestEnv = signManifest(sodium, author, manifest);
     const blob = packBundle({ [MANIFEST_FILE]: manifestEnv, [moduleFile("fwd")]: forwarderBytes, [GUEST_FILE]: GUEST_BYTES });
     const admit = parsePolicy(policyJson);
@@ -932,9 +978,9 @@ async function testRequiresPickThePrivileges() {
     [MANIFEST_FILE]: signManifest(sodium, author, {
       app: "mod", version: 1,
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      // The transport claims the reserved id it is reached by (§12.10); an ordinary app
-      // claims nothing here.
-      ...(requires.some((r) => r.startsWith("link/")) ? { protocols: ["_net"] } : {}),
+      // The transport claims the local service id it is reached by (§12.10); an ordinary
+      // app claims nothing here.
+      ...(requires.includes("link") ? { services: ["_net"] } : {}),
       guest: GUEST({ requires }),
     }),
     [moduleFile("fwd")]: forwarderBytes,
@@ -961,10 +1007,10 @@ async function testRequiresPickThePrivileges() {
     let appAsked = 0, transportAsked = 0;
     const shell = await mkTestShell(() => { appAsked++; return true; }, () => { transportAsked++; return true; });
     try {
-      await load(shell, ["fs/get", "clock/now"]);
+      await load(shell, ["fs", "clock"]);
       assert(appAsked === 1 && transportAsked === 0, "a bundle reaching no privilege is governed by the base predicate");
       appAsked = transportAsked = 0;
-      await load(shell, ["link/open"]);
+      await load(shell, ["link"]);
       assert(transportAsked === 1 && appAsked === 0, "a bundle naming the `link/*` names is governed by the `link` grant alone");
     } finally { shell.close(); }
   }
@@ -974,27 +1020,26 @@ async function testRequiresPickThePrivileges() {
   {
     const shell = await mkTestShell(admitAll, denyAll);
     try {
-      const err = await load(shell, ["link/open"]);
+      const err = await load(shell, ["link"]);
       assert(err !== null && /rejected by admission/.test(err),
         "a permissive author list does not admit a bundle naming the `link/*` names");
-      assert(await load(shell, ["fs/get", "clock/now"]) === null, "the same shell still lands an ordinary app");
+      assert(await load(shell, ["fs", "clock"]) === null, "the same shell still lands an ordinary app");
     } finally { shell.close(); }
   }
 
-  // 3. A privilege is ONE thing, so there are no halves to claim: ANY `link/*` name puts
-  //    `link` in the set, and a bundle naming one beside ordinary app authorities is
-  //    governed by the `link` grant, never by the base. Otherwise a bundle could reach
-  //    sockets while falling through to the unprivileged list.
+  // 3. A privilege is ONE thing, so there are no halves to claim: `link` beside ordinary
+  //    app services is still governed by the `link` grant alone, never by the base.
+  //    Otherwise a bundle could reach sockets while falling through to the unprivileged
+  //    list by mixing in an ordinary service.
   {
-    for (const requires of [["link/stat"], ["fs/get", "link/open"]]) {
-      let appAsked = 0, linkAsked = 0;
-      const shell = await mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
-      try {
-        await load(shell, requires);
-        assert(linkAsked === 1 && appAsked === 0,
-          `${JSON.stringify(requires)} reaches the \`link\` grant, not the base`);
-      } finally { shell.close(); }
-    }
+    const requires = ["fs", "link"];
+    let appAsked = 0, linkAsked = 0;
+    const shell = await mkTestShell(() => { appAsked++; return true; }, () => { linkAsked++; return true; });
+    try {
+      await load(shell, requires);
+      assert(linkAsked === 1 && appAsked === 0,
+        `${JSON.stringify(requires)} reaches the \`link\` grant, not the base`);
+    } finally { shell.close(); }
   }
   console.log("  OK\n");
 }
@@ -1043,7 +1088,7 @@ async function testSigningScopeFollowsSlot() {
   try {
     // The link slot's one scope is the NETWORK scope: the channel AUTH is a fact of the
     // slot, not a second name.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node/sign", "node/verify", "link/open"]));
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 1, ["node", "link"]));
     const v1 = await seam("node/sign", msg);
     assert(signs(v1, DOMAIN_LINK, networkKey, msg),
       "the link slot's node/sign signs under DOMAIN_link_scope ‖ networkKey");
@@ -1053,7 +1098,7 @@ async function testSigningScopeFollowsSlot() {
       "node/verify on the link slot checks under the same network scope");
 
     // The path a lease would be dropped on: the standing slot is replaced in place.
-    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node/sign", "node/verify", "link/open"]));
+    await shell.loadBundleBlob(blob(linkAuthor, "linkprobe", 2, ["node", "link"]));
     const v2 = await seam("node/sign", msg);
     assert(signs(v2, DOMAIN_LINK, networkKey, msg),
       "an in-place update of the link slot keeps the SAME network scope — an upgrade cannot re-scope a node");
@@ -1061,7 +1106,7 @@ async function testSigningScopeFollowsSlot() {
     // And the other arm, on a shell that already has a link occupant: an ordinary app
     // signs under its own scope, and there is only one pair of sign names — nothing under
     // a second name to reach.
-    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node/sign", "node/verify"]));
+    await shell.loadBundleBlob(blob(appAuthor, "plainapp", 1, ["node"]));
     const app = await seam("node/sign", msg);
     assert(signs(app, DOMAIN_GUEST, guestSignScope(appAuthor.id, "plainapp"), msg),
       "an ordinary app's node/sign signs under DOMAIN_guest ‖ author ‖ app");
@@ -1118,20 +1163,45 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
-  // `requires` is grants ONLY. The pure half of the seam — a bundle's own modules and the
-  // primitive catalog (§12.1) — cannot be absent from a host, so requiring one is a
-  // requirement on something that cannot fail, and the format refuses it rather than
-  // accepting a no-op.
-  for (const name of ["module", "codec", "crypto/blake2b-256", "fs"]) {
+  // `requires` speaks at SERVICE granularity (§12.2): a finer method name is now a
+  // refused manifest, since the seam gates a `host.call` by the method's service, never
+  // by the exact method, and a manifest naming one would be asking for a grant finer
+  // than the seam can enforce.
+  {
     let refused = "";
-    try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: [name] })); }
+    try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs/get"] })); }
     catch (e) { refused = e.message; }
-    assert(refused.includes(`no authority "${name}"`),
-      `a manifest requiring the non-grant "${name}" is refused at load (got: ${refused})`);
+    assert(refused.includes("names a host METHOD") && refused.includes('"fs"'),
+      `a manifest requiring the method "fs/get" is refused, naming the service to declare instead (got: ${refused})`);
   }
-  // …and the guest still CALLS them — being undeclarable is not being unavailable.
-  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs/get"] })) !== null,
-    "an authority, by exact name, is what a manifest may require");
+  // …and the SERVICE, by exact name, is what a manifest may require — the guest still
+  // calls the finer-grained method; being undeclarable at that granularity is not being
+  // unavailable.
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs"] })) !== null,
+    "a service, by exact name, is what a manifest may require");
+
+  // A bare name colliding with this bundle's OWN module name is refused: the seam's
+  // dispatch resolves a declared local service before this bundle's modules, so a
+  // collision would silently shadow the module (guest-seam.ts).
+  {
+    const withModule = (requires) => signManifest(sodium, author, {
+      app: "abi", version: 1,
+      modules: [{ name: "codec", hash: "aa" }],
+      guest: { hash, abi: GUEST_ABI_VERSION, requires },
+    });
+    let refused = "";
+    try { verifyManifest(sodium, withModule(["codec"])); } catch (e) { refused = e.message; }
+    assert(refused.includes("codec") && refused.includes("module"),
+      `a local service id colliding with this bundle's own module name is refused (got: ${refused})`);
+    assert(verifyManifest(sodium, withModule([])) !== null,
+      "…and the same module name is fine when nothing declares it as a local service too");
+  }
+
+  // Any OTHER bare or slashed name — not a known service, not a collision — is a
+  // legitimate LOCAL service id (§12.10): the vocabulary is open on that half, since
+  // whether anything actually claims it is answered at the call, never at the manifest.
+  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["_backup", "reporting/v2"] })) !== null,
+    "an arbitrary local service id verifies; nothing claiming it yet is not a manifest error");
 
   console.log("  OK\n");
 }
@@ -1668,7 +1738,7 @@ async function testSeamGating() {
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (names) => createGuestSeam({
     platform: { sodium, identity: id, peers: () => [] },
-    grants: { names, transport: stubTransport, fs: new MemoryFs() },
+    grants: { names, signScope: appSignScope(id, new Uint8Array(32), "probe"), transport: stubTransport, fs: new MemoryFs() },
     modules: { names: new Set(), call: () => null },
   });
   const U = (...xs) => new Uint8Array(xs);
@@ -1677,7 +1747,7 @@ async function testSeamGating() {
   // A PRIMITIVE is exempt from the gate by a rule about one prefix: `crypto/` reaches
   // nothing, so there is nothing to grant. A seam built for a bundle declaring NO
   // names still hashes.
-  const clockOnly = mk(["clock/now"]);
+  const clockOnly = mk(["clock"]);
   assertEqual((await clockOnly("crypto/blake2b-256", U(1, 2))).length, 32,
     "crypto/blake2b-256 resolves for a bundle declaring no crypto name — a pure transform is not a grant");
   threw = false;
@@ -1692,22 +1762,35 @@ async function testSeamGating() {
   assert(gateMsg.includes("no module by that name"),
     `a bare name passes the gate ungated and fails only on existence (got: ${gateMsg})`);
 
-  // Authorities are gated by EXACT name: declaring `node` grants nothing, declaring
-  // `node/sign` grants only it.
+  // Grants are gated by SERVICE, not by method: declaring `clock` resolves `clock/now`,
+  // and a different, undeclared service is still refused beside it.
   threw = false;
   try { await clockOnly("node/sign", U(1)); } catch { threw = true; }
-  assert(threw, "an undeclared authority (node/sign) is refused by the seam");
+  assert(threw, "an undeclared service (node) is refused by the seam");
   threw = false;
   try { await clockOnly("fs/delete", U(120)); } catch { threw = true; }
-  assert(threw, "an undeclared authority (fs/delete) is refused by the seam");
+  assert(threw, "an undeclared service (fs) is refused by the seam");
   threw = false;
   try { await clockOnly("clock/now", U()); } catch { threw = true; }
-  assert(!threw, "clock/now resolves under the declared name");
-  // A declared `clock` (bare prefix) is not the same thing as a declared `clock/now`.
-  const prefixOnly = mk(["clock"]);
+  assert(!threw, "clock/now resolves under the declared service");
+
+  // The unit a manifest grants is the WHOLE service: declaring `node` grants every
+  // `node/*` method — `node/identity` beside `node/sign` included — because there was
+  // never a finer boundary anyone held (§12.2).
+  const nodeOnly = mk(["node"]);
+  assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign resolves under the declared service");
+  assertEqual((await nodeOnly("node/identity", U())).length, 32, "…and so does node/identity, the SAME declared service");
   threw = false;
-  try { await prefixOnly("clock/now", U()); } catch { threw = true; }
-  assert(threw, "declaring a bare prefix grants no name — requires are exact");
+  try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
+  assert(threw, "a different, undeclared service (fs) is still refused beside the declared one");
+
+  // Declaring the method's exact STRING is not declaring its service: the gate checks
+  // `serviceOf(name)` against the declared set, so a manifest naming `node/sign` (rather
+  // than `node`) grants nothing at all — `requires` speaks in services.
+  const methodNameOnly = mk(["node/sign"]);
+  threw = false;
+  try { await methodNameOnly("node/sign", U(1, 2)); } catch { threw = true; }
+  assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
   // guest-controlled allocation caps. UNRESTRICTED_NAMES is the host-side caller that
   // opts out of gating *by name* — omitting grants.names entirely now throws (§12.2).
@@ -1719,27 +1802,6 @@ async function testSeamGating() {
   threw = false;
   try { await open("node/random", U(0xff, 0xff, 0xff, 0xff)); } catch { threw = true; }
   assert(threw, "node/random over the cap is refused");
-
-  // requires → names: a bundle declares the EXACT names and the seam enforces them
-  // as exact-membership checks.
-  const nodeOnly = createGuestSeam({
-    platform: { sodium, identity: id, peers: () => [] },
-    grants: {
-      names: ["node/sign"],
-      signScope: appSignScope(id, new Uint8Array(32), "probe"),
-      transport: stubTransport, fs: new MemoryFs(),
-    },
-    modules: { names: new Set(), call: () => null },
-  });
-  assertEqual((await nodeOnly("node/sign", U(1, 2))).length, 64, "node/sign is granted by its declared name");
-  assertEqual((await nodeOnly("crypto/blake2b-256", U(1, 2))).length, 32,
-    "…and hashing needs no grant at all");
-  threw = false;
-  try { await nodeOnly("fs/get", U(120)); } catch { threw = true; }
-  assert(threw, "a name outside the declared requires (fs/get) is refused");
-  threw = false;
-  try { await nodeOnly("node/identity", U()); } catch { threw = true; }
-  assert(threw, "a name beside the declared one (node/identity under node/sign) is refused");
 
   // The vocabulary is closed at LOAD, not at first use: an unknown name in a manifest is
   // a refused bundle (verifyManifest), and the seam answers "no such name" besides.
@@ -2663,20 +2725,20 @@ async function testCandidateRealmCannotActBeforeCommit() {
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(guest)), abi: GUEST_ABI_VERSION,
-        requires: ["fs/put", "link/open", "_svc"],
+        requires: ["fs", "link", "_svc"],
       },
     }),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: guest,
   });
-  // The neighbour a candidate must not reach: a REAL second bundle claiming `_svc`,
-  // installed under its own slot rather than stood in for by a host closure — dispatch
-  // has only ever had one owner kind. Its own realm is a plain counting stub; what is
-  // under test is whether the OFFSIDE candidate can reach it, not what it does once
-  // reached.
+  // The neighbour a candidate must not reach: a REAL second bundle declaring `_svc`
+  // under `services` (a co-resident guest's to reach, never a peer's), installed under
+  // its own slot rather than stood in for by a host closure — dispatch has only ever had
+  // one owner kind. Its own realm is a plain counting stub; what is under test is
+  // whether the OFFSIDE candidate can reach it, not what it does once reached.
   const neighborBlob = packBundle({
     [MANIFEST_FILE]: signManifest(sodium, author, {
-      app: "svc-neighbor", version: 1, protocols: ["_svc"],
+      app: "svc-neighbor", version: 1, services: ["_svc"],
       modules: [], guest: GUEST(),
     }),
     [GUEST_FILE]: GUEST_BYTES,
@@ -2803,7 +2865,7 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
       app: "upgrade", version,
       protocols: ["upgrade/v1"],
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-      guest: GUEST({ requires: ["timer/arm"] }),
+      guest: GUEST({ requires: ["timer"] }),
     }),
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: GUEST_BYTES,
@@ -2817,10 +2879,17 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   const realms = [];
   let failNextRealm = false;
   const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
+  // A fired deadline and an ordinary loopback invoke arrive with the SAME (zero) caller
+  // id now, so what tells them apart is the op name in the body, not a caller byte —
+  // `invoke` above sends an empty body, which has no op to read at all.
+  const opNameOf = (p) => {
+    if (p.length <= 32) return null;
+    try { return readOp(p.subarray(32)).op; } catch { return null; }
+  };
   const shell = await bootTestShell({
     createRealm: async (o) => {
       if (failNextRealm) { failNextRealm = false; throw new Error("broken candidate guest"); }
-      const r = { calls: [], disposed: false, call: async (p) => { r.calls.push(p.length > 0 && p[0] === 1 ? "timer" : "invoke"); return new Uint8Array(); }, dispose() { r.disposed = true; } };
+      const r = { calls: [], disposed: false, call: async (p) => { r.calls.push(opNameOf(p) === "timer" ? "timer" : "invoke"); return new Uint8Array(); }, dispose() { r.disposed = true; } };
       realms.push(r);
       await o.hostCall("timer/arm", arm(1, 200));
       return r;

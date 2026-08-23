@@ -42,7 +42,7 @@ func TestGuestSeamOps(t *testing.T) {
 		// test rebuilds the raw preimage from to prove node/verify applies it.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
 		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
-		__buildGuestSeam(["node/sign", "node/verify", "node/identity", "fs/put", "fs/get", "clock/now"], __id, null, __scope);
+		__buildGuestSeam(["node", "fs", "clock"], __id, null, __scope);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}
@@ -162,16 +162,29 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatalf("clock/now = %v, want nonzero u64", clk)
 	}
 
-	// Gate: a name outside the granted set is refused. A SYNCHRONOUS name, so the refusal
-	// is a thrown error rather than a rejected promise — which is what a round-tripping
-	// name would give back and what a test cannot observe in the same breath.
-	if _, err := call(nameNodeRandom, []byte{0, 0, 0, 4}); err == nil {
-		t.Fatal("node/random resolved despite not being a declared name")
+	// The unit a manifest declares is the SERVICE, so node/random resolves beside
+	// node/sign: one service under two calls, never a boundary a guest could hold half of.
+	if r := callBytes(nameNodeRandom, []byte{0, 0, 0, 4}); len(r) != 4 {
+		t.Fatalf("node/random = %d bytes, want 4", len(r))
 	}
 	// And raw net is not merely undeclared here — it is capability-wired, so no app
 	// seam is ever wired one.
 	if _, err := call(nameLinkSend, make([]byte, 8)); err == nil {
 		t.Fatal("a link/* name resolved on an app seam")
+	}
+
+	// THE gate, on a service this harness wires a real backend for, so nothing but the
+	// gate can be what refuses it: the same seam narrowed to `clock` alone answers no
+	// fs name. A SYNCHRONOUS refusal — a thrown error rather than the rejected promise a
+	// round-tripping name gives back, which a test cannot observe in the same breath.
+	if _, err := qc.Eval("narrow.js", qjs.Code(`__buildGuestSeam(["clock"], __id, null, __scope);`)); err != nil {
+		t.Fatal("narrow seam:", err)
+	}
+	if _, err := call(nameFsPut, make([]byte, 8)); err == nil {
+		t.Fatal("fs/put resolved on a seam declaring no fs service")
+	}
+	if clk := callBytes(nameClockNow, nil); len(clk) != 8 {
+		t.Fatalf("clock/now = %v on the narrowed seam, want the one service it declares", clk)
 	}
 }
 

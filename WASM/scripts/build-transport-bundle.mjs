@@ -97,28 +97,24 @@ async function main() {
   const { blob, author } = authorBundle(sodium, keys, {
     app: "transport",
     version: 1,
-    // The local service name chosen by this composition. It has no kernel semantics.
-    protocols: ["_net"],
+    // The local service name chosen by this composition. It has no kernel semantics — it
+    // is a `services` claim, reachable by a co-resident guest and by no peer, never a
+    // `protocols` claim (which is what a PEER may send to this slot).
+    services: ["_net"],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // EXACTLY the authorities this program holds, and so exactly what an operator
-    // agrees to in granting it `link`. `link/*` — the sockets behind opaque link ids —
-    // are the ONLY names carrying that privilege. Inbound attributed delivery is this
-    // slot's return convention (the `linkBytes` frame this program returns), never a
-    // second grant to declare here.
+    // EXACTLY the services this program holds, and so exactly what an operator agrees to
+    // in granting it `link`. `link` — the sockets behind opaque link ids — is the ONLY
+    // service carrying that privilege. Inbound attributed delivery is this slot's return
+    // convention (the `linkBytes` frame this program returns), never a second grant to
+    // declare here.
     //
-    // What this program PROVIDES back is not here: it is not an authority it calls, it
-    // is the id it claims above. Its ws.wasm and its crypto are absent because neither
-    // is a grant and neither can be missing — a bare `host.call` name reaches modules
-    // from this same signed bundle, and the primitive catalog is total on any host with
-    // a guest seam. What this program needs of them is the `abi` above (§12.1).
-    guestRequires: [
-      "node/random",
-      "node/sign", "node/verify",
-      "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down",
-      "timer/arm", "timer/clear",
-    ],
+    // What this program PROVIDES back is not here: it is not a service it calls, it is
+    // the id it claims above. Its ws.wasm and its crypto are absent because neither is a
+    // grant and neither can be missing — a bare `host.call` name reaches modules from
+    // this same signed bundle, and the primitive catalog is total on any host with a
+    // guest seam. What this program needs of them is the `abi` above (§12.1).
+    guestRequires: ["node", "link", "timer"],
   });
   // The 0x02 author id: the key-set hash policy pins, table names derive from, and
   // freshness is keyed by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`). Carried

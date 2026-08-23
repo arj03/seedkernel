@@ -203,22 +203,26 @@ globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
   globalThis.__guestSeam = createGuestSeam({
     // Per NODE.
     platform: { sodium, identity, now: () => Date.now() },
-    // Per REALM: the granted names straight through — a call resolves iff the name
-    // itself is one of these (or crypto/*, or one of the bundle's own modules — never
-    // grants) — plus the backends behind them.
+    // Per REALM: the granted names straight through — a host call resolves iff the
+    // name's SERVICE is one of these (or crypto/*, or one of the bundle's own modules
+    // — never grants) — plus the backends behind them.
     grants: {
       names,
+      // The names that are not host services are this realm's LOCAL service ids, split
+      // out exactly as the shell splits them from a manifest's requires (§12.10): it is
+      // what tells one from a bare module name at the dispatch.
+      localServices: new Set(names.filter((n) => !isService(n))),
       signScope: scope || undefined,
       fs,
-      // The routing a reserved (_-led) name resolves through: the shell's, in
-      // production. Absent here means nothing claims any id, which the seam reports
-      // by name rather than leaving the caller pending.
+      // The routing a local service id resolves through: the shell's, in production.
+      // Absent here means nothing claims any id, which the seam reports by name rather
+      // than leaving the caller pending.
       calls: calls || { call: () => null },
     },
     // Per APP: no app behind this harness, so a bare name reaches nothing. Nothing to
     // scope either — the seam is wired against ONE app's module map, so "a guest
     // reaches only its own modules" needs no argument here to stay true.
-    modules: { call: () => null, has: () => false },
+    modules: { names: new Set(), call: () => null },
   });
   return __guestSeam;
 };

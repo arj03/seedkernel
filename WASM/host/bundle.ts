@@ -1,13 +1,14 @@
 // App bundle format (§12.4): signed manifest envelope + modules + guest.js.
 // Every name is derived; the manifest commits to every file hash.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, GUEST_ABI_VERSION, AUTHORITY_CALLS, PRIVILEGES, isAuthority, isGrant, isReservedProtocol, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, GUEST_ABI_VERSION, PRIVILEGES, HOST_SERVICES, isService, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
     /** Logical name: both the module's file in the container (`<name>.wasm`) and the key
      *  the guest addresses it by through `host.call`. Unique within a manifest; NAME_RE
-     *  below keeps it from spelling either other kind of host-call name (§12.2). */
+     *  below keeps it from spelling a host method (§12.2), and `validateManifest` refuses
+     *  a `requires` entry that collides with one. */
     name: string;
     /** genesisHash(wasm) hex — content integrity for the module bytes (§12.4). */
     hash: string;
@@ -36,11 +37,14 @@ export interface BundleGuest {
      *  Required, not optional-with-a-default: the default would have to be the oldest ABI,
      *  exactly the population a bump exists to catch. */
     abi: number;
-    /** Exactly the authorities this guest is granted (`AUTHORITY_CALLS`, core/domains.ts).
-     *  Matched at the seam by exact match, and closed — a name this host does not grant is a
-     *  refused manifest, not a requirement that quietly grants nothing at first use.
-     *  `crypto/*` and the bundle's own module names are not declarable, so the list an
-     *  operator reads is the bundle's whole reach. Empty is the common case. */
+    /** Exactly the SERVICES this guest is granted (`HOST_SERVICES`, core/domains.ts) plus
+     *  the local service ids it calls (§12.10) — one flat list, since both are reached by
+     *  the same `host.call` and both are closed at load: a service this host does not grant
+     *  is a refused manifest, not a requirement that quietly grants nothing at first use. A
+     *  method name (`fs/get`) is refused here too — the unit a manifest declares is the
+     *  service, never the finer-grained call. `crypto/*` and the bundle's own module names
+     *  are not declarable, so the list an operator reads is the bundle's whole reach. Empty
+     *  is the common case. */
     requires: string[];
     /** The app's signed configuration, injected unchanged into the guest preamble as
      *  `const APP`. Its schema is the app's alone; the one shape the runtime insists on is
@@ -56,9 +60,15 @@ export interface BundleManifest {
     /** Monotonic version of the coherent set (§12.4), enforced at load against a persisted
      *  per-`(author, app)` high-water mark. An integer, not a label. */
     version: number;
-    /** Wire protocol id(s) this app serves (§12.10). Optional: an initiator-only
-     *  bundle claims nothing. A claim is not authority. */
+    /** Wire protocol id(s) this app serves — the names a PEER may send to this slot
+     *  (§12.10). Optional: an initiator-only bundle claims nothing. A claim is not
+     *  authority. */
     protocols?: string[];
+    /** Local service id(s) this app serves — the names a CO-RESIDENT guest may reach with
+     *  `host.call` (§12.10), never a peer. Optional; disjoint from `protocols`, since a
+     *  name in both would be ambiguous about which reach it grants. A claim is not
+     *  authority here either. */
+    services?: string[];
     modules: BundleModule[];
     /** The guest program — required. Modules are the pure transforms it drives. */
     guest: BundleGuest;
@@ -205,13 +215,13 @@ export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array 
     return sodium.crypto_generichash(32, data, null);
 }
 /** Which privileges (§12.5) a manifest's `requires` reach — the catalog values of the
- *  authorities it names (`AUTHORITY_CALLS`), read off the table and never off a prefix
- *  parsed out of a name. Empty ⇒ an ordinary app; reserved ids contribute none.
+ *  services it names (`HOST_SERVICES`), read off the table and never off a prefix parsed
+ *  out of a name. Empty ⇒ an ordinary app; local service ids contribute none.
  *
- *  Not folded into `verifyManifest`: a manifest naming `link/open` is well-formed, and
+ *  Not folded into `verifyManifest`: a manifest naming `link` is well-formed, and
  *  whether this node grants it is policy, decided where the policy is in hand (shell-core). */
 export function privilegesOf(manifest: BundleManifest): Privilege[] {
-    const reached = manifest.guest.requires.filter(isAuthority).map((n) => AUTHORITY_CALLS[n]);
+    const reached = manifest.guest.requires.filter(isService).map((s) => HOST_SERVICES[s].privilege);
     return PRIVILEGES.filter((p) => reached.includes(p));
 }
 /** The fs keyspace prefix for one app (§12.2). A hash of the app key rather than the key
@@ -243,18 +253,20 @@ const OFF_ED_SIG = OFF_ML_PK + ML_DSA_PK_LEN;
 const OFF_ML_SIG = OFF_ED_SIG + SIG_LEN;
 const OFF_JSON = OFF_ML_SIG + ML_DSA_SIG_LEN;
 /** Module names double as filenames and as the guest's module keys, so they are held to an
- *  unambiguous charset — and, since one `host.call` carries three kinds of name, to a first
- *  character that cannot be either of the other two: a `/` would spell a host authority, a
- *  leading `_` a reserved protocol id (core/domains.ts). */
+ *  unambiguous charset — and, since one `host.call` name is either a host method or a bare
+ *  name, to a first character that cannot start one: a `/` would spell a host method. A
+ *  module name colliding with a declared local service id is a different question, checked
+ *  by content at `validateManifest` — the dispatch resolves a declared local service before
+ *  this bundle's modules, so a collision would silently shadow the module. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-/** A protocol id's charset (§12.10): alphanumeric first, then alphanumerics and `._/-`, at
- *  most 64 bytes. These travel on the wire and are what a receiving host routes by, so the
+/** The claim charset (§12.10): shared by `protocols`, `services`, and a local service id in
+ *  `requires` — one shape for every name a manifest signs outside its module table.
+ *  Alphanumeric-or-`_` first, then alphanumerics and `._/-`, at most 64 bytes. A leading `_`
+ *  is admitted like any other character: it is a spelling convention this repo's own bundles
+ *  use for a local-only name (`_net`), never a kernel-known reservation. These travel on the
+ *  wire (`protocols`) or name a local call graph edge (`services`, `requires`), so the
  *  whitespace, control and lookalike characters an operator could not tell apart are out. */
-const PROTO_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,63}$/;
-/** A reserved protocol id: the same charset behind a leading `_`. These are local
- *  cross-realm service names — the only ids a guest may *call* (core/domains.ts), and ones
- *  inbound delivery refuses (shell-core.ts). Shape only: no spelling carries authority. */
-const RESERVED_PROTO_RE = /^_[A-Za-z0-9._/-]{1,63}$/;
+const CLAIM_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,63}$/;
 /** Canonical manifest bytes. The signed envelope carries these verbatim and the verifier
  *  parses the exact bytes it checked, so there is no separate canonicalisation step — the
  *  bytes *are* the manifest. */
@@ -364,17 +376,20 @@ function isValidManifest(m: unknown): m is BundleManifest {
         return false;
     if (typeof o.version !== "number" || !Number.isInteger(o.version))
         return false;
-    // The claimed protocol ids (§12.10), checked like the module names below and for the
-    // same reason: they are keys, so a duplicate is ambiguous rather than merely redundant.
-    // Absent is legal (an initiator-only app claims nothing), as is `[]`.
-    if (o.protocols !== undefined) {
-        if (!Array.isArray(o.protocols))
+    // The claimed names (§12.10): `protocols` is what a PEER may reach, `services` is what
+    // a CO-RESIDENT guest may reach with `host.call`. Checked like the module names below
+    // and for the same reason — they are keys, so a duplicate is ambiguous rather than
+    // merely redundant — and checked across BOTH lists into one set, so a name in both is
+    // refused too: it would be ambiguous which reach it grants. Absent is legal on either
+    // (an initiator-only app claims nothing, publicly or locally), as is `[]`.
+    const claimed = new Set<string>();
+    for (const list of [o.protocols, o.services]) {
+        if (list === undefined)
+            continue;
+        if (!Array.isArray(list))
             return false;
-        const claimed = new Set();
-        for (const p of o.protocols) {
-            // Both shapes are well *formed* here; who may claim the reserved one is
-            // answered in verifyManifest below.
-            if (typeof p !== "string" || !(PROTO_RE.test(p) || RESERVED_PROTO_RE.test(p)))
+        for (const p of list) {
+            if (typeof p !== "string" || !CLAIM_RE.test(p))
                 return false;
             if (claimed.has(p))
                 return false;
@@ -427,30 +442,34 @@ function validateManifest(manifest: unknown): asserts manifest is BundleManifest
     if (manifest.guest.abi !== GUEST_ABI_VERSION) {
         throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${GUEST_ABI_VERSION})`);
     }
-    // The declared requires. The vocabulary (§12.2) is closed and is the authorities alone:
-    // an unknown name — `crypto/blake2b-256` included — is a refused manifest, not a grant
-    // that quietly reaches nothing at first use. Well-formedness only: `link/open` is in the
+    // The declared requires. The vocabulary (§12.2) is closed and is the SERVICES alone,
+    // plus this bundle's own local service ids: an unknown service — `crypto/*` and a
+    // finer-grained method name (`fs/get`) included — is a refused manifest, not a grant
+    // that quietly reaches nothing at first use. Well-formedness only: `link` is in the
     // vocabulary, and whether this node grants it is the shell's call (§12.5).
+    const moduleNames = new Set(manifest.modules.map((m) => m.name));
     for (const r of manifest.guest.requires) {
-        // A reserved id grants over another *realm* rather than over a host authority, so it
-        // is not in the catalog and only its shape can be wrong. Whether anything claims it
-        // is answered at the call (guest-seam.ts): an app may legitimately be installed
-        // before the local service that answers it.
-        if (isReservedProtocol(r)) {
-            if (!RESERVED_PROTO_RE.test(r)) {
-                throw new Error(`bundle: "${r}" is not a well-formed reserved id (manifest guest.requires; "_" then alphanumerics and ._/-, at most 64 bytes)`);
-            }
+        if (isService(r))
             continue;
+        // A name whose head, up to the first "/", is a known SERVICE is a method name a
+        // manifest can no longer declare at that granularity — refused explicitly, with the
+        // fix, rather than read as an (unreachable) local service id that happens to share
+        // a host service's spelling.
+        const slash = r.indexOf("/");
+        const head = slash < 0 ? r : r.slice(0, slash);
+        if (slash >= 0 && isService(head)) {
+            throw new Error(`bundle: "${r}" names a host METHOD (manifest guest.requires) — declare the SERVICE "${head}" instead (this host's services: ${Object.keys(HOST_SERVICES).join(", ")})`);
         }
-        if (!isGrant(r)) {
-            // The authorities sharing the rejected name's prefix, not the whole list: a
-            // misspelled `fs/exists`, or a bare `fs`, is answered by the `fs/` names.
-            const prefix = r.includes("/") ? r.slice(0, r.indexOf("/") + 1) : r + "/";
-            const near = Object.keys(AUTHORITY_CALLS).filter((n) => n.startsWith(prefix));
-            const hint = near.length > 0
-                ? `this host grants: ${near.join(", ")}`
-                : `no authority under "${prefix}" exists — a pure name (crypto/*, or one of this bundle's own modules) is not a grant and is not declared`;
-            throw new Error(`bundle: this host has no authority "${r}" (manifest guest.requires; ${hint})`);
+        // Otherwise a LOCAL service id: another realm, reached over the same call
+        // (core/domains.ts). Only its shape and its non-collision with this bundle's own
+        // modules can be wrong — whether anything claims it is answered at the call
+        // (guest-seam.ts), since an app may legitimately be installed before the local
+        // service that answers it.
+        if (!CLAIM_RE.test(r)) {
+            throw new Error(`bundle: "${r}" is not a well-formed local service id (manifest guest.requires; alphanumeric-or-"_" first, then alphanumerics and ._/-, at most 64 bytes)`);
+        }
+        if (moduleNames.has(r)) {
+            throw new Error(`bundle: "${r}" is both a local service id (manifest guest.requires) and one of this bundle's own module names — the seam would resolve the local service first and the module would never be reached`);
         }
     }
 }
@@ -739,6 +758,7 @@ export interface UnsignedBundle {
     /** Monotonic per-(author, app) freshness mark (§12.4) — the caller's to bump. */
     version: number;
     protocols?: string[];
+    services?: string[];
     modules: { name: string; wasm: Uint8Array }[];
     /** The guest program's source *text*: the manifest commits to its UTF-8 encoding (see
      *  `authorBundle`), so a string is the only shape that can be authored and also verify —
@@ -779,6 +799,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
         app: input.app,
         version: input.version,
         ...(input.protocols !== undefined ? { protocols: input.protocols } : {}),
+        ...(input.services !== undefined ? { services: input.services } : {}),
         modules,
         guest,
     };

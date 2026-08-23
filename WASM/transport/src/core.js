@@ -300,24 +300,25 @@ function findLink(linkId) {
 
 // ── the one entrypoint ────────────────────────────────────────────────────────
 //
-// This program is reached exactly as an app is: the manifest claims `_net` (§12.10) and
-// `handle` is invoked with `[caller 32][body …]`. Two things follow the caller:
-//
-//   a fired deadline — the HOST's own re-entry (its `TIMER_CALLER_ID`), body `[id u32]`,
-//   and no op because it is not a call at all: it is the shell's per-realm timer table
-//   re-entering the realm that armed the deadline (shell-core.ts), the same shape every
-//   guest declaring `timer/*` gets.
-//   an op — `[opLen u8][op][args]`, THIS bundle's envelope (util.js `readOp`), which is
-//   how `send`/`peers`/`ready` from an app and the host's own events land on one
-//   entrypoint. The op is a NAME, not a tag byte: collapsing many events onto one call
-//   must not smuggle in a number two sides have to agree on, so an unimplemented op
-//   fails loud. The framing is content: it belongs to this bundle and its driver.
+// This program is reached exactly as an app is: the manifest declares `_net` under
+// `services` (§12.10) and `handle` is invoked with `[caller 32][body …]`. The body is
+// always an op envelope — `[opLen u8][op][args]`, THIS bundle's envelope (util.js
+// `readOp`) — which is how `send`/`peers`/`ready` from an app and the host's own events,
+// a fired deadline included, land on one entrypoint. A fired deadline is an ORDINARY
+// host loopback naming the `timer` op, body `[id u32]`: the shell's per-realm timer
+// table re-entering the realm that armed the deadline (shell-core.ts) writes the same
+// zero caller id as any other host event, so what says "this is a deadline" is the op
+// name, never a second caller identity. The op is a NAME, not a tag byte: collapsing
+// many events onto one call must not smuggle in a number two sides have to agree on, so
+// an unimplemented op fails loud. The framing is content: it belongs to this bundle and
+// its driver.
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
 //
 //   the HOST   32 zero bytes (shell-core.ts) — the platform's own events: the one-time
-//              node facts (`init`), sockets opening, bytes arriving, an address, and the
-//              two questions the operator's console asks (`ready`, `peers`).
+//              node facts (`init`), sockets opening, bytes arriving, an address, a fired
+//              deadline (`timer`), and the two questions the operator's console asks
+//              (`ready`, `peers`).
 //   an APP     its app key, derived host-side from the admitted manifest, exactly as an
 //              inbound frame carries the authenticated sender's key. `send` is the only
 //              op an app may name; anything else is refused, because the platform's
@@ -402,13 +403,8 @@ entry("init", (r) => {
  * everything after it is this bundle's format (util.js `callerOf`/`readOp`).
  */
 function handle(argBytes) {
-  const { fromHost, fromTimer, caller, body } = callerOf(argBytes);
+  const { fromHost, caller, body } = callerOf(argBytes);
   try {
-    // A fired deadline the host is delivering: `[id u32]`, never an op.
-    if (fromTimer) {
-      fireTimer(readU32BE(body, 0));
-      return NOTHING;
-    }
     const { op, args } = readOp(body);
     const r = new Reader(args);
     const fn = ops[op];
@@ -505,8 +501,11 @@ entry("linkClosed", (r) => {
   if (link) link.onChannelClosed();
 });
 
-// A fired deadline is handled by `handle` itself, off the caller tag — there is no
-// second entrypoint and no second invocation shape to keep in step with ops above.
+/** A fired deadline (§12.2): the shell's per-realm timer table re-entering this realm as
+ *  an ordinary host loopback, body `[id u32]`. HOST-ONLY — absent from `APP_OPS` below —
+ *  because an app naming it could fire an id it never armed, exactly the reason
+ *  `linkBytes` and the other platform events above are host-only. */
+entry("timer", (r) => fireTimer(r.u32()));
 
 /** App-facing send: deferred because the peer's response is another invocation
  *  of this realm. `deadlineMs` 0 → node default. */

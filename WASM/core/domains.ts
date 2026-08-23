@@ -28,7 +28,7 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  the caller id, which is content. A guest declares `handle` and reads
  *  `[caller 32][body …]`; everything past the caller is its own, so no further inbound
  *  vocabulary grows here. */
-export const GUEST_ABI_VERSION = 12;
+export const GUEST_ABI_VERSION = 13;
 /** Guest `crypto/` catalog. Total over this list; not a grant. Adding a name is the whole cost of a new algorithm. */
 export const PRIMITIVE_NAMES = [
     "blake2b-256",
@@ -47,44 +47,58 @@ export const PRIMITIVE_NAMES = [
 ] as const;
 
 export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
-/** The authorities. A name is a grant iff it is a key here or a reserved id (`isGrant`);
- *  `crypto/*` and the bundle's own modules are absent, and that absence is the gate.
- *  Every key must contain `/` (guest-seam.ts checks at construction). The value is the
- *  privilege an operator grants, or `"app"` for the unprivileged case. `timer/*` is
- *  `"app"` on purpose. */
-export const AUTHORITY_CALLS = {
-    "node/sign": "app",
-    "node/verify": "app",
-    "node/identity": "app",
-    "node/random": "app",
-    "fs/get": "app",
-    "fs/put": "app",
-    "fs/list": "app",
-    "fs/delete": "app",
-    "fs/size": "app",
-    "fs/stat": "app",
-    "clock/now": "app",
-    "timer/arm": "app",
-    "timer/clear": "app",
-    "link/open": "link",
-    "link/send": "link",
-    "link/close": "link",
-    "link/stat": "link",
-    "link/authenticated": "link",
-    "link/down": "link",
+/** The host SERVICES — the unit a manifest declares and an operator grants. Each key is
+ *  everything before the first `/` of the method names it fronts; `calls` is dispatch
+ *  vocabulary, not a second grant — a manifest cannot reach for `node/sign` without also
+ *  reaching `node/verify`, so there was never a finer boundary to hold. The value is the
+ *  privilege an operator grants, or `"app"` for the unprivileged case. `timer` is `"app"`
+ *  on purpose. */
+export const HOST_SERVICES = {
+    node: { privilege: "app", calls: ["sign", "verify", "identity", "random"] },
+    fs: { privilege: "app", calls: ["get", "put", "list", "delete", "size", "stat"] },
+    clock: { privilege: "app", calls: ["now"] },
+    timer: { privilege: "app", calls: ["arm", "clear"] },
+    link: { privilege: "link", calls: ["open", "send", "close", "stat", "authenticated", "down"] },
 } as const;
-export type CapabilityName = keyof typeof AUTHORITY_CALLS;
-/** Whether a name is one of the host's own authorities — membership in the table above,
- *  never a parse of the name's text. */
+export type ServiceName = keyof typeof HOST_SERVICES;
+/** The full `service/call` vocabulary, as a template-literal union over the table above —
+ *  what the dispatch table's keys are typed against (guest-seam.ts `HandlerKey`). */
+export type CapabilityName = {
+    [S in ServiceName]: `${S}/${(typeof HOST_SERVICES)[S]["calls"][number]}`;
+}[ServiceName];
+/** The full `service/call` vocabulary, flattened to a runtime list — the dispatch-table
+ *  completeness check (guest-seam.ts `HANDLER_KEYS`) and the "near names" hint on a
+ *  refused manifest (bundle.ts) both walk this rather than the table shape. */
+export const AUTHORITY_CALLS: readonly CapabilityName[] = (Object.keys(HOST_SERVICES) as ServiceName[]).flatMap(
+    (s) => (HOST_SERVICES[s].calls as readonly string[]).map((c) => `${s}/${c}` as CapabilityName),
+);
+const AUTHORITY_SET: ReadonlySet<string> = new Set(AUTHORITY_CALLS);
+/** Whether a name is one of the host's own methods — membership in the catalog above,
+ *  never a parse of the name's text. Dispatch granularity: what the seam's handler table
+ *  is keyed on, not what a manifest declares. */
 export function isAuthority(name: string): name is CapabilityName {
-    return Object.prototype.hasOwnProperty.call(AUTHORITY_CALLS, name);
+    return AUTHORITY_SET.has(name);
+}
+/** Whether a name is a host SERVICE — the vocabulary a manifest's `guest.requires` may
+ *  name. An own-property check on `HOST_SERVICES`, never a parse. */
+export function isService(name: string): name is ServiceName {
+    return Object.prototype.hasOwnProperty.call(HOST_SERVICES, name);
+}
+/** The service a host method belongs to, or null when `name` is not one — split at the
+ *  FIRST `/` and looked up in the table, never a semantic read of the text either side of
+ *  it. What the seam's gate checks a `host.call` name's SERVICE against (guest-seam.ts). */
+export function serviceOf(name: string): ServiceName | null {
+    const i = name.indexOf("/");
+    if (i < 0) return null;
+    const svc = name.slice(0, i);
+    return isService(svc) ? (svc as ServiceName) : null;
 }
 /** A PRIVILEGE — the unit an operator grants and a policy file is keyed on (policy.ts).
  *  Derived from the catalog rather than declared beside it, so the set an operator must say
  *  yes to cannot fall behind the table. */
-export type Privilege = Exclude<(typeof AUTHORITY_CALLS)[CapabilityName], "app">;
+export type Privilege = Exclude<(typeof HOST_SERVICES)[ServiceName]["privilege"], "app">;
 export const PRIVILEGES: readonly Privilege[] = [
-    ...new Set(Object.values(AUTHORITY_CALLS).filter((p): p is Privilege => p !== "app")),
+    ...new Set(Object.values(HOST_SERVICES).map((s) => s.privilege).filter((p): p is Privilege => p !== "app")),
 ];
 /** Raw links — the privilege the node's transport is built out of (§12.6). Named so the
  *  shell can wire the socket driver to whatever holds it; admission treats it as one key
@@ -92,25 +106,17 @@ export const PRIVILEGES: readonly Privilege[] = [
  *  the occupant decoded off its links is that slot's return convention, never a second
  *  privilege. */
 export const PRIVILEGE_LINK = "link" satisfies Privilege;
-// Reserved `_`-led ids: local cross-realm calls (§12.10). A claim cannot be `_`-led
-// (bundle.ts). Callable, granted in `requires`, invoked on a later turn.
-/** A reserved id — routed between local realms, never from remote delivery. */
-export function isReservedProtocol(name: string): boolean {
-    return name.charCodeAt(0) === 0x5f; // "_"
-}
-/** Whether a name is a *grant* — the question the seam's gate asks, and exactly what a
- *  manifest may declare in `guest.requires`: an authority the host owns, or a reserved id
- *  that reaches another realm. */
-export function isGrant(name: string): boolean {
-    return isAuthority(name) || isReservedProtocol(name);
-}
-/** The authorities that leave something behind. Typed against the catalog, so renaming a
- *  name here is a build error rather than a silently empty set. */
+/** The methods that leave something behind. Typed against the catalog, so renaming
+ *  a name here is a build error rather than a silently empty set. A LOCAL service id
+ *  (§12.10) is irreversible by the same rule, applied at the slot that knows which bare
+ *  names its manifest declared (`isIrreversible` here covers only the dispatch-level
+ *  half; shell-core.ts's `seamFor` folds in the slot's own local services). */
 const IRREVERSIBLE: ReadonlySet<string> = new Set<CapabilityName>(["fs/put", "fs/delete"]);
-/** Names that leave something behind. Refused until the slot commits (§3.1). Reserved
- *  ids included. Reads, `crypto/*`, `timer/*`, `link/*` are not. */
+/** Names that leave something behind, at DISPATCH granularity — refused until the slot
+ *  commits (§3.1). Reads, `crypto/*`, `timer/*`, `link/*` are not; a local service id is
+ *  the caller's to add (shell-core.ts). */
 export function isIrreversible(name: string): boolean {
-    return IRREVERSIBLE.has(name) || isReservedProtocol(name);
+    return IRREVERSIBLE.has(name);
 }
 // Manifest suite: first byte of the envelope, covered by the signature. Channel suite
 // lives in the transport bundle (ake.js), not here — §14.1.

@@ -774,12 +774,13 @@ await test("a peer-inbound answer reaches the loader through onInbound", async (
 
 // A peer names the id the TRANSPORT ITSELF claims. Nothing about the delivery return
 // reads the protocol bytes off the wire — the transport merely returns what it decoded —
-// so the refusal has to be the routing's: a bundle's `_`-led claim is a LOCAL service
-// name (§12.10). Were it reachable, this frame would land in the transport realm's own
-// `handle` with the sender's key as the caller id, which `APP_OPS` admits — `peers`
-// would enumerate the node's links and `send` would make it issue requests on the
-// caller's behalf.
-await test("a peer cannot reach a bundle's `_`-led local claim, the transport's included", async (keep) => {
+// so the refusal has to be the routing's: the transport declares `_net` under its
+// manifest's `services` list, never its `protocols` list, and inbound delivery answers
+// only what is in the latter (§12.10). Were it reachable, this frame would land in the
+// transport realm's own `handle` with the sender's key as the caller id, which
+// `APP_OPS` admits — `peers` would enumerate the node's links and `send` would make it
+// issue requests on the caller's behalf.
+await test("a peer cannot reach a bundle's local service claim, the transport's included", async (keep) => {
   const st = keep(await upPair());
   const opEnvelope = (op) => {
     const n = Buffer.from(op, "utf8");

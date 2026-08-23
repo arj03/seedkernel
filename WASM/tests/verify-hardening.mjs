@@ -34,7 +34,7 @@ const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
-const { callerOf, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
+const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -402,31 +402,28 @@ console.log("\n§12.6 — the host's pre-open send queue is bounded");
 
 console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
 {
-  // The catalog calls `timer/*` an app authority (core/domains.ts), so what is under test
-  // is that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring
+  // The catalog calls `timer` an app service (core/domains.ts), so what is under test is
+  // that an ORDINARY app gets one: no transport bundle is loaded anywhere below. Wiring
   // it off the transport driver would admit such an app and then fail it at its first
   // `host.call` — a manifest the loader accepted naming a backend nothing wired.
   const kp = testAuthor();
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
-    let spoofed = 0;
     // handle reads [caller 32][body]: ONE entrypoint, and the body is this app's own
     // op framing ([opLen u8][op][args]) — composed here with the kernel's own spelling
-    // of that convention (core/op-frame.ts, content). The TIMER caller id ([1][00...])
-    // carries a bare [id u32] instead — a deadline the host delivers, reached from the
-    // shell rather than by invoke — and it is matched over all 32 bytes, so a caller
-    // that merely STARTS with 0x01 is an ordinary caller, not a deadline.
+    // of that convention (core/op-frame.ts, content). A fired deadline re-enters this
+    // realm as an ORDINARY host loopback naming the "timer" op, body a bare [id u32] —
+    // the host writes the same zero caller id either way, so what says "this is a
+    // deadline" is the op name this app reads, never a second caller identity.
 ${guestOpFraming()}
     function handle(arg) {
-      const { fromTimer, caller, body } = callerOf(arg);
-      if (fromTimer) { fired.push((body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0); return new Uint8Array(0); }
-      if (caller[0] === 1) spoofed++;
+      const { body } = callerOf(arg);
       const { op, args: p } = readOp(body);
+      if (op === "timer") { fired.push((p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]) >>> 0); return new Uint8Array(0); }
       if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
       if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
       if (op === "fired") return new Uint8Array(fired);
-      if (op === "spoofed") return new Uint8Array([spoofed]);
       return new Uint8Array(0);
     }
   `;
@@ -451,7 +448,7 @@ ${guestOpFraming()}
   })).shell;
 
   const shell = await newShell();
-  const ticker = await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  const ticker = await shell.loadBundleBlob(mkBlob(["timer"]));
   // The op frame is this app's own format (its `handle` reads it); the invoke below
   // passes bytes the shell never interprets. Same `writeOp` the guest's inlined block
   // reads back, from the one definition of it.
@@ -472,29 +469,42 @@ ${guestOpFraming()}
   ok(after.length === 1, `a cleared id does not fire, and two arms of it are one deadline (got [${[...after]}])`);
   shell.close();
 
-  // The gate is still the manifest: a bundle that did not declare `timer/arm` is refused
-  // by NAME at the seam, not handed a table because the shell has one to give.
+  // The gate is still the manifest: a bundle that did not declare `timer` is refused by
+  // NAME at the seam, not handed a table because the shell has one to give.
   const ungated = await newShell();
   const ungatedApp = await ungated.loadBundleBlob(mkBlob([]));
   let refused = false;
   try { await ungatedApp.invoke(opInput("arm", new Uint8Array([1, 1]))); } catch { refused = true; }
-  ok(refused, "an undeclared timer/arm is refused at the seam, wired backend or not");
+  ok(refused, "an undeclared timer service is refused at the seam, wired backend or not");
   ungated.close();
 
   // Uninstall CANCELS: a pending setTimeout holds a callback that re-enters the realm, so
   // one outliving its realm is a call into a freed QuickJS context (§2.1) rather than an
   // error. Through a stub realm, since what must be observed is the entrypoint NOT being
-  // invoked — which a real realm would report only by crashing, or not at all.
+  // invoked — which a real realm would report only by crashing, or not at all. The fired
+  // deadline and the ordinary `arm` invoke both arrive with the SAME zero caller id, so
+  // the stub tells them apart by the op NAME in the body, never by a caller byte.
   let armed = null;
   const entries = [];
   const { shell: stub } = await bootShell({
     sodium, identity: kp.ed, modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    createRealm: async (o) => { armed = o.hostCall; return { call: async (p) => { entries.push(p.length > 0 && p[0] === 1 ? "timer" : "invoke"); return new Uint8Array(); }, dispose() {} }; },
+    createRealm: async (o) => {
+      armed = o.hostCall;
+      return {
+        call: async (p) => {
+          let op = "";
+          try { op = readOp(p.subarray(32)).op; } catch { /* empty body — not an op call */ }
+          entries.push(op === "timer" ? "timer" : "invoke");
+          return new Uint8Array();
+        },
+        dispose() {},
+      };
+    },
     admit: admitAll,
   });
-  const stubApp = await stub.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
+  const stubApp = await stub.loadBundleBlob(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
   await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
@@ -504,39 +514,27 @@ ${guestOpFraming()}
   stub.close();
 }
 
-// ── §12.2 — the host's caller ids are matched whole, never by prefix ────────────
+// ── §12.2 — the host's one caller id is matched whole, never by prefix ──────────
 //
-// A fired deadline reaches the guest as `[0x01][0x00 × 31]`, and the host proper as 32
-// zero bytes. Every other caller id is an app key or a peer key — a hash of facts its
-// author picks, so any BYTE of it is grindable: an author retries app names until the
-// digest starts how it likes, which costs ~256 tries for one byte. A reader that stops at
-// the first non-zero byte therefore hands the "this is the host's own timer" verdict to
-// whoever wants it, and in the transport that verdict lands on `fireTimer` — reached
-// BEFORE the op gate that would otherwise refuse an app naming a host event.
-console.log("\n§12.2 — a host caller id is matched over all 32 bytes, not by its prefix");
+// There is exactly ONE host caller id — 32 zero bytes, matched over the WHOLE 32 bytes.
+// Every other caller id is an app key or a peer key — a hash of facts its author picks,
+// so any BYTE of it is grindable: an author retries app names until the digest starts
+// how it likes, which costs ~256 tries for one byte. A reader that stopped at the first
+// zero byte would hand the "this is the host proper" verdict to whoever wants it, which
+// is why the match runs the whole prefix rather than a shortcut over its lead byte.
+console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not by its prefix");
 {
-  const timerId = new Uint8Array(32); timerId[0] = 1;
   const body = new Uint8Array([9, 9, 9, 9]);
   const withCaller = (caller) => { const a = new Uint8Array(36); a.set(caller, 0); a.set(body, 32); return a; };
 
   // The kernel's own spelling, shipped to apps as content (core/op-frame.ts).
   ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
-  ok(callerOf(withCaller(timerId)).fromTimer, "the exact timer id reads as a fired deadline");
-
-  // The grindable shapes: right first byte, wrong tail. Each of these was a timer before.
-  const spoofs = {
-    "0x01 then 0xff": (() => { const c = new Uint8Array(32).fill(0xff); c[0] = 1; return c; })(),
-    "0x01 then one late bit": (() => { const c = new Uint8Array(32); c[0] = 1; c[31] = 1; return c; })(),
-    "0x01 then a mid-byte": (() => { const c = new Uint8Array(32); c[0] = 1; c[7] = 0x40; return c; })(),
-  };
-  for (const [name, caller] of Object.entries(spoofs)) {
-    const r = callerOf(withCaller(caller));
-    ok(!r.fromTimer, `an app key beginning 0x01 (${name}) is NOT a fired deadline`);
-    ok(!r.fromHost, `and it is not the host proper either (${name})`);
-  }
   // A near-miss on the host id is not the host: one late bit is all it takes.
   const nearHost = new Uint8Array(32); nearHost[31] = 1;
   ok(!callerOf(withCaller(nearHost)).fromHost, "an app key that is zero but for its last byte is not the host");
+  const leadingZero = new Uint8Array(32); leadingZero[31] = 0xff; // zero everywhere but the LAST byte
+  ok(!callerOf(withCaller(leadingZero)).fromHost,
+    "an app key that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
 
   // The transport bundle carries its OWN copy of this reader (transport/src/util.js) —
   // content paired with its driver, so the fix has to hold there too. Evaluated out of
@@ -545,11 +543,8 @@ console.log("\n§12.2 — a host caller id is matched over all 32 bytes, not by 
   const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(utilSrc);
   ok(m !== null, "the transport bundle's own callerOf is where this test expects it");
   const transportCallerOf = new Function(`${m[0]}; return callerOf;`)();
-  ok(transportCallerOf(withCaller(timerId)).fromTimer, "the transport reads the exact timer id as a deadline");
-  for (const [name, caller] of Object.entries(spoofs)) {
-    ok(!transportCallerOf(withCaller(caller)).fromTimer,
-      `the transport refuses a 0x01-prefixed app key as a deadline (${name})`);
-  }
+  ok(transportCallerOf(withCaller(new Uint8Array(32))).fromHost, "the transport reads 32 zero bytes as the host proper");
+  ok(!transportCallerOf(withCaller(nearHost)).fromHost, "…and refuses a near-miss as the host proper");
 }
 
 summary("hardening checks");

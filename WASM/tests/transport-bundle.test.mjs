@@ -68,21 +68,16 @@ function transportBundleAt(version, keys, guestSource) {
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const { blob } = authorBundle(sodium, keys, {
     app: "transport", version,
-    // The reserved id the transport claims (§12.10) — mirror of the artifact manifest.
-    protocols: [TRANSPORT_SERVICE],
+    // The local service id the transport claims (§12.10) — mirror of the artifact
+    // manifest. A `services` claim, reachable by a co-resident guest and by no peer.
+    services: [TRANSPORT_SERVICE],
     modules: [{ name: "ws", wasm: wsWasm }],
     guestSource: guest,
-    // Exactly the authorities the transport guest holds — a mirror of the artifact
-    // manifest (scripts/build-transport-bundle.mjs). `link/*` is what carries the
+    // Exactly the services the transport guest holds — a mirror of the artifact
+    // manifest (scripts/build-transport-bundle.mjs). `link` is what carries the
     // `link` privilege the admission dispatch reads (§12.5); inbound delivery is this
     // slot's return convention, not a name to declare.
-    guestRequires: [
-      "node/random",
-      "node/sign", "node/verify",
-      "link/open", "link/send", "link/close", "link/stat",
-      "link/authenticated", "link/down",
-      "timer/arm", "timer/clear",
-    ],
+    guestRequires: ["node", "link", "timer"],
   });
   return blob;
 }

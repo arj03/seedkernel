@@ -150,7 +150,7 @@ func serveNode(t *testing.T, authorID []byte) nodeStatus {
 func TestServeGuestApp(t *testing.T) {
 	author := testAuthor(t)
 	st := serveNode(t, author.id())
-	bundlePath, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
+	bundlePath, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
 	holderKey := appKeyFor(author.id(), "holderapp")
 	// The load is the whole of it (§12.10): the manifest claims `holderapp`, so the
 	// bundle that landed is already the destination for that protocol, and its guest is
@@ -191,7 +191,7 @@ func TestServeRoutesEachProtocolToItsOwnApp(t *testing.T) {
 	// "fwd" module, which echoes its input — so the echo app's response IS whatever the
 	// shell handed the guest. Each protocol reaches its own app because each manifest
 	// claims its own id (§12.10) and the two claims cannot collide.
-	guestBundle, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs/put", "fs/get"})
+	guestBundle, _ := writeBundle(t, author, "holderapp", 1, holderGuestSource, []string{"fs"})
 	holderKey := appKeyFor(author.id(), "holderapp")
 	if status := loadBundle(guestBundle); status != loadedLine("holderapp", 1, holderKey, "holderapp") {
 		t.Fatalf("guest bundle load: %s", status)

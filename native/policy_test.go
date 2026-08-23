@@ -58,14 +58,14 @@ func TestPolicyLinkIsASeparatelyGrantedPrivilege(t *testing.T) {
 	if err := applyPolicy(`{"authors":["` + authorHex + `"]}`); err != nil {
 		t.Fatalf("applyPolicy: %v", err)
 	}
-	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link/open"})
+	linkBundle, _ := writeBundle(t, author, "linkapp", 1, "", []string{"link"})
 	if status := loadBundle(linkBundle); !strings.Contains(status, "rejected by admission") {
 		t.Fatalf("an app-allowlisted author must not thereby become the transport: %s", status)
 	}
 
 	// A privilege is ONE thing, so there is no partial claim to refuse and nothing that
-	// could fall through to the unprivileged base: a single `link/*` name is the whole
-	// claim, which is what the one-name bundle above already proves.
+	// could fall through to the unprivileged base: the single `link` service is the whole
+	// claim, which is what the one-service bundle above already proves.
 
 	// The OTHER half: granting the privilege is still not enough. This node booted the
 	// artifact's own transport, so the pin names that author and no other — an operator

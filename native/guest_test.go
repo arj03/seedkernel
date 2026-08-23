@@ -60,7 +60,7 @@ func TestGuestPutGetAndConfinement(t *testing.T) {
 	// Host realm: build the guest seam granting fs/put + fs/get (no net).
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam(["fs/put", "fs/get"], __id, null);
+		__buildGuestSeam(["fs"], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}

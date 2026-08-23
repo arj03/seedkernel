@@ -232,13 +232,17 @@ function loadNodeKeys(host: CliHost, keyPath: string): NodeKeys {
 }
 
 /** The one console line a successful load prints (§12.4, §12.10): the app, its version, the
- *  app key an operator would pass to `--uninstall`, and what the load CLAIMED to serve.
- *  The protocols come from the manifest, so a node that will answer nothing says so at the
- *  load rather than at the first frame. */
+ *  app key an operator would pass to `--uninstall`, and what the load CLAIMED: what a PEER
+ *  may reach (`protocols`) always, and what a co-resident guest may reach (`services`) when
+ *  there is one — two audiences, so folding them into one list would leave a reader to
+ *  guess which name a peer can send to. Both come from the manifest, so a node says what it
+ *  will and will not answer at the load rather than at the first frame. */
 export function loadedLine(b: AppHandle): string {
-  const serves = b.manifest.protocols ?? [];
-  return `${b.manifest.app} v${b.manifest.version}  key ${b.key}` +
-    `  serves ${serves.length ? serves.join(", ") : "(nothing — this bundle claims no protocol)"}`;
+  const protocols = b.manifest.protocols ?? [];
+  const services = b.manifest.services ?? [];
+  const serves = protocols.length ? protocols.join(", ") : "(nothing — this bundle claims no protocol)";
+  return `${b.manifest.app} v${b.manifest.version}  key ${b.key}  serves ${serves}` +
+    (services.length ? `  locally ${services.join(", ")}` : "");
 }
 
 /** Run the operator flow to completion. Throws on anything the operator got wrong — a bad

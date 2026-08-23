@@ -250,10 +250,17 @@ console.log("\n— the load line —");
   const author = new Uint8Array(32).fill(0xab);
   const key = `${toHex(author)}:chat`;
   const line = loadedLine({ key, author, manifest: { app: "chat", version: 3, protocols: ["chat-v1", "chat-v2"] } });
-  ok(line === `chat v3  key ${key}  serves chat-v1, chat-v2`, "app, version, app key and protocols");
+  ok(line === `chat v3  key ${key}  serves chat-v1, chat-v2`,
+    "app, version, app key and the public protocols");
   const quiet = loadedLine({ key, author, manifest: { app: "tool", version: 1 } });
   ok(quiet.endsWith("serves (nothing — this bundle claims no protocol)"),
     "a bundle claiming no protocol says so at the load, not at the first frame");
+  // The two audiences are labelled apart: a transport-shaped bundle answers nothing
+  // publicly yet serves a local service, and folding the two into one list would leave a
+  // reader guessing which of the names a peer can send to.
+  const local = loadedLine({ key, author, manifest: { app: "transport", version: 1, services: ["_net"] } });
+  ok(local.endsWith("serves (nothing — this bundle claims no protocol)  locally _net"),
+    "a local service claim is shown apart from the public protocols");
 }
 
 summary("cli");

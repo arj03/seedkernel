@@ -22,7 +22,7 @@ func TestGuestRealmChainedFsCallsAdvanceWithNothingElseDrivingTheLoop(t *testing
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
-		__buildGuestSeam(["fs/put", "fs/get", "fs/size"], __id, null);
+		__buildGuestSeam(["fs"], __id, null);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
 	}

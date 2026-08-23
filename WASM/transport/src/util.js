@@ -118,26 +118,21 @@ Reader.prototype.blob = function () {
 // tag byte: collapsing many events onto one call must not smuggle in a number two sides
 // have to agree on, so an unimplemented op fails loud.
 
-/** The three kinds of caller, told apart by those 32 bytes and nothing else:
- *  the HOST proper (`[0x00 × 32]`, platform events and loopbacks), a fired TIMER
- *  (`[0x01][0x00 × 31]`, the host's own re-entry for a deadline this program armed),
- *  and an APP (its app key, derived host-side from the admitted manifest, exactly as an
- *  inbound frame carries the authenticated sender's key).
+/** The two kinds of caller, told apart by those 32 bytes and nothing else: the HOST
+ *  proper (`[0x00 × 32]`, platform events and loopbacks — a fired deadline re-enters this
+ *  way too, naming the host-only `timer` op like any other event, §12.2) and an APP (its
+ *  app key, derived host-side from the admitted manifest, exactly as an inbound frame
+ *  carries the authenticated sender's key).
  *
- *  Both host ids are matched over the WHOLE 32 bytes. An app key is a hash of facts its
- *  author picks, so a prefix test is a name an app can grind its way into: matching only
- *  the first byte of the timer id would let any app whose key happens to start `0x01`
- *  have its calls read as a deadline this program armed — reaching `fireTimer` past the
- *  op gate, which runs after. */
+ *  The host id is matched over the WHOLE 32 bytes. An app key is a hash of facts its
+ *  author picks, so a prefix test is a name an app can grind its way into. */
 function callerOf(arg) {
   const caller = arg.subarray(0, 32);
   let fromHost = true;
-  let fromTimer = true;
   for (let i = 0; i < 32; i++) {
     if (caller[i] !== 0) fromHost = false;
-    if (caller[i] !== (i === 0 ? 1 : 0)) fromTimer = false;
   }
-  return { fromHost, fromTimer, caller, body: arg.subarray(32) };
+  return { fromHost, caller, body: arg.subarray(32) };
 }
 
 /** `[opLen u8][op ascii][args …]` — this bundle's one envelope. Malformed framing

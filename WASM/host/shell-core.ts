@@ -4,12 +4,13 @@
 // bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
-import { createGuestSeam, slotSignScope, HOST_CALLER_ID, TIMER_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
+import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isIrreversible, isReservedProtocol, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
+import { isIrreversible, isService, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
+import { writeOp } from "../core/op-frame.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
@@ -183,7 +184,8 @@ export interface Shell {
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
      *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
-     *  which a bundle's `_`-led LOCAL service claim is not, however it is spelled.
+     *  which a bundle's `services` claim is not: that list is a CO-RESIDENT guest's to
+     *  reach, never a peer's.
      *
      *  Every app is a guest, so the answer is always the realm's — a Promise the transport
      *  driver resumes on, never raw bytes. */
@@ -359,7 +361,12 @@ function createShell(opts: CreateShellOptions & {
     let inFlight = Promise.resolve();
     const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
     const findSlot = (appKey: string) => slots.find((slot) => keyOf(slot) === appKey);
-    const slotClaims = (slot: AppSlot) => slot.verifiedBundle.manifest.protocols ?? [];
+    /** Every name a manifest claims, public and local together (§12.10) — the union the
+     *  `claims` map is keyed on, one owner per name across both lists. `protocols` and
+     *  `services` are disjoint by construction (`validateManifest`), so this is a plain
+     *  concatenation, never a merge that could collapse two different reaches into one. */
+    const manifestClaims = (manifest: LoadedBundle["manifest"]) => [...(manifest.protocols ?? []), ...(manifest.services ?? [])];
+    const slotClaims = (slot: AppSlot) => manifestClaims(slot.verifiedBundle.manifest);
     const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
     const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
     /** The slot the platform's raw-link events go to. Exclusive, like a claim: the driver
@@ -378,14 +385,16 @@ function createShell(opts: CreateShellOptions & {
     const newSlot = (loaded: LoadedBundle, pureModules: PureModules, onInbound: LoadBundleOptions["onInbound"]): AppSlot => {
         let slot: AppSlot;
         const timers = createRealmTimers((id) => {
-            const args = new Uint8Array(4);
-            writeU32BE(args, 0, id);
-            // The one entrypoint, with the TIMER caller id: a fired deadline is an event
-            // the host delivers into the guest, not a host authority — the callee reads
-            // the tag from the caller prefix (guest-seam.ts). A guest's `handle` may throw
-            // on it; there is no caller left to reject — the arming call returned turns
-            // ago — so report and swallow.
-            void slot.realm?.call(concatBytes([TIMER_CALLER_ID, args])).catch((err: unknown) => {
+            const idBytes = new Uint8Array(4);
+            writeU32BE(idBytes, 0, id);
+            // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
+            // an event the host delivers into the guest, not a host authority, so it carries
+            // the HOST's caller id and names itself by OP rather than by a second caller id
+            // — the callee reads the name from the body it already parses every other event
+            // through (`writeOp`, core/op-frame.ts, the same spelling `--op` uses). A
+            // guest's `handle` may throw on it; there is no caller left to reject — the
+            // arming call returned turns ago — so report and swallow.
+            void slot.realm?.call(concatBytes([HOST_CALLER_ID, writeOp("timer", idBytes)])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
@@ -443,6 +452,13 @@ function createShell(opts: CreateShellOptions & {
     const seamFor = (slot: AppSlot): HostCall => {
         const b = slot.verifiedBundle;
         const links = hasLink(slot);
+        // THIS realm's own local service ids — the `requires` entries that are not host
+        // services (`validateManifest` already refused any other kind of entry). Computed
+        // once per slot: it is what tells a bare `host.call` name apart from this bundle's
+        // own module (guest-seam.ts dispatch), and what the irreversibility guard below
+        // folds in, since a local cross-realm call leaves something behind in the callee
+        // exactly like `fs/put` does in this realm.
+        const localServices = new Set(b.manifest.guest.requires.filter((r) => !isService(r)));
         // The 32 bytes this realm is attributed by when it calls another: the app key,
         // hashed. The same shape as the sender key prepended to an inbound frame, so a
         // callee reads one field whether the caller was a peer or a co-resident app. Zero
@@ -455,10 +471,12 @@ function createShell(opts: CreateShellOptions & {
                 now: platform.now ?? (() => Date.now()),
             },
             grants: {
-                // The declared requires ARE the gate — a `host.call` resolves iff the name
-                // is one of these. `crypto/*` and the bundle's own module names are exempt:
-                // a fixed catalog and the app's own code, never grants.
+                // The declared requires ARE the gate — a `host.call` naming a host method
+                // resolves iff the method's SERVICE is one of these. `crypto/*` and the
+                // bundle's own module names are exempt: a fixed catalog and the app's own
+                // code, never grants.
                 names: new Set(b.manifest.guest.requires),
+                localServices,
                 // What node/sign signs under: this slot's ONE scope, derived at load —
                 // an ordinary app's own `DOMAIN_guest ‖ author ‖ app`, the link slot's
                 // `DOMAIN_link_scope ‖ networkKey` (§12.2). The host chooses what the
@@ -494,7 +512,11 @@ function createShell(opts: CreateShellOptions & {
         // host invokes the freshly stood slot's `handle` once with them, as the `init`
         // op's payload (initLinkSlot), before the binding is published.
         return (name, payload, budget) => {
-            if (!slot.active && isIrreversible(name)) {
+            // A local service id leaves something behind in the CALLEE the same way
+            // `fs/put` leaves something behind in this realm — folded in here rather than
+            // into `isIrreversible` itself, which knows only the dispatch-level catalog and
+            // nothing about any one slot's own `requires`.
+            if (!slot.active && (isIrreversible(name) || localServices.has(name))) {
                 throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
             }
             return fullSeam(name, payload, budget);
@@ -539,8 +561,8 @@ function createShell(opts: CreateShellOptions & {
         // and silence are one fact at the boundary.
         return deliverInbound(claim, attribution, payload);
     });
-    /** Cross-realm call by reserved id. Host prepends caller's 32-byte id — the local half
-     *  of `callClaimant`'s one table, the same claim → slot lookup a peer-inbound frame
+    /** Cross-realm call by local service id. Host prepends caller's 32-byte id — the local
+     *  half of `callClaimant`'s one table, the same claim → slot lookup a peer-inbound frame
      *  resolves through (`deliverInbound`). */
     const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
         return callClaimant(id, callerId, payload);
@@ -548,7 +570,7 @@ function createShell(opts: CreateShellOptions & {
     /** Refuse a candidate contesting a claim or the raw-link binding another identity
      *  holds (§12.10). Asked before candidate code runs, then again in the commit window. */
     const refuseContested = (loaded: LoadedBundle, key: string) => {
-        for (const claim of loaded.manifest.protocols ?? []) {
+        for (const claim of manifestClaims(loaded.manifest)) {
             const incumbent = claims.get(claim);
             if (incumbent && keyOf(incumbent) !== key) {
                 throw new Error(`shell: claim '${claim}' is already held by '${keyOf(incumbent)}'`);
@@ -606,15 +628,18 @@ function createShell(opts: CreateShellOptions & {
         return slot ? callFramed(slot, attribution, payload) : null;
     };
     /** Inbound from outside this node (the link occupant's delivery return, `dispatch`).
-     *  `_`-led claims are local and refused here with no exception (§12.10).
+     *  A claim under the resolved slot's `services` — never its `protocols` — is local and
+     *  refused here with no exception (§12.10): the manifest's own signed lists are the
+     *  source of truth for which audience may reach a name, so this reads the slot's
+     *  `protocols` rather than keeping a second structure in step with it.
      *
      *  Once the answer resolves it is also handed to the slot's own `onInbound`
      *  (`LoadBundleOptions.onInbound`), if the load that installed it named one — see there
      *  for why the seam exists and what it promises not to do. */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
-        if (isReservedProtocol(claim)) return null;
         const slot = claims.get(claim);
         if (!slot) return null;
+        if (!(slot.verifiedBundle.manifest.protocols ?? []).includes(claim)) return null;
         const answer = callFramed(slot, attribution, payload);
         if (slot.onInbound) {
             const onInbound = slot.onInbound;
