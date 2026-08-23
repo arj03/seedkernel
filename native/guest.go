@@ -399,7 +399,18 @@ func (g *guestRealm) settleAll(msg string) {
 	}
 }
 
-// pump drains this realm's job queue under its execution budget.statements
+// pump drains this realm's job queue under its execution budget.
+//
+// The loop calls it instead of Context.Pump because a queued job IS guest code: the
+// continuation after `await Promise.resolve()` never passes through settleNet, so pumping
+// the context directly would run it outside every guard the realm has — one await would
+// buy an unbounded loop. A dead realm is skipped; markDead already settled its callers.
+//
+// A pump that FAILS wakes the loop, which is load-bearing for the budget: the interrupt
+// unwinds as a throw that rejects the entrypoint's promise, and delivering that rejection
+// is itself more queued work after this round has drained. A guest spinning on its own
+// generates no I/O, so without the nudge the caller waits out its whole timeout for a
+// call the engine already stopped. A clean pump wakes nobody.
 func (g *guestRealm) pump() {
 	if g.rt == nil || g.dead || !g.rt.Alive() {
 		return

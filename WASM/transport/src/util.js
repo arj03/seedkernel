@@ -122,13 +122,20 @@ Reader.prototype.blob = function () {
  *  the HOST proper (`[0x00 × 32]`, platform events and loopbacks), a fired TIMER
  *  (`[0x01][0x00 × 31]`, the host's own re-entry for a deadline this program armed),
  *  and an APP (its app key, derived host-side from the admitted manifest, exactly as an
- *  inbound frame carries the authenticated sender's key). */
+ *  inbound frame carries the authenticated sender's key).
+ *
+ *  Both host ids are matched over the WHOLE 32 bytes. An app key is a hash of facts its
+ *  author picks, so a prefix test is a name an app can grind its way into: matching only
+ *  the first byte of the timer id would let any app whose key happens to start `0x01`
+ *  have its calls read as a deadline this program armed — reaching `fireTimer` past the
+ *  op gate, which runs after. */
 function callerOf(arg) {
   const caller = arg.subarray(0, 32);
   let fromHost = true;
-  let fromTimer = false;
+  let fromTimer = true;
   for (let i = 0; i < 32; i++) {
-    if (caller[i] !== 0) { fromHost = false; if (i === 0 && caller[i] === 1) fromTimer = true; break; }
+    if (caller[i] !== 0) fromHost = false;
+    if (caller[i] !== (i === 0 ? 1 : 0)) fromTimer = false;
   }
   return { fromHost, fromTimer, caller, body: arg.subarray(32) };
 }

@@ -315,10 +315,6 @@ export const HOST_CALLER_ID = new Uint8Array(32);
  *  "the host, tag timer". The payload behind it is the timer id. */
 export const TIMER_CALLER_ID = new Uint8Array(32);
 TIMER_CALLER_ID[0] = 1;
-/** `[opLen u8][op][args]` read back — the host-side twin of the preamble's `readOp`, for
- *  host code reading an op envelope a guest wrote. Same bytes, same failure: malformed
- *  framing throws rather than yielding a truncated name that the caller would then see
- *  reported as an unimplemented op. */
 /** Authority catalog, re-exported from core/domains.ts. Grants are these names
  *  plus reserved ids; `crypto/*` and the bundle's own modules are not. */
 export { AUTHORITY_CALLS, PRIVILEGES } from "../core/domains.js";

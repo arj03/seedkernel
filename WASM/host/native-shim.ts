@@ -14,6 +14,7 @@ import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../cor
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
+import { writeOp } from "../core/op-frame.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
@@ -525,16 +526,10 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
 
 /** Native test seam: drive a slot through the host invocation path. Pure modules stay
  *  private; no module lookup crosses this boundary. The "test" op frame is THIS test
- *  surface's own spelling (the shell passes bytes unread) — what the probe guests parse. */
-const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) => {
-    const p = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-    const op = "test";
-    const framed = new Uint8Array(1 + op.length + p.length);
-    framed[0] = op.length;
-    for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
-    framed.set(p, 1 + op.length);
-    return theShell().invoke(framed, appKey);
-};
+ *  surface's own spelling (the shell passes bytes unread) — what the probe guests parse,
+ *  composed with the one definition of that convention (core/op-frame.ts). */
+const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) =>
+    theShell().invoke(writeOp("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload)), appKey);
 
 // ── the operator flow ────────────────────────────────────────────────────────
 /** This platform, as `cli.ts` needs it: files, a console line, raw stdout, entropy, and

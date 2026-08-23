@@ -209,23 +209,31 @@ class ReqRes {
       const payload = frame.slice(6 + idLen);
       // The delivery RETURN frame, not a call: the relation here is that this program
       // returns a request its host must route — `[noReply u8][corr u32][claimLen u8]
-      // [claim][attrLen u32][attribution][payload]` — and the answer comes back as the
-      // host's own `linkResp` event on a later turn, never re-entering this realm
-      // (realm-queue). This program is the link occupant, so it is the one that saw the
-      // plaintext and so the one that attributes the request; the host prepends that
-      // attribution to the claim handler's input. The KEY the pending answer is filed
-      // under is the authenticated sender's, so a corr collision between two peers never
-      // answers one peer with the other's response. A noReply request has nothing
-      // waiting for it on the wire, so nothing is filed — the host still delivers it and
-      // answers nothing, exactly as the request asked.
+      // [claim][attrLen u32][attribution][payloadLen u32][payload]` — and the answer
+      // comes back as the host's own `linkResp` event on a later turn, never re-entering
+      // this realm (realm-queue). This program is the link occupant, so it is the one
+      // that saw the plaintext and so the one that attributes the request; the host
+      // prepends that attribution to the claim handler's input. The KEY the pending
+      // answer is filed under is the authenticated sender's, so a corr collision between
+      // two peers never answers one peer with the other's response. A noReply request has
+      // nothing waiting for it on the wire, so nothing is filed — the host still delivers
+      // it and answers nothing, exactly as the request asked.
+      //
+      // EVERY variable field is length-prefixed, the payload included: one socket read can
+      // carry several whole requests, so `packDeliveries` returns several of these records
+      // in one frame. A record whose last field ran to the end of the frame would make the
+      // NEXT record's claim and attribution readable out of this one's remote-controlled
+      // payload — a peer choosing whom its own bytes are attributed to.
       const head = new Uint8Array(1 + 4 + 1);
       head[0] = noReply ? 1 : 0;
       writeU32BE(head, 1, corr);
       head[5] = proto.length;
       const attrHead = new Uint8Array(4);
       writeU32BE(attrHead, 0, PK_LEN);
+      const payloadHead = new Uint8Array(4);
+      writeU32BE(payloadHead, 0, payload.length);
       if (!noReply) this.pendingIn.set(from + ":" + corr, { noReply });
-      return concatBytes([head, proto, attrHead, fromHex(from), payload]);
+      return concatBytes([head, proto, attrHead, fromHex(from), payloadHead, payload]);
     }
     return null;
   }

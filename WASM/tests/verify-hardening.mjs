@@ -34,6 +34,7 @@ const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
 const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
+const { callerOf, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -409,19 +410,23 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const guestSrc = `
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
+    let spoofed = 0;
     // handle reads [caller 32][body]: ONE entrypoint, and the body is this app's own
-    // op framing ([opLen u8][op][args]). The TIMER caller id ([1][00...]) carries a bare
-    // [id u32] instead — a deadline the host delivers, reached from the shell rather
-    // than by invoke.
+    // op framing ([opLen u8][op][args]) — composed here with the kernel's own spelling
+    // of that convention (core/op-frame.ts, content). The TIMER caller id ([1][00...])
+    // carries a bare [id u32] instead — a deadline the host delivers, reached from the
+    // shell rather than by invoke — and it is matched over all 32 bytes, so a caller
+    // that merely STARTS with 0x01 is an ordinary caller, not a deadline.
+${guestOpFraming()}
     function handle(arg) {
-      const c = arg.subarray(0, 32);
-      let fromHost = true, fromTimer = false;
-      for (let i = 0; i < 32; i++) { if (c[i] !== 0) { fromHost = false; if (i === 0 && c[i] === 1) fromTimer = true; break; } }
-      if (fromTimer) { fired.push((arg[32] << 24 | arg[33] << 16 | arg[34] << 8 | arg[35]) >>> 0); return new Uint8Array(0); }
-      const n = arg[32], op = String.fromCharCode(...arg.subarray(33, 33 + n)), p = arg.subarray(33 + n);
+      const { fromTimer, caller, body } = callerOf(arg);
+      if (fromTimer) { fired.push((body[0] << 24 | body[1] << 16 | body[2] << 8 | body[3]) >>> 0); return new Uint8Array(0); }
+      if (caller[0] === 1) spoofed++;
+      const { op, args: p } = readOp(body);
       if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
       if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
       if (op === "fired") return new Uint8Array(fired);
+      if (op === "spoofed") return new Uint8Array([spoofed]);
       return new Uint8Array(0);
     }
   `;
@@ -448,14 +453,9 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   const shell = await newShell();
   const ticker = await shell.loadBundleBlob(mkBlob(["timer/arm", "timer/clear"]));
   // The op frame is this app's own format (its `handle` reads it); the invoke below
-  // passes bytes the shell never interprets.
-  const opInput = (op, p = new Uint8Array(0)) => {
-    const out = new Uint8Array(1 + op.length + p.length);
-    out[0] = op.length;
-    for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
-    out.set(p, 1 + op.length);
-    return out;
-  };
+  // passes bytes the shell never interprets. Same `writeOp` the guest's inlined block
+  // reads back, from the one definition of it.
+  const opInput = (op, p = new Uint8Array(0)) => writeOp(op, p);
   await ticker.invoke(opInput("arm", new Uint8Array([7, 5])));    // arm: id 7, in 5ms
   await sleep(80);
   const fired = await ticker.invoke(opInput("fired"));
@@ -502,6 +502,54 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);
   stub.close();
+}
+
+// ── §12.2 — the host's caller ids are matched whole, never by prefix ────────────
+//
+// A fired deadline reaches the guest as `[0x01][0x00 × 31]`, and the host proper as 32
+// zero bytes. Every other caller id is an app key or a peer key — a hash of facts its
+// author picks, so any BYTE of it is grindable: an author retries app names until the
+// digest starts how it likes, which costs ~256 tries for one byte. A reader that stops at
+// the first non-zero byte therefore hands the "this is the host's own timer" verdict to
+// whoever wants it, and in the transport that verdict lands on `fireTimer` — reached
+// BEFORE the op gate that would otherwise refuse an app naming a host event.
+console.log("\n§12.2 — a host caller id is matched over all 32 bytes, not by its prefix");
+{
+  const timerId = new Uint8Array(32); timerId[0] = 1;
+  const body = new Uint8Array([9, 9, 9, 9]);
+  const withCaller = (caller) => { const a = new Uint8Array(36); a.set(caller, 0); a.set(body, 32); return a; };
+
+  // The kernel's own spelling, shipped to apps as content (core/op-frame.ts).
+  ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
+  ok(callerOf(withCaller(timerId)).fromTimer, "the exact timer id reads as a fired deadline");
+
+  // The grindable shapes: right first byte, wrong tail. Each of these was a timer before.
+  const spoofs = {
+    "0x01 then 0xff": (() => { const c = new Uint8Array(32).fill(0xff); c[0] = 1; return c; })(),
+    "0x01 then one late bit": (() => { const c = new Uint8Array(32); c[0] = 1; c[31] = 1; return c; })(),
+    "0x01 then a mid-byte": (() => { const c = new Uint8Array(32); c[0] = 1; c[7] = 0x40; return c; })(),
+  };
+  for (const [name, caller] of Object.entries(spoofs)) {
+    const r = callerOf(withCaller(caller));
+    ok(!r.fromTimer, `an app key beginning 0x01 (${name}) is NOT a fired deadline`);
+    ok(!r.fromHost, `and it is not the host proper either (${name})`);
+  }
+  // A near-miss on the host id is not the host: one late bit is all it takes.
+  const nearHost = new Uint8Array(32); nearHost[31] = 1;
+  ok(!callerOf(withCaller(nearHost)).fromHost, "an app key that is zero but for its last byte is not the host");
+
+  // The transport bundle carries its OWN copy of this reader (transport/src/util.js) —
+  // content paired with its driver, so the fix has to hold there too. Evaluated out of
+  // the signed source rather than restated, so the two cannot drift apart silently.
+  const utilSrc = readFileSync(join(root, "transport", "src", "util.js"), "utf8");
+  const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(utilSrc);
+  ok(m !== null, "the transport bundle's own callerOf is where this test expects it");
+  const transportCallerOf = new Function(`${m[0]}; return callerOf;`)();
+  ok(transportCallerOf(withCaller(timerId)).fromTimer, "the transport reads the exact timer id as a deadline");
+  for (const [name, caller] of Object.entries(spoofs)) {
+    ok(!transportCallerOf(withCaller(caller)).fromTimer,
+      `the transport refuses a 0x01-prefixed app key as a deadline (${name})`);
+  }
 }
 
 summary("hardening checks");

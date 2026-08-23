@@ -48,7 +48,8 @@ export const PROTO = "harness/v1";
  *    op   — an already-framed `[opLen u8][op][args]` handed to `_net` verbatim, for the
  *           tests whose subject is WHICH ops an app may name. It writes no name of its
  *           own, so a refusal is the transport's.
- *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`. */
+ *    seen — everything `handle` was handed INBOUND, as `[len u32][bytes]…`.
+ *    from — who each of those was attributed to, `[pk 32]…`, in step with `seen`. */
 const HARNESS_GUEST = `
 // This app's own copies of the shape it shares with whatever it calls (its own format
 // after the kernel's 32-byte caller prefix): a local op is [opLen u8][op][args], and
@@ -69,6 +70,11 @@ function writeOp(op, args) {
   return out;
 }
 const seen = [];
+// Who each inbound frame was ATTRIBUTED to, in step with \`seen\`: the shell puts the
+// authenticated sender in front of the payload, so this is what a delivery claims about
+// its own origin. Recorded separately because a test about attribution must be able to
+// read it back without the payload tests changing shape.
+const from = [];
 function handle(arg) {
   const c = arg.subarray(0, 32);
   let fromHost = true;
@@ -92,10 +98,17 @@ function handle(arg) {
       }
       return out;
     }
+    if (op === "from") {
+      const out = new Uint8Array(from.length * 32);
+      for (let i = 0; i < from.length; i++) out.set(from[i], i * 32);
+      return out;
+    }
     return new Uint8Array(0);
   }
-  // A remote peer's frame: record it, then echo it (or hang, or generate).
+  // A remote peer's frame: record it and who it came from, then echo it (or hang, or
+  // generate).
   seen.push(p);
+  from.push(c.slice());
   if (APP.mode === "hang") return new Promise(() => {});
   // A GENERATOR request, for the reassembly tests: [0xff][len u32][mul u8] asks for
   // len bytes where out[i] = (i * mul) & 255 — a response far larger than anything
@@ -111,7 +124,7 @@ function handle(arg) {
 `;
 
 /** The harness app's local op names — the one op vocabulary its `handle` reads. */
-const OP = { SEND: "send", RAW: "op", SEEN: "seen" };
+const OP = { SEND: "send", RAW: "op", SEEN: "seen", FROM: "from" };
 
 /** One local op into the harness app: `shell.invoke` loops back through `handle`, with the
  *  host's caller id in front of THIS app's own op framing — the name is the app's
@@ -299,15 +312,26 @@ export async function makeTransportHost(opts = {}) {
     }
     return out;
   };
+  /** Who this node's app was told each inbound frame came from, in step with `seen` —
+   *  the attribution the shell put in front of the payload, as hex. */
+  node.from = async () => {
+    const b = await invoke(shell, appKey, OP.FROM);
+    const out = [];
+    for (let off = 0; off + 32 <= b.length; off += 32) out.push(Buffer.from(b.slice(off, off + 32)).toString("hex"));
+    return out;
+  };
   node.peers = () => driver.linkedPeers();
   return node;
 }
 
-/** Await a condition with a deadline — the tests' tick, bounded. */
+/** Await a condition with a deadline — the tests' tick, bounded. The predicate is
+ *  AWAITED, so an async one is polled on its resolved value: a promise object is truthy
+ *  on the first tick, which would return immediately and make the whole wait a silent
+ *  no-op. A sync predicate costs one microtask per tick and reads the same. */
 export async function until(fn, ms = 3000, what = "condition") {
   const start = Date.now();
   for (;;) {
-    if (fn()) return;
+    if (await fn()) return;
     if (Date.now() - start > ms) throw new Error("timeout waiting for " + what);
     await new Promise((r) => setTimeout(r, 2));
   }

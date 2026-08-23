@@ -23,10 +23,13 @@ export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 /** Author ML-DSA seed label (§16.1). KDF tag, not a signing prefix — frozen. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
-/** v12: the op envelope left the preamble - a guest declares handle and reads
- *  [caller 32][body ...]; everything after the caller is its own format, so no
- *  further vocabulary grows here. */
+/** Guest ABI version (§12.2). Adding a catalog name does not bump it; changing a name,
+ *  framing, or preamble meaning does — and neither does the callee's own format after
+ *  the caller id, which is content. A guest declares `handle` and reads
+ *  `[caller 32][body …]`; everything past the caller is its own, so no further inbound
+ *  vocabulary grows here. */
 export const GUEST_ABI_VERSION = 12;
+/** Guest `crypto/` catalog. Total over this list; not a grant. Adding a name is the whole cost of a new algorithm. */
 export const PRIMITIVE_NAMES = [
     "blake2b-256",
     "ed25519/verify",

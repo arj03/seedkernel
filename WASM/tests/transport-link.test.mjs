@@ -28,11 +28,33 @@ import { testkit } from "./testkit.mjs";
 // runs over the pair — 0 leaves it alone, 1 length-prefixes, as a real TCP link gets.
 // Delivery is deferred a microtask so nothing re-enters a live guest frame, the same
 // discipline a real socket imposes.
+//
+// `hold`/`flush` model what a byte stream does and a message fabric cannot: several whole
+// messages arriving in ONE read. Held writes queue instead of being delivered, and `flush`
+// hands the far end their concatenation as a single `onData` — exactly a TCP segment
+// carrying two pipelined requests.
 function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, framing = 0 } = {}) {
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
     sent: [], closeArgs: [], dead: false, inFlight: 0,
     msg: null, cls: null, peer: null,
+    holding: false, held: [],
+    /** Queue writes rather than delivering them, until `flush`. */
+    hold() { this.holding = true; this.held = []; },
+    /** Deliver everything held as ONE read at the far end; answers how many writes
+     *  were coalesced, so a test can assert it really got more than one. */
+    flush() {
+      this.holding = false;
+      const parts = this.held.splice(0);
+      if (parts.length === 0) return 0;
+      let n = 0;
+      for (const b of parts) n += b.length;
+      const one = new Uint8Array(n);
+      let off = 0;
+      for (const b of parts) { one.set(b, off); off += b.length; }
+      queueMicrotask(() => { if (!this.peer.dead) this.peer.msg?.(one); });
+      return parts.length;
+    },
     // The stall clock's progress signal (core/socket-seam.ts `RawLink.buffered`):
     // bytes written but not yet on the wire. A test drives it directly to model a
     // backpressured socket — draining, or stuck.
@@ -43,6 +65,7 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       this.sent.push(Buffer.from(bytes).toString("hex"));
       const out = tamper ? tamper(bytes, this.name) : bytes;
       if (out === null) return; // dropped in flight
+      if (this.holding) { this.held.push(Uint8Array.from(out)); return; }
       const seq = ++this.inFlight;
       queueMicrotask(() => {
         // A destructive close zeroes inFlight; anything still queued never made it.
@@ -781,6 +804,65 @@ await test("a peer cannot reach a bundle's `_`-led local claim, the transport's 
   // link, so this is a routing rule and not a link that stopped carrying frames.
   const ordinary = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([4, 5]));
   assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
+});
+
+// ── the delivery return, when one read carries several requests ──────────────
+//
+// The link occupant answers a `linkBytes` event with `[count u32]` and that many delivery
+// records, and the driver routes each through the shell's claim table (§12.10). Several
+// records in one return is the ORDINARY case on a byte stream: whatever the peer
+// pipelined into a segment, the guest's length framer delivers in one pass.
+//
+// It is also where attribution is decided, which is what makes the record layout
+// load-bearing rather than a detail. The occupant writes the authenticated sender into
+// each record; if any field of a record ran to the end of the FRAME rather than to its own
+// length, the next record would be read out of this one's payload — bytes a peer wrote —
+// and a peer could hand the claim table a request attributed to any key it liked.
+await test("DELIVERY: two pipelined requests in ONE read are two correctly attributed deliveries", async (keep) => {
+  // framing 1: a byte-stream link, so the guest runs its own length framer and a single
+  // read really can carry two whole messages. (The default fabric preserves message
+  // boundaries and can never produce more than one record.)
+  const st = keep(await upPair({ framing: 1 }));
+  const first = Uint8Array.from([0x11, 0x22, 0x33]);
+  // The second request's payload is itself a well-formed delivery record naming another
+  // claim and another sender — the shape a mis-parse would promote into a real delivery.
+  const forgedAttribution = new Uint8Array(32).fill(0xfe);
+  const forgedClaim = Buffer.from("admin/grant", "utf8");
+  const second = Uint8Array.from([
+    1, 0, 0, 0, 0, forgedClaim.length, ...forgedClaim,
+    0, 0, 0, 32, ...forgedAttribution,
+    0, 0, 0, 5, 0x41, 0x41, 0x41, 0x41, 0x41,
+  ]);
+
+  // Hold A's writes, issue both requests, then deliver them as one read.
+  st.chans[0].hold();
+  const sends = [
+    st.A.sendNoReply(st.B.driver.peerId, PROTO, first),
+    st.A.sendNoReply(st.B.driver.peerId, PROTO, second),
+  ];
+  await until(() => st.chans[0].held.length >= 2, 4000, "both requests written");
+  const coalesced = st.chans[0].flush();
+  assert(coalesced === 2, `the test must coalesce two writes into one read, got ${coalesced}`);
+  await Promise.all(sends);
+
+  // `until` does not await its predicate, and `seen` is an invoke — so poll it directly.
+  let seen = [], from = [];
+  for (const started = Date.now(); Date.now() - started < 4000;) {
+    seen = await st.B.seen();
+    if (seen.length >= 2) break;
+    await settle(10);
+  }
+  from = await st.B.from();
+  assert(seen.length === 2, `exactly two deliveries, got ${seen.length}`);
+  // Each payload is its own, whole: neither swallowed the record behind it.
+  assert(hexOf(seen[0]) === hexOf(first), `first payload intact, got ${hexOf(seen[0])}`);
+  assert(hexOf(seen[1]) === hexOf(second), `second payload intact, got ${hexOf(seen[1])}`);
+  // And both are attributed to the peer that actually sent them — never to the key the
+  // second payload names, which is the whole point of the crafted bytes above.
+  assert(from.length === 2 && from.every((f) => f === st.A.driver.peerId),
+    `both deliveries must be attributed to the sending peer, got ${from.join(", ")}`);
+  assert(!from.includes(hexOf(forgedAttribution)),
+    "a payload's own bytes must never become another delivery's attribution");
 });
 
 // ── the transport guest's caller boundary ────────────────────────────────────

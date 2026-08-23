@@ -79,7 +79,8 @@ function hostOpHeader(op: string): Uint8Array {
 /** Op-argument encoder: the op NAME first as the discriminator, then u32 BE / u8 /
  *  length-prefixed blob fields in the order the op declares. The guest twin is `Reader`
  *  (transport/src/util.js); a field written and not read desyncs the payload rather than
- *  degrading quietly. */class Args {
+ *  degrading quietly. */
+class Args {
   /** The op this payload is for, or `""` for a nested blob. Read back by `tell`. */
   readonly op: string;
   private readonly parts: Uint8Array[] = [];
@@ -323,8 +324,8 @@ export class TransportHost {
 
   /** `tell`, for `linkBytes`: the invocation's return is the link occupant's delivery
    *  frame — `[count u32][d…]`, each `d` =
-   *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payload]` —
-   *  empty when the occupant decoded nothing deliverable. The occupant that saw the
+   *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`
+   *  — empty when the occupant decoded nothing deliverable. The occupant that saw the
    *  plaintext is the one that attributes it, so the driver hands the frame straight to
    *  the claim routing wired in `route` and answers back through `linkResp`; no second
    *  capability is granted, because the only slot that produces such a return is the one
@@ -346,7 +347,13 @@ export class TransportHost {
    *  and a payload; a record nobody serves settles as an empty answer, exactly as a
    *  request that never reached a claimant. A malformed frame is dropped: it is the
    *  occupant's own contract with the driver, and a bogus record must not become a
-   *  partial delivery. */
+   *  partial delivery.
+   *
+   *  EVERY variable field is read by its own length, the payload included. One socket
+   *  read can carry several whole requests, so a record that ran to the end of the frame
+   *  would put the NEXT record's claim and attribution inside this one's payload — bytes
+   *  a peer wrote, letting it attribute its own request to any key it names. Nothing is
+   *  delivered past the first record that does not fit. */
   private deliverFrom(ret: Uint8Array): void {
     if (!this.deliver || ret.length < 4) return;
     const dec = TransportHost.dec;
@@ -361,16 +368,20 @@ export class TransportHost {
       const claim = dec.decode(ret.slice(off + 6, off + 6 + claimLen));
       const attrStart = off + 6 + claimLen;
       if (ret.length < attrStart + 4) return;
-      const attrLen = readU32BE(ret, attrStart);
-      const payloadStart = attrStart + 4 + attrLen;
-      if (payloadStart > ret.length) return;
-      const attribution = ret.slice(attrStart + 4, attrStart + 4 + attrLen);
-      const payload = ret.slice(payloadStart);
+      const attrLen = readU32BE(ret, attrStart) >>> 0;
+      const lenStart = attrStart + 4 + attrLen;
+      if (lenStart + 4 > ret.length) return;
+      const payloadLen = readU32BE(ret, lenStart) >>> 0;
+      const payloadStart = lenStart + 4;
+      const next = payloadStart + payloadLen;
+      if (next > ret.length) return;
+      const attribution = ret.slice(attrStart + 4, lenStart);
+      const payload = ret.slice(payloadStart, next);
       void Promise.resolve(this.deliver(claim, attribution, payload)).then(
         (answer: Uint8Array | null | undefined) => this.answer(noReply, attribution, corr, answer ?? EMPTY),
         () => this.answer(noReply, attribution, corr, EMPTY),
       );
-      off = payloadStart;
+      off = next;
     }
   }
 

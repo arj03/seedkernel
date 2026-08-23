@@ -212,12 +212,19 @@ function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args(
 function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
 function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
 
-/** One linkBytes invocation's delivery return: the count-prefixed list of records the
- *  request/response layer produced, or null when this frame decoded to nothing
- *  deliverable. The host reads the frame, routes each record through its claim table,
- *  and answers this realm with a `linkResp` event — delivery is this slot's return
- *  convention, not a second capability (there is one link occupant, and it is the one
- *  that saw the plaintext). */
+/** One linkBytes invocation's delivery return: `[count u32]` then that many records
+ *  from the request/response layer (`ReqRes.onFrame`), each one
+ *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`,
+ *  or null when this frame decoded to nothing deliverable. The host reads the frame,
+ *  routes each record through its claim table, and answers this realm with a `linkResp`
+ *  event — delivery is this slot's return convention, not a second capability (there is
+ *  one link occupant, and it is the one that saw the plaintext).
+ *
+ *  Several records is the ordinary case, not an edge one: a single socket read carries
+ *  whatever the peer pipelined into it, and the framer delivers every whole message in
+ *  the chunk before this return is built. Every field a record holds is therefore
+ *  length-prefixed — the payload too — so record boundaries never depend on where the
+ *  frame ends. */
 function packDeliveries(records) {
   if (!records || records.length === 0) return null;
   const head = new Uint8Array(4);

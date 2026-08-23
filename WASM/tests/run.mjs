@@ -1945,11 +1945,12 @@ async function testModuleCallChargedToGuestBudget() {
 //
 // The number is only worth carrying if the host refuses a seam it does not implement, and
 // the case that matters is always the one just retired — the population that actually
-// exists. At ABI 11 the node facts moved off the `link/config` name into the host's
-// one-time `init` invocation; an ABI-10 transport calls a name this host no longer has,
-// and a host that tolerated it would run a program holding different facts than the
-// numbers it was built against. Written against the constant, so the boundary moves with
-// it rather than pinning whichever version was current the day it was written.
+// exists. A guest written against the previous seam calls names this host no longer has,
+// or reads a shape it no longer sends; tolerating it would run a program against a
+// contract neither side agreed to, and the failure that follows is silent (a name that
+// answers nothing, a field read at the wrong offset). Written against the constant, so
+// the boundary moves with the seam rather than pinning whichever version was current the
+// day this was written.
 async function testPreviousAbiRefused() {
   const stale = GUEST_ABI_VERSION - 1;
   console.log(`Test: guest ABI ${stale} is refused at load — a retired seam is not tolerated`);
