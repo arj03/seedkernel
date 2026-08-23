@@ -17,8 +17,10 @@
 
 import {
   makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until, PROTO,
+  authorBundle,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
+import { bytesEqual } from "./bytes.mjs";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
 // The RawLink shape (core/socket-seam.ts) with the hooks these tests need: every byte
@@ -723,65 +725,51 @@ await test("a decrypt failure does not advance the receive counter", async (keep
   assert((await st.B.seen()).length === 0, "a forged record must not be delivered");
 });
 
-// ── §12.10: platform handlers register exact claims ─────────────────────────────
+// ── §12.10: a slot's own answer reaches its loader through onInbound ────────────
 //
-// An inbound frame reaches the shell as the link occupant's delivery return and goes to
-// the routing table, so a host that serves an id of its own — seedchat's `offer/v1`,
-// which carries a bundle between two browsers before either has an app that could
-// receive it — needs an explicit seam. `bootShell({ claims })` is it: exact names, no
-// wildcard and no fall-through. These pin both halves — a registered name wins, and an
-// unregistered one is never consulted — plus the reach an ORDINARY id carries and a
-// reserved one does not (below).
+// Dispatch is one claim → slot map; there is no second table an embedder's own name could
+// occupy. What that leaves out is the one thing a table never gave an embedder anyway: its
+// own view of what its own app just answered. A peer-inbound frame's reply is consumed by
+// the wire on the way back out, so an embedder that must paint what its own mounted app
+// produced — seedchat's guest relaying its render bytes to the page hosting it — has no
+// other path to those bytes. `LoadBundleOptions.onInbound` is that one seam: scoped to the
+// load that named it, not the shell, so there is no table, no owner and no name to contest.
 
-await test("EXACT CLAIM: the platform answers the claim it registered", async (keep) => {
+await test("a peer-inbound answer reaches the loader through onInbound", async (keep) => {
+  const st = keep(await upPair());
+  // A second, tiny app on B: it claims its own protocol and answers by flipping every
+  // byte, so the response is trivially distinct from the request that produced it.
+  const guestSource = `
+    function handle(arg) {
+      const payload = arg.subarray(32);
+      const out = new Uint8Array(payload.length);
+      for (let i = 0; i < payload.length; i++) out[i] = payload[i] ^ 0xff;
+      return out;
+    }
+  `;
+  const { blob } = authorBundle(sodium, st.B.appAuthor, {
+    app: "watcher", version: 1, protocols: ["watch/v1"],
+    modules: [], guestSource, guestRequires: [],
+  });
   const seen = [];
-  const st = keep(await upPair(undefined, undefined, {
-    claims: { "offer/v1": (from, payload) => {
-      seen.push({ from: Buffer.from(from).toString("hex"), payload });
-      return Promise.resolve(Uint8Array.from([0xaa, payload.length]));
-    } },
-  }));
-  const resp = await st.A.request(st.B.driver.peerId, "offer/v1", Uint8Array.from([1, 2, 3]));
-  assert(resp.length === 2 && resp[0] === 0xaa && resp[1] === 3,
-    `the shell's own answer must reach the caller, got ${[...resp]}`);
-  assert(seen.length === 1, "the hook must be consulted exactly once per inbound frame");
+  await st.B.shell.loadBundleBlob(blob, {
+    onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
+  });
+
+  const resp = await st.A.request(st.B.driver.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
+  assert(resp.length === 3 && resp[0] === 0xfe && resp[1] === 0xfd && resp[2] === 0xfc,
+    `the caller must still get the app's own answer untouched, got ${[...resp]}`);
+  assert(seen.length === 1, "onInbound must fire exactly once per peer-inbound answer");
+  assert(seen[0].claim === "watch/v1", "…named the claim the frame arrived on");
   assert(seen[0].from === st.A.driver.peerId,
-    "the hook must be handed the AUTHENTICATED sender, as dispatch is");
-  // The app never saw it: an id the shell claims is answered by the shell, not routed.
-  const inbound = await st.B.seen();
-  assert(inbound.length === 0, "a frame the shell answered must not also reach the app");
-});
+    "…and the AUTHENTICATED sender, exactly as dispatch attributes it");
+  assert(bytesEqual(seen[0].answer, resp), "…carrying exactly the bytes the caller received");
 
-// The reach half, and the reason the rule has no host-code exception. seedchat registers
-// `_render` as a platform claim precisely BECAUSE it is local-only: a chat app's guest
-// relays its render bytes there and the shell draws them, trusting the 32 bytes it is
-// handed to be an app key. A peer reaching that name would push bytes into the iframe
-// under a peer key sitting in an app key's place — so the `_`-led refusal comes before the
-// platform table, not after it.
-await test("EXACT CLAIM: a `_`-led platform claim is local-only, like any reserved id", async (keep) => {
-  let asked = 0;
-  const st = keep(await upPair(undefined, undefined, {
-    claims: { "_render": async () => { asked++; return Uint8Array.from([1]); } },
-  }));
-  const resp = await st.A.request(st.B.driver.peerId, "_render", Uint8Array.from([1, 2, 3]));
-  assert(resp.length === 0, `a peer must not reach a reserved platform claim, got ${[...resp]}`);
-  assert(asked === 0, "…and the handler is never consulted");
-  // Not a link that stopped carrying frames: the ordinary claim still answers over it.
-  const ordinary = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([4, 5]));
-  assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
-});
-
-await test("EXACT CLAIM: unrelated traffic goes directly to its claimant", async (keep) => {
-  let asked = 0;
-  const st = keep(await upPair(undefined, undefined, {
-    claims: { "offer/v1": async () => { asked++; return new Uint8Array(0); } },
-  }));
-  // The harness app claims PROTO, and the hook declines it — so the app answers, exactly
-  // without consulting the unrelated exact platform claim.
-  const resp = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([7, 8]));
-  assert(resp.length === 2 && resp[1] === 8, `the app must still answer its own id, got ${[...resp]}`);
-  assert(asked === 0, "an exact platform claim is not consulted for unrelated traffic");
-  assert((await st.B.seen()).length === 1, "the frame reached its app claimant");
+  // The host loopback path already holds its own return value directly — onInbound is
+  // wired for the peer path alone, so invoking the SAME slot as the host must not fire it.
+  const appKey = `${Buffer.from(st.B.appAuthor.id).toString("hex")}:watcher`;
+  await st.B.shell.invoke(Uint8Array.from([9, 9]), appKey);
+  assert(seen.length === 1, "a host loopback invoke of the same slot must not fire onInbound");
 });
 
 // A peer names the id the TRANSPORT ITSELF claims. Nothing about the delivery return

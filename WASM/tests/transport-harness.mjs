@@ -255,7 +255,6 @@ export async function makeTransportHost(opts = {}) {
     transportBundle: blob,
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
-    claims: opts.claims,
   }).then((r) => r.shell);
   await shell.loadBundleBlob(blob);
   const node = { shell, driver, identity, appAuthor };

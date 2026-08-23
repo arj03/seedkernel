@@ -2669,18 +2669,38 @@ async function testCandidateRealmCannotActBeforeCommit() {
     [moduleFile("fwd")]: forwarderBytes,
     [GUEST_FILE]: guest,
   });
+  // The neighbour a candidate must not reach: a REAL second bundle claiming `_svc`,
+  // installed under its own slot rather than stood in for by a host closure — dispatch
+  // has only ever had one owner kind. Its own realm is a plain counting stub; what is
+  // under test is whether the OFFSIDE candidate can reach it, not what it does once
+  // reached.
+  const neighborBlob = packBundle({
+    [MANIFEST_FILE]: signManifest(sodium, author, {
+      app: "svc-neighbor", version: 1, protocols: ["_svc"],
+      modules: [], guest: GUEST(),
+    }),
+    [GUEST_FILE]: GUEST_BYTES,
+  });
   class FlakyStore extends FreshnessMarks {
     fail = true;
     persist() { if (this.fail) throw new Error("disk full"); }
   }
   const store = new FlakyStore();
   const candidates = [];
+  // Set only while `neighborBlob` is the one loading, so the ONE factory both bundles
+  // share can tell which realm it is being asked to stand: the neighbour gets a stub that
+  // only counts entries, and everything else — including every offside attempt — gets the
+  // offside probing below, pushed into `candidates` in load order.
+  let loadingNeighbor = false;
   // A REAL socket-less driver (the browser-edge shape), so a link read is the seam's true
   // read through the candidate's own unpublished binding, and the pin — this author's — is
   // what lets a `link`-reaching candidate get as far as the seam under test.
   const shell = await bootTestShell({
       fs, freshnessStore: store, pinAuthor: author,
       createRealm: async ({ hostCall }) => {
+        if (loadingNeighbor) {
+          return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
+        }
         const refused = [];
         for (const [name, payload] of [["fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9)], ["_svc", new Uint8Array()]]) {
           try { await hostCall(name, payload); } catch { refused.push(name); }
@@ -2693,12 +2713,22 @@ async function testCandidateRealmCannotActBeforeCommit() {
         candidates.push({ hostCall, refused, openBytes, moduleAnswer });
         return { call: async () => new Uint8Array(), dispose() {} };
       },
-      // A platform claim standing in for the neighbour a candidate must not reach.
-      claims: { _svc: () => { reached++; return Promise.resolve(new Uint8Array()); } },
       admit: admitAll,
   });
   const key = appKey(author.id, "offside");
   try {
+    // The neighbour goes in FIRST, so `_svc` is a claim held by a standing realm before the
+    // candidate ever reaches for it: the refusal below is then the offside gate's, and not
+    // the absence of a claimant. Its own mark has to persist, so the store is let through
+    // for that one load and put back to failing afterwards.
+    store.fail = false;
+    loadingNeighbor = true;
+    await shell.loadBundleBlob(neighborBlob);
+    loadingNeighbor = false;
+    store.fail = true;
+    assertEqual(shell.resolve("_svc"), appKey(author.id, "svc-neighbor"),
+      "the neighbour holds the claim the candidate is about to reach for");
+
     let rejected = false;
     try { await shell.loadBundleBlob(blob); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");

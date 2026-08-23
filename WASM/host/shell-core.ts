@@ -25,11 +25,6 @@ export type ShellSodium = BundleCrypto & SeamCrypto;
  *  "a node without a network", a deliberate configuration rather than a failure. */
 export const ADMISSION_REJECTED = "bundle: rejected by admission predicate";
 
-/** What `resolve`/`routes` report as the owner of a claim the EMBEDDER registered
- *  ({@link PlatformClaims}) rather than a bundle. Unambiguous by construction: an app
- *  key is `<author hex>:<app>` and always carries a colon, which this cannot. */
-export const PLATFORM_OWNER = "platform";
-
 /** True iff a loadBundleBlob failure was the policy's refusal (see ADMISSION_REJECTED),
  *  whatever shape the thrown value took. */
 export function isAdmissionRejected(err: unknown): boolean {
@@ -111,12 +106,7 @@ interface CreateShellOptions {
      *  the module memory ceiling (§4.3), how long this node spends on one message is a
      *  property of the deployment. */
     guestDeadlineMs?: number;
-    claims?: PlatformClaims;
 }
-
-/** Exact platform-owned claims. Same lookup and conflict rules as bundle claims;
- *  no wildcard. A `_`-led name is local-only whoever holds it (§12.10). */
-export type PlatformClaims = Readonly<Record<string, (attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array>>>;
 
 /** Configuration supplied by this installation for one particular bundle load. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
@@ -139,12 +129,25 @@ export interface LoadBundleOptions {
      *  Omitted ⇒ the shell's `guestDeadlineMs`, and failing that
      *  `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. */
     guestDeadlineMs?: number;
+    /** Observe this slot's own answer to a PEER-inbound frame, after it resolves
+     *  (`deliverInbound`). The one gap left once dispatch is a single claim → slot map: the
+     *  wire consumes a delivery return on its way back out, so an embedder whose own
+     *  mounted app must paint what it just answered — seedchat's guest relaying its render
+     *  bytes to the page hosting it — has no other path to those bytes. Scoped to THIS load
+     *  rather than the shell, so there is no table, no owner and no name to contest; a
+     *  replacement load carries its own, like `realmMemoryBytes` above.
+     *
+     *  Observation only: it cannot change what the caller (the transport driver) receives,
+     *  it is never consulted for a host loopback `invoke` or a co-resident guest's
+     *  cross-realm call — both already hold the return directly — and a throw from it is
+     *  reported and swallowed rather than reaching the driver. */
+    onInbound?: (claim: string, from: Uint8Array, answer: Uint8Array) => void;
 }
 
 export interface Shell {
     /** Which app serves this protocol, or null (§12.10). A read of the projection the
-     *  installed manifests define — there is nothing to write here. `PLATFORM_OWNER` for a
-     *  claim the embedder registered rather than a bundle. */
+     *  installed manifests define — there is nothing to write here. The one owner kind is
+     *  a bundle slot: dispatch is a single claim → slot map. */
     resolve(proto: string): string | null;
     /** Every protocol this node serves, as `[proto, owner]` — what an operator's console
      *  line or a shell's UI lists. A snapshot, not the live map. */
@@ -239,6 +242,12 @@ interface AppSlot {
    *  re-entry into one particular realm: the cap is then one guest's to spend, and
    *  disposing that realm cancels exactly its own (`disposeSlot`). */
   timers: RealmTimers;
+  /** THIS load's answer observer (`LoadBundleOptions.onInbound`), or absent. Carried on
+   *  the slot rather than read from the load call's own options at call time, because a
+   *  peer-inbound frame can land at any point after commit, long after that call
+   *  returned. A replacement load's slot gets its own value or none — never the outgoing
+   *  slot's, the same rule `realmMemoryBytes` follows. */
+  onInbound?: LoadBundleOptions["onInbound"];
 }
 
 /** Per-realm timer table. Cap live count; `clearAll` before realm disposal (§2.1). */
@@ -341,7 +350,6 @@ function createShell(opts: CreateShellOptions & {
      *  `protocols`, so there is nothing to write, persist, or keep in step. Materialized
      *  rather than scanned for because it is read once per inbound frame. */
     const claims = new Map<string, AppSlot>();
-    const platformClaims = new Map(Object.entries(opts.claims ?? {}));
     /** The existing concrete channel adapter is supplied and owned by the platform. The
      *  shell may wire raw-link calls to it, but it is not part of the Shell API. */
     const netHost = platform.transportHost;
@@ -367,7 +375,7 @@ function createShell(opts: CreateShellOptions & {
      *  slot does not have yet. The cycle is tied by reading `holder.realm` at FIRE time,
      *  which is the correct reading anyway: the realm a deadline re-enters is the one
      *  standing when it fires (a transport handover replaces it while the slot stays). */
-    const newSlot = (loaded: LoadedBundle, pureModules: PureModules): AppSlot => {
+    const newSlot = (loaded: LoadedBundle, pureModules: PureModules, onInbound: LoadBundleOptions["onInbound"]): AppSlot => {
         let slot: AppSlot;
         const timers = createRealmTimers((id) => {
             const args = new Uint8Array(4);
@@ -392,6 +400,7 @@ function createShell(opts: CreateShellOptions & {
             realm: null,
             active: false,
             timers,
+            onInbound,
         };
         return slot;
     };
@@ -530,17 +539,16 @@ function createShell(opts: CreateShellOptions & {
         // and silence are one fact at the boundary.
         return deliverInbound(claim, attribution, payload);
     });
-    /** Cross-realm call by reserved id. Host prepends caller's 32-byte id. */
+    /** Cross-realm call by reserved id. Host prepends caller's 32-byte id — the local half
+     *  of `callClaimant`'s one table, the same claim → slot lookup a peer-inbound frame
+     *  resolves through (`deliverInbound`). */
     const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
-        return callLocal(id, callerId, payload);
+        return callClaimant(id, callerId, payload);
     };
     /** Refuse a candidate contesting a claim or the raw-link binding another identity
      *  holds (§12.10). Asked before candidate code runs, then again in the commit window. */
     const refuseContested = (loaded: LoadedBundle, key: string) => {
         for (const claim of loaded.manifest.protocols ?? []) {
-            if (platformClaims.has(claim)) {
-                throw new Error(`shell: claim '${claim}' is already held by the platform`);
-            }
             const incumbent = claims.get(claim);
             if (incumbent && keyOf(incumbent) !== key) {
                 throw new Error(`shell: claim '${claim}' is already held by '${keyOf(incumbent)}'`);
@@ -581,42 +589,55 @@ function createShell(opts: CreateShellOptions & {
         disposeSlot(slot);
         return true;
     };
-    /** Hand a request to the realm claiming `claim`. Answer is the realm's Promise. */
-    const callClaimant = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
-        const slot = claims.get(claim);
-        if (!slot) return null;
+    /** Frame `[attribution ‖ payload]` and enter a slot's guest — the shape both a
+     *  cross-realm call and a peer-inbound frame arrive as (`callClaimant`,
+     *  `deliverInbound`). */
+    const callFramed = (slot: AppSlot, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> => {
         const input = new Uint8Array(attribution.length + payload.length);
         input.set(attribution, 0);
         input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
+    /** Hand a request to the realm claiming `claim` — the local half of the one table a
+     *  peer-inbound frame also resolves through (`deliverInbound`). Answer is the realm's
+     *  Promise. */
+    const callClaimant = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const slot = claims.get(claim);
+        return slot ? callFramed(slot, attribution, payload) : null;
+    };
     /** Inbound from outside this node (the link occupant's delivery return, `dispatch`).
-     *  `_`-led claims are local and refused here with no exception — platform claims
-     *  included (§12.10). */
+     *  `_`-led claims are local and refused here with no exception (§12.10).
+     *
+     *  Once the answer resolves it is also handed to the slot's own `onInbound`
+     *  (`LoadBundleOptions.onInbound`), if the load that installed it named one — see there
+     *  for why the seam exists and what it promises not to do. */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
         if (isReservedProtocol(claim)) return null;
-        const platformHandler = platformClaims.get(claim);
-        if (platformHandler) return platformHandler(attribution, payload);
-        return callClaimant(claim, attribution, payload);
-    };
-    /** The cross-realm call, from a co-resident guest. Only a reserved id is callable (the
-     *  seam's grant gate), so this is the local half of the same table. */
-    const callLocal = (claim: string, callerId: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
-        const platformHandler = platformClaims.get(claim);
-        if (platformHandler) return platformHandler(callerId, payload);
-        return callClaimant(claim, callerId, payload);
+        const slot = claims.get(claim);
+        if (!slot) return null;
+        const answer = callFramed(slot, attribution, payload);
+        if (slot.onInbound) {
+            const onInbound = slot.onInbound;
+            // Two-arg `.then`, not a bare call plus a stray `.catch`: this branch's own
+            // Promise must settle either way, or a guest that refuses the frame leaves an
+            // unhandled rejection behind that `answer` — the one the caller actually
+            // holds — already reports. Nothing to do on a refusal: there is no answer to
+            // observe.
+            answer.then((bytes) => {
+                try { onInbound(claim, attribution, bytes); }
+                catch (err) { console.error(`[shell] the loader's onInbound threw: ${errMessage(err)}`); }
+            }, () => { });
+        }
+        return answer;
     };
     const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) =>
         deliverInbound(proto, fromHex(from), payload);
     return {
         resolve: (proto) => {
             const slot = claims.get(proto);
-            return slot ? keyOf(slot) : platformClaims.has(proto) ? PLATFORM_OWNER : null;
+            return slot ? keyOf(slot) : null;
         },
-        routes: () => [
-            ...[...platformClaims.keys()].map((claim): [string, string] => [claim, PLATFORM_OWNER]),
-            ...[...claims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
-        ],
+        routes: () => [...claims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
         fs,
         sodium,
         async loadBundleBlob(blob, loadOpts = {}) {
@@ -654,7 +675,7 @@ function createShell(opts: CreateShellOptions & {
             // free claim while this candidate is built.
             refuseContested(loaded, key);
             const pureModules = await loadBundleModules(moduleLoader, v);
-            const slot = newSlot(loaded, pureModules);
+            const slot = newSlot(loaded, pureModules, loadOpts.onInbound);
             // Stand the guest, before anything already standing is replaced. Every app is a
             // guest (§12.4), so a bundle whose guest will not compile has not loaded — and
             // discovering that at the first frame instead would leave the mark advanced for
@@ -799,8 +820,6 @@ export interface BootShellOptions {
      *  platform member rather than something the shared shell reaches for itself. */
     createRealm?: RealmFactory;
     now?: () => number;
-    /** Platform-owned claims ({@link PlatformClaims}). */
-    claims?: PlatformClaims;
     /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate.
      *  Absent ⇒ the public network. */
     networkKey?: Uint8Array;
@@ -897,7 +916,6 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             createRealm, now: opts.now,
         },
         admit,
-        claims: opts.claims,
         guestDeadlineMs: opts.guestDeadlineMs,
         realmMemoryBytes: opts.realmMemoryBytes,
     });
