@@ -439,9 +439,10 @@ entry("linkOpen", (r) => {
   const link = new Link(Object.assign({}, spec, {
     onAuth: (peerId, l) => {
       // The peer lint answered at msg3/msg4 (`admits`); what is left is the
-      // double-connect tie-break. The host owns this socket, so it is told.
+      // double-connect tie-break. The host owns this socket, so the `linkBytes` event
+      // that completed authentication returns the peer without a guest-selected link id.
       if (!router.promote(peerId, l)) { l.close(); return; }
-      hostLinkAuth(linkId, fromHex(peerId));
+      l.reportedPeer = fromHex(peerId);
     },
     onFrame: (peerId, frame) => router.deliver(peerId, frame),
     // `l`, not the `link` binding below: a Link that tears itself down in its own
@@ -449,9 +450,10 @@ entry("linkOpen", (r) => {
     // deferred flush, and `link` is a `const` that was never initialized — closing
     // over it would raise a ReferenceError instead of telling the host its socket is down.
     onClose: (l) => {
-      openLinks.delete(linkId);
       router.remove(l);
-      hostLinkDown(linkId, reasonCode(l));
+      // Keep the closed link as a tombstone until the platform reports the raw socket's
+      // `linkClosed` event. Its return carries the reason; deleting it here would lose
+      // that causal event on a locally initiated close.
     },
   }));
   openLinks.set(linkId, link);
@@ -459,10 +461,13 @@ entry("linkOpen", (r) => {
 
 entry("linkBytes", async (r) => {
   const link = findLink(r.u32());
-  // onWire answers a promise for the delivery frame — every seam call the processing
-  // awaits is one — and an empty answer means nothing deliverable.
+  // onWire answers a promise for the delivery frame. Authentication, if this read
+  // completed it, rides the same return and is bound host-side to this event's link.
   if (!link) return NOTHING;
-  return (await link.onWire(r.blob())) || NOTHING;
+  const deliveries = await link.onWire(r.blob());
+  const peer = link.reportedPeer;
+  link.reportedPeer = null;
+  return packLinkBytesResult(peer, deliveries) || NOTHING;
 });
 
 /** The claim handler's answer to a delivery this program returned off a `linkBytes`
@@ -477,8 +482,16 @@ entry("linkResp", (r) => {
 });
 
 entry("linkClosed", (r) => {
-  const link = findLink(r.u32());
-  if (link) link.onChannelClosed();
+  const linkId = r.u32();
+  const link = findLink(linkId);
+  if (!link) return NOTHING;
+  link.onChannelClosed();
+  const out = Uint8Array.of(reasonCode(link));
+  // Host-managed links stay here until this exact event so their down report cannot be
+  // redirected to another platform-owned socket. Core links were already forgotten by
+  // their own onClose callback and have no platform callback to answer.
+  if (openLinks.get(linkId) === link) openLinks.delete(linkId);
+  return out;
 });
 
 /** A fired deadline (§12.2): the shell's per-realm timer table re-entering this realm as

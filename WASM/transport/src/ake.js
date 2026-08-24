@@ -13,8 +13,6 @@ const N_LINK_CLOSE = "link/close";
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
 const N_LINK_STAT = "link/stat";
-const N_LINK_AUTHENTICATED = "link/authenticated";
-const N_LINK_DOWN = "link/down";
 
 const N_TIMER_ARM = "timer/arm";
 const N_TIMER_CLEAR = "timer/clear";
@@ -34,7 +32,8 @@ const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 const LINK_CORE = 0;
 const LINK_OPEN = 1;
 
-// Link close-reason codes (transport/link-down's u8) — mirror Link.closeReason.
+// Link close-reason codes returned from the driver's `linkClosed` event — mirror
+// Link.closeReason. The event already names the link, so the return carries no link id.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
       REASON_LOCAL = 4, REASON_TRUNCATED = 5;
 
@@ -185,22 +184,28 @@ function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([lin
  *  stall clock to the deadline alone. */
 async function netLinkBuffered(linkId) { return readU32BE(await host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** A link the HOST handed us (openLink) changed state — relayed so whoever passed the
- *  channel in learns its fate. A core link's fate is ours alone. */
-function hostLinkAuth(linkId, peerBytes) { void host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)).catch(() => {}); }
-function hostLinkDown(linkId, reason) { void host.call(N_LINK_DOWN, args([linkId], [reason])).catch(() => {}); }
-
-/** One linkBytes invocation's delivery return: `[count u32]` then that many records
- *  from the request/response layer (`ReqRes.onFrame`), each one
+/** The delivery half of one linkBytes return: `[count u32]` then that many records from
+ *  the request/response layer (`ReqRes.onFrame`), each one
  *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`,
- *  or null when this frame decoded to nothing deliverable — a host reads any non-empty
- *  return as a frame, so the empty case is a real signal. Several records is the
- *  ordinary case, which is why every field is length-prefixed. */
+ *  or null when this frame decoded to nothing deliverable. `packLinkBytesResult` prefixes
+ *  the event's optional authentication transition. Several records is the ordinary case,
+ *  which is why every field is length-prefixed. */
 function packDeliveries(records) {
   if (!records || records.length === 0) return null;
   const head = new Uint8Array(4);
   writeU32BE(head, 0, records.length);
   return concatBytes([head, ...records]);
+}
+
+/** One `linkBytes` event's complete return. The event already names its link, so this
+ *  value deliberately cannot redirect either result to another socket:
+ *  `[authenticated u8][peer 32 when authenticated][delivery count + records]`.
+ *  Empty means the read caused no externally visible transition or delivery. */
+function packLinkBytesResult(peer, deliveries) {
+  if (!peer && !deliveries) return null;
+  const state = Uint8Array.of(peer ? 1 : 0);
+  const emptyDeliveries = new Uint8Array(4);
+  return concatBytes([state, ...(peer ? [peer] : []), deliveries || emptyDeliveries]);
 }
 
 /** Peer lint (§12.6): asked at msg3 when accepting, msg4 when dialing — before this
@@ -272,6 +277,10 @@ class Link {
     this.peerEph = null;
     this.closed = false;
     this.notified = false;
+    // Set exactly once by a host-managed link's onAuth callback and consumed by the
+    // `linkBytes` invocation that caused it. It contains no link id: the driver binds the
+    // returned peer to the event's own captured link.
+    this.reportedPeer = null;
     this.closedLocally = false;
     this.aborted = false;
     this.slot = null;

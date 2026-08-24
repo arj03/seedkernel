@@ -18,6 +18,25 @@ const LINK_OPEN = 1;
 
 const EMPTY = new Uint8Array(0);
 
+interface OpenLinkRecord {
+  onAuth?: (peerId: PeerId) => void;
+  onClose?: (linkId: number, reason: number) => void;
+  authenticated: boolean;
+}
+
+interface ReturnedDelivery {
+  noReply: boolean;
+  corr: number;
+  claim: string;
+  attribution: Uint8Array;
+  payload: Uint8Array;
+}
+
+interface LinkBytesResult {
+  peer: Uint8Array | null;
+  deliveries: ReturnedDelivery[];
+}
+
 /** No address book entry, or no channel factory at all. Link id 0 is never live, so the
  *  framing is moot — the guest reads the id first and stops. */
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
@@ -216,7 +235,7 @@ export class TransportHost {
 
   private readonly opts: TransportHostOptions;
   private readonly channels = new Map<number, RawLink>;
-  private readonly openLinks = new Map<number, { onAuth?: (peerId: PeerId) => void; onClose?: (linkId: number, reason: number) => void }>;
+  private readonly openLinks = new Map<number, OpenLinkRecord>();
   private readonly addrs = new Map<PeerId, PeerAddr>;
   private nextLinkId = 1;
   private transport: TransportCall | null = null;
@@ -324,63 +343,107 @@ export class TransportHost {
     });
   }
 
-  /** `tell`, for `linkBytes`: the invocation's return is the link occupant's delivery
-   *  frame — `[count u32][d…]`, each `d` =
+  /** Invoke `linkBytes` and consume its event-bound return:
+   *  `[authenticated u8][peer 32 when authenticated][count u32][d…]`, each `d` =
    *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`
-   *  — empty when the occupant decoded nothing deliverable. The occupant that saw the
-   *  plaintext is the one that attributes it, so the driver hands the frame straight to the
-   *  claim routing wired in `route`; no second capability is granted, because the only slot
-   *  that produces such a return is the one holding the raw-link binding. */
-  private tellDeliver(args: Args): void {
-    const r = this.toTransport(args);
+   *  — empty when the occupant observed nothing. Neither result contains a link id: the
+   *  driver binds it to this invocation's captured channel and owner. */
+  private linkBytes(linkId: number, bytes: Uint8Array): void {
+    const channel = this.channels.get(linkId);
+    if (!channel) return;
+    const owner = this.activeOwner;
+    const open = this.openLinks.get(linkId);
+    const r = this.toTransport(new Args("linkBytes").u32(linkId).blob(bytes));
     if (!r) return;
     void r.then((ret) => {
-      if (ret.length > 0) this.deliverFrom(ret);
+      const parsed = this.parseLinkBytes(ret);
+      if (!parsed) return;
+      // A close, reset or slot handover while the guest was awaiting makes this result
+      // stale. Link ids are monotonic, but checking the captured object as well makes the
+      // non-reuse assumption unnecessary to the authority boundary.
+      if (this.activeOwner !== owner || this.channels.get(linkId) !== channel) return;
+      // Authentication is meaningful only for a platform-owned openLink. A core link's
+      // result cannot manufacture an openLink callback, and a duplicate cannot rename an
+      // already-authenticated connection.
+      if (parsed.peer && open && this.openLinks.get(linkId) === open && !open.authenticated) {
+        open.authenticated = true;
+        try { open.onAuth?.(toHex(parsed.peer)); }
+        catch { /* a platform callback cannot corrupt delivery of the same read */ }
+      }
+      // The platform's onAuth hook is arbitrary embedder code and may synchronously reset
+      // or replace this binding. Do not let deliveries from the old result cross that edge.
+      if (this.activeOwner !== owner || this.channels.get(linkId) !== channel) return;
+      // Authentication is applied first: one byte-stream read may finish the handshake
+      // and carry the first request behind it.
+      this.deliverFrom(parsed.deliveries);
     }, (err: unknown) => {
       if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
-      console.error(`[transport] error in ${args.op}: ${String(err)}`);
+      console.error(`[transport] error in linkBytes: ${String(err)}`);
     });
   }
 
   private static readonly dec = new TextDecoder();
 
-  /** Route one delivery frame. Each record names an exact claim, an opaque attribution and a
-   *  payload; a record nobody serves settles as an empty answer. A malformed frame is
-   *  dropped: it is the occupant's own contract with the driver.
+  /** Parse a whole `linkBytes` return before applying any part of it. A malformed return
+   *  therefore authenticates nobody and delivers nothing; peer-controlled bytes cannot
+   *  make a valid prefix take effect before a malformed suffix is noticed.
    *
    *  EVERY variable field is read by its own length, the payload included. One socket read
    *  can carry several whole requests, so a record that ran to the end of the frame would
    *  put the NEXT record's claim and attribution inside this one's payload — bytes a peer
-   *  wrote, letting it attribute its own request to any key it names. Nothing is delivered
-   *  past the first record that does not fit. */
-  private deliverFrom(ret: Uint8Array): void {
-    if (!this.deliver || ret.length < 4) return;
+   *  wrote, letting it attribute its own request to any key it names. The complete return
+   *  must fit exactly or none of it takes effect. */
+  private parseLinkBytes(ret: Uint8Array): LinkBytesResult | null {
+    if (ret.length === 0) return { peer: null, deliveries: [] };
+    if (ret.length < 5 || ret[0] > 1) return null;
     const dec = TransportHost.dec;
-    const count = (readU32BE(ret, 0) >>> 0);
-    let off = 4;
+    let off = 1;
+    let peer: Uint8Array | null = null;
+    if (ret[0] === 1) {
+      if (ret.length < off + 32 + 4) return null;
+      peer = ret.slice(off, off + 32);
+      off += 32;
+    }
+    if (ret.length < off + 4) return null;
+    const count = readU32BE(ret, off) >>> 0;
+    off += 4;
+    // Fourteen bytes is the smallest possible record. Bound the loop before trusting a
+    // guest-supplied count, even though each iteration below also checks its fields.
+    if (count > Math.floor((ret.length - off) / 14)) return null;
+    const deliveries: ReturnedDelivery[] = [];
     for (let i = 0; i < count; i++) {
-      if (ret.length < off + 6) return;
+      if (ret.length < off + 6 || ret[off] > 1) return null;
       const noReply = ret[off] === 1;
       const corr = readU32BE(ret, off + 1);
       const claimLen = ret[off + 5];
-      if (ret.length < off + 6 + claimLen) return;
+      if (ret.length < off + 6 + claimLen) return null;
       const claim = dec.decode(ret.slice(off + 6, off + 6 + claimLen));
       const attrStart = off + 6 + claimLen;
-      if (ret.length < attrStart + 4) return;
+      if (ret.length < attrStart + 4) return null;
       const attrLen = readU32BE(ret, attrStart) >>> 0;
       const lenStart = attrStart + 4 + attrLen;
-      if (lenStart + 4 > ret.length) return;
+      if (lenStart + 4 > ret.length) return null;
       const payloadLen = readU32BE(ret, lenStart) >>> 0;
       const payloadStart = lenStart + 4;
       const next = payloadStart + payloadLen;
-      if (next > ret.length) return;
+      if (next > ret.length) return null;
       const attribution = ret.slice(attrStart + 4, lenStart);
       const payload = ret.slice(payloadStart, next);
+      deliveries.push({ noReply, corr, claim, attribution, payload });
+      off = next;
+    }
+    return off === ret.length ? { peer, deliveries } : null;
+  }
+
+  /** Route already-validated delivery records. The occupant that saw the plaintext is the
+   *  one that attributes it; the driver does not reinterpret that claim. */
+  private deliverFrom(deliveries: ReturnedDelivery[]): void {
+    if (!this.deliver) return;
+    for (const { noReply, corr, claim, attribution, payload } of deliveries) {
       void Promise.resolve(this.deliver(claim, attribution, payload)).then(
         (answer: Uint8Array | null | undefined) => this.answer(noReply, attribution, corr, answer ?? EMPTY),
         () => this.answer(noReply, attribution, corr, EMPTY),
       );
-      off = next;
     }
   }
 
@@ -425,7 +488,13 @@ export class TransportHost {
       send: (linkId, bytes) => { if (ownsBinding()) this.channels.get(linkId)?.send(bytes); },
       close: (linkId, graceful) => {
         if (!ownsBinding()) return;
-        try { this.channels.get(linkId)?.close(graceful); } catch { /* already gone */ }
+        const channel = this.channels.get(linkId);
+        if (!channel) return;
+        try { channel.close(graceful); } catch { /* already gone */ }
+        // RawLink implementations disagree about whether a deliberate local close later
+        // fires onClose (native explicitly cannot). The driver owns the table, so it makes
+        // the event universal on a later turn; a backend callback racing it is idempotent.
+        queueMicrotask(() => this.channelClosed(linkId, channel));
       },
       // A link that is gone, or a channel that cannot say, both read 0 — the safe answer:
       // the occupant's stall clock sees no progress and lets the deadline decide.
@@ -433,24 +502,7 @@ export class TransportHost {
         if (!ownsBinding()) return 0;
         try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
       },
-      authenticated: (linkId, peer) => { if (ownsBinding()) this.linkAuthed(linkId, peer); },
-      down: (linkId, reason) => { if (ownsBinding()) this.linkDown(linkId, reason); },
     };
-  }
-
-  // ── reports returned through this raw-link binding ──────────────────────────
-
-  /** A link this driver handed over (`openLink`) authenticated as `pk`. Relayed to
-   *  whoever passed the channel in; the driver forms no opinion about the peer. */
-  linkAuthed(linkId: number, pk: Uint8Array): void {
-    this.openLinks.get(linkId)?.onAuth?.(toHex(pk));
-  }
-
-  /** A link this driver handed over tore down, with the occupant's reason code —
-   *  relayed, never interpreted. */
-  linkDown(linkId: number, reason: number): void {
-    const o = this.openLinks.get(linkId);
-    if (o) { this.openLinks.delete(linkId); o.onClose?.(linkId, reason); }
   }
 
   // ── channels ────────────────────────────────────────────────────────────────
@@ -469,13 +521,36 @@ export class TransportHost {
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
     channel.onData((bytes) => {
-      this.tellDeliver(new Args("linkBytes").u32(linkId).blob(bytes));
+      if (this.channels.get(linkId) === channel) this.linkBytes(linkId, bytes);
     });
-    channel.onClose(() => {
-      if (!this.channels.delete(linkId)) return;
-      this.tell(new Args("linkClosed").u32(linkId));
-    });
+    channel.onClose(() => this.channelClosed(linkId, channel));
     return linkId;
+  }
+
+  /** One raw channel became unusable. The guest returns the close reason from this exact
+   *  event; no return field can select a sibling link. A stale owner/record cannot fire a
+   *  callback after handover. */
+  private channelClosed(linkId: number, channel: RawLink): void {
+    if (this.channels.get(linkId) !== channel) return;
+    this.channels.delete(linkId);
+    const owner = this.activeOwner;
+    const open = this.openLinks.get(linkId);
+    const finish = (reason: number) => {
+      if (!open || this.activeOwner !== owner || this.openLinks.get(linkId) !== open) return;
+      this.openLinks.delete(linkId);
+      try { open.onClose?.(linkId, reason); }
+      catch { /* the platform callback cannot retain a dead driver entry */ }
+    };
+    const r = this.toTransport(new Args("linkClosed").u32(linkId));
+    if (!r) { finish(0); return; }
+    void r.then(
+      (ret) => finish(ret.length === 1 ? ret[0] : 0),
+      (err: unknown) => {
+        finish(0);
+        if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+        console.error(`[transport] error in linkClosed: ${String(err)}`);
+      },
+    );
   }
 
   /** Tell the transport about a link the HOST opened: an accepted socket, or one a
@@ -511,7 +586,7 @@ export class TransportHost {
     // The channel is already closed (`register`), so this throws rather than returning a
     // handle onto a dead socket: a host-managed transport can be told no, unlike an accept.
     if (linkId === 0) throw new Error(`transport: raw link table is full (${this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS} links)`);
-    this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose });
+    this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose, authenticated: false });
     this.announce(linkId, {
       weDialed: opts.weDialed,
       kind: LINK_OPEN,

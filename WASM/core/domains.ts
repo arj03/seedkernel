@@ -45,7 +45,7 @@ export const HOST_SERVICES = {
     fs: { privilege: "app", calls: ["get", "put", "list", "delete", "size", "stat"] },
     clock: { privilege: "app", calls: ["now"] },
     timer: { privilege: "app", calls: ["arm", "clear"] },
-    link: { privilege: "link", calls: ["open", "send", "close", "stat", "authenticated", "down"] },
+    link: { privilege: "link", calls: ["open", "send", "close", "stat"] },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
 /** The full `service/call` vocabulary as a template-literal union — what the dispatch

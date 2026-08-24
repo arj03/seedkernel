@@ -70,9 +70,6 @@ export interface RawNet {
      *  `RawLink.buffered`). Optional: a host whose channels cannot say omits it,
      *  and the transport's stall clock degrades to a plain deadline. */
     buffered?(linkId: number): number;
-    /** Report the fate of a platform-owned link back to the binding that supplied it. */
-    authenticated(linkId: number, peer: Uint8Array): void;
-    down(linkId: number, reason: number): void;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -545,14 +542,6 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             const out = new Uint8Array(4);
             writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
             return out;
-        },
-        "link/authenticated": (payload) => {
-            rawNet().authenticated(readU32BE(payload, 0), payload.slice(4));
-            return NONE;
-        },
-        "link/down": (payload) => {
-            rawNet().down(readU32BE(payload, 0), payload[4]);
-            return NONE;
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {

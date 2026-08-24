@@ -863,9 +863,10 @@ await test("a peer cannot reach a bundle's local service claim, the transport's 
 });
 
 // ── the delivery return, when one read carries several requests ──────────────
-// The link occupant answers a `linkBytes` event with `[count u32]` and that many delivery
-// records, and the driver routes each through the shell's claim table (§12.10). Several
-// records in one return is the ORDINARY case on a byte stream. It is also where attribution
+// The link occupant answers a `linkBytes` event with an optional authenticated-peer
+// transition followed by `[count u32]` and that many delivery records, and the driver
+// routes each through the shell's claim table (§12.10). Several records in one return is
+// the ORDINARY case on a byte stream. It is also where attribution
 // is decided: the occupant writes the authenticated sender into each record, and if any
 // field ran to the end of the FRAME rather than to its own length, the next record would
 // be read out of this one's payload — a peer could hand the claim table a request
@@ -937,6 +938,91 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
   catch (e) { refused = String(e); }
   assert(refused.includes("the host's, not an app's"),
     `an app naming a platform event must be refused, got ${refused || "no error"}`);
+});
+
+// The event result carries no link id: the driver supplies it from the event context and
+// checks the captured owner/channel again after the result settles. Exercise that boundary
+// with a deliberately dishonest occupant rather than the real, pinned transport bundle.
+await test("EVENT RETURNS: authentication and down cannot be redirected to another link", async (keep) => {
+  class ManualChannel {
+    framing = 0;
+    data = null;
+    closed = null;
+    send() {}
+    onData(cb) { this.data = cb; }
+    onClose(cb) { this.closed = cb; }
+    // Deliberately does not fire `onClose`: this is native's local-close behavior. The
+    // driver must synthesize its own later event and still notify exactly once.
+    close() {}
+    emit(bytes = Uint8Array.of(1)) { this.data?.(bytes); }
+    fail() { this.closed?.(); }
+  }
+  const owner = {};
+  const driver = keep(new TransportHost({ identity: generateKeyPair() }));
+  driver.activate(owner);
+  const peerA = new Uint8Array(32).fill(0xa1);
+  const peerB = new Uint8Array(32).fill(0xb2);
+  const authResult = (peer, trailing = []) => Uint8Array.from([1, ...peer, 0, 0, 0, 0, ...trailing]);
+  let nextBytesResult = new Uint8Array();
+  let pending = null;
+  driver.route(async (payload) => {
+    const n = payload[0];
+    const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
+    if (op === "linkBytes") {
+      if (pending) return new Promise((resolve) => { pending.resolve = resolve; });
+      return nextBytesResult;
+    }
+    if (op === "linkClosed") return Uint8Array.of(CLOSE_REASON.LOCAL);
+    return new Uint8Array();
+  }, () => true);
+
+  const aChannel = new ManualChannel(), bChannel = new ManualChannel();
+  const a = { auth: [], close: [] }, b = { auth: [], close: [] };
+  const aLink = driver.openLink({
+    channel: aChannel, weDialed: false,
+    onAuth: (peer) => a.auth.push(peer), onClose: (_id, reason) => a.close.push(reason),
+  });
+  const bLink = driver.openLink({
+    channel: bChannel, weDialed: false,
+    onAuth: (peer) => b.auth.push(peer), onClose: (_id, reason) => b.close.push(reason),
+  });
+
+  nextBytesResult = authResult(peerA);
+  aChannel.emit();
+  await until(() => a.auth.length === 1, 1000, "A's event-bound authentication");
+  assert(a.auth[0] === hexOf(peerA) && b.auth.length === 0,
+    "A's linkBytes return must authenticate A and cannot select B");
+
+  // A second return cannot rename an authenticated link, and a malformed result has no
+  // valid prefix: neither authentication nor any later delivery may partially apply.
+  nextBytesResult = authResult(peerB);
+  aChannel.emit();
+  nextBytesResult = authResult(peerB, [0xff]);
+  bChannel.emit();
+  await settle();
+  assert(a.auth.length === 1 && b.auth.length === 0,
+    "duplicate or malformed authentication returns must have no effect");
+
+  // Hold B's result, close B through the raw-link owner, then settle the stale result.
+  // The channel intentionally emits no callback of its own, so this also pins the
+  // driver's cross-backend local-close event.
+  pending = {};
+  bChannel.emit();
+  await until(() => typeof pending.resolve === "function", 1000, "B's pending linkBytes return");
+  driver.rawNet(owner).close(bLink.linkId, false);
+  await until(() => b.close.length === 1, 1000, "B's event-bound close report");
+  pending.resolve(authResult(peerB));
+  pending = null;
+  await settle();
+  assert(b.auth.length === 0 && b.close[0] === CLOSE_REASON.LOCAL,
+    "a stale linkBytes result cannot revive or authenticate its closed link");
+
+  // A backend callback racing the synthesized close event is idempotent.
+  driver.rawNet(owner).close(aLink.linkId, false);
+  await until(() => a.close.length === 1, 1000, "A's close report");
+  aChannel.fail();
+  await settle();
+  assert(a.close.length === 1, "a local close and backend close callback must report down once");
 });
 
 await test("default caps are sane", async () => {

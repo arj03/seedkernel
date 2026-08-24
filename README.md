@@ -185,8 +185,8 @@ The fair follow-up to all these seams is whether confinement costs throughput. T
 
 - **The full write path — encrypt, hash every block, RS-encode — runs at ~270 MB/s on one thread** (100 MB, RS(10,6), 64 KB blocks, Node 20.11, a Ryzen 7 PRO 7840U), balanced across its three pieces: xchacha20 at ~550 MB/s, BLAKE2b block-ids at ~1.1 GB/s, SIMD RS encode at ~1.45 GB/s. Those are the codec's own computations and they dominate — the runtime's seam between guest and module is not where the time goes.
 - **A read with every block present is ~2.8 GB/s** — the code is systematic, so a full read is a concatenation with no GF(2⁸) work at all; only a missing block pays a decode, at ~1.6 GB/s.
-- **End to end, the link bounds throughput, not the runtime:** ~11 MB/s PUT and ~17 MB/s GET over a 10 ms-RTT, WebRTC-capped link with windowed round trips, and ~13 MB/s browser-to-browser — all through the same signed transport bundle every app gets.
-- **The whole layer ships as ~15 KB of WASM plus ~8 KB of gzipped guest JS**, reusing the libsodium the runtime already loads rather than bundling a second copy of a crypto library. The numbers reproduce with `node tests/bench.mjs` in the seedstore repo.
+- **End to end, the link bounds throughput, not the runtime:** ~4.5 MB/s PUT and ~10 MB/s GET over a fully modelled 10 ms request/response RTT, WebRTC-sized messages and a 32-request window, and ~13 MB/s browser-to-browser — all through the same signed transport bundle every app gets. The former ~11/~17 MB/s figures charged latency only on the inbound request, not on its response, and are not comparable to a real 10 ms RTT.
+- **The whole layer ships as ~15 KB of WASM plus ~8 KB of gzipped guest JS**, reusing the libsodium the runtime already loads rather than bundling a second copy of a crypto library. In the seedstore repo, `node tests/bench.mjs` reproduces the compute numbers and `node tests/bench-net.mjs 10 4 32` reproduces the latency-bearing PUT/GET sweep.
 
 ## Post-quantum posture
 
