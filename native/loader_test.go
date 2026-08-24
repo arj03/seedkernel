@@ -35,6 +35,10 @@ func TestScratchRegion(t *testing.T) {
 	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
 		t.Fatalf("echo module returned %q, want %q", r, msg)
 	}
+	residue, ok := w.mod.Memory().Read(w.scratch, uint32(len(msg)))
+	if !ok || !bytes.Equal(residue, make([]byte, len(msg))) {
+		t.Fatalf("module scratch retained the staged request after return: %x", residue)
+	}
 	// A payload past the reserved region is refused by the clamp, not by memory bounds.
 	if r := callModule(key, "fwd", make([]byte, w.size+1)); r != nil {
 		t.Fatalf("a payload past the reserved region must be refused, got %d B", len(r))

@@ -89,7 +89,7 @@
     "build": "npm run build:ws && npm run build:transport-bundle && npm run build:host && npm run build:host:min",
     "build:browser": "npm run build && npm run build:browser-sodium && npm run build:pq",
     "shell": "node build/host/main-node.js",
-    "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release",
+    "build:fixtures": "asc tests/fixtures/forwarder.ts --config asconfig.forwarder.json --target release && asc tests/fixtures/forwarder.ts --config asconfig.forwarder-nomax.json --target release && asc tests/fixtures/scratch-probe.ts --config asconfig.scratch-probe.json --target release",
     "test": "npm run build && npm run build:fixtures && node tests/verify-hardening.mjs && node tests/cli.test.mjs && node tests/transport-link.test.mjs && node tests/transport-load.test.mjs && node tests/transport.test.mjs && node tests/transport-tcp.test.mjs && node tests/transport-bundle.test.mjs && node tests/net-rtc.test.mjs && node tests/run.mjs",
     "test:load": "npm run build && node tests/transport-load.test.mjs",
     "loc": "node scripts/loc.mjs",

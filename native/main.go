@@ -111,9 +111,18 @@ func callModule(slot, module string, payload []byte) []byte {
 	// §4: write input at scratch, call handle(input_len), read the response back. Both
 	// copies are clamped to what the module reserved (§4.1) — writing past it would
 	// scribble whatever it keeps beyond scratch.
-	if uint32(len(payload)) > w.size || !w.mod.Memory().Write(w.scratch, payload) {
+	mem := w.mod.Memory()
+	if uint32(len(payload)) > w.size || mem == nil || !mem.Write(w.scratch, payload) {
 		return nil
 	}
+	// The module instance is long-lived. Once the response has been copied out, erase both
+	// the staged request and any longer response (for example an ML-KEM private key).
+	wipeLen := len(payload)
+	defer func() {
+		if b, ok := mem.Read(w.scratch, uint32(wipeLen)); ok {
+			clear(b)
+		}
+	}()
 	// The runtime is armed with WithCloseOnContextDone, which is what gives the §4.3
 	// bound teeth: a module that never returns is interrupted at its next loop back-edge.
 	callCtx, cancel := ctx, func() {}
@@ -141,11 +150,14 @@ func callModule(slot, module string, payload []byte) []byte {
 	if outLen < 0 || uint32(outLen) > w.size {
 		return nil
 	}
+	if int(outLen) > wipeLen {
+		wipeLen = int(outLen)
+	}
 	out := make([]byte, outLen)
 	if len(out) > 0 {
 		// A length past the module's memory is as bogus as an oversized payload — fail
 		// rather than return zero-filled bytes.
-		b, ok := w.mod.Memory().Read(w.scratch, uint32(len(out)))
+		b, ok := mem.Read(w.scratch, uint32(len(out)))
 		if !ok {
 			return nil
 		}

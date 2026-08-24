@@ -44,6 +44,29 @@ await test("RtcChannel exposes a length-framed stream and caps physical messages
   channel.close();
 });
 
+await test("RtcChannel fails closed when a chunked write throws after a prefix", async () => {
+  const listeners = new Map();
+  let writes = 0, closes = 0, failed = 0;
+  const dc = {
+    binaryType: "",
+    bufferedAmount: 0,
+    send() {
+      writes++;
+      if (writes === 2) throw new Error("SCTP buffer full");
+    },
+    close() { closes++; },
+    addEventListener(type, cb) { listeners.set(type, cb); },
+  };
+  const channel = new RtcChannel(dc);
+  channel.onClose(() => { failed++; });
+  listeners.get("open")();
+  channel.send(new Uint8Array(RTC_CHUNK_BYTES * 2 + 1));
+  assert(writes === 2, `the throwing second chunk must stop the write, got ${writes} attempts`);
+  assert(closes === 1 && failed === 1, "a partial RTC write must close and fail the channel exactly once");
+  channel.send(Uint8Array.of(9));
+  assert(writes === 2, "a failed channel must never append bytes after the truncated frame");
+});
+
 await test("offers cannot force more than MAX_UNAUTHED_PEERS peer entries", async () => {
   // The old cap applied to the broadcast-hello path only: an offer from an
   // arbitrary `from` created an entry (and an RTCPeerConnection) unconditionally.

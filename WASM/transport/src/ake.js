@@ -329,8 +329,10 @@ class Link {
     this.closed = false;
     this.notified = false;
     // Set exactly once by a host-managed link's onAuth callback and consumed by the
-    // `linkBytes` invocation that caused it. It contains no link id: the driver binds the
-    // returned peer to the event's own captured link.
+    // `linkBytes` invocation that caused it. Invariant: onAuth runs synchronously only
+    // from onWire's inbound msg3/msg4 path; a new deferred/timer auth path must report the
+    // peer through its own event instead of this read-coupled latch. It contains no link id:
+    // the driver binds the returned peer to the event's own captured link.
     this.reportedPeer = null;
     this.closedLocally = false;
     this.aborted = false;

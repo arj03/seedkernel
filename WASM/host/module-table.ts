@@ -126,15 +126,21 @@ port.onmessage = (e) => {
     // a caller downstream already reads for a failed transform. ms is this worker's own
     // time inside handle — the module's actual compute, excluding queue wait — which is what
     // the caller's execution budget is billed (§12.3).
-    let bytes = null;
+    let bytes = null, wipeLen = m.payload.byteLength;
     const t0 = performance.now();
     try {
       new Uint8Array(memory.buffer, scratch, m.payload.byteLength).set(new Uint8Array(m.payload));
       const len = handle(m.payload.byteLength);
       if (typeof len === "number" && len >= 0 && len <= scratchSize) {
         bytes = new Uint8Array(memory.buffer, scratch, len).slice().buffer;
+        wipeLen = Math.max(wipeLen, len);
       }
     } catch { bytes = null; }
+    finally {
+      // The response has been copied out. Neither request bytes nor a secret-bearing
+      // response may survive in a long-lived module instance's shared scratch window.
+      try { new Uint8Array(memory.buffer, scratch, wipeLen).fill(0); } catch { /* trapped/grown memory */ }
+    }
     const ms = performance.now() - t0;
     port.postMessage({ type: "result", id: m.id, bytes, ms }, bytes === null ? [] : [bytes]);
   }

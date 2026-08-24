@@ -126,6 +126,7 @@ EXPORT int handle(int input_len)
     {
       wipe(kem_coins, sizeof(kem_coins));
       wipe(kem_sk, sizeof(kem_sk));
+      wipe(scratch, input_len);
       return 0;
     }
     memcpy(scratch, kem_pk, MLKEM768_PUBLICKEYBYTES);
@@ -144,6 +145,7 @@ EXPORT int handle(int input_len)
       scratch[0] = 0;
       wipe(kem_coins, sizeof(kem_coins));
       wipe(kem_ss, sizeof(kem_ss));
+      wipe(scratch + 1, input_len - 1);
       return 1;
     }
     scratch[0] = 1;
@@ -151,6 +153,8 @@ EXPORT int handle(int input_len)
     memcpy(scratch + 1 + MLKEM768_CIPHERTEXTBYTES, kem_ss, MLKEM768_BYTES);
     wipe(kem_coins, sizeof(kem_coins));
     wipe(kem_ss, sizeof(kem_ss));
+    wipe(scratch + 1 + MLKEM768_CIPHERTEXTBYTES + MLKEM768_BYTES,
+         input_len - (1 + MLKEM768_CIPHERTEXTBYTES + MLKEM768_BYTES));
     return 1 + MLKEM768_CIPHERTEXTBYTES + MLKEM768_BYTES;
   }
 
@@ -163,14 +167,22 @@ EXPORT int handle(int input_len)
       scratch[0] = 0;
       wipe(kem_sk, sizeof(kem_sk));
       wipe(kem_ss, sizeof(kem_ss));
+      wipe(scratch + 1, input_len - 1);
       return 1;
     }
     scratch[0] = 1;
     memcpy(scratch + 1, kem_ss, MLKEM768_BYTES);
     wipe(kem_sk, sizeof(kem_sk));
     wipe(kem_ss, sizeof(kem_ss));
+    wipe(scratch + 1 + MLKEM768_BYTES, input_len - (1 + MLKEM768_BYTES));
     return 1 + MLKEM768_BYTES;
   }
 
+  /* A wrong tag/width may still carry a secret-shaped request. The module ABI supplies
+   * a non-negative length within scratch, but keep the exported shim safe on its own. */
+  if (input_len > 0 && input_len <= MODULE_SCRATCH_BYTES)
+  {
+    wipe(scratch, (size_t)input_len);
+  }
   return 0;
 }

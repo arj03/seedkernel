@@ -1773,6 +1773,25 @@ async function testCallModuleGuards() {
   assert(empty !== null && empty.length === 0,
     "an empty response is an empty array, distinct from null");
 
+  // The worker copies a result out before erasing scratch. This probe's second call
+  // returns the first call's old span without rewriting it, so any staged secret left in
+  // the long-lived instance would come straight back here.
+  const scrubber = await new JsModuleLoader().build([{
+    name: "probe", wasm: readFileSync(join(root, "build/scratch-probe.wasm")),
+  }]);
+  const secret = new Uint8Array(64).fill(0xa5);
+  assert((await scrubber.call("probe", secret)).bytes.length === 0, "scratch probe records a secret-bearing request");
+  const residue = (await scrubber.call("probe", Uint8Array.of(0))).bytes;
+  assert(residue.length === secret.length && residue.every((b) => b === 0),
+    "the JS module worker erases staged requests before the next call");
+  const secretResult = (await scrubber.call("probe", Uint8Array.of(1))).bytes;
+  assert(secretResult.length === secret.length && secretResult.every((b) => b === 0xa5),
+    "scratch probe returns a secret-bearing response longer than its request");
+  const resultResidue = (await scrubber.call("probe", Uint8Array.of(0))).bytes;
+  assert(resultResidue.length === secret.length && resultResidue.every((b) => b === 0),
+    "the JS module worker erases copied responses before the next call");
+  scrubber.dispose();
+
   console.log("  OK\n");
 }
 
@@ -2523,10 +2542,14 @@ async function testPreRevocationStoreIsRefused() {
   let absentThrew = false;
   try { new FreshnessMarks(null); } catch { absentThrew = true; }
   assert(!absentThrew, "an absent store starts empty on first boot");
-  for (const json of ["not json at all", "{}", '{"marks":{}}', '{"revoked":[]}']) {
-    let threw = false;
-    try { new FreshnessMarks(json); } catch { threw = true; }
+  for (const json of ["", "not json at all", "{}", '{"marks":{}}', '{"revoked":[]}']) {
+    let threw = false, msg = "";
+    try { new FreshnessMarks(json); } catch (e) { threw = true; msg = String(e.message); }
     assert(threw, `an existing malformed or partial store fails closed (${json})`);
+    if (json === "" || json === "{}") {
+      assert(msg.includes("delete it to start from no marks") || msg.includes("Delete it to start from no marks"),
+        `a ${json === "" ? "zero-byte" : "fieldless"} store explains operator recovery`);
+    }
   }
   console.log("  OK\n");
 }

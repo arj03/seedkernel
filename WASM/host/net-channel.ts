@@ -29,8 +29,16 @@ export abstract class BufferedChannel {
     send(bytes: Uint8Array): void {
         if (this.dead)
             return;
-        if (this.opened)
-            this.write(bytes);
+        if (this.opened) {
+            try {
+                this.write(bytes);
+            }
+            catch {
+                // A message may have been split into several physical writes. Once any
+                // write fails, the byte stream cannot safely continue after that prefix.
+                this.fail();
+            }
+        }
         else if (this.pendingBytes + bytes.length > MAX_PREOPEN_QUEUE_BYTES)
             this.fail();
         else {
@@ -64,8 +72,14 @@ export abstract class BufferedChannel {
         if (this.opened)
             return;
         this.opened = true;
-        for (const b of this.pending)
-            this.write(b);
+        try {
+            for (const b of this.pending)
+                this.write(b);
+        }
+        catch {
+            this.fail();
+            return;
+        }
         this.dropPending();
     }
     /** A whole message arrived. */

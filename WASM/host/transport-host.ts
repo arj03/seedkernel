@@ -357,7 +357,10 @@ export class TransportHost {
     if (!r) return;
     void r.then((ret) => {
       const parsed = this.parseLinkBytes(ret);
-      if (!parsed) return;
+      if (!parsed) {
+        console.error(`[transport] malformed linkBytes return (${ret.length} bytes)`);
+        return;
+      }
       // A close, reset or slot handover while the guest was awaiting makes this result
       // stale. Link ids are monotonic, but checking the captured object as well makes the
       // non-reuse assumption unnecessary to the authority boundary.
@@ -485,7 +488,18 @@ export class TransportHost {
         if (linkId === 0) return NO_ROUTE;
         return { linkId, framing: channel.framing, authority: channel.authority ?? "" };
       },
-      send: (linkId, bytes) => { if (ownsBinding()) this.channels.get(linkId)?.send(bytes); },
+      send: (linkId, bytes) => {
+        if (!ownsBinding()) return;
+        const channel = this.channels.get(linkId);
+        if (!channel) return;
+        try { channel.send(bytes); }
+        catch {
+          // A throwing backend may already have emitted a prefix (notably an RTC write
+          // split into SCTP-sized chunks). Continuing would desynchronize LENGTH framing.
+          try { channel.close(false); } catch { /* already gone */ }
+          this.channelClosed(linkId, channel);
+        }
+      },
       close: (linkId, graceful) => {
         if (!ownsBinding()) return;
         const channel = this.channels.get(linkId);

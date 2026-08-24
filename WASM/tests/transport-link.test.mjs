@@ -998,10 +998,19 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   nextBytesResult = authResult(peerB);
   aChannel.emit();
   nextBytesResult = authResult(peerB, [0xff]);
-  bChannel.emit();
-  await settle();
+  const diagnostics = [];
+  const oldError = console.error;
+  console.error = (...args) => diagnostics.push(args.join(" "));
+  try {
+    bChannel.emit();
+    await settle();
+  } finally {
+    console.error = oldError;
+  }
   assert(a.auth.length === 1 && b.auth.length === 0,
     "duplicate or malformed authentication returns must have no effect");
+  assert(diagnostics.some((line) => line.includes("malformed linkBytes return")),
+    "a malformed linkBytes return must leave an operator-visible diagnostic");
 
   // Hold B's result, close B through the raw-link owner, then settle the stale result.
   // The channel intentionally emits no callback of its own, so this also pins the
@@ -1023,6 +1032,25 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   aChannel.fail();
   await settle();
   assert(a.close.length === 1, "a local close and backend close callback must report down once");
+
+  // Not every RawLink is a BufferedChannel. The driver is the final containment boundary:
+  // a backend send that throws after emitting bytes must be failed and removed, never left
+  // available for another write that would follow a truncated LENGTH frame.
+  class ThrowingChannel extends ManualChannel {
+    stops = 0;
+    send() { throw new Error("partial backend write"); }
+    close() { this.stops++; }
+  }
+  const cChannel = new ThrowingChannel();
+  const c = { close: [] };
+  const cLink = driver.openLink({
+    channel: cChannel, weDialed: false,
+    onClose: (_id, reason) => c.close.push(reason),
+  });
+  driver.rawNet(owner).send(cLink.linkId, Uint8Array.of(1, 2, 3));
+  await until(() => c.close.length === 1, 1000, "throwing channel close report");
+  assert(cChannel.stops === 1 && c.close[0] === CLOSE_REASON.LOCAL,
+    "a throwing raw send must close the backend and fail its driver link");
 });
 
 await test("default caps are sane", async () => {

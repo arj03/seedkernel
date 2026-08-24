@@ -590,7 +590,8 @@ export class FreshnessMarks {
                 parsed = JSON.parse(json);
             }
             catch (e) {
-                throw new Error(`freshness store: corrupt file — malformed JSON: ${errMessage(e)}`, { cause: e });
+                throw new Error(`freshness store: corrupt file — malformed JSON: ${errMessage(e)}. ` +
+                    "Delete it to start from no marks.", { cause: e });
             }
             if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
                 throw new Error("freshness store: corrupt file — root must be an object with marks and revoked fields");
@@ -602,7 +603,8 @@ export class FreshnessMarks {
                     "or delete it to start from no marks.");
             }
             if (raw.marks === undefined || raw.revoked === undefined) {
-                throw new Error('freshness store: corrupt file — expected both "marks" and "revoked" fields');
+                throw new Error('freshness store: corrupt file — expected both "marks" and "revoked" fields. ' +
+                    "Delete it to start from no marks.");
             }
             const marks = raw.marks;
             if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {

@@ -65,6 +65,43 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	}
 }
 
+func TestGuestRealmStraySettleDoesNotLoosenOutstandingCap(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build-seam.js", qjs.Code(`
+		globalThis.__guestSeam = () => new Promise(() => {});
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealm(t, "{}", `
+		function handle() {
+		  host.call("hold", new Uint8Array([1]));
+		  return new Uint8Array();
+		}
+	`)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+
+	g := realms[realmSeq]
+	if _, err := realmCall("park", nil); err != nil {
+		t.Fatal("park host call:", err)
+	}
+	if g.outstandingHostCalls != 1 {
+		t.Fatalf("parked call count = %d, want 1", g.outstandingHostCalls)
+	}
+	var liveID int64
+	for id := range g.hostCalls {
+		liveID = id
+	}
+
+	g.settleNet(liveID+1000, []byte{}, "")
+	if g.outstandingHostCalls != 1 {
+		t.Fatalf("stray settlement changed parked call count to %d", g.outstandingHostCalls)
+	}
+	g.settleNet(liveID, []byte{}, "")
+	if g.outstandingHostCalls != 0 {
+		t.Fatalf("live settlement left parked call count at %d", g.outstandingHostCalls)
+	}
+}
+
 // A confined guest realm runs an app's entrypoints over the single
 // host.call seam, reaching only its declared requires. This exercises a
 // content-addressed put/get guest (local, synchronous ops) end-to-end, and asserts
