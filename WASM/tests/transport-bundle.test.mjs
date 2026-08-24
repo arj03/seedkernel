@@ -82,11 +82,9 @@ function transportBundleAt(version, keys, guestSource) {
 // reaches a handler on the other.
 const appAuthor = makeAuthor(sodium);
 const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
-const appKey = `${appAuthorHex}:harness`;
-
-/** One request out of `shell`, through its app, to `to` — the path a deployment uses. */
-async function request(shell, to, payload) {
-  return appRequest(shell, appKey, to, payload);
+/** One request through a node's app handle to `to` — the path a deployment uses. */
+async function request(app, to, payload) {
+  return appRequest(app, to, payload);
 }
 
 async function makeNode(channels, listen, freshnessStore = new FreshnessMarks()) {
@@ -120,8 +118,8 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     admit: policy,
   });
   await shell.loadBundleBlob(transportBlob);
-  await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return { shell, transport, realmControl };
+  const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
+  return { shell, transport, realmControl, app };
 }
 
 console.log("Test: transport bundle drives two nodes over loopback");
@@ -151,7 +149,7 @@ aNet.addPeerAddr(bId, { host: "loopback", port: bNet.port, transport: "tcp" });
 await aNet.ready(2000);
 assert((await aNet.linkedPeers()).includes(bId), "A authenticated B over loopback (AKE ran)");
 
-const resp = await request(b.shell, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
+const resp = await request(b.app, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through the record layer");
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
@@ -182,19 +180,19 @@ assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold")
 assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
 
 let racedAddrResp = null;
-try { racedAddrResp = await request(a.shell, cId, new Uint8Array([7, 8, 9])); } catch { /* assertion below */ }
+try { racedAddrResp = await request(a.app, cId, new Uint8Array([7, 8, 9])); } catch { /* assertion below */ }
 assert(racedAddrResp?.length === 3 && racedAddrResp[2] === 9,
   "an address added after candidate config but before claim commit is replayed to the replacement");
 
 // Live links do not survive and are not meant to: session keys live in the outgoing
 // guest's private memory. What survives is the host's half — the address book — so the
 // first request redials and succeeds.
-const resp2 = await request(a.shell, bId, new Uint8Array([9, 9]));
+const resp2 = await request(a.app, bId, new Uint8Array([9, 9]));
 assert(resp2.length === 2 && resp2[0] === 9, "A reconnects from the re-seeded address book and requests through the NEW transport");
 
 // And the reverse direction: B dials A on the port it already knew, and reaches A's app
 // through the incoming guest.
-const resp3 = await request(b.shell, aNet.peerId, new Uint8Array([5, 6, 7]));
+const resp3 = await request(b.app, aNet.peerId, new Uint8Array([5, 6, 7]));
 assert(resp3.length === 3 && resp3[2] === 7, "B reaches A on the unchanged port, through the new guest");
 
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
@@ -203,7 +201,7 @@ let refused = false;
 try { await a.shell.loadBundleBlob(transportBundleAt(1, transportKeys)); }
 catch { refused = true; }
 assert(refused, "a lower version from the same author is refused after the upgrade");
-assert((await request(a.shell, bId, new Uint8Array([4]))).length === 1,
+assert((await request(a.app, bId, new Uint8Array([4]))).length === 1,
   "…and the refused load left the standing transport serving");
 
 // ── A version that never ran must not consume the claim ──────────────────────────
@@ -221,7 +219,7 @@ try { await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
 assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
-assert((await request(a.shell, bId, new Uint8Array([8, 8]))).length === 2,
+assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
 
 // ── A mark that cannot be persisted is a failed load ─────────────────────────────

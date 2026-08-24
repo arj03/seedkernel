@@ -1,6 +1,6 @@
 // seedkernel-shell — the NODE platform (README §12).
 //
-// `bootRuntime()` assembles a node out of this platform's parts — `NodeFs` on a data
+// `bootNodeShell()` assembles a node out of this platform's parts — `NodeFs` on a data
 // directory, a `node:net` channel factory, a file-backed freshness store — and hands them
 // to the shared `bootShell`, which is the assembly (§12.9). It knows nothing about any app:
 // everything arrives as a signed bundle (§12.4) whose author must clear the policy gate.
@@ -20,7 +20,7 @@ import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
 import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
 
-export interface ShellOptions {
+export interface NodeShellOptions {
     /** Policy file contents (policy.ts). Omit ⇒ deny-all: the node boots and serves but
      *  accepts no installs. */
     policyJson?: string;
@@ -66,7 +66,7 @@ export interface ShellOptions {
 
 /** The Node-side Shell — the platform-neutral CoreShell plus a file-backed
  *  `loadBundle` and a guaranteed `fs` (Node always has a filesystem). */
-export interface Shell extends CoreShell {
+export interface NodeShell extends CoreShell {
     fs: Fs;
     /** Load a signed bundle *file*: read it from disk then delegate to
      *  loadBundleBlob (§12.4). This is the Node convenience wrapper;
@@ -76,8 +76,8 @@ export interface Shell extends CoreShell {
 
 /** The CLI's runtime pair, narrowed to this platform's shell — one declaration of the
  *  shape, so `standUp` returning it stays a compile-time fact rather than a coincidence. */
-export interface NodeRuntime extends CliNodeRuntime {
-    shell: Shell;
+export interface NodeShellRuntime extends CliNodeRuntime {
+    shell: NodeShell;
 }
 
 /** A `FreshnessStore` backed by one JSON file (`{ marks, revoked }`), kept OUTSIDE the
@@ -111,7 +111,7 @@ export class FileFreshnessStore extends FreshnessMarks {
 /** Assemble the runtime on Node: build the platform seam, hand it to the shared
  *  `bootShell` — which admits the transport bundle, the signed program that is the node's
  *  network (§12.6) — then wrap the core shell with the file-backed `loadBundle`. */
-export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
+export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRuntime> {
     const sodium = await loadCrypto();
     // ── Node platform seam ─────────────────────────────────────────────────────
     const fs = new NodeFs(opts.dir);
@@ -141,7 +141,7 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
         realmMemoryBytes: opts.realmMemoryBytes,
     });
     // ── Node wrapper: add file-backed loadBundle ────────────────────────────────
-    const shell: Shell = {
+    const shell: NodeShell = {
         resolve: core.resolve,
         routes: core.routes,
         // This platform always supplies an fs (Node always has a filesystem), so the
@@ -154,7 +154,6 @@ export async function bootRuntime(opts: ShellOptions): Promise<NodeRuntime> {
         async loadBundle(file, loadOpts) {
             return core.loadBundleBlob(new Uint8Array(readFileSync(file)), loadOpts);
         },
-        invoke: core.invoke,
         dispatch: core.dispatch,
         close() { core.close(); },
     };

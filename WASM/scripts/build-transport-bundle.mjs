@@ -2,7 +2,7 @@
 // (§12.6): guest parts + ws.wasm, signed under suite 0x02 (Ed25519 + ML-DSA-65, §12.4,
 // §14.1) with host/bundle.ts's own authorBundle — the same functions the runtime signs
 // and verifies with, not a second copy. Writes build/transport.skb and
-// host/transport-bundle.ts (b64 inline; both gitignored — host/main.ts imports the
+// host/transport-bundle.ts (b64 inline; both gitignored — host/shell-node.ts imports the
 // latter, hence the narrow prebuild compile before the full tsc, see npm scripts).
 //
 // The author key is `--key <seed>` or transport/author.key (generated, gitignored), so a

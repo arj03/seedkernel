@@ -69,8 +69,10 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
 globalThis.__requester = null;
 // The requester loads the probe app and asks through it: a request is an app calling
 // the id the transport claims, so there is nothing host-side to call instead.
-globalThis.loadIntoRequester = (bytes) => __requesterNode.shell.loadBundleBlob(new Uint8Array(bytes));
-globalThis.ask = async (appKey, sendArgs) => {
+globalThis.loadIntoRequester = async (bytes) => {
+  globalThis.__requester = await __requesterNode.shell.loadBundleBlob(new Uint8Array(bytes));
+};
+globalThis.ask = async (sendArgs) => {
   // The op is a NAME of the probe app's own vocabulary (the shell passes bytes unread;
   // this file composes the frame the app's handle reads).
   const op = "send", args = new Uint8Array(sendArgs);
@@ -78,15 +80,11 @@ globalThis.ask = async (appKey, sendArgs) => {
   framed[0] = op.length;
   for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
   framed.set(args, 1 + op.length);
-  const r = await __requesterNode.shell.invoke(framed, appKey);
+  const r = await __requester.invoke(framed);
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 };
 `
-
-// requesterAppKey is the app key the probe bundle binds under on the requester — the
-// app `ask` invokes, since a request is a local loopback into an app.
-var requesterAppKey string
 
 // startRequester boots the second node, loads the probe app into it, and returns its
 // peer id. The app is what actually sends: there is no host-side request facade.
@@ -112,7 +110,6 @@ func startRequester(t *testing.T, holderAuthorHex, holderID string, port int) st
 	if _, err := callRealm("loadIntoRequester", 5*time.Second, qc.NewArrayBuffer(blob)); err != nil {
 		t.Fatal("loadIntoRequester:", err)
 	}
-	requesterAppKey = appKeyFor(sender.id(), "probe")
 	return mustEvalString(t, qc, `__peerId`)
 }
 
@@ -120,7 +117,7 @@ func startRequester(t *testing.T, holderAuthorHex, holderID string, port int) st
 func ask(t *testing.T, holderID, proto string, payload []byte) []byte {
 	t.Helper()
 	out, err := callRealm("ask", 8*time.Second,
-		qc.NewString(requesterAppKey), qc.NewArrayBuffer(probeSendArgs(holderID, proto, payload)))
+		qc.NewArrayBuffer(probeSendArgs(holderID, proto, payload)))
 	if err != nil {
 		t.Fatal("request:", err)
 	}

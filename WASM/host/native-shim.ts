@@ -5,16 +5,15 @@
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
-import { runCli, loadedLine, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { runCli, parsePeerSpec, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import {
-  bootShell, type RealmFactory, type Shell, type ShellSodium,
+  bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { serializeCalls } from "./realm-queue.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
-import { writeOp } from "../core/op-frame.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
@@ -518,12 +517,6 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     return utf8.encode(JSON.stringify(status));
 }
 
-/** Native test seam: drive a slot through the host invocation path. Pure modules stay
- *  private; no module lookup crosses this boundary. The shell passes the client helper's
- *  "test" frame unread. */
-const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) =>
-    theShell().invoke(writeOp("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload)), appKey);
-
 // ── the operator flow ────────────────────────────────────────────────────────
 /** This platform, as `cli.ts` needs it: files, a console line, raw stdout, entropy, and
  *  "stand a node up here" — none of which decides anything. The flag set, the defaults,
@@ -572,13 +565,12 @@ async function runMain(): Promise<Uint8Array> {
     if (!serving) close();
     return utf8.encode(JSON.stringify({ serving }));
 }
-/** Load a bundle FILE and return the operator's console line for it — byte for byte the
- *  line `runCli` prints, because it is the same `loadedLine`. Here for the native tests,
- *  which drive the real §12.4 load path and assert on what an operator would see. */
-async function cliLoadBundle(path: string): Promise<Uint8Array> {
+/** Node-like file convenience over the native platform's byte bridge. The returned
+ *  handle remains with the caller; the platform keeps no key-to-handle registry. */
+async function loadBundleFile(path: string): Promise<AppHandle> {
     const raw = bridge.readFile(path);
     if (raw === null) throw new Error(`cannot read ${path}`);
-    return utf8.encode(loadedLine(await theShell().loadBundleBlob(new Uint8Array(raw))));
+    return theShell().loadBundleBlob(new Uint8Array(raw));
 }
 
 /** The confined realm's own plumbing (native/guest.go `guestDriverJS`): one pre-compiled
@@ -621,4 +613,4 @@ globalThis.__start = function (id, arg) {
 // What Go reaches by name in the realm. `createRealm` and the transport helpers are here
 // for the native tests as much as for the boot above, so a test that stands up a guest or
 // a second node drives the very factories production does.
-export { runMain, cliLoadBundle, openStore, bootNode, invokeApp, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };

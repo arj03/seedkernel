@@ -159,10 +159,6 @@ export interface Shell {
      *  on the same derived names, refusing alone leaves the compromised code running.
      *  Permanent and host-local — recovery is a new author key, not an un-revoke. */
     revoke(authorHex: string): string[];
-    /** Loopback into a loaded app's `handle` as the host (32 zero-byte caller id).
-     *  Addressed by app key — whatever is installed under that identity now. The payload
-     *  is the app's OWN format: the shell prefixes attribution and reads no further. */
-    invoke(payload: Uint8Array, appKey: string): Promise<Uint8Array>;
     /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
      *  the app claiming it and invoke that app's guest `handle` entrypoint with
      *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
@@ -172,8 +168,7 @@ export interface Shell {
     close(): void;
 }
 
-/** What a load returns: verified facts plus a slot-bound handle (§12.4).
- *  `invoke` is bound to this slot; `Shell.invoke` re-resolves the key. */
+/** What a load returns: verified facts plus a slot-bound handle (§12.4). */
 export interface AppHandle extends LoadedBundle {
     /** `<author hex>:<app>` (§12.4) — the slot's audit identity, the freshness key and
      *  what `uninstall`/`revoke` address. */
@@ -187,11 +182,9 @@ export interface AppHandle extends LoadedBundle {
      *  (outside a running node), `scopedFs(raw, appScope)` re-derives the same view. */
     appScope: string;
     /** Loopback invoke into this app's one `handle` entrypoint, bound to THE SLOT this
-     *  load stood — not to the app key, which is what `Shell.invoke` re-resolves. The
-     *  difference is an upgrade: a replacement load stands a new slot under the same key,
-     *  so a handle taken before it keeps naming the version it was handed, and rejects
-     *  once that slot is disposed. A caller meaning "whatever is installed now" holds the
-     *  key and calls `Shell.invoke`. */
+     *  load stood. A replacement load stands a new slot under the same key, so a handle
+     *  taken before it keeps naming the version it was handed and rejects once that slot
+     *  is disposed. The replacement load returns the new handle. */
     invoke(payload: Uint8Array): Promise<Uint8Array>;
 }
 
@@ -391,6 +384,7 @@ function createShell(opts: CreateShellOptions & {
     };
     /** Cancel deadlines, then dispose realm. Every teardown path goes through this. */
     const disposeSlot = (slot: AppSlot | null | undefined) => {
+        if (slot) slot.active = false;
         slot?.timers.clearAll();
         slot?.realm?.dispose();
         slot?.pureModules.dispose();
@@ -728,7 +722,9 @@ function createShell(opts: CreateShellOptions & {
                 key,
                 fs: slot.fsScope,
                 appScope: slot.appScope,
-                invoke: (payload) => invokeSlot(slot, payload),
+                invoke: (payload) => slot.active
+                    ? invokeSlot(slot, payload)
+                    : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
             };
             return handle;
         },
@@ -751,14 +747,6 @@ function createShell(opts: CreateShellOptions & {
                 }
             }
             return gone;
-        },
-        async invoke(payload, appKey) {
-            const slot = findSlot(appKey);
-            if (!slot)
-                throw new Error(`shell: no app '${appKey}' loaded`);
-            // `AppHandle.invoke` is the same call with the slot already bound — see
-            // `invokeSlot` for the framing and the close() chaining.
-            return invokeSlot(slot, payload);
         },
         dispatch: doDispatch,
         close() {

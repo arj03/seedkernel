@@ -822,7 +822,7 @@ await test("a peer-inbound answer reaches the loader through onInbound", async (
     modules: [], guestSource, guestRequires: [],
   });
   const seen = [];
-  await st.B.shell.loadBundleBlob(blob, {
+  const watcher = await st.B.shell.loadBundleBlob(blob, {
     onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
   });
 
@@ -837,8 +837,7 @@ await test("a peer-inbound answer reaches the loader through onInbound", async (
 
   // The host loopback path already holds its own return value directly — onInbound is
   // wired for the peer path alone, so invoking the SAME slot as the host must not fire it.
-  const appKey = `${Buffer.from(st.B.appAuthor.id).toString("hex")}:watcher`;
-  await st.B.shell.invoke(Uint8Array.from([9, 9]), appKey);
+  await watcher.invoke(Uint8Array.from([9, 9]));
   assert(seen.length === 1, "a host loopback invoke of the same slot must not fire onInbound");
 });
 

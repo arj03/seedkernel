@@ -349,9 +349,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     // app's argument shape, which a flag per operation could not avoid. A name too long
     // or not ASCII is refused there rather than truncated into a different frame.
     //
-    // Addressed to the app THIS flow loaded, by the key its load returned, rather than
-    // left to `invoke`'s "the only app" default: a node with a network has the transport
-    // loaded too, so "the only one" is not something `--bundle` can mean.
+    // Addressed through the handle THIS flow's load returned. A node with a network has
+    // the transport loaded too, so no shell-level "the only app" operation exists.
     const op = args.get("op");
     if (op !== undefined) {
       host.stdout(await loaded.invoke(writeOp(op, host.stdin())));

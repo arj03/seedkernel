@@ -16,6 +16,24 @@ import (
 	"seedloader/qjs"
 )
 
+// The old Shell.invoke-by-key shape survives only as a TEST adapter for Go assertions
+// that select among several bundles. Production returns AppHandles and retains none.
+const nativeHandleHarness = `
+(() => {
+  const apps = new Map();
+  globalThis.cliLoadBundle = async (path) => {
+    const app = await loadBundleFile(path);
+    apps.set(app.key, app);
+    return new TextEncoder().encode(loadedLine(app));
+  };
+  globalThis.invokeApp = (appKey, payload) => {
+    const app = apps.get(appKey);
+    if (!app) throw new Error("native test: no loaded handle for '" + appKey + "'");
+    return app.invoke(writeOp("test", new Uint8Array(payload)));
+  };
+})();
+`
+
 // bootRealm stands up a fresh realm on a temp data dir: the engines, the platform
 // primitives, and the one shared bundle — but no node. For tests that exercise a
 // primitive (fs, the byte seam) or the shared JS directly.
@@ -25,6 +43,9 @@ func bootRealmIn(tb testing.TB, dir string) {
 	tb.Helper()
 	if err := boot(); err != nil {
 		tb.Fatal("boot:", err)
+	}
+	if _, err := qc.Eval("native-handle-harness.js", qjs.Code(nativeHandleHarness)); err != nil {
+		tb.Fatal("native handle harness:", err)
 	}
 	// Where this node's disk is, through the same `openStore` the operator flow calls
 	// once it has read --dir (host/native-shim.ts). Go's boot no longer knows about a

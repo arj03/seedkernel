@@ -1,5 +1,5 @@
 // Node CLI entry for the seedkernel-shell: the shared operator flow (`cli.ts`) bound to
-// the Node platform. Kept separate from main.ts so that stays a pure library module with
+// the Node platform. Kept separate from shell-node.ts so that stays a pure library module with
 // no argv-sniffing auto-run guard.
 //
 //   node build/host/main-node.js --policy ./allowed-keys.json --dir ./data \
@@ -10,7 +10,7 @@
 // native binary runs inside QuickJS.
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { runCli, type CliHost, type NodeSetup } from "./cli.js";
-import { bootRuntime } from "./main.js";
+import { bootNodeShell } from "./shell-node.js";
 import { loadCrypto } from "./crypto-node.js";
 import { errMessage } from "../core/util.js";
 
@@ -47,9 +47,9 @@ async function nodeHost(): Promise<CliHost> {
     },
     sodium,
     async standUp(cfg: NodeSetup) {
-      // ShellOptions is NodeSetup plus this platform's optional members, so the config
+      // NodeShellOptions is NodeSetup plus this platform's optional members, so the config
       // crosses unchanged — no field-by-field copy to fall out of step.
-      return bootRuntime(cfg);
+      return bootNodeShell(cfg);
     },
   };
 }

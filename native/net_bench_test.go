@@ -85,15 +85,14 @@ const netBenchGuestSource = `
 // app's author (for the app) before either node has a network at all: the shared bench
 // realm boots deny-all (ensureBooted).
 //
-// The four %q holes, in order: the app bundle hex, the app key invoke addresses, the
-// app author's hex id, and the protocol id B sends under.
+// The three %q holes, in order: the app bundle hex, the app author's hex id, and the
+// protocol id B sends under.
 const netBenchHarness = `
 	globalThis.idA = sodium.crypto_sign_keypair();
 	globalThis.idB = sodium.crypto_sign_keypair();
 	globalThis.aId = toHex(idA.publicKey);
 	globalThis.bId = toHex(idB.publicKey);
 	globalThis.__appBlob = fromHex(%q);
-	globalThis.__appKey = %q;
 	setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor, %q],
 	                           grants: { link: [embeddedTransportAuthor] } }));
 	globalThis.__netSetup = (async () => {
@@ -104,7 +103,7 @@ const netBenchHarness = `
 	  // A claims the protocol so inbound frames route to its guest; B holds the same app
 	  // because the request goes out THROUGH it.
 	  await a.shell.loadBundleBlob(__appBlob);
-	  await b.shell.loadBundleBlob(__appBlob);
+	  const bApp = await b.shell.loadBundleBlob(__appBlob);
 
 	  // The transport's 'send' op argument order (transport/src/core.js):
 	  // [noReply u8][deadline u32][to blob][proto blob][payload blob].
@@ -133,7 +132,7 @@ const netBenchHarness = `
 	  // One request out of B, answered by A's app. The [ok u8][response] answer shape is
 	  // the transport's; a 0 means unreachable, a deadline, or a refusal.
 	  const req = async (args) => {
-	    const r = await b.shell.invoke(opFrame("send", args), __appKey);
+	    const r = await bApp.invoke(opFrame("send", args));
 	    if (r[0] !== 1) throw new Error("net: request failed");
 	    return r.slice(1);
 	  };
@@ -151,7 +150,7 @@ const netBenchHarness = `
 	  // receiver's), so it is what says whether a round-trip number is the wire or the
 	  // guest boundary.
 	  const localArg = new Uint8Array(34);
-	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await b.shell.invoke(opFrame("echo", localArg), __appKey); return new Uint8Array(0); };
+	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await bApp.invoke(opFrame("echo", localArg)); return new Uint8Array(0); };
 	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
 	})();
 `
@@ -179,7 +178,6 @@ func setupNetBench(b *testing.B) *eventLoop {
 		blob := signedBundleBytes(b, author, benchProto, 1, netBenchGuestSource, []string{"_net"})
 		src := fmt.Sprintf(netBenchHarness,
 			hex.EncodeToString(blob),
-			appKeyFor(author.id(), benchProto),
 			hex.EncodeToString(author.id()),
 			benchProto)
 		if _, err := qc.Eval("net-bench-harness.js", qjs.Code(src)); err != nil {

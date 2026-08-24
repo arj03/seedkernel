@@ -17,7 +17,7 @@ const {
 } = await imp("build/host/crypto-node.js");
 const { ModuleTable: JsModuleLoader } = await imp("build/host/module-table.js");
 const { bootShell } = await imp("build/host/shell-core.js");
-const { bootRuntime } = await imp("build/host/main.js");
+const { bootNodeShell } = await imp("build/host/shell-node.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
 
 // The host's already-readied instance rather than our own copy:
@@ -63,11 +63,11 @@ const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), requires: [], 
  *  half an identity. */
 const testAuthor = () => makeAuthor(sodium);
 
-/** A NODE-platform node for one test: `bootRuntime` (main.ts) minus the channel
+/** A NODE-platform node for one test: `bootNodeShell` (shell-node.ts) minus the channel
  *  adapter, which these tests do not drive. The disk-backed platform — NodeFs on a data
  *  directory, a file-backed freshness store — is the point of reaching for it over
  *  {@link bootTestShell}, which stands a node with no disk. */
-const boot = async (cfg) => (await bootRuntime(cfg)).shell;
+const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
 
 /** A node for ONE test, through the one assembly (`bootShell`, §12.9). The platform
  *  members are stated flat, as the assembly takes them; `fs` defaults to `false` — most
@@ -2875,8 +2875,8 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
     admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
   });
   try {
-    await shell.loadBundleBlob(blob(1));
-    await shell.invoke(new Uint8Array(), key);
+    const first = await shell.loadBundleBlob(blob(1));
+    await first.invoke(new Uint8Array());
     assertEqual(realms.length, 1, "the first slot stands one realm");
 
     failNextRealm = true;
@@ -2886,9 +2886,12 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
     assert(!realms[0].disposed, "the failed candidate leaves the running realm intact");
     assertEqual(shell.resolve("upgrade/v1"), key, "…and leaves its claim intact");
 
-    await shell.loadBundleBlob(blob(2));
+    const replacement = await shell.loadBundleBlob(blob(2));
     assert(realms[0].disposed, "the upgrade disposed the realm it replaced");
-    await shell.invoke(new Uint8Array(), key);
+    let staleRejected = false;
+    try { await first.invoke(new Uint8Array()); } catch { staleRejected = true; }
+    assert(staleRejected, "the replaced slot's handle is revoked");
+    await replacement.invoke(new Uint8Array());
     assertEqual(realms.length, 2, "…and the app answers from a NEW realm");
     assert(!realms[1].disposed, "…which is the one left standing");
 

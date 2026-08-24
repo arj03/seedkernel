@@ -32,7 +32,7 @@ The realm is the only inbound entry. `pureModules` is a private name-to-instance
 
 The shell also retains installed slots for administration and initiator-only bundles, but that collection is not a second routing model: dispatch is always one `claim → slot` lookup. A claim has one active owner. A different identity that contests it is rejected; an update may atomically replace its own slot and claims.
 
-App keys remain only where identity is required: freshness and revocation records, filesystem and signing scope derivation, audit output, and the operator's explicit `invoke`/`uninstall` selector. They are not module addresses and claims do not route through them.
+App keys remain only where identity is required: freshness and revocation records, filesystem and signing scope derivation, audit output, and the operator's explicit `uninstall` selector. Host invocation uses the slot-bound handle returned by a load. Keys are not module addresses and claims do not route through them.
 
 ### 3.1 Atomic load and replacement
 

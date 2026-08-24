@@ -44,7 +44,6 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	probeKey := appKeyFor(sender.id(), "probe")
 	harness := fmt.Sprintf(`
 		// A node's network IS the transport bundle, so both ends are stood up by
 		// makeTransportNode — the factory bootNode uses — and the policy has to admit
@@ -61,7 +60,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  const b = await makeTransportNode({ identity: idB, timeoutMs: 1000 });
 		  await a.transport.start();
 		  await a.shell.loadBundleBlob(__probe);
-		  await b.shell.loadBundleBlob(__probe);
+		  const bApp = await b.shell.loadBundleBlob(__probe);
 		  b.transport.addPeerAddr(aId, { host: "127.0.0.1", port: a.transport.%s, transport: "%s" });
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME that
@@ -86,11 +85,11 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		    out.set(b, 1 + name.length);
 		    return out;
 		  };
-		  const r = await b.shell.invoke(opFrame("send", args), %q);
+		  const r = await bApp.invoke(opFrame("send", args));
 		  if (r[0] !== 1) throw new Error("net: request failed");
 		  return r.slice(1);
 		};
-	`, senderHex, listenArgs, portField, transport, probeKey)
+	`, senderHex, listenArgs, portField, transport)
 	if _, err := qc.Eval("transport-harness.js", qjs.Code(harness)); err != nil {
 		t.Fatal("harness:", err)
 	}

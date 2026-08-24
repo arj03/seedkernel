@@ -117,15 +117,15 @@ function handle(arg) {
 /** The harness app's local op names — the one op vocabulary its `handle` reads. */
 const OP = { SEND: "send", RAW: "op", SEEN: "seen", FROM: "from" };
 
-/** One local op into the harness app: `shell.invoke` loops back through `handle`, with the
- *  host's caller id in front of THIS app's own op framing — the name is the app's
- *  vocabulary and the shell never reads it. */
-function invoke(shell, appKey, op, args = new Uint8Array(0)) {
+/** One local op through the harness app's slot-bound handle, with the host's caller id in
+ *  front of THIS app's own op framing — the name is the app's vocabulary and the shell
+ *  never reads it. */
+function invoke(app, op, args = new Uint8Array(0)) {
   const b = new Uint8Array(1 + op.length + args.length);
   b[0] = op.length;
   for (let i = 0; i < op.length; i++) b[1 + i] = op.charCodeAt(i) & 0xff;
   b.set(args, 1 + op.length);
-  return shell.invoke(b, appKey);
+  return app.invoke(b);
 }
 
 /** Sign the harness app under `author`, in `mode` ("echo" | "hang"). */
@@ -143,7 +143,7 @@ export function harnessAppBlob(author, mode = "echo") {
   return blob;
 }
 
-/** The app key the harness app binds under, for `invoke`. */
+/** The app key the harness app binds under, for routing assertions. */
 export function harnessAppKey(author) {
   return `${Buffer.from(author.id).toString("hex")}:harness`;
 }
@@ -169,8 +169,8 @@ export function sendArgs(to, payload, { proto = PROTO, deadlineMs = 0, noReply =
 
 /** One request out of `shell`, through the harness app it loaded — the path a real
  *  deployment uses. */
-export async function appRequest(shell, appKey, to, payload, opts) {
-  const r = await invoke(shell, appKey, OP.SEND, sendArgs(to, payload, opts));
+export async function appRequest(app, to, payload, opts) {
+  const r = await invoke(app, OP.SEND, sendArgs(to, payload, opts));
   if (r[0] !== 1) throw new Error("net: request failed");
   return r.slice(1);
 }
@@ -248,8 +248,7 @@ export async function makeTransportHost(opts = {}) {
   await shell.loadBundleBlob(blob);
   const node = { shell, driver, identity, appAuthor };
   if (opts.app === false) return node;
-  const appKey = `${appAuthorHex}:harness`;
-  await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
+  const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
 
   const enc = new TextEncoder();
   const call = (to, proto, payload, deadlineMs, noReply) => {
@@ -267,7 +266,7 @@ export async function makeTransportHost(opts = {}) {
     out.set(p, off); off += p.length;
     u32(payload.length);
     out.set(payload, off);
-    return invoke(shell, appKey, OP.SEND, out);
+    return invoke(app, OP.SEND, out);
   };
   /** One request out, resolving with the response bytes — or rejecting, which is what
    *  the `[0]` failure byte means (an unreachable peer, a deadline, a refusal). */
@@ -277,7 +276,8 @@ export async function makeTransportHost(opts = {}) {
     return r.slice(1);
   };
   node.sendNoReply = (to, proto, payload) => call(to, proto, payload, 0, true);
-  node.appKey = appKey;
+  node.app = app;
+  node.appKey = app.key;
   /** Name an arbitrary transport op FROM THE APP, for the tests whose subject is the caller
    *  boundary (transport/src/core.js `APP_OPS`). Rejects when the transport refuses the
    *  name, which is what those tests pin. */
@@ -287,11 +287,11 @@ export async function makeTransportHost(opts = {}) {
     out[0] = n.length;
     out.set(n, 1);
     out.set(args, 1 + n.length);
-    return invoke(shell, appKey, OP.RAW, out);
+    return invoke(app, OP.RAW, out);
   };
   /** Everything this node's app was handed inbound. */
   node.seen = async () => {
-    const b = await invoke(shell, appKey, OP.SEEN);
+    const b = await invoke(app, OP.SEEN);
     const out = [];
     for (let off = 0; off + 4 <= b.length;) {
       const n = ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0;
@@ -303,7 +303,7 @@ export async function makeTransportHost(opts = {}) {
   /** Who this node's app was told each inbound frame came from, in step with `seen` —
    *  the attribution the shell put in front of the payload, as hex. */
   node.from = async () => {
-    const b = await invoke(shell, appKey, OP.FROM);
+    const b = await invoke(app, OP.FROM);
     const out = [];
     for (let off = 0; off + 32 <= b.length; off += 32) out.push(Buffer.from(b.slice(off, off + 32)).toString("hex"));
     return out;

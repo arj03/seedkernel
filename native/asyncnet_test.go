@@ -52,7 +52,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  globalThis.__nodeB = b;
 		  // The seam a confined guest on B runs against: _net resolves through B's own
 		  // routing, which is what an app's seam is wired with (shell-core crossRealmCall).
-		  // Driven through invoke rather than dispatch, because _net is a LOCAL service
+		  // Driven through B's retained app handle rather than dispatch, because _net is a LOCAL service
 		  // name: a co-resident realm reaches it and a peer does not (§12.10), and
 		  // dispatch is the peer's door. This seam is hand-built rather than a loaded
 		  // slot, so the host loopback stands in for the cross-realm call — the same
@@ -67,7 +67,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		    framed[0] = op.length;
 		    for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
 		    framed.set(args, 1 + op.length);
-		    return b.shell.invoke(framed, b.shell.resolve(id));
+		    return globalThis.__nodeBApp.invoke(framed);
 		  } });
 		})();
 	`, hex.EncodeToString(sender.id())))); err != nil {
@@ -78,7 +78,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 	}
 
 	// Bind A's listener (sets netA.port), then point B at A.
-	if _, _, _, err := el.await("(async () => { await __setup; await netA.start(); await __nodeA.shell.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
+	if _, _, _, err := el.await("(async () => { await __setup; globalThis.__nodeBApp = await __nodeB.shell.loadBundleBlob(__probe); await netA.start(); await __nodeA.shell.loadBundleBlob(__probe); return new Uint8Array(0); })()", 5*time.Second); err != nil {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(
