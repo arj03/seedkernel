@@ -22,10 +22,10 @@ import { toHex, fromHex, errMessage } from "../core/util.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 
 /** The seam as Go calls into it — `HostCall` (guest-seam.ts) in this boundary's currency.
- *  `null` means the call parked: Go holds the guest's Promise under `callId` and settles it
- *  through `bridge.realmSettle`, the same null-means-async contract safe-js.ts
- *  implements. */
-type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => Uint8Array | null;
+ *  The answer is always `null`: every call parks, Go holds the guest's Promise under
+ *  `callId`, and the seam's Promise settles it through `bridge.realmSettle` — refused
+ *  names included, as rejections. */
+type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => null;
 
 /** The opaque native-module slots and realm plumbing Go exposes (main.go). */
 declare const bridge: {
@@ -377,17 +377,18 @@ const embeddedTransportAuthor = (() => {
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
     // Assigned before any guest code can call back: bridge.createRealm evaluates the guest,
-    // whose top-level can only reach sync names (no Promise it could await).
+    // whose top level may call the seam but reads only Promises — there is nothing to
+    // await at top level, so nothing settles inside realm construction.
     let realm: number;
     // No `CallBudget` crosses here: this realm's segment lives in the engine, not in JS, so
     // there is nothing on this side to read a remainder from or bill a module's burn back
     // to. The module bound this target enforces is Go's own
     // (`SEEDKERNEL_MODULE_DEADLINE_MS`), which is why the seam takes the budget as optional.
     const nativeCall: NativeHostCall = (name, payload, callId) => {
-        const r = hostCall(name, new Uint8Array(payload)) as Uint8Array | Promise<Uint8Array> | null;
-        if (!r || typeof (r as Promise<Uint8Array>).then !== "function")
-            return r as Uint8Array;
-        (r as Promise<Uint8Array>).then((bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null), (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)));
+        void Promise.resolve(hostCall(name, new Uint8Array(payload))).then(
+            (bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null),
+            (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)),
+        );
         return null;
     };
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));

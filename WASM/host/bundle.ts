@@ -1,7 +1,7 @@
 // App bundle format (§12.4): signed manifest envelope + modules + guest.js.
 // Every name is derived; the manifest commits to every file hash.
 import { concatBytes, toHex, enc, dec, errMessage } from "../core/util.js";
-import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, GUEST_ABI_VERSION, PRIVILEGES, HOST_SERVICES, isService, type Privilege, } from "../core/domains.js";
+import { DOMAIN_MANIFEST, DOMAIN_MANIFEST_AUTHOR, AUTHOR_MLDSA_SEED_LABEL, SUITE_MANIFEST_HYBRID_PQ, PRIVILEGES, HOST_SERVICES, isService, type Privilege, } from "../core/domains.js";
 import { checkModuleMemory, DEFAULT_MAX_MODULE_MEMORY_BYTES } from "../core/wasm-limits.js";
 
 export interface BundleModule {
@@ -32,10 +32,6 @@ export interface BundleCrypto extends ManifestVerifier {
 export interface BundleGuest {
     /** genesisHash(utf8(source)) hex of `guest.js`. */
     hash: string;
-    /** Which host seam this guest was written against (`GUEST_ABI_VERSION`, §12.2). Required:
-     *  a default would have to be the oldest ABI, exactly the population a bump exists to
-     *  catch. */
-    abi: number;
     /** Exactly the SERVICES this guest is granted (`HOST_SERVICES`) plus the local service ids
      *  it calls (§12.10) — one flat list, since both are reached by the same `host.call` and
      *  both are closed at load: a service this host does not grant is a refused manifest, not
@@ -348,8 +344,8 @@ export function isJsonObject(value: unknown): value is JsonObject {
 
 /** Structural check on a parsed manifest, run only *after* the signature verified — not a
  *  security boundary: it turns a manifest the author signed but got wrong into a loud
- *  rejection instead of a TypeError deep in the loader. Whether this host implements the
- *  declared `abi`, or serves a required name, is `validateManifest`'s. */
+ *  rejection instead of a TypeError deep in the loader. Whether this host serves a required
+ *  name is `validateManifest`'s. */
 function isValidManifest(m: unknown): m is BundleManifest {
     if (typeof m !== "object" || m === null || Array.isArray(m))
         return false;
@@ -406,8 +402,6 @@ function isValidManifest(m: unknown): m is BundleManifest {
             return false;
         if (typeof g.hash !== "string")
             return false;
-        if (typeof g.abi !== "number" || !Number.isInteger(g.abi))
-            return false;
         if (!Array.isArray(g.requires) || g.requires.some((r: unknown) => typeof r !== "string"))
             return false;
         if (g.config !== undefined && !isJsonObject(g.config))
@@ -422,11 +416,6 @@ function isValidManifest(m: unknown): m is BundleManifest {
 function validateManifest(manifest: unknown): asserts manifest is BundleManifest {
     if (!isValidManifest(manifest))
         throw new Error("bundle: malformed manifest");
-    // Guest ABI support (§12.2) — refused the same way as a bad suite, at the one place a
-    // manifest becomes a value the rest of the runtime trusts.
-    if (manifest.guest.abi !== GUEST_ABI_VERSION) {
-        throw new Error(`bundle: guest ABI ${manifest.guest.abi} is not implemented by this host (supported: ${GUEST_ABI_VERSION})`);
-    }
     // The declared requires. The vocabulary (§12.2) is closed and is the SERVICES alone, plus
     // this bundle's own local service ids: an unknown service — `crypto/*` and a finer-grained
     // method name (`fs/get`) included — is a refused manifest, not a grant that quietly
@@ -769,7 +758,6 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     const guestBytes = enc.encode(input.guestSource);
     const guest: BundleGuest = {
         hash: toHex(genesisHash(sodium, guestBytes)),
-        abi: GUEST_ABI_VERSION,
         requires: input.guestRequires,
         ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
     };

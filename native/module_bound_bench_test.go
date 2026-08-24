@@ -191,7 +191,7 @@ func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 // If a genuinely chatty module ever lands, the fix is to stop rebuilding the timeout
 // per call rather than to give the bound up.
 func BenchmarkBoundCallOverhead(b *testing.B) {
-	bootRealm(b)
+	ensureBooted(b)
 	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")
 	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
 		b.Fatalf("buildModuleSlot refused: %v", err)

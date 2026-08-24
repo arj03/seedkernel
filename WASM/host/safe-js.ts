@@ -1,7 +1,8 @@
 // Zero-authority QuickJS realm (§12.3): ECMAScript intrinsics plus one injected
-// `__host_call`. Async names return null and settle via `__netResolve`/`__netReject` in
-// the shared preamble — not quickjs-emscripten's `newPromise()`, so this host and the
-// native loader share one guest ABI. Invocations are serialized (realm-queue.ts).
+// `__host_call`. Every call parks and settles via `__netResolve`/`__netReject` in the
+// shared preamble — not quickjs-emscripten's `newPromise()`, so this host and the
+// native loader share one guest seam contract. Invocations are serialized
+// (realm-queue.ts).
 
 import {
   newQuickJSWASMModuleFromVariant,
@@ -266,10 +267,11 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     }
   };
 
-  // The single seam. QuickJS calls it synchronously: a sync name hands its ArrayBuffer
-  // straight back; a round-tripping name returns null — the preamble parks a Promise under
-  // callId — settled when the seam's promise resolves. Returning null rather than a
-  // host-created deferred is what keeps this seam identical to the native loader's.
+  // The single seam. QuickJS calls it synchronously; the answer never comes back this
+  // way. `null` is the one return: the preamble parks a Promise under callId, and the
+  // seam's Promise — every name is async now, refused names included — settles it here.
+  // `Promise.resolve` flattens an inline answer too, so no continuation ever re-enters
+  // the realm inside the frame that issued the call.
   const hostCallFn = ctx.newFunction("__host_call", (nameHandle, callIdHandle, payloadHandle) => {
     const name = ctx.getString(nameHandle);
     const callId = ctx.getNumber(callIdHandle);
@@ -277,13 +279,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // live — what a module call runs under; `charge` bills a module's burn once it settles,
     // since the segment is closed by then (§4.3).
     const budget: CallBudget = { remainingMs: clock.remaining(), charge: (ms) => clock.charge(ms) };
-    const result = opts.hostCall(name, copyPayload(ctx, payloadHandle), budget);
-    if (!result || typeof (result as Promise<Uint8Array>).then !== "function") {
-      // Sync name — return the bytes directly (no promise, no job queue).
-      return ctx.newArrayBuffer(toArrayBuffer(result as Uint8Array));
-    }
-    // A genuine round trip: the guest holds the Promise, settled here by callId.
-    (result as Promise<Uint8Array>).then(
+    void Promise.resolve(opts.hostCall(name, copyPayload(ctx, payloadHandle), budget)).then(
       (bytes) => {
         if (disposed || !ctx.alive) return;
         settleNet("__netResolve", callId, ctx.newArrayBuffer(toArrayBuffer(bytes)));

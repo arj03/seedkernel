@@ -2,9 +2,9 @@
 // QuickJS runtime holding only ECMAScript intrinsics, so the guest cannot even name
 // sodium / fs / net. Its single seam is host.call(name, bytes), funnelled into the host
 // realm's guest seam (a JS function retained here); nothing in this file knows what a
-// name means. The seam is async: sync names return bytes, round-tripping ones (every fs/*)
-// return null and the guest preamble parks a Promise that settleNet resolves — a suspended
-// guest is just heap state. Exposed to the shell as `createRealm`.
+// name means. The seam is async all the way down: __host_call always answers null, the
+// preamble parks a Promise that settleNet resolves — a suspended guest is just heap
+// state. Exposed to the shell as `createRealm`.
 package main
 
 import (
@@ -161,8 +161,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	loop.addContext(g.qc, g.pump)
 
 	// The single seam. Read (name, callId, payload) from the guest and shuttle it to the
-	// host-realm guest seam: a sync name returns bytes here, an async name null, and the
-	// preamble parks a Promise under callId for settleNet.
+	// host-realm guest seam: every call parks — the shim answers null — and the preamble's
+	// Promise under callId is settled by realmSettle when the seam's promise lands.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
@@ -179,22 +179,12 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		if err != nil {
 			return nil, err
 		}
-		defer res.Free() // the seam's own-ref result (sync bytes, or the JS_NULL immediate)
-		// CONTRACT: null means "async, not yet settled". A sync name returning null would
-		// be mistaken for one and left pending forever — hence guest-seam.ts maps an empty
-		// module reply to NONE rather than null.
-		if res.IsNull() {
-			// The call parked; its settlement arrives as a HOST-realm microtask after
-			// pumpAll already drained el.c this round, and a holder answering from local
-			// fs generates no I/O of its own — so without a nudge nothing wakes the loop.
-			g.loop.wake()
-			return t.Context().NewNull(), nil
-		}
-		out, err := qjs.JsTypedArrayToGo(res)
-		if err != nil {
-			return nil, err
-		}
-		return t.Context().NewArrayBuffer(out), nil
+		res.Free() // always the JS_NULL immediate: the call parked
+		// The settlement arrives as a HOST-realm microtask after pumpAll already drained
+		// el.c this round, and a holder answering from local fs generates no I/O of its
+		// own — so without a nudge nothing wakes the loop.
+		g.loop.wake()
+		return t.Context().NewNull(), nil
 	}))
 
 	// An initiator call's two outcomes, reported by __start once the entrypoint's promise

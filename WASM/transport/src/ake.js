@@ -86,8 +86,12 @@ const UNVERIFIED_TIMEOUT_MS = 2_000;
 const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-oldest)
 
 // ── the seam helpers ──────────────────────────────────────────────────────────
+//
+// EVERY seam name answers a Promise now — there is no sync/async line to fall on the
+// wrong side of — so every helper is `async` and its callers await it. The cost is a
+// few microtasks per call; the transforms themselves still run inline in the host.
 
-function hash() {
+async function hash() {
   const parts = [...arguments];
   let len = 0;
   for (const p of parts) len += p.length;
@@ -96,32 +100,33 @@ function hash() {
   for (const p of parts) { out.set(p, off); off += p.length; }
   return host.call(P_HASH, out);
 }
-function verify(pk, sig, msg) {
+async function verify(pk, sig, msg) {
   let len = pk.length + sig.length + msg.length;
   const out = new Uint8Array(len);
   out.set(pk, 0); out.set(sig, pk.length); out.set(msg, pk.length + sig.length);
-  return host.call(N_VERIFY, out)[0] === 1;
+  const r = await host.call(N_VERIFY, out);
+  return r[0] === 1;
 }
-function randomBytes(n) {
+async function randomBytes(n) {
   const req = new Uint8Array(4);
   writeU32BE(req, 0, n);
   return host.call(N_RANDOM, req);
 }
-function aeadEnc(key, npub, msg) {
+async function aeadEnc(key, npub, msg) {
   const out = new Uint8Array(npub.length + key.length + msg.length);
   out.set(npub, 0); out.set(key, npub.length); out.set(msg, npub.length + key.length);
   return host.call(P_SEAL, out);
 }
-function aeadDec(key, npub, ct) {
+async function aeadDec(key, npub, ct) {
   const out = new Uint8Array(npub.length + key.length + ct.length);
   out.set(npub, 0); out.set(key, npub.length); out.set(ct, npub.length + key.length);
-  const r = host.call(P_OPEN, out);
+  const r = await host.call(P_OPEN, out);
   return r[0] === 1 ? { ok: true, pt: r.subarray(1) } : { ok: false, pt: null };
 }
-function scalarmult(sk, pk) {
+async function scalarmult(sk, pk) {
   const out = new Uint8Array(64);
   out.set(sk, 0); out.set(pk, 32);
-  const r = host.call(P_DH, out);
+  const r = await host.call(P_DH, out);
   // The buffer held a COPY of the private scalar; zero it, or the call leaves a second
   // copy on the heap for a memory-image attacker to find.
   out.fill(0);
@@ -129,9 +134,9 @@ function scalarmult(sk, pk) {
 }
 /** An ephemeral X25519 pair: entropy from the host, the public half through the DH
  *  primitive against the base point. */
-function boxKeypair() {
-  const sk = randomBytes(32);
-  const r = scalarmult(sk, X25519_BASEPOINT);
+async function boxKeypair() {
+  const sk = await randomBytes(32);
+  const r = await scalarmult(sk, X25519_BASEPOINT);
   if (!r.ok) throw new Error("transport: ephemeral keygen failed");
   return { publicKey: r.x, privateKey: sk };
 }
@@ -141,12 +146,12 @@ function channelIdentityMessage(root, th, id) {
   return concatBytes([DOMAIN_CHANNEL, root, th, id]);
 }
 /** Ask the host to sign under `DOMAIN_link_scope ‖ networkKey` with the node's channel
- *  key, which never enters this program. `node/sign` THROWS when the authority is not
+ *  key, which never enters this program. `node/sign` REJECTS when the authority is not
  *  reached, so the `{ok}` shape is a real status: catching here lets the caller abort the
  *  link rather than unwind out of a frame-delivery callback. */
-function channelSign(root, th, id) {
+async function channelSign(root, th, id) {
   try {
-    return { ok: true, sig: host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
+    return { ok: true, sig: await host.call(N_SIGN, channelIdentityMessage(root, th, id)) };
   } catch {
     return { ok: false, sig: null };
   }
@@ -156,12 +161,13 @@ function channelSign(root, th, id) {
 //
 // No action buffer and no batch — accumulating orders would be a second host↔module ABI.
 // The arrangement rests on the host's rule that no op re-enters this realm, so nothing
-// below can call back into a frame still on the stack. Hence no `await`: an inbound
-// request is dispatched with `.then`, and an app's send is answered with `defer()`.
+// below can call back into a frame still on the stack. Every name answers on a later
+// microtask now, so callers `await`; an inbound request is dispatched with `.then`, and
+// an app's send is answered with `defer()`.
 
 /** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
-function netLinkOpen(destBytes) {
-  const r = host.call(N_LINK_OPEN, destBytes);
+async function netLinkOpen(destBytes) {
+  const r = await host.call(N_LINK_OPEN, destBytes);
   const authLen = readU32BE(r, 5);
   return {
     linkId: readU32BE(r, 0),
@@ -169,17 +175,20 @@ function netLinkOpen(destBytes) {
     authority: authLen > 0 ? utf8Decode(r.subarray(9, 9 + authLen)) : "",
   };
 }
-function netLinkSend(linkId, bytes) { host.call(N_LINK_SEND, args([linkId], [], bytes)); }
-function netLinkClose(linkId, graceful) { host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])); }
+/** Fire-and-forget wire ops: a link/send cannot answer anything worth having (the
+ *  channel drops silently when the link is gone either way), so their rejections are
+ *  swallowed here rather than left to surface as unhandled rejections. */
+function netLinkSend(linkId, bytes) { void host.call(N_LINK_SEND, args([linkId], [], bytes)).catch(() => {}); }
+function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([linkId], [graceful ? 1 : 0])).catch(() => {}); }
 /** Bytes handed to this link that are not yet on the wire. 0 for a link that is gone
  *  or a channel that cannot say — both read as "nothing queued", which leaves the
  *  stall clock to the deadline alone. */
-function netLinkBuffered(linkId) { return readU32BE(host.call(N_LINK_STAT, args([linkId], [])), 0); }
+async function netLinkBuffered(linkId) { return readU32BE(await host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
 /** A link the HOST handed us (openLink) changed state — relayed so whoever passed the
  *  channel in learns its fate. A core link's fate is ours alone. */
-function hostLinkAuth(linkId, peerBytes) { host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)); }
-function hostLinkDown(linkId, reason) { host.call(N_LINK_DOWN, args([linkId], [reason])); }
+function hostLinkAuth(linkId, peerBytes) { void host.call(N_LINK_AUTHENTICATED, args([linkId], [], peerBytes)).catch(() => {}); }
+function hostLinkDown(linkId, reason) { void host.call(N_LINK_DOWN, args([linkId], [reason])).catch(() => {}); }
 
 /** One linkBytes invocation's delivery return: `[count u32]` then that many records
  *  from the request/response layer (`ReqRes.onFrame`), each one
@@ -204,22 +213,20 @@ function admits(peerBytes) {
 
 // ── timers ────────────────────────────────────────────────────────────────────
 
-// `timer/arm` is the host's table and the host's cap (DEFAULT_MAX_LIVE_TIMERS), so a
-// realm that has spent it gets a THROW here. The entry is dropped before the throw
-// escapes so a retrying caller does not accumulate callbacks for an unarmed deadline.
+// `timer/arm` is the host's table and the host's cap (DEFAULT_MAX_LIVE_TIMERS). The arm
+// lands on a later microtask now, so the id returns immediately and a REFUSAL (the cap)
+// drops the entry instead of throwing to the armer — the tables stay honest, and the
+// deadline that never fires reads as a stall to whichever clock armed it.
 function armTimer(ms, fn) {
   const id = nextTimerId++;
   timers.set(id, fn);
-  try {
-    host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], []));
-  } catch (e) {
+  void host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], [])).catch(() => {
     timers.delete(id);
-    throw e;
-  }
+  });
   return id;
 }
 function clearTimer(id) {
-  if (timers.delete(id)) host.call(N_TIMER_CLEAR, args([id], []));
+  if (timers.delete(id)) void host.call(N_TIMER_CLEAR, args([id], [])).catch(() => {});
 }
 function fireTimer(id) {
   const fn = timers.get(id);
@@ -248,7 +255,7 @@ class Link {
     // The secret this link opens under: THE PEER's on a dial, OURS on an accept — carried
     // per link at open, so the gate tracks the node's secret (§12.6.3).
     this.contactSecret = spec.linkSecret || contactSecret;
-    this.root = hash(DOMAIN_CHANNEL, spec.networkKey || networkKey);
+    this.root = null; // set by the boot chain below — every seam call is async now
 
     this.peerPubkey = null;
     this.peerId = "";
@@ -276,6 +283,12 @@ class Link {
     this.th = null;
     this.ee = null;
 
+    // One work chain per link. Every seam call answers a Promise now, so a handshake
+    // step spans microtasks; serializing ALL of a link's processing through one chain
+    // keeps two steps from interleaving mid-handshake and keeps arrival order (the
+    // record layer counts nonces). The chain STARTS as the boot sequence.
+    this.work = Promise.resolve();
+
     // Half-open slot BEFORE any key material — a refused connection costs a map lookup,
     // not a keypair. Teardown of an over-budget link is deferred (see deferTeardown).
     if (spec.limiter) {
@@ -289,24 +302,34 @@ class Link {
     // Only a dialer speaks unprompted; an accepting link says nothing until a msg1 opens
     // under the contact secret (§12.6.2).
     //
-    // Everything from here on can THROW (`timer/arm`'s cap is a co-resident app's to
-    // spend), so a throw escaping the constructor would leak the slot and the host
-    // channel. Hence the same deferred teardown the refused slot takes.
-    try {
+    // Everything here runs async now, so the constructor's old try/catch becomes the
+    // boot chain's rejection arm — same deferred teardown the refused slot takes: the
+    // slot first and on its own, then the timer table, then the notify-on-later-turn.
+    const networkKeyBytes = spec.networkKey || networkKey;
+    this.work = (async () => {
+      this.root = await hash(DOMAIN_CHANNEL, networkKeyBytes);
       if (this.weDialed) {
-        this.ensureKeys();
+        await this.ensureKeys();
         this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
-        this.sendMsg1();
+        await this.sendMsg1();
       } else {
         this.armDeadline(this.handshakeTimeoutMs || UNVERIFIED_TIMEOUT_MS);
       }
-    } catch {
-      // The slot first and on its own: it is the resource with a hard cap, and releasing
-      // it touches nothing outside this module; a failure to tidy must not cost the slot.
+    })();
+    this.work.catch(() => {
       this.releaseSlot();
       try { this.teardown(); } catch { /* the host has evidently lost the timer anyway */ }
       this.deferTeardown();
-    }
+    });
+  }
+
+  /** Run `fn` as the next step of this link's one work chain. The returned promise
+   *  settles with fn's own outcome; the CHAIN swallows it so one failed step never
+   *  wedges the ones behind it. */
+  enqueue(fn) {
+    const done = this.work.then(fn);
+    this.work = done.catch(() => {});
+    return done;
   }
 
   /** Close the host channel and notify, but AFTER the current event: the caller's
@@ -321,10 +344,10 @@ class Link {
     });
   }
 
-  ensureKeys() {
+  async ensureKeys() {
     if (this.myEph) return;
-    this.myNonce = randomBytes(NONCE_LEN);
-    this.myEph = boxKeypair();
+    this.myNonce = await randomBytes(NONCE_LEN);
+    this.myEph = await boxKeypair();
   }
 
   armDeadline(ms) {
@@ -371,7 +394,11 @@ class Link {
     if (this.authed) {
       if (this.sendEpoch >= REJECT_AFTER_EPOCHS) { this.close(); return; }
       this.sawTraffic = true;
-      this.wire(this.seal(frame));
+      // Sealed and wired through the one work chain, so records leave in send order.
+      void this.enqueue(async () => {
+        if (this.closed) return;
+        this.wire(await this.seal(frame));
+      });
       return;
     }
     this.queue.push(frame);
@@ -385,22 +412,25 @@ class Link {
     if (this.closed) return;
     this.closed = true;
     this.closedLocally = true;
-    let saidGoodbye = false;
-    if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS) {
-      try {
-        this.wire(this.seal(new Uint8Array(0)));
-        // A codec with its own end-of-stream signal says it too, on the same byte
-        // stream after our record, so the peer reads one clean shutdown.
-        if (this.framer && this.framer.goodbye) this.framer.goodbye();
-        saidGoodbye = true;
-      } catch { /* the channel is already gone */ }
-    }
-    this.teardown();
-    // The goodbye record is QUEUED, not yet on the wire; only closing once the framer's
-    // last write has landed lets the peer read a clean shutdown, not a truncation.
-    const flushed = (this.framer && this.framer.flush ? this.framer.flush() : Promise.resolve()).catch(() => {});
-    void flushed.then(() => {
-      try { netLinkClose(this.linkId, saidGoodbye); } catch { /* already gone */ }
+    // The goodbye rides the same work chain as everything else, so it cannot overtake
+    // a record still being sealed and cannot race teardown's key-zeroing.
+    void this.enqueue(async () => {
+      let saidGoodbye = false;
+      if (this.authed && !this.peerSaidGoodbye && this.sendEpoch <= REJECT_AFTER_EPOCHS && this.sendKey) {
+        try {
+          this.wire(await this.seal(new Uint8Array(0)));
+          // A codec with its own end-of-stream signal says it too, on the same byte
+          // stream after our record, so the peer reads one clean shutdown.
+          if (this.framer && this.framer.goodbye) this.framer.goodbye();
+          saidGoodbye = true;
+        } catch { /* the channel is already gone */ }
+      }
+      this.teardown();
+      // The goodbye record is QUEUED, not yet on the wire; only closing once the framer's
+      // last write has landed lets the peer read a clean shutdown, not a truncation.
+      const flushed = (this.framer && this.framer.flush ? this.framer.flush() : Promise.resolve()).catch(() => {});
+      await flushed;
+      netLinkClose(this.linkId, saidGoodbye);
       this.finish();
     });
   }
@@ -412,9 +442,13 @@ class Link {
     this.closed = true;
     this.closedLocally = true;
     if (defensive) this.aborted = true;
-    this.teardown();
-    try { netLinkClose(this.linkId, false); } catch { /* already gone */ }
-    this.finish();
+    // Behind the chain like close(), so an in-flight step finishes before its keys are
+    // zeroed under it.
+    void this.enqueue(async () => {
+      this.teardown();
+      netLinkClose(this.linkId, false);
+      this.finish();
+    });
   }
 
   get closeReason() {
@@ -435,53 +469,65 @@ class Link {
     else netLinkSend(this.linkId, msg);
   }
 
-  /** Inbound bytes. Over-cap is a defensive abort. Framed push is async; delivery
-   *  order rides the framer's one-chunk-at-a-time read chain. Returns the delivery
-   *  frame this input produced — the count-prefixed record list, or null when none. */
+  /** Inbound bytes. Over-cap is a defensive abort. Every step rides the link's one work
+   *  chain, so handshake steps cannot interleave and delivery order holds. Returns a
+   *  promise for the delivery frame this input produced — the count-prefixed record
+   *  list, or null when none. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
       // boundaries already on it — but the two-stage cap is about how much a peer may
       // make us HOLD, not about who framed it. Without this, one huge message takes the
       // realm down.
-      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return null; }
-      const d = this.onMessage(bytes);
-      return d ? packDeliveries([d]) : null;
+      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return Promise.resolve(null); }
+      // Same shape as the framer path below: the caller gets a COUNT-PREFIXED delivery
+      // frame (or null), never the bare record.
+      return this.enqueue(() => this.onMessage(bytes))
+        .then((d) => (d ? packDeliveries([d]) : null));
     }
+    // Deliveries collected as PROMISES, in arrival order: a length-framed chunk's parse
+    // loop fires `deliver` synchronously and does not await it, so packing has to wait
+    // for every step through Promise.all rather than count pushes.
     const out = [];
-    const deliver = (m) => { const d = this.onMessage(m); if (d) out.push(d); };
+    const deliver = (m) => { out.push(this.enqueue(() => this.onMessage(m))); };
     try {
       const ok = this.framer.push(bytes, deliver);
-      // The promise must ALWAYS yield bytes (never null): the empty case is "nothing
-      // deliverable", and the host reads any non-empty return as a frame.
       return Promise.resolve(ok).then(
-        (good) => { if (!good) this.abort(true); return packDeliveries(out) ?? new Uint8Array(0); },
-        () => { this.abort(true); return new Uint8Array(0); },
+        (good) => {
+          if (!good) { this.abort(true); return null; }
+          return Promise.all(out).then((ds) => {
+            const records = ds.filter((d) => d);
+            return records.length ? packDeliveries(records) : null;
+          });
+        },
+        () => { this.abort(true); return null; },
       );
     } catch {
       this.abort(true);
-      return new Uint8Array(0);
+      return Promise.resolve(null);
     }
   }
 
   /** Route one whole link message. A message is a bare body — the sender chooses
    *  nothing: which one it is follows from our role and how far the exchange got, each
    *  handler checks its exact width, and a post-auth body goes to the AEAD, which fails
-   *  closed (see §12.6). Returns the delivery frame a request produced, or null for
-   *  everything the handshake itself answers. */
+   *  closed (see §12.6). Returns a promise for the delivery frame a request produced,
+   *  or null for everything the handshake itself answers. */
   onMessage(m) {
-    if (this.closed) return null;
-    if (this.authed) return this.onRecord(m);
-    if (this.weDialed) { this.peerEph ? this.onMsg4(m) : this.onMsg2(m); }
-    else { this.peerEph ? this.onMsg3(m) : this.onMsg1(m); }
-    return null;
+    if (this.closed) return Promise.resolve(null);
+    const step = this.authed
+      ? this.onRecord(m)
+      : this.weDialed
+        ? (this.peerEph ? this.onMsg4(m) : this.onMsg2(m))
+        : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
+    return Promise.resolve(step).catch(() => { this.abort(true); return null; });
   }
 
   // Refuse WITHOUT saying so — every refusal funnels here, so they are
   // indistinguishable from each other and from silence (§12.6.2).
   stall() { /* deliberately nothing */ }
 
-  becomeAuthed() {
+  async becomeAuthed() {
     this.authed = true;
     // The slot is NOT released — it moves to the authed tier and is held until the link
     // dies, so the budget bounds how many peers may be IN rather than how many got in.
@@ -493,9 +539,10 @@ class Link {
     if (this.framer) this.framer.raiseCap();
     this.onAuth(this.peerId, this);
     if (this.closed) return; // onAuth may have torn us down (the tie-break)
-    for (const f of this.queue) this.wire(this.seal(f));
-    this.queue.length = 0;
+    const flush = this.queue;
+    this.queue = [];
     this.queuedBytes = 0;
+    for (const f of flush) this.wire(await this.seal(f));
   }
 
   // ── the concealed-identity handshake (suite 0x03, §12.6.2) ──────────────────
@@ -514,33 +561,33 @@ class Link {
     return this.h(...parts);
   }
 
-  sealZero(key, plain) {
-    const ct = aeadEnc(key, ZERO_NPUB, plain);
+  async sealZero(key, plain) {
+    const ct = await aeadEnc(key, ZERO_NPUB, plain);
     key.fill(0);
     return ct;
   }
-  openZero(key, ct) {
-    try { return aeadDec(key, ZERO_NPUB, ct); }
+  async openZero(key, ct) {
+    try { return await aeadDec(key, ZERO_NPUB, ct); }
     finally { key.fill(0); }
   }
 
-  probeKey(suiteByte, ephI) {
-    return this.kdf([], this.h(this.root, suiteByte, ephI), LABEL_PROBE);
+  async probeKey(suiteByte, ephI) {
+    return this.kdf([], await this.h(this.root, suiteByte, ephI), LABEL_PROBE);
   }
 
-  signIdentity(th) {
+  async signIdentity(th) {
     // The channel tag and `root ‖ th ‖ id` are the opaque suffix; the host reads none of
     // it and prefixes this slot's network scope — which is why the network binding
     // survives a transport that lies about its own root.
-    const r = channelSign(this.root, th, ownPk);
+    const r = await channelSign(this.root, th, ownPk);
     // The seam refused: our own misconfiguration, never the peer's doing, so it aborts —
     // a stall would claim this address went quiet, which is a different fact.
     if (!r.ok) { this.abort(); return null; }
     return { id: ownPk, sig: r.sig };
   }
 
-  openIdentity(key, ct, th) {
-    const r = this.openZero(key, ct);
+  async openIdentity(key, ct, th) {
+    const r = await this.openZero(key, ct);
     if (!r.ok) return null;
     const plain = r.pt;
     const id = plain.slice(0, PK_LEN);
@@ -548,62 +595,62 @@ class Link {
     // node/verify applies the same host-owned scope this node signs under, so the
     // preimage the two ends must agree on is the host's for its prefix half. The channel
     // format tag is ours, so the two ends reconstruct that half here.
-    if (!verify(id, sig, channelIdentityMessage(this.root, th, id))) return null;
+    if (!(await verify(id, sig, channelIdentityMessage(this.root, th, id)))) return null;
     if (bytesCompare(id, ownPk) === 0) return null; // our own traffic reflected
     return id;
   }
 
-  sendMsg1() {
+  async sendMsg1() {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
-    const w1 = concatBytes([SUITE_BYTE, eph, this.sealZero(this.probeKey(SUITE_BYTE, eph), this.myNonce)]);
-    this.th = this.h(this.root, w1);
+    const w1 = concatBytes([SUITE_BYTE, eph, await this.sealZero(await this.probeKey(SUITE_BYTE, eph), this.myNonce)]);
+    this.th = await this.h(this.root, w1);
     this.wire(w1);
   }
 
-  onMsg1(w1) {
+  async onMsg1(w1) {
     if (this.peerEph || this.weDialed || w1.length !== M1_LEN) { this.stall(); return; }
     if (w1[0] !== SUITE_CHANNEL_CONCEALED) { this.stall(); return; }
     const ephI = w1.slice(SUITE_LEN, SUITE_LEN + EPH_LEN);
-    const probe = this.openZero(this.probeKey(w1.slice(0, SUITE_LEN), ephI), w1.slice(SUITE_LEN + EPH_LEN));
+    const probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI), w1.slice(SUITE_LEN + EPH_LEN));
     if (!probe.ok) { this.stall(); return; }
     // Proved: move off the contended budget before the expensive work.
     if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stall(); return; }
     this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
-    this.ensureKeys();
-    const dh = scalarmult(this.myEph.privateKey, ephI);
+    await this.ensureKeys();
+    const dh = await scalarmult(this.myEph.privateKey, ephI);
     if (!dh.ok) { this.stall(); return; }
     this.ee = dh.x;
     this.peerEph = ephI;
 
-    const h1 = this.h(this.root, w1);
+    const h1 = await this.h(this.root, w1);
     const w2 = concatBytes([
       this.myEph.publicKey.subarray(0, EPH_LEN),
-      this.sealZero(this.kdf([this.ee], h1, LABEL_M2), this.myNonce),
+      await this.sealZero(await this.kdf([this.ee], h1, LABEL_M2), this.myNonce),
     ]);
-    this.th = this.h(h1, w2);
+    this.th = await this.h(h1, w2);
     this.wire(w2);
   }
 
-  onMsg2(w2) {
+  async onMsg2(w2) {
     if (this.authed || this.peerEph || !this.th || w2.length !== M2_LEN) { this.stall(); return; }
     const ephR = w2.slice(0, EPH_LEN);
-    const dh = scalarmult(this.myEph.privateKey, ephR);
+    const dh = await scalarmult(this.myEph.privateKey, ephR);
     if (!dh.ok) { this.stall(); return; }
-    const r = this.openZero(this.kdf([dh.x], this.th, LABEL_M2), w2.slice(EPH_LEN));
+    const r = await this.openZero(await this.kdf([dh.x], this.th, LABEL_M2), w2.slice(EPH_LEN));
     if (!r.ok) { this.stall(); return; }
     this.ee = dh.x; this.peerEph = ephR;
 
-    const h2 = this.h(this.th, w2);
-    const si = this.signIdentity(h2);
+    const h2 = await this.h(this.th, w2);
+    const si = await this.signIdentity(h2);
     if (!si) return;
-    const w3 = this.sealZero(this.kdf([this.ee], h2, LABEL_M3), concatBytes([si.id, si.sig]));
-    this.th = this.h(h2, w3);
+    const w3 = await this.sealZero(await this.kdf([this.ee], h2, LABEL_M3), concatBytes([si.id, si.sig]));
+    this.th = await this.h(h2, w3);
     this.wire(w3);
   }
 
-  onMsg3(w3) {
+  async onMsg3(w3) {
     if (this.authed || !this.peerEph || !this.th || !this.ee || w3.length !== M3_LEN) { this.stall(); return; }
-    const idI = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
+    const idI = await this.openIdentity(await this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
     // The peer lint runs HERE: after decryption and signature, never on a claimed key,
@@ -612,19 +659,19 @@ class Link {
     if (!admits(idI)) { this.stall(); return; }
     this.peerPubkey = idI; this.peerId = peerId;
 
-    const h3 = this.h(this.th, w3);
-    const si = this.signIdentity(h3);
+    const h3 = await this.h(this.th, w3);
+    const si = await this.signIdentity(h3);
     if (!si) return;
-    const w4 = this.sealZero(this.kdf([this.ee], h3, LABEL_M4), concatBytes([si.id, si.sig]));
-    this.th = this.h(h3, w4);
-    try { this.deriveConcealedSession(); } catch { this.stall(); return; }
+    const w4 = await this.sealZero(await this.kdf([this.ee], h3, LABEL_M4), concatBytes([si.id, si.sig]));
+    this.th = await this.h(h3, w4);
+    try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
     this.wire(w4);
-    this.becomeAuthed();
+    await this.becomeAuthed();
   }
 
-  onMsg4(w4) {
+  async onMsg4(w4) {
     if (this.authed || !this.peerEph || !this.th || !this.ee || w4.length !== M4_LEN) { this.stall(); return; }
-    const idR = this.openIdentity(this.kdf([this.ee], this.th, LABEL_M4), w4, this.th);
+    const idR = await this.openIdentity(await this.kdf([this.ee], this.th, LABEL_M4), w4, this.th);
     if (!idR) { this.stall(); return; }
     const peerId = toHex(idR);
     // A mismatch here is a local fault, not a probe to hide from — we already revealed
@@ -634,14 +681,14 @@ class Link {
     // msg3, so an abort here is honest rather than a probe.
     if (!admits(idR)) { this.abort(true); return; }
     this.peerPubkey = idR; this.peerId = peerId;
-    this.th = this.h(this.th, w4);
-    try { this.deriveConcealedSession(); } catch { this.abort(); return; }
-    this.becomeAuthed();
+    this.th = await this.h(this.th, w4);
+    try { await this.deriveConcealedSession(); } catch { this.abort(); return; }
+    await this.becomeAuthed();
   }
 
-  deriveConcealedSession() {
-    const kI2R = this.kdf([this.ee], this.th, LABEL_I2R);
-    const kR2I = this.kdf([this.ee], this.th, LABEL_R2I);
+  async deriveConcealedSession() {
+    const kI2R = await this.kdf([this.ee], this.th, LABEL_I2R);
+    const kR2I = await this.kdf([this.ee], this.th, LABEL_R2I);
     this.sendKey = this.weDialed ? kI2R : kR2I;
     this.recvKey = this.weDialed ? kR2I : kI2R;
     // Every input that produced the session can now only be used to RE-derive it — the
@@ -669,16 +716,16 @@ class Link {
     return n;
   }
 
-  ratchet(k) {
-    const next = this.h(k, LABEL_REKEY);
+  async ratchet(k) {
+    const next = await this.h(k, LABEL_REKEY);
     k.fill(0);
     return next;
   }
 
-  seal(frame) {
-    const ct = aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
+  async seal(frame) {
+    const ct = await aeadEnc(this.sendKey, this.nonce(this.sendEpoch, this.sendCtr), frame);
     if (++this.sendCtr >= this.rekeyAfter) {
-      this.sendKey = this.ratchet(this.sendKey);
+      this.sendKey = await this.ratchet(this.sendKey);
       this.sendEpoch++;
       this.sendCtr = 0;
     }
@@ -688,22 +735,22 @@ class Link {
   // Reached only on an authenticated link, where a body that will not open is corruption
   // or injection either way. The one receive path that SPEAKS: concealment is owed to
   // strangers, and this peer proved who it is.
-  onRecord(body) {
+  async onRecord(body) {
     // Framed links were measured on arrival; this is the platform-framed link's floor.
     if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return null; }
     if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return null; }
-    const r = aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
+    const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
     if (!r.ok) { this.abort(true); return null; }
     this.sawTraffic = true;
     // Advance only on success — a failed decrypt must never move the counter.
     if (++this.recvCtr >= this.rekeyAfter) {
-      this.recvKey = this.ratchet(this.recvKey);
+      this.recvKey = await this.ratchet(this.recvKey);
       this.recvEpoch++;
       this.recvCtr = 0;
     }
     // The reserved empty record: an authenticated end-of-stream.
     if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return null; }
-    return this.onFrame(this.peerId, r.pt);
+    return await this.onFrame(this.peerId, r.pt);
   }
 
   onChannelClosed() {

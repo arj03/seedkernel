@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"time"
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -17,14 +17,14 @@ import (
 // The names of guest-seam.ts's catalog, written here so a rename shows up as
 // one edit rather than as bare strings scattered through the assertions.
 const (
-	nameSign     = "node/sign"
-	nameVerify   = "node/verify"
-	nameIdentity = "node/identity"
+	nameSign       = "node/sign"
+	nameVerify     = "node/verify"
+	nameIdentity   = "node/identity"
 	nameNodeRandom = "node/random"
-	nameFsGet    = "fs/get"
-	nameFsPut    = "fs/put"
-	nameClockNow = "clock/now"
-	nameLinkSend = "link/send"
+	nameFsGet      = "fs/get"
+	nameFsPut      = "fs/put"
+	nameClockNow   = "clock/now"
+	nameLinkSend   = "link/send"
 )
 
 func TestGuestSeamOps(t *testing.T) {
@@ -47,21 +47,23 @@ func TestGuestSeamOps(t *testing.T) {
 		t.Fatal("build seam:", err)
 	}
 
-	call := func(name string, payload []byte) (*qjs.Value, error) {
-		fn := qc.Global().GetPropertyStr("__callSeam")
-		return qc.Invoke(fn, qc.NewUndefined(), qc.NewString(name), qc.NewArrayBuffer(payload))
-	}
+	// Every seam name — crypto included — answers a Promise now, so every probe goes
+	// through callRealm, which pumps the loop until it settles. A gate refusal is a
+	// rejected promise here and surfaces as callRealm's error.
 	callBytes := func(name string, payload []byte) []byte {
 		t.Helper()
-		v, err := call(name, payload)
+		b, err := callRealm("__callSeam", 5*time.Second,
+			qc.NewString(name), qc.NewArrayBuffer(payload))
 		if err != nil {
 			t.Fatalf("call %s: %v", name, err)
 		}
-		b, err := qjs.JsTypedArrayToGo(v)
-		if err != nil {
-			t.Fatalf("call %s result: %v", name, err)
-		}
 		return b
+	}
+	refused := func(name string, payload []byte) error {
+		t.Helper()
+		_, err := callRealm("__callSeam", 5*time.Second,
+			qc.NewString(name), qc.NewArrayBuffer(payload))
+		return err
 	}
 
 	// The node pubkey. JsTypedArrayToGo copies on read and leaves __id.publicKey intact
@@ -109,7 +111,7 @@ func TestGuestSeamOps(t *testing.T) {
 	// A mis-framed call is not a failed verification: a payload too short to hold
 	// [pk 32][sig 64] errors, where [0] would have been a verdict about bytes nothing
 	// checked. The bound is exactly that prefix, so an empty message still answers.
-	if _, err := call(nameVerify, verifyScoped[:95]); err == nil {
+	if err := refused(nameVerify, verifyScoped[:95]); err == nil {
 		t.Fatal("node/verify(short payload) returned a verdict, want an error (mis-framed is not invalid)")
 	}
 	emptySig := callBytes(nameSign, nil)
@@ -169,18 +171,18 @@ func TestGuestSeamOps(t *testing.T) {
 	}
 	// And raw net is not merely undeclared here — it is capability-wired, so no app
 	// seam is ever wired one.
-	if _, err := call(nameLinkSend, make([]byte, 8)); err == nil {
+	if err := refused(nameLinkSend, make([]byte, 8)); err == nil {
 		t.Fatal("a link/* name resolved on an app seam")
 	}
 
 	// THE gate, on a service this harness wires a real backend for, so nothing but the
 	// gate can be what refuses it: the same seam narrowed to `clock` alone answers no
-	// fs name. A SYNCHRONOUS refusal — a thrown error rather than the rejected promise a
-	// round-tripping name gives back, which a test cannot observe in the same breath.
+	// fs name. A refusal at the GATE — an undeclared service, still a throw at the call
+	// site (guest-seam.ts) — reaches the test as callRealm's error.
 	if _, err := qc.Eval("narrow.js", qjs.Code(`__buildGuestSeam(["clock"], __id, null, __scope);`)); err != nil {
 		t.Fatal("narrow seam:", err)
 	}
-	if _, err := call(nameFsPut, make([]byte, 8)); err == nil {
+	if err := refused(nameFsPut, make([]byte, 8)); err == nil {
 		t.Fatal("fs/put resolved on a seam declaring no fs service")
 	}
 	if clk := callBytes(nameClockNow, nil); len(clk) != 8 {

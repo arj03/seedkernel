@@ -53,13 +53,13 @@ func jsonString(s string) string {
 // production the shared CLI builds this from the flags; here a test builds it directly
 // to stand a node up without a command line.
 type nodeConfig struct {
-	PolicyJSON       *string        `json:"policyJson"`
-	KeyHex           string         `json:"keyHex"`
-	ContactSecretHex string         `json:"contactSecretHex"`
-	Listen           *hostPort      `json:"listen,omitempty"`
-	WsListen         *hostPort      `json:"wsListen,omitempty"`
-	Peers            []string       `json:"peers,omitempty"`
-	RequestDeadline  int            `json:"requestDeadlineMs,omitempty"`
+	PolicyJSON       *string   `json:"policyJson"`
+	KeyHex           string    `json:"keyHex"`
+	ContactSecretHex string    `json:"contactSecretHex"`
+	Listen           *hostPort `json:"listen,omitempty"`
+	WsListen         *hostPort `json:"wsListen,omitempty"`
+	Peers            []string  `json:"peers,omitempty"`
+	RequestDeadline  int       `json:"requestDeadlineMs,omitempty"`
 }
 
 type hostPort struct {
@@ -226,11 +226,11 @@ globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
   });
   return __guestSeam;
 };
-globalThis.__callSeam = (name, ab) => __guestSeam(name, new Uint8Array(ab));
-// The round-tripping names — net/send and every fs/* — hand back a Promise (§12.2),
-// so a caller that wants their bytes has to settle it. Driven through callRealm,
-// which already knows how to pump the loop until a realm promise settles.
-globalThis.__callSeamAwait = async (name, ab) => __guestSeam(name, new Uint8Array(ab));
+globalThis.__callSeam = async (name, ab) => __guestSeam(name, new Uint8Array(ab));
+// EVERY name answers a Promise now — crypto included — so this is the one calling
+// convention. Driven through callRealm, which already knows how to pump the loop
+// until a realm promise settles.
+globalThis.__callSeamAwait = __callSeam;
 `
 
 // guestSeamRealm boots a realm and adds the test-only guest-seam builder above.

@@ -32,7 +32,6 @@ const sodium = await loadCrypto();
 const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
   = await imp("build/host/guest-seam.js");
-const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { readOp } = await imp("build/core/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
@@ -56,7 +55,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // used by tests that do not exercise the guest is the same minimal program throughout.
 const GUEST_TEXT = "function handle() { return new Uint8Array([1]); }";
 const GUEST_BYTES = new TextEncoder().encode(GUEST_TEXT);
-const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), abi: GUEST_ABI_VERSION, requires: [], ...extra });
+const GUEST = (extra = {}) => ({ hash: toHex(gHash(GUEST_BYTES)), requires: [], ...extra });
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id the
  *  two derive. Tests name `a.id` wherever the runtime names an author (policy pins, app
@@ -311,7 +310,7 @@ async function testBundleRefusesNonModule() {
   const manifest = { app: "demo", version: 1, modules: [
     { name: "fwd", hash: toHex(gHash(forwarderBytes)) },
     { name: "broken", hash: toHex(gHash(notAModule)) },
-  ], guest: { hash: toHex(gHash(guestBytes)), abi: GUEST_ABI_VERSION, requires: [] } };
+  ], guest: { hash: toHex(gHash(guestBytes)), requires: [] } };
   const manifestEnv = signManifest(sodium, author, manifest);
   const blob = packBundle({
     [MANIFEST_FILE]: manifestEnv,
@@ -828,11 +827,13 @@ async function testGuestSeam() {
     const szAbsent = await seam("fs/size", new TextEncoder().encode("missing"));
     assertEqual(new DataView(szAbsent.buffer, szAbsent.byteOffset).getUint32(0, false), 0xffffffff, "fs/size of an absent key → -1 (0xFFFFFFFF)");
 
-    // Which side of the sync/async line a name sits on is the ABI (§12.2), and what
-    // `guest.abi` versions: a primitive is a function of its arguments and resolves
-    // inline, while net and fs genuinely round-trip and hand back a Promise.
-    assert(!(prim("blake2b-256", msg) instanceof Promise), "a catalog primitive resolves synchronously (bytes, no Promise)");
-    assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise (fs round-trips)");
+    // There is no sync/async line and nothing to version: every name — a catalog
+    // primitive included — answers a Promise the guest awaits. A forgotten `await`
+    // reads a Promise where bytes were expected for ALL names alike, which is why no
+    // manifest field is needed to catch it any more.
+    assert(prim("blake2b-256", msg) instanceof Promise, "a catalog primitive answers a Promise like every name");
+    assert(seam("fs/size", fk) instanceof Promise, "fs/size returns a Promise");
+    assert(seam("clock/now", U()) instanceof Promise, "clock/now returns a Promise");
 
     // The CROSS-REALM call: a name in THIS realm's declared local services is another
     // realm, reached on a later turn, so it is a Promise like fs. There is no `net`
@@ -1109,10 +1110,10 @@ async function testSigningScopeFollowsSlot() {
   console.log("  OK\n");
 }
 
-// ─── Test: the guest ABI field (§12.2, §12.4) ───────────────────────────
+// ─── Test: the manifest carries no seam version (§12.2, §12.4) ──────────
 
 async function testGuestAbi() {
-  console.log("Test: a guest declares the host ABI it was written against");
+  console.log("Test: the seam needs no version word — it is async all the way down");
 
   const author = testAuthor();
   const guestText = "function handle() { return new Uint8Array([1]); }";
@@ -1121,26 +1122,16 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [], guest });
   const hash = toHex(gHash(guestBytes));
 
-  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: [] })) !== null,
-    "a guest declaring this host's ABI verifies");
+  // A guest declares only its hash and its requires. There is no `abi` field left to
+  // get wrong or forget — the one failure the version existed to refuse (a name read
+  // on the wrong side of a sync/async line) is structurally impossible when every
+  // name answers a Promise.
+  const verified = verifyManifest(sodium, mk({ hash, requires: [] }));
+  assert(verified !== null, "a manifest with no seam version verifies");
+  assert(!("abi" in verified.manifest.guest), "the verified manifest carries no abi field");
 
-  // Missing: the field is required, not defaulted. A guest author who never thought
-  // about the seam version is indistinguishable from one who meant the old one, and
-  // defaulting would silently pick the population a bump exists to catch.
-  let threw = false;
-  try { verifyManifest(sodium, mk({ hash, requires: [] })); } catch { threw = true; }
-  assert(threw, "a guest with no declared ABI is refused as malformed");
-
-  // Present but unimplemented: a legibility failure ("this bundle wants a host I am
-  // not"), so it throws with its own message rather than reading as a bad signature.
-  let msg = "";
-  try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION + 1, requires: [] })); }
-  catch (e) { msg = e.message; }
-  assert(msg.includes("guest ABI"), `an unimplemented guest ABI is refused by name (got: ${msg})`);
-
-  // Every bundle declares a guest (§12.4), and a manifest without one is refused BY NAME
-  // like the ABI above: it is what a bundle written against the retired module-only
-  // format produces, so the message has to state the rule.
+  // Every bundle declares a guest (§12.4), and a manifest without one is refused BY NAME:
+  // it is what a bundle written against the retired module-only format produces.
   let noGuest = "";
   try { verifyManifest(sodium, signManifest(sodium, author,
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
@@ -1152,7 +1143,7 @@ async function testGuestAbi() {
   // enforce.
   {
     let refused = "";
-    try { verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs/get"] })); }
+    try { verifyManifest(sodium, mk({ hash, requires: ["fs/get"] })); }
     catch (e) { refused = e.message; }
     assert(refused.includes("names a host METHOD") && refused.includes('"fs"'),
       `a manifest requiring the method "fs/get" is refused, naming the service to declare instead (got: ${refused})`);
@@ -1160,7 +1151,7 @@ async function testGuestAbi() {
   // …and the SERVICE, by exact name, is what a manifest may require — the guest still
   // calls the finer-grained method; being undeclarable at that granularity is not being
   // unavailable.
-  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["fs"] })) !== null,
+  assert(verifyManifest(sodium, mk({ hash, requires: ["fs"] })) !== null,
     "a service, by exact name, is what a manifest may require");
 
   // A bare name colliding with this bundle's OWN module name is refused: the seam's
@@ -1170,7 +1161,7 @@ async function testGuestAbi() {
     const withModule = (requires) => signManifest(sodium, author, {
       app: "abi", version: 1,
       modules: [{ name: "codec", hash: "aa" }],
-      guest: { hash, abi: GUEST_ABI_VERSION, requires },
+      guest: { hash, requires },
     });
     let refused = "";
     try { verifyManifest(sodium, withModule(["codec"])); } catch (e) { refused = e.message; }
@@ -1183,7 +1174,7 @@ async function testGuestAbi() {
   // Any OTHER bare or slashed name — not a known service, not a collision — is a
   // legitimate LOCAL service id (§12.10): the vocabulary is open on that half, since
   // whether anything actually claims it is answered at the call, never at the manifest.
-  assert(verifyManifest(sodium, mk({ hash, abi: GUEST_ABI_VERSION, requires: ["_backup", "reporting/v2"] })) !== null,
+  assert(verifyManifest(sodium, mk({ hash, requires: ["_backup", "reporting/v2"] })) !== null,
     "an arbitrary local service id verifies; nothing claiming it yet is not a manifest error");
 
   console.log("  OK\n");
@@ -1311,7 +1302,6 @@ async function testBundle() {
       // requires + config live INSIDE guest (§12.4) — a bundle's authority is the guest's.
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
-        abi: GUEST_ABI_VERSION,
         requires: [],
       },
     };
@@ -1979,35 +1969,43 @@ async function testModuleCallChargedToGuestBudget() {
   console.log("  OK\n");
 }
 
-// ─── Test: the seam version just retired is refused, not tolerated ───────────────
+// ─── Test: the seam is always async, and a forgotten await cannot read bytes ─────
 //
-// The number is only worth carrying if the host refuses a seam it does not implement, and
-// the case that matters is always the one just retired — the population that actually
-// exists. A guest written against the previous seam calls names this host no longer has,
-// or reads a shape it no longer sends; tolerating it would run a program against a
-// contract neither side agreed to, and the failure that follows is silent (a name that
-// answers nothing, a field read at the wrong offset). Written against the constant, so
-// the boundary moves with the seam rather than pinning whichever version was current the
-// day this was written.
+// There is no seam version to refuse a guest written against the old calling convention,
+// because there is no old convention left to be written against: every name — crypto
+// included — answers a Promise. The invariant worth pinning is the one the version used
+// to buy: `host.call` NEVER resolves to bytes in the calling turn. A guest that forgets
+// the await reads a Promise where bytes were expected, and this test makes that shape
+// loud instead of silent.
 async function testPreviousAbiRefused() {
-  const stale = GUEST_ABI_VERSION - 1;
-  console.log(`Test: guest ABI ${stale} is refused at load — a retired seam is not tolerated`);
+  console.log("Test: every host.call answers a Promise — no name sits on a sync line");
 
-  const author = testAuthor();
-  const manifest = { app: "legacy", version: 1,
-    modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
-    guest: { hash: "aa", abi: stale, requires: [] } };
-  const env = signManifest(sodium, author, manifest);
-  const blob = packBundle({
-    [MANIFEST_FILE]: env,
-    [moduleFile("fwd")]: forwarderBytes,
-    [GUEST_FILE]: GUEST_BYTES,
+  const NAMES = ["crypto/blake2b-256", "clock/now", "node/identity", "node/random"];
+  // One byte per probed name: 1 when the un-awaited call handed back a thenable.
+  const source = `
+    const names = ${JSON.stringify(NAMES)};
+    function handle() {
+      const out = new Uint8Array(names.length);
+      for (let i = 0; i < names.length; i++) {
+        const r = host.call(names[i], new Uint8Array(4));
+        out[i] = typeof r.then === "function" ? 1 : 0;
+      }
+      return out;
+    }`;
+  const realm = await createSafeRealm({
+    source,
+    hostCall: createGuestSeam({
+      platform: { sodium, identity: generateKeyPair(), now: () => 1 },
+      grants: { names: UNRESTRICTED_NAMES },
+      modules: { names: new Set(), call: () => null },
+    }),
   });
-  let msg = "";
-  try { verifyBundle(sodium, blob); } catch (e) { msg = e.message; }
-  assert(msg.includes(`guest ABI ${stale} is not implemented`),
-    `ABI ${stale} is refused by name (got: ${msg || "no throw"})`);
-  assert(msg.includes(String(GUEST_ABI_VERSION)), "the refusal names the supported ABI");
+  const out = await realm.call(new Uint8Array(0));
+  assert(out.length === NAMES.length, `one verdict per probed name (got ${out.length})`);
+  for (let i = 0; i < NAMES.length; i++) {
+    assert(out[i] === 1, `${NAMES[i]} answered a Promise, not inline bytes`);
+  }
+  await realm.dispose();
 
   console.log("  OK\n");
 }
@@ -2054,7 +2052,7 @@ async function testManifestSuiteByte() {
 
   const author = testAuthor();
   // One module: this test is about the suite byte, not the module count.
-  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
+  const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", requires: [] } };
   const env = signManifest(sodium, author, manifest);
 
   // Layout: the suite byte leads, and the author's Ed25519 key follows it (not at
@@ -2260,7 +2258,7 @@ async function testHybridManifestSuite() {
   const keys = testAuthor();
   const ed = keys.ed, pq = keys.mlDsa;
   // One module: this test is about the envelope, not the module count.
-  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } };
+  const manifest = { app: "pq-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", requires: [] } };
   const env = signManifest(sodium, keys, manifest);
 
   // 1. Layout: `[0x02][edPk 32][mlDsaPk 1952][edSig 64][mlDsaSig 3309][json]`. Both keys
@@ -2383,7 +2381,6 @@ async function testBundleCorruptNewerRollback() {
       modules: [{ name: "codec", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(new TextEncoder().encode(guestText))),
-        abi: GUEST_ABI_VERSION,
         requires: [],
       },
     });
@@ -2700,7 +2697,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
       app: "offside", version: 1, protocols: ["offside/v1"],
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
-        hash: toHex(gHash(guest)), abi: GUEST_ABI_VERSION,
+        hash: toHex(gHash(guest)),
         requires: ["fs", "link", "_svc"],
       },
     }),

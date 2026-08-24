@@ -488,7 +488,8 @@ function createShell(opts: CreateShellOptions & {
         // seam refuses what disposing that candidate could not take back (`isIrreversible`).
         // Everything a guest initializes from stays open. The node facts a link occupant
         // needs are never read OFF this seam — the host invokes the freshly stood slot's
-        // `handle` once with them, as the `init` op's payload (initLinkSlot).
+        // `handle` once with them, as the `init` op's payload (initLinkSlot). The refusal
+        // THROWS at the call site like every gate refusal (guest-seam.ts).
         return (name, payload, budget) => {
             // A local service id leaves something behind in the CALLEE the same way
             // `fs/put` leaves something behind in this realm — folded in here rather than

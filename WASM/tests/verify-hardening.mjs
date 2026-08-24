@@ -31,7 +31,6 @@ const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
-const { GUEST_ABI_VERSION } = await imp("build/core/domains.js");
 const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -140,9 +139,9 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
   const refusal = (m) => { try { verify(m); return ""; } catch (e) { return e.message; } };
   const none = refusal({ app: "x", version: 1, modules: [] });
   ok(none.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${none})`);
-  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [], guest: { hash: "aa", requires: [] } }) !== null,
     "a guest may declare no modules at all — zero-to-many, no count rule");
-  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", abi: GUEST_ABI_VERSION, requires: [] } }) !== null,
+  ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", requires: [] } }) !== null,
     "a guest may declare many modules — the guest dispatches them");
 }
 
@@ -169,8 +168,7 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     grants: { ...base.grants, names: [] },
     modules: { names: new Set(["codec"]), call: chatModules.call },
   });
-  // The forwarder echoes its input, so a resolved module answers with the body. A module
-  // call is async since ABI 6 (it round-trips through the module's worker).
+  // The forwarder echoes its input, so a resolved module answers with the body.
   ok((await scoped("codec", new Uint8Array([7, 7, 7]))).length === 3, "a module of this app resolves and runs");
   throws(() => scoped("evil", new Uint8Array([7, 7, 7])),
     "another app's module name reaches nothing through this seam");
@@ -261,7 +259,7 @@ console.log("\n§12.3 — the bounds a target sets actually reach the realm");
   const manifest = {
     app: "probe", version: 1, modules: [],
     guest: {
-      hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires: [],
+      hash: toHex(genesisHash(sodium, guestBytes)), requires: [],
       config: signedConfig,
     },
   };
@@ -428,7 +426,7 @@ ${guestOpFraming()}
   const mkBlob = (requires) => {
     const manifest = {
       app: "ticker", version: 1, modules: [],
-      guest: { hash: toHex(genesisHash(sodium, guestBytes)), abi: GUEST_ABI_VERSION, requires },
+      guest: { hash: toHex(genesisHash(sodium, guestBytes)), requires },
     };
     return packBundle({
       [MANIFEST_FILE]: signManifest(sodium, kp, manifest),

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"testing"
+	"time"
 
 	"seedloader/qjs"
 )
@@ -22,35 +23,35 @@ import (
 type mlkemKat struct {
 	KeyGen []struct {
 		TcID int    `json:"tcId"`
-		D string `json:"d"`
-		Z string `json:"z"`
-		Ek string `json:"ek"`
-		Dk string `json:"dk"`
+		D    string `json:"d"`
+		Z    string `json:"z"`
+		Ek   string `json:"ek"`
+		Dk   string `json:"dk"`
 	} `json:"keyGen"`
 	Encaps []struct {
 		TcID int    `json:"tcId"`
-		Ek string `json:"ek"`
-		M string `json:"m"`
-		C string `json:"c"`
-		K string `json:"k"`
+		Ek   string `json:"ek"`
+		M    string `json:"m"`
+		C    string `json:"c"`
+		K    string `json:"k"`
 	} `json:"encaps"`
 	Decaps []struct {
-		TcID int    `json:"tcId"`
-		Dk string `json:"dk"`
-		C string `json:"c"`
-		K string `json:"k"`
+		TcID   int    `json:"tcId"`
+		Dk     string `json:"dk"`
+		C      string `json:"c"`
+		K      string `json:"k"`
 		Reason string `json:"reason"`
 	} `json:"decaps"`
 	EncapsKeyCheck []struct {
-		TcID int    `json:"tcId"`
-		Ek string `json:"ek"`
-		Pass bool   `json:"pass"`
+		TcID   int    `json:"tcId"`
+		Ek     string `json:"ek"`
+		Pass   bool   `json:"pass"`
 		Reason string `json:"reason"`
 	} `json:"encapsKeyCheck"`
 	DecapsKeyCheck []struct {
-		TcID int    `json:"tcId"`
-		Dk string `json:"dk"`
-		Pass bool   `json:"pass"`
+		TcID   int    `json:"tcId"`
+		Dk     string `json:"dk"`
+		Pass   bool   `json:"pass"`
 		Reason string `json:"reason"`
 	} `json:"decapsKeyCheck"`
 }
@@ -153,14 +154,12 @@ func TestMlKemThroughCatalog(t *testing.T) {
 	}
 	prim := func(name string, args []byte) []byte {
 		t.Helper()
-		fn := qc.Global().GetPropertyStr("__callSeam")
-		v, err := qc.Invoke(fn, qc.NewUndefined(), qc.NewString("crypto/"+name), qc.NewArrayBuffer(args))
+		// Every seam name answers a Promise now, so drive it through callRealm, which
+		// pumps the loop until it settles.
+		b, err := callRealm("__callSeam", 5*time.Second,
+			qc.NewString("crypto/"+name), qc.NewArrayBuffer(args))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
-		}
-		b, err := qjs.JsTypedArrayToGo(v)
-		if err != nil {
-			t.Fatalf("%s result: %v", name, err)
 		}
 		return b
 	}

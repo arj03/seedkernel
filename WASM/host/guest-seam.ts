@@ -146,9 +146,9 @@ export interface SeamGrants {
  *  The slot wires this private value directly, so there is no wider module namespace. */
 export interface SeamModules {
     names: ReadonlySet<string>;
-    /** Reach one of this app's modules by bare name. Async; `deadlineMs` is the
-     *  calling guest's remaining segment, never guest-supplied. */
-    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Uint8Array | Promise<ModuleResult> | null;
+    /** Reach one of this app's modules by bare name. Async like every seam call;
+     *  `deadlineMs` is the calling guest's remaining segment, never guest-supplied. */
+    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult> | null;
 }
 
 /** Everything the seam needs, in the three groups that own it. */
@@ -167,9 +167,10 @@ export interface CallBudget {
     charge(ms: number): void;
 }
 
-/** The host half of `host.call`. Sync names return bytes; round-tripping ones
- *  return a Promise. `budget` is the caller's segment, supplied by the realm. */
-export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array> | Uint8Array;
+/** The host half of `host.call`. EVERY name answers a Promise — the seam is async,
+ *  not any backend — so "forgetting the await" is the one calling convention and it is
+ *  wrong for all of them alike. `budget` is the caller's segment, supplied by the realm. */
+export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array>;
 
 export { PRIMITIVE_NAMES } from "../core/domains.js";
 /** The `crypto/` members of the catalog, as a template literal over `PRIMITIVE_NAMES`, so
@@ -189,8 +190,9 @@ const HANDLER_KEYS: readonly string[] = [
     ...AUTHORITY_CALLS,
     ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
 ];
-/** One catalog entry's implementation: argument bytes in, response bytes out (or a
- *  Promise of them, for the round-tripping `fs/*` names). */
+/** One catalog entry's implementation: argument bytes in, response bytes out. A handler
+ *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
+ *  seam flattens both into the one Promise the guest awaits. */
 type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 /** Primitive half of the catalog (§12.1): a flat name→transform map. */
 function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
@@ -266,8 +268,11 @@ globalThis.__netReject = (callId, msg) => {
   p.reject(new Error(msg));
 };
 globalThis.host = {
-  // Sync names return bytes; fs / cross-realm return a Promise. Payload is a plain
-  // ArrayBuffer — quickjs-emscripten's getArrayBuffer rejects a view.
+  // EVERY name answers a Promise the guest awaits — there is no sync/async line to
+  // fall on the wrong side of. A name the seam REFUSES (undeclared service, no such
+  // name) still throws right here: a mis-uttered name is a programming error, and it
+  // fails at the call site rather than as a rejection nobody awaits. Payload is a
+  // plain ArrayBuffer — quickjs-emscripten's getArrayBuffer rejects a view.
   call(name, bytes) {
     const callId = ++__callSeq;
     const ab = bytes instanceof ArrayBuffer
@@ -275,9 +280,14 @@ globalThis.host = {
       : (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
         ? bytes.buffer
         : bytes.slice().buffer;
-    const r = __host_call(name, callId, ab);
-    if (r !== null) return new Uint8Array(r);          // sync name — bytes directly
-    return new Promise((resolve, reject) => { __pending[callId] = { resolve, reject }; }); // net / fs
+    // Issued BEFORE the table entry exists: every target settles through a microtask
+    // attached to the seam's own promise, so nothing can resolve a call that is not
+    // parked yet — and a synchronous refusal above leaves nothing behind to clean up.
+    __host_call(name, callId, ab);
+    let resolve, reject;
+    const answer = new Promise((res, rej) => { resolve = res; reject = rej; });
+    __pending[callId] = { resolve, reject };
+    return answer;
   },
 };
 // The answer-to-a-later-turn marker. The guest sets it (its own helper, content) and the
@@ -572,7 +582,13 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     return handlers;
 }
 /** The one `host.call` a realm runs against: the gate in front of `hostCatalog`.
- *  Sync vs async is the ABI (`guest.abi`); serialization is the realm's, not here. */
+ *  Every name ANSWERS a Promise — the one shape a guest can read, so "forgetting the
+ *  await" is wrong for all of them alike and there is no line to version. Failures keep
+ *  their old voice: a refusal (undeclared service, unknown name, uninstalled module,
+ *  spent budget) and a handler that throws inline both throw AT THE CALL SITE —
+ *  programming errors fail loudly where they were made, awaited or not — while a call
+ *  that round-trips fails as its own rejected Promise. Serialization is the realm's,
+ *  not here. */
 export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     const { platform, grants, modules } = deps;
     // Checked at runtime, not only in the types: the native target evaluates the COMPILED
@@ -616,7 +632,11 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
             const fn = handlers[name];
             if (!fn)
                 throw new Error("guest-seam: no such name " + name);
-            return fn(payload);
+            // Flattened so the caller reads ONE shape: a handler that answered inline
+            // (every crypto name, clock, link, timer) resolves in a microtask exactly like
+            // a round-tripping one. An inline THROW propagates synchronously, on purpose —
+            // see the contract above.
+            return Promise.resolve(fn(payload));
         }
         // Any other name is one of THIS slot's private modules, by its manifest name. The
         // slot wired this value directly, so no name can reach another app. Ungated like
@@ -629,17 +649,15 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         if (budget !== undefined && budget.remainingMs <= 0)
             throw new Error("guest-seam: execution budget exhausted before " + name);
         const r = modules.call(name, payload, budget?.remainingMs);
-        if (r !== null && typeof (r as Promise<ModuleResult>).then === "function") {
-            return (r as Promise<ModuleResult>).then(({ bytes, ms }) => {
-                // Bill the module's OWN processing time (measured on the worker that ran
-                // it), never the issue-to-settle wall clock — a burst of fire-and-forget
-                // module calls serialized through one worker would otherwise charge their
-                // queue wait quadratically. Only the parked path is charged: a module
-                // answering synchronously ran inside the guest's open segment.
-                budget?.charge(ms);
-                return bytes ?? NONE;
-            });
-        }
-        return (r as Uint8Array | null) ?? NONE;
+        if (r === null)
+            return Promise.resolve(NONE);
+        return r.then(({ bytes, ms }) => {
+            // Bill the module's OWN processing time (measured on the worker that ran
+            // it), never the issue-to-settle wall clock — a burst of fire-and-forget
+            // module calls serialized through one worker would otherwise charge their
+            // queue wait quadratically.
+            budget?.charge(ms);
+            return bytes ?? NONE;
+        });
     };
 }

@@ -35,9 +35,9 @@ function handle(arg) {
   const data = arg.subarray(33 + n);
   if (op === "put") {
     // A primitive is reached BY NAME through the crypto/ prefix — the name is the
-    // seam, not an op number — and it resolves synchronously like every primitive.
-    const id = host.call("crypto/blake2b-256", data);
-    return host.call("fs/put", fsPutArg(hex(id), data)).then(() => id);
+    // seam, not an op number — and it answers a Promise like every name now.
+    return host.call("crypto/blake2b-256", data).then((id) =>
+      host.call("fs/put", fsPutArg(hex(id), data)).then(() => id));
   }
   if (op === "get") {
     return host.call("fs/get", new TextEncoder().encode(hex(data))).then((r) => {

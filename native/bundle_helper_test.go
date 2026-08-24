@@ -40,7 +40,6 @@ type manifestVocab struct {
 	Manifest string `json:"manifest"` // DOMAIN_MANIFEST, hex
 	Author   string `json:"author"`   // DOMAIN_MANIFEST_AUTHOR, hex
 	Suite    int    `json:"suite"`    // SUITE_MANIFEST_HYBRID_PQ, the one manifest suite
-	ABI      int    `json:"abi"`      // GUEST_ABI_VERSION
 }
 
 // vocab reads that vocabulary from the booted realm. Cached: the values are the shared
@@ -52,7 +51,7 @@ func vocab() manifestVocab {
 		var v manifestVocab
 		out := realmString(`JSON.stringify({
 			manifest: toHex(DOMAIN_MANIFEST), author: toHex(DOMAIN_MANIFEST_AUTHOR),
-			suite: SUITE_MANIFEST_HYBRID_PQ, abi: GUEST_ABI_VERSION })`)
+			suite: SUITE_MANIFEST_HYBRID_PQ })`)
 		if err := json.Unmarshal([]byte(out), &v); err != nil {
 			panic("vocab: " + err.Error())
 		}
@@ -66,7 +65,6 @@ func vocab() manifestVocab {
 func domainManifest() []byte       { return hexBytes(vocab().Manifest) }
 func domainManifestAuthor() []byte { return hexBytes(vocab().Author) }
 func manifestSuite() byte          { return byte(vocab().Suite) }
-func guestABIVersion() int         { return vocab().ABI }
 
 func hexBytes(s string) []byte {
 	b, err := hex.DecodeString(s)
@@ -244,7 +242,6 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 		}},
 		"guest": map[string]any{
 			"hash":     hex.EncodeToString(sd.genericHash(32, []byte(stubGuestSrc))),
-			"abi":      guestABIVersion(),
 			"requires": []string{},
 		},
 	})
@@ -263,10 +260,17 @@ func appProtocols(app string, _ []string) []string {
 	return []string{app}
 }
 
-// manifestJSON builds the manifest body both suites sign: one forwarder module plus the
-// given guest, whose authority is its `requires` list. These bytes ARE the signed bytes —
-// there is no canonicalisation step, so the verifier parses exactly what it checked (§12.4).
+// manifestJSON builds the ordinary fixture manifest: one forwarder module plus the guest.
 func manifestJSON(t testing.TB, app string, version int, guestSrc string, requires []string) []byte {
+	t.Helper()
+	return manifestJSONForModule(t, app, version, guestSrc, requires, "fwd", forwarderWasm)
+}
+
+// manifestJSONForModule is the same fixture shape with an explicitly supplied private
+// module. The RS benchmark uses it to exercise a loaded module through its guest instead
+// of reaching into the native module table by the app key (loaded modules now have opaque
+// slot ids). These bytes ARE the signed bytes: there is no canonicalisation step.
+func manifestJSONForModule(t testing.TB, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
 	t.Helper()
 
 	type mod struct {
@@ -274,11 +278,9 @@ func manifestJSON(t testing.TB, app string, version int, guestSrc string, requir
 		Hash string `json:"hash"`
 	}
 	// requires + config live inside `guest` (§12.4), so "no authority" is an empty
-	// `requires` list rather than an absent object. `abi` names the host seam the guest was
-	// written against (§12.2) and is required — the loader refuses one it cannot implement.
+	// `requires` list rather than an absent object.
 	type guest struct {
 		Hash     string   `json:"hash"`
-		Abi      int      `json:"abi"`
 		Requires []string `json:"requires"`
 	}
 	manifest := struct {
@@ -296,11 +298,10 @@ func manifestJSON(t testing.TB, app string, version int, guestSrc string, requir
 		Protocols: appProtocols(app, requires),
 		Version:   version,
 		Modules: []mod{{
-			Name: "fwd", Hash: hex.EncodeToString(sd.genericHash(32, forwarderWasm)),
+			Name: moduleName, Hash: hex.EncodeToString(sd.genericHash(32, moduleBytes)),
 		}},
 		Guest: guest{
 			Hash:     hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
-			Abi:      guestABIVersion(),
 			Requires: requires,
 		},
 	}
@@ -314,15 +315,19 @@ func manifestJSON(t testing.TB, app string, version int, guestSrc string, requir
 	return mjson
 }
 
-// bundleBytes packs a finished manifest envelope, the forwarder module and the guest into
-// the container. Suite-agnostic on purpose: the envelope is opaque bytes to the container,
-// which is the property that lets a new signature suite land without the packing format
-// moving (§12.4).
+// bundleBytes packs the ordinary forwarder fixture.
 func bundleBytes(menv []byte, guestSrc string) []byte {
+	return bundleBytesForModule(menv, guestSrc, "fwd", forwarderWasm)
+}
+
+// bundleBytesForModule packs a finished manifest envelope, one private module and the
+// guest into the container. Suite-agnostic on purpose: the envelope is opaque bytes to
+// the container, so signature-suite changes do not move the packing format (§12.4).
+func bundleBytesForModule(menv []byte, guestSrc, moduleName string, moduleBytes []byte) []byte {
 	// Module and guest name no file: they are `<name>.wasm` and `guest.js` (§12.4).
 	return packBundle([][2]any{
 		{"manifest.bundle", menv},
-		{"fwd.wasm", forwarderWasm},
+		{moduleName + ".wasm", moduleBytes},
 		{"guest.js", []byte(guestSrc)},
 	})
 }
@@ -344,6 +349,14 @@ func writeBundleFile(t testing.TB, app string, menv []byte, guestSrc string) str
 func signedBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string) []byte {
 	t.Helper()
 	return bundleBytes(manifestEnvelope(t, a, manifestJSON(t, app, version, guestSrc, requires)), guestSrc)
+}
+
+// signedModuleBundleBytes is the custom-module twin used by benchmarks whose real module
+// bytes are supplied out of tree.
+func signedModuleBundleBytes(t testing.TB, a authorKeys, app string, version int, guestSrc string, requires []string, moduleName string, moduleBytes []byte) []byte {
+	t.Helper()
+	mjson := manifestJSONForModule(t, app, version, guestSrc, requires, moduleName, moduleBytes)
+	return bundleBytesForModule(manifestEnvelope(t, a, mjson), guestSrc, moduleName, moduleBytes)
 }
 
 // ── the probe app: how a native test puts a request on the wire ───────────────

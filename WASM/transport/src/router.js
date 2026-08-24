@@ -120,10 +120,11 @@ class ReqRes {
   note(to, n) { this.sent.set(to, (this.sent.get(to) || 0) + n); }
 
   /** Bytes of ours that have actually left for this peer: everything handed over, less
-   *  what its links are still holding. Flat while the wire is not moving. */
-  flushed(to) {
+   *  what its links are still holding. Flat while the wire is not moving.
+   *  Async: link/stat answers a Promise like every seam call. */
+  async flushed(to) {
     let buffered = 0;
-    for (const link of router.linksTo(to)) buffered += netLinkBuffered(link.linkId);
+    for (const link of router.linksTo(to)) buffered += await netLinkBuffered(link.linkId);
     return (this.sent.get(to) || 0) - buffered;
   }
 
@@ -136,10 +137,10 @@ class ReqRes {
    *  reading could correct. The cost is one deadline of grace to find the link. */
   armStall(corr, to, deadlineMs, owed) {
     let mark = null;
-    const tick = () => {
+    const tick = async () => {
       this.timers.delete(corr);
       if (!this.pending.has(corr)) return;
-      const now = this.flushed(to);
+      const now = await this.flushed(to);
       // Still going out, and moving: we have not finished asking. Anything else —
       // drained (the peer owes us an answer) or stuck (the wire is one) — settles.
       if (now < owed && (mark === null || now > mark)) {

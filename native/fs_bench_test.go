@@ -90,14 +90,13 @@ func BenchmarkFsGetJS64K(b *testing.B) {
 	b.StopTimer()
 }
 
-// setupFsJS boots the shared shell, wires fs.go's `fs` object onto a fresh data dir,
+// setupFsJS boots the shared shell, uses the process-wide benchmark data dir,
 // seeds one block, and returns the loop the benches drive. The seed put is itself an
 // awaited async call — `fs.put` returning a Promise is the whole point of the seam.
 func setupFsJS(b *testing.B) *eventLoop {
 	ensureBooted(b)
-	// Re-point the backend at a fresh directory, the same way the operator flow points
-	// it at --dir. The `__fs` object itself is installed once, at boot.
-	evalString(b, "openStore("+jsonString(b.TempDir())+")")
+	// Do not re-point the process-wide realm at b.TempDir(): Go removes that directory
+	// when this benchmark ends, while later benchmarks still use the same store.
 	if _, err := qc.Eval("fs-bench-setup.js", qjs.Code(`
 		globalThis.__benchBlock = new Uint8Array(65536); __benchBlock.fill(0x5a);
 		globalThis.__benchPut = async (n) => { for (let i = 0; i < n; i++) await fs.put("benchblk", __benchBlock); return new Uint8Array(0); };

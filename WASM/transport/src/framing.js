@@ -136,10 +136,10 @@ const WS_CLOSE_NORMAL = new Uint8Array([0x03, 0xe8]);
 const MAX_WS_HANDSHAKE = 16 * 1024;
 
 /** Run this bundle's own ws.wasm — an ordinary `host.call`. An empty answer is the
- *  module's failure signal (§4). Module calls are async on the JS targets (the module
- *  runs in its own worker); `Promise.resolve` normalizes a sync host. */
+ *  module's failure signal (§4). Every seam call answers a Promise; `host.call` is
+ *  already one, so nothing to normalize here. */
 function wsCall(req) {
-  return Promise.resolve(host.call(N_WS, req)).then((out) => {
+  return host.call(N_WS, req).then((out) => {
     if (!out || out.length === 0) throw new Error("ws: module error");
     return out;
   });
@@ -172,7 +172,7 @@ class WsFramer {
       // its GET must abort rather than wait out the idle clock. The bare catch only keeps
       // a link torn down before anyone awaits it from reporting an unhandled rejection.
       this.prepared = (async () => {
-        const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), randomBytes(16)]));
+        const r = await wsCall(concatBytes([Uint8Array.of(WS_OP_BASE64), await randomBytes(16)]));
         this.key = utf8Decode(r);
         this.expectAccept = utf8Decode(await wsCall(concatBytes([Uint8Array.of(WS_OP_ACCEPT), r])));
         this.put(utf8Encode(
@@ -188,10 +188,10 @@ class WsFramer {
 
   raiseCap() { this.cap = maxFrameBytes; }
 
-  mask() { return this.client ? randomBytes(4) : null; }
+  async mask() { return this.client ? await randomBytes(4) : null; }
 
-  frame(opcode, payload) {
-    const m = this.mask();
+  async frame(opcode, payload) {
+    const m = await this.mask();
     const req = new Uint8Array(3 + (m ? 4 : 0) + payload.length);
     req[0] = WS_OP_ENCODE;
     req[1] = opcode & 0x0f;

@@ -131,6 +131,7 @@ class Core {
     this.inbound = new Set();    // accepted, pre-auth
     this.addrs = new Map();      // peerId → 32B contact secret (or null = open)
     this.readyWaiters = [];      // [{check, d, timer}] — one per in-flight ready()
+    this.dialing = new Map();    // peerId → in-flight dial, so concurrent senders share one
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
   }
 
@@ -149,18 +150,26 @@ class Core {
     this.addrs.set(toHex(peerBytes), secret.length > 0 ? secret : null);
   }
 
-  // Top a dialed peer up to connsPerPeer outbound links. `link/open` answers immediately,
-  // so the link lands in `connecting` before this returns — no in-flight dial window.
+  /** Top a dialed peer up to connsPerPeer outbound links. One dial per peer at a time:
+   *  two callers racing to reach the same peer must not open double the budget. */
   dial(peerId) {
+    const inFlight = this.dialing.get(peerId);
+    if (inFlight) return inFlight;
+    const done = this.dialNow(peerId).finally(() => this.dialing.delete(peerId));
+    this.dialing.set(peerId, done);
+    return done;
+  }
+
+  async dialNow(peerId) {
     if (!this.addrs.has(peerId)) return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const { linkId, framing, authority } = netLinkOpen(fromHex(peerId));
-      if (linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
+      const opened = await netLinkOpen(fromHex(peerId));
+      if (opened.linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
       this.openLink({
-        linkId,
-        framing,
-        authority,
+        linkId: opened.linkId,
+        framing: opened.framing,
+        authority: opened.authority,
         weDialed: true,
         expectPeerId: fromHex(peerId),
         linkSecret: this.addrs.get(peerId),
@@ -208,22 +217,27 @@ class Core {
     router.remove(link);
   }
 
-  sendFrame(to, frame) {
+  // A frame for a peer with no routable link yet: dial, then hand the frame to the
+  // link that lands (it queues pre-auth). The dial is shared per peer (`dial`), so a
+  // burst of frames to one unreachable peer costs one open, and a frame with no
+  // address at all is dropped, as a fabric with no route drops it.
+  async sendFrame(to, frame) {
     if (to === ownId) return;
     if (router.send(to, frame)) return;
-    let pool = this.connecting.get(to);
-    // Dialing lands the link synchronously, so the frame goes straight into its pre-auth
-    // queue. No address → dropped, as a fabric with no route drops a frame.
-    if (!pool || pool.length === 0) { this.dial(to); pool = this.connecting.get(to); }
-    if (!pool || pool.length === 0) return;
-    pool[0].send(frame);
+    const pool = this.connecting.get(to);
+    if (pool && pool.length > 0) { pool[0].send(frame); return; }
+    if (!this.addrs.has(to)) return;
+    await this.dial(to);
+    const landed = this.connecting.get(to);
+    if (landed && landed.length > 0) landed[0].send(frame);
   }
 
   // Resolve once every known peer is authenticated, or the deadline passes —
-  // event-driven off the router's up edge.
+  // event-driven off the router's up edge. Dials are issued fire-and-forget: the
+  // deadline below settles the waiter either way.
   ready(d, timeoutMs) {
     const targets = [...this.addrs.keys()].filter((p) => p !== ownId);
-    for (const p of targets) this.dial(p);
+    for (const p of targets) void this.dial(p);
     const allUp = () => targets.every((p) => router.linkCount(p) >= 1);
     if (allUp()) { d.settle(EMPTY); return; }
     // A LIST, not a slot: two callers may wait at once, each with its own deferred.
@@ -327,12 +341,13 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-/** The host's one-time delivery of the immutable node facts. Shape versioned by
- *  `guest.abi`: removing or reordering a field bumps it, appending one does not (§12.4). */
+/** The host's one-time delivery of the immutable node facts. The shape is a contract
+ *  with the pinned bundle — transport-host.ts `initialConfig` — not a kernel version:
+ *  removing or reordering a field is a bundle update, appending one breaks nothing. */
 entry("init", (r) => {
   if (core !== null) throw new Error("transport: node facts delivered twice");
-  // No version word inside: the shape is pinned by `guest.abi`, and a host feeding a
-  // different shape refuses the bundle before this line runs (§12.4).
+  // No version word inside: the host feeding a different shape fails the load at this
+  // line, and the fix is shipping the matching bundle.
   ownPk = r.blob();
   ownId = toHex(ownPk);
   networkKey = r.blob();
@@ -442,9 +457,12 @@ entry("linkOpen", (r) => {
   openLinks.set(linkId, link);
 });
 
-entry("linkBytes", (r) => {
+entry("linkBytes", async (r) => {
   const link = findLink(r.u32());
-  return link ? link.onWire(r.blob()) || NOTHING : NOTHING;
+  // onWire answers a promise for the delivery frame — every seam call the processing
+  // awaits is one — and an empty answer means nothing deliverable.
+  if (!link) return NOTHING;
+  return (await link.onWire(r.blob())) || NOTHING;
 });
 
 /** The claim handler's answer to a delivery this program returned off a `linkBytes`

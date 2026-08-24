@@ -1,18 +1,17 @@
 package main
 
-// Reed–Solomon codec perf for the Go loader. RS lives in the seedstore repo's codec.wasm,
-// which the loader runs as an installed module, so its throughput is comparable
-// runtime-to-runtime against seedstore/WASM/tests/bench.mjs. Same shape as that bench:
-// RS(10,6), 64 KB blocks, 640 KB per chunk, throughput reported over data bytes.
+// Reed–Solomon codec perf for the Go loader. RS lives in seedstore's codec.wasm;
+// this benchmark signs it into a tiny app and calls it through the loaded guest, the
+// same private-module path a deployment uses. The request shape matches
+// seedstore/WASM/tests/bench.mjs: RS(10,6), 64 KB blocks and 640 KB of data per chunk.
 //
-// Opt-in, since the loader has no seedstore dependency: with SEEDSTORE_BUNDLE unset these
-// Skip.
+// Opt-in, since the loader has no seedstore dependency: with SEEDSTORE_CODEC unset these
+// benchmarks skip.
 //
-//	SEEDSTORE_BUNDLE=/path/to/seedstore/WASM/bundle/seedstore.skb go test -run x -bench 'BenchmarkRS' -benchmem ./...
+//	SEEDSTORE_CODEC=/path/to/seedstore/WASM/build/codec.wasm go test -run x -bench 'BenchmarkRS' -benchmem ./...
 //
-// With the var SET every failure below is fatal rather than a Skip: this bench once spent
-// a while reporting nothing because it still expected the old directory-form bundle and
-// silently skipped. An opt-in the operator asked for must not quietly decline.
+// With the variable set, every setup failure is fatal. An explicitly requested benchmark
+// must not silently decline because its external artifact is stale or unusable.
 
 import (
 	"bytes"
@@ -20,122 +19,68 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
-
-	"golang.org/x/crypto/blake2b"
 )
 
 const (
-	rsK  = 10        // data blocks  (RS(10,6), the seedstore default §4.1)
+	rsK  = 10        // data blocks (RS(10,6), the seedstore default §4.1)
 	rsM  = 6         // parity blocks
 	rsBS = 64 * 1024 // block size → 640 KB data / 384 KB parity per chunk
 )
 
 var (
 	rsOnce      sync.Once
-	rsAppKey string
+	rsAppKey    string
 	rsEncodeReq []byte // [OP_ENCODE][k][m][bs BE][640 KB data]
 	rsDecodeReq []byte // [OP_DECODE][k][m][bs BE][cnt][rowIdx][blocks] — block 0 lost
 	rsReady     bool
-	rsSetupErr  error // non-nil ⇒ SEEDSTORE_BUNDLE was set but unusable: fail, don't skip
+	rsSetupErr  error // non-nil ⇒ SEEDSTORE_CODEC was set but unusable: fail, don't skip
 )
 
-const manifestAuthorDomain = "seedkernel-manifest-author-v1\x00"
-const hybridEnvelopePK = 1952 // ML-DSA-65 public key width (WASM/core/pq.ts ML_DSA65_PK_LEN)
+// invokeApp prefixes the host caller identity and its test op-frame. The guest removes
+// both before handing the codec its private payload. Returning the Promise is the async
+// guest ABI.
+const rsBenchGuestSource = `async function handle(arg) {
+	const opLen = arg.length > 32 ? arg[32] : -1;
+	return await host.call("codec", arg.subarray(33 + opLen));
+}`
 
-// bundleAuthor pulls the manifest author id out of a packed bundle blob (§12.4). The
-// container is [magic 4][count u16] then per file [nameLen u16][name][dataLen u32][data],
-// and the manifest envelope inside it leads with a suite byte. Under suite 0x01 the
-// author id IS the Ed25519 key: [suite 1][ed_pk 32][sig 64][json]. Under the hybrid
-// suite 0x02 it is the DERIVED genesis hash — DOMAIN_MANIFEST_AUTHOR ‖ 0x02 ‖ ed_pk ‖
-// ml_dsa_pk (bundle.ts hybridAuthorId), never either key alone, so a policy written for
-// the raw key would refuse the load (fail-closed). Mirrors packBundle/verifyManifest in
-// bundle.ts. The bench only needs the id to allow-list — loadBundle still verifies the
-// signature against it, so a wrong id here fails the load rather than weakening it.
-func bundleAuthor(blob []byte) ([]byte, error) {
-	if len(blob) < 6 {
-		return nil, fmt.Errorf("bundle blob too short (%d B)", len(blob))
-	}
-	for o := 6; o+2 <= len(blob); {
-		nameLen := int(binary.BigEndian.Uint16(blob[o:]))
-		o += 2
-		if o+nameLen+4 > len(blob) {
-			break
-		}
-		name := string(blob[o : o+nameLen])
-		o += nameLen
-		dataLen := int(binary.BigEndian.Uint32(blob[o:]))
-		o += 4
-		if o+dataLen > len(blob) {
-			break
-		}
-		if name == "manifest.bundle" {
-			if dataLen < 33 {
-				return nil, fmt.Errorf("manifest envelope too short (%d B)", dataLen)
-			}
-			switch suite := blob[o]; suite {
-			case 1:
-				return blob[o+1 : o+33], nil // +1 skips the suite byte
-			case 2:
-				if dataLen < 1+32+hybridEnvelopePK {
-					return nil, fmt.Errorf("hybrid manifest envelope too short (%d B)", dataLen)
-				}
-				pre := make([]byte, 0, len(manifestAuthorDomain)+1+32+hybridEnvelopePK)
-				pre = append(pre, manifestAuthorDomain...)
-				pre = append(pre, suite)
-				pre = append(pre, blob[o+1:o+33]...)            // ed_pk
-				pre = append(pre, blob[o+33:o+33+hybridEnvelopePK]...) // ml_dsa_pk
-				h := blake2b.Sum256(pre)
-				return h[:], nil
-			default:
-				return nil, fmt.Errorf("unknown manifest suite 0x%02x", suite)
-			}
-		}
-		o += dataLen
-	}
-	return nil, fmt.Errorf("no manifest.bundle entry in the container")
-}
-
-// setupRS loads the seedstore bundle (installing seedstore:codec) and stages a fixed
-// encode request plus a "one data block lost" decode request — the §21 single-loss
-// read path, identical to bench.mjs's decode case (surviving data rows 1..k-1 plus
-// the first parity row). Both requests are validated once before timing.
+// setupRS loads a benchmark app containing codec.wasm and stages a fixed encode request
+// plus a one-data-block-lost decode request. Both are validated once before timing.
 func setupRS(tb testing.TB) {
 	ensureBooted(tb)
 
-	path := os.Getenv("SEEDSTORE_BUNDLE")
+	path := os.Getenv("SEEDSTORE_CODEC")
 	if path == "" {
-		return // opt-in only: no seedstore bundle configured → rsReady stays false → Skip
-	}
-	blob, err := os.ReadFile(path)
-	if err != nil {
-		rsSetupErr = fmt.Errorf("SEEDSTORE_BUNDLE=%s: %w", path, err)
 		return
 	}
-	// The booted default policy is deny-all, which would refuse the bundle. The bench is
-	// pointed at a bundle the operator chose, so authorize its own manifest author.
-	author, err := bundleAuthor(blob)
+	codec, err := os.ReadFile(path)
 	if err != nil {
-		rsSetupErr = fmt.Errorf("SEEDSTORE_BUNDLE=%s: %w", path, err)
+		rsSetupErr = fmt.Errorf("SEEDSTORE_CODEC=%s: %w", path, err)
 		return
 	}
-	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author) + `"]}`); err != nil {
+
+	const app = "rsbench"
+	author := testAuthor(tb)
+	if err := applyPolicy(`{"authors":["` + hex.EncodeToString(author.id()) + `"]}`); err != nil {
 		rsSetupErr = fmt.Errorf("applyPolicy: %w", err)
 		return
 	}
-	if status := loadBundle(path); !strings.HasPrefix(status, "seedstore v") {
-		rsSetupErr = fmt.Errorf("loadBundle(%s): %s", path, status)
+	blob := signedModuleBundleBytes(tb, author, app, 1, rsBenchGuestSource, nil, "codec", codec)
+	bundlePath := filepath.Join(tb.TempDir(), app+".skb")
+	if err := os.WriteFile(bundlePath, blob, 0o644); err != nil {
+		rsSetupErr = fmt.Errorf("write benchmark bundle: %w", err)
 		return
 	}
-	// Which app the loader bound the bundle's modules under: derived from the manifest's
-	// signed (author, app) pair (§5.1), not declared anywhere. `author` is the key we just
-	// authorized, so this is the entry that bundle's `codec` module landed in.
-	rsAppKey = appKeyFor(author, "seedstore")
+	if status := loadBundle(bundlePath); !strings.HasPrefix(status, app+" v") {
+		rsSetupErr = fmt.Errorf("loadBundle(%s): %s", bundlePath, status)
+		return
+	}
+	rsAppKey = appKeyFor(author.id(), app)
 
-	// 640 KB of deterministic data (content is irrelevant to RS timing; this is the
-	// same cheap fill bench.mjs uses).
 	data := make([]byte, rsK*rsBS)
 	for i := range data {
 		data[i] = byte(i*1103515245 + 12345)
@@ -146,63 +91,71 @@ func setupRS(tb testing.TB) {
 	binary.BigEndian.PutUint32(rsEncodeReq[3:7], rsBS)
 	copy(rsEncodeReq[7:], data)
 
-	parity := callModule(rsAppKey, "codec", rsEncodeReq)
+	parity, err := invokeBundle(rsAppKey, rsEncodeReq)
+	if err != nil {
+		rsSetupErr = fmt.Errorf("encode via %s: %w", rsAppKey, err)
+		return
+	}
 	if len(parity) != rsM*rsBS {
 		rsSetupErr = fmt.Errorf("encode via %s returned %d B, want %d", rsAppKey, len(parity), rsM*rsBS)
 		return
 	}
 
-	// Decode with data block 0 missing: rows 1..k-1 (surviving data) + row k (first
-	// parity) = k rows, the minimum basis the codec needs to rebuild all k data rows.
+	// Rows 1..k-1 plus the first parity row are the minimum basis needed to rebuild row 0.
 	cnt := rsK
 	rsDecodeReq = make([]byte, 8+cnt+cnt*rsBS)
 	rsDecodeReq[0], rsDecodeReq[1], rsDecodeReq[2] = 2, rsK, rsM // OP_DECODE
 	binary.BigEndian.PutUint32(rsDecodeReq[3:7], rsBS)
 	rsDecodeReq[7] = byte(cnt)
-	rows := rsDecodeReq[8 : 8+cnt]
-	blocks := rsDecodeReq[8+cnt:]
-	for r := 0; r < rsK-1; r++ { // surviving data rows 1..k-1
+	rows, blocks := rsDecodeReq[8:8+cnt], rsDecodeReq[8+cnt:]
+	for r := 0; r < rsK-1; r++ {
 		rows[r] = byte(r + 1)
 		copy(blocks[r*rsBS:], data[(r+1)*rsBS:(r+2)*rsBS])
 	}
-	rows[rsK-1] = byte(rsK) // first parity row (index k)
+	rows[rsK-1] = byte(rsK)
 	copy(blocks[(rsK-1)*rsBS:], parity[:rsBS])
 
-	out := callModule(rsAppKey, "codec", rsDecodeReq)
+	out, err := invokeBundle(rsAppKey, rsDecodeReq)
+	if err != nil {
+		rsSetupErr = fmt.Errorf("decode via %s: %w", rsAppKey, err)
+		return
+	}
 	if len(out) != rsK*rsBS || !bytes.Equal(out[:rsBS], data[:rsBS]) {
-		// Don't report a bogus rate for a codec that didn't rebuild the lost block.
 		rsSetupErr = fmt.Errorf("decode via %s did not reconstruct block 0 (%d B out)", rsAppKey, len(out))
 		return
 	}
 	rsReady = true
 }
 
-func BenchmarkRSEncode(b *testing.B) {
+func requireRS(b *testing.B) {
+	b.Helper()
 	rsOnce.Do(func() { setupRS(b) })
 	if rsSetupErr != nil {
-		b.Fatalf("SEEDSTORE_BUNDLE is set but the bench could not run: %v", rsSetupErr)
+		b.Fatalf("SEEDSTORE_CODEC is set but the bench could not run: %v", rsSetupErr)
 	}
 	if !rsReady {
-		b.Skip("seedstore bundle not built (set SEEDSTORE_BUNDLE)")
+		b.Skip("seedstore codec not built (set SEEDSTORE_CODEC)")
 	}
+}
+
+func BenchmarkRSEncode(b *testing.B) {
+	requireRS(b)
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		callModule(rsAppKey, "codec", rsEncodeReq)
+		if _, err := invokeBundle(rsAppKey, rsEncodeReq); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
 func BenchmarkRSDecode(b *testing.B) {
-	rsOnce.Do(func() { setupRS(b) })
-	if rsSetupErr != nil {
-		b.Fatalf("SEEDSTORE_BUNDLE is set but the bench could not run: %v", rsSetupErr)
-	}
-	if !rsReady {
-		b.Skip("seedstore bundle not built (set SEEDSTORE_BUNDLE)")
-	}
+	requireRS(b)
 	b.SetBytes(rsK * rsBS)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		callModule(rsAppKey, "codec", rsDecodeReq)
+		if _, err := invokeBundle(rsAppKey, rsDecodeReq); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
