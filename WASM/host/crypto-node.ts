@@ -3,7 +3,7 @@
 // host trust root; application and transport transforms ship in their own bundles. The `-node`
 // suffix means Node.js, as it does in `fs-node.ts` / `net-node.ts` — never a network
 // node. Node-only: everything here needs the npm package or a local file read; a browser
-// page readies its own crypto (docs/EXPORTS.md).
+// page readies its own crypto (docs/CLIENT.md).
 
 import { readFileSync } from "node:fs";
 import { withMlDsa65, loadMlDsa65, ML_DSA65_SEED_LEN } from "./pq.js";

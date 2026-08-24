@@ -207,7 +207,7 @@ npm run build    # ws.wasm + the transport bundle + the shared host
 npm test         # the full suite
 ```
 
-This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. [EXPORTS](docs/EXPORTS.md) is where a new client starts: the published API, grouped by what a client actually does — author a bundle, boot a node, pick its platform adapters — with seed store and seedchat as the worked examples. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seed store also points at.
+This repo is the runtime only. Apps live outside it and consume the published surface of `seedkernel-wasm`: [seed store](https://github.com/arj03/seedstore) (a P2P storage node) and [seedchat](https://github.com/arj03/seedchat) (the browser P2P chat demo, §11). `npm run build:browser` produces the browser artifacts they vendor. [CLIENT](docs/CLIENT.md) is where a new client starts: dependency setup, bundle authoring, node boot, platform adapters, loading and invocation, with seed store and seedchat as the worked examples. The WebRTC signaling rendezvous both use is a deployment concern rather than runtime surface, so it lives with the apps — `npm run relay` in seedchat, which seed store also points at.
 
 `npm run build:pq` rebuilds the two PQ modules from the pinned `pq/mldsa-native` and `pq/mlkem-native` submodules; it needs `git submodule update --init` and a clang with the wasm32 target.
 
@@ -221,9 +221,9 @@ This file is §1 (and §15); the rest of the spec lives in `docs/`, split by con
 | [RUNTIME](docs/RUNTIME.md) | §10–§12 | Distribution size, the app layer (chat as the worked example), and the shell: capability backends, the guest-seam ABI, zero-authority JS realms, signed bundles and how the loader admits them under policy, the node↔node transport, the Go/native binary. |
 | [SECURITY](docs/SECURITY.md) | §13–§14 | A byte-by-byte worked example and the collected trust model. |
 | [CHANNEL](docs/CHANNEL.md) | §12.6.2 | The concealed-identity channel handshake: what the four messages do, the three secrets and their different jobs, why one identity key signs for both purposes, and where the design sits against Noise, WireGuard and Secret Handshake. Normative text stays in RUNTIME §12.6; this is the *why*. |
-| [EXPORTS](docs/EXPORTS.md) | — | How to write a client on the runtime: the published entry points, what each is for, the traps a browser consumer hits, and the two existing clients as worked examples. API guide, not protocol. |
+| [CLIENT](docs/CLIENT.md) | — | How to write a client on the runtime: dependency setup, bundle authoring, node boot, platform adapters, loading and invocation, browser integration traps, and the two existing clients as worked examples. Client guide, not protocol. |
 
-To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. CHANNEL and EXPORTS sit outside that sequence — one is rationale, the other the API guide for building on the runtime.
+To read the spec as one document, concatenate the files in that order: `cat README.md docs/{PROTOCOL,RUNTIME,SECURITY}.md`. CHANNEL and CLIENT sit outside that sequence — one is rationale, the other the client guide for building on the runtime.
 
 ## 15. Background
 
