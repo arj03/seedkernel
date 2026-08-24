@@ -1,7 +1,7 @@
 // Shared host socket plumbing: FRAMING.PLATFORM RawLink base (Ws/Rtc) and the
 // bookkeeping RtcNetwork/WsNetwork share over one TransportHost.
 
-import { FRAMING, type PeerId } from "../core/socket-seam.js";
+import { FRAMING, type Framing, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost } from "./transport-host.js";
 
 /** Pre-open send queue ceiling. Overflow fails the channel rather than dropping
@@ -10,7 +10,7 @@ const MAX_PREOPEN_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export abstract class BufferedChannel {
     /** Every subclass here wraps a transport that already has message boundaries. */
-    readonly framing = FRAMING.PLATFORM;
+    readonly framing: Framing = FRAMING.PLATFORM;
     protected onMsg: ((bytes: Uint8Array) => void) | null = null;
     protected onCls: (() => void) | null = null;
     private readonly pending: Uint8Array[] = [];

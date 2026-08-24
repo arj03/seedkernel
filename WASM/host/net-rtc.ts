@@ -15,7 +15,7 @@
 // importing this under Node is safe — a console peer joins the same mesh with a
 // werift-backed `peerConnectionFactory` (./net-rtc-node).
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { type PeerId } from "../core/socket-seam.js";
+import { FRAMING, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
@@ -69,11 +69,19 @@ export interface RtcNetworkOptions {
     onPeerDown?: (peerId: PeerId) => void;
 }
 
-// An RTCDataChannel is already an ordered, whole-message binary pipe, so this is a thin
-// adapter over MessageChannel (net-channel.ts) — including its pre-open send buffer, which
-// the transport needs because it emits its HELLO the instant a link is constructed.
+// Keep physical data-channel messages below the conservative cross-browser ceiling while
+// exposing an ordered byte stream to the transport. Its existing bounded length framer
+// restores record boundaries, so storage can coalesce several blocks per encrypted record
+// without asking WebRTC to carry that record as one message.
+export const RTC_CHUNK_BYTES = 48 * 1024;
 export class RtcChannel extends MessageChannel {
+  override readonly framing = FRAMING.LENGTH;
   constructor(dc: RTCDataChannel) { super(dc); }
+  protected override write(bytes: Uint8Array): void {
+    for (let off = 0; off < bytes.length; off += RTC_CHUNK_BYTES) {
+      super.write(bytes.subarray(off, Math.min(bytes.length, off + RTC_CHUNK_BYTES)));
+    }
+  }
 }
 // Cap on speculative (unauthenticated) peer entries the relay can force us to allocate by
 // spamming `hello`s with arbitrary `from` values. Authenticated peers do not count, so a

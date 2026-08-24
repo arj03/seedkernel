@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
-const { RtcNetwork } = await imp("build/host/net-rtc.js");
+const { RtcChannel, RtcNetwork, RTC_CHUNK_BYTES } = await imp("build/host/net-rtc.js");
 import { testkit } from "./testkit.mjs";
 
 const { test, assert, summary } = testkit();
@@ -21,6 +21,28 @@ const MAX_UNAUTHED_PEERS = 256;
 const peerId = (n) => String(n).padStart(64, "0");
 
 console.log("\nRtcNetwork speculative-entry cap (§12.6.1)\n");
+
+await test("RtcChannel exposes a length-framed stream and caps physical messages", async () => {
+  const listeners = new Map();
+  const sent = [];
+  const dc = {
+    binaryType: "",
+    bufferedAmount: 0,
+    send(bytes) { sent.push(Uint8Array.from(bytes)); },
+    close() {},
+    addEventListener(type, cb) { listeners.set(type, cb); },
+  };
+  const channel = new RtcChannel(dc);
+  assert(channel.framing === 1, "RTC bytes must run through the transport's LENGTH framer");
+  listeners.get("open")();
+  const bytes = new Uint8Array(RTC_CHUNK_BYTES * 2 + 7).fill(0x5a);
+  channel.send(bytes);
+  assert(sent.length === 3, `a two-chunk-plus-tail write must make 3 messages, got ${sent.length}`);
+  assert(sent[0].length === RTC_CHUNK_BYTES && sent[1].length === RTC_CHUNK_BYTES && sent[2].length === 7,
+    `physical messages must be capped at ${RTC_CHUNK_BYTES} bytes`);
+  assert(sent.every((part) => part.every((byte) => byte === 0x5a)), "chunking must preserve every byte");
+  channel.close();
+});
 
 await test("offers cannot force more than MAX_UNAUTHED_PEERS peer entries", async () => {
   // The old cap applied to the broadcast-hello path only: an offer from an
