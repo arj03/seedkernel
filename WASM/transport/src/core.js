@@ -304,9 +304,9 @@ function findLink(linkId) {
 // Reached as an app is: `handle([caller 32][body …])`, body always an op envelope
 // `[opLen u8][op][args]` (util.js `readOp`) — this bundle's envelope, which is how an
 // app's `send` and the host's own events (a fired deadline included) land on one
-// entrypoint. A fired deadline is an ORDINARY host loopback naming the `timer` op,
-// body `[id u32]`: the op name says "this is a deadline", never a second caller
-// identity. The op is a NAME, not a tag byte — an unimplemented op fails loud.
+// entrypoint. For a deadline this bundle supplies the complete `timer` envelope when it
+// arms the host table; the kernel stores and returns those bytes opaquely. The op is a
+// NAME, not a tag byte — an unimplemented op fails loud.
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
 //   the HOST  32 zero bytes — the platform's events: `init`, sockets opening, bytes

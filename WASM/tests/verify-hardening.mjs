@@ -406,17 +406,20 @@ console.log("\n§12.2 — timers are an ordinary authority, wired per realm");
     let fired = [];
     const u32x2 = (a, b) => new Uint8Array([a >>> 24, a >>> 16, a >>> 8, a, b >>> 24, b >>> 16, b >>> 8, b]);
     // handle reads [caller 32][body]: ONE entrypoint, and the body is this app's own
-    // op framing ([opLen u8][op][args]) — composed here with the kernel's own spelling
-    // of that convention (core/op-frame.ts, content). A fired deadline re-enters this
-    // realm as an ORDINARY host loopback naming the "timer" op, body a bare [id u32] —
-    // the host writes the same zero caller id either way, so what says "this is a
-    // deadline" is the op name this app reads, never a second caller identity.
+    // op framing ([opLen u8][op][args]), supplied by this test app. When arming a
+    // deadline the app gives the host its complete future loopback body; the host stores
+    // and returns those bytes opaquely after the same zero caller id used by invoke.
 ${guestOpFraming()}
     function handle(arg) {
       const { body } = callerOf(arg);
       const { op, args: p } = readOp(body);
       if (op === "timer") { fired.push((p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]) >>> 0); return new Uint8Array(0); }
-      if (op === "arm") { host.call("timer/arm", u32x2(p[0], p[1])); return new Uint8Array(0); }
+      if (op === "arm") {
+        const event = writeOp("timer", u32x2(p[0], 0).slice(0, 4));
+        const request = new Uint8Array(8 + event.length);
+        request.set(u32x2(p[0], p[1])); request.set(event, 8);
+        host.call("timer/arm", request); return new Uint8Array(0);
+      }
       if (op === "clear") { host.call("timer/clear", u32x2(p[0], 0).slice(0, 4)); return new Uint8Array(0); }
       if (op === "fired") return new Uint8Array(fired);
       return new Uint8Array(0);
@@ -500,7 +503,10 @@ ${guestOpFraming()}
   const stubApp = await stub.loadBundleBlob(mkBlob(["timer"]));
   await stubApp.invoke(opInput("arm", new Uint8Array([0, 0])));
   // Arm through the very seam the realm was handed, then drop the app underneath it.
-  await armed("timer/arm", new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
+  const pending = new Uint8Array(8 + opInput("timer", new Uint8Array([0, 0, 0, 1])).length);
+  pending.set(new Uint8Array([0, 0, 0, 1, 0, 0, 0, 5]));
+  pending.set(opInput("timer", new Uint8Array([0, 0, 0, 1])), 8);
+  await armed("timer/arm", pending);
   ok(stub.uninstall(appKeyFor(kp.id, "ticker")) === true, "the app uninstalls with a deadline still pending");
   await sleep(80);
   ok(!entries.includes("timer"), `uninstalling an app cancels its pending deadlines (entries: ${entries.join(", ")})`);
@@ -518,7 +524,7 @@ console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not b
   const body = new Uint8Array([9, 9, 9, 9]);
   const withCaller = (caller) => { const a = new Uint8Array(36); a.set(caller, 0); a.set(body, 32); return a; };
 
-  // The kernel's own spelling, shipped to apps as content (core/op-frame.ts).
+  // This test app's reader; the kernel contributes only the 32-byte attribution prefix.
   ok(callerOf(withCaller(new Uint8Array(32))).fromHost, "32 zero bytes read as the host proper");
   // A near-miss on the host id is not the host: one late bit is all it takes.
   const nearHost = new Uint8Array(32); nearHost[31] = 1;

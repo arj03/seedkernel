@@ -519,9 +519,8 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
 }
 
 /** Native test seam: drive a slot through the host invocation path. Pure modules stay
- *  private; no module lookup crosses this boundary. The "test" op frame is THIS test
- *  surface's own spelling (the shell passes bytes unread) — what the probe guests parse,
- *  composed with the one definition of that convention (core/op-frame.ts). */
+ *  private; no module lookup crosses this boundary. The shell passes the client helper's
+ *  "test" frame unread. */
 const invokeApp = (appKey: string, payload: Uint8Array | ArrayBuffer) =>
     theShell().invoke(writeOp("test", payload instanceof Uint8Array ? payload : new Uint8Array(payload)), appKey);
 

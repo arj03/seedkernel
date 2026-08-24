@@ -80,9 +80,10 @@ export interface RawNet {
  *  the host keeps no name of its own for a deadline. The implementer bounds how many
  *  deadlines a guest may hold at once — the table of live timers is its memory to spend. */
 export interface HostTimers {
-    /** Arm (or re-arm) `id` to fire the guest's `timer` entrypoint in `ms`. Refuse, by
-     *  throwing, past whatever bound the implementation sets on live timers. */
-    arm(id: number, ms: number): void;
+    /** Arm (or re-arm) `id` to return `payload` to the guest as an ordinary host
+     *  loopback in `ms`. The payload is the guest's own format and remains opaque to the
+     *  host. Refuse, by throwing, past the implementation's live-timer bound. */
+    arm(id: number, ms: number, payload: Uint8Array): void;
     clear(id: number): void;
 }
 
@@ -318,9 +319,9 @@ globalThis.__invoke = (argBuf) => {
 //
 // The ONLY bytes the host puts in front of a callee's format: one 32-byte id, unforgeable
 // by a guest. There is exactly ONE host id — the zero id, whose events and loopback calls
-// the host writes (a fired deadline re-enters as an ordinary loopback naming a "timer" op,
-// so a second host id was never needed). Everything else non-zero is a peer or a
-// co-resident app key.
+// the host writes (a fired deadline re-enters as an ordinary loopback carrying the opaque
+// body supplied when it was armed, so a second host id is unnecessary). Everything else
+// non-zero is a peer or a co-resident app key.
 /** The host's own caller id: 32 zero bytes. No app key derives it. */
 export const HOST_CALLER_ID = new Uint8Array(32);
 /** Method catalog, re-exported from core/domains.ts. A grant is a SERVICE name
@@ -557,7 +558,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         "timer/arm": (payload) => {
             // The live-timer cap is the BACKEND's, not here: the table is its memory to
             // spend.
-            timers().arm(readU32BE(payload, 0), readU32BE(payload, 4));
+            timers().arm(readU32BE(payload, 0), readU32BE(payload, 4), payload.subarray(8));
             return NONE;
         },
         "timer/clear": (payload) => {

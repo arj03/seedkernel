@@ -1,12 +1,9 @@
-// op-frame — the one definition of the app-facing loopback envelope: `[caller 32]` split
-// by `callerOf`, `[opLen u8][op][args]` by `readOp`/`writeOp`, with `guestOpFraming()`
-// emitting the same three as a flat block bundle tooling can inline. CONTENT, never ABI
-// (§12.2): the kernel's own guest preamble does not include it, and the host never
-// interprets it.
+// op-frame — the one definition of the optional client-side named-op envelope.
+// Clients and the operator CLI compose it; dispatch, timers, and the guest seam never
+// interpret it, because the kernel ABI ends after `[caller 32]`.
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched
- *  over the WHOLE 32 bytes — an app key is a hash of facts its author picks, so a prefix
- *  test is a name an app can grind its way into (§12.2). */
+ *  over the whole 32 bytes — an app key is grindable, so a prefix test is unsafe. */
 export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Array; body: Uint8Array } {
   const caller = arg.subarray(0, 32);
   let fromHost = true;
@@ -16,8 +13,7 @@ export function callerOf(arg: Uint8Array): { fromHost: boolean; caller: Uint8Arr
   return { fromHost, caller, body: arg.subarray(32) };
 }
 
-/** `[opLen u8][op ascii][args …]` read back. Malformed framing throws rather than
- *  yielding a truncated name that would read as an unimplemented op. */
+/** Read the optional `[opLen u8][op ascii][args …]` client convention. */
 export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   const n = body.length > 0 ? body[0] : -1;
   if (n < 0 || body.length < 1 + n) throw new Error("op-frame: malformed op envelope");
@@ -26,9 +22,7 @@ export function readOp(body: Uint8Array): { op: string; args: Uint8Array } {
   return { op, args: body.subarray(1 + n) };
 }
 
-/** The same, written. The op is a NAME, never a tag byte, ASCII 1..255 — checked
- *  rather than truncated, because the one-byte length and UTF-16 counting would
- *  otherwise go out silently different. */
+/** Write the optional `[opLen u8][op ascii][args …]` client convention. */
 export function writeOp(op: string, args: Uint8Array): Uint8Array {
   if (op.length < 1 || op.length > 255)
     throw new Error(`op-frame: op name ${JSON.stringify(op)} must be 1..255 bytes`);
@@ -43,13 +37,10 @@ export function writeOp(op: string, args: Uint8Array): Uint8Array {
   return out;
 }
 
-/** The above three as a flat guest-source block: `"use strict"`-safe, no imports — ready
- *  to prepend to a bundle's guest source by its build tooling. */
+/** The helpers above as flat guest source: `"use strict"` safe and import-free. */
 export function guestOpFraming(): string {
   return `
-// op-frame: the app's own loopback framing (seedkernel core/op-frame.ts) - inlined by
-// bundle tooling, content not ABI: after the kernel's 32-byte caller id it is the
-// callee's format. The kernel never reads any of it.
+// op-frame: optional client framing; seedkernel reads none of these body bytes.
 const callerOf = (arg) => {
   const caller = arg.subarray(0, 32);
   let fromHost = true;

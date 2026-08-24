@@ -344,8 +344,8 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     // ONE one-shot op through the loaded guest — "the shell runs the app" as the
     // *initiator* (§12.8). `handle`'s ABI and nothing more (§12.2): stdin is the argument,
     // stdout is the response, and the op name is framed here with the app's own
-    // convention (`writeOp`, core/op-frame.ts — the kernel's spelling of that convention,
-    // shipped as content) and passed through unread. Nothing here decodes or knows an
+    // convention (`writeOp`, the leaf client helper) and passed through unread. Nothing
+    // here decodes or knows an
     // app's argument shape, which a flag per operation could not avoid. A name too long
     // or not ASCII is refused there rather than truncated into a different frame.
     //

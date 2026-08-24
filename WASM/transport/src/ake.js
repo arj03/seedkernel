@@ -220,7 +220,11 @@ function admits(peerBytes) {
 function armTimer(ms, fn) {
   const id = nextTimerId++;
   timers.set(id, fn);
-  void host.call(N_TIMER_ARM, args([id, Math.max(1, Math.floor(ms))], [])).catch(() => {
+  // The kernel stores and returns the tail opaquely. This transport owns the event's
+  // `timer` name and framing just as it owns every other byte after the caller id.
+  void host.call(N_TIMER_ARM, args(
+    [id, Math.max(1, Math.floor(ms))], [], writeOp("timer", argU32(id)),
+  )).catch(() => {
     timers.delete(id);
   });
   return id;

@@ -32,7 +32,7 @@ const sodium = await loadCrypto();
 const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
   = await imp("build/host/guest-seam.js");
-const { readOp } = await imp("build/core/op-frame.js");
+const { readOp, writeOp } = await imp("build/core/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
@@ -2851,7 +2851,12 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   // firing inside that window is a legitimate turn of the guest that armed it.
   const realms = [];
   let failNextRealm = false;
-  const arm = (id, ms) => { const p = new Uint8Array(8); writeU32BE(p, 0, id); writeU32BE(p, 4, ms); return p; };
+  const arm = (id, ms) => {
+    const event = writeOp("timer", Uint8Array.from([id >>> 24, id >>> 16, id >>> 8, id]));
+    const p = new Uint8Array(8 + event.length);
+    writeU32BE(p, 0, id); writeU32BE(p, 4, ms); p.set(event, 8);
+    return p;
+  };
   // A fired deadline and an ordinary loopback invoke arrive with the SAME (zero) caller
   // id now, so what tells them apart is the op name in the body, not a caller byte —
   // `invoke` above sends an empty body, which has no op to read at all.

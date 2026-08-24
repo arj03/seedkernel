@@ -10,7 +10,6 @@ import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { isIrreversible, isService, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
-import { writeOp } from "../core/op-frame.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import { type PeerId } from "../core/socket-seam.js";
@@ -238,17 +237,17 @@ interface RealmTimers extends HostTimers {
   clearAll(): void;
 }
 
-/** A timer table over `fire`, which is what a fired deadline re-enters the realm with.
+/** A timer table over `fire`, which returns the guest-chosen body to its realm.
  *  The table is the resource being spent, so the cap lives here rather than in the seam:
  *  the seam never learns that a timer fired, so a count kept there would only ever grow. */
-function createRealmTimers(fire: (id: number) => void, max = DEFAULT_MAX_LIVE_TIMERS): RealmTimers {
+function createRealmTimers(fire: (payload: Uint8Array) => void, max = DEFAULT_MAX_LIVE_TIMERS): RealmTimers {
     const live = new Map<number, ReturnType<typeof setTimeout>>();
     const clear = (id: number) => {
         const t = live.get(id);
         if (t !== undefined) { clearTimeout(t); live.delete(id); }
     };
     return {
-        arm(id, ms) {
+        arm(id, ms, payload) {
             // Counted before the re-arm, so replacing a live deadline is always allowed
             // and only a NEW id can be the one over the line.
             if (!live.has(id) && live.size >= max)
@@ -257,7 +256,7 @@ function createRealmTimers(fire: (id: number) => void, max = DEFAULT_MAX_LIVE_TI
             // Dropped from the table BEFORE the realm is re-entered, so a guest that
             // re-arms the same id from inside its own `timer` entrypoint arms the new
             // deadline rather than having it cleared out from under it on the way out.
-            live.set(id, setTimeout(() => { live.delete(id); fire(id); }, ms));
+            live.set(id, setTimeout(() => { live.delete(id); fire(payload); }, ms));
         },
         clear,
         clearAll() {
@@ -364,17 +363,14 @@ function createShell(opts: CreateShellOptions & {
      *  standing when it fires (a transport handover replaces it while the slot stays). */
     const newSlot = (loaded: LoadedBundle, pureModules: PureModules, onInbound: LoadBundleOptions["onInbound"]): AppSlot => {
         let slot: AppSlot;
-        const timers = createRealmTimers((id) => {
-            const idBytes = new Uint8Array(4);
-            writeU32BE(idBytes, 0, id);
+        const timers = createRealmTimers((payload) => {
             // An ordinary host loopback, exactly like `invoke` (§12.2): a fired deadline is
-            // an event the host delivers into the guest, not a host authority, so it carries
-            // the HOST's caller id and names itself by OP rather than by a second caller id
-            // — the callee reads the name from the body it already parses every other event
-            // through (`writeOp`, core/op-frame.ts, the same spelling `--op` uses). A
+            // an event the host delivers into the guest, not a host authority. It carries
+            // the HOST's caller id followed by the opaque body supplied to `timer/arm`;
+            // event framing belongs to the guest whose `handle` reads it. A
             // guest's `handle` may throw on it; there is no caller left to reject — the
             // arming call returned turns ago — so report and swallow.
-            void slot.realm?.call(concatBytes([HOST_CALLER_ID, writeOp("timer", idBytes)])).catch((err: unknown) => {
+            void slot.realm?.call(concatBytes([HOST_CALLER_ID, payload])).catch((err: unknown) => {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
