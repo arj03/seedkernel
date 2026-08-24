@@ -3,6 +3,7 @@
 // tight loop over one seam; run.mjs covers the same ground end-to-end. Run after `npm run build`.
 
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import _sodium from "libsodium-wrappers";
@@ -15,7 +16,8 @@ await _sodium.ready;
 const sodium = _sodium;
 
 const { ModuleTable } = await imp("build/host/module-table.js");
-const { readMemoryLimits, checkModuleMemory } = await imp("build/core/wasm-limits.js");
+const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS }
+  = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
@@ -27,7 +29,7 @@ withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.w
 /** A manifest author: both halves of the key set, plus the 32-byte id they derive — the
  *  identity policy pins and app keys lead with. `ed` doubles as a node identity. */
 const testAuthor = () => makeAuthor(sodium);
-const { bootShell, scopedFs } = await imp("build/host/shell-core.js");
+const { bootShell, scopedFs, createRealmTimers } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
@@ -143,6 +145,10 @@ console.log("\n§12.4 — every app is a guest, modules are its library");
     "a guest may declare no modules at all — zero-to-many, no count rule");
   ok(verify({ app: "x", version: 1, modules: [{ name: "a", hash: "aa" }, { name: "b", hash: "bb" }], guest: { hash: "aa", requires: [] } }) !== null,
     "a guest may declare many modules — the guest dispatches them");
+  for (const version of [-1, Number.MAX_SAFE_INTEGER + 1]) {
+    ok(refusal({ app: "x", version, modules: [], guest: { hash: "aa", requires: [] } }).includes("malformed manifest"),
+      `version ${version} is refused before it can poison freshness state`);
+  }
 }
 
 console.log("\n§12.2 — the capability gates cannot be reached by omission");
@@ -180,6 +186,15 @@ console.log("\n§4.3 — the guest realm has an execution budget");
 
   const enc = new TextEncoder();
   const noop = () => new Uint8Array();
+
+  // Construction has to be isolated from this runner: the regression shape blocks the
+  // thread forever when its guard is missing, so the parent kills a broken child instead
+  // of hanging the entire suite.
+  const initProbe = spawnSync(process.execPath, [join(root, "tests/fixtures/guest-init-deadline.mjs")], {
+    timeout: 3000, encoding: "utf8",
+  });
+  ok(initProbe.status === 0 && !initProbe.error,
+    `top-level guest code is interrupted during realm construction (${initProbe.error?.message ?? initProbe.stderr.trim()})`);
 
   // A holder that loops forever is interrupted rather than wedging the host thread.
   const spinner = await createSafeRealm({
@@ -245,6 +260,57 @@ console.log("\n§4.3 — the guest realm has an execution budget");
   ok(defaultInterrupted, "with no deadlineMs configured the 5s default still interrupts");
   ok(Date.now() - t1 >= 4000, "the default budget is the documented 5s, not something tighter");
   defaulted.dispose();
+
+  // Fire-and-forget calls retain copied payloads and promise state in the host. Once the
+  // per-realm count is reached, the next call fails before its payload crosses; settling
+  // the retained calls returns the allowance to the realm.
+  const held = [];
+  let hold = true;
+  const boundedCalls = await createSafeRealm({
+    source: `function handle(a) {
+      if (a[0]) {
+        for (let i = 0; i <= ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS}; i++)
+          host.call("hold", new Uint8Array([i & 255]));
+        return new Uint8Array();
+      }
+      return host.call("hold", new Uint8Array());
+    }`,
+    hostCall: () => hold ? new Promise((resolve) => held.push(resolve)) : new Uint8Array([7]),
+    deadlineMs: 1000,
+  });
+  await rejects(boundedCalls.call(new Uint8Array([1])), "a realm cannot accumulate unbounded unresolved host calls");
+  ok(held.length === DEFAULT_MAX_OUTSTANDING_HOST_CALLS,
+    `the refusal happens before copy ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS + 1}`);
+  hold = false;
+  for (const resolve of held) resolve(new Uint8Array());
+  await sleep(20);
+  ok((await boundedCalls.call(new Uint8Array([0])))[0] === 7,
+    "settled host calls release their per-realm accounting");
+  boundedCalls.dispose();
+}
+
+console.log("\n§12.3 — timer count and copied payload bytes are bounded per realm");
+{
+  const countBound = createRealmTimers(() => {}, 2, 100);
+  countBound.arm(1, 60_000, new Uint8Array(1));
+  countBound.arm(2, 60_000, new Uint8Array(1));
+  throws(() => countBound.arm(3, 60_000, new Uint8Array(1)), "a third live id is refused at a two-timer cap");
+  countBound.clearAll();
+
+  let fired = 0;
+  const byteBound = createRealmTimers(() => { fired++; }, 10, 8);
+  byteBound.arm(1, 60_000, new Uint8Array(6));
+  throws(() => byteBound.arm(2, 60_000, new Uint8Array(3)), "aggregate copied timer bodies cannot cross their byte cap");
+  byteBound.arm(1, 60_000, new Uint8Array(8));
+  byteBound.clear(1);
+  byteBound.arm(2, 1, new Uint8Array(8));
+  await sleep(20);
+  ok(fired === 1, "a timer fires once under the byte cap");
+  byteBound.arm(3, 60_000, new Uint8Array(8));
+  byteBound.clearAll();
+  byteBound.arm(4, 60_000, new Uint8Array(8));
+  byteBound.clearAll();
+  ok(true, "clear, fire, and disposal release timer payload accounting");
 }
 
 console.log("\n§12.3 — the bounds a target sets actually reach the realm");

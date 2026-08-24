@@ -382,8 +382,12 @@ func exposeBridge(qc *qjs.Context) {
 	b.SetPropertyStr("readFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		fb, err := os.ReadFile(argString(t, 0))
 		if err != nil {
-			// null is "absent" (a --key file on a first boot), not a failure to report.
-			return t.Context().NewNull(), nil
+			// Only absence maps to null. Permission errors, directories and I/O failures
+			// must remain visible to guard-bearing callers such as the freshness store.
+			if errors.Is(err, os.ErrNotExist) {
+				return t.Context().NewNull(), nil
+			}
+			return nil, err
 		}
 		return t.Context().NewArrayBuffer(fb), nil
 	}))
@@ -392,8 +396,8 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return nil, err
 		}
-		// Atomic for every caller: a truncated freshness file reads back as "no marks",
-		// silently dropping every downgrade guard.
+		// Atomic for every caller: a truncated freshness file must never replace the last
+		// readable guard state (and is refused on read if one exists out of band).
 		if err := writeFileAtomic(argString(t, 0), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
 			return nil, err
 		}

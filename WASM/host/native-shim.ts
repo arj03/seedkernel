@@ -14,7 +14,7 @@ import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../cor
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
 // The artifact-shipped transport bundle (scripts/build-transport-bundle.mjs) — the signed
 // program that is the node's network (§12.6).
@@ -34,7 +34,7 @@ declare const bridge: {
   /** Process arguments after the program name, as a JSON array — not a joined string,
    *  because an argument may legitimately contain any byte. */
   argv(): string;
-  /** Read a whole file; `null` when absent/unreadable — the `CliFiles` contract (cli.ts). */
+  /** Read a whole file; `null` only when absent. Other read failures throw. */
   readFile(path: string): ArrayBuffer | null;
   /** Write a whole file atomically (temp + rename). `mode` is a POSIX permission bit
    *  set, or 0 to leave the platform default. */
@@ -49,7 +49,8 @@ declare const bridge: {
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
-  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
+  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
+              maxOutstandingHostCalls: number): number;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
   realmCall(realm: number, payload: Uint8Array,
@@ -375,7 +376,9 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
         );
         return null;
     };
-    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES, deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
+    realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
+        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
+        DEFAULT_MAX_OUTSTANDING_HOST_CALLS);
     let disposed = false;
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm

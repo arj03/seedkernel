@@ -2,12 +2,68 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
 	"seedloader/qjs"
 )
+
+// Initialization regressions run in a child process: without the source-evaluation guard,
+// QuickJS holds the test thread forever and no in-process timeout can make progress.
+func TestGuestRealmInitializationBudget(t *testing.T) {
+	const marker = "SEEDKERNEL_TEST_GUEST_INIT_BUDGET"
+	if os.Getenv(marker) == "1" {
+		guestSeamRealm(t)
+		if _, err := qc.Eval("build.js", qjs.Code(`
+			globalThis.__id = sodium.crypto_sign_keypair();
+			__buildGuestSeam([], __id, null);
+			globalThis.__src = "for (;;) {}";
+		`)); err != nil {
+			t.Fatal("build seam:", err)
+		}
+		if _, err := callRealm(`createRealm({ source: __src, hostCall: __guestSeam, deadlineMs: 100 })`, 3*time.Second); err == nil {
+			t.Fatal("top-level guest loop unexpectedly completed")
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestGuestRealmInitializationBudget$", "-test.v")
+	cmd.Env = append(os.Environ(), marker+"=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("guest source evaluation wedged its host process: %v\n%s", ctx.Err(), out)
+	}
+	if err != nil {
+		t.Fatalf("initialization budget probe failed: %v\n%s", err, out)
+	}
+}
+
+func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("build.js", qjs.Code(`
+		// A host operation that never settles retains every copied request unless the realm
+		// refuses new calls at its shared per-realm limit.
+		globalThis.__guestSeam = () => new Promise(() => {});
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() {
+		  for (let i = 0; i < 10000; i++) host.call("hold", new Uint8Array([i & 255]));
+		  return new Uint8Array();
+		}
+	`, 1000)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	if _, err := realmCall("flood", nil); err == nil {
+		t.Fatal("a guest accumulated unbounded unresolved host calls")
+	}
+}
 
 // A confined guest realm runs an app's entrypoints over the single
 // host.call seam, reaching only its declared requires. This exercises a

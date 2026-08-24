@@ -356,7 +356,7 @@ function isValidManifest(m: unknown): m is BundleManifest {
         return false;
     if (enc.encode(o.app).length > 255)
         return false;
-    if (typeof o.version !== "number" || !Number.isInteger(o.version))
+    if (typeof o.version !== "number" || !Number.isSafeInteger(o.version) || o.version < 0)
         return false;
     // The claimed names (§12.10): `protocols` is what a PEER may reach, `services` what a
     // CO-RESIDENT guest may reach with `host.call`. Checked like the module names and for the
@@ -584,50 +584,50 @@ export class FreshnessMarks {
      *  "unrevoked" — so a target's `persist` must be atomic. Bare pre-revocation maps throw
      *  rather than reading as empty (would discard every downgrade guard). */
     constructor(json?: string | null) {
-        if (json) {
-            let raw;
+        if (json !== undefined && json !== null) {
+            let parsed: unknown;
             try {
-                const parsed = JSON.parse(json);
-                if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-                    raw = parsed;
-                }
+                parsed = JSON.parse(json);
             }
-            catch { /* malformed ⇒ start empty */ }
-            if (raw) {
-                if (raw.marks === undefined && raw.revoked === undefined && Object.keys(raw).length > 0) {
-                    throw new Error("freshness store: this file predates author revocation (§12.5) and holds only high-water marks. " +
-                        'Reading it as-is would silently drop every downgrade guard. Migrate it to {"marks":{…},"revoked":[]} ' +
-                        "or delete it to start from no marks.");
+            catch (e) {
+                throw new Error(`freshness store: corrupt file — malformed JSON: ${errMessage(e)}`, { cause: e });
+            }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                throw new Error("freshness store: corrupt file — root must be an object with marks and revoked fields");
+            }
+            const raw = parsed as Record<string, unknown>;
+            if (raw.marks === undefined && raw.revoked === undefined && Object.keys(raw).length > 0) {
+                throw new Error("freshness store: this file predates author revocation (§12.5) and holds only high-water marks. " +
+                    'Reading it as-is would silently drop every downgrade guard. Migrate it to {"marks":{…},"revoked":[]} ' +
+                    "or delete it to start from no marks.");
+            }
+            if (raw.marks === undefined || raw.revoked === undefined) {
+                throw new Error('freshness store: corrupt file — expected both "marks" and "revoked" fields');
+            }
+            const marks = raw.marks;
+            if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
+                throw new Error('freshness store: corrupt file — "marks" must be an object of {appKey: version} pairs');
+            }
+            for (const [k, v] of Object.entries(marks)) {
+                // The app suffix is arbitrary manifest text (and may contain line breaks),
+                // so validate the fixed author prefix and the non-empty suffix separately.
+                if (!/^[0-9a-fA-F]{64}:/u.test(k) || k.length === 65) {
+                    throw new Error(`freshness store: corrupt file — mark key ${JSON.stringify(k)} is not "<author hex>:<app>"`);
                 }
-                // The legacy guard above catches only the old shape; a new-shaped store with
-                // wrong-typed fields would read as "no marks, nothing revoked" just as
-                // silently. Guard data that exists but cannot be read is a corrupt store.
-                const marks = raw.marks;
-                if (marks !== undefined) {
-                    if (typeof marks !== "object" || marks === null || Array.isArray(marks)) {
-                        throw new Error('freshness store: corrupt file — "marks" must be an object of {appKey: version} pairs');
-                    }
-                    for (const [k, v] of Object.entries(marks)) {
-                        // Versions are manifest-verified integers; anything else silently
-                        // changes what a downgrade check means.
-                        if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
-                            throw new Error(`freshness store: corrupt file — mark "${k}" is not a non-negative integer version (got ${JSON.stringify(v)})`);
-                        }
-                        this.marks.set(k, v);
-                    }
+                if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
+                    throw new Error(`freshness store: corrupt file — mark "${k}" is not a non-negative safe-integer version (got ${JSON.stringify(v)})`);
                 }
-                const revoked = raw.revoked;
-                if (revoked !== undefined) {
-                    if (!Array.isArray(revoked)) {
-                        throw new Error('freshness store: corrupt file — "revoked" must be an array of hex author ids');
-                    }
-                    for (const a of revoked) {
-                        if (typeof a !== "string") {
-                            throw new Error(`freshness store: corrupt file — a revoked entry is not a string (got ${JSON.stringify(a)})`);
-                        }
-                        this.revoked.add(a.toLowerCase());
-                    }
+                this.marks.set(k, v);
+            }
+            const revoked = raw.revoked;
+            if (!Array.isArray(revoked)) {
+                throw new Error('freshness store: corrupt file — "revoked" must be an array of hex author ids');
+            }
+            for (const a of revoked) {
+                if (typeof a !== "string" || !/^[0-9a-fA-F]{64}$/u.test(a)) {
+                    throw new Error(`freshness store: corrupt file — a revoked entry is not a 32-byte author id in hex (got ${JSON.stringify(a)})`);
                 }
+                this.revoked.add(a.toLowerCase());
             }
         }
     }
@@ -638,9 +638,8 @@ export class FreshnessMarks {
             marks[k] = v;
         return JSON.stringify({ marks, revoked: [...this.revoked] });
     }
-    /** Write the serialized state durably. In-memory here; a target overrides it with its
-     *  atomic-write seam — a truncated store reads back as "nothing known", discarding every
-     *  downgrade guard and every revocation. */
+    /** Write the serialized state durably. In-memory here; a target overrides it with an
+     *  atomic-write seam so a crash cannot replace valid guard state with a corrupt file. */
     persist(_json: string): void { }
     key(author: Uint8Array, app: string): string { return appKeyFor(author, app); }
     get(author: Uint8Array, app: string): number {
@@ -648,6 +647,8 @@ export class FreshnessMarks {
         return v === undefined ? -Infinity : v;
     }
     set(author: Uint8Array, app: string, version: number): void {
+        if (!Number.isSafeInteger(version) || version < 0)
+            throw new Error(`freshness store: refusing invalid version ${JSON.stringify(version)} (expected a non-negative safe integer)`);
         const k = this.key(author, app);
         const cur = this.marks.get(k);
         if (cur !== undefined && cur >= version)

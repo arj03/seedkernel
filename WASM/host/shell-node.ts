@@ -18,6 +18,7 @@ import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
+import { errMessage } from "../core/util.js";
 import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
 
 export interface NodeShellOptions {
@@ -92,7 +93,13 @@ export class FileFreshnessStore extends FreshnessMarks {
         try {
             json = readFileSync(path, "utf8");
         }
-        catch { /* absent/unreadable ⇒ start empty (−∞ for every key) */ }
+        catch (e) {
+            const code = (e as NodeJS.ErrnoException)?.code;
+            if (code !== "ENOENT") {
+                throw new Error(`freshness store: cannot read ${path}: ${errMessage(e)}`, { cause: e });
+            }
+            // A genuine missing file is the only first-boot case.
+        }
         super(json);
         this.path = path;
     }

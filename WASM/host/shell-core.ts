@@ -8,7 +8,7 @@ import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type S
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
-import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
+import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
 import { isIrreversible, isService, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
@@ -224,7 +224,8 @@ interface AppSlot {
   onInbound?: LoadBundleOptions["onInbound"];
 }
 
-/** Per-realm timer table. Cap live count; `clearAll` before realm disposal (§2.1). */
+/** Per-realm timer table. Cap live count and retained bytes; `clearAll` before realm
+ *  disposal (§2.1). */
 interface RealmTimers extends HostTimers {
   /** Cancel every live deadline. Called only from `disposeSlot`, before the realm goes. */
   clearAll(): void;
@@ -233,11 +234,20 @@ interface RealmTimers extends HostTimers {
 /** A timer table over `fire`, which returns the guest-chosen body to its realm.
  *  The table is the resource being spent, so the cap lives here rather than in the seam:
  *  the seam never learns that a timer fired, so a count kept there would only ever grow. */
-function createRealmTimers(fire: (payload: Uint8Array) => void, max = DEFAULT_MAX_LIVE_TIMERS): RealmTimers {
-    const live = new Map<number, ReturnType<typeof setTimeout>>();
+export function createRealmTimers(
+    fire: (payload: Uint8Array) => void,
+    max = DEFAULT_MAX_LIVE_TIMERS,
+    maxPayloadBytes = DEFAULT_MAX_TIMER_PAYLOAD_BYTES,
+): RealmTimers {
+    const live = new Map<number, { timer: ReturnType<typeof setTimeout>; payloadBytes: number }>();
+    let payloadBytes = 0;
     const clear = (id: number) => {
-        const t = live.get(id);
-        if (t !== undefined) { clearTimeout(t); live.delete(id); }
+        const entry = live.get(id);
+        if (entry !== undefined) {
+            clearTimeout(entry.timer);
+            live.delete(id);
+            payloadBytes -= entry.payloadBytes;
+        }
     };
     return {
         arm(id, ms, payload) {
@@ -245,16 +255,32 @@ function createRealmTimers(fire: (payload: Uint8Array) => void, max = DEFAULT_MA
             // and only a NEW id can be the one over the line.
             if (!live.has(id) && live.size >= max)
                 throw new Error(`guest: too many live timers (cap ${max})`);
+            const previousBytes = live.get(id)?.payloadBytes ?? 0;
+            const nextBytes = payloadBytes - previousBytes + payload.byteLength;
+            if (nextBytes > maxPayloadBytes)
+                throw new Error(`guest: live timer payloads exceed byte cap ${maxPayloadBytes}`);
+            // Copy only after both checks pass. The guest-call request buffer can then be
+            // collected, and the table retains exactly the bytes it accounts for.
+            const body = payload.slice();
             clear(id);
             // Dropped from the table BEFORE the realm is re-entered, so a guest that
             // re-arms the same id from inside its own `timer` entrypoint arms the new
             // deadline rather than having it cleared out from under it on the way out.
-            live.set(id, setTimeout(() => { live.delete(id); fire(payload); }, ms));
+            const timer = setTimeout(() => {
+                const entry = live.get(id);
+                if (!entry || entry.timer !== timer) return;
+                live.delete(id);
+                payloadBytes -= entry.payloadBytes;
+                fire(body);
+            }, ms);
+            live.set(id, { timer, payloadBytes: body.byteLength });
+            payloadBytes += body.byteLength;
         },
         clear,
         clearAll() {
-            for (const t of live.values()) clearTimeout(t);
+            for (const { timer } of live.values()) clearTimeout(timer);
             live.clear();
+            payloadBytes = 0;
         },
     };
 }

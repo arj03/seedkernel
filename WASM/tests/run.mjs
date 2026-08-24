@@ -1203,9 +1203,10 @@ async function testSlotFreshness() {
   // one a newer version added, say — still loads (it is ignored, not refused) and is
   // rewritten without it.
   {
-    const legacy = new FreshnessMarks(JSON.stringify({ marks: { "aa:app": 2 }, futureKey: { anything: 1 }, revoked: [] }));
+    const markKey = "aa".repeat(32) + ":app";
+    const legacy = new FreshnessMarks(JSON.stringify({ marks: { [markKey]: 2 }, futureKey: { anything: 1 }, revoked: [] }));
     const round = JSON.parse(legacy.serialize());
-    assertEqual(round.marks["aa:app"], 2, "a store carrying an unknown key still loads its marks");
+    assertEqual(round.marks[markKey], 2, "a store carrying an unknown key still loads its marks");
     assert(round.futureKey === undefined, "…and is rewritten without it");
   }
 
@@ -2517,15 +2518,16 @@ async function testPreRevocationStoreIsRefused() {
   assert(cur.get(new Uint8Array(32).fill(0xaa), "app") === 7, "the current format reads marks back");
   assert(cur.isRevoked(new Uint8Array(32).fill(0xbb)), "the current format reads revocations back");
 
-  // The first-boot cases must NOT throw: absent, unparseable, or an empty object are
-  // all "nothing known yet", and only a populated bare map is the old format.
-  let firstBootThrew = false;
-  try {
-    new FreshnessMarks(null);
-    new FreshnessMarks("not json at all");
-    new FreshnessMarks("{}");
-  } catch { firstBootThrew = true; }
-  assert(!firstBootThrew, "absent, unparseable and empty stores still start empty");
+  // Only actual absence is first boot. Bytes that exist but cannot reconstruct both
+  // guard-bearing fields must fail closed.
+  let absentThrew = false;
+  try { new FreshnessMarks(null); } catch { absentThrew = true; }
+  assert(!absentThrew, "an absent store starts empty on first boot");
+  for (const json of ["not json at all", "{}", '{"marks":{}}', '{"revoked":[]}']) {
+    let threw = false;
+    try { new FreshnessMarks(json); } catch { threw = true; }
+    assert(threw, `an existing malformed or partial store fails closed (${json})`);
+  }
   console.log("  OK\n");
 }
 
@@ -2546,8 +2548,11 @@ async function testWrongTypedStoreIsRefused() {
     ['a string mark value', JSON.stringify({ marks: { "aa:app": "2" }, revoked: [] })],
     ['a fractional mark', JSON.stringify({ marks: { "aa:app": 2.5 }, revoked: [] })],
     ['a negative mark', JSON.stringify({ marks: { "aa:app": -1 }, revoked: [] })],
+    ['an unsafe-integer mark', JSON.stringify({ marks: { "aa:app": Number.MAX_SAFE_INTEGER + 1 }, revoked: [] })],
     ['a non-array "revoked"', JSON.stringify({ marks: {}, revoked: "nul" })],
     ['a non-string revoked entry', JSON.stringify({ marks: {}, revoked: [1] })],
+    ['a malformed mark key', JSON.stringify({ marks: { "aa:app": 2 }, revoked: [] })],
+    ['a malformed revoked author', JSON.stringify({ marks: {}, revoked: ["aa"] })],
   ]) {
     let threw = false;
     try { new FreshnessMarks(json); } catch { threw = true; }
@@ -2561,6 +2566,41 @@ async function testWrongTypedStoreIsRefused() {
   }));
   assert(good.get(new Uint8Array(32).fill(0xaa), "app") === 2, "a well-formed store still loads its marks");
   assert(good.isRevoked(new Uint8Array(32).fill(0xbb)), "…and its revocations");
+  const oddApp = "line\nbreak:still-app";
+  const odd = new FreshnessMarks(JSON.stringify({
+    marks: { ["cc".repeat(32) + ":" + oddApp]: 3 }, revoked: [],
+  }));
+  assert(odd.get(new Uint8Array(32).fill(0xcc), oddApp) === 3,
+    "freshness accepts every app spelling the manifest accepts");
+  for (const version of [-1, Number.MAX_SAFE_INTEGER + 1]) {
+    let threw = false;
+    try { good.set(new Uint8Array(32).fill(0xaa), "new", version); } catch { threw = true; }
+    assert(threw, `persistence refuses invalid version ${version}`);
+  }
+
+  // The Node adapter distinguishes a missing first-boot file from malformed or unreadable
+  // state. A directory at the file path is a portable read failure that cannot be mistaken
+  // for ENOENT.
+  const { FileFreshnessStore } = await imp("build/host/shell-node.js");
+  const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: pjoin } = await import("node:path");
+  const dir = mkdtempSync(pjoin(tmpdir(), "seedkernel-freshness-read-"));
+  const path = pjoin(dir, "marks.json");
+  try {
+    new FileFreshnessStore(path); // genuine absence
+    writeFileSync(path, "not json");
+    let malformed = false;
+    try { new FileFreshnessStore(path); } catch { malformed = true; }
+    assert(malformed, "Node refuses a malformed freshness file");
+    rmSync(path);
+    mkdirSync(path);
+    let unreadable = false;
+    try { new FileFreshnessStore(path); } catch { unreadable = true; }
+    assert(unreadable, "Node refuses freshness read errors other than file-not-found");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
   console.log("  OK\n");
 }
 

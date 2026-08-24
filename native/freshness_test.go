@@ -118,3 +118,33 @@ func TestFreshnessPersistFailureFailsTheLoad(t *testing.T) {
 		t.Fatalf("the failed load must leave no mark behind, got: %s", status)
 	}
 }
+
+func TestFreshnessReadFailuresFailClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		directory bool
+	}{
+		{name: "malformed JSON"},
+		{name: "read error", directory: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			dataDir := filepath.Join(parent, "data")
+			bootRealmIn(t, dataDir)
+			markPath := evalString(t, "freshnessPathFor("+jsonString(dataDir)+")")
+			if tc.directory {
+				if err := os.Mkdir(markPath, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(markPath, []byte("not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			policy := withTransportAuthor(t, `{}`)
+			cfg := nodeConfig{PolicyJSON: &policy, KeyHex: testKeyHex(t), ContactSecretHex: testContactSecretHex}
+			if _, err := startNode(cfg); err == nil {
+				t.Fatalf("freshness %s was silently treated as an empty store", tc.name)
+			}
+		})
+	}
+}
