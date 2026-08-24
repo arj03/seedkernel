@@ -58,14 +58,13 @@ declare const bridge: {
   realmDispose(realm: number): void;
 };
 
-/** Go's raw crypto primitives (native/sodium.go, mldsa.go, mlkem.go). Bytes cross as
+/** Go's host crypto primitives (native/sodium.go, mldsa.go). Bytes cross as
  *  ArrayBuffers and a failure as `null` — what the bridge can carry.
  *
  *  `crypto_generichash` takes its optional key so the native blake2b shim can refuse a
  *  keyed hash loudly; dropping the argument here would turn a MAC into a plain hash. */
 declare const __sodium: {
   crypto_generichash(hashLength: number, message: Uint8Array, key?: Uint8Array | null): ArrayBuffer;
-  crypto_stream_xchacha20_xor(message: Uint8Array, nonce: Uint8Array, key: Uint8Array): ArrayBuffer;
   crypto_sign_detached(message: Uint8Array, sk: Uint8Array): ArrayBuffer;
   crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
   crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): ArrayBuffer | null;
@@ -77,9 +76,6 @@ declare const __sodium: {
   crypto_sign_seed_keypair(seed: Uint8Array): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
   randombytes_buf(n: number): ArrayBuffer;
   ml_dsa65_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
-  ml_kem768_keypair_from_seed(seed: Uint8Array): { publicKey: ArrayBuffer; privateKey: ArrayBuffer };
-  ml_kem768_encaps(pk: Uint8Array, coins: Uint8Array): { ciphertext: ArrayBuffer; sharedSecret: ArrayBuffer } | null;
-  ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): ArrayBuffer | null;
 };
 
 /** The crypto surface this target serves: `ShellSodium` plus the two keypair producers a
@@ -95,16 +91,14 @@ export interface NativeSodium extends ShellSodium {
 /** libsodium, in libsodium-wrappers method names, over Go's primitives: Uint8Array
  *  results, `{publicKey, privateKey}` keypairs, and a throw where the wrappers throw.
  *
- *  `null` means different things on the two halves and both are preserved: libsodium's
- *  wrappers throw on a failed open or a bad scalarmult, while ML-KEM's `null` is a
- *  *rejection* the caller must be able to read (a key failing FIPS 203's checks). */
+ *  A native `null` becomes the same throw libsodium wrappers use for failed open or a bad
+ *  scalar multiplication. */
 function wrapNativeSodium(N: typeof __sodium): NativeSodium {
   const u8 = (b: ArrayBuffer) => new Uint8Array(b);
   const kp = (k: { publicKey: ArrayBuffer; privateKey: ArrayBuffer }): Keypair =>
     ({ publicKey: u8(k.publicKey), privateKey: u8(k.privateKey) });
   return {
     crypto_generichash: (len: number, m: Uint8Array, key?: Uint8Array | null) => u8(N.crypto_generichash(len, m, key)),
-    crypto_stream_xchacha20_xor: (m, nonce, key) => u8(N.crypto_stream_xchacha20_xor(m, nonce, key)),
     crypto_sign_detached: (m, sk) => u8(N.crypto_sign_detached(m, sk)),
     crypto_sign_verify_detached: (sig, m, pk) => N.crypto_sign_verify_detached(sig, m, pk),
     ml_dsa65_verify_detached: (sig, m, pk) => N.ml_dsa65_verify_detached(sig, m, pk),
@@ -123,15 +117,6 @@ function wrapNativeSodium(N: typeof __sodium): NativeSodium {
     crypto_sign_keypair: () => kp(N.crypto_sign_keypair()),
     crypto_sign_seed_keypair: (seed) => kp(N.crypto_sign_seed_keypair(seed)),
     randombytes_buf: (n) => u8(N.randombytes_buf(n)),
-    ml_kem768_keypair_from_seed: (seed) => kp(N.ml_kem768_keypair_from_seed(seed)),
-    ml_kem768_encaps: (pk, coins) => {
-      const r = N.ml_kem768_encaps(pk, coins);
-      return r === null ? null : { ciphertext: u8(r.ciphertext), sharedSecret: u8(r.sharedSecret) };
-    },
-    ml_kem768_decaps: (sk, ct) => {
-      const r = N.ml_kem768_decaps(sk, ct);
-      return r === null ? null : u8(r);
-    },
   };
 }
 

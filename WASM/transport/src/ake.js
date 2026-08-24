@@ -6,6 +6,8 @@ const N_RANDOM = "node/random";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
 const N_WS = "ws";
+/** ML-KEM is bundle content, not a host primitive. */
+const N_MLKEM = "mlkem";
 
 const N_LINK_OPEN = "link/open";
 const N_LINK_SEND = "link/send";
@@ -23,7 +25,7 @@ const P_OPEN = "crypto/chacha20poly1305-ietf/open";
 const P_DH = "crypto/x25519/dh";
 
 // The X25519 base point: `dh(sk, BASEPOINT)` IS the public-key derivation, so the
-// catalog needs no keygen entry while the secret comes from node/random.
+// the residual host transform needs no keygen entry while the secret comes from node/random.
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
@@ -49,8 +51,9 @@ function reasonCode(link) {
 const SUITE_CHANNEL_CONCEALED = 0x03;
 const SUITE_LEN = 1, PK_LEN = 32, NONCE_LEN = 32, EPH_LEN = 32, SIG_LEN = 64;
 const KEY_LEN = 32, NPUB_LEN = 12, TAG_LEN = 16;
-const M1_LEN = SUITE_LEN + EPH_LEN + NONCE_LEN + TAG_LEN; //  81
-const M2_LEN = EPH_LEN + NONCE_LEN + TAG_LEN;             //  80
+const KEM_PK_LEN = 1184, KEM_SK_LEN = 2400, KEM_CT_LEN = 1088, KEM_SS_LEN = 32;
+const M1_LEN = SUITE_LEN + EPH_LEN + KEM_PK_LEN + NONCE_LEN + TAG_LEN; // 1265
+const M2_LEN = EPH_LEN + KEM_CT_LEN + NONCE_LEN + TAG_LEN;             // 1168
 const M3_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 const M4_LEN = PK_LEN + SIG_LEN + TAG_LEN;                // 112
 
@@ -131,13 +134,59 @@ async function scalarmult(sk, pk) {
   out.fill(0);
   return r[0] === 1 ? { ok: true, x: r.subarray(1) } : { ok: false, x: null };
 }
-/** An ephemeral X25519 pair: entropy from the host, the public half through the DH
- *  primitive against the base point. */
+/** An ephemeral X25519 pair: entropy from the host, the public half through the current
+ *  host transform against the base point. */
 async function boxKeypair() {
   const sk = await randomBytes(32);
   const r = await scalarmult(sk, X25519_BASEPOINT);
   if (!r.ok) throw new Error("transport: ephemeral keygen failed");
   return { publicKey: r.x, privateKey: sk };
+}
+async function kemKeypair(seed) {
+  const req = concatBytes([Uint8Array.of(0), seed]);
+  let r;
+  try {
+    r = await host.call(N_MLKEM, req);
+  } finally {
+    req.fill(0);
+    seed.fill(0);
+  }
+  if (r.length !== KEM_PK_LEN + KEM_SK_LEN) {
+    r.fill(0);
+    throw new Error("transport: ML-KEM keygen failed");
+  }
+  const pair = { publicKey: r.slice(0, KEM_PK_LEN), privateKey: r.slice(KEM_PK_LEN) };
+  r.fill(0);
+  return pair;
+}
+async function kemEncaps(pk, coins) {
+  const req = concatBytes([Uint8Array.of(1), pk, coins]);
+  let r;
+  try {
+    r = await host.call(N_MLKEM, req);
+  } finally {
+    req.fill(0);
+    coins.fill(0);
+  }
+  const result = r.length === 1 + KEM_CT_LEN + KEM_SS_LEN && r[0] === 1
+    ? { ok: true, ciphertext: r.slice(1, 1 + KEM_CT_LEN), sharedSecret: r.slice(1 + KEM_CT_LEN) }
+    : { ok: false, ciphertext: null, sharedSecret: null };
+  r.fill(0);
+  return result;
+}
+async function kemDecaps(sk, ct) {
+  const req = concatBytes([Uint8Array.of(2), sk, ct]);
+  let r;
+  try {
+    r = await host.call(N_MLKEM, req);
+  } finally {
+    req.fill(0);
+  }
+  const result = r.length === 1 + KEM_SS_LEN && r[0] === 1
+    ? { ok: true, sharedSecret: r.slice(1) }
+    : { ok: false, sharedSecret: null };
+  r.fill(0);
+  return result;
 }
 /** The channel's tagged identity-signature format — the host's slot scope, prefixed by
  *  the HOST, wraps this whole value as an opaque suffix. */
@@ -272,6 +321,8 @@ class Link {
     this.peerSaidGoodbye = false;
     this.myNonce = null;
     this.myEph = null;
+    this.myKem = null;
+    this.kemSecret = null;
     this.queue = [];
     this.queuedBytes = 0;
     this.peerEph = null;
@@ -358,9 +409,11 @@ class Link {
   }
 
   async ensureKeys() {
-    if (this.myEph) return;
-    this.myNonce = await randomBytes(NONCE_LEN);
-    this.myEph = await boxKeypair();
+    if (!this.myNonce) this.myNonce = await randomBytes(NONCE_LEN);
+    if (!this.myEph) this.myEph = await boxKeypair();
+    // Only the initiator publishes an encapsulation key. The responder creates its KEM
+    // state by encapsulating that key after the contact-secret probe has opened.
+    if (this.weDialed && !this.myKem) this.myKem = await kemKeypair(await randomBytes(64));
   }
 
   armDeadline(ms) {
@@ -584,8 +637,8 @@ class Link {
     finally { key.fill(0); }
   }
 
-  async probeKey(suiteByte, ephI) {
-    return this.kdf([], await this.h(this.root, suiteByte, ephI), LABEL_PROBE);
+  async probeKey(suiteByte, ephI, kemPkI) {
+    return this.kdf([], await this.h(this.root, suiteByte, ephI, kemPkI), LABEL_PROBE);
   }
 
   async signIdentity(th) {
@@ -615,7 +668,9 @@ class Link {
 
   async sendMsg1() {
     const eph = this.myEph.publicKey.subarray(0, EPH_LEN);
-    const w1 = concatBytes([SUITE_BYTE, eph, await this.sealZero(await this.probeKey(SUITE_BYTE, eph), this.myNonce)]);
+    const kemPk = this.myKem.publicKey;
+    const w1 = concatBytes([SUITE_BYTE, eph, kemPk,
+      await this.sealZero(await this.probeKey(SUITE_BYTE, eph, kemPk), this.myNonce)]);
     this.th = await this.h(this.root, w1);
     this.wire(w1);
   }
@@ -624,7 +679,10 @@ class Link {
     if (this.peerEph || this.weDialed || w1.length !== M1_LEN) { this.stall(); return; }
     if (w1[0] !== SUITE_CHANNEL_CONCEALED) { this.stall(); return; }
     const ephI = w1.slice(SUITE_LEN, SUITE_LEN + EPH_LEN);
-    const probe = await this.openZero(await this.probeKey(w1.slice(0, SUITE_LEN), ephI), w1.slice(SUITE_LEN + EPH_LEN));
+    const kemPkI = w1.slice(SUITE_LEN + EPH_LEN, SUITE_LEN + EPH_LEN + KEM_PK_LEN);
+    const probe = await this.openZero(
+      await this.probeKey(w1.slice(0, SUITE_LEN), ephI, kemPkI),
+      w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN));
     if (!probe.ok) { this.stall(); return; }
     // Proved: move off the contended budget before the expensive work.
     if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stall(); return; }
@@ -632,13 +690,17 @@ class Link {
     await this.ensureKeys();
     const dh = await scalarmult(this.myEph.privateKey, ephI);
     if (!dh.ok) { this.stall(); return; }
+    const kem = await kemEncaps(kemPkI, await randomBytes(32));
+    if (!kem.ok) { this.stall(); return; }
     this.ee = dh.x;
+    this.kemSecret = kem.sharedSecret;
     this.peerEph = ephI;
 
     const h1 = await this.h(this.root, w1);
     const w2 = concatBytes([
       this.myEph.publicKey.subarray(0, EPH_LEN),
-      await this.sealZero(await this.kdf([this.ee], h1, LABEL_M2), this.myNonce),
+      kem.ciphertext,
+      await this.sealZero(await this.kdf([this.ee, this.kemSecret], h1, LABEL_M2), this.myNonce),
     ]);
     this.th = await this.h(h1, w2);
     this.wire(w2);
@@ -647,23 +709,28 @@ class Link {
   async onMsg2(w2) {
     if (this.authed || this.peerEph || !this.th || w2.length !== M2_LEN) { this.stall(); return; }
     const ephR = w2.slice(0, EPH_LEN);
+    const kemCt = w2.slice(EPH_LEN, EPH_LEN + KEM_CT_LEN);
     const dh = await scalarmult(this.myEph.privateKey, ephR);
     if (!dh.ok) { this.stall(); return; }
-    const r = await this.openZero(await this.kdf([dh.x], this.th, LABEL_M2), w2.slice(EPH_LEN));
+    const kem = await kemDecaps(this.myKem.privateKey, kemCt);
+    if (!kem.ok) { this.stall(); return; }
+    const r = await this.openZero(
+      await this.kdf([dh.x, kem.sharedSecret], this.th, LABEL_M2),
+      w2.slice(EPH_LEN + KEM_CT_LEN));
     if (!r.ok) { this.stall(); return; }
-    this.ee = dh.x; this.peerEph = ephR;
+    this.ee = dh.x; this.kemSecret = kem.sharedSecret; this.peerEph = ephR;
 
     const h2 = await this.h(this.th, w2);
     const si = await this.signIdentity(h2);
     if (!si) return;
-    const w3 = await this.sealZero(await this.kdf([this.ee], h2, LABEL_M3), concatBytes([si.id, si.sig]));
+    const w3 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h2, LABEL_M3), concatBytes([si.id, si.sig]));
     this.th = await this.h(h2, w3);
     this.wire(w3);
   }
 
   async onMsg3(w3) {
     if (this.authed || !this.peerEph || !this.th || !this.ee || w3.length !== M3_LEN) { this.stall(); return; }
-    const idI = await this.openIdentity(await this.kdf([this.ee], this.th, LABEL_M3), w3, this.th);
+    const idI = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M3), w3, this.th);
     if (!idI) { this.stall(); return; }
     const peerId = toHex(idI);
     // The peer lint runs HERE: after decryption and signature, never on a claimed key,
@@ -675,7 +742,7 @@ class Link {
     const h3 = await this.h(this.th, w3);
     const si = await this.signIdentity(h3);
     if (!si) return;
-    const w4 = await this.sealZero(await this.kdf([this.ee], h3, LABEL_M4), concatBytes([si.id, si.sig]));
+    const w4 = await this.sealZero(await this.kdf([this.ee, this.kemSecret], h3, LABEL_M4), concatBytes([si.id, si.sig]));
     this.th = await this.h(h3, w4);
     try { await this.deriveConcealedSession(); } catch { this.stall(); return; }
     this.wire(w4);
@@ -684,7 +751,7 @@ class Link {
 
   async onMsg4(w4) {
     if (this.authed || !this.peerEph || !this.th || !this.ee || w4.length !== M4_LEN) { this.stall(); return; }
-    const idR = await this.openIdentity(await this.kdf([this.ee], this.th, LABEL_M4), w4, this.th);
+    const idR = await this.openIdentity(await this.kdf([this.ee, this.kemSecret], this.th, LABEL_M4), w4, this.th);
     if (!idR) { this.stall(); return; }
     const peerId = toHex(idR);
     // A mismatch here is a local fault, not a probe to hide from — we already revealed
@@ -700,8 +767,8 @@ class Link {
   }
 
   async deriveConcealedSession() {
-    const kI2R = await this.kdf([this.ee], this.th, LABEL_I2R);
-    const kR2I = await this.kdf([this.ee], this.th, LABEL_R2I);
+    const kI2R = await this.kdf([this.ee, this.kemSecret], this.th, LABEL_I2R);
+    const kR2I = await this.kdf([this.ee, this.kemSecret], this.th, LABEL_R2I);
     this.sendKey = this.weDialed ? kI2R : kR2I;
     this.recvKey = this.weDialed ? kR2I : kI2R;
     // Every input that produced the session can now only be used to RE-derive it — the
@@ -717,8 +784,13 @@ class Link {
       this.myEph.privateKey.fill(0); // the secret half only — the public one was on the wire
       this.myEph = null;
     }
+    if (this.myKem) {
+      this.myKem.privateKey.fill(0);
+      this.myKem = null;
+    }
     if (this.myNonce) { this.myNonce.fill(0); this.myNonce = null; }
     if (this.ee) { this.ee.fill(0); this.ee = null; }
+    if (this.kemSecret) { this.kemSecret.fill(0); this.kemSecret = null; }
   }
 
   // A 12-byte nonce from the implicit (epoch, counter) pair — never transmitted.

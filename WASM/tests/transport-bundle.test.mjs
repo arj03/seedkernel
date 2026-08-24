@@ -62,12 +62,13 @@ assert(derivedTransportAuthor === transportAuthor,
 function transportBundleAt(version, keys, guestSource) {
   const guest = guestSource ?? readGuestSource();
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
+  const mlkemWasm = new Uint8Array(readFileSync(join(root, "browser/mlkem768.wasm")));
   const { blob } = authorBundle(sodium, keys, {
     app: "transport", version,
     // The local service id the transport claims (§12.10) — mirror of the artifact
     // manifest. A `services` claim, reachable by a co-resident guest and by no peer.
     services: [TRANSPORT_SERVICE],
-    modules: [{ name: "ws", wasm: wsWasm }],
+    modules: [{ name: "ws", wasm: wsWasm }, { name: "mlkem", wasm: mlkemWasm }],
     guestSource: guest,
     // Exactly the services the transport guest holds — a mirror of the artifact manifest
     // (scripts/build-transport-bundle.mjs). `link` is what carries the `link` privilege

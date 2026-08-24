@@ -139,11 +139,10 @@ for (const { file, re } of inlineChecks) {
 }
 
 // Prose figures (not cells): matched on the words either side, so the number is the only
-// thing rewritten. The shared total is one claim stated twice — both are checked — and
-// the guest figure is summed from guest-source.mjs.
+// thing rewritten. The shared total lives in the heading; the guest figure is summed
+// from guest-source.mjs.
 const proseFigures = [
     ["shared total (heading)", /(all three targets \()[\d,]+( LOC\))/, sharedTotal],
-    ["shared total (prose)", /(therefore runs )[\d,]+( shared lines)/, sharedTotal],
     ["transport/src/*.js", /(transport bundle — )[\d,]+( lines of `transport\/src\/\*\.js`)/,
      sum(guestSourcePaths())],
 ];

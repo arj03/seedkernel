@@ -16,7 +16,7 @@ import { type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
- *  (BundleCrypto) plus the guest seam's crypto ops (SeamCrypto). Any sumo libsodium
+ *  (BundleCrypto) plus the remaining guest crypto ops (SeamCrypto). Core libsodium
  *  build satisfies both. */
 export type ShellSodium = BundleCrypto & SeamCrypto;
 
@@ -764,7 +764,7 @@ function createShell(opts: CreateShellOptions & {
 /** JS-target assembly options (§12.9). Every field but `sodium` and `identity`
  *  has a default; the pin and load order are part of standing a node up. */
 export interface BootShellOptions {
-    /** The crypto surface the shell needs — sumo libsodium with the ML-DSA-65 verifier
+    /** The crypto surface the shell needs — core libsodium with the ML-DSA-65 verifier
      *  mixed in (the one thing no target can default: main.ts loads it, a browser page
      *  readies it). */
     sodium: ShellSodium;

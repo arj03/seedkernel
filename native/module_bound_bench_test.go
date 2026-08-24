@@ -3,7 +3,7 @@ package main
 // module_bound_bench_test.go — what the §4.3 module-call bound COSTS, which is what
 // decided it should be a default (SECURITY §14.1). Arming a runtime compiles a termination
 // check into every loop of every module on it, and this prices that check on real
-// module-shaped wasm: libsodium's XChaCha20 and Ed25519, and — opt-in — seedstore's
+// module-shaped wasm: libsodium's Ed25519 and — opt-in — seedstore's
 // Reed–Solomon codec, an installed app module and so the code the bound exists to stop.
 //
 //	go test -run x -bench BenchmarkBound -benchtime 2s -count 5 ./...
@@ -37,22 +37,6 @@ func boundRuntime(b *testing.B, armed bool) wazero.Runtime {
 	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().WithCloseOnContextDone(armed))
 	b.Cleanup(func() { rt.Close(context.Background()) })
 	return rt
-}
-
-func BenchmarkBoundXChaCha20_640K(b *testing.B) {
-	data := bytes.Repeat([]byte{0x11}, 640*1024)
-	key := bytes.Repeat([]byte{0x42}, 32)
-	nonce := bytes.Repeat([]byte{0x24}, 24)
-	for _, c := range boundConfigs {
-		b.Run(c.name, func(b *testing.B) {
-			s := bootSodium(boundRuntime(b, c.armed))
-			b.SetBytes(int64(len(data)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_ = s.streamXor(data, nonce, key)
-			}
-		})
-	}
 }
 
 func BenchmarkBoundEd25519Verify(b *testing.B) {

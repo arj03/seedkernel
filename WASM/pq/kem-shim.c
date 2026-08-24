@@ -1,19 +1,17 @@
 /*
  * kem-shim.c — the entire seedkernel-specific surface of mlkem768.wasm.
  *
- * Three exports over mlkem-native's derandomized core API, in the shape the
- * runtime's crypto seam already speaks: raw byte pointers into linear memory, no
- * key objects, no formats, no allocation. Every buffer is caller-owned and its
- * length is a format constant of the parameter set, so there is nothing here to get
- * wrong at runtime.
+ * Three low-level exports over mlkem-native's derandomized core API, plus the generic
+ * seedkernel pure-module `scratch`/`handle` ABI. The latter is what lets a signed bundle
+ * carry this implementation as one of its own modules instead of growing the host's
+ * guest vocabulary.
  *
  * Randomness is an *argument*, never a syscall — the same rule shim.c states for
  * ML-DSA, and here it does double duty. It keeps the module import-free, so one
  * artifact instantiates identically under Node, under a browser, and under wazero
  * in the Go host with no per-target glue to disagree about (§12.9). And it is what
- * lets the KEM enter the primitive catalog at all: a catalog entry is a pure
- * function of its argument bytes (guest-seam.ts), so the coins come from `RANDOM`
- * — an authority the guest already holds — rather than from inside the primitive.
+ * lets the KEM remain a pure module: coins come from `node/random` — an authority the
+ * guest already holds — and are explicit module input.
  *
  * There is no `check_pk` / `check_sk` export. FIPS 203's modulus and hash checks
  * are not optional extras a caller might skip: enc_derand and dec run them
@@ -88,3 +86,91 @@ EXPORT int mlkem768_secretkeybytes(void) { return MLKEM768_SECRETKEYBYTES; }
 EXPORT int mlkem768_ciphertextbytes(void) { return MLKEM768_CIPHERTEXTBYTES; }
 EXPORT int mlkem768_bytes(void) { return MLKEM768_BYTES; }
 EXPORT int mlkem768_symbytes(void) { return MLKEM768_SYMBYTES; }
+
+/* Bundle-module ABI -------------------------------------------------------
+ *
+ * Request/response formats (the first byte is an operation tag):
+ *   0 [seed 64]              -> [pk 1184][sk 2400]
+ *   1 [pk 1184][coins 32]    -> [ok 1][ct 1088][ss 32]
+ *   2 [sk 2400][ct 1088]     -> [ok 1][ss 32]
+ *
+ * Inputs are copied out of scratch before the primitive runs, so output may safely
+ * replace the request even when the upstream implementation does not permit overlap.
+ * The generic module loaders require at least their 64 KiB default scratch window. */
+#define MODULE_SCRATCH_BYTES 65536
+#define OP_KEYPAIR 0
+#define OP_ENCAPS 1
+#define OP_DECAPS 2
+
+EXPORT uint8_t scratch[MODULE_SCRATCH_BYTES];
+
+static uint8_t kem_pk[MLKEM768_PUBLICKEYBYTES];
+static uint8_t kem_sk[MLKEM768_SECRETKEYBYTES];
+static uint8_t kem_ct[MLKEM768_CIPHERTEXTBYTES];
+static uint8_t kem_ss[MLKEM768_BYTES];
+static uint8_t kem_coins[2 * MLKEM768_SYMBYTES];
+
+/* Keep secret-bearing temporaries from surviving the call or being optimized away. */
+static void wipe(void *ptr, size_t n)
+{
+  volatile uint8_t *p = (volatile uint8_t *)ptr;
+  while (n--) *p++ = 0;
+}
+
+EXPORT int handle(int input_len)
+{
+  if (input_len == 1 + 2 * MLKEM768_SYMBYTES && scratch[0] == OP_KEYPAIR)
+  {
+    memcpy(kem_coins, scratch + 1, 2 * MLKEM768_SYMBYTES);
+    if (!mlkem768_keypair(kem_pk, kem_sk, kem_coins))
+    {
+      wipe(kem_coins, sizeof(kem_coins));
+      wipe(kem_sk, sizeof(kem_sk));
+      return 0;
+    }
+    memcpy(scratch, kem_pk, MLKEM768_PUBLICKEYBYTES);
+    memcpy(scratch + MLKEM768_PUBLICKEYBYTES, kem_sk, MLKEM768_SECRETKEYBYTES);
+    wipe(kem_coins, sizeof(kem_coins));
+    wipe(kem_sk, sizeof(kem_sk));
+    return MLKEM768_PUBLICKEYBYTES + MLKEM768_SECRETKEYBYTES;
+  }
+
+  if (input_len == 1 + MLKEM768_PUBLICKEYBYTES + MLKEM768_SYMBYTES && scratch[0] == OP_ENCAPS)
+  {
+    memcpy(kem_pk, scratch + 1, MLKEM768_PUBLICKEYBYTES);
+    memcpy(kem_coins, scratch + 1 + MLKEM768_PUBLICKEYBYTES, MLKEM768_SYMBYTES);
+    if (!mlkem768_encaps(kem_ct, kem_ss, kem_pk, kem_coins))
+    {
+      scratch[0] = 0;
+      wipe(kem_coins, sizeof(kem_coins));
+      wipe(kem_ss, sizeof(kem_ss));
+      return 1;
+    }
+    scratch[0] = 1;
+    memcpy(scratch + 1, kem_ct, MLKEM768_CIPHERTEXTBYTES);
+    memcpy(scratch + 1 + MLKEM768_CIPHERTEXTBYTES, kem_ss, MLKEM768_BYTES);
+    wipe(kem_coins, sizeof(kem_coins));
+    wipe(kem_ss, sizeof(kem_ss));
+    return 1 + MLKEM768_CIPHERTEXTBYTES + MLKEM768_BYTES;
+  }
+
+  if (input_len == 1 + MLKEM768_SECRETKEYBYTES + MLKEM768_CIPHERTEXTBYTES && scratch[0] == OP_DECAPS)
+  {
+    memcpy(kem_sk, scratch + 1, MLKEM768_SECRETKEYBYTES);
+    memcpy(kem_ct, scratch + 1 + MLKEM768_SECRETKEYBYTES, MLKEM768_CIPHERTEXTBYTES);
+    if (!mlkem768_decaps(kem_ss, kem_ct, kem_sk))
+    {
+      scratch[0] = 0;
+      wipe(kem_sk, sizeof(kem_sk));
+      wipe(kem_ss, sizeof(kem_ss));
+      return 1;
+    }
+    scratch[0] = 1;
+    memcpy(scratch + 1, kem_ss, MLKEM768_BYTES);
+    wipe(kem_sk, sizeof(kem_sk));
+    wipe(kem_ss, sizeof(kem_ss));
+    return 1 + MLKEM768_BYTES;
+  }
+
+  return 0;
+}

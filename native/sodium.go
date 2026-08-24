@@ -64,31 +64,30 @@ var sd *libsodium // the process-wide libsodium instance (genesis verify + sodiu
 
 // real libsodium name → minified wasm export, for the pinned browser/libsodium.wasm.
 var sodiumExports = map[string]string{
-	"malloc":                               "lm",
-	"free":                                 "mm",
-	"sodium_init":                          "Uj",
-	"crypto_generichash":                   "kc",
-	"crypto_stream_xchacha20_xor":          "jm",
-	"crypto_sign_detached":                 "Nh",
-	"crypto_sign_verify_detached":          "Oh",
-	"crypto_sign_keypair":                  "Kh",
-	"crypto_sign_seed_keypair":             "Jh",
-	"crypto_sign_ed25519_pk_to_curve25519": "fi",
-	"crypto_sign_ed25519_sk_to_curve25519": "gi",
-	"crypto_box_seal":                      "gb",
-	"crypto_box_seal_open":                 "hb",
+	"malloc":                               "Ee",
+	"free":                                 "Fe",
+	"sodium_init":                          "xe",
+	"crypto_generichash":                   "Ja",
+	"crypto_sign_detached":                 "wd",
+	"crypto_sign_verify_detached":          "xd",
+	"crypto_sign_keypair":                  "td",
+	"crypto_sign_seed_keypair":             "sd",
+	"crypto_sign_ed25519_pk_to_curve25519": "Cd",
+	"crypto_sign_ed25519_sk_to_curve25519": "Dd",
+	"crypto_box_seal":                      "za",
+	"crypto_box_seal_open":                 "Aa",
 	// One export covers the §12.6 AKE's X25519: the transport bundle reaches scalarmult
 	// through the guest seam's `x25519/dh` and derives its ephemeral PUBLIC key with the
 	// same entry against the base point — no keypair primitive to export.
-	"crypto_scalarmult": "Dg",
+	"crypto_scalarmult": "Jc",
 }
 
 // EM_JS entropy snippet code addresses (libsodium-core.mjs `d={…}`): randombytes routes
 // through the asm-const import `a.b`, and these are the only two snippets in this build,
 // satisfied from crypto/rand (the source need not match across nodes).
 const (
-	sodiumRandU32  = 40712 // ()->u32: one random word
-	sodiumRandInit = 40748 // ()->void: lazy RNG init (a no-op here)
+	sodiumRandU32  = 40216 // ()->u32: one random word
+	sodiumRandInit = 40252 // ()->void: lazy RNG init (a no-op here)
 )
 
 const sealBytes = 48 // crypto_box_SEALBYTES (ephemeral pk 32 + MAC 16)
@@ -257,17 +256,6 @@ func (s *libsodium) genericHash(outLen int, msg []byte) []byte {
 	return h.Sum(nil)
 }
 
-func (s *libsodium) streamXor(msg, nonce, key []byte) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(msg)) + alignUp(len(nonce)) + alignUp(len(key)) + alignUp(len(msg)))
-	in, np, kp := s.takeIn(msg), s.takeIn(nonce), s.takeIn(key)
-	out := s.take(len(msg))
-	lo, hi := lenArgs(len(msg))
-	s.mustCall("crypto_stream_xchacha20_xor", uint64(out), uint64(in), lo, hi, uint64(np), uint64(kp))
-	return s.read(out, len(msg))
-}
-
 func (s *libsodium) signDetached(msg, sk []byte) []byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -432,9 +420,6 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		}
 		return bytesAB(t, s.genericHash(int(t.Args()[0].Int32()), argBytes(t, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_stream_xchacha20_xor", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return bytesAB(t, s.streamXor(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
-	}))
 	o.SetPropertyStr("crypto_sign_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
 		return bytesAB(t, s.signDetached(argBytes(t, 0), argBytes(t, 1))), nil
 	}))
@@ -471,11 +456,9 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		crand.Read(b)
 		return bytesAB(t, b), nil
 	}))
-	// The PQ half of the manifest suite (mldsa.go) and the catalog's KEM (mlkem.go) hang
-	// off the same object: the shared loader's crypto surface is one `sodium`, and it
-	// feature-detects suite 0x02 by the presence of the ML-DSA method.
+	// The PQ half of the manifest suite hangs off the same object. It is part of the host
+	// trust root because it verifies the bundles that deliver everything else.
 	exposeMlDsa(qc, o, md)
-	exposeMlKem(qc, o, mk)
 	qc.Global().SetPropertyStr("__sodium", o)
 }
 

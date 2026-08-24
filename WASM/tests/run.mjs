@@ -21,7 +21,7 @@ const { bootNodeShell } = await imp("build/host/shell-node.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
 
 // The host's already-readied instance rather than our own copy:
-// libsodium-wrappers-sumo declares separate "import" and "require" conditions pointing at
+// libsodium-wrappers declares separate "import" and "require" conditions pointing at
 // different builds, so a require() here returns a SECOND instance with its own wasm heap
 // that nothing awaits .ready on. One shared instance is the rule (§12.1).
 const sodium = await loadCrypto();
@@ -47,7 +47,6 @@ const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMark
   = await imp("build/host/bundle.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
-const { withMlKem768, loadMlKem768 } = await imp("build/host/kem.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -173,9 +172,6 @@ const forwarderBytes = new Uint8Array(readFileSync(join(root, "build/forwarder.w
 // ML-DSA-65 onto the test instance exactly as a target does at its crypto seam — the
 // hybrid manifest suite is "a sodium that knows this method" (§12.4).
 withMlDsa65(sodium, await loadMlDsa65(readFileSync(join(root, "browser/mldsa65.wasm"))));
-// And ML-KEM-768, the catalog primitive the same seam mixes in: a manifest is checked
-// against PRIMITIVE_NAMES, so those methods must be on the object handed to the seam.
-withMlKem768(sodium, await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm"))));
 
 // Install one verified module as the whole of `appKey`'s module set. Async: a bind stands
 // each module up in its own worker and returns when it has loaded.
@@ -711,7 +707,7 @@ async function testFsKeyRule() {
 // seam's single-peer cross-realm call, concurrently, so the round trips overlap in one realm.
 
 async function testGuestSeam() {
-  console.log("Test: guest seam — generic primitive capabilities, no app vocabulary (step 7)");
+  console.log("Test: guest seam — host transforms, authorities and private modules (step 7)");
 
   const id = generateKeyPair();
   const otherKey = generateKeyPair();
@@ -755,9 +751,6 @@ async function testGuestSeam() {
     const prim = (name, argBytes) => seam(`crypto/${name}`, argBytes);
     const msg = U(1, 2, 3, 4, 5);
     assert(bytesEqual(await prim("blake2b-256", msg), sodium.crypto_generichash(32, msg)), "crypto/blake2b-256, by name");
-    const key = sodium.randombytes_buf(32), nonce = sodium.randombytes_buf(24);
-    assert(bytesEqual(await prim("xchacha20/xor", concatBytes([nonce, key, msg])),
-      sodium.crypto_stream_xchacha20_xor(msg, nonce, key)), "crypto/xchacha20/xor, by name");
     // node/sign is scoped, never raw (§12.2): it signs DOMAIN_guest ‖ scope ‖ msg.
     // node/verify applies the SAME scope host-side, so a guest checks a signature by
     // naming the key, never by reconstructing the prefix the host owns.
@@ -779,39 +772,11 @@ async function testGuestSeam() {
     assert(verifyThrew, "node/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
     assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "crypto/ed25519/verify accepts the scoped preimage — the raw primitive node/verify wraps");
     assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "crypto/ed25519/verify rejects a forged message");
-    // ML-KEM-768 is in the catalog ahead of any caller, so what is checked here is that
-    // it is REACHABLE like every other primitive: by name, with no capability declared.
-    // Derandomized, so the coins come from node/random and the entry stays pure.
-    {
-      const seed = await seam("node/random", U(0, 0, 0, 64));
-      const kp = await prim("ml-kem-768/keypair", seed);
-      assertEqual(kp.length, 1184 + 2400, "crypto/ml-kem-768/keypair returns [pk 1184][sk 2400]");
-      const kemPk = kp.slice(0, 1184), kemSk = kp.slice(1184);
-      const coins = await seam("node/random", U(0, 0, 0, 32));
-      const enc = await prim("ml-kem-768/encaps", concatBytes([kemPk, coins]));
-      assertEqual(enc[0], 1, "crypto/ml-kem-768/encaps accepts a well-formed encapsulation key");
-      assertEqual(enc.length, 1 + 1088 + 32, "encaps returns [ok][ct 1088][ss 32]");
-      const ct = enc.slice(1, 1 + 1088), ss = enc.slice(1 + 1088);
-      const dec = await prim("ml-kem-768/decaps", concatBytes([kemSk, ct]));
-      assertEqual(dec[0], 1, "crypto/ml-kem-768/decaps accepts a well-formed decapsulation key");
-      assert(bytesEqual(dec.slice(1), ss), "both ends derive the same shared secret");
-      // Encapsulation is deterministic in its coins — that is what makes it a catalog
-      // entry rather than an authority.
-      const again = await prim("ml-kem-768/encaps", concatBytes([kemPk, coins]));
-      assert(bytesEqual(again, enc), "encaps is a pure function of (key, coins)");
-      // A malformed peer key is an answer, not a throw: the caller did not choose it.
-      // 12-bit little-endian packing: 0xff,0xff decodes to 4095, out of [0, q-1].
-      const badPk = kemPk.slice(); badPk[0] = 0xff; badPk[1] = 0xff;
-      assertEqual((await prim("ml-kem-768/encaps", concatBytes([badPk, coins]))).length, 1,
-        "a key failing the FIPS 203 modulus check answers [0], not an exception");
-      // A tampered ciphertext is NOT an error — implicit rejection returns a different
-      // shared secret in constant time, and saying so would be the oracle.
-      const badCt = ct.slice(); badCt[0] ^= 1;
-      const implicit = await prim("ml-kem-768/decaps", concatBytes([kemSk, badCt]));
-      assertEqual(implicit[0], 1, "a bad ciphertext still succeeds — ML-KEM rejects implicitly");
-      assert(!bytesEqual(implicit.slice(1), ss), "…but derives an unrelated shared secret");
+    for (const removed of ["xchacha20/xor", "ml-kem-768/keypair", "ml-kem-768/encaps", "ml-kem-768/decaps"]) {
+      let refused = false;
+      try { await prim(removed, new Uint8Array(0)); } catch { refused = true; }
+      assert(refused, `crypto/${removed} is not host vocabulary — pure transforms ship in their consumer's bundle`);
     }
-
     assert(bytesEqual(await seam("node/identity", U()), id.publicKey), "node/identity = the node pubkey");
     assertEqual((await seam("node/random", U(0, 0, 0, 16))).length, 16, "node/random returns n bytes");
     assertEqual((await seam("clock/now", U())).length, 8, "clock/now returns a u64");
@@ -1713,7 +1678,7 @@ async function testSeamGating() {
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
 
-  // A PRIMITIVE is exempt from the gate by a rule about one prefix: `crypto/` reaches
+  // A residual HOST TRANSFORM is exempt from the gate by rule: `crypto/` reaches
   // nothing, so there is nothing to grant. A seam built for a bundle declaring NO
   // names still hashes.
   const clockOnly = mk(["clock"]);
@@ -2191,7 +2156,7 @@ async function testMlDsaAcvpVectors() {
 // rather than falling back.
 // ─── Test: ML-KEM-768 against NIST's own vectors (ACVP known-answer test) ────────
 //
-// testMlDsaAcvpVectors' argument, applied to the catalog's KEM: NIST's published ACVP
+// testMlDsaAcvpVectors' argument, applied to the transport's own module: NIST's published ACVP
 // vectors for ML-KEM-768 (FIPS 203) — fixed coins with the key, ciphertext and shared
 // secret that must come out of them byte for byte.
 //
@@ -2202,50 +2167,55 @@ async function testMlKemAcvpVectors() {
   console.log("Test: ML-KEM-768 ACVP known-answer vectors (FIPS 203)");
   const kat = JSON.parse(readFileSync(join(root, "tests/fixtures/mlkem768-acvp.json"), "utf8"));
   const hex = (h) => Uint8Array.from(Buffer.from(h, "hex"));
-  const kem = await loadMlKem768(readFileSync(join(root, "browser/mlkem768.wasm")));
+  const kem = await new JsModuleLoader().build([{
+    name: "mlkem",
+    wasm: readFileSync(join(root, "browser/mlkem768.wasm")),
+  }]);
+  const call = async (...parts) => {
+    const r = await kem.call("mlkem", concatBytes(parts));
+    return r.bytes ?? new Uint8Array(0);
+  };
 
   let checked = 0;
   for (const t of kat.keyGen) {
-    const kp = kem.ml_kem768_keypair_from_seed(hex(t.d + t.z));
-    assertEqual(toHex(kp.publicKey), t.ek, `ACVP keyGen tc${t.tcId} encapsulation key is byte-exact`);
-    assertEqual(toHex(kp.privateKey), t.dk, `ACVP keyGen tc${t.tcId} decapsulation key is byte-exact`);
+    const kp = await call(Uint8Array.of(0), hex(t.d + t.z));
+    assertEqual(toHex(kp.slice(0, 1184)), t.ek, `ACVP keyGen tc${t.tcId} encapsulation key is byte-exact`);
+    assertEqual(toHex(kp.slice(1184)), t.dk, `ACVP keyGen tc${t.tcId} decapsulation key is byte-exact`);
     checked++;
   }
   for (const t of kat.encaps) {
-    const r = kem.ml_kem768_encaps(hex(t.ek), hex(t.m));
-    assert(r !== null, `ACVP encaps tc${t.tcId} accepts the vector's key`);
-    assertEqual(toHex(r.ciphertext), t.c, `ACVP encaps tc${t.tcId} ciphertext is byte-exact`);
-    assertEqual(toHex(r.sharedSecret), t.k, `ACVP encaps tc${t.tcId} shared secret is byte-exact`);
+    const r = await call(Uint8Array.of(1), hex(t.ek), hex(t.m));
+    assertEqual(r[0], 1, `ACVP encaps tc${t.tcId} accepts the vector's key`);
+    assertEqual(toHex(r.slice(1, 1 + 1088)), t.c, `ACVP encaps tc${t.tcId} ciphertext is byte-exact`);
+    assertEqual(toHex(r.slice(1 + 1088)), t.k, `ACVP encaps tc${t.tcId} shared secret is byte-exact`);
     checked++;
   }
   for (const t of kat.decaps) {
-    const ss = kem.ml_kem768_decaps(hex(t.dk), hex(t.c));
-    assert(ss !== null, `ACVP decaps tc${t.tcId} accepts the vector's key`);
+    const r = await call(Uint8Array.of(2), hex(t.dk), hex(t.c));
+    assertEqual(r[0], 1, `ACVP decaps tc${t.tcId} accepts the vector's key`);
     // Both "valid decapsulation" and "modified ciphertext" cases run through here and
     // both must match: the modified ones are implicit rejection, which has one right
     // answer, not an error.
-    assertEqual(toHex(ss), t.k, `ACVP decaps tc${t.tcId} shared secret is byte-exact (${t.reason})`);
+    assertEqual(toHex(r.slice(1)), t.k, `ACVP decaps tc${t.tcId} shared secret is byte-exact (${t.reason})`);
     checked++;
   }
   for (const t of kat.encapsKeyCheck) {
-    const r = kem.ml_kem768_encaps(hex(t.ek), new Uint8Array(32));
-    assertEqual(r !== null, t.pass, `ACVP encapsulationKeyCheck tc${t.tcId} (${t.reason})`);
+    const r = await call(Uint8Array.of(1), hex(t.ek), new Uint8Array(32));
+    assertEqual(r[0] === 1, t.pass, `ACVP encapsulationKeyCheck tc${t.tcId} (${t.reason})`);
     checked++;
   }
   for (const t of kat.decapsKeyCheck) {
-    const ss = kem.ml_kem768_decaps(hex(t.dk), new Uint8Array(1088));
-    assertEqual(ss !== null, t.pass, `ACVP decapsulationKeyCheck tc${t.tcId} (${t.reason})`);
+    const r = await call(Uint8Array.of(2), hex(t.dk), new Uint8Array(1088));
+    assertEqual(r[0] === 1, t.pass, `ACVP decapsulationKeyCheck tc${t.tcId} (${t.reason})`);
     checked++;
   }
 
-  // Wrong-width arguments are the same rejection as a malformed key, never a throw: the
-  // seam turns `null` into a leading zero byte, and there is no second channel for a
-  // structural failure to come back through.
-  assertEqual(kem.ml_kem768_encaps(new Uint8Array(10), new Uint8Array(32)), null,
-    "a wrong-width encapsulation key is null, not a throw");
-  assertEqual(kem.ml_kem768_decaps(new Uint8Array(10), new Uint8Array(1088)), null,
-    "a wrong-width decapsulation key is null, not a throw");
+  assertEqual((await call(Uint8Array.of(1), new Uint8Array(10), new Uint8Array(32))).length, 0,
+    "a wrong-width encapsulation request is an empty module answer");
+  assertEqual((await call(Uint8Array.of(2), new Uint8Array(10), new Uint8Array(1088))).length, 0,
+    "a wrong-width decapsulation request is an empty module answer");
 
+  kem.dispose();
   console.log(`  OK (${checked} NIST vectors)\n`);
 }
 

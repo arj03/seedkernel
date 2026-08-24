@@ -377,22 +377,20 @@ distinction.
 
 ## 11. The post-quantum landing (suite `0x03`)
 
-**The primitive is already there.** `ml-kem-768/{keypair,encaps,decaps}` are in the host's
-primitive catalog (`PRIMITIVE_NAMES`, §12.2), provisioned ahead of any caller because a
-bundle is replaceable and the vocabulary it draws on is not. So `0x03` is a signed transport
-bundle and one policy entry — no host rebuild on three targets, which is what the ordering
-argument in §14.1 was protecting against.
+**The KEM is bundle content.** `mlkem768.wasm` is the transport bundle's own import-free
+pure module, reached under the bare name `mlkem` through the same private module map as
+`ws.wasm`. It adds no host transform name, native KEM bridge or separately embedded host
+artifact. The generic module ABI is pinned to 40 NIST ACVP cases.
 
-**Already prepared for.** The message widths are derived in one place from named field
-lengths (`M1_LEN`…`M4_LEN`, `transport/src/ake.js`), so `0x03` changes those constants and
-nothing else reads them — the host never sees a handshake width. The key schedule takes a
+The message widths are derived in one place from named field
+lengths (`M1_LEN`…`M4_LEN`, `transport/src/ake.js`); the host never sees a handshake width. The key schedule takes a
 *list* of shared secrets, so a KEM secret joins it rather than displacing anything. And
 because the handshake publishes no long-term DH key, **a KEM never enters an address** —
 addresses stay `pk[.secret]@host:port` across the migration, which is the part that would
 otherwise have hurt.
 
-**What changes, and it is not a flight.** msg1 gains the initiator's ML-KEM-768
-encapsulation key and msg2 the responder's ciphertext: 81 → ~1.3 KB and 80 → ~1.3 KB.
+Msg1 carries the initiator's ML-KEM-768 encapsulation key and msg2 the responder's
+ciphertext: exactly 1,265 and 1,168 bytes.
 Session keys derive from the X25519 and KEM secrets both — hybrid, so the classical half
 stays load-bearing while the PQ half is young. The worry that hybrid costs a round trip
 belongs to a symmetric two-message layout; this one has four messages with explicit roles,
@@ -401,31 +399,21 @@ its own. Still four messages, still 1.5 RTT to the responder's authentication an
 initiator's, one encapsulation and one decapsulation per link.
 
 **Where the KEM secret enters is the part that is quiet when wrong.** It is appended to the
-schedule's ordered list, never XOR-ed into `ee` and never substituted for it, which is what
-keeps the classical half load-bearing; the transcript binds it with no new rule, since `h1`
-chains msg1 and each later `h` chains the next message — and binding the *ciphertext* rather
-than only the encapsulation key is what preserves the guarantee under re-encapsulation, which
-the TLS hybrid work and X-Wing are explicit about. The failure to avoid: mixing it into the
-directional session keys while leaving the seal keys `k3`/`k4` on `ee ‖ contact` alone would
-leave the *identities* — the thing this suite conceals — protected by X25519 only, so a
-recorded handshake still deanonymises both ends later. The PQ secret must enter at the first
-key derived after decapsulation.
+schedule's ordered list, never XOR-ed into `ee` and never substituted for it. Msg2's seal
+key is the first key available to both endpoints after encapsulation/decapsulation, and it
+already derives from `[ee, kemSecret]`; msg3, msg4 and both session directions inherit the
+same pair. The transcript chains complete messages, binding both the encapsulation key and
+ciphertext.
 
 **What must not change.** The transcript chain, the signature preimages, the contact-secret
 and network-key mixes, the silence discipline, the address format, the record layer, and the
 invariant that the bytes a node sends are the bytes it folds into the transcript.
 
-**The DoS interaction.** A refused connection is held to its deadline, and msg1 grows ~16×,
-all of it sent before either end has authenticated. The cap that would have blocked this has
-already moved: `MAX_HANDSHAKE_FRAME_BYTES` was sized at 512 bytes, under which a `0x03` msg1
-would not have fitted — the socket seam refusing the message the primitive catalog had just
-made expressible, a core rev standing in the way of a change that is supposed to be content.
-At 8 KiB it clears the PQ widths with room and still bounds a stranger to 8 MiB across the
+**The DoS interaction.** A refused connection is held to its deadline, and msg1 is 1,265
+bytes before either end has authenticated. `MAX_HANDSHAKE_FRAME_BYTES` is 8 KiB, clearing
+both PQ widths with room while bounding a stranger to 8 MiB across the
 1,024 unverified budget. `MAX_QUEUE_BYTES` is unaffected: it bounds queued application
 frames, not the handshake. What does change is the memory a stranger holds for
 `UNVERIFIED_TIMEOUT_MS`, and — on any datagram path — that msg1 stops fitting one common-case
-MTU. `tests/transport-load.test.mjs` measures the budgets at 81 bytes, so re-run it against
-the new widths and re-check `MAX_HALF_OPEN_UNVERIFIED` against the resulting memory profile
-rather than against connection count. Keep the ordering when porting — the contact-secret
-seal on msg1 must be checked *before* KEM decapsulation, or the cost of a junk connection
-rises with the KEM.
+MTU. The contact-secret seal covers the KEM public key and is checked before the responder
+performs encapsulation, so unauthenticated junk does not reach the expensive transform.

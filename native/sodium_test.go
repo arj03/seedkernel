@@ -136,20 +136,6 @@ func TestSodiumSign(t *testing.T) {
 	}
 }
 
-// xchacha20 keystream XOR is its own inverse.
-func TestSodiumStreamXor(t *testing.T) {
-	s := newSodium(t)
-	key, nonce := bytes.Repeat([]byte{0x42}, 32), bytes.Repeat([]byte{0x24}, 24)
-	msg := []byte("the quick brown fox jumps over the lazy dog")
-	ct := s.streamXor(msg, nonce, key)
-	if bytes.Equal(ct, msg) {
-		t.Fatal("xchacha20 left the plaintext unchanged")
-	}
-	if pt := s.streamXor(ct, nonce, key); !bytes.Equal(pt, msg) {
-		t.Fatalf("xchacha20 round trip: %q", pt)
-	}
-}
-
 // Random keypair → ed25519→curve25519 → sealed-box round trip. This is the path
 // that exercises the wasm RNG (crypto_sign_keypair and crypto_box_seal both draw
 // from randombytes, routed through the asm-const entropy import).
@@ -184,4 +170,3 @@ func TestSodiumSealedBox(t *testing.T) {
 		t.Fatal("seal_open succeeded under the wrong keypair")
 	}
 }
-

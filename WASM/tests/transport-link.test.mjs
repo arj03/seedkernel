@@ -229,7 +229,7 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
   // Trailing bytes would ride outside the transcript hash, and so outside what both
   // signatures cover. Exact, not minimum, for every message in the flight.
   // A's two handshake messages, by the width each is accepted at: msg1 and msg3.
-  for (const len of [81, 112]) {
+  for (const len of [1265, 112]) {
     const chans = wirePair({
       tamper: (b, from) => (from === "A" && b.length === len ? Buffer.concat([Buffer.from(b), Buffer.from([0])]) : b),
     });
@@ -276,7 +276,7 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
   const st = keep(await linked(chans));
   await until(() => chans[0].sent.length > 0, 4000, "msg1");
   const msg1 = Buffer.from(chans[0].sent[0], "hex");
-  assert(msg1.length === 81, `msg1 should be 81 bytes, got ${msg1.length}`);
+  assert(msg1.length === 1265, `hybrid msg1 should be 1265 bytes, got ${msg1.length}`);
   assert(!msg1.includes(Buffer.from(st.A.driver.peerId, "hex")), "msg1 must not carry the initiator identity");
 });
 

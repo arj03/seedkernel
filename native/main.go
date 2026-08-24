@@ -262,9 +262,6 @@ func boot() error {
 	rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rtCore)
 	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
-	// ML-KEM-768 for the primitive catalog (§14.1) — provisioned ahead of any caller,
-	// because a primitive is the one thing a bundle cannot deliver (mlkem.go).
-	mk = bootMlKem(rtCore)
 	// AssemblyScript's three imports, exactly the set the JS host resolves (a subset would
 	// make "does this module load" a property of the target). All inert — `seed` is a
 	// constant (§4.2), `trace` drops args (§4.3), `abort` need not trap.

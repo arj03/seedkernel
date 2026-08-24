@@ -1,8 +1,8 @@
-// wasmmod.go — the shared driver for the two no-import PQ wasm modules (mldsa.go,
-// mlkem.go): instantiate the artifact, cross-check its constant-width exports, and hand
-// out buffers from its own linear memory with a bump pointer. Neither module allocates or
-// retains anything across a call, so a rewind at the start of each op is the whole memory
-// manager and there is no free list to corrupt. Ops are serialized by mu — held for one
+// wasmmod.go — the driver for the no-import ML-DSA wasm module: instantiate the artifact,
+// cross-check its constant-width exports, and hand out buffers from its own linear memory
+// with a bump pointer. The module does not allocate or retain anything across a call, so
+// a rewind at the start of each op is the whole memory manager and there is no free list
+// to corrupt. Ops are serialized by mu — held for one
 // call, never across a callback into JS or Go.
 package main
 
@@ -15,7 +15,7 @@ import (
 )
 
 // wasmModule is a no-import wasm module plus the bump allocator over its memory.
-// name feeds the error messages ("mldsa65", "mlkem768").
+// name feeds the error messages ("mldsa65").
 type wasmModule struct {
 	mod      api.Module
 	mem      api.Memory

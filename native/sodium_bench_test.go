@@ -51,15 +51,3 @@ func BenchmarkSodiumBlake2b64K(b *testing.B) {
 		_ = s.genericHash(32, block)
 	}
 }
-
-func BenchmarkSodiumXChaCha20_640K(b *testing.B) {
-	s := benchSodium(b)
-	data := bytes.Repeat([]byte{0x11}, 640*1024)
-	key := bytes.Repeat([]byte{0x42}, 32)
-	nonce := bytes.Repeat([]byte{0x24}, 24)
-	b.SetBytes(int64(len(data)))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = s.streamXor(data, nonce, key)
-	}
-}

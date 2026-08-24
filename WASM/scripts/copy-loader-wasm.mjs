@@ -16,9 +16,6 @@ const copies = [
   // ML-DSA-65 for manifest suite 0x02 (§12.4): the Go loader instantiates the very
   // artifact the browser fetches, so there is one accept/reject boundary.
   ["browser/mldsa65.wasm", "mldsa65.wasm"],
-  // ML-KEM-768 for the primitive catalog (§14.1) — a name in the catalog must mean the
-  // same bytes on every target.
-  ["browser/mlkem768.wasm", "mlkem768.wasm"],
 ];
 
 for (const [from, to] of copies) {

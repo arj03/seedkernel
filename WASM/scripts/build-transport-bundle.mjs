@@ -1,5 +1,5 @@
 // Builds the transport bundle — the signed artifact the host ships and loads at boot
-// (§12.6): guest parts + ws.wasm, signed under suite 0x02 (Ed25519 + ML-DSA-65, §12.4,
+// (§12.6): guest parts + ws.wasm + mlkem768.wasm, signed under suite 0x02 (Ed25519 + ML-DSA-65, §12.4,
 // §14.1) with host/bundle.ts's own authorBundle — the same functions the runtime signs
 // and verifies with, not a second copy. Writes build/transport.skb and
 // host/transport-bundle.ts (b64 inline; both gitignored — host/shell-node.ts imports the
@@ -14,7 +14,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import sodiumDefault from "libsodium-wrappers-sumo";
+import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
 import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
@@ -60,10 +60,10 @@ async function main() {
   const keys = hybridAuthorKeysFromSeed(sodium, seed);
 
   const guest = readGuestSource();
-  // ws.wasm rides IN the bundle: the RFC 6455 codec is content, so it arrives through the
-  // one install path signed by this program's own author and is reached by logical name.
-  // An ordinary §4 pure transform, admitted like any other module.
+  // Both pure transforms ride IN the bundle: RFC 6455 framing and the handshake KEM are
+  // content, admitted through the one signed install path and reached by logical name.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
+  const mlkemWasm = readFileSync(join(root, "browser", "mlkem768.wasm"));
   const { blob, author } = authorBundle(sodium, keys, {
     app: "transport",
     version: 1,
@@ -71,7 +71,10 @@ async function main() {
     // is a `services` claim, reachable by a co-resident guest and by no peer, never a
     // `protocols` claim (which is what a PEER may send to this slot).
     services: ["_net"],
-    modules: [{ name: "ws", wasm: wsWasm }],
+    modules: [
+      { name: "ws", wasm: wsWasm },
+      { name: "mlkem", wasm: mlkemWasm },
+    ],
     guestSource: guest,
     // Exactly the services this program holds — `link` is the ONLY one carrying a
     // privilege grant (inbound delivery is this slot's return convention, not a grant).

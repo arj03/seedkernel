@@ -4,15 +4,14 @@
  * The sibling of pq/config.h, and the same four choices for the same reasons —
  * each one removes something from the artifact rather than adding to it:
  *
- *  - PARAMETER_SET 768      the only set the primitive catalog names
- *                           (the `ml-kem-768` catalog names, README §14.1)
+ *  - PARAMETER_SET 768      the parameter set the transport bundle's `mlkem` module uses
  *  - NO_RANDOMIZED_API      leaves only keypair_derand / enc_derand / dec — the
  *                           variants that take their randomness as an argument. The
  *                           randomized wrappers are what would pull randombytes()
  *                           in, and an import the host must satisfy is an import
  *                           the Go host must satisfy identically. The module has
  *                           none: no imports at all, only exports. It is also what
- *                           keeps the catalog PURELY FUNCTIONAL — a bundle draws
+ *                           keeps the module PURELY FUNCTIONAL — the bundle draws
  *                           its coins from `RANDOM`, an authority, and hands them
  *                           in, exactly as an ephemeral X25519 pair is `RANDOM(32)`
  *                           plus `x25519/dh` (guest-seam.ts).

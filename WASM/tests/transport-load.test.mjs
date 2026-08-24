@@ -16,7 +16,7 @@ import { testkit } from "./testkit.mjs";
 const CONTACT = new Uint8Array(32).fill(3);
 
 /** The node's sodium, wrapped to charge the asymmetric operations to a counter. The guest
- *  reaches these through the guest seam's primitive catalog, so this is the real bill for a
+ *  reaches ML-KEM through its private module and the remaining transforms through the host seam, so this is the real bill for a
  *  connection — including the ephemeral keypair, which is `RANDOM(32)` + an x25519/dh
  *  against the base point and so shows up as a scalarmult. */
 function countingSodium(base) {
@@ -111,8 +111,8 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
     // A well-formed-looking msg1 — right suite byte, right length, wrong everything
     // else. The suite byte matters: get it wrong and the guest refuses on the byte
     // alone, and this measures a cheaper path than a real attacker gets.
-    const junk = new Uint8Array(81);
-    junk[0] = 0x02; // SUITE_CHANNEL_CONCEALED
+    const junk = new Uint8Array(1265);
+    junk[0] = 0x03; // SUITE_CHANNEL_CONCEALED
     for (let j = 1; j < junk.length; j++) junk[j] = (i * 31 + j) & 255;
     d.ch.send(junk);
     dials.push(d);
@@ -122,7 +122,7 @@ await test("a stranger who TRIES costs one AEAD open and nothing more", async ()
        `(${(c.ops.aead / N).toFixed(2)} AEAD opens per connection)`);
   assert(c.ops.scalarmult === 0, `garbage msg1 cost ${c.ops.scalarmult} scalarmults, want 0`);
   assert(c.ops.sign === 0, "garbage must not reach the signing path");
-  assert(c.ops.aead <= N, `a rejected msg1 must cost at most one AEAD open, got ${c.ops.aead / N} each`);
+  assert(c.ops.aead === N, `a plausible rejected msg1 must cost exactly one AEAD open, got ${c.ops.aead / N} each`);
   assert(dials.every((d) => !d.closed), "a refusal is SILENCE, not a close — the deadline does that");
 });
 

@@ -32,9 +32,9 @@ A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node
 
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
-| `.` (root) | Node's `loadCrypto` — sumo libsodium with ML-DSA-65 and ML-KEM-768 mixed in, read off disk. The `sodium` every other call takes | seedstore `WASM/host/sodium.ts`, `WASM/scripts/build-bundle.mjs` |
-| `./crypto-browser` | The browser's `loadCrypto` — the same mix, fetched by URL onto a sumo instance you supply | seedstore `WASM/browser/index.html` and `p2p.html`, seedchat `browser/chat-shell.js` |
-| `./libsodium` | That sumo instance: the runtime's own prebuilt browser libsodium. Do not ship a second one — this is the same binary the Go loader embeds | the three pages above |
+| `.` (root) | Node's `loadCrypto` — core libsodium with ML-DSA-65 mixed in, read off disk. The `sodium` every other host call takes | seedstore `WASM/host/sodium.ts`, `WASM/scripts/build-bundle.mjs` |
+| `./crypto-browser` | The browser's `loadCrypto` — the same host trust-root mix, fetched by URL onto a core instance you supply | seedstore `WASM/browser/index.html` and `p2p.html`, seedchat `browser/chat-shell.js` |
+| `./libsodium` | That core instance: the runtime's prebuilt browser libsodium, identical to the binary the Go loader embeds | the three pages above |
 | `./quickjs` | Nothing you call. It is the QuickJS engine `safe-js` names by bare specifier, so a **browser** client must carry it in its import map even though its own code never mentions it | the import map in seedstore `WASM/browser/p2p.html` |
 | `./fs`, `./fs-memory`, `./fs-node` | The `Fs` interface, and the two backends: in-memory (`bootShell`'s default) or a directory on disk | seedstore `WASM/host/storage-node.ts`, `WASM/tests/bench-holder.mjs` |
 | `./net-node` | `NodeChannelFactory` — TCP over `node:net`, plus the peer-spec parsers | seedstore `WASM/tests/net.test.mjs` |
@@ -44,7 +44,7 @@ A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node
 
 **The WebRTC seam is the runtime's, not any one app's.** seed store drives `RtcNetwork` from a browser page *and* from the console over werift; seedchat subclasses it to carry live media. Treat it as a first-class adapter on either target, and subclass it rather than fork it when you need more than raw bytes.
 
-**`loadCrypto` has a Node build and a browser build, not one shared function.** Node's (`.`) pulls the npm package and reads both PQ `.wasm` files off disk; the browser's (`./crypto-browser`) fetches them by URL onto a caller-supplied sumo instance instead. A browser client takes that instance from `./libsodium` and should not ship a second sumo build. `./pq` and `./kem` are internal — both `loadCrypto`s reach them relatively, and an app gets their primitives through the capability catalog, never by importing them.
+**`loadCrypto` has a Node build and a browser build, not one shared function.** Node's (`.`) pulls the core npm package and reads the ML-DSA verifier off disk; the browser's (`./crypto-browser`) fetches that verifier onto a caller-supplied core instance. ML-KEM is not part of either surface: it is a private module of the signed transport bundle. `./pq` is internal.
 
 ## The assembly is an export
 

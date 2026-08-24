@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import _sodium from "libsodium-wrappers-sumo";
+import _sodium from "libsodium-wrappers";
 import { testkit, makeAuthor } from "./testkit.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");

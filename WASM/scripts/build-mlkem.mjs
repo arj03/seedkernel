@@ -1,8 +1,7 @@
-// Builds browser/mlkem768.wasm — ML-KEM-768 (FIPS 203) for the primitive catalog
-// (`ml-kem-768/*`, §14.1) — from the pinned mlkem-native submodule; see build-pq-wasm.mjs
-// for the shared flag set. ONE artifact for all three targets: a catalog entry is a name
-// two nodes exchange bytes under (§12.6), so two implementations disagreeing on a
-// rejected encoding would simply fail to share a key in production.
+// Builds browser/mlkem768.wasm — ML-KEM-768 (FIPS 203) as an import-free pure module
+// carried by the transport bundle — from the pinned mlkem-native submodule.
+// One artifact rides in the same signed bundle on every target, so a rejected encoding
+// cannot become a target-dependent handshake result.
 import { buildPqWasm } from "./build-pq-wasm.mjs";
 
 buildPqWasm({

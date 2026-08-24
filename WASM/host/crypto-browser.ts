@@ -1,24 +1,18 @@
 // Browser crypto seam — crypto-node.ts's loadCrypto for a target with no node:fs: the
-// same two artifacts (mldsa65.wasm, mlkem768.wasm) mixed onto one caller-readied sumo
-// libsodium instance, fetched by URL instead of read from disk.
+// ML-DSA verifier mixed onto one caller-readied core libsodium instance.
 import { loadMlDsa65, withMlDsa65, type MlDsa65Signer } from "./pq.js";
-import { loadMlKem768, withMlKem768, type MlKem768 } from "./kem.js";
 
-/** Ready a caller's sumo libsodium with ML-DSA-65 + ML-KEM-768 mixed on — the browser
- *  counterpart to crypto-node.ts's Node-only `loadCrypto` (§12.1). Both, always: the PQ
- *  half is needed for ANY bundle (§12.4), and KEM rides along so a future guest capability
- *  does not hit the same gap (§14.1). `baseUrl` is where the caller's build staged both
- *  .wasm files, siblings by convention. */
+/** Ready a caller's core libsodium with ML-DSA-65 — the browser counterpart to
+ *  crypto-node.ts's Node-only `loadCrypto`. */
 export async function loadCrypto<T extends { ready: Promise<void> }>(
   sodium: T, baseUrl: string | URL = "./",
-): Promise<T & MlDsa65Signer & MlKem768> {
+): Promise<T & MlDsa65Signer> {
   const base = typeof baseUrl === "string" ? baseUrl : baseUrl.href;
   const fetchWasm = (name: string) =>
     fetch(base + name, { cache: "no-store" }).then((r) => r.arrayBuffer());
-  const [, mldsa, mlkem] = await Promise.all([
+  const [, mldsa] = await Promise.all([
     sodium.ready,
     fetchWasm("mldsa65.wasm").then(loadMlDsa65),
-    fetchWasm("mlkem768.wasm").then(loadMlKem768),
   ]);
-  return withMlDsa65(withMlKem768(sodium, mlkem), mldsa);
+  return withMlDsa65(sodium, mldsa);
 }

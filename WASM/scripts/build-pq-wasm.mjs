@@ -60,6 +60,7 @@ export function buildPqWasm(cfg) {
     // default overflows silently into a trap. 256 KB covers both with headroom.
     "-Wl,-z,stack-size=262144",
     "-Wl,--initial-memory=1048576",
+    "-Wl,--max-memory=1048576",
     "-o",
     out,
     resolve(src, cfg.cSource),

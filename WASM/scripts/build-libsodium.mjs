@@ -1,4 +1,4 @@
-// Extracts browser/libsodium.wasm from the upstream libsodium-wrappers-sumo npm dist and
+// Extracts browser/libsodium.wasm from the upstream core libsodium-wrappers npm dist and
 // patches the wrapper so the browser fetches the raw .wasm instead of base64-decoding it
 // per load. The embedded decoder stays (fed ""); the wrapper's own instantiateWasm never
 // reads its output.
@@ -9,8 +9,8 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
-const coreSrc = resolve(root, "node_modules/libsodium-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs");
-const wrapSrc = resolve(root, "node_modules/libsodium-wrappers-sumo/dist/modules-sumo-esm/libsodium-wrappers.mjs");
+const coreSrc = resolve(root, "node_modules/libsodium/dist/modules-esm/libsodium.mjs");
+const wrapSrc = resolve(root, "node_modules/libsodium-wrappers/dist/modules-esm/libsodium-wrappers.mjs");
 const outDir = resolve(root, "browser");
 
 const core = readFileSync(coreSrc, "utf8");
@@ -18,7 +18,7 @@ const core = readFileSync(coreSrc, "utf8");
 // The embedded WASM is a base64 string literal beginning "AGFzbQ" (the "\0asm" magic):
 // extract it for the standalone .wasm, then blank the literal in the core.
 const b64Start = core.indexOf('"AGFzbQ');
-if (b64Start < 0) throw new Error("could not locate base64 WASM string in libsodium-sumo.mjs");
+if (b64Start < 0) throw new Error("could not locate base64 WASM string in libsodium.mjs");
 const b64End = core.indexOf('"', b64Start + 1);
 if (b64End < 0) throw new Error("unterminated base64 WASM string");
 
@@ -30,10 +30,10 @@ const patchedCore = core.slice(0, b64Start) + '""' + core.slice(b64End + 1);
 writeFileSync(resolve(outDir, "libsodium-core.mjs"), patchedCore);
 
 // Patch the wrapper: import our stripped core, and inject an instantiateWasm that fetches
-// the .wasm — the sumo wrappers invoke the core as `a({getRandomValue:function(){…}})`.
+// the .wasm — the wrappers invoke the core as `a({getRandomValue:function(){…}})`.
 const wrap = readFileSync(wrapSrc, "utf8");
 const wrapPatched = wrap
-  .replace('import e from"libsodium-sumo"', 'import e from"./libsodium-core.mjs"')
+    .replace('import e from"libsodium"', 'import e from"./libsodium-core.mjs"')
   .replace(
     "a({getRandomValue:function(){",
     "a({instantiateWasm:async(imports,cb)=>{" +

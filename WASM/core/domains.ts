@@ -19,24 +19,18 @@ export const DOMAIN_LINK_SCOPE = domain("seedkernel-link-scope-v1\0");
 export const DOMAIN_SUBKEY = domain("seedkernel-subkey-v1\0");
 /** Author ML-DSA seed label (§16.1). KDF tag, not a signing prefix. */
 export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
-/** Guest `crypto/` catalog. Total over this list; not a grant. Adding a name is the whole
- *  cost of a new algorithm. */
-export const PRIMITIVE_NAMES = [
+/** Residual guest-visible host transforms. This is legacy vocabulary, not a menu of computations:
+ *  a pure transform belongs in the bundle that uses it. Keep a name here only while the
+ *  host itself already carries and calls the same implementation. */
+export const HOST_TRANSFORM_NAMES = [
     "blake2b-256",
     "ed25519/verify",
-    "xchacha20/xor",
     "chacha20poly1305-ietf/seal",
     "chacha20poly1305-ietf/open",
     "x25519/dh",
-    // Provisioned ahead of any caller — the one thing that cannot be delivered as a bundle
-    // (SECURITY §14.1). Derandomized: coins come from `node/random`, so the catalog stays
-    // purely functional.
-    "ml-kem-768/keypair",
-    "ml-kem-768/encaps",
-    "ml-kem-768/decaps",
 ] as const;
 
-export type PrimitiveName = (typeof PRIMITIVE_NAMES)[number];
+export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
 /** The host SERVICES — the unit a manifest declares and an operator grants. Each key is
  *  everything before the first `/` of the method names it fronts; `calls` is dispatch
  *  vocabulary, not a second grant. `timer` is `"app"`, not a privilege. */

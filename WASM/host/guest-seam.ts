@@ -3,7 +3,7 @@
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, PRIMITIVE_NAMES, PRIVILEGE_LINK, serviceOf, type PrimitiveName, type CapabilityName, type Privilege } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 
@@ -23,26 +23,15 @@ export interface SignScope {
     };
 }
 
-/** The libsodium surface the crypto names use — structural so any sumo build
- *  (the host's bundled `libsodium-wrappers-sumo`) satisfies it. */
+/** The libsodium surface the remaining host crypto names use. */
 export interface SeamCrypto {
     crypto_generichash(hashLength: number, message: Uint8Array): Uint8Array;
-    crypto_stream_xchacha20_xor(message: Uint8Array, nonce: Uint8Array, key: Uint8Array): Uint8Array;
     crypto_sign_detached(message: Uint8Array, sk: Uint8Array): Uint8Array;
     crypto_sign_verify_detached(sig: Uint8Array, message: Uint8Array, pk: Uint8Array): boolean;
     randombytes_buf(n: number): Uint8Array;
     crypto_aead_chacha20poly1305_ietf_encrypt(message: Uint8Array, additional_data: Uint8Array | null, secret_nonce: Uint8Array | null, public_nonce: Uint8Array, key: Uint8Array): Uint8Array;
     crypto_aead_chacha20poly1305_ietf_decrypt(secret_nonce: Uint8Array | null, ciphertext: Uint8Array, additional_data: Uint8Array | null, public_nonce: Uint8Array, key: Uint8Array): Uint8Array;
     crypto_scalarmult(sk: Uint8Array, pk: Uint8Array): Uint8Array;
-    ml_kem768_keypair_from_seed(seed: Uint8Array): {
-        publicKey: Uint8Array;
-        privateKey: Uint8Array;
-    };
-    ml_kem768_encaps(pk: Uint8Array, coins: Uint8Array): {
-        ciphertext: Uint8Array;
-        sharedSecret: Uint8Array;
-    } | null;
-    ml_kem768_decaps(sk: Uint8Array, ct: Uint8Array): Uint8Array | null;
 }
 
 /** Cross-realm call by a local service id. `null` when nothing claims it. */
@@ -170,11 +159,12 @@ export interface CallBudget {
  *  wrong for all of them alike. `budget` is the caller's segment, supplied by the realm. */
 export type HostCall = (name: string, payload: Uint8Array, budget?: CallBudget) => Promise<Uint8Array>;
 
-export { PRIMITIVE_NAMES } from "../core/domains.js";
-/** The `crypto/` members of the catalog, as a template literal over `PRIMITIVE_NAMES`, so
+export { HOST_TRANSFORM_NAMES } from "../core/domains.js";
+/** The `crypto/` members of the legacy host transform table, as a template literal over
+ *  `HOST_TRANSFORM_NAMES`, so
  *  the vocabulary a manifest is checked against and the table the seam dispatches through
  *  cannot drift. */
-type CryptoName = `crypto/${PrimitiveName}`;
+type CryptoName = `crypto/${HostTransformName}`;
 /** The keys the dispatch table must cover, typed so a name added to the vocabulary without
  *  a handler is a compile error, and so is a handler whose name the loader would refuse.
  *
@@ -186,14 +176,14 @@ type HandlerKey = CapabilityName | CryptoName;
  *  half of the one-file rule. */
 const HANDLER_KEYS: readonly string[] = [
     ...AUTHORITY_CALLS,
-    ...PRIMITIVE_NAMES.map((p) => `crypto/${p}`),
+    ...HOST_TRANSFORM_NAMES.map((p) => `crypto/${p}`),
 ];
-/** One catalog entry's implementation: argument bytes in, response bytes out. A handler
+/** One host transform's implementation: argument bytes in, response bytes out. A handler
  *  may answer inline (every crypto name, clock, link, timer) or round-trip (fs/*); the
  *  seam flattens both into the one Promise the guest awaits. */
 type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
-/** Primitive half of the catalog (§12.1): a flat name→transform map. */
-function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
+/** Residual host-transform table (§12.1). */
+function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     return {
         "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
         "crypto/ed25519/verify": (a) => {
@@ -205,7 +195,6 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
                 return ZERO;
             }
         },
-        "crypto/xchacha20/xor": (a) => sodium.crypto_stream_xchacha20_xor(a.slice(56), a.slice(0, 24), a.slice(24, 56)),
         "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.slice(44), null, null, a.slice(0, 12), a.slice(12, 44)),
         "crypto/chacha20poly1305-ietf/open": (a) => {
             try {
@@ -224,21 +213,6 @@ function cryptoCatalog(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
             catch {
                 return ZERO;
             }
-        },
-        // [seed 64] -> [pk 1184][sk 2400]. Seed is FIPS 203's `d ‖ z`.
-        "crypto/ml-kem-768/keypair": (a) => {
-            const kp = sodium.ml_kem768_keypair_from_seed(a.slice(0, 64));
-            return concatBytes([kp.publicKey, kp.privateKey]);
-        },
-        // [pk 1184][coins 32] -> [ok u8][ct 1088][ss 32]. ok=0: FIPS 203 §7.2.
-        "crypto/ml-kem-768/encaps": (a) => {
-            const r = sodium.ml_kem768_encaps(a.slice(0, 1184), a.slice(1184, 1216));
-            return r ? concatBytes([ONE, r.ciphertext, r.sharedSecret]) : ZERO;
-        },
-        // [sk 2400][ct 1088] -> [ok u8][ss 32]. ok=0: §7.3 on the secret key, never a bad ct.
-        "crypto/ml-kem-768/decaps": (a) => {
-            const ss = sodium.ml_kem768_decaps(a.slice(0, 2400), a.slice(2400, 3488));
-            return ss ? concatBytes([ONE, ss]) : ZERO;
         },
     };
 }
@@ -449,7 +423,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     const handlers: Record<string, SeamHandler> = Object.assign(Object.create(null), {
         // ── the primitive seam (§12.1): functions of bytes the guest already holds, so
         // there is nothing to grant. The bundle's own modules are the other ungated half.
-        ...cryptoCatalog(sodium),
+        ...hostTransforms(sodium),
         // ── authorities: each reaches something no confined guest can hold ──────────
         // node/sign and node/verify are scoped, never raw, to THIS SLOT's one scope,
         // derived at load: an app slot's own `DOMAIN_guest ‖ author ‖ app`, the link
@@ -563,7 +537,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
     // the native target evaluates (§12.9).
     for (const name of Object.keys(handlers)) {
         if (!HANDLER_KEYS.includes(name)) {
-            throw new Error(`guest-seam: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no primitive (PRIMITIVE_NAMES)`);
+            throw new Error(`guest-seam: "${name}" is not a host-call name — it is no authority (AUTHORITY_CALLS) and no host transform (HOST_TRANSFORM_NAMES)`);
         }
         if (!name.includes("/")) {
             throw new Error(`guest-seam: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
