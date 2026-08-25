@@ -32,7 +32,8 @@ const testAuthor = () => makeAuthor(sodium);
 const { bootShell, scopedFs, createRealmTimers } = await imp("build/host/shell-core.js");
 const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
-const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
+const { createGuestSeam } = await imp("build/host/guest-seam.js");
+const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -160,8 +161,8 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
     modules: { names: new Set(), call: () => null },
   };
   throws(() => createGuestSeam({ ...base }), "omitting grants.names throws at construction");
-  ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: UNRESTRICTED_NAMES } }) === "function",
-    "naming the sentinel is accepted");
+  ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: ALL_HOST_SERVICES } }) === "function",
+    "an explicit full service set is accepted");
 
   // A guest reaches its own app's modules with NO grant: a bare name is the asking
   // bundle's own code, scoped by the app key the seam was wired with, so it resolves under

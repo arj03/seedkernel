@@ -30,8 +30,9 @@ const sodium = await loadCrypto();
 // hands it out with its address; one value here just means every test node is reachable
 // by every other.
 const TEST_CONTACT = new Uint8Array(32).fill(3);
-const { createGuestSeam, guestSignScope, appSignScope, UNRESTRICTED_NAMES }
+const { createGuestSeam, guestSignScope, appSignScope }
   = await imp("build/host/guest-seam.js");
+const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const { readOp, writeOp } = await imp("build/core/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
@@ -384,7 +385,17 @@ async function testManifestClaimIsTheRouting() {
     [GUEST_FILE]: GUEST_BYTES,
   });
   let realmBuilds = 0;
+  const identity = generateKeyPair();
+  class RoutedTransportHost extends TransportHost {
+    route(call, available, deliver) {
+      super.route(call, available, deliver);
+      this.routeDeliver = deliver;
+    }
+  }
+  const transport = new RoutedTransportHost({ identity });
   const shell = await bootTestShell({
+    identity,
+    transport,
     createRealm: async () => {
       realmBuilds++;
       return { call: async () => new Uint8Array(), dispose() {} };
@@ -463,7 +474,8 @@ async function testManifestClaimIsTheRouting() {
     }
     // The property that actually matters: a name in `services` is unreachable from a
     // PEER while the SAME bundle's `protocols` name is — checked through the real
-    // delivery path (`shell.dispatch`) rather than by inspecting the claim table.
+    // delivery callback wired through `TransportHost.route`, rather than by inspecting
+    // the claim table or entering the shell through a second test-only method.
     {
       const pub = "reach/public", priv = "_reach-private";
       const reachKey = appKey(author.id, "reach");
@@ -472,12 +484,13 @@ async function testManifestClaimIsTheRouting() {
           { app: "reach", version: 1, protocols: [pub], services: [priv], modules: [], guest: GUEST() }),
         [GUEST_FILE]: GUEST_BYTES,
       }));
-      const senderHex = "11".repeat(32);
+      const sender = new Uint8Array(32).fill(0x11);
       const payload = new Uint8Array([1, 2, 3]);
-      const publicAnswer = shell.dispatch(senderHex, pub, payload);
+      assert(typeof transport.routeDeliver === "function", "the shell wires inbound delivery through the transport route");
+      const publicAnswer = transport.routeDeliver(pub, sender, payload);
       assert(publicAnswer !== null, "a name in `protocols` is reachable by a peer");
       await publicAnswer;
-      assert(shell.dispatch(senderHex, priv, payload) === null,
+      assert(transport.routeDeliver(priv, sender, payload) === null,
         "the same bundle's `services` name is unreachable by a peer, however it is spelled");
       shell.uninstall(reachKey);
     }
@@ -718,8 +731,7 @@ async function testGuestSeam() {
   const claimed = new Set(["_net", "chat/v1"]);
   const calls = { call: (idName) => (claimed.has(idName) ? Promise.resolve(U(9, 9)) : null) };
   // THIS realm's declared local services (§12.10) — what tells them apart from a bare
-  // module name at the dispatch, independent of `names` (which opts out of gating below
-  // via UNRESTRICTED_NAMES). `chat/v1` is here because a local service id is an ordinary
+  // module name at the dispatch. `chat/v1` is here because a local service id is an ordinary
   // claim: it may carry a `/` exactly like a wire protocol id.
   const localServices = new Set(["_net", "_nobody", "chat/v1"]);
 
@@ -734,7 +746,7 @@ async function testGuestSeam() {
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const seam = createGuestSeam({
     platform: { sodium, identity: id },
-    grants: { names: UNRESTRICTED_NAMES, localServices, signScope, fs, calls },
+    grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
@@ -1728,9 +1740,9 @@ async function testSeamGating() {
   try { await methodNameOnly("node/sign", U(1, 2)); } catch { threw = true; }
   assert(threw, "declaring a method's exact name, not its service, grants nothing");
 
-  // guest-controlled allocation caps. UNRESTRICTED_NAMES is the host-side caller that
-  // opts out of gating *by name* — omitting grants.names entirely now throws (§12.2).
-  const open = mk(UNRESTRICTED_NAMES);
+  // Guest-controlled allocation caps. Tests that exercise the full catalog name every
+  // host service explicitly; omitting grants.names entirely still throws (§12.2).
+  const open = mk(ALL_HOST_SERVICES);
   let omitted = false;
   try { mk(undefined); } catch { omitted = true; }
   assert(omitted, "omitting grants.names throws rather than granting every name");
@@ -1890,7 +1902,7 @@ async function testModuleCallChargedToGuestBudget() {
 
   const { ModuleTable } = await imp("build/host/module-table.js");
   const { SPIN_WASM } = await import("./fixtures/spin-wasm.mjs");
-  const { createGuestSeam, UNRESTRICTED_NAMES } = await imp("build/host/guest-seam.js");
+  const { createGuestSeam } = await imp("build/host/guest-seam.js");
   const { createSafeRealm } = await imp("build/host/safe-js.js");
   const id = generateKeyPair();
 
@@ -1899,7 +1911,7 @@ async function testModuleCallChargedToGuestBudget() {
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
     platform: { sodium, identity: id },
-    grants: { names: UNRESTRICTED_NAMES },
+    grants: { names: ALL_HOST_SERVICES },
     modules: {
       names: new Set(["spin"]),
       call: (n, p, deadlineMs) => host.slots.get(spinKey)?.call(n, p, deadlineMs) ?? Promise.resolve({ bytes: null, ms: 0 }),
@@ -1982,7 +1994,7 @@ async function testPreviousAbiRefused() {
     source,
     hostCall: createGuestSeam({
       platform: { sodium, identity: generateKeyPair(), now: () => 1 },
-      grants: { names: UNRESTRICTED_NAMES },
+      grants: { names: ALL_HOST_SERVICES },
       modules: { names: new Set(), call: () => null },
     }),
   });

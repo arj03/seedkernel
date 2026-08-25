@@ -12,7 +12,6 @@ import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_P
 import { isIrreversible, isService, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
 import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
-import { type PeerId } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
@@ -159,12 +158,6 @@ export interface Shell {
      *  on the same derived names, refusing alone leaves the compromised code running.
      *  Permanent and host-local — recovery is a new author key, not an un-revoke. */
     revoke(authorHex: string): string[];
-    /** Dispatch an inbound request to the right app (§12.10): resolve the protocol to
-     *  the app claiming it and invoke that app's guest `handle` entrypoint with
-     *  `senderPk ‖ payload`. Null when nothing a peer may reach claims the protocol —
-     *  a bundle's `services` claim is a CO-RESIDENT guest's, never a peer's. The answer is
-     *  always the realm's — a Promise the transport driver resumes on. */
-    dispatch(from: PeerId, proto: string, payload: Uint8Array): Promise<Uint8Array> | null;
     close(): void;
 }
 
@@ -622,7 +615,8 @@ function createShell(opts: CreateShellOptions & {
         const slot = claims.get(claim);
         return slot ? callFramed(slot, attribution, payload) : null;
     };
-    /** Inbound from outside this node (the link occupant's delivery return, `dispatch`).
+    /** Inbound from outside this node (the link occupant's delivery return, routed by
+     *  `TransportHost`).
      *  A claim under the resolved slot's `services` — never its `protocols` — is local and
      *  refused here with no exception (§12.10): this reads the slot's signed `protocols`,
      *  no second structure kept in step with it. Once the answer resolves it is also handed
@@ -646,8 +640,6 @@ function createShell(opts: CreateShellOptions & {
         }
         return answer;
     };
-    const doDispatch = (from: PeerId, proto: string, payload: Uint8Array) =>
-        deliverInbound(proto, fromHex(from), payload);
     return {
         resolve: (proto) => {
             const slot = claims.get(proto);
@@ -774,7 +766,6 @@ function createShell(opts: CreateShellOptions & {
             }
             return gone;
         },
-        dispatch: doDispatch,
         close() {
             netHost?.close();
             const dispose = () => {

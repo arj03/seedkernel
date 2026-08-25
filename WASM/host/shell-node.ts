@@ -16,7 +16,6 @@ import { NodeFs } from "./fs-node.js";
 import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
 import { type ChannelFactory } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
-import { type PeerId } from "../core/socket-seam.js";
 import { type Fs } from "../core/fs.js";
 import { errMessage } from "../core/util.js";
 import type { NodeRuntime as CliNodeRuntime } from "./cli.js";
@@ -161,7 +160,6 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
         async loadBundle(file, loadOpts) {
             return core.loadBundleBlob(new Uint8Array(readFileSync(file)), loadOpts);
         },
-        dispatch: core.dispatch,
         close() { core.close(); },
     };
     return { shell, transport };

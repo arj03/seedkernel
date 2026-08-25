@@ -98,14 +98,13 @@ export interface SeamGrants {
     /** EXACTLY the manifest's declared `guest.requires` (§12.2) — service names and local
      *  service ids together, as signed. A `host.call` naming a host method is refused unless
      *  the method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
-     *  declared local service pass regardless. Required — pass `UNRESTRICTED_NAMES` to opt
-     *  out deliberately. */
-    names: Iterable<string> | typeof UNRESTRICTED_NAMES;
+     *  declared local service pass regardless. */
+    names: Iterable<string>;
     /** THIS realm's declared local service ids — the `guest.requires` entries that are not
      *  host services. What tells a bare `host.call` name apart from one of this bundle's own
      *  modules (§12.10): declared here, it is a cross-realm call; otherwise it is a module.
-     *  Explicit rather than inferred from `names` so the rule holds under
-     *  `UNRESTRICTED_NAMES` too. */
+     *  Explicit rather than inferred from `names` because the two sets answer different
+     *  questions: what the manifest requires and which of those names are local. */
     localServices?: ReadonlySet<string>;
     /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
      *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
@@ -368,12 +367,6 @@ export function slotSignScope(node: {
         ? linkSignScope(node.identity, node.networkKey)
         : appSignScope(node.identity, author, app);
 }
-// ── Opting out of gating, explicitly ────────────────────────────────────────
-//
-// Absent grants.names must not mean permissive. The sentinel is a Symbol so it
-// cannot arrive from parsed config (§12.2).
-/** Run without name gating. Host-side only; never a bundle's guest. */
-export const UNRESTRICTED_NAMES = Symbol("seedkernel.seam.unrestricted-names");
 // Host-side allocation bounds for guest-controlled sizes: the realm's own memory limit
 // does not cover host allocations the guest requests, so the seam caps them itself.
 const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
@@ -550,10 +543,9 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // JS of this file (§12.9), where a TypeScript signature enforces nothing — and a gate
     // that holds on one of two targets is not a gate.
     if (grants.names === undefined) {
-        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires, or UNRESTRICTED_NAMES to opt out");
+        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires");
     }
-    // null means "the caller named the sentinel" — never "the caller forgot".
-    const allowed = grants.names === UNRESTRICTED_NAMES ? null : new Set(grants.names);
+    const allowed = new Set(grants.names);
     const localServices = grants.localServices ?? EMPTY_SET;
     const handlers = hostCatalog(platform, grants);
     return (name, payload, budget) => {
@@ -581,7 +573,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // `undefined` and is refused regardless of the gate.
         if (name.includes("/")) {
             const svc = serviceOf(name);
-            if (allowed && svc && !allowed.has(svc)) {
+            if (svc && !allowed.has(svc)) {
                 throw new Error("guest-seam: " + name + " not declared by the bundle manifest requires");
             }
             const fn = handlers[name];
