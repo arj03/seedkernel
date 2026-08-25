@@ -34,7 +34,7 @@ export const denyAll: Admit = () => false;
 export const admitAll: Admit = () => true;
 
 /** Refuse a written-off author key (§12.5). Runs before every other gate. */
-export const notRevoked: Admit = (v, ctx) => {
+const notRevoked: Admit = (v, ctx) => {
   if (ctx.revoked) {
     throw new Error(`bundle: author ${toHex(v.author)} is revoked on this host — refusing ${v.manifest.app} v${v.manifest.version}`);
   }
@@ -43,7 +43,7 @@ export const notRevoked: Admit = (v, ctx) => {
 
 /** Refuse a load below the persisted `(author, app)` high-water mark (§12.4).
  *  Equal versions reload. Transport uses the same ordinary mark. */
-export const freshVersion: Admit = (v, ctx) => {
+const freshVersion: Admit = (v, ctx) => {
   if (v.manifest.version < ctx.highWater) {
     throw new Error(`bundle: version ${v.manifest.version} is below the (author, app) freshness high-water mark ${ctx.highWater} — downgrade refused`);
   }

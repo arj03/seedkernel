@@ -33,7 +33,7 @@ type eventLoop struct {
 	settleInstalled map[*qjs.Context]bool
 	onSettle        func(kind int, bytes []byte, msg string)
 
-	// runGen tags each bounded run (awaitIn / runUntilSignal). A safety timer captures the
+	// runGen tags each bounded awaitIn run. A safety timer captures the
 	// gen it was armed under, so a late fire after a new run began is ignored.
 	runGen int64
 
@@ -147,12 +147,6 @@ func (el *eventLoop) install() {
 		}
 		return nil, nil
 	}))
-	// __signal flips the loop's stop flag; runUntilSignal-driven flows call it from JS.
-	// Installed once, so repeated runUntilSignal calls add no fresh callback.
-	g.SetPropertyStr("__signal", el.c.Function(func(t *qjs.This) (*qjs.Value, error) {
-		el.stopped = true
-		return nil, nil
-	}))
 	// queueMicrotask is not loop state but a missing Web global, so it lives with the rest
 	// of them in host/native-polyfills.ts.
 }
@@ -259,8 +253,8 @@ func (el *eventLoop) step(deadline time.Time, pump func(), until func() bool) {
 }
 
 // run drives the loop on the current goroutine until stopped, one step() per turn, pumping
-// every realm. awaitIn and runUntilSignal set up an exit signal that flips el.stopped and
-// then drive the loop through here.
+// every realm. Its callers set up an exit signal that flips el.stopped and then drive the
+// loop through here.
 func (el *eventLoop) run() {
 	for !el.stopped {
 		el.step(time.Time{}, el.pumpAll, func() bool { return el.stopped })
@@ -282,21 +276,6 @@ func (el *eventLoop) armSafety(timeout time.Duration, onFire func()) (stop func(
 		})
 	})
 	return safety.Stop
-}
-
-// runUntilSignal evaluates kick, then drives the loop until JS calls __signal() or the
-// safety timeout fires — for flows (a PeerLink handshake, the serve loop) that don't
-// reduce to a single awaitable promise.
-func (el *eventLoop) runUntilSignal(kick string, timeout time.Duration) error {
-	el.stopped = false
-	if _, err := el.c.Eval("<kick>", qjs.Code(kick)); err != nil {
-		return err
-	}
-	if !el.stopped && timeout > 0 {
-		defer el.armSafety(timeout, func() { el.stopped = true })()
-	}
-	el.run()
-	return nil
 }
 
 // await evaluates an async JS expression in the loop's primary context (el.c) and

@@ -252,49 +252,49 @@ func exposeFs(qc *qjs.Context) {
 	var fs *nodeFs
 	o := qc.NewObject()
 
-	o.SetPropertyStr("open", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		f, err := newNodeFs(argString(t, 0))
+	o.SetPropertyStr("open", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		f, err := newNodeFs(t.Args()[0].String())
 		if err != nil {
 			return nil, err // surfaces as a JS exception: an unusable --dir is fatal
 		}
 		fs = f
 		return t.Context().NewUndefined(), nil
 	}))
-	o.SetPropertyStr("get", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		b := fs.get(argString(t, 0))
+	o.SetPropertyStr("get", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		b := fs.get(t.Args()[0].String())
 		if b == nil {
 			return t.Context().NewNull(), nil
 		}
 		return t.Context().NewArrayBuffer(b), nil
 	}))
-	o.SetPropertyStr("put", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("put", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		b, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return nil, err // non-bytes arg throws, like NodeFs — not a silent empty write
 		}
-		if err := fs.put(argString(t, 0), b); err != nil {
+		if err := fs.put(t.Args()[0].String(), b); err != nil {
 			return nil, err // surfaces as a JS exception, like NodeFs writeFileSync
 		}
 		return t.Context().NewUndefined(), nil
 	}))
-	o.SetPropertyStr("size", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("size", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// NewInt64, not NewInt32: a ≥2 GiB file would wrap to a negative int32 and read
 		// back as the "missing" sentinel.
-		return t.Context().NewInt64(int64(fs.size(argString(t, 0)))), nil
+		return t.Context().NewInt64(int64(fs.size(t.Args()[0].String()))), nil
 	}))
-	o.SetPropertyStr("list", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("list", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		prefix := ""
 		if len(t.Args()) > 0 && !t.Args()[0].IsUndefined() && !t.Args()[0].IsNull() {
-			prefix = argString(t, 0)
+			prefix = t.Args()[0].String()
 		}
 		// One \n-joined string, split back by the shim: building a JS array here would
 		// cost an engine call plus a C string per key. The charset forbids '\n'.
 		return t.Context().NewString(strings.Join(fs.list(prefix), "\n")), nil
 	}))
-	o.SetPropertyStr("delete", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		return t.Context().NewBool(fs.delete(argString(t, 0))), nil
+	o.SetPropertyStr("delete", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		return t.Context().NewBool(fs.delete(t.Args()[0].String())), nil
 	}))
-	o.SetPropertyStr("stat", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("stat", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		s := t.Context().NewObject()
 		s.SetPropertyStr("used", t.Context().NewInt64(fs.stat()))
 		// -1: no portable free-disk figure; the shim maps it to FS_AVAILABLE_UNKNOWN

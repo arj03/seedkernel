@@ -81,14 +81,3 @@ func (m *wasmModule) put(b []byte) uint32 {
 	}
 	return p
 }
-
-// read copies n bytes out of the module's memory at p.
-func (m *wasmModule) read(p uint32, n int) []byte {
-	b, ok := m.mem.Read(p, uint32(n))
-	if !ok {
-		panic(fmt.Sprintf("%s: memory read out of range", m.name))
-	}
-	out := make([]byte, n)
-	copy(out, b)
-	return out
-}

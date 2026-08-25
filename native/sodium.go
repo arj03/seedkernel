@@ -33,7 +33,6 @@ var sodiumWasm []byte
 // real-name → minified-export map (and the two EM_JS entropy code addresses below) are
 // read from browser/libsodium-core.mjs — re-derive both if libsodium.wasm is rebuilt.
 type libsodium struct {
-	mod api.Module
 	mem api.Memory
 	fns map[string]api.Function
 	// One shared scratch heap and allocator, so an op is a malloc/call/read sequence that
@@ -64,18 +63,13 @@ var sd *libsodium // the process-wide libsodium instance (genesis verify + sodiu
 
 // real libsodium name → minified wasm export, for the pinned browser/libsodium.wasm.
 var sodiumExports = map[string]string{
-	"malloc":                               "Ee",
-	"free":                                 "Fe",
-	"sodium_init":                          "xe",
-	"crypto_generichash":                   "Ja",
-	"crypto_sign_detached":                 "wd",
-	"crypto_sign_verify_detached":          "xd",
-	"crypto_sign_keypair":                  "td",
-	"crypto_sign_seed_keypair":             "sd",
-	"crypto_sign_ed25519_pk_to_curve25519": "Cd",
-	"crypto_sign_ed25519_sk_to_curve25519": "Dd",
-	"crypto_box_seal":                      "za",
-	"crypto_box_seal_open":                 "Aa",
+	"malloc":                      "Ee",
+	"free":                        "Fe",
+	"sodium_init":                 "xe",
+	"crypto_sign_detached":        "wd",
+	"crypto_sign_verify_detached": "xd",
+	"crypto_sign_keypair":         "td",
+	"crypto_sign_seed_keypair":    "sd",
 	// One export covers the §12.6 AKE's X25519: the transport bundle reaches scalarmult
 	// through the guest seam's `x25519/dh` and derives its ephemeral PUBLIC key with the
 	// same entry against the base point — no keypair primitive to export.
@@ -89,8 +83,6 @@ const (
 	sodiumRandU32  = 40216 // ()->u32: one random word
 	sodiumRandInit = 40252 // ()->void: lazy RNG init (a no-op here)
 )
-
-const sealBytes = 48 // crypto_box_SEALBYTES (ephemeral pk 32 + MAC 16)
 
 // bootSodium wires the four emscripten host imports (module "a"), instantiates
 // libsodium.wasm, binds the exports used, and runs sodium_init — what libsodium-wrappers
@@ -141,7 +133,7 @@ func bootSodium(rt wazero.Runtime) *libsodium {
 	if err != nil {
 		panic(fmt.Sprintf("libsodium instantiate: %v", err))
 	}
-	s := &libsodium{mod: mod, mem: mod.Memory(), fns: map[string]api.Function{}}
+	s := &libsodium{mem: mod.Memory(), fns: map[string]api.Function{}}
 	for nm, min := range sodiumExports {
 		f := mod.ExportedFunction(min)
 		if f == nil {
@@ -297,59 +289,6 @@ func (s *libsodium) signSeedKeypair(seed []byte) (pk, sk []byte) {
 	return s.read(pkp, 32), s.read(skp, 64)
 }
 
-// edPkToCurve converts an Ed25519 public key to its X25519 counterpart. ok=false rather
-// than a panic on -1: the input is somebody ELSE's key and libsodium refuses one that is
-// not a canonical point — a data-dependent failure, not an invariant of ours. The output
-// is read only on success (the arena otherwise still holds the previous op's bytes).
-func (s *libsodium) edPkToCurve(edPk []byte) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(edPk)) + alignUp(32))
-	in, out := s.takeIn(edPk), s.take(32)
-	if s.call("crypto_sign_ed25519_pk_to_curve25519", uint64(out), uint64(in)) != 0 {
-		return nil, false
-	}
-	return s.read(out, 32), true
-}
-
-// edSkToCurve is the secret-key half; same contract (see edPkToCurve).
-func (s *libsodium) edSkToCurve(edSk []byte) ([]byte, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(edSk)) + alignUp(32))
-	in, out := s.takeIn(edSk), s.take(32)
-	if s.call("crypto_sign_ed25519_sk_to_curve25519", uint64(out), uint64(in)) != 0 {
-		return nil, false
-	}
-	return s.read(out, 32), true
-}
-
-func (s *libsodium) boxSeal(msg, curvePk []byte) []byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(msg)) + alignUp(len(curvePk)) + alignUp(len(msg)+sealBytes))
-	in, pkp, out := s.takeIn(msg), s.takeIn(curvePk), s.take(len(msg)+sealBytes)
-	lo, hi := lenArgs(len(msg))
-	s.mustCall("crypto_box_seal", uint64(out), uint64(in), lo, hi, uint64(pkp))
-	return s.read(out, len(msg)+sealBytes)
-}
-
-func (s *libsodium) boxSealOpen(ct, curvePk, curveSk []byte) ([]byte, bool) {
-	if len(ct) < sealBytes {
-		return nil, false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.arenaReset(alignUp(len(ct)) + alignUp(len(curvePk)) + alignUp(len(curveSk)) + alignUp(len(ct)-sealBytes))
-	cp, pkp, skp := s.takeIn(ct), s.takeIn(curvePk), s.takeIn(curveSk)
-	out := s.take(len(ct) - sealBytes)
-	lo, hi := lenArgs(len(ct))
-	if s.call("crypto_box_seal_open", uint64(out), uint64(cp), lo, hi, uint64(pkp), uint64(skp)) != 0 {
-		return nil, false
-	}
-	return s.read(out, len(ct)-sealBytes), true
-}
-
 // ── §12.6 transport AKE primitives ──
 
 // scalarmult computes the X25519 shared point q = n·p. Against the base point it is also
@@ -403,13 +342,11 @@ func (s *libsodium) aeadDecrypt(ct, npub, key []byte) ([]byte, bool) {
 // code consumes is `wrapNativeSodium` in host/native-shim.ts, where it is typechecked
 // against `ShellSodium`.
 //
-// Only what JS actually reaches is registered. The curve25519 conversions and
-// crypto_box_seal have no caller above this seam (sodium_test.go exercises them directly),
-// so they are not published into the realm.
+// Only what JS actually reaches is registered.
 func exposeSodium(qc *qjs.Context, s *libsodium) {
 	o := qc.NewObject()
 
-	o.SetPropertyStr("crypto_generichash", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_generichash", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// crypto_generichash(hashLength, message, key?): the native blake2b shim computes
 		// only the UNKEYED hash, so a key arg would be silently dropped — a plain hash
 		// where libsodium computes a MAC.
@@ -420,38 +357,38 @@ func exposeSodium(qc *qjs.Context, s *libsodium) {
 		}
 		return bytesAB(t, s.genericHash(int(t.Args()[0].Int32()), argBytes(t, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		return bytesAB(t, s.signDetached(argBytes(t, 0), argBytes(t, 1))), nil
 	}))
-	o.SetPropertyStr("crypto_sign_verify_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_verify_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(s.verifyDetached(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_scalarmult", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_scalarmult", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		q, ok := s.scalarmult(argBytes(t, 0), argBytes(t, 1))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}
 		return bytesAB(t, q), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_encrypt", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		return bytesAB(t, s.aeadEncrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
-	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_aead_chacha20poly1305_ietf_decrypt", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		pt, ok := s.aeadDecrypt(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))
 		if !ok {
 			return t.Context().NewNull(), nil
 		}
 		return bytesAB(t, pt), nil
 	}))
-	o.SetPropertyStr("crypto_sign_keypair", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_keypair", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		pk, skv := s.signKeypair()
 		return keypairObj(t.Context(), pk, skv), nil
 	}))
-	o.SetPropertyStr("crypto_sign_seed_keypair", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("crypto_sign_seed_keypair", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		pk, skv := s.signSeedKeypair(argBytes(t, 0))
 		return keypairObj(t.Context(), pk, skv), nil
 	}))
-	o.SetPropertyStr("randombytes_buf", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("randombytes_buf", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		b := make([]byte, t.Args()[0].Int32())
 		crand.Read(b)
 		return bytesAB(t, b), nil

@@ -135,38 +135,3 @@ func TestSodiumSign(t *testing.T) {
 		t.Fatal("verify accepted a tampered message")
 	}
 }
-
-// Random keypair → ed25519→curve25519 → sealed-box round trip. This is the path
-// that exercises the wasm RNG (crypto_sign_keypair and crypto_box_seal both draw
-// from randombytes, routed through the asm-const entropy import).
-func TestSodiumSealedBox(t *testing.T) {
-	s := newSodium(t)
-	pk, sk := s.signKeypair()
-	if len(pk) != 32 || len(sk) != 64 {
-		t.Fatalf("keypair sizes: pk=%d sk=%d", len(pk), len(sk))
-	}
-	cpk, okPk := s.edPkToCurve(pk)
-	csk, okSk := s.edSkToCurve(sk)
-	if !okPk || !okSk {
-		t.Fatalf("ed→curve conversion refused a fresh keypair: pk=%v sk=%v", okPk, okSk)
-	}
-
-	msg := []byte("a sealed secret for the holder")
-	ct := s.boxSeal(msg, cpk)
-	if len(ct) != len(msg)+sealBytes {
-		t.Fatalf("seal length = %d, want %d", len(ct), len(msg)+sealBytes)
-	}
-	if bytes.Contains(ct, msg) {
-		t.Fatal("ciphertext leaks plaintext")
-	}
-	pt, ok := s.boxSealOpen(ct, cpk, csk)
-	if !ok || !bytes.Equal(pt, msg) {
-		t.Fatalf("seal_open: ok=%v pt=%q", ok, pt)
-	}
-	pk2, sk2 := s.signKeypair()
-	cpk2, _ := s.edPkToCurve(pk2)
-	csk2, _ := s.edSkToCurve(sk2)
-	if _, ok := s.boxSealOpen(ct, cpk2, csk2); ok {
-		t.Fatal("seal_open succeeded under the wrong keypair")
-	}
-}

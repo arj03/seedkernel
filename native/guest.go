@@ -67,7 +67,7 @@ type initiatorCall struct{ onDone, onFail *qjs.Value }
 // realm, call into it, settle a parked op, dispose. This is the whole of Go's involvement
 // with a guest — no guest seam, no preamble assembly, no bundle facts, no dispatch.
 func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
-	b.SetPropertyStr("createRealm", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("createRealm", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		mem := uint64(t.Args()[2].Int64())
 		if mem == 0 {
 			// A 0 is a caller that forgot, and an unbounded realm is a confinement hole.
@@ -90,7 +90,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		realms[realmSeq] = g
 		return t.Context().NewInt64(realmSeq), nil
 	}))
-	b.SetPropertyStr("realmCall", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmCall", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		g := realms[t.Args()[0].Int64()]
 		if g == nil {
 			return nil, fmt.Errorf("realmCall: no such realm")
@@ -105,7 +105,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		}
 		return t.Context().NewInt64(int64(deferred)), nil
 	}))
-	b.SetPropertyStr("realmSettle", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmSettle", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// A settlement for a disposed realm is a no-op: the Transport promise behind it
 		// outlives an uninstall.
 		g := realms[t.Args()[0].Int64()]
@@ -125,7 +125,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		g.settleNet(callID, bytes, "")
 		return nil, nil
 	}))
-	b.SetPropertyStr("realmDispose", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("realmDispose", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		id := t.Args()[0].Int64()
 		if g := realms[id]; g != nil {
 			delete(realms, id)
@@ -150,7 +150,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
 		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		hostCalls: make(map[int64]struct{}),
-		budget: budget, maxOutstandingHostCalls: maxOutstandingHostCalls,
+		budget:    budget, maxOutstandingHostCalls: maxOutstandingHostCalls,
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -232,7 +232,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		return nil, nil
 	}))
 
-	if _, err := g.qc.Eval("guest-preamble.js", qjs.Code(hostGuestPreamble(hostQc))); err != nil {
+	if _, err := g.qc.Eval("guest-preamble.js", qjs.Code(hostFnString(hostQc, "guestPreamble"))); err != nil {
 		return fail(fmt.Errorf("guest preamble: %w", err))
 	}
 	// Guest top-level code is execution just like an entrypoint. Run it under one fresh
@@ -249,13 +249,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	g.netResolve = g.qc.Global().GetPropertyStr("__netResolve")
 	g.netReject = g.qc.Global().GetPropertyStr("__netReject")
 	return g, nil
-}
-
-// hostGuestPreamble asks the host realm for guestPreamble() — the guest-side ABI over the
-// one seam. Fetched rather than restated: one guest.js runs byte-identical on every
-// target, and the preamble is a contract with signed content, not a per-target detail.
-func hostGuestPreamble(hostQc *qjs.Context) string {
-	return hostFnString(hostQc, "guestPreamble")
 }
 
 // hostFnString asks the host realm for one zero-argument string-valued export

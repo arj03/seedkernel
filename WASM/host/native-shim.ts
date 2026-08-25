@@ -601,4 +601,4 @@ globalThis.__start = function (id, arg) {
 // What Go reaches by name in the realm. `createRealm` and the transport helpers are here
 // for the native tests as much as for the boot above, so a test that stands up a guest or
 // a second node drives the very factories production does.
-export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransport, embeddedTransportAuthor, makeTransportNode, };
+export { runMain, loadBundleFile, openStore, bootNode, setPolicy, createRealm, guestDriver, embeddedTransportAuthor, makeTransportNode, };

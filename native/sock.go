@@ -54,14 +54,14 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 
 	// One socket kind: a raw byte duplex. Which codec runs over it is the transport
 	// bundle's business, never Go's.
-	o.SetPropertyStr("connect", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("connect", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return t.Context().NewInt64(0), nil // 0 is never a live id (get → nil)
 		}
 		addr := net.JoinHostPort(t.Args()[0].String(), strconv.Itoa(int(t.Args()[1].Int32())))
 		return t.Context().NewInt64(n.dial(addr)), nil
 	}))
-	o.SetPropertyStr("listen", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("listen", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return t.Context().NewInt32(-1), nil // -1: the shim throws on a failed bind
 		}
@@ -71,7 +71,7 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return t.Context().NewInt32(int32(bound)), nil
 	}))
-	o.SetPropertyStr("send", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("send", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 2 {
 			return nil, nil
 		}
@@ -85,11 +85,11 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return nil, nil
 	}))
-	o.SetPropertyStr("closeListeners", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("closeListeners", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		n.closeListeners()
 		return nil, nil
 	}))
-	o.SetPropertyStr("close", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("close", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if len(t.Args()) < 1 {
 			return nil, nil
 		}
@@ -187,8 +187,8 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				if errors.Is(err, net.ErrClosed) {
 					return // listener closed (closeListeners) — release the goroutine
 				}
-			// Anything else is this process's condition (descriptor exhaustion, a reset
-			// between SYN and accept): pause and keep serving, not retire the port.
+				// Anything else is this process's condition (descriptor exhaustion, a reset
+				// between SYN and accept): pause and keep serving, not retire the port.
 				time.Sleep(acceptErrBackoff)
 				continue
 			}

@@ -337,7 +337,7 @@ func exposeBridge(qc *qjs.Context) {
 	// ── private module slots (§3) ──
 	// One transactional build of an opaque slot's module set. The §4.1 scratch default
 	// arrives from the shared host rather than Go owning a copy of it.
-	b.SetPropertyStr("buildModules", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("buildModules", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		slot := t.Args()[0].String()
 		mods := t.Args()[1]
 		lenv := mods.GetPropertyStr("length")
@@ -364,7 +364,7 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewNull(), nil
 	}))
-	b.SetPropertyStr("callModule", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("callModule", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		pl, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
 			return t.Context().NewNull(), nil
@@ -375,14 +375,14 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewArrayBuffer(resp), nil
 	}))
-	b.SetPropertyStr("disposeModules", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("disposeModules", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewInt64(int64(disposeModuleSlot(t.Args()[0].String()))), nil
 	}))
 
 	// ── the operator's world (host/cli.ts) ──
 	// Files, arguments and stdout: which files get read and what gets printed is the
 	// shared CLI's, the same module the Node shell runs.
-	b.SetPropertyStr("argv", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("argv", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// JSON rather than a joined string: an argument may contain any byte, including
 		// whatever separator a join would pick.
 		j, err := json.Marshal(os.Args[1:])
@@ -391,8 +391,8 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewString(string(j)), nil
 	}))
-	b.SetPropertyStr("readFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
-		fb, err := os.ReadFile(argString(t, 0))
+	b.SetPropertyStr("readFile", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		fb, err := os.ReadFile(t.Args()[0].String())
 		if err != nil {
 			// Only absence maps to null. Permission errors, directories and I/O failures
 			// must remain visible to guard-bearing callers such as the freshness store.
@@ -403,31 +403,31 @@ func exposeBridge(qc *qjs.Context) {
 		}
 		return t.Context().NewArrayBuffer(fb), nil
 	}))
-	b.SetPropertyStr("writeFile", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("writeFile", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		bytes, err := qjs.JsTypedArrayToGo(t.Args()[1])
 		if err != nil {
 			return nil, err
 		}
 		// Atomic for every caller: a truncated freshness file must never replace the last
 		// readable guard state (and is refused on read if one exists out of band).
-		if err := writeFileAtomic(argString(t, 0), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
+		if err := writeFileAtomic(t.Args()[0].String(), bytes, ".seedkernel-", os.FileMode(t.Args()[2].Int64())); err != nil {
 			return nil, err
 		}
 		return t.Context().NewUndefined(), nil
 	}))
-	b.SetPropertyStr("log", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("log", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// The realm's console.log writes to a WASI stdout wazero leaves disconnected, so
 		// operator output returns via stderr — stdout is `--op`'s raw data channel.
-		fmt.Fprintln(os.Stderr, argString(t, 0))
+		fmt.Fprintln(os.Stderr, t.Args()[0].String())
 		return t.Context().NewUndefined(), nil
 	}))
-	b.SetPropertyStr("logErr", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("logErr", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// Diagnostics — every `console.*` in the host realm (host/native-polyfills.ts).
 		// Stderr for the same reason as `log` above.
-		fmt.Fprintln(os.Stderr, argString(t, 0))
+		fmt.Fprintln(os.Stderr, t.Args()[0].String())
 		return t.Context().NewUndefined(), nil
 	}))
-	b.SetPropertyStr("stdout", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("stdout", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		bytes, err := qjs.JsTypedArrayToGo(t.Args()[0])
 		if err != nil {
 			return nil, err
@@ -435,7 +435,7 @@ func exposeBridge(qc *qjs.Context) {
 		os.Stdout.Write(bytes)
 		return t.Context().NewUndefined(), nil
 	}))
-	b.SetPropertyStr("stdin", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	b.SetPropertyStr("stdin", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		// `--op`'s argument, read whole; cli.ts calls this lazily, so a serving node never
 		// waits on stdin. A read error answers the same as an empty pipe.
 		bytes, err := io.ReadAll(os.Stdin)

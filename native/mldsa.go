@@ -77,7 +77,7 @@ func (m *mldsa) verifyDetached(sig, msg, pk []byte) bool {
 // feature-detects on exactly this method: absent, it refuses suite 0x02 bundles rather
 // than falling back to the Ed25519 half alone.
 func exposeMlDsa(qc *qjs.Context, o *qjs.Value, m *mldsa) {
-	o.SetPropertyStr("ml_dsa65_verify_detached", bridgeFn(qc, func(t *qjs.This) (*qjs.Value, error) {
+	o.SetPropertyStr("ml_dsa65_verify_detached", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		return t.Context().NewBool(m.verifyDetached(argBytes(t, 0), argBytes(t, 1), argBytes(t, 2))), nil
 	}))
 }
