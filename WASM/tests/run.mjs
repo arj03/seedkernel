@@ -770,8 +770,9 @@ async function testGuestSeam() {
     let verifyThrew = false;
     try { await seam("node/verify", concatBytes([id.publicKey, sig.slice(0, 63)])); } catch { verifyThrew = true; }
     assert(verifyThrew, "node/verify refuses a short payload rather than answering 0 (mis-framed ≠ invalid)");
-    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, preimage])))[0], 1, "crypto/ed25519/verify accepts the scoped preimage — the raw primitive node/verify wraps");
-    assertEqual((await prim("ed25519/verify", concatBytes([id.publicKey, sig, U(9, 9)])))[0], 0, "crypto/ed25519/verify rejects a forged message");
+    let rawVerifyRefused = false;
+    try { await prim("ed25519/verify", new Uint8Array(0)); } catch { rawVerifyRefused = true; }
+    assert(rawVerifyRefused, "crypto/ed25519/verify is host-internal — guests use scoped node/verify");
     for (const removed of ["xchacha20/xor", "ml-kem-768/keypair", "ml-kem-768/encaps", "ml-kem-768/decaps"]) {
       let refused = false;
       try { await prim(removed, new Uint8Array(0)); } catch { refused = true; }

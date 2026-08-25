@@ -24,7 +24,6 @@ export const AUTHOR_MLDSA_SEED_LABEL = domain("seedkernel-author-mldsa-v1");
  *  host itself already carries and calls the same implementation. */
 export const HOST_TRANSFORM_NAMES = [
     "blake2b-256",
-    "ed25519/verify",
     "chacha20poly1305-ietf/seal",
     "chacha20poly1305-ietf/open",
     "x25519/dh",

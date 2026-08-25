@@ -186,15 +186,6 @@ type SeamHandler = (payload: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 function hostTransforms(sodium: SeamCrypto): Record<CryptoName, SeamHandler> {
     return {
         "crypto/blake2b-256": (a) => sodium.crypto_generichash(32, a),
-        "crypto/ed25519/verify": (a) => {
-            const pk = a.slice(0, 32), sig = a.slice(32, 96), msg = a.slice(96);
-            try {
-                return sodium.crypto_sign_verify_detached(sig, msg, pk) ? ONE : ZERO;
-            }
-            catch {
-                return ZERO;
-            }
-        },
         "crypto/chacha20poly1305-ietf/seal": (a) => sodium.crypto_aead_chacha20poly1305_ietf_encrypt(a.slice(44), null, null, a.slice(0, 12), a.slice(12, 44)),
         "crypto/chacha20poly1305-ietf/open": (a) => {
             try {

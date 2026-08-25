@@ -38,10 +38,8 @@ func TestGuestSeamOps(t *testing.T) {
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__other = sodium.crypto_sign_keypair();
 		// What node/sign signs under is a SLOT-derived scope — domain, scope bytes and
-		// the key that signs, all three. __scopeBytes is the middle third, which this
-		// test rebuilds the raw preimage from to prove node/verify applies it.
+		// the key that signs, all three.
 		globalThis.__scope = appSignScope(__id, __id.publicKey, "testapp");
-		globalThis.__scopeBytes = guestSignScope(__id.publicKey, "testapp");
 		__buildGuestSeam(["node", "fs", "clock"], __id, null, __scope);
 	`)); err != nil {
 		t.Fatal("build seam:", err)
@@ -119,20 +117,10 @@ func TestGuestSeamOps(t *testing.T) {
 	if v := callBytes(nameVerify, verifyEmpty); len(v) != 1 || v[0] != 1 {
 		t.Fatalf("node/verify(empty msg) = %v, want [1]", v)
 	}
-	// The raw message must NOT verify — proof the signature is bound to the scope, and
-	// that node/verify has no raw mode: the same [pk][sig][msg] fed to the raw
-	// primitive answers 0, where the scoped name answered 1.
-	verifyRaw := append(append(append([]byte{}, pk...), sig...), msg...)
-	if v := callBytes("crypto/ed25519/verify", verifyRaw); len(v) != 1 || v[0] != 0 {
-		t.Fatalf("crypto/ed25519/verify(raw msg) = %v, want [0] (node/verify is the scoped wrapper)", v)
-	}
-	// node/verify is exactly the raw primitive over the scoped preimage: rebuild the
-	// preimage from the slot-derived scope and the raw primitive answers 1 too.
-	scope := jsBytes(t, qc, `__scopeBytes`)
-	preimage := append(append(append([]byte{}, []byte("seedkernel-guest-sig-v1\x00")...), scope...), msg...)
-	verifyPreimage := append(append(append([]byte{}, pk...), sig...), preimage...)
-	if v := callBytes("crypto/ed25519/verify", verifyPreimage); len(v) != 1 || v[0] != 1 {
-		t.Fatalf("crypto/ed25519/verify(scoped preimage) = %v, want [1]", v)
+	// Raw Ed25519 verification is host-internal. Guests get only node/verify, whose
+	// scope is supplied by the host rather than reconstructed in guest bytes.
+	if err := refused("crypto/ed25519/verify", nil); err == nil {
+		t.Fatal("crypto/ed25519/verify was exposed, want unknown host transform")
 	}
 
 	// fs/put then fs/get: content-addressed round trip. Both AWAIT — fs round-trips at
