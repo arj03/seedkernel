@@ -121,10 +121,15 @@ class ReqRes {
 
   /** Bytes of ours that have actually left for this peer: everything handed over, less
    *  what its links are still holding. Flat while the wire is not moving.
-   *  Async: link/stat answers a Promise like every seam call. */
+   *  Async: link/stat answers a Promise like every seam call, so the reads FAN OUT —
+   *  one round trip for the peer rather than one per link. The ids are taken in this
+   *  turn, before the first await: the pool is live, and a link retired mid-read would
+   *  otherwise shorten the array being walked and skip a sibling's backlog. */
   async flushed(to) {
+    const ids = router.linksTo(to).map((link) => link.linkId);
+    const held = await Promise.all(ids.map((id) => netLinkBuffered(id)));
     let buffered = 0;
-    for (const link of router.linksTo(to)) buffered += await netLinkBuffered(link.linkId);
+    for (const n of held) buffered += n;
     return (this.sent.get(to) || 0) - buffered;
   }
 
