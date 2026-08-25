@@ -20,10 +20,6 @@
       "types": "./build/host/net-ws.d.ts",
       "default": "./build/host/net-ws.js"
     },
-    "./net-rtc-node": {
-      "types": "./build/host/net-rtc-node.d.ts",
-      "default": "./build/host/net-rtc-node.js"
-    },
     "./fs": {
       "types": "./build/core/fs.d.ts",
       "default": "./build/core/fs.js"
@@ -97,8 +93,7 @@
   },
   "dependencies": {
     "libsodium-wrappers": "0.8.4",
-    "quickjs-emscripten-core": "^0.32.0",
-    "werift": "^0.23.0"
+    "quickjs-emscripten-core": "^0.32.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

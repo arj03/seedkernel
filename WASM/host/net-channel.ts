@@ -102,9 +102,9 @@ export abstract class BufferedChannel {
 }
 
 /** The minimal view of a message-oriented transport that MessageChannel wraps: a
- *  browser WebSocket and an RTCDataChannel (browser or the werift facade in
- *  net-rtc-node) both deliver whole ordered binary messages and expose
- *  binaryType/bufferedAmount. */
+ *  browser WebSocket and an RTCDataChannel both deliver whole ordered binary
+ *  messages and expose binaryType/bufferedAmount. It is the whole contract a
+ *  console peer's own peer-connection implementation has to satisfy. */
 export interface MessageTransport {
     binaryType: string;
     /** Bytes queued but not yet on the wire — the stall clock's progress signal
@@ -112,7 +112,8 @@ export interface MessageTransport {
      *  object in a test double reports it. */
     bufferedAmount?: number;
     /** The send accepted by every real transport here (DOM WebSocket and
-     *  RTCDataChannel both take any of these shapes; werift takes a Uint8Array). */
+     *  RTCDataChannel both take any of these shapes; an off-browser data channel
+     *  may accept only a Uint8Array, which is what this class always sends). */
     send(data: string | ArrayBufferView | ArrayBuffer | Blob): void;
     close(): void;
     addEventListener(type: "open" | "close" | "error", cb: () => void): void;

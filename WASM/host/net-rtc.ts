@@ -12,8 +12,9 @@
 // can never complete AUTH without the peer's private key, so the link never authenticates.
 //
 // Browser-native, but the globals are referenced only inside RtcNetwork / relaySignaling, so
-// importing this under Node is safe — a console peer joins the same mesh with a
-// werift-backed `peerConnectionFactory` (./net-rtc-node).
+// importing this under Node is safe — a console peer joins the same mesh by passing its own
+// `peerConnectionFactory`. That implementation is the app's: the kernel owes openLink a byte
+// duplex and owns the seam, not any one ICE/DTLS stack behind it.
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { FRAMING, type PeerId } from "../core/socket-seam.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
@@ -56,8 +57,8 @@ export interface RtcNetworkOptions {
     /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
     rtcConfig?: RTCConfiguration;
     /** Factory for the underlying RTCPeerConnection. Defaults to the platform global; a
-     *  Node/Bun console node passes a werift-backed one (./net-rtc-node) so this exact
-     *  stack runs off-browser. */
+     *  Node/Bun console node supplies its own (a pure-JS WebRTC library wrapped to the
+     *  W3C surface used here) so this exact stack runs off-browser. */
     peerConnectionFactory?: (config?: RTCConfiguration) => RTCPeerConnection;
     /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
      *  admits every peer to the rendezvous; the in-channel peer lint (the
