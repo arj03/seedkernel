@@ -150,16 +150,16 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,419 LOC)**
+**Shared — compiled once, run by all three targets (2,417 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
 | Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 608 |
-| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 431 |
+| Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 430 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 391 |
 | Shell and protocol routing (§12.10) | `host/shell-core.ts` | 433 |
 | Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 216 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, the host-call names, the app-facing op envelope | `core/*.ts` (8 files) | 340 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, the host-call names, the app-facing op envelope | `core/*.ts` (8 files) | 339 |
 
 **Four reasons a row is shared**, and which reason applies decides whether it could ever leave the set:
 
@@ -175,7 +175,7 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, manifest-verifier plumbing, entry points, key derivation | 1,410 TS |
 | **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (378) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 1,961 Go + 471 TS |
 
-What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,544 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
+What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it lands in the driver's `openLink` and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,543 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
 Each target therefore runs the same shared host over its own plumbing, and nothing on the wire is any of it. The host artifact carries `libsodium.wasm` core and `mldsa65.wasm`, the `0x02` manifest verifier. `mlkem768.wasm` is byte-identical across targets too, but it arrives inside the signed transport bundle and is instantiated by the ordinary private-module loader. The Go platform embeds the two host artifacts, owns an event loop, and drives them over wazero; it is a bridge, not a second runtime — no manifest verification, routing or policy logic lives in Go.
 

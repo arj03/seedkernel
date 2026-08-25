@@ -21,9 +21,6 @@ const connected = new Set();
 // Every literal below is what INIT overwrites — the bounds belong to whoever owns the
 // resource (net-limits.ts, core); this module only applies them.
 let maxFrameBytes = 2 * 1024 * 1024;
-// The pre-auth cap, applied HERE because on an unframed link the host holds a byte
-// duplex and has no frames to measure — we impose the boundaries.
-let maxHandshakeFrameBytes = 8 * 1024;
 let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256, maxAuthed = 256;
 // How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
 let linkIdleTimeoutMs = 0;
@@ -358,7 +355,6 @@ entry("init", (r) => {
   maxVerified = r.u32();
   maxAuthed = r.u32();
   maxFrameBytes = r.u32();
-  maxHandshakeFrameBytes = r.u32();
   requestDeadlineMs = r.u32();
   linkIdleTimeoutMs = r.u32();
   // An empty list means "admit everyone", said as a zero-length blob rather than a

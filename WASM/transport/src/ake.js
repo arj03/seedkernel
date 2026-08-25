@@ -547,7 +547,7 @@ class Link {
       // boundaries already on it — but the two-stage cap is about how much a peer may
       // make us HOLD, not about who framed it. Without this, one huge message takes the
       // realm down.
-      if (bytes.length > (this.authed ? maxFrameBytes : maxHandshakeFrameBytes)) { this.abort(true); return Promise.resolve(null); }
+      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(null); }
       // Same shape as the framer path below: the caller gets a COUNT-PREFIXED delivery
       // frame (or null), never the bare record.
       return this.enqueue(() => this.onMessage(bytes))

@@ -3,7 +3,7 @@
 
 
 import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
-import { MAX_FRAME_BYTES, MAX_HANDSHAKE_FRAME_BYTES } from "../core/net-limits.js";
+import { MAX_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type RawNet } from "./guest-seam.js";
 
@@ -295,7 +295,6 @@ export class TransportHost {
       .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
       .u32(o.maxAuthedLinks ?? DEFAULT_MAX_AUTHED_LINKS)
       .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
-      .u32(MAX_HANDSHAKE_FRAME_BYTES)
       .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
       .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
       .blob(admit.build())

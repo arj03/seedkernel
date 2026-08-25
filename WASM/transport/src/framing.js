@@ -2,6 +2,10 @@
 // [len u32 BE][bytes]; WS/RTC already have message boundaries. Two-stage cap:
 // handshake bound pre-auth, MAX_FRAME_BYTES once admitted.
 
+/** Pre-auth frame cap. 8 KiB leaves room for the suite's ML-KEM-768 encapsulation
+ *  key (1184 B); unlike the platform ceiling, this is transport-bundle content. */
+const MAX_HANDSHAKE_FRAME_BYTES = 8 * 1024;
+
 // ── inbound byte assembly ─────────────────────────────────────────────────────
 //
 // A link message arrives in arbitrarily small slices. Merge slices below MERGE_BELOW
@@ -95,7 +99,7 @@ class LengthFramer {
   constructor(put) {
     this.put = put;
     this.parts = new ByteParts();
-    this.cap = maxHandshakeFrameBytes;
+    this.cap = MAX_HANDSHAKE_FRAME_BYTES;
   }
 
   send(msg) {
@@ -151,7 +155,7 @@ class WsFramer {
   constructor(put, weDialed, authority) {
     this.put = put;
     this.client = weDialed;
-    this.cap = maxHandshakeFrameBytes;
+    this.cap = MAX_HANDSHAKE_FRAME_BYTES;
     this.parts = new ByteParts();      // inbound: handshake head, then frames
     this.queue = [];                   // outbound, until the upgrade completes
     this.open = false;
