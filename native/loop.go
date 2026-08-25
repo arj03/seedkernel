@@ -9,6 +9,7 @@ package main
 import (
 	"container/heap"
 	"fmt"
+	"os"
 	"time"
 
 	"seedloader/qjs"
@@ -181,7 +182,7 @@ func (el *eventLoop) armTimer(d time.Duration) <-chan time.Time {
 // callJS invokes a retained JS callback with no arguments (timer / deferred work).
 func (el *eventLoop) callJS(cb *qjs.Value) {
 	if _, err := el.c.Invoke(cb, el.c.NewUndefined()); err != nil {
-		fmt.Println("eventLoop: callback error:", err)
+		fmt.Fprintln(os.Stderr, "eventLoop: callback error:", err)
 	}
 }
 

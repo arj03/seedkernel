@@ -10,6 +10,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"seedloader/qjs"
@@ -49,6 +50,9 @@ type guestRealm struct {
 	// nobody's budget (a tight budget would kill an initiator parked on a slow request).
 	budget   time.Duration
 	consumed time.Duration
+	// End of the currently-running segment. The host-call bridge reads this while guest
+	// code is on the stack so a module inherits the caller's live remainder.
+	segmentDeadline time.Time
 	// dead is set when a budget kill terminated the wasm module: wazero closes the module
 	// rather than unwinding one call, so the realm cannot be reused — recovery is a fresh
 	// realm, and later calls are refused rather than panicking on a freed handle.
@@ -173,7 +177,8 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 
 	// The single seam. Read (name, callId, payload) from the guest and shuttle it to the
 	// host-realm guest seam: every call parks — the shim answers null — and the preamble's
-	// Promise under callId is settled by realmSettle when the seam's promise lands.
+	// Promise under callId is settled by realmSettle when the seam's promise lands. The
+	// fourth host argument is this segment's live module deadline; -1 means unbounded.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		if g.outstandingHostCalls >= g.maxOutstandingHostCalls {
 			return nil, fmt.Errorf("guest: too many outstanding host calls (cap %d)", g.maxOutstandingHostCalls)
@@ -187,10 +192,17 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		nv := hostQc.NewString(t.Args()[0].String())
 		pv := hostQc.NewArrayBuffer(payload)
 		callID := t.Args()[1].Int64()
+		deadlineMs := int64(-1)
+		if !g.segmentDeadline.IsZero() {
+			deadlineMs = time.Until(g.segmentDeadline).Milliseconds()
+			if deadlineMs < 0 {
+				deadlineMs = 0
+			}
+		}
 		g.outstandingHostCalls++
 		g.hostCalls[callID] = struct{}{}
 		res, err := hostQc.Invoke(g.hostCall, hostQc.NewUndefined(),
-			nv, pv, hostQc.NewInt64(callID))
+			nv, pv, hostQc.NewInt64(callID), hostQc.NewInt64(deadlineMs))
 		pv.Free()
 		nv.Free()
 		if err != nil {
@@ -319,8 +331,13 @@ func (g *guestRealm) within(fn func() (*qjs.Value, error)) (v *qjs.Value, err er
 	}
 	restore := g.rt.Budget(remaining)
 	start := time.Now()
+	g.segmentDeadline = time.Time{}
+	if remaining > 0 {
+		g.segmentDeadline = start.Add(remaining)
+	}
 	defer func() {
 		g.consumed += time.Since(start)
+		g.segmentDeadline = time.Time{}
 		restore()
 	}()
 	v, err = fn()
@@ -468,7 +485,7 @@ func (g *guestRealm) reportCall(cb *qjs.Value, arg *qjs.Value) {
 		res.Free()
 	}
 	if err != nil {
-		fmt.Println("guest: call settlement error:", err)
+		fmt.Fprintln(os.Stderr, "guest: call settlement error:", err)
 	}
 	// Settling a host promise only queues a host microtask, and pumpAll pumps the host
 	// realm first — so the reaction (possibly the realm's next queued entrypoint,

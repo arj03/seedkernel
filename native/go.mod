@@ -16,8 +16,7 @@ require golang.org/x/sys v0.46.0 // indirect
 // runtime cost percent rather than multiples — see module_bound_bench_test.go.
 //
 // Fetched from the fork rather than a working copy: a bound only this machine can build is
-// a bound nobody has, and the flag it backs (SEEDKERNEL_MODULE_DEADLINE_MS) stays opt-in
-// until anyone can `go build` it. A path replace made that impossible to check out and
+// a bound nobody has. A path replace made that impossible to check out and
 // verify. Pinned to a commit rather than a branch so a fork push cannot change what this
 // builds; drop the replace entirely if the change lands upstream.
 replace github.com/tetratelabs/wazero => github.com/arj03/wazero v0.0.0-20260816133253-a01f823c77d3

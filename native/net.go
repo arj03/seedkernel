@@ -12,14 +12,7 @@ import (
 	"time"
 )
 
-// sendQueueLimit caps the bytes a channel buffers for its writer goroutine. The JS
-// protocol acks even bulk chunks, so a healthy link's queue stays a few messages deep;
-// hitting the cap means the peer has stopped draining, and the channel fails rather than
-// buffering without bound. 2× core/net-limits.ts's MAX_FRAME_BYTES so one max-size frame
-// always fits.
-const sendQueueLimit = 4 << 20
-
-// closeGrace bounds how long a deliberate close() lets the writer flush queued sends (a
+// closeGrace bounds how long a graceful close() lets the writer flush queued sends (a
 // PeerLink rejection, a WS close frame), so a wedged peer cannot pin the writer forever.
 const closeGrace = 5 * time.Second
 
@@ -57,7 +50,8 @@ func dialTCP(addr string) (net.Conn, error) {
 // ownership of its slice; onMsg likewise hands the callee a fresh slice it owns.
 type rawChannel interface {
 	send(bytes []byte)
-	close()
+	buffered() int
+	close(graceful bool)
 }
 
 // ── sockChannel: the connection core ───────────────────────────────────────────
@@ -75,7 +69,7 @@ type sockChannel struct {
 	mu     sync.Mutex
 	conn   net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
 	queue  [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
-	queued int      // bytes held in queue — the sendQueueLimit accounting
+	queued int      // bytes held in queue, reported to the transport's stall clock
 	dead   bool
 
 	wake chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
@@ -123,14 +117,6 @@ func (c *sockChannel) send(bytes []byte) {
 		c.mu.Unlock()
 		return
 	}
-	if c.queued+len(bytes) > sendQueueLimit {
-		c.mu.Unlock()
-		// The peer has stopped draining: fail rather than buffer forever. On its own
-		// goroutine, because send runs on the loop goroutine and fail's onClose posts to
-		// the possibly-full el.tasks, which only the loop drains.
-		go c.fail()
-		return
-	}
 	c.queue = append(c.queue, bytes)
 	c.queued += len(bytes)
 	c.mu.Unlock()
@@ -139,6 +125,15 @@ func (c *sockChannel) send(bytes []byte) {
 	// the frame hits the wire now, overlapping the sender's JS turn — ~10% round-trip
 	// latency on the Net benches. A hint only: correctness never depends on it.
 	runtime.Gosched()
+}
+
+// buffered is the transport-owned stall clock's view of this socket: bytes accepted from
+// the guest but not yet handed to conn.Write. The bundle decides how much queued progress
+// is acceptable; this primitive only reports the fact.
+func (c *sockChannel) buffered() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.queued
 }
 
 // signal nudges the writer without blocking: the cap-1 buffer coalesces bursts, and the
@@ -152,8 +147,8 @@ func (c *sockChannel) signal() {
 
 // writeLoop is the channel's sole writer: it pops sends in FIFO order and writes on this
 // goroutine, so a stalled conn.Write blocks only this channel. It exits once the channel
-// is dead AND the queue is empty: fail() empties the queue itself, while a deliberate
-// close() leaves it for the writer to flush under the closeGrace deadline.
+// is dead AND the queue is empty: fail() and a non-graceful close empty the queue, while a
+// graceful close leaves it for the writer to flush under the closeGrace deadline.
 func (c *sockChannel) writeLoop() {
 	for {
 		c.mu.Lock()
@@ -183,10 +178,10 @@ func (c *sockChannel) writeLoop() {
 }
 
 // close is the deliberate teardown: it does NOT fire onClose (the owner asked for it), and
-// a fail() racing behind it stays silent because dead is set. Queued sends still flush,
-// because the JS side sends-then-closes (a PeerLink rejection, a WS close frame); closeGrace
-// bounds the flush, and the writer owns the actual conn.Close.
-func (c *sockChannel) close() {
+// a fail() racing behind it stays silent because dead is set. A graceful close retains the
+// queue for the writer to flush under closeGrace; a non-graceful close drops it and closes
+// the socket immediately.
+func (c *sockChannel) close(graceful bool) {
 	c.mu.Lock()
 	if c.dead {
 		c.mu.Unlock()
@@ -194,9 +189,17 @@ func (c *sockChannel) close() {
 	}
 	c.dead = true
 	conn := c.conn
+	if !graceful {
+		c.queue, c.queued = nil, 0
+	}
 	c.mu.Unlock()
 	if conn == nil {
 		return // dial still in flight: its goroutine sees dead and closes the fresh conn
+	}
+	if !graceful {
+		conn.Close()
+		c.signal() // wake a parked writer so it observes dead and exits
+		return
 	}
 	conn.SetWriteDeadline(time.Now().Add(closeGrace))
 	c.signal() // the writer flushes the queue, then Close()s and exits

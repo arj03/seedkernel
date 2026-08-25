@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -85,6 +86,15 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return nil, nil
 	}))
+	o.SetPropertyStr("buffered", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 1 {
+			return t.Context().NewInt64(0), nil
+		}
+		if ch := n.get(t.Args()[0].Int64()); ch != nil {
+			return t.Context().NewInt64(int64(ch.buffered())), nil
+		}
+		return t.Context().NewInt64(0), nil
+	}))
 	o.SetPropertyStr("closeListeners", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		n.closeListeners()
 		return nil, nil
@@ -100,7 +110,8 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		// its own Map for the same reason.
 		id := t.Args()[0].Int64()
 		if ch := n.get(id); ch != nil {
-			ch.close()
+			graceful := len(t.Args()) >= 2 && t.Args()[1].Int32() != 0
+			ch.close(graceful)
 			n.mu.Lock()
 			delete(n.chans, id)
 			n.mu.Unlock()
@@ -199,11 +210,14 @@ func (n *netHost) listen(host string, port int) (int, error) {
 				continue
 			}
 			ch, start := n.wrapInbound(id, conn)
+			// The transport's per-source half-open budget groups by IP, not ephemeral
+			// source port. This listener is TCP, so RemoteAddr is a *net.TCPAddr.
+			remoteAddr := conn.RemoteAddr().(*net.TCPAddr).IP.String()
 			n.mu.Lock()
 			n.chans[id] = ch
 			n.mu.Unlock()
 			n.el.post(func() {
-				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(id))
+				n.invoke(n.fnAccept, n.qc.NewInt32(int32(bound)), n.qc.NewInt64(id), n.qc.NewString(remoteAddr))
 				start() // safe now: the JS channel exists
 			})
 		}
@@ -258,7 +272,7 @@ func (n *netHost) onClose(id int64) func() {
 // the bytes out, so the ArrayBuffer need not survive the call).
 func (n *netHost) invoke(fn *qjs.Value, args ...*qjs.Value) {
 	if _, err := n.qc.Invoke(fn, n.und, args...); err != nil {
-		fmt.Println("netHost: dispatcher error:", err)
+		fmt.Fprintln(os.Stderr, "netHost: dispatcher error:", err)
 	}
 	for _, a := range args {
 		a.Free()

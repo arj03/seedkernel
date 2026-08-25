@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"testing"
 	"time"
 
@@ -62,6 +63,42 @@ func TestGuestRealmOutstandingHostCallsCapped(t *testing.T) {
 	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
 	if _, err := realmCall("flood", nil); err == nil {
 		t.Fatal("a guest accumulated unbounded unresolved host calls")
+	}
+}
+
+// TestGuestRealmCarriesModuleDeadline pins the native-only half of CallBudget: guest.go
+// owns the live execution segment, so it must carry that remainder into the shared seam.
+// The seam then hands exactly that value to this slot's private module call.
+func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
+	guestSeamRealm(t)
+	if _, err := qc.Eval("module-budget-seam.js", qjs.Code(`
+		globalThis.__seenModuleDeadline = -1;
+		const __budgetIdentity = sodium.crypto_sign_keypair();
+		globalThis.__guestSeam = createGuestSeam({
+		  platform: { sodium, identity: __budgetIdentity, now: () => Date.now() },
+		  grants: { names: [], localServices: new Set(), calls: { call: () => null } },
+		  modules: {
+		    names: new Set(["probe"]),
+		    call: (_name, _payload, deadlineMs) => {
+		      globalThis.__seenModuleDeadline = deadlineMs;
+		      return Promise.resolve({ bytes: new Uint8Array([9]), ms: 0 });
+		    },
+		  },
+		});
+	`)); err != nil {
+		t.Fatal("build seam:", err)
+	}
+	newTestRealmBudget(t, "{}", `
+		function handle() { return host.call("probe", new Uint8Array()); }
+	`, 250)
+	defer func() { _, _ = callRealm(`__realm.dispose()`, 2*time.Second) }()
+	if got, err := realmCall("probe", nil); err != nil || !bytes.Equal(got, []byte{9}) {
+		t.Fatalf("module probe = %v, err = %v", got, err)
+	}
+	deadline := evalString(t, "String(__seenModuleDeadline)")
+	ms, err := strconv.Atoi(deadline)
+	if err != nil || ms <= 0 || ms > 250 {
+		t.Fatalf("module deadline = %q ms, want the live remainder of a 250 ms segment", deadline)
 	}
 }
 

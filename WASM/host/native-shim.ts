@@ -10,6 +10,7 @@ import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
 import { serializeCalls } from "./realm-queue.js";
+import type { CallBudget } from "./guest-seam.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
@@ -24,12 +25,13 @@ import { transportBundleBytes } from "./transport-bundle.js";
  *  The answer is always `null`: every call parks, Go holds the guest's Promise under
  *  `callId`, and the seam's Promise settles it through `bridge.realmSettle` — refused
  *  names included, as rejections. */
-type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number) => null;
+type NativeHostCall = (name: string, payload: ArrayBuffer, callId: number, deadlineMs: number) => null;
 
 /** The opaque native-module slots and realm plumbing Go exposes (main.go). */
 declare const bridge: {
-  buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number): void;
-  callModule(slot: string, module: string, payload: Uint8Array): ArrayBuffer | null;
+  buildModules(slot: string, mods: { name: string; wasm: Uint8Array }[], scratchDefault: number,
+               bindDeadlineMs: number): void;
+  callModule(slot: string, module: string, payload: Uint8Array, deadlineMs: number): ArrayBuffer | null;
   disposeModules(slot: string): number;
   /** Process arguments after the program name, as a JSON array — not a joined string,
    *  because an argument may legitimately contain any byte. */
@@ -177,8 +179,10 @@ declare const __net: {
   listen(host: string, port: number): number;
   /** Queue bytes for the writer goroutine (never blocks the loop goroutine). */
   send(id: number, bytes: Uint8Array): void;
+  /** Bytes queued for the writer goroutine but not yet handed to the socket. */
+  buffered(id: number): number;
   /** A deliberate close — never fires `__netClosed` (Go closes silently). */
-  close(id: number): void;
+  close(id: number, graceful?: boolean): void;
   closeListeners(): void;
 };
 
@@ -191,11 +195,11 @@ declare const __net: {
 
 /** Channel table + accept registry, keyed by Go's socket ids / bound ports. */
 const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
-const netAccepts = new Map<number, (id: number) => void>();
+const netAccepts = new Map<number, (id: number, remoteAddr: string) => void>();
 
 /** One RawLink (core/socket-seam.ts), minus its framing: Go vends one socket kind
  *  and this file says which codec runs over it. */
-function makeGoLink(id: number): GoLink {
+function makeGoLink(id: number, remoteAddr?: string): GoLink {
   let onData: (bytes: Uint8Array) => void = () => {};
   let onClose: () => void = () => {};
   netChans.set(id, {
@@ -203,12 +207,14 @@ function makeGoLink(id: number): GoLink {
     closed: () => { netChans.delete(id); onClose(); },
   });
   return {
+    remoteAddr,
     send: (bytes) => __net.send(id, bytes),
+    buffered: () => __net.buffered(id),
     onData: (cb) => { onData = cb; },
     onClose: (cb) => { onClose = cb; },
     // A deliberate close never fires __netClosed (Go closes silently), so drop our own
     // map entry here too, or every local close leaks one.
-    close: () => { __net.close(id); netChans.delete(id); },
+    close: (graceful) => { __net.close(id, graceful); netChans.delete(id); },
   };
 }
 
@@ -219,7 +225,7 @@ function netConnectRaw(host: string, port: number): GoLink {
 function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void): number {
   const bound = __net.listen(host, port);
   if (bound < 0) throw new Error("netListenRaw: bind failed");
-  netAccepts.set(bound, (id) => onAccept(makeGoLink(id)));
+  netAccepts.set(bound, (id, remoteAddr) => onAccept(makeGoLink(id, remoteAddr)));
   return bound;
 }
 
@@ -236,14 +242,14 @@ declare global {
   /** A channel's fail path fired — the RawLink's onClose (sock.go). */
   var __netClosed: (id: number) => void;
   /** An accepted socket landed — routes to the port's accept closure (sock.go). */
-  var __netAccept: (port: number, id: number) => void;
+  var __netAccept: (port: number, id: number, remoteAddr: string) => void;
 }
 
 // Defined at module scope — i.e. when host-shell.gen.js is evaluated, after Go has
 // installed `__net` — and retained by Go once the bundle is up (netHost.retain).
 globalThis.__netDeliver = (id, bytes) => { const c = netChans.get(id); if (c) c.deliver(new Uint8Array(bytes)); };
 globalThis.__netClosed = (id) => { const c = netChans.get(id); if (c) c.closed(); };
-globalThis.__netAccept = (port, id) => { const a = netAccepts.get(port); if (a) a(id); };
+globalThis.__netAccept = (port, id, remoteAddr) => { const a = netAccepts.get(port); if (a) a(id, remoteAddr); };
 
 // ── The platform ─────────────────────────────────────────────────────────────
 /** Build private module values over opaque Go handles (wazero instances cannot be JS
@@ -252,9 +258,9 @@ let moduleSlotSeq = 0;
 const modules: PureModuleLoader = {
     build(mods) {
         const slot = `slot:${++moduleSlotSeq}`;
-        bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE);
+        bridge.buildModules(slot, mods, DEFAULT_SCRATCH_SIZE, DEFAULT_GUEST_DEADLINE_MS);
         return {
-            call(module, payload, _deadlineMs) {
+            call(module, payload, deadlineMs) {
                 // The bridge call runs the module synchronously inside the Go event loop, so
                 // the wall clock around it IS the module's own compute — nothing sits queued
                 // behind earlier calls (the native target serializes per slot in Go). Return
@@ -264,7 +270,9 @@ const modules: PureModuleLoader = {
                     ? () => performance.now()
                     : () => Date.now();
                 const t0 = clock();
-                const r = bridge.callModule(slot, module, payload);
+                const bound = deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS
+                    : (deadlineMs === Infinity ? -1 : deadlineMs);
+                const r = bridge.callModule(slot, module, payload, bound);
                 return Promise.resolve({
                     bytes: r === null ? null : new Uint8Array(r),
                     ms: clock() - t0,
@@ -365,12 +373,16 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // whose top level may call the seam but reads only Promises — there is nothing to
     // await at top level, so nothing settles inside realm construction.
     let realm: number;
-    // No `CallBudget` crosses here: this realm's segment lives in the engine, not in JS, so
-    // there is nothing on this side to read a remainder from or bill a module's burn back
-    // to. The module bound this target enforces is Go's own
-    // (`SEEDKERNEL_MODULE_DEADLINE_MS`), which is why the seam takes the budget as optional.
-    const nativeCall: NativeHostCall = (name, payload, callId) => {
-        void Promise.resolve(hostCall(name, new Uint8Array(payload))).then(
+    // Go supplies the live segment remainder because it owns this realm's execution
+    // clock. A native module runs synchronously inside that same segment, so its elapsed
+    // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
+    // second charge when guest-seam's common module path settles.
+    const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
+        const budget: CallBudget = {
+            remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
+            charge: () => {},
+        };
+        void Promise.resolve(hostCall(name, new Uint8Array(payload), budget)).then(
             (bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null),
             (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)),
         );

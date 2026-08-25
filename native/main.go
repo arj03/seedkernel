@@ -41,12 +41,6 @@ type boundModule struct {
 	size    uint32 // bytes reserved there: the declared scratchSize, or the default
 }
 
-// defaultModuleCallDeadline bounds one module invocation (§4.3, SECURITY §14). It is the
-// shared guest budget (DEFAULT_GUEST_DEADLINE_MS); arming the termination check costs
-// ~1.1–1.2x on module paths (module_bound_bench_test.go). SEEDKERNEL_MODULE_DEADLINE_MS
-// overrides; 0 means no bound and no arming.
-const defaultModuleCallDeadline = 5 * time.Second
-
 var (
 	ctx = context.Background()
 	// rt holds every installed app module and the env shims they import: the untrusted
@@ -65,9 +59,6 @@ var (
 	// modSeq only names wazero instances (h1, h2, …) so two installs never share a
 	// module name; it is not an identity anything resolves through.
 	modSeq = 0
-	// moduleCallDeadline is the settled bound, resolved once at boot because the
-	// runtime's arming decision is made there.
-	moduleCallDeadline time.Duration = defaultModuleCallDeadline
 )
 
 // The §4.1 scratch default arrives from the shared host (core/wasm-limits.ts
@@ -101,9 +92,10 @@ func disposeModuleSlot(slot string) int {
 }
 
 // callModule invokes one app's module by logical name (README §4), returning its response
-// or nil if nothing is bound there. Modules are pure transforms and cannot call back, so
-// there is no re-entrancy to guard.
-func callModule(slot, module string, payload []byte) []byte {
+// or nil if nothing is bound there. `deadline` is the calling guest's remaining segment;
+// a negative value denotes an unbounded guest. Modules are pure transforms and cannot
+// call back, so there is no re-entrancy to guard.
+func callModule(slot, module string, payload []byte, deadline time.Duration) []byte {
 	w := moduleSlots[slot][module]
 	if w == nil {
 		return nil
@@ -126,8 +118,8 @@ func callModule(slot, module string, payload []byte) []byte {
 	// The runtime is armed with WithCloseOnContextDone, which is what gives the §4.3
 	// bound teeth: a module that never returns is interrupted at its next loop back-edge.
 	callCtx, cancel := ctx, func() {}
-	if moduleCallDeadline > 0 {
-		callCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
+	if deadline >= 0 {
+		callCtx, cancel = context.WithTimeout(ctx, deadline)
 	}
 	r, err := w.fn.Call(callCtx, uint64(len(payload)))
 	cancel()
@@ -169,10 +161,10 @@ func callModule(slot, module string, payload []byte) []byte {
 // buildModuleSlot constructs one opaque slot's modules, all or none (README §3.1),
 // reached from JS as bridge.buildModules. The transaction is here because this is the
 // side holding the half-built instances, which a rejected bundle must close itself.
-func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault uint32) error {
+func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault uint32, bindDeadline time.Duration) error {
 	built := make(map[string]*boundModule, len(wasms))
 	for i, wasm := range wasms {
-		w, err := instantiateWasm(wasm, scratchDefault)
+		w, err := instantiateWasm(wasm, scratchDefault, bindDeadline)
 		if err != nil {
 			for _, h := range built {
 				closeModule(h)
@@ -188,7 +180,7 @@ func buildModuleSlot(slot string, names []string, wasms [][]byte, scratchDefault
 
 // instantiateWasm compiles, instantiates and validates module bytes against the §4 ABI.
 // No slot effect: the result is an intermediate of buildModuleSlot's transaction.
-func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
+func instantiateWasm(wasm []byte, scratchDefault uint32, bindDeadline time.Duration) (*boundModule, error) {
 	cm, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
@@ -198,8 +190,8 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 	// is bound at BIND the same way module-table.ts bounds its load, at the one place a
 	// call-time deadline cannot reach. The context bounds only this invocation.
 	instCtx, cancel := ctx, func() {}
-	if moduleCallDeadline > 0 {
-		instCtx, cancel = context.WithTimeout(ctx, moduleCallDeadline)
+	if bindDeadline >= 0 {
+		instCtx, cancel = context.WithTimeout(ctx, bindDeadline)
 	}
 	m, err := rt.InstantiateModule(instCtx, cm, wazero.NewModuleConfig().WithName(fmt.Sprintf("h%d", modSeq)))
 	cancel()
@@ -243,34 +235,16 @@ func instantiateWasm(wasm []byte, scratchDefault uint32) (*boundModule, error) {
 
 // ───────────────────────── the realm and its primitives ─────────────────────────
 
-// moduleDeadlineFromEnv resolves the module-call bound, falling back to the armed
-// default; 0 means no bound and no arming. Native-only configuration: the JS targets
-// reach the same bound through their own lever.
-func moduleDeadlineFromEnv() (time.Duration, error) {
-	v := os.Getenv("SEEDKERNEL_MODULE_DEADLINE_MS")
-	if v == "" {
-		return defaultModuleCallDeadline, nil
-	}
-	ms, err := strconv.Atoi(v)
-	if err != nil || ms < 0 {
-		return 0, fmt.Errorf("SEEDKERNEL_MODULE_DEADLINE_MS=%q is not a non-negative millisecond count", v)
-	}
-	return time.Duration(ms) * time.Millisecond, nil
-}
-
 // boot stands up the engines and the host realm: wazero + libsodium, QuickJS and its
 // event loop, the platform primitives, then the ONE shared bundle. No node yet — `--dir`
 // is the operator's (§12.9). Idempotent: each boot releases the previous one's engines.
 func boot() error {
 	shutdown()
 	var err error
-	if moduleCallDeadline, err = moduleDeadlineFromEnv(); err != nil {
-		return err
-	}
 	// WithCloseOnContextDone arms the termination check compiled into every loop of every
-	// module on this runtime — which is why rtCore below is left unarmed (see the vars).
+	// app module. Calls carry the guest segment's own deadline; rtCore stays unarmed.
 	rt = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler().
-		WithCloseOnContextDone(moduleCallDeadline > 0))
+		WithCloseOnContextDone(true))
 	rtCore = wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigCompiler())
 	sd = bootSodium(rtCore)
 	md = bootMlDsa(rtCore) // manifest suite 0x02 (§12.4)
@@ -359,7 +333,8 @@ func exposeBridge(qc *qjs.Context) {
 			}
 			wasms[i] = wb
 		}
-		if err := buildModuleSlot(slot, names, wasms, uint32(t.Args()[2].Int64())); err != nil {
+		bindDeadline := time.Duration(t.Args()[3].Int64()) * time.Millisecond
+		if err := buildModuleSlot(slot, names, wasms, uint32(t.Args()[2].Int64()), bindDeadline); err != nil {
 			return nil, err
 		}
 		return t.Context().NewNull(), nil
@@ -369,7 +344,8 @@ func exposeBridge(qc *qjs.Context) {
 		if err != nil {
 			return t.Context().NewNull(), nil
 		}
-		resp := callModule(t.Args()[0].String(), t.Args()[1].String(), pl)
+		deadline := time.Duration(t.Args()[3].Int64()) * time.Millisecond
+		resp := callModule(t.Args()[0].String(), t.Args()[1].String(), pl, deadline)
 		if resp == nil {
 			return t.Context().NewNull(), nil
 		}
@@ -529,6 +505,6 @@ func main() {
 // fatal reports a startup failure and exits non-zero, so a script driving the loader
 // sees it.
 func fatal(stage string, err error) {
-	fmt.Println("ERROR: " + stage + ": " + err.Error())
+	fmt.Fprintln(os.Stderr, "ERROR: "+stage+": "+err.Error())
 	os.Exit(1)
 }

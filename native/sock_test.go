@@ -58,7 +58,7 @@ func TestSockChannelRoundTrip(t *testing.T) {
 	if string(buf[:n]) != "outbound" {
 		t.Fatalf("outbound frame = %q, want %q", buf[:n], "outbound")
 	}
-	c.close()
+	c.close(false)
 }
 
 // TestSockChannelCloseFlushesQueuedSends pins the deliberate-close contract: queued
@@ -69,7 +69,7 @@ func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
 	c.send([]byte("first"))
 	c.send([]byte("second"))
-	c.close()
+	c.close(true)
 
 	c2.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var got []byte
@@ -94,28 +94,39 @@ func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 	}
 }
 
-// TestSockChannelSendQueueLimitFails trips the bounded-queue fail path: a send past
-// sendQueueLimit fails the channel (onClose fires) instead of buffering without
-// bound, and the channel stays dead — later sends are dropped and a second fail is
-// silent.
-func TestSockChannelSendQueueLimitFails(t *testing.T) {
+// TestSockChannelNonGracefulCloseDropsQueuedSends is the other close mode: bytes still
+// blocked in the writer are discarded and the socket closes immediately.
+func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
-	defer c2.Close()
-	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) {}, func() {
-		select {
-		case onClosed <- struct{}{}:
-		default:
-		}
-	})
-	// One send past the cap trips the fail path before anything reaches the socket;
-	// the writer is parked on wake and never sees the payload.
-	c.send(make([]byte, sendQueueLimit+1))
-	waitOn(t, onClosed, "a queue overflowing the send limit must fail the channel")
-	c.send([]byte("after-fail")) // dead: dropped, not queued, no panic
-	c.fail()                     // idempotent: the dead flag short-circuits it
-	if len(onClosed) != 0 {
-		t.Fatal("fail() fired onClose twice")
+	var onClosed atomic.Int32
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
+	c.send([]byte("must-not-flush"))
+	c.close(false)
+
+	c2.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 32)
+	n, err := c2.Read(buf)
+	if n != 0 || (err != io.EOF && err != io.ErrClosedPipe) {
+		t.Fatalf("non-graceful close delivered %q, err=%v; want no bytes and EOF", buf[:n], err)
+	}
+	if onClosed.Load() != 0 {
+		t.Fatal("a deliberate non-graceful close must not fire onClose")
+	}
+}
+
+// TestSockChannelBufferedReportsQueue pins the fact the native RawLink exposes to the
+// transport's stall clock. No writer is started, so every byte remains deterministically
+// queued until a non-graceful close drops it.
+func TestSockChannelBufferedReportsQueue(t *testing.T) {
+	c := &sockChannel{wake: make(chan struct{}, 1)}
+	c.send([]byte("first"))
+	c.send([]byte("second"))
+	if got := c.buffered(); got != len("firstsecond") {
+		t.Fatalf("buffered = %d, want %d queued bytes", got, len("firstsecond"))
+	}
+	c.close(false)
+	if got := c.buffered(); got != 0 {
+		t.Fatalf("buffered after non-graceful close = %d, want 0", got)
 	}
 }
 
@@ -135,10 +146,9 @@ func TestSockChannelDialFailureFiresOnClose(t *testing.T) {
 	c.send([]byte("x")) // dead: dropped without a panic
 }
 
-// TestSockChannelCloseWhileDialing pins the pre-connect close: whichever side wins
-// the race — close() before the dial lands (queued sends dropped, fresh conn closed
-// unopened) or after (writer flushes then closes) — a deliberate close never fires
-// onClose and the conn the dial produced always ends up closed.
+// TestSockChannelCloseWhileDialing pins the pre-connect non-graceful close: whichever
+// side wins the race, queued sends are dropped, a deliberate close never fires onClose,
+// and the connection the dial produced always ends up closed.
 func TestSockChannelCloseWhileDialing(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -148,8 +158,8 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 
 	var onClosed atomic.Int32
 	c := newDialChannel(ln.Addr().String(), func([]byte) {}, func() { onClosed.Add(1) })
-	c.send([]byte("queued")) // buffers pre-connect; flushed only if the dial lands first
-	c.close()
+	c.send([]byte("queued")) // buffers pre-connect; the non-graceful close drops it
+	c.close(false)
 
 	conn, err := ln.Accept() // the dial lands, sees dead, and closes the fresh conn
 	if err != nil {
@@ -226,7 +236,7 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 		t.Fatal("a link that had spoken was killed for idling")
 	default:
 	}
-	c.close()
+	c.close(false)
 }
 
 // TestNetHostAcceptCeiling pins the accept bound (maxLiveChannels): past the ceiling an
@@ -270,7 +280,7 @@ func TestSockChannelCloseFailRace(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(2)
-		go func() { defer wg.Done(); c.close() }()
+		go func() { defer wg.Done(); c.close(false) }()
 		go func() { defer wg.Done(); c.fail() }()
 	}
 	wg.Wait()

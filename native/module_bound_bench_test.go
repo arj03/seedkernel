@@ -155,9 +155,9 @@ func benchBoundRS(b *testing.B, decode bool) {
 func BenchmarkBoundRSEncode(b *testing.B) { benchBoundRS(b, false) }
 func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 
-// BenchmarkBoundCallOverhead prices the OTHER half of the default (main.go
-// defaultModuleCallDeadline): the per-call `context.WithTimeout` that a bound deadline
-// makes callModule build, where an unbound one took a no-op branch. The benchmarks
+// BenchmarkBoundCallOverhead prices the OTHER half of the bound: the per-call
+// `context.WithTimeout` that a finite guest deadline makes callModule build, where an
+// unbounded guest takes a no-op branch. The benchmarks
 // above measure the compiled checks, which are billed per back-edge and so are
 // invisible on a call that barely loops; this one measures what every call pays no
 // matter how little it does, on the smallest real module there is (the forwarder,
@@ -177,23 +177,19 @@ func BenchmarkBoundRSDecode(b *testing.B) { benchBoundRS(b, true) }
 func BenchmarkBoundCallOverhead(b *testing.B) {
 	ensureBooted(b)
 	key := appKeyFor(bytes.Repeat([]byte{0x5b}, 32), "callcost")
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, 5*time.Second); err != nil {
 		b.Fatalf("buildModuleSlot refused: %v", err)
 	}
 	payload := bytes.Repeat([]byte{0x7e}, 32)
-	saved := moduleCallDeadline
-	b.Cleanup(func() { moduleCallDeadline = saved })
-
 	for _, c := range []struct {
 		name     string
 		deadline time.Duration
-	}{{"noCallDeadline", 0}, {"callDeadline", defaultModuleCallDeadline}} {
+	}{{"noCallDeadline", -1}, {"callDeadline", 5 * time.Second}} {
 		b.Run(c.name, func(b *testing.B) {
-			moduleCallDeadline = c.deadline
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if r := callModule(key, "fwd", payload); len(r) != len(payload) {
+				if r := callModule(key, "fwd", payload, c.deadline); len(r) != len(payload) {
 					b.Fatalf("forwarder returned %d B, want %d", len(r), len(payload))
 				}
 			}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestScratchRegion covers the §4.1 reservation on this target: a module that declares no
@@ -20,7 +21,7 @@ import (
 func TestScratchRegion(t *testing.T) {
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0xab}, 32), "scratchapp")
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot(forwarder) refused: %v", err)
 	}
 	w := moduleSlots[key]["fwd"]
@@ -32,7 +33,7 @@ func TestScratchRegion(t *testing.T) {
 	// proving the host stages input at `scratch`, calls handle, and reads the response
 	// from the same region (README §4).
 	msg := []byte("hello module")
-	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
+	if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
 		t.Fatalf("echo module returned %q, want %q", r, msg)
 	}
 	residue, ok := w.mod.Memory().Read(w.scratch, uint32(len(msg)))
@@ -40,7 +41,7 @@ func TestScratchRegion(t *testing.T) {
 		t.Fatalf("module scratch retained the staged request after return: %x", residue)
 	}
 	// A payload past the reserved region is refused by the clamp, not by memory bounds.
-	if r := callModule(key, "fwd", make([]byte, w.size+1)); r != nil {
+	if r := callModule(key, "fwd", make([]byte, w.size+1), time.Second); r != nil {
 		t.Fatalf("a payload past the reserved region must be refused, got %d B", len(r))
 	}
 }

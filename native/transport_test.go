@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -27,6 +29,77 @@ import (
 
 func TestTwoNodeRequestResponseWS(t *testing.T) {
 	runTwoNode(t, "ws", "wsPort", `wsListen: { host: "127.0.0.1", port: 0 },`)
+}
+
+// TestNativeAcceptedLinksShareRemoteSourceBudget proves the native accept bridge carries
+// the peer IP all the way into RawLink.remoteAddr. Eight silent loopback connections fill
+// the transport's per-source budget; the ninth must be closed while the first eight stay
+// open. If the Go callback or native-shim drops the address, all nine remain admitted.
+func TestNativeAcceptedLinksShareRemoteSourceBudget(t *testing.T) {
+	bootRealm(t)
+	if _, err := qc.Eval("source-cap-harness.js", qjs.Code(`
+		setPolicy(JSON.stringify({ authors: [embeddedTransportAuthor],
+		                           grants: { link: [embeddedTransportAuthor] } }));
+		globalThis.__startSourceCapTest = async () => {
+		  globalThis.__sourceCapNode = await makeTransportNode({
+		    identity: sodium.crypto_sign_keypair(),
+		    listen: { host: "127.0.0.1", port: 0 },
+		  });
+		  return new Uint8Array(0);
+		};
+		globalThis.__stopSourceCapTest = () => {
+		  __sourceCapNode.shell.close();
+		  return new Uint8Array(0);
+		};
+	`)); err != nil {
+		t.Fatal("harness:", err)
+	}
+	if _, err := callRealm("__startSourceCapTest", 10*time.Second); err != nil {
+		t.Fatal("start:", err)
+	}
+	defer func() { _, _ = callRealm("__stopSourceCapTest", 5*time.Second) }()
+	port, err := strconv.Atoi(evalString(t, "String(__sourceCapNode.transport.port)"))
+	if err != nil || port == 0 {
+		t.Fatalf("listener port = %d, err = %v", port, err)
+	}
+
+	conns := make([]net.Conn, 0, 9)
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	for i := 0; i < 9; i++ {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), time.Second)
+		if err != nil {
+			t.Fatalf("dial %d: %v", i+1, err)
+		}
+		conns = append(conns, conn)
+	}
+	// Drive the Go-owned QuickJS loop so every posted accept reaches the transport guest.
+	if kind, _, msg, err := el.await(`(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		return new Uint8Array(0);
+	})()`, 2*time.Second); err != nil || kind != 0 {
+		t.Fatalf("drain accepts: kind=%d msg=%q err=%v", kind, msg, err)
+	}
+
+	// Every admitted socket is silent and therefore has nothing to read, but remains open.
+	for i, conn := range conns[:8] {
+		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		_, err := conn.Read(make([]byte, 1))
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("admitted connection %d closed early: %v", i+1, err)
+		}
+	}
+	_ = conns[8].SetReadDeadline(time.Now().Add(time.Second))
+	_, err = conns[8].Read(make([]byte, 1))
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("ninth connection from 127.0.0.1 was not refused by the per-source cap")
+	}
+	if err == nil {
+		t.Fatal("refused connection unexpectedly delivered bytes")
+	}
 }
 
 // listenArgs is the `listen, wsListen` pair — makeTransportNode's transport config,

@@ -25,6 +25,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"seedloader/qjs"
 )
 
 // sec size-prefixes one wasm section. Sizes are computed rather than hand-counted so a
@@ -129,31 +131,37 @@ func wedgeStartWasmBytes() []byte {
 }
 
 func TestModuleCallBound(t *testing.T) {
-	// The bound is armed by default at the guest budget; tighten it to 50 ms here so
-	// the wedge is caught in test time rather than in five seconds. Still generous
-	// headroom over a real transform.
-	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "50")
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0x5e}, 32), "wedgeapp")
-	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
+	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot refused: %v", err)
+	}
+	if _, err := qc.Eval("module-deadline-bridge.js", qjs.Code(`
+		globalThis.__callBoundModule = (slot, name, deadlineMs) => {
+		  const out = bridge.callModule(slot, name, new Uint8Array(0), deadlineMs);
+		  return out === null ? new Uint8Array(0) : new Uint8Array(out);
+		};
+	`)); err != nil {
+		t.Fatal("bridge harness:", err)
 	}
 	// The healthy module on the same app works before and after the kill: the bound
 	// takes the wedged module, not the app.
 	msg := []byte("still alive")
 	echo := func() {
 		t.Helper()
-		if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
+		if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
 			t.Fatalf("healthy module echo = %q, want %q", r, msg)
 		}
 	}
 	echo()
 
 	// The wedge must be interrupted at the deadline, not return early and not wedge
-	// the test: without the bound this call would hang the process forever.
+	// the test. Drive the real JS→Go bridge so dropping its deadline argument would hang
+	// the process forever.
 	start := time.Now()
-	if r := callModule(key, "wedge", nil); r != nil {
-		t.Fatalf("wedged module returned %d B, want nil (the bound must interrupt it)", len(r))
+	if r, err := callRealm("__callBoundModule", time.Second,
+		qc.NewString(key), qc.NewString("wedge"), qc.NewInt64(50)); err != nil || len(r) != 0 {
+		t.Fatalf("wedged module returned %d B, err=%v; want an empty bounded failure", len(r), err)
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Fatalf("wedge returned after %s, want ~50 ms: the bound did not fire", elapsed)
@@ -165,19 +173,19 @@ func TestModuleCallBound(t *testing.T) {
 	if moduleSlots[key]["wedge"] != nil {
 		t.Fatal("the wedged module must be evicted from the table, not left as a closed instance")
 	}
-	if r := callModule(key, "wedge", nil); r != nil {
+	if r := callModule(key, "wedge", nil, 50*time.Millisecond); r != nil {
 		t.Fatalf("evicted wedge still answered %d B", len(r))
 	}
 	echo()
 
 	// A reinstall binds a fresh instance and the bound fires again on it — recovery
 	// is the ordinary reload path, not a restart of the host.
-	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000); err != nil {
+	if err := buildModuleSlot(key, []string{"wedge", "fwd"}, [][]byte{wedgeWasmBytes(), forwarderWasm}, 0x1000, time.Second); err != nil {
 		t.Fatalf("reinstall refused: %v", err)
 	}
 	echo()
 	start = time.Now()
-	if r := callModule(key, "wedge", nil); r != nil {
+	if r := callModule(key, "wedge", nil, 50*time.Millisecond); r != nil {
 		t.Fatalf("reinstalled wedge returned %d B, want nil", len(r))
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
@@ -185,24 +193,14 @@ func TestModuleCallBound(t *testing.T) {
 	}
 }
 
-// TestModuleCallBoundArmedByDefault proves the bound is ON with no configuration, and that
-// SEEDKERNEL_MODULE_DEADLINE_MS=0 is a real off switch. Both are asked of wazero
-// behaviorally, with an already-canceled context — which an armed runtime honors at call
-// entry by closing the module, and an unarmed one ignores entirely:
-//
-//   - default boot: the call fails and the module is closed;
-//   - deadline 0: the same call runs normally and the module stays open — the escape
-//     hatch, and the "no bound, no checks" baseline, since an unbound runtime is left
-//     unarmed rather than paying for a disabled lever.
-//
-// A wedge would prove it too, but a goroutine stuck in wasm forever poisons the test
-// process (closing the runtime under an executing call hangs the next boot), so the
-// infinite-loop module stays in the armed test, where the bound ends it.
-func TestModuleCallBoundArmedByDefault(t *testing.T) {
+// TestModuleRuntimeArmed proves the app-module runtime honors the per-call context handed
+// to it. The deadline value is no longer process configuration; every call supplies its
+// calling guest's remainder, while the runtime stays armed so that context has teeth.
+func TestModuleRuntimeArmed(t *testing.T) {
 	probe := func(t *testing.T) (called bool, closed bool) {
 		t.Helper()
 		key := appKeyFor(bytes.Repeat([]byte{0x5c}, 32), "probeapp")
-		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+		if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 			t.Fatalf("buildModuleSlot refused: %v", err)
 		}
 		w := moduleSlots[key]["fwd"]
@@ -213,21 +211,9 @@ func TestModuleCallBoundArmedByDefault(t *testing.T) {
 		return err == nil, w.mod.IsClosed()
 	}
 
-	bootRealm(t) // no env: the bound is armed by default
-	if moduleCallDeadline != defaultModuleCallDeadline || moduleCallDeadline <= 0 {
-		t.Fatalf("default boot resolved a deadline of %s, want %s (armed by default)", moduleCallDeadline, defaultModuleCallDeadline)
-	}
+	bootRealm(t)
 	if called, closed := probe(t); called || !closed {
 		t.Fatalf("armed runtime: call ok=%v closed=%v, want ok=false closed=true (the done ctx must end the call)", called, closed)
-	}
-
-	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "0")
-	bootRealm(t) // re-boot reads the env: the runtime unarms
-	if moduleCallDeadline != 0 {
-		t.Fatalf("deadline 0 resolved %s, want 0 (the off switch)", moduleCallDeadline)
-	}
-	if called, closed := probe(t); !called || closed {
-		t.Fatalf("unarmed runtime: call ok=%v closed=%v, want ok=true closed=false (the ctx must be ignored)", called, closed)
 	}
 }
 
@@ -237,12 +223,11 @@ func TestModuleCallBoundArmedByDefault(t *testing.T) {
 // instantiateWasm), or an install is the hole the whole lever was closing. The JS
 // table bounds its worker load for the same reason (module-table.ts).
 func TestModuleBindBound(t *testing.T) {
-	t.Setenv("SEEDKERNEL_MODULE_DEADLINE_MS", "50")
 	bootRealm(t)
 	key := appKeyFor(bytes.Repeat([]byte{0x5d}, 32), "startwedge")
 
 	start := time.Now()
-	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000)
+	err := buildModuleSlot(key, []string{"wedge"}, [][]byte{wedgeStartWasmBytes()}, 0x1000, 50*time.Millisecond)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("buildModuleSlot accepted a module whose start section never returns")
@@ -263,11 +248,11 @@ func TestModuleBindBound(t *testing.T) {
 
 	// The host is unharmed — the runtime that killed the wedge still binds and runs an
 	// ordinary module.
-	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000); err != nil {
+	if err := buildModuleSlot(key, []string{"fwd"}, [][]byte{forwarderWasm}, 0x20000, time.Second); err != nil {
 		t.Fatalf("buildModuleSlot refused a healthy module after the wedge: %v", err)
 	}
 	msg := []byte("still alive")
-	if r := callModule(key, "fwd", msg); !bytes.Equal(r, msg) {
+	if r := callModule(key, "fwd", msg, time.Second); !bytes.Equal(r, msg) {
 		t.Fatalf("healthy module echo = %q, want %q", r, msg)
 	}
 }
