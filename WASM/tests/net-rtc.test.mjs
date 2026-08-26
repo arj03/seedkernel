@@ -1,15 +1,17 @@
-// net-rtc.test.mjs — RtcNetwork's speculative-entry cap (§12.6.1). The relay can force
-// entries by naming arbitrary `from` values in hellos AND in SDP offers, and every entry
-// carries an RTCPeerConnection — so every path that CREATES one answers to the same
-// MAX_UNAUTHED_PEERS bound. Pinned with stubs: the browser globals are referenced only
-// inside methods, so net-rtc runs under Node. Run after `npm run build`.
+// net-rtc.test.mjs — RtcNetwork's untrusted signaling boundary and speculative-entry cap
+// (§12.6.1). A signaling endpoint can name arbitrary `from` values in hellos AND in SDP
+// offers, and every entry carries an RTCPeerConnection — so decoding precedes policy and
+// every path that CREATES an entry answers to the same MAX_UNAUTHED_PEERS bound. Pinned with
+// stubs: the browser globals are referenced only inside methods, so net-rtc runs under Node.
+// Run after `npm run build`.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
-const { RtcChannel, RtcNetwork, RTC_CHUNK_BYTES } = await imp("build/host/net-rtc.js");
+const rtc = await imp("build/host/net-rtc.js");
+const { RtcChannel, RtcNetwork, RTC_CHUNK_BYTES } = rtc;
 import { testkit } from "./testkit.mjs";
 
 const { test, assert, summary } = testkit();
@@ -20,7 +22,68 @@ const { test, assert, summary } = testkit();
 const MAX_UNAUTHED_PEERS = 256;
 const peerId = (n) => String(n).padStart(64, "0");
 
-console.log("\nRtcNetwork speculative-entry cap (§12.6.1)\n");
+console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.6.1)\n");
+
+await test("net-rtc exports the signaling seam, not a WebSocket relay implementation", async () => {
+  assert(!("relaySignaling" in rtc), "the kernel must not ship a rendezvous wire implementation");
+});
+
+await test("RtcNetwork validates opaque signaling messages before admitting them", async () => {
+  let receive = () => {};
+  let admitted = 0;
+  let pcs = 0;
+  const sent = [];
+  const signaling = {
+    send(msg) { sent.push(msg); },
+    onMessage(cb) { receive = cb; },
+    close() {},
+  };
+  const ownId = peerId(0);
+  const net = new RtcNetwork({
+    driver: {
+      peerId: ownId,
+      setPeerHooks() {},
+      openLink() { return { linkId: 1, send() {}, close() {} }; },
+    },
+    signaling,
+    admitPeer() { admitted++; return true; },
+    peerConnectionFactory: () => {
+      pcs++;
+      return {
+        signalingState: "stable",
+        remoteDescription: null,
+        addEventListener() {},
+        createDataChannel() { return { binaryType: "arraybuffer", send() {}, close() {}, addEventListener() {} }; },
+        async setRemoteDescription() {},
+        async setLocalDescription() {},
+        async addIceCandidate() {},
+        close() {},
+      };
+    },
+  });
+
+  const malformed = [
+    null,
+    "hello",
+    [],
+    {},
+    { type: "hello", from: "not-a-peer" },
+    { type: "hello", from: peerId(1), to: 7 },
+    { type: "sdp", from: peerId(1) },
+    { type: "sdp", from: peerId(1), sdp: { type: "bogus", sdp: "x" } },
+    { type: "ice", from: peerId(1) },
+    { type: "ice", from: peerId(1), candidate: { candidate: "x", sdpMLineIndex: -1 } },
+  ];
+  for (const msg of malformed) await receive(msg);
+  assert(admitted === 0, `malformed messages must be dropped before policy (got ${admitted})`);
+  assert(pcs === 0 && net.peers.size === 0, "malformed messages must not allocate peer connections");
+
+  await receive({ type: "hello", from: peerId(1) });
+  assert(admitted === 1 && pcs === 1, "a valid opaque hello must reach policy and create one peer");
+  assert(sent.length === 1 && sent[0].type === "hello" && sent[0].to === peerId(1),
+    "a valid broadcast hello must receive one directed reply");
+  net.close();
+});
 
 await test("RtcChannel exposes a length-framed stream and caps physical messages", async () => {
   const listeners = new Map();
@@ -120,4 +183,4 @@ await test("offers cannot force more than MAX_UNAUTHED_PEERS peer entries", asyn
   net.close();
 });
 
-summary("net-rtc speculative-entry cap");
+summary("net-rtc signaling boundary and speculative-entry cap");

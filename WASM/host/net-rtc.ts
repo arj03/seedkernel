@@ -11,12 +11,13 @@
 // SDP-fingerprint assertion: a MITM relay can splice SDP and bring up DTLS to itself, but it
 // can never complete AUTH without the peer's private key, so the link never authenticates.
 //
-// Browser-native, but the globals are referenced only inside RtcNetwork / relaySignaling, so
-// importing this under Node is safe — a console peer joins the same mesh by passing its own
-// `peerConnectionFactory`. That implementation is the app's: the kernel owes openLink a byte
-// duplex and owns the seam, not any one ICE/DTLS stack behind it.
+// Browser-native, but the platform globals are referenced only inside RtcNetwork, so importing
+// this under Node is safe — a console peer joins the same mesh by passing its own
+// `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
+// owes openLink a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
 import { FRAMING, type PeerId } from "../core/socket-seam.js";
+import { isHex64 } from "../core/util.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
@@ -34,16 +35,60 @@ export interface PeerEntry {
 
 export interface Signaling {
     send(msg: unknown): void;
-    onMessage(cb: (msg: SignalMsg) => void): void;
+    /** Deliver one implementation-defined inbound message. RtcNetwork owns decoding its
+     *  private protocol; a signaling adapter need only transport opaque values. */
+    onMessage(cb: (msg: unknown) => void): void;
     close(): void;
 }
 
-interface SignalMsg {
-    type: "hello" | "sdp" | "ice";
+interface SignalBase {
     from: PeerId;
     to?: PeerId;
-    sdp?: RTCSessionDescriptionInit;
-    candidate?: RTCIceCandidateInit;
+}
+
+type HelloSignal = SignalBase & { type: "hello" };
+type SdpSignal = SignalBase & {
+    type: "sdp";
+    sdp: RTCSessionDescriptionInit & { type: "offer" | "answer" };
+};
+type IceSignal = SignalBase & { type: "ice"; candidate: RTCIceCandidateInit };
+type SignalMsg = HelloSignal | SdpSignal | IceSignal;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSessionDescription(value: unknown): value is SdpSignal["sdp"] {
+    return isRecord(value)
+        && (value.type === "offer" || value.type === "answer")
+        && typeof value.sdp === "string";
+}
+
+function isIceCandidate(value: unknown): value is RTCIceCandidateInit {
+    if (!isRecord(value) || typeof value.candidate !== "string") return false;
+    return (value.sdpMid === undefined || value.sdpMid === null || typeof value.sdpMid === "string")
+        && (value.sdpMLineIndex === undefined || value.sdpMLineIndex === null
+            || (typeof value.sdpMLineIndex === "number" && Number.isInteger(value.sdpMLineIndex)
+                && value.sdpMLineIndex >= 0 && value.sdpMLineIndex <= 0xffff))
+        && (value.usernameFragment === undefined || value.usernameFragment === null
+            || typeof value.usernameFragment === "string");
+}
+
+/** Decode the kernel's private negotiation protocol at the untrusted signaling boundary. */
+function signalMsg(value: unknown): SignalMsg | undefined {
+    if (!isRecord(value) || typeof value.from !== "string" || !isHex64(value.from))
+        return undefined;
+    if (value.to !== undefined && (typeof value.to !== "string" || !isHex64(value.to)))
+        return undefined;
+    const base: SignalBase = value.to === undefined
+        ? { from: value.from }
+        : { from: value.from, to: value.to };
+    if (value.type === "hello") return { type: "hello", ...base };
+    if (value.type === "sdp" && isSessionDescription(value.sdp))
+        return { type: "sdp", ...base, sdp: value.sdp };
+    if (value.type === "ice" && isIceCandidate(value.candidate))
+        return { type: "ice", ...base, candidate: value.candidate };
+    return undefined;
 }
 
 export interface RtcNetworkOptions {
@@ -104,7 +149,7 @@ export class RtcNetwork extends SingleIdentityNetwork {
     /** Announce ourselves into the room so present peers begin the WebRTC dance.
      *  Call once after registering the sink (or constructing a StorageNode/Transport
      *  over this network). */
-    join(): void { this.opts.signaling.send({ type: "hello", from: this.ownId }); }
+    join(): void { this.sendSignal({ type: "hello", from: this.ownId }); }
     /** Tear down every connection and the signaling channel. The transport's links
      *  die with their channels. */
     close(): void {
@@ -135,7 +180,7 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.peers.set(peerId, e);
         pc.addEventListener("icecandidate", (ev) => {
             if (ev.candidate)
-                this.opts.signaling.send({ type: "ice", from: this.ownId, to: peerId, candidate: ev.candidate.toJSON() });
+                this.sendSignal({ type: "ice", from: this.ownId, to: peerId, candidate: ev.candidate.toJSON() });
         });
         pc.addEventListener("negotiationneeded", async () => {
             // Single entry point for offers — fires when the impolite side creates the
@@ -143,7 +188,9 @@ export class RtcNetwork extends SingleIdentityNetwork {
             try {
                 e.makingOffer = true;
                 await pc.setLocalDescription();
-                this.opts.signaling.send({ type: "sdp", from: this.ownId, to: peerId, sdp: pc.localDescription ?? undefined });
+                const sdp = pc.localDescription;
+                if (isSessionDescription(sdp))
+                    this.sendSignal({ type: "sdp", from: this.ownId, to: peerId, sdp });
             }
             catch { /* renegotiation failed; ICE restart / next hello recovers */ }
             finally {
@@ -204,14 +251,14 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.peers.delete(peerId);
     }
     // ── signaling handlers: hello / sdp / ice (perfect negotiation) ───────────────
-    async onSignal(msg: SignalMsg) {
-        if (!msg || typeof msg !== "object")
-            return;
-        if (msg.from === this.ownId || (msg.to && msg.to !== this.ownId))
-            return;
-        if (this.opts.admitPeer && !this.opts.admitPeer(msg.from))
-            return; // ignore peers outside the signaling allowlist
+    private sendSignal(msg: SignalMsg): void { this.opts.signaling.send(msg); }
+    private async onSignal(value: unknown) {
         try {
+            const msg = signalMsg(value);
+            if (!msg || msg.from === this.ownId || (msg.to && msg.to !== this.ownId))
+                return;
+            if (this.opts.admitPeer && !this.opts.admitPeer(msg.from))
+                return; // ignore peers outside the signaling allowlist
             if (msg.type === "hello")
                 await this.onHello(msg);
             else if (msg.type === "sdp")
@@ -221,7 +268,7 @@ export class RtcNetwork extends SingleIdentityNetwork {
         }
         catch { /* a malformed signal must not crash the network */ }
     }
-    async onHello(msg: SignalMsg) {
+    private async onHello(msg: HelloSignal) {
         const broadcast = !msg.to;
         // A speculative entry that never authenticated is a zombie; a fresh broadcast
         // hello means the peer reloaded, so replace it.
@@ -238,12 +285,10 @@ export class RtcNetwork extends SingleIdentityNetwork {
         // Reply to a broadcast once (directed), so the peer learns we're here; never
         // reply to a directed hello, or the two bounce forever.
         if (broadcast)
-            this.opts.signaling.send({ type: "hello", from: this.ownId, to: msg.from });
+            this.sendSignal({ type: "hello", from: this.ownId, to: msg.from });
         this.dialChannel(msg.from, e); // impolite side opens the channel
     }
-    async onSdp(msg: SignalMsg) {
-        if (!msg.sdp)
-            return;
+    private async onSdp(msg: SdpSignal) {
         // Only an offer may create a peer; a stray answer for an unknown one is dropped.
         // An offer clears the same speculative-entry cap a hello does — the relay can name
         // arbitrary `from` values in offers too, and each entry costs a connection.
@@ -267,10 +312,12 @@ export class RtcNetwork extends SingleIdentityNetwork {
         }
         if (msg.sdp.type === "offer") {
             await e.pc.setLocalDescription();
-            this.opts.signaling.send({ type: "sdp", from: this.ownId, to: msg.from, sdp: e.pc.localDescription ?? undefined });
+            const sdp = e.pc.localDescription;
+            if (isSessionDescription(sdp))
+                this.sendSignal({ type: "sdp", from: this.ownId, to: msg.from, sdp });
         }
     }
-    async onIce(msg: SignalMsg) {
+    private async onIce(msg: IceSignal) {
         const e = this.peers.get(msg.from);
         if (!e || !msg.candidate)
             return;
@@ -285,40 +332,4 @@ export class RtcNetwork extends SingleIdentityNetwork {
         else
             e.pendingIce.push(msg.candidate);
     }
-}
-// ── a Signaling over the relay WebSocket (seedchat's scripts/relay.mjs) ────────
-// Connect to ws://host:port/<room>; the relay broadcasts every JSON frame to the
-// other clients in the same room. Browser-native (uses the platform WebSocket).
-export function relaySignaling(url: string): Signaling {
-    const ws = new WebSocket(url);
-    let cb: (msg: SignalMsg) => void = () => { };
-    const outbox: string[] = [];
-    ws.addEventListener("open", () => { for (const s of outbox)
-        ws.send(s); outbox.length = 0; });
-    ws.addEventListener("message", (ev) => {
-        if (typeof ev.data !== "string")
-            return;
-        let m;
-        try {
-            m = JSON.parse(ev.data);
-        }
-        catch {
-            return;
-        }
-        cb(m);
-    });
-    return {
-        send(msg: unknown) {
-            const s = JSON.stringify(msg);
-            if (ws.readyState === WebSocket.OPEN)
-                ws.send(s);
-            else
-                outbox.push(s);
-        },
-        onMessage(fn: (msg: SignalMsg) => void) { cb = fn; },
-        close() { try {
-            ws.close();
-        }
-        catch { /* ignore */ } },
-    };
 }
