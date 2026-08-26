@@ -20,12 +20,6 @@ export interface JsonObject {
     [key: string]: JsonValue;
 }
 
-/** The crypto a bundle load needs, in libsodium-wrappers method names so a raw libsodium
- *  satisfies it directly. Identical to `ManifestVerifier` today; separated so call sites are
- *  written against "what a *load* needs", not "what a *manifest* needs". */
-export interface BundleCrypto extends ManifestVerifier {
-}
-
 /** The zero-authority guest program. `requires` and `config` live here rather than at the
  *  top level because both are the guest's alone: WASM modules carry no authority and read
  *  no config. */
@@ -178,7 +172,7 @@ export function appKeyFor(author: Uint8Array, app: string): string {
 }
 /** The genesis hash (BLAKE2b-256) — the one system hash. A free function taking the crypto
  *  rather than a host method, so target module builders need no crypto dependency. */
-export function genesisHash(sodium: BundleCrypto, data: Uint8Array): Uint8Array {
+export function genesisHash(sodium: ManifestVerifier, data: Uint8Array): Uint8Array {
     return sodium.crypto_generichash(32, data, null);
 }
 /** Which privileges (§12.5) a manifest's `requires` reach — the catalog values of the
@@ -196,7 +190,7 @@ export function privilegesOf(manifest: BundleManifest): Privilege[] {
  *  to `[A-Za-z0-9._-]`, which an author-chosen `app` cannot be trusted to satisfy. 128 bits
  *  fixed-length hex also means no prefix can extend another — this separates namespaces, it
  *  does not authenticate them. */
-export function appScopeFor(crypto: BundleCrypto, author: Uint8Array, app: string): string {
+export function appScopeFor(crypto: ManifestVerifier, author: Uint8Array, app: string): string {
     const key = enc.encode(appKeyFor(author, app));
     return toHex(genesisHash(crypto, key)).slice(0, 32) + "-";
 }
@@ -608,7 +602,7 @@ export class FreshnessMarks {
  *  then hash every module and the guest against what it commits to. Throws on anything that
  *  does not check out. Takes no host and no policy, so "nothing has landed" is a property of
  *  the type. */
-export function verifyBundle(sodium: BundleCrypto, blob: Uint8Array): VerifiedBundle {
+export function verifyBundle(sodium: ManifestVerifier, blob: Uint8Array): VerifiedBundle {
     const files = unpackBundle(blob);
     const env = files[MANIFEST_FILE];
     if (!env)

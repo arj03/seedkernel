@@ -81,14 +81,6 @@ export function allOf(...predicates: Admit[]): Admit {
   };
 }
 
-/** Logical OR, short-circuiting. A throw still aborts the whole disjunction. */
-export function anyOf(...predicates: Admit[]): Admit {
-  return async (v, ctx) => {
-    for (const p of predicates) if (await p(v, ctx)) return true;
-    return false;
-  };
-}
-
 /** One author list, parsed strictly — shared by `authors` and every grant. */
 function authorList(value: unknown, name: string): string[] {
   if (!Array.isArray(value) || value.some((x) => typeof x !== "string")) {

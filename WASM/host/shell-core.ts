@@ -3,7 +3,7 @@
 // seedstore). `createShell` is private: it would skip the transport author pin. Signed
 // bundles are the only way slots land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
-import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type BundleCrypto, type FreshnessStore, type JsonObject, type LoadedBundle, type PureModuleLoader, type PureModules } from "./bundle.js";
+import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
 import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
@@ -15,9 +15,9 @@ import { type SafeRealm } from "./safe-js.js";
 import type { Keypair } from "../core/subkeys.js";
 
 /** The crypto surface the shell needs: manifest verification + genesis hashing
- *  (BundleCrypto) plus the remaining guest crypto ops (SeamCrypto). Core libsodium
+ *  (ManifestVerifier) plus the remaining guest crypto ops (SeamCrypto). Core libsodium
  *  build satisfies both. */
-export type ShellSodium = BundleCrypto & SeamCrypto;
+export type ShellSodium = ManifestVerifier & SeamCrypto;
 
 /** The one reason a bundle load is refused without being an error worth reporting: the
  *  policy predicate said no (§12.4). Shared so the transport's installers can read it as
@@ -183,7 +183,7 @@ export interface AppHandle extends LoadedBundle {
 
 // Re-exported so a target reaches the admission constructors from the same module it gets
 // bootShell from. Pure-module builders remain target implementations, not shell API.
-export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, anyOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
+export { denyAll, admitAll, authorAllowlist, byPrivilege, allOf, policyFromJson, type Admit, type AdmissionContext } from "./policy.js";
 /** A slot's realm. Nullable for exactly the window between the holder being made and the
  *  factory resolving, inside one `loadBundleBlob` — a slot only enters `slots` with its
  *  realm standing, and teardown reads the settled handle synchronously, because the
