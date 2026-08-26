@@ -155,3 +155,45 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
         author: hybridAuthorId(sodium, keys.ed.publicKey, keys.mlDsa.publicKey),
     };
 }
+
+// ── guest source: the optional op-frame codec ────────────────────────────────
+// Not signing, but offline like the rest of this module: a build tool inlines these
+// into guest source before it is hashed and signed, so they must not reach the runtime
+// tree a browser shell vendors. host/op-frame.ts holds the same three functions as
+// TypeScript for host and test callers; `tests/run.mjs` cross-checks the two so this
+// copy cannot drift from the one clients import.
+
+/** The op-frame codec as flat guest source: `"use strict"` safe and import-free. The
+ *  behavioural twin of host/op-frame.ts `callerOf`/`readOp`/`writeOp`. */
+export function guestOpFraming(): string {
+    return `
+// op-frame: optional client framing; seedkernel reads none of these body bytes.
+const callerOf = (arg) => {
+  const caller = arg.subarray(0, 32);
+  let fromHost = true;
+  for (let i = 0; i < 32; i++) {
+    if (caller[i] !== 0) fromHost = false;
+  }
+  return { fromHost, caller, body: arg.subarray(32) };
+};
+const readOp = (body) => {
+  const n = body.length > 0 ? body[0] : -1;
+  if (n < 0 || body.length < 1 + n) throw new Error("op-frame: malformed op envelope");
+  let op = "";
+  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
+  return { op, args: body.subarray(1 + n) };
+};
+const writeOp = (op, args) => {
+  if (op.length < 1 || op.length > 255) throw new Error("op-frame: op name must be 1..255 bytes");
+  const out = new Uint8Array(1 + op.length + args.length);
+  out[0] = op.length;
+  for (let i = 0; i < op.length; i++) {
+    const c = op.charCodeAt(i);
+    if (c > 127) throw new Error("op-frame: op name must be ASCII");
+    out[1 + i] = c;
+  }
+  out.set(args, 1 + op.length);
+  return out;
+};
+`;
+}

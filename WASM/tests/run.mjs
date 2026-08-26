@@ -35,7 +35,7 @@ const { createGuestSeam, guestSignScope, appSignScope }
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { readOp, writeOp } = await imp("build/host/op-frame.js");
+const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");
@@ -48,7 +48,7 @@ import { bytesEqual } from "./bytes.mjs";
 const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMarks,
          verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
-const { signManifest, packBundle } = await imp("build/host/bundle-author.js");
+const { signManifest, packBundle, guestOpFraming } = await imp("build/host/bundle-author.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
@@ -2967,12 +2967,46 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("  OK\n");
 }
 
+// ─── Test: the guest-source op-frame twin matches the TypeScript one ─────────
+//
+// The codec exists twice: host/op-frame.ts for callers that can import, and
+// host/bundle-author.ts `guestOpFraming` as flat source a build tool inlines into a
+// guest. Only one of the two may reach the runtime tree a browser shell vendors, so
+// they cannot be one file and nothing but this test keeps them honest. One input per
+// boundary a hand-copy lands on — the rest of the codec is the same six lines twice.
+function testOpFrameGuestTwin() {
+  console.log("Test: the inlined guest op-frame codec behaves exactly like host/op-frame.ts");
+  const host = { callerOf, readOp, writeOp };
+  const guest = new Function(`"use strict";${guestOpFraming()}
+    return { callerOf, readOp, writeOp };`)();
+  // Outcome, not message: the TS copies quote the offending op name and a guest carries
+  // no formatter, so what must agree is accept-vs-reject and the bytes on accept.
+  const out = (impl, fn, args) => { try { return JSON.stringify(impl[fn](...args)); } catch { return "threw"; } };
+  const agree = (label, fn, ...args) =>
+    assert(out(host, fn, args) === out(guest, fn, args), `${label}: the guest twin and host disagree`);
+
+  // A caller id differing from the host's all-zero one in its LAST byte: a prefix test
+  // would call this the host.
+  const peer = new Uint8Array(32); peer[31] = 1;
+  agree("a host loopback", "callerOf", concatBytes([new Uint8Array(32), enc.encode("hi")]));
+  agree("a caller differing only in its last byte", "callerOf", concatBytes([peer, new Uint8Array(0)]));
+  agree("a well-formed op", "readOp", Uint8Array.from([2, 0x68, 0x69, 9]));
+  // Declared length equal to the bytes left after it — what separates `len < 1 + n`
+  // from `len < n`.
+  agree("a length one byte past the end", "readOp", Uint8Array.from([2, 0x61]));
+  agree("an ordinary op", "writeOp", "put", Uint8Array.from([1, 2, 3]));
+  // 0x80 is the only code point that separates a `> 127` ceiling from a `> 128` one.
+  agree("an op at the first non-ASCII code point", "writeOp", "a" + String.fromCharCode(0x80), new Uint8Array(0));
+  console.log("  OK\n");
+}
+
 // ─── Run ────────────────────────────────────────────────────────────────
 
 await testFullLifecycle();
 await testInstallRejectsUntrustedAuthor();
 await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
+testOpFrameGuestTwin();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();

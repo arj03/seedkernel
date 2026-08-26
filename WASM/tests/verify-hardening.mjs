@@ -21,7 +21,7 @@ const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS 
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const { appKeyFor, appScopeFor, genesisHash, verifyManifest, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
-const { signManifest, packBundle } = await imp("build/host/bundle-author.js");
+const { signManifest, packBundle, guestOpFraming } = await imp("build/host/bundle-author.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
 // is signed and verified with both halves of the author's key set (§12.4), so a bare
 // libsodium cannot sign one.
@@ -37,7 +37,7 @@ const { createGuestSeam } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/host/op-frame.js");
+const { callerOf, readOp, writeOp } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
