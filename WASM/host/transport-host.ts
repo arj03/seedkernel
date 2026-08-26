@@ -222,8 +222,7 @@ export class TransportHost {
   private readonly openLinks = new Map<number, OpenLinkRecord>();
   private readonly addrs = new Map<PeerId, PeerAddr>;
   private nextLinkId = 1;
-  private transport: TransportCall | null = null;
-  private transportAvailable: () => boolean = () => false;
+  private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
   private activeOwner: object | null = null;
   private closed = false;
@@ -237,31 +236,28 @@ export class TransportHost {
     this.peerId = toHex(nodeFacts.identity.publicKey);
   }
 
-  /** Wire this platform binding once. All callbacks resolve its capability owner
-   *  dynamically, so claim changes never reconfigure this driver. `deliver` is the claim
-   *  routing a `link/deliver` call is handed to — the host must route what the link
-   *  occupant decoded, whoever the occupant is (§12.10). */
-  route(transport: TransportCall, available: () => boolean, deliver?: TransportDeliver): void {
-    this.transport = transport;
-    this.transportAvailable = available;
-    this.deliver = deliver ?? null;
-  }
+  /** Wire the claim routing behind `link/deliver` once. Not owner-keyed: an inbound frame
+   *  resolves through the shell's claim table, whoever occupies the link (§12.10). */
+  routeInbound(deliver: TransportDeliver): void { this.deliver = deliver; }
 
   /** Whether this platform binding currently has an admitted raw-link owner. */
-  available(): boolean { return !this.closed && this.transportAvailable(); }
+  available(): boolean { return !this.closed && this.activeOwner !== null; }
 
-  /** Publish one slot's raw-link binding. A different binding is a handover: live links
-   *  belonged to the old guest's private state and are closed before the new owner runs. */
-  activate(owner: object): void {
+  /** Publish one slot's raw-link binding, with the call this driver reaches it through. A
+   *  different binding is a handover: live links belonged to the old guest's private state
+   *  and are closed before the new owner runs. */
+  activate(owner: object, call: TransportCall): void {
     if (this.activeOwner === owner) return;
     if (this.activeOwner) this.reset();
     this.activeOwner = owner;
+    this.call = call;
   }
 
   /** Release only the binding named by its owner token. */
   release(owner: object): void {
     if (this.activeOwner !== owner) return;
     this.activeOwner = null;
+    this.call = null;
     this.reset();
   }
 
@@ -316,8 +312,8 @@ export class TransportHost {
    *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
    *  so bytes arriving on one link reach the occupant in arrival order. */
   private toTransport(args: Args): Promise<Uint8Array> | null {
-    if (this.closed || !this.transport) return null;
-    return this.transport(args.build());
+    if (this.closed || !this.call) return null;
+    return this.call(args.build());
   }
 
   /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged,
@@ -517,7 +513,7 @@ export class TransportHost {
    *  object stays the caller's; the link state machine runs in the guest, keyed by the
    *  returned link id. */
   openLink(opts: OpenLinkOptions): LinkHandle {
-    if (!this.transportAvailable()) throw new Error("transport: no bundle owns the raw-link binding");
+    if (!this.available()) throw new Error("transport: no bundle owns the raw-link binding");
     const linkId = this.register(opts.channel);
     // The channel is already closed (`register`), so this throws rather than returning a
     // handle onto a dead socket: a host-managed transport can be told no, unlike an accept.
@@ -574,7 +570,7 @@ export class TransportHost {
     const { port, wsPort } = await this.opts.channels.listen(
       this.opts.listen, this.opts.wsListen,
       (channel) => {
-        if (!this.transportAvailable()) {
+        if (!this.available()) {
           try { channel.close(false); } catch { /* already gone */ }
           return;
         }
@@ -624,8 +620,7 @@ export class TransportHost {
     // First, so nothing below re-enters a realm the caller is about to dispose: the
     // channel closes fire `onClose`, which would otherwise queue a `linkClosed`.
     this.closed = true;
-    this.transport = null;
-    this.transportAvailable = () => false;
+    this.call = null;
     this.activeOwner = null;
     this.reset();
     this.opts.channels?.close();

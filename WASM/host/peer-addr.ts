@@ -1,6 +1,5 @@
 import { fromHex, isHex64 } from "../core/util.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
-export { isHex64 };
 
 // ── the `pk[.secret]@location` grammar ────────────────────────────────────────
 //

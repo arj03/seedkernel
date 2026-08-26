@@ -360,11 +360,12 @@ function createShell(opts: CreateShellOptions & {
     const manifestClaims = (manifest: LoadedBundle["manifest"]) => [...(manifest.protocols ?? []), ...(manifest.services ?? [])];
     const slotClaims = (slot: AppSlot) => manifestClaims(slot.verifiedBundle.manifest);
     const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
+    /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has
+     *  ONE event sink, so two holders are not a composition — the second would take the
+     *  node's sockets off the first, silently. A pure function of the signed manifest, so
+     *  there is nothing here to store or keep in step — `slots.find(hasLink)` IS the
+     *  binding's holder. */
     const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
-    /** The slot the platform's raw-link events go to. Exclusive, like a claim: the driver
-     *  has ONE event sink, so two holders are not a composition — the second would take
-     *  the node's sockets off the first, silently. */
-    let linkOwner: AppSlot | null = null;
     const releaseClaims = (slot: AppSlot) => {
         for (const claim of slotClaims(slot)) {
             if (claims.get(claim) === slot) claims.delete(claim);
@@ -537,17 +538,6 @@ function createShell(opts: CreateShellOptions & {
             throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
         return { ...localConfig, ...facts };
     };
-    netHost?.route((payload) => {
-        // Platform link events into the occupant: sockets opening, bytes arriving, an
-        // address. What the occupant decoded off those bytes comes back the other way, as
-        // its own `link/deliver` call — never as a return read out of this one.
-        return linkOwner ? hostCallSlot(linkOwner, payload) : null;
-    }, () => linkOwner !== null, (claim, attribution, payload) => {
-        // The claim routing behind `link/deliver`. The driver normalizes the answer to
-        // empty before handing it back, so refusal and silence are one fact at the
-        // boundary.
-        return deliverInbound(claim, attribution, payload);
-    });
     /** Cross-realm call by local service id. Host prepends caller's 32-byte id — the local
      *  half of `callClaimant`'s one table, the same claim → slot lookup a peer-inbound frame
      *  resolves through (`deliverInbound`). */
@@ -566,8 +556,9 @@ function createShell(opts: CreateShellOptions & {
         // Refused rather than shadowed for the same reason a claim is, and LOUDLY because
         // the alternative is a node that looks installed and is off the network: the
         // incumbent keeps its claims and its realm, and only its sockets stop answering.
-        if (linkOwner && keyOf(linkOwner) !== key && reachesLink(loaded.manifest)) {
-            throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkOwner)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
+        const linkIncumbent = slots.find(hasLink);
+        if (linkIncumbent && keyOf(linkIncumbent) !== key && reachesLink(loaded.manifest)) {
+            throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkIncumbent)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
         }
     };
     /** Persist freshness mark after the candidate stands, before claim commit. */
@@ -589,12 +580,8 @@ function createShell(opts: CreateShellOptions & {
         const i = slots.findIndex((slot) => keyOf(slot) === appKey);
         if (i < 0) return false;
         const [slot] = slots.splice(i, 1);
-        const ownedLinks = linkOwner === slot;
         releaseClaims(slot);
-        if (ownedLinks) {
-            linkOwner = null;
-            netHost?.release(slot);
-        }
+        if (hasLink(slot)) netHost?.release(slot);
         disposeSlot(slot);
         return true;
     };
@@ -639,6 +626,11 @@ function createShell(opts: CreateShellOptions & {
         }
         return answer;
     };
+    // The claim routing behind `link/deliver` (§12.10), wired once: the driver normalizes
+    // the answer to empty before handing it back, so refusal and silence are one fact at
+    // the boundary. Not owner-keyed like `activate` — an inbound frame resolves through
+    // the claim table above, whoever currently occupies the link.
+    netHost?.routeInbound(deliverInbound);
     return {
         resolve: (proto) => {
             const slot = claims.get(proto);
@@ -698,7 +690,7 @@ function createShell(opts: CreateShellOptions & {
             }
             const previousIndex = slots.findIndex((installed) => keyOf(installed) === key);
             const previous = previousIndex < 0 ? undefined : slots[previousIndex];
-            const replacingLinkOwner = previous !== undefined && linkOwner === previous;
+            const replacingLinkOwner = previous !== undefined && hasLink(previous);
             if (previous) releaseClaims(previous);
             if (previousIndex < 0) slots.push(slot);
             else slots[previousIndex] = slot;
@@ -711,10 +703,9 @@ function createShell(opts: CreateShellOptions & {
             // binding or this identity's own: `refuseContested` turned any other candidate
             // away, and a version that DROPS `link/*` releases the binding the same way
             // dropping a claim releases the claim.
-            if (hasLink(slot)) {                netHost?.activate(slot);
-                linkOwner = slot;
+            if (hasLink(slot)) {
+                netHost?.activate(slot, (payload) => hostCallSlot(slot, payload));
             } else if (replacingLinkOwner) {
-                linkOwner = null;
                 netHost?.release(previous!);
             }
             // The mark and every claim/link binding have landed, so this slot's writes and
@@ -724,7 +715,7 @@ function createShell(opts: CreateShellOptions & {
             // occupant received in LOCAL. Publish first, then replay it through the
             // ordinary host-event path. No await in between: a concurrent add is either
             // in this replay or is announced directly to the newly published claimant.
-            if (linkOwner === slot) netHost?.replayAddresses();
+            if (hasLink(slot)) netHost?.replayAddresses();
             disposeSlot(previous);
             // The handle: the verified facts plus the bound slot — the key, the scoped fs
             // view and the loopback invoke. One object, so a caller cannot derive half of

@@ -391,10 +391,10 @@ async function testManifestClaimIsTheRouting() {
   let realmBuilds = 0;
   const identity = generateKeyPair();
   let routeDeliver;
-  const route = TransportHost.prototype.route;
-  TransportHost.prototype.route = function (call, available, deliver) {
+  const routeInbound = TransportHost.prototype.routeInbound;
+  TransportHost.prototype.routeInbound = function (deliver) {
     routeDeliver = deliver;
-    return route.call(this, call, available, deliver);
+    return routeInbound.call(this, deliver);
   };
   let shell;
   try {
@@ -409,7 +409,7 @@ async function testManifestClaimIsTheRouting() {
       admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
     });
   } finally {
-    TransportHost.prototype.route = route;
+    TransportHost.prototype.routeInbound = routeInbound;
   }
   try {
     const key = appKey(author.id, "store");
@@ -483,8 +483,8 @@ async function testManifestClaimIsTheRouting() {
     }
     // The property that actually matters: a name in `services` is unreachable from a
     // PEER while the SAME bundle's `protocols` name is — checked through the real
-    // delivery callback wired through `TransportHost.route`, rather than by inspecting
-    // the claim table or entering the shell through a second test-only method.
+    // delivery callback wired through `TransportHost.routeInbound`, rather than by
+    // inspecting the claim table or entering the shell through a second test-only method.
     {
       const pub = "reach/public", priv = "_reach-private";
       const reachKey = appKey(author.id, "reach");

@@ -957,7 +957,6 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   }
   const owner = {};
   const driver = keep(new TransportHost({}, { identity: generateKeyPair() }));
-  driver.activate(owner);
   const peerA = new Uint8Array(32).fill(0xa1);
   const peerB = new Uint8Array(32).fill(0xb2);
   // The whole `linkBytes` return: the authenticated peer, or nothing. Any other length is
@@ -965,7 +964,7 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   const authResult = (peer, trailing = []) => Uint8Array.from([...peer, ...trailing]);
   let nextBytesResult = new Uint8Array();
   let pending = null;
-  driver.route(async (payload) => {
+  driver.activate(owner, async (payload) => {
     const n = payload[0];
     const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
     if (op === "linkBytes") {
@@ -974,7 +973,7 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
     }
     if (op === "linkClosed") return Uint8Array.of(CLOSE_REASON.LOCAL);
     return new Uint8Array();
-  }, () => true);
+  });
 
   const aChannel = new ManualChannel(), bChannel = new ManualChannel();
   const a = { auth: [], close: [] }, b = { auth: [], close: [] };
