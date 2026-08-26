@@ -495,10 +495,9 @@ function createShell(opts: CreateShellOptions & {
         });
         // A candidate's top level runs before its mark and claims commit, so until then the
         // seam refuses what disposing that candidate could not take back (`isIrreversible`).
-        // Everything a guest initializes from stays open. The node facts a link occupant
-        // needs are never read OFF this seam — the host invokes the freshly stood slot's
-        // `handle` once with them, as the `init` op's payload (initLinkSlot). The refusal
-        // THROWS at the call site like every gate refusal (guest-seam.ts).
+        // Everything a guest initializes from stays open. A link occupant receives the
+        // node facts through its installation-local config, never by reading them off this
+        // seam. The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
         return (name, payload, budget) => {
             // A local service id leaves something behind in the CALLEE the same way
             // `fs/put` leaves something behind in this realm — folded in here rather than
@@ -517,7 +516,7 @@ function createShell(opts: CreateShellOptions & {
         ? slot.realm.call(input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
     /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
-     *  caller id the shell holds (loopback, init, and socket/addrs events). */
+     *  caller id the shell holds (loopback and socket/address events). */
     const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
         callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
     /** Loopback invoke with host caller id. Chained onto `inFlight` so `close()`
@@ -527,17 +526,15 @@ function createShell(opts: CreateShellOptions & {
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
-    /** The one delivery of the node's immutable facts to a link occupant: a host-proper
-     *  event into the freshly stood slot's `handle`, before the binding is published and
-     *  before any event. Constructor argument, not a capability: nothing here is
-     *  re-readable, and what is mutable — the address book — arrives as `addr` events after
-     *  publication. The body is the driver's own framing (transport-host.ts), a contract
-     *  with the pinned bundle, not a kernel ABI. */
-    const initLinkSlot = async (slot: AppSlot): Promise<void> => {
+    /** Fold this node's immutable facts into a link occupant's ordinary LOCAL config.
+     *  Host facts win same-named keys: a load may add installation-local values, but it
+     *  cannot replace the identity or resource bounds owned by the driver. */
+    const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
+        if (!hasLink(slot)) return localConfig;
         const facts = netHost?.initialConfig();
         if (!facts)
             throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
-        await invokeSlot(slot, facts);
+        return { ...localConfig, ...facts };
     };
     netHost?.route((payload) => {
         // The link occupant's `handle` return is the driver's to read: an inbound request
@@ -686,12 +683,7 @@ function createShell(opts: CreateShellOptions & {
             // discovering that at the first frame would leave the mark advanced for a
             // bundle that never ran a line.
             try {
-                await standRealm(slot, localConfig, loadOpts);
-                // The host invokes the link occupant once with the node facts — an init op
-                // into its own `handle`. A transport that refuses its own boot arguments
-                // fails the load: nothing below has been marked or claimed, so the candidate
-                // is simply disposed.
-                if (hasLink(slot)) await initLinkSlot(slot);
+                await standRealm(slot, configFor(slot, localConfig), loadOpts);
                 // The candidate is complete. EVERYTHING FROM HERE IS SYNCHRONOUS, which is
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
@@ -727,7 +719,7 @@ function createShell(opts: CreateShellOptions & {
             // cross-realm calls are now its own (`seamFor`).
             slot.active = true;
             // The address book is mutable node state, not part of the immutable facts the
-            // occupant received at init. Publish first, then replay it through the
+            // occupant received in LOCAL. Publish first, then replay it through the
             // ordinary host-event path. No await in between: a concurrent add is either
             // in this replay or is announced directly to the newly published claimant.
             if (linkOwner === slot) netHost?.replayAddresses();

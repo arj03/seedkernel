@@ -2775,7 +2775,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
   // what lets a `link`-reaching candidate get as far as the seam under test.
   const shell = await bootTestShell({
       fs, freshnessStore: store, pinAuthor: author,
-      createRealm: async ({ hostCall }) => {
+      createRealm: async ({ hostCall, source }) => {
         if (loadingNeighbor) {
           return { call: async () => { reached++; return new Uint8Array(); }, dispose() {} };
         }
@@ -2784,12 +2784,16 @@ async function testCandidateRealmCannotActBeforeCommit() {
           try { await hostCall(name, payload); } catch { refused.push(name); }
         }
         // The node facts are no longer a seam name a candidate reads offside — the host
-        // hands them to the freshly stood slot as its `init` op. A link READ stays open:
+        // folds them into its LOCAL config before standing it. A link READ stays open:
         // `link/open` answers "no route" for the unpublished binding rather than throwing.
         const openBytes = await hostCall("link/open", new Uint8Array(32));
         const moduleAnswer = await hostCall("fwd", Uint8Array.of(4));
-        candidates.push({ hostCall, refused, openBytes, moduleAnswer });
-        return { call: async () => new Uint8Array(), dispose() {} };
+        const candidate = { hostCall, refused, openBytes, moduleAnswer, source, calls: 0 };
+        candidates.push(candidate);
+        return {
+          call: async () => { candidate.calls++; return new Uint8Array(); },
+          dispose() {},
+        };
       },
       admit: admitAll,
   });
@@ -2808,8 +2812,21 @@ async function testCandidateRealmCannotActBeforeCommit() {
       "the neighbour holds the claim the candidate is about to reach for");
 
     let rejected = false;
-    try { await shell.loadBundleBlob(blob); } catch { rejected = true; }
+    const localConfig = { custom: "kept", peerId: "caller-value", requestDeadlineMs: 1 };
+    try { await shell.loadBundleBlob(blob, { localConfig }); } catch { rejected = true; }
     assert(rejected, "a failed freshness write rejects the candidate");
+    const [, candidateLocal] = Function(
+      candidates[0].source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+    )();
+    assert(candidateLocal.custom === "kept",
+      "a link slot keeps the load's ordinary installation-local config");
+    assert(/^[0-9a-f]{64}$/.test(candidateLocal.peerId) && candidateLocal.peerId !== localConfig.peerId &&
+      candidateLocal.networkKey === "00".repeat(32) &&
+      candidateLocal.contactSecret === "00".repeat(32) &&
+      candidateLocal.requestDeadlineMs === 10000,
+      "the driver's immutable node facts are hex JSON and override same-named LOCAL keys");
+    assert(candidates[0].calls === 0,
+      "standing a link slot does not invoke a second privileged init path");
     assertEqual(candidates[0].refused.sort(), ["_svc", "fs/put"],
       "a candidate reaches neither a durable write nor another realm");
     assertEqual(reached, 0, "…so the realm it called was never entered");
@@ -2820,7 +2837,7 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(shell.uninstall(key) === false, "a failed candidate never publishes its claim");
 
     store.fail = false;
-    await shell.loadBundleBlob(blob);
+    await shell.loadBundleBlob(blob, { localConfig });
     assertEqual(shell.resolve("offside/v1"), key, "the claim commits before the seam opens");
     await candidates[1].hostCall("fs/put", Uint8Array.of(0, 0, 0, 1, 120, 9));
     await candidates[1].hostCall("_svc", new Uint8Array());

@@ -4,26 +4,29 @@
 // the state the earlier parts read at runtime.
 // ============================================================================
 
-// ── per-host state, set by the `init` op ─────────────────────────────────────
+// ── per-host state, read from installation-local config ──────────────────────
 
-let ownPk = null;          // 32B node channel public key
-let ownId = "";            // its hex — the peer id
-let networkKey = null;     // 32B
-let contactSecret = null;  // 32B — OUR inbound gate (zeros = open)
-let connsPerPeer = 1;
+const ownId = LOCAL.peerId;                 // node channel public key, hex
+const ownPk = fromHex(ownId);               // 32B node channel public key
+const networkKey = fromHex(LOCAL.networkKey);
+const contactSecret = fromHex(LOCAL.contactSecret); // OUR inbound gate (zeros = open)
+const connsPerPeer = Math.max(1, LOCAL.connsPerPeer);
 // The operator's peer list as a Set of hex keys, or null for "admit everyone".
-// A lint applied by `admits` (ake.js); a node fact, shipped in the init payload.
-let admitPeers = null;
-// Fallback request deadline, learned at init.
-let requestDeadlineMs = 10000;
+// A lint applied by `admits` (ake.js); a node fact in LOCAL.
+const admitPeers = LOCAL.admitPeers.length > 0 ? new Set(LOCAL.admitPeers) : null;
+// Fallback request deadline from LOCAL.
+const requestDeadlineMs = LOCAL.requestDeadlineMs;
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
-// Every literal below is what INIT overwrites — the bounds belong to whoever owns the
-// resource (net-limits.ts, core); this module only applies them.
-let maxFrameBytes = 2 * 1024 * 1024;
-let maxUnverified = 1024, maxPerSource = 8, maxVerified = 256, maxAuthed = 256;
+// These bounds belong to whoever owns the resource (net-limits.ts, core); this module
+// only applies the values supplied in LOCAL.
+const maxFrameBytes = LOCAL.maxFrameBytes;
+const maxUnverified = LOCAL.maxHalfOpenUnverified;
+const maxPerSource = LOCAL.maxHalfOpenPerSource;
+const maxVerified = LOCAL.maxHalfOpenVerified;
+const maxAuthed = LOCAL.maxAuthedLinks;
 // How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
-let linkIdleTimeoutMs = 0;
+const linkIdleTimeoutMs = LOCAL.linkIdleTimeoutMs;
 
 // The one router and the one request/response layer per host instance.
 let router = null;
@@ -40,7 +43,7 @@ const deferQueue = [];
 // Host-managed (openLink) links by id — the pre-auth ones are in no pool.
 const openLinks = new Map();
 
-// The link limiter, over budgets from INIT (§12.6.2). THREE tiers: a slot is acquired
+// The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
 // when a socket is accepted, moves to `verified` when a msg1 opens under the contact
 // secret, and to `authed` once the peer's identity is proved and admitted — HELD there
 // for the link's whole life. Each tier evicts its own stalest occupant when full, so a
@@ -274,12 +277,6 @@ class Core {
   }
 }
 
-// ── init: the host delivers this node once ───────────────────────────────────
-//
-// The shell invokes `handle` with an `init` op while the slot is still a candidate —
-// the constructor's argument, delivered with the host's caller id. Node facts are an
-// input, not a grant: the seam's name table has no entry for them.
-
 /** Every core link, wherever it currently sits: authenticated ones live in the
  *  router's pools, pre-auth ones in the core's connecting/inbound tables, a
  *  host-managed one in `openLinks`. */
@@ -306,7 +303,7 @@ function findLink(linkId) {
 // NAME, not a tag byte — an unimplemented op fails loud.
 //
 // Two kinds of caller, told apart by those 32 bytes and nothing else:
-//   the HOST  32 zero bytes — the platform's events: `init`, sockets opening, bytes
+//   the HOST  32 zero bytes — the platform's events: sockets opening, bytes
 //              arriving, an address, a fired deadline, and the operator's `ready`/`peers`.
 //   an APP    its app key, exactly as an inbound frame carries the authenticated
 //              sender's key. `send` is the only op an app may name.
@@ -338,41 +335,16 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-/** The host's one-time delivery of the immutable node facts. The shape is a contract
- *  with the pinned bundle — transport-host.ts `initialConfig` — not a kernel version:
- *  removing or reordering a field is a bundle update, appending one breaks nothing. */
-entry("init", (r) => {
-  if (core !== null) throw new Error("transport: node facts delivered twice");
-  // No version word inside: the host feeding a different shape fails the load at this
-  // line, and the fix is shipping the matching bundle.
-  ownPk = r.blob();
-  ownId = toHex(ownPk);
-  networkKey = r.blob();
-  contactSecret = r.blob();
-  connsPerPeer = Math.max(1, r.u32());
-  maxUnverified = r.u32();
-  maxPerSource = r.u32();
-  maxVerified = r.u32();
-  maxAuthed = r.u32();
-  maxFrameBytes = r.u32();
-  requestDeadlineMs = r.u32();
-  linkIdleTimeoutMs = r.u32();
-  // An empty list means "admit everyone", said as a zero-length blob rather than a
-  // missing field, so there is one shape to read.
-  const peers = new Reader(r.blob());
-  admitPeers = peers.b.length > 0 ? new Set() : null;
-  while (peers.off < peers.b.length) admitPeers.add(toHex(peers.blob()));
-
-  router = new Router(ownPk, ownId);
-  reqres = new ReqRes();
-  core = new Core();
-  connected.clear();
-  reqres.attach((to, frame) => core.sendFrame(to, frame));
-  router.sink = (from, frame) => reqres.onFrame(from, frame);
-  // The cohort edges stay in this heap; the host reads them with the `peers` op.
-  router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-  router.onPeerDown = (peerId) => { connected.delete(peerId); };
-});
+// Build the transport from the immutable node facts in this installation's LOCAL config.
+// Mutable addresses still arrive later as ordinary `addr` events after publication.
+router = new Router(ownPk, ownId);
+reqres = new ReqRes();
+core = new Core();
+reqres.attach((to, frame) => core.sendFrame(to, frame));
+router.sink = (from, frame) => reqres.onFrame(from, frame);
+// The cohort edges stay in this heap; the host reads them with the `peers` op.
+router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
+router.onPeerDown = (peerId) => { connected.delete(peerId); };
 
 /**
  * The one entrypoint. The kernel's part of the argument is exactly the 32-byte caller;
@@ -388,8 +360,6 @@ function handle(argBytes) {
     // The platform's events are the host's alone; the caller id is the host's to write,
     // so this is a real boundary and not a hint.
     if (!fromHost && !APP_OPS[op]) throw new Error("transport: '" + op + "' is the host's, not an app's");
-    // The node facts arrive before anything else; without init, refuse by name.
-    if (core === null && op !== "init") throw new Error("transport: node facts never arrived — '" + op + "' ran before init");
     return fn(r, caller) || NOTHING;
   } finally {
     const deferred = deferQueue.splice(0);
@@ -401,7 +371,7 @@ function handle(argBytes) {
  *  transport handed over (kind OPEN, either direction). A core link we dialed never
  *  arrives here. `linkSecret` is the secret THIS link opens under: the peer's on a dial,
  *  the host's own current one on an accept — so an accept gates on the secret now, not
- *  on the one the init saw (§12.6.3). */
+ *  on the fallback in LOCAL (§12.6.3). */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
   const weDialed = r.u8() === 1;

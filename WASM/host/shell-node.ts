@@ -148,19 +148,13 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
     });
     // ── Node wrapper: add file-backed loadBundle ────────────────────────────────
     const shell: NodeShell = {
-        resolve: core.resolve,
-        routes: core.routes,
+        ...core,
         // This platform always supplies an fs (Node always has a filesystem), so the
         // optional seam member is non-null here.
         fs: core.fs!,
-        sodium: core.sodium,
-        loadBundleBlob: core.loadBundleBlob,
-        uninstall: core.uninstall,
-        revoke: core.revoke,
         async loadBundle(file, loadOpts) {
             return core.loadBundleBlob(new Uint8Array(readFileSync(file)), loadOpts);
         },
-        close() { core.close(); },
     };
     // This wrapper always supplies transport options above, so the core's nullable result
     // (needed for no-network bootShell callers) is non-null at this boundary.

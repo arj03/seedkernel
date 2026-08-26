@@ -175,7 +175,7 @@ Two things it does *for* you, which is why you should not try to reproduce them:
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
-`loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None of those values becomes author-signed bundle content; they belong to this installation and this load.
+`loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None of those values becomes author-signed bundle content; they belong to this installation and this load. For an ordinary app, `localConfig` becomes `LOCAL` unchanged. For the one slot reaching `link`, the shell adds the `TransportHost`'s node facts to `LOCAL` before standing the realm, with those host-owned keys winning collisions; callers do not need a separate transport initialization step.
 
 The handle's `invoke` is bound to the slot this load stood. On an upgrade, a replacement load stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the load they intend to drive.
 

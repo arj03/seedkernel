@@ -5,6 +5,7 @@
 import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
 import { MAX_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
+import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
 
 /** Link kinds, as `linkOpen` declares them: CORE is the routing core's own (accepted through
@@ -42,7 +43,7 @@ interface LinkBytesResult {
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 
-/** Default half-open budgets, shipped to the transport guest at init and enforced there
+/** Default half-open budgets, shipped to the transport guest in LOCAL and enforced there
  *  (§12.6.2). Tests shrink them via TransportHostOptions. */
 export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
 export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
@@ -56,7 +57,7 @@ export const DEFAULT_MAX_AUTHED_LINKS = 256;
 export const DEFAULT_MAX_RAW_LINKS = 4096;
 
 /** How long one request may take when its caller names no deadline. Generous on purpose: it
- *  has to be right for a caller who did not think about it. Shipped to the guest at init,
+ *  has to be right for a caller who did not think about it. Shipped to the guest in LOCAL,
  *  since the request path is entirely the guest's. */
 export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
 
@@ -158,8 +159,8 @@ export interface TransportHostOptions {
   requestDeadlineMs?: number;
   /** Parallel connections per dialed peer (default 1). */
   connsPerPeer?: number;
-  /** The host's inbound flood cap (default net-limits MAX_FRAME_BYTES), which the guest
- *  learns at init — the module never declares the number that bounds it. */
+  /** The host's inbound flood cap (default net-limits MAX_FRAME_BYTES), supplied to the
+   *  guest in LOCAL — the module never declares the number that bounds it. */
   maxFrameBytes?: number;
   /** Concurrent half-open budgets, enforced in the transport guest; tests shrink them. */
   maxHalfOpenUnverified?: number;
@@ -174,7 +175,7 @@ export interface TransportHostOptions {
  *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
   /** The peers this node will talk to, as 32-byte channel keys — a lint the guest applies,
- *  shipped to it at init. Absent ⇒ admit every peer that completes the handshake
+   *  shipped to it in LOCAL. Absent ⇒ admit every peer that completes the handshake
  *  (§12.6.3). */
   admitPeers?: Uint8Array[];
   /** The socket seam: dialing, listening, and the address book live here. Absent for a
@@ -206,7 +207,7 @@ export interface OpenLinkOptions {
   /** THE PEER's contact secret for a dial (from the address); absent on a dial ⇒ the
    *  peer is open (zero secret). Absent on an accept: the driver seals the accept under
    *  ITS OWN current contact secret (§12.6.3), read at announce time — so a getter-backed
-   *  value changes the gate with no transport reload — and the init facts are the fallback. */
+   *  value changes the gate with no transport reload — and the LOCAL facts are the fallback. */
   contactSecret?: Uint8Array;
   /** Transport-supplied far-end identifier (an IP), for the half-open buckets. */
   source?: string;
@@ -282,29 +283,29 @@ export class TransportHost {
     this.reset();
   }
 
-  /** The immutable node facts a freshly stood link occupant receives once — the `init`
-   *  event of this bundle's format (hostOpHeader + fields). Not re-readable afterwards,
-   *  and the address book is not here: it is mutable node state, replayed after
-   *  publication as `addr` events. The shell prepends the host's caller id. */
-  initialConfig(): Uint8Array {
+  /** The immutable node facts folded into a link occupant's installation-local config.
+   *  Binary values use the same hex spelling as peer references. The address book is not
+   *  here: it is mutable node state, replayed after publication as `addr` events. */
+  initialConfig(): JsonObject {
     const o = this.opts;
     const { identity, networkKey } = this.nodeFacts;
-    const admit = new Args();
-    for (const pk of o.admitPeers ?? []) admit.blob(pk);
-    return new Args("init")
-      .blob(identity.publicKey)
-      .blob(networkKey ?? ZERO32)
-      .blob(o.contactSecret ?? ZERO32)
-      .u32(o.connsPerPeer ?? 1)
-      .u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED)
-      .u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE)
-      .u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED)
-      .u32(o.maxAuthedLinks ?? DEFAULT_MAX_AUTHED_LINKS)
-      .u32(o.maxFrameBytes ?? MAX_FRAME_BYTES)
-      .u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS)
-      .u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS)
-      .blob(admit.build())
-      .build();
+    // Preserve the driver's u32 normalization now that these values no longer pass
+    // through Args.u32 on their way into the guest.
+    const u32 = (v: number): number => v >>> 0;
+    return {
+      peerId: toHex(identity.publicKey),
+      networkKey: toHex(networkKey ?? ZERO32),
+      contactSecret: toHex(o.contactSecret ?? ZERO32),
+      connsPerPeer: u32(o.connsPerPeer ?? 1),
+      maxHalfOpenUnverified: u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED),
+      maxHalfOpenPerSource: u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE),
+      maxHalfOpenVerified: u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED),
+      maxAuthedLinks: u32(o.maxAuthedLinks ?? DEFAULT_MAX_AUTHED_LINKS),
+      maxFrameBytes: u32(o.maxFrameBytes ?? MAX_FRAME_BYTES),
+      requestDeadlineMs: u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS),
+      linkIdleTimeoutMs: u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS),
+      admitPeers: (o.admitPeers ?? []).map(toHex),
+    };
   }
 
   /** Release link state owned by a departing link-capable slot, retaining listeners and
@@ -615,7 +616,7 @@ export class TransportHost {
       // The secret THIS link opens under: the peer's on a dial (an open peer = the zero
       // secret said explicitly); OURS on an accept, read NOW from the options, so a
       // getter-backed contact secret gates this node's accepting side with no transport
-      // reload (§12.6.3). The guest falls back to its init facts if the field is empty.
+      // reload (§12.6.3). The guest falls back to its LOCAL facts if the field is empty.
       linkSecret: opts.weDialed ? (opts.contactSecret ?? ZERO32) : (this.opts.contactSecret ?? ZERO32),
       source: opts.source,
       handshakeTimeoutMs: opts.handshakeTimeoutMs,

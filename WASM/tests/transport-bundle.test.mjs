@@ -100,8 +100,8 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   }));
   const transportOptions = { channels, listen, requestDeadlineMs: 800 };
   // A test may pause a candidate right after its realm stands, before the shell publishes
-  // it: the candidate's `init` op has not yet been delivered and the incumbent still owns
-  // `_net`, which exposes address-book updates in the replacement window deterministically.
+  // it: its LOCAL facts are installed, but the incumbent still owns `_net`, which exposes
+  // address-book updates in the replacement window deterministically.
   const realmControl = { pauseNext: null };
   // bootShell owns the adapter but leaves the load to this test — the thing under test,
   // upgrades included. Every
@@ -175,7 +175,7 @@ await configured;
 // The candidate's `init` facts were not snapped at the pause: this address update lands
 // after it, before the handover, while the incumbent still owns `_net`. The address book
 // is the NODE's, so it survives the commit iff the host replays it to the published
-// claimant; the facts the newcomer received at init never carried it.
+// claimant; the facts the newcomer received in LOCAL never carried it.
 aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
 publishCandidate();
 await upgrading;
