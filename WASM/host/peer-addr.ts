@@ -1,13 +1,12 @@
 import { fromHex, isHex64 } from "../core/util.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
+export { isHex64 };
 
-// ── the address syntax an operator types ──────────────────────────────────────
+// ── the `pk[.secret]@location` grammar ────────────────────────────────────────
 //
-// `pk[.secret]@location` is a thing a HUMAN writes — into `--peers`, into a demo page's
-// input box. It is not the transport's: the driver never sees a string, only the 32 bytes
-// and the `PeerAddr` these produce. So the grammar lives with the rest of the operator's
-// surface, and the edges with their own address form (`./net-node`, `./net-ws`) reach it
-// from here rather than the other way round.
+// A human types this string; the driver never sees it, only the 32 bytes and the
+// `PeerAddr` it produces. Where a peer lives is the transport's business, so the TCP
+// and WS edges (`./net-node`, `./net-ws`) parse `location` themselves.
 
 /** The credential half of a peer spec — `pk[.secret]` — plus whatever followed the `@`.
  *  `pk` names WHO lives there and keys the address book; the optional `.secret` is THAT

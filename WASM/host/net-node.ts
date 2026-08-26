@@ -11,11 +11,6 @@ import { createServer as createTcpServer, connect as tcpConnect, type Server as 
 import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
 import { TCP_LINGER_MS } from "../core/net-limits.js";
 
-
-// The peer-spec grammar is the operator's (peer-addr.ts), re-exported because `./net-node` is
-// where a caller holding a `pk[.secret]@host:port` string looks for the parser.
-export { parsePeerSpec, parsePeerRef, parseHostPort } from "./peer-addr.js";
-export { isHex64 } from "../core/util.js";
 // ── An unframed RawLink over a node:net socket ────────────────────────────────
 // Raw bytes in and out, no boundaries; a WS link is the same socket with a different codec
 // declared on it. node:net buffers writes issued before connect, so the link is writable
