@@ -820,14 +820,11 @@ export interface BootShellOptions {
     realmMemoryBytes?: number;
     /** The channel adapter. An OPTIONS object ⇒ bootShell constructs the `TransportHost`
      *  (identity and networkKey come from the top-level fields, never restated), admits
-     *  the transport bundle under the pin, and starts its listeners. A `TransportHost`
-     *  instance ⇒ the caller owns it — and its transport-bundle load (a browser edge loads
-     *  lazily and re-loads to change its room secret). `false` or absent ⇒ no network. */
-    transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | TransportHost | false;
-    /** Boot auto-load of the pinned transport bundle, for the OPTIONS case only (an
-     *  instance's load is its owner's). Default true. `false` ⇒ bootShell constructs the
-     *  adapter but leaves the load to the caller — the same lazy-first-connect shape an
-     *  instance gives, with no adapter to construct. */
+     *  the transport bundle under the pin, and starts its listeners. The object is retained,
+     *  so getter-backed live options stay live. `false` or absent ⇒ no network. */
+    transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | false;
+    /** Boot auto-load of the pinned transport bundle. Default true. `false` ⇒ bootShell
+     *  constructs the adapter but leaves the load to the caller. */
     transportLoad?: boolean;
     /** The transport bundle to PIN — and, in the options case, load. Default: the
      *  artifact-shipped one (`transportBundleBytes`). */
@@ -846,10 +843,6 @@ export interface BootResult {
     transport: TransportHost | null;
 }
 
-export async function bootShell(
-    opts: BootShellOptions & { transport: Omit<TransportHostOptions, "identity" | "networkKey"> | TransportHost },
-): Promise<BootResult & { transport: TransportHost }>;
-export async function bootShell(opts: BootShellOptions): Promise<BootResult>;
 export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const sodium = opts.sodium;
     // The defaults are imported lazily: they are JS-target parts (a worker-backed module
@@ -862,14 +855,13 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     const createRealm = opts.createRealm
         ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
     const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
-    // The channel adapter: CONSTRUCTED here when given options (identity + network key are
-    // the NODE's, so they are taken from the top-level fields), accepted as-is when given an
-    // instance (a browser edge with a getter contact secret), absent when false.
-    // `ownAdapter` is the adapter this assembly BUILT — it decides the transport load below.
-    const ownAdapter = opts.transport && !(opts.transport instanceof TransportHost)
-        ? new TransportHost({ ...opts.transport, identity: opts.identity, networkKey: opts.networkKey })
+    // The channel adapter is CONSTRUCTED here when given options (identity + network key
+    // are the NODE's, so they are taken from the top-level fields), absent when false. Keep
+    // the caller's object intact: live getters such as a rotating contact secret must not
+    // be flattened by assembly.
+    const transport = opts.transport
+        ? new TransportHost(opts.transport, { identity: opts.identity, networkKey: opts.networkKey })
         : null;
-    const transport = ownAdapter ?? (opts.transport instanceof TransportHost ? opts.transport : null);
     // The transport bundle this node pins, and (when constructed here) loads: the
     // caller's or the artifact-shipped one. Its author is DERIVED from the blob, never
     // restated — the pin is the whole of "only this author may be the network" (§12.5).
@@ -912,13 +904,11 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     // The transport bundle IS the node's network (§12.6): verify + govern under the
     // composed predicate, install, and the shell stands the driver up. A predicate that
     // refuses the transport author leaves the node without a network, a deliberate
-    // configuration rather than an error. Only when bootShell constructed the adapter and
-    // the caller did not defer the load: an instance's load is its owner's, and
-    // `transportLoad: false` asks for the same laziness while still letting bootShell own
-    // the adapter. A boot that throws returns no handle, so whatever it stood up must not
-    // leak: one teardown, the shell's.
+    // configuration rather than an error. `transportLoad: false` leaves the load to the
+    // caller while bootShell still owns the adapter. A boot that throws returns no handle,
+    // so whatever it stood up must not leak: one teardown, the shell's.
     try {
-        if (ownAdapter && transport && transportBlob && opts.transportLoad !== false) {
+        if (transport && transportBlob && opts.transportLoad !== false) {
             try {
                 await shell.loadBundleBlob(transportBlob);
             }

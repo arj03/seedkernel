@@ -162,6 +162,8 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
         },
         close() { core.close(); },
     };
-    return { shell, transport };
+    // This wrapper always supplies transport options above, so the core's nullable result
+    // (needed for no-network bootShell callers) is non-null at this boundary.
+    return { shell, transport: transport! };
 }
 

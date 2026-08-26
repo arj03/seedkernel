@@ -85,7 +85,8 @@ const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
 async function bootTestShell({ pinAuthor, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const pinned = pinAuthor ? {
-    transport: new TransportHost({ identity }),
+    transport: {},
+    transportLoad: false,
     transportBundle: packBundle({
       [MANIFEST_FILE]: signManifest(sodium, pinAuthor,
         { app: "pin", version: 1, modules: [], guest: GUEST() }),
@@ -389,22 +390,27 @@ async function testManifestClaimIsTheRouting() {
   });
   let realmBuilds = 0;
   const identity = generateKeyPair();
-  class RoutedTransportHost extends TransportHost {
-    route(call, available, deliver) {
-      super.route(call, available, deliver);
-      this.routeDeliver = deliver;
-    }
+  let routeDeliver;
+  const route = TransportHost.prototype.route;
+  TransportHost.prototype.route = function (call, available, deliver) {
+    routeDeliver = deliver;
+    return route.call(this, call, available, deliver);
+  };
+  let shell;
+  try {
+    shell = await bootTestShell({
+      identity,
+      transport: {},
+      transportLoad: false,
+      createRealm: async () => {
+        realmBuilds++;
+        return { call: async () => new Uint8Array(), dispose() {} };
+      },
+      admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
+    });
+  } finally {
+    TransportHost.prototype.route = route;
   }
-  const transport = new RoutedTransportHost({ identity });
-  const shell = await bootTestShell({
-    identity,
-    transport,
-    createRealm: async () => {
-      realmBuilds++;
-      return { call: async () => new Uint8Array(), dispose() {} };
-    },
-    admit: byPrivilege({ base: admitAll, grants: { link: denyAll } }),
-  });
   try {
     const key = appKey(author.id, "store");
     await shell.loadBundleBlob(blob(author, "store", 1, ["seedstore/v1"]));
@@ -489,11 +495,11 @@ async function testManifestClaimIsTheRouting() {
       }));
       const sender = new Uint8Array(32).fill(0x11);
       const payload = new Uint8Array([1, 2, 3]);
-      assert(typeof transport.routeDeliver === "function", "the shell wires inbound delivery through the transport route");
-      const publicAnswer = transport.routeDeliver(pub, sender, payload);
+      assert(typeof routeDeliver === "function", "the shell wires inbound delivery through the transport route");
+      const publicAnswer = routeDeliver(pub, sender, payload);
       assert(publicAnswer !== null, "a name in `protocols` is reachable by a peer");
       await publicAnswer;
-      assert(transport.routeDeliver(priv, sender, payload) === null,
+      assert(routeDeliver(priv, sender, payload) === null,
         "the same bundle's `services` name is unreachable by a peer, however it is spelled");
       shell.uninstall(reachKey);
     }

@@ -27,7 +27,6 @@ const authorApi = await imp("build/host/bundle-author.js");
 const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
 const { authorBundle, hybridAuthorKeysFromSeed } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
-const { TransportHost } = await imp("build/host/transport-host.js");
 const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
@@ -99,21 +98,22 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     authors: [transportAuthor, appAuthorHex],
     grants: { link: [transportAuthor] },
   }));
-  const transport = new TransportHost({ identity, channels, listen, requestDeadlineMs: 800 });
+  const transportOptions = { channels, listen, requestDeadlineMs: 800 };
   // A test may pause a candidate right after its realm stands, before the shell publishes
   // it: the candidate's `init` op has not yet been delivered and the incumbent still owns
   // `_net`, which exposes address-book updates in the replacement window deterministically.
   const realmControl = { pauseNext: null };
-  // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
-  // but leaves the load to this test — the thing under test, upgrades included. Every
+  // bootShell owns the adapter but leaves the load to this test — the thing under test,
+  // upgrades included. Every
   // candidate below is signed by the shipped blob's own author, so the pin admits them
   // and each load exercises the freshness rule, not the pin.
-  const { shell } = await bootShell({
+  const { shell, transport } = await bootShell({
     sodium, identity,
     modules: new ModuleTable(),
     freshnessStore,
     fs: false,
-    transport,
+    transport: transportOptions,
+    transportLoad: false,
     transportBundle: transportBlob,
     createRealm: async (o) => {
       const realm = await createSafeRealm(o);

@@ -158,14 +158,13 @@ window.addEventListener("pagehide", () => shell.close(), { once: true });
 
 `bootShell` (`./shell-core`) is the ONE node-assembly (§12.9), and entering it is how a client gets a node that is correct by construction. Every field but `sodium` and `identity` has a default — the module table, an in-memory fs and freshness store, a lazily-imported safe-js realm factory — so you state only what you genuinely own. One default is a decision rather than a convenience: `admit` absent is **deny-all** — the node boots but installs nothing, the transport bundle included, so a client that states no gate has no network. Browser and Node clients, the native loader, and seedstore's wrapper all enter through this assembly; they differ only in which defaults they displace.
 
-Transport behavior is determined by four options whose combinations are deliberate:
+Transport behavior has three deliberate modes:
 
 | Configuration | Adapter | Transport bundle |
 | --- | --- | --- |
 | `transport` omitted or `false` | No `TransportHost`; `BootResult.transport` is `null` | Not loaded. The node has no network. |
 | `transport: { …options }` | `bootShell` constructs and returns the adapter, filling in the top-level `identity` and `networkKey` | The shipped bundle—or `transportBundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded; listeners are then started. |
-| `transport: { …options }`, `transportLoad: false` | `bootShell` constructs and starts the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob`; this is seedchat's lazy-first-connect mode. |
-| `transport: existingTransportHost` | The supplied adapter is returned unchanged | The caller owns loading. `bootShell` still uses the shipped or supplied `transportBundle` to derive the author pin. |
+| `transport: { …options }`, `transportLoad: false` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob`; this is seedchat's lazy-first-connect mode. The options object is retained, so accessors such as seedchat's live `contactSecret` getter survive. |
 
 `transportBundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload.
 

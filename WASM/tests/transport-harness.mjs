@@ -208,11 +208,9 @@ export async function makeTransportHost(opts = {}) {
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
   const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
-  const driver = new TransportHost({
-    identity,
+  const transport = {
     channels: opts.channels,
     listen: opts.listen,
-    networkKey: opts.networkKey,
     contactSecret: opts.contactSecret,
     admitPeers: opts.admitPeers,
     connsPerPeer: opts.connsPerPeer,
@@ -225,13 +223,12 @@ export async function makeTransportHost(opts = {}) {
     // guest enforces, this is what the host holds.
     maxRawLinks: opts.maxRawLinks,
     linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
-  });
-  // A DRIVER INSTANCE, so bootShell wires it and composes the pin but neither loads the
-  // transport bundle nor starts the listeners — this harness owns the load because a test
-  // wants it observable (sometimes refused). `transportBundle` is still stated: the blob
+  };
+  // bootShell owns the adapter but leaves the load to this harness because a test wants it
+  // observable (sometimes refused). `transportBundle` is still stated: the blob
   // loaded below and the blob the pin admits are one fact, not two that can drift.
   const blob = opts.transportBlob ?? transportBlob;
-  const shell = await bootShell({
+  const { shell, transport: driver } = await bootShell({
     sodium: opts.sodium ?? sodium,
     identity,
     modules: new ModuleTable(),
@@ -240,11 +237,12 @@ export async function makeTransportHost(opts = {}) {
     // these tests never meant to hand out.
     fs: false,
     networkKey: opts.networkKey,
-    transport: driver,
+    transport,
+    transportLoad: false,
     transportBundle: blob,
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
-  }).then((r) => r.shell);
+  });
   await shell.loadBundleBlob(blob);
   const node = { shell, driver, identity, appAuthor };
   if (opts.app === false) return node;

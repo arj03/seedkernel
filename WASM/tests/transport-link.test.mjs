@@ -496,18 +496,17 @@ await test("CONTACT SECRET: it is the RECEIVER's, and only the receiver's", asyn
 
 /** One transport host whose contact secret is a LIVE getter — the shape a platform with a
  *  rotating gate has (§12.6.3). Deliberately parallels makeTransportHost in the pieces a
- *  test needs: an options object's value would be copied at construction, and the point is
- *  that the driver RE-READS the secret when it opens a link. */
+ *  test needs: bootShell must retain the options object, so the driver RE-READS the secret
+ *  when it opens a link. */
 async function makeTransportHostWithGetter(getSecret) {
   const identity = generateKeyPair();
-  const driver = new TransportHost({
-    identity,
+  const transport = {
     channels: new LoopbackChannels(),
     get contactSecret() { return getSecret(); },
-  });
-  const { shell } = await bootShell({
+  };
+  const { shell, transport: driver } = await bootShell({
     sodium, identity, modules: new ModuleTable(), freshnessStore: new FreshnessMarks(),
-    fs: false, transport: driver, transportBundle: transportBlob,
+    fs: false, transport, transportLoad: false, transportBundle: transportBlob,
     createRealm: async (o) => createSafeRealm(o), admit: transportPolicy(transportAuthor()),
   });
   await shell.loadBundleBlob(transportBlob);
@@ -958,7 +957,7 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
     fail() { this.closed?.(); }
   }
   const owner = {};
-  const driver = keep(new TransportHost({ identity: generateKeyPair() }));
+  const driver = keep(new TransportHost({}, { identity: generateKeyPair() }));
   driver.activate(owner);
   const peerA = new Uint8Array(32).fill(0xa1);
   const peerB = new Uint8Array(32).fill(0xb2);

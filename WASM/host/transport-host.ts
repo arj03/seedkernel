@@ -233,7 +233,8 @@ export class TransportHost {
   port = 0;
   wsPort = 0;
 
-  private readonly opts: TransportHostOptions;
+  private readonly opts: Omit<TransportHostOptions, "identity" | "networkKey">;
+  private readonly nodeFacts: Pick<TransportHostOptions, "identity" | "networkKey">;
   private readonly channels = new Map<number, RawLink>;
   private readonly openLinks = new Map<number, OpenLinkRecord>();
   private readonly addrs = new Map<PeerId, PeerAddr>;
@@ -244,9 +245,13 @@ export class TransportHost {
   private activeOwner: object | null = null;
   private closed = false;
 
-  constructor(opts: TransportHostOptions) {
+  constructor(
+    opts: Omit<TransportHostOptions, "identity" | "networkKey">,
+    nodeFacts: Pick<TransportHostOptions, "identity" | "networkKey">,
+  ) {
     this.opts = opts;
-    this.peerId = toHex(opts.identity.publicKey);
+    this.nodeFacts = nodeFacts;
+    this.peerId = toHex(nodeFacts.identity.publicKey);
   }
 
   /** Wire this platform binding once. All callbacks resolve its capability owner
@@ -283,11 +288,12 @@ export class TransportHost {
    *  publication as `addr` events. The shell prepends the host's caller id. */
   initialConfig(): Uint8Array {
     const o = this.opts;
+    const { identity, networkKey } = this.nodeFacts;
     const admit = new Args();
     for (const pk of o.admitPeers ?? []) admit.blob(pk);
     return new Args("init")
-      .blob(o.identity.publicKey)
-      .blob(o.networkKey ?? ZERO32)
+      .blob(identity.publicKey)
+      .blob(networkKey ?? ZERO32)
       .blob(o.contactSecret ?? ZERO32)
       .u32(o.connsPerPeer ?? 1)
       .u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED)

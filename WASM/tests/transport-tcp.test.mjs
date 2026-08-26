@@ -20,7 +20,6 @@ const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
 const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 const { ModuleTable } = await imp("build/host/module-table.js");
-const { TransportHost } = await imp("build/host/transport-host.js");
 const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = transportBundleBytes();
@@ -40,21 +39,21 @@ async function makeNode(ws = false) {
     authors: [transportAuthor, appAuthorHex],
     grants: { link: [transportAuthor] },
   }));
-  const transport = new TransportHost({
-    identity,
+  const transportOptions = {
     channels: new NodeChannelFactory(),
     listen: { host: HOST, port: 0 },
     ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
     requestDeadlineMs: 2000,
-  });
-  // A driver INSTANCE, so bootShell wires it and derives the pin from `transportBundle`
-  // but leaves the load and the listeners to this test, which starts them by hand below.
-  const { shell } = await bootShell({
+  };
+  // bootShell owns the adapter but leaves the load and listeners to this test, which
+  // starts them by hand below.
+  const { shell, transport } = await bootShell({
     sodium, identity,
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    transport,
+    transport: transportOptions,
+    transportLoad: false,
     transportBundle: transportBlob,
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
