@@ -37,7 +37,7 @@ const { createGuestSeam } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
+const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/host/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

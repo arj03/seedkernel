@@ -29,7 +29,14 @@ const nativeHandleHarness = `
   globalThis.invokeApp = (appKey, payload) => {
     const app = apps.get(appKey);
     if (!app) throw new Error("native test: no loaded handle for '" + appKey + "'");
-    return app.invoke(writeOp("test", new Uint8Array(payload)));
+    // This adapter only ever invokes the test fixture's literal "test" operation. Keep
+    // that fixture frame here rather than widening the production QuickJS globals with
+    // the optional client codec solely for Go assertions.
+    const args = new Uint8Array(payload);
+    const body = new Uint8Array(5 + args.length);
+    body.set([4, 0x74, 0x65, 0x73, 0x74]);
+    body.set(args, 5);
+    return app.invoke(body);
   };
 })();
 `

@@ -35,7 +35,7 @@ const { createGuestSeam, guestSignScope, appSignScope }
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
 const TEST_TIMERS = { arm() {}, clear() {} };
 const TEST_CALLS = { call: () => null };
-const { readOp, writeOp } = await imp("build/core/op-frame.js");
+const { readOp, writeOp } = await imp("build/host/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
 const _testProto = enc.encode("_test");

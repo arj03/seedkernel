@@ -158,15 +158,15 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 | Transport driver — channels by link id, outbound promises, the address book. No protocol, no state machine | `host/transport-host.ts` | 430 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 382 |
 | Shell and protocol routing (§12.10) | `host/shell-core.ts` | 433 |
-| Node startup — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints | `host/cli.ts` | 216 |
-| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id, the host-call names, the app-facing op envelope | `core/*.ts` (8 files) | 339 |
+| Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/op-frame.ts` | 275 |
+| Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id and the host-call names | `core/*.ts` (7 files) | 280 |
 
 **Four reasons a row is shared**, and which reason applies decides whether it could ever leave the set:
 
 - **Trust root** — the bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle. None of it is core by the end-to-end test; all of it is stuck.
-- **Vocabulary** — the domain prefixes, manifest suite id, authority names and flood bounds in `core/`. A bundle defining the vocabulary its own signature is verified under is circular. Pure transforms do not enter it: seed store and the transport both ship their computations as modules and add no host name.
+- **Vocabulary** — the domain prefixes, manifest suite id, authority names and flood bounds in `core/`. Core is the vocabulary a bundle's own signature is verified under; a bundle defining that vocabulary would be circular. A codec nothing verifies is not core. Pure transforms do not enter it either: seed store and the transport both ship their computations as modules and add no host name.
 - **A stable adapter** — the transport driver holds link ids, listeners and the address book, while raw-link events target the slot/platform binding that owns that capability. Listener lifecycle follows host configuration, not claim lifecycle or service spelling.
-- **Reuse** — protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule on every target, not because agreement is load-bearing.
+- **Reuse** — protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule on every target, not because agreement is load-bearing. The optional op codec likewise stays shared so clients and guest build tools do not each restate it.
 
 **Per-target platform — the seam, written once per target**
 

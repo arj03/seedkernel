@@ -10,7 +10,7 @@ import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
-import { writeOp } from "../core/op-frame.js";
+import { writeOp } from "./op-frame.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, Shell } from "./shell-core.js";
 
