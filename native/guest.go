@@ -58,11 +58,9 @@ type guestRealm struct {
 	// realm, and later calls are refused rather than panicking on a freed handle.
 	dead bool
 
-	// Host-side calls parked for this realm. The maximum arrives from the shared limits
-	// module on every construction, before any payload is copied out of the guest runtime.
-	maxOutstandingHostCalls int
-	outstandingHostCalls    int
-	hostCalls               map[int64]struct{} // live parked host calls, by guest-minted id
+	// Host-side calls parked for this realm. This map rejects duplicate/stray settlements;
+	// the shared TypeScript nativeCall owns the independent outstanding-call policy cap.
+	hostCalls map[int64]struct{} // live parked host calls, by guest-minted id
 }
 
 type initiatorCall struct{ onDone, onFail *qjs.Value }
@@ -82,11 +80,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 		if ms := t.Args()[3].Int64(); ms > 0 {
 			budget = time.Duration(ms) * time.Millisecond
 		}
-		maxOutstanding := int(t.Args()[4].Int64())
-		if maxOutstanding <= 0 {
-			return nil, errors.New("createRealm: no outstanding host-call limit supplied")
-		}
-		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget, maxOutstanding)
+		g, err := newGuestRealm(el, t.Args()[0].String(), t.Args()[1], mem, budget)
 		if err != nil {
 			return nil, err
 		}
@@ -142,7 +136,7 @@ func installRealmBridge(qc *qjs.Context, b *qjs.Value) {
 // newGuestRealm builds a confined realm running `source` — already fronted by the shell
 // with the guest preamble, signed APP config and per-load LOCAL config, so what arrives
 // here is what a safe-js realm would be handed — with host.call funnelled into `hostCall`.
-func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLimit uint64, budget time.Duration, maxOutstandingHostCalls int) (*guestRealm, error) {
+func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLimit uint64, budget time.Duration) (*guestRealm, error) {
 	hostQc := loop.c
 	// The execution bound lives in the engine (qjs.Budget arms the interrupt handler), so
 	// an unbounded realm costs what a bounded one does.
@@ -154,7 +148,7 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 		hostQc: hostQc, rt: rt, qc: rt.Context(), loop: loop,
 		hostCall: hostCall.Dup(), calls: map[int64]*initiatorCall{},
 		hostCalls: make(map[int64]struct{}),
-		budget:    budget, maxOutstandingHostCalls: maxOutstandingHostCalls,
+		budget:    budget,
 	}
 	fail := func(err error) (*guestRealm, error) {
 		g.close()
@@ -180,9 +174,6 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 	// Promise under callId is settled by realmSettle when the seam's promise lands. The
 	// fourth host argument is this segment's live module deadline; -1 means unbounded.
 	g.qc.Global().SetPropertyStr("__host_call", g.qc.Function(func(t *qjs.This) (*qjs.Value, error) {
-		if g.outstandingHostCalls >= g.maxOutstandingHostCalls {
-			return nil, fmt.Errorf("guest: too many outstanding host calls (cap %d)", g.maxOutstandingHostCalls)
-		}
 		payload, err := qjs.JsTypedArrayToGo(t.Args()[2])
 		if err != nil {
 			return nil, err
@@ -199,14 +190,12 @@ func newGuestRealm(loop *eventLoop, source string, hostCall *qjs.Value, memoryLi
 				deadlineMs = 0
 			}
 		}
-		g.outstandingHostCalls++
 		g.hostCalls[callID] = struct{}{}
 		res, err := hostQc.Invoke(g.hostCall, hostQc.NewUndefined(),
 			nv, pv, hostQc.NewInt64(callID), hostQc.NewInt64(deadlineMs))
 		pv.Free()
 		nv.Free()
 		if err != nil {
-			g.outstandingHostCalls--
 			delete(g.hostCalls, callID)
 			return nil, err
 		}
@@ -427,15 +416,12 @@ func (g *guestRealm) settleNet(callID int64, bytes []byte, msg string) {
 	if g.checkAlive() != nil {
 		return // the realm the continuation belonged to no longer exists
 	}
-	// Look up the parked call before touching the count. A duplicate or stray settlement
-	// therefore cannot loosen the outstanding-call cap.
+	// Look up the parked call first. A duplicate or stray settlement must not consume a
+	// different live call or run a guest continuation twice.
 	if _, parked := g.hostCalls[callID]; !parked {
 		return
 	}
 	delete(g.hostCalls, callID)
-	if g.outstandingHostCalls > 0 {
-		g.outstandingHostCalls--
-	}
 	var res *qjs.Value
 	var err error
 	if bytes != nil {
@@ -509,7 +495,6 @@ func (g *guestRealm) close() {
 	}
 	g.loop.removeContext(g.qc) // stop pumpAll touching this realm before freeing it
 	g.settleAll("guest realm closed")
-	g.outstandingHostCalls = 0
 	clear(g.hostCalls)
 	g.hostCall.Free() // a HOST-realm ref: rt.Close only tears down the guest realm
 	g.rt.Close()

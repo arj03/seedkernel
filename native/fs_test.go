@@ -58,24 +58,24 @@ func TestNodeFsRoundTrip(t *testing.T) {
 // directory itself, so an unchecked empty key makes delete("") remove the store.
 func TestNodeFsRejectsUnsafeKeys(t *testing.T) {
 	fs, _ := newNodeFs(t.TempDir())
-	unsafe := []string{
-		"", ".", "..", "a/b", "../escape", `a\b`, "a\x00b", "a\nb",
-		// Outside the shared charset (core/fs.ts SAFE_CHARS) — the backstop is the same
-		// predicate as the rule it stands behind, not a laxer one, so everything the
-		// shared rule refuses is refused here too.
-		"a b", "a~b", "a:b", "a*b", "héllo", "日本",
-		// Windows device names, with and without an extension: opening one reaches the
-		// console or a serial port rather than a file, and would hang the single event
-		// loop on a read that never returns. Refused on every OS (the key space must not
-		// depend on where a node runs), which is why this test is not Windows-only.
-		"CON", "nul", "NUL.txt", "com1", "LPT9.dat", "AUX", "PRN",
-	}
+	unsafe := []string{"", ".", "..", "a/b", "../escape", `a\b`}
 	for _, k := range unsafe {
 		if err := fs.put(k, []byte("x")); err == nil {
 			t.Fatalf("put(%q) accepted an unsafe key", k)
 		}
 		if fs.size(k) != -1 || fs.get(k) != nil || fs.delete(k) {
 			t.Fatalf("unsafe key %q resolved on read/delete", k)
+		}
+	}
+}
+
+func TestNodeFsDoesNotRestateSharedKeyPolicy(t *testing.T) {
+	// validatedFs applies isSafeFsKey before production calls reach this backend. The
+	// backend itself checks containment only, like NodeFs, so additions to that shared
+	// predicate cannot silently produce a different native key space.
+	for _, k := range []string{"a b", "a~b", "héllo", "CON"} {
+		if !fsKeySafe(k) {
+			t.Fatalf("backend restated shared key policy for %q", k)
 		}
 	}
 }

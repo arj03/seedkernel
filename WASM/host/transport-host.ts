@@ -3,7 +3,7 @@
 
 
 import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
-import { MAX_FRAME_BYTES } from "../core/net-limits.js";
+import { DEFAULT_MAX_RAW_LINKS, MAX_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
@@ -54,7 +54,7 @@ export const DEFAULT_MAX_AUTHED_LINKS = 256;
 
 /** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
  *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
-export const DEFAULT_MAX_RAW_LINKS = 4096;
+export { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
 
 /** How long one request may take when its caller names no deadline. Generous on purpose: it
  *  has to be right for a caller who did not think about it. Shipped to the guest in LOCAL,

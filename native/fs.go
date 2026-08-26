@@ -12,49 +12,13 @@ import (
 	"seedloader/qjs"
 )
 
-// fsKeySafe is the BACKSTOP, not the rule: which keys are legal is `isSafeFsKey`
-// (WASM/core/fs.ts, a consensus predicate) over this backend. It transcribes that
-// predicate only ever as strict or stricter, so a divergence refuses a key the shared
-// rule admits rather than admitting one it refuses (a laxer backstop once passed "CON".
-// It covers "" because filepath.Join(dir, "") is the data directory itself, and '\n'
-// because list() serializes on newlines.
+// fsKeySafe is only the backend's containment backstop. Which keys are portable is the
+// shared isSafeFsKey predicate (WASM/core/fs.ts), applied by validatedFs; restating that
+// policy here would let targets' key spaces drift. Keep path-shaped cases because the
+// loader's direct fs handle bypasses validatedFs. Empty is also refused because it names
+// the store directory itself, which os.Remove can remove when it is empty.
 func fsKeySafe(k string) bool {
-	if k == "" || k == "." || k == ".." {
-		return false
-	}
-	// SAFE_CHARS byte-wise: every legal character is ASCII, so any byte outside the set
-	// (including multi-byte runes) refuses the key, as the shared regex does.
-	for i := 0; i < len(k); i++ {
-		c := k[i]
-		ok := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
-			c == '.' || c == '_' || c == '-'
-		if !ok {
-			return false
-		}
-	}
-	return !reservedDeviceName(k)
-}
-
-// reservedDeviceNames are the names Windows resolves to a DEVICE before the request
-// reaches a filesystem. Refused on every OS — the key space must not depend on where a
-// node runs (core/fs.ts RESERVED_DEVICE_NAMES).
-var reservedDeviceNames = func() map[string]bool {
-	m := map[string]bool{"CON": true, "PRN": true, "AUX": true, "NUL": true}
-	for i := '0'; i <= '9'; i++ { // COM0/LPT0 are reserved on current Windows too
-		m["COM"+string(i)] = true
-		m["LPT"+string(i)] = true
-	}
-	return m
-}()
-
-// reservedDeviceName mirrors core/fs.ts isReservedDeviceName: Windows ignores the
-// extension, so the stem before the first '.' decides it ("NUL.txt" is still NUL).
-func reservedDeviceName(k string) bool {
-	stem := k
-	if d := strings.IndexByte(k, '.'); d >= 0 {
-		stem = k[:d]
-	}
-	return reservedDeviceNames[strings.ToUpper(stem)]
+	return k != "" && k != "." && k != ".." && !strings.ContainsAny(k, `/\`)
 }
 
 // fsTmpPrefix marks put()'s scratch files before the rename onto a key: its '~' is

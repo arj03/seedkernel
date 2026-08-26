@@ -19,13 +19,6 @@ import (
 	"seedloader/qjs"
 )
 
-// maxLiveChannels caps how many sockets this host holds at once: accepting happens without
-// anyone asking, and each accepted socket costs two goroutines, a 64 KiB buffer and a map
-// entry BEFORE the transport guest has looked at it. This bounds the flood window the
-// guest's link budgets (transport-host.ts) cannot reach — a var only so a test can shrink
-// it.
-var maxLiveChannels = 4096
-
 // acceptErrBackoff paces the accept loop after a non-fatal error: EMFILE makes Accept fail
 // immediately and repeatedly, and retrying flat out would spin a core.
 const acceptErrBackoff = 20 * time.Millisecond
@@ -40,6 +33,10 @@ type netHost struct {
 	nextID    int64
 	listeners []net.Listener // bound listeners, closed on network teardown
 
+	// Policy values installed by host/native-shim.ts before any socket is opened.
+	maxLiveChannels int
+	closeGrace      time.Duration
+
 	// Retained JS dispatchers (the host realm's router into per-channel callbacks).
 	fnDeliver *qjs.Value
 	fnClosed  *qjs.Value
@@ -52,6 +49,25 @@ type netHost struct {
 func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 	n := &netHost{el: el, qc: qc, und: qc.NewUndefined(), chans: map[int64]rawChannel{}}
 	o := qc.NewObject()
+
+	o.SetPropertyStr("install", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) < 2 {
+			return nil, errors.New("net: no socket limits supplied")
+		}
+		maxLive := int(t.Args()[0].Int64())
+		grace := time.Duration(t.Args()[1].Int64()) * time.Millisecond
+		if maxLive <= 0 || grace <= 0 {
+			return nil, errors.New("net: invalid socket limits")
+		}
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if n.maxLiveChannels != 0 || n.closeGrace != 0 {
+			return nil, errors.New("net: socket limits already installed")
+		}
+		n.maxLiveChannels = maxLive
+		n.closeGrace = grace
+		return t.Context().NewUndefined(), nil
+	}))
 
 	// One socket kind: a raw byte duplex. Which codec runs over it is the transport
 	// bundle's business, never Go's.
@@ -157,7 +173,7 @@ func (n *netHost) alloc() int64 {
 func (n *netHost) allocInbound() (int64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if len(n.chans) >= maxLiveChannels {
+	if len(n.chans) >= n.maxLiveChannels {
 		return 0, false
 	}
 	n.nextID++
@@ -168,7 +184,7 @@ func (n *netHost) allocInbound() (int64, bool) {
 // pre-connect sends, so JS can wrap the id and send its HELLO (or WS upgrade) immediately.
 func (n *netHost) dial(addr string) int64 {
 	id := n.alloc()
-	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id))
+	ch := newDialChannel(addr, n.onMsg(id), n.onClose(id), n.closeGrace)
 	n.mu.Lock()
 	n.chans[id] = ch
 	n.mu.Unlock()
@@ -240,7 +256,7 @@ func (n *netHost) closeListeners() {
 // wrapInbound builds a channel for an accepted socket but defers its read goroutine
 // to the returned start(), so the loop registers the JS channel first.
 func (n *netHost) wrapInbound(id int64, conn net.Conn) (rawChannel, func()) {
-	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id))
+	c := newInboundChannel(conn, n.onMsg(id), n.onClose(id), n.closeGrace)
 	return c, func() { go c.readLoop() }
 }
 

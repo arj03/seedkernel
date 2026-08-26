@@ -102,7 +102,7 @@ func TestGuestRealmCarriesModuleDeadline(t *testing.T) {
 	}
 }
 
-func TestGuestRealmStraySettleDoesNotLoosenOutstandingCap(t *testing.T) {
+func TestGuestRealmStraySettleDoesNotConsumeParkedCall(t *testing.T) {
 	guestSeamRealm(t)
 	if _, err := qc.Eval("build-seam.js", qjs.Code(`
 		globalThis.__guestSeam = () => new Promise(() => {});
@@ -121,8 +121,8 @@ func TestGuestRealmStraySettleDoesNotLoosenOutstandingCap(t *testing.T) {
 	if _, err := realmCall("park", nil); err != nil {
 		t.Fatal("park host call:", err)
 	}
-	if g.outstandingHostCalls != 1 {
-		t.Fatalf("parked call count = %d, want 1", g.outstandingHostCalls)
+	if len(g.hostCalls) != 1 {
+		t.Fatalf("parked call count = %d, want 1", len(g.hostCalls))
 	}
 	var liveID int64
 	for id := range g.hostCalls {
@@ -130,12 +130,12 @@ func TestGuestRealmStraySettleDoesNotLoosenOutstandingCap(t *testing.T) {
 	}
 
 	g.settleNet(liveID+1000, []byte{}, "")
-	if g.outstandingHostCalls != 1 {
-		t.Fatalf("stray settlement changed parked call count to %d", g.outstandingHostCalls)
+	if len(g.hostCalls) != 1 {
+		t.Fatalf("stray settlement changed parked call count to %d", len(g.hostCalls))
 	}
 	g.settleNet(liveID, []byte{}, "")
-	if g.outstandingHostCalls != 0 {
-		t.Fatalf("live settlement left parked call count at %d", g.outstandingHostCalls)
+	if len(g.hostCalls) != 0 {
+		t.Fatalf("live settlement left parked call count at %d", len(g.hostCalls))
 	}
 }
 

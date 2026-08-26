@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+const testCloseGrace = time.Second
+
 func waitOn(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()
 	select {
@@ -33,7 +35,7 @@ func TestSockChannelRoundTrip(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	in := make(chan []byte, 1)
-	c := newInboundChannel(c1, func(b []byte) { in <- b }, func() {})
+	c := newInboundChannel(c1, func(b []byte) { in <- b }, func() {}, testCloseGrace)
 	go c.readLoop()
 
 	if _, err := c2.Write([]byte("inbound")); err != nil {
@@ -66,7 +68,7 @@ func TestSockChannelRoundTrip(t *testing.T) {
 func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
 	c.send([]byte("first"))
 	c.send([]byte("second"))
 	c.close(true)
@@ -99,7 +101,7 @@ func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {
 func TestSockChannelNonGracefulCloseDropsQueuedSends(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
 	c.send([]byte("must-not-flush"))
 	c.close(false)
 
@@ -141,7 +143,7 @@ func TestSockChannelDialFailureFiresOnClose(t *testing.T) {
 	ln.Close() // now nothing listens: the dial must fail
 
 	onClosed := make(chan struct{}, 1)
-	c := newDialChannel(addr, func([]byte) {}, func() { onClosed <- struct{}{} })
+	c := newDialChannel(addr, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
 	waitOn(t, onClosed, "a failed dial must fire onClose")
 	c.send([]byte("x")) // dead: dropped without a panic
 }
@@ -157,7 +159,7 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 	defer ln.Close()
 
 	var onClosed atomic.Int32
-	c := newDialChannel(ln.Addr().String(), func([]byte) {}, func() { onClosed.Add(1) })
+	c := newDialChannel(ln.Addr().String(), func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
 	c.send([]byte("queued")) // buffers pre-connect; the non-graceful close drops it
 	c.close(false)
 
@@ -185,7 +187,7 @@ func TestSockChannelCloseWhileDialing(t *testing.T) {
 func TestSockChannelPeerCloseFiresOnClose(t *testing.T) {
 	c1, c2 := net.Pipe()
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
 	go c.readLoop()
 	c2.Close() // the peer tears down
 	waitOn(t, onClosed, "a peer close must fire onClose")
@@ -206,7 +208,7 @@ func TestSockChannelSilentPeerTimesOut(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} })
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed <- struct{}{} }, testCloseGrace)
 	go c.readLoop()
 	waitOn(t, onClosed, "a connection that never spoke must be reclaimed")
 }
@@ -223,7 +225,7 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 	defer c2.Close()
 	in := make(chan struct{}, 1)
 	onClosed := make(chan struct{}, 1)
-	c := newInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} })
+	c := newInboundChannel(c1, func([]byte) { in <- struct{}{} }, func() { onClosed <- struct{}{} }, testCloseGrace)
 	go c.readLoop()
 
 	if _, err := c2.Write([]byte("hello")); err != nil {
@@ -244,11 +246,8 @@ func TestSockChannelSpokenForSurvives(t *testing.T) {
 // the listener keeps serving, so the node recovers as live channels drain rather than
 // going deaf.
 func TestNetHostAcceptCeiling(t *testing.T) {
-	defer func(m int) { maxLiveChannels = m }(maxLiveChannels)
-	maxLiveChannels = 2
-
-	n := &netHost{chans: map[int64]rawChannel{}}
-	for i := 0; i < maxLiveChannels; i++ {
+	n := &netHost{chans: map[int64]rawChannel{}, maxLiveChannels: 2}
+	for i := 0; i < n.maxLiveChannels; i++ {
 		id, ok := n.allocInbound()
 		if !ok {
 			t.Fatalf("connection %d refused under the ceiling", i)
@@ -274,7 +273,7 @@ func TestNetHostAcceptCeiling(t *testing.T) {
 func TestSockChannelCloseFailRace(t *testing.T) {
 	c1, c2 := net.Pipe()
 	var onClosed atomic.Int32
-	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) })
+	c := newInboundChannel(c1, func([]byte) {}, func() { onClosed.Add(1) }, testCloseGrace)
 	go c.readLoop()
 
 	var wg sync.WaitGroup

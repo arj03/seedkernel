@@ -9,6 +9,7 @@
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
 import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
+import { TCP_LINGER_MS } from "../core/net-limits.js";
 
 
 // The peer-spec grammar is the operator's (cli.ts), re-exported because `./net-node` is
@@ -19,9 +20,6 @@ export { isHex64 } from "../core/util.js";
 // Raw bytes in and out, no boundaries; a WS link is the same socket with a different codec
 // declared on it. node:net buffers writes issued before connect, so the link is writable
 // from birth — the transport can send its HELLO the moment it is constructed.
-/** How long a gracefully-closed socket may linger waiting for its FIN to flush
- *  before it is destroyed outright. */
-const TCP_LINGER_MS = 5_000;
 function nodeRawStream(socket: Socket, framing: Framing, authority?: string): RawLink {
     return {
         framing,

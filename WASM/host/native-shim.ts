@@ -12,6 +12,7 @@ import {
 import { serializeCalls } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
+import { DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKeys } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
@@ -51,8 +52,7 @@ declare const bridge: {
   stdout(bytes: Uint8Array): void;
   /** Raw bytes from stdin — `--op`'s argument, or empty when nothing was piped in. */
   stdin(): ArrayBuffer;
-  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number,
-              maxOutstandingHostCalls: number): number;
+  createRealm(source: string, hostCall: NativeHostCall, memoryLimitBytes: number, deadlineMs: number): number;
   /** Invoke the realm's one `handle` entrypoint. Returns 1 when it handed its answer to a
    *  later turn (the `__deferred` marker), 0 otherwise. */
   realmCall(realm: number, payload: Uint8Array,
@@ -172,6 +172,8 @@ export const fs: Fs = {
  *  applies follows from the address, which is this file's to read and never Go's. */
 type GoLink = Omit<RawLink, "framing">;
 declare const __net: {
+  /** Install host-owned socket limits before any channel can be opened. */
+  install(maxLiveChannels: number, closeGraceMs: number): void;
   /** Open an outbound byte duplex. The id is never 0, and the channel buffers
    *  pre-connect sends, so JS can write the transport's HELLO immediately. */
   connect(host: string, port: number): number;
@@ -185,6 +187,10 @@ declare const __net: {
   close(id: number, graceful?: boolean): void;
   closeListeners(): void;
 };
+
+// Policy values live in shared TypeScript and cross once when the primitive is installed;
+// Go retains the mechanisms that must act before JS can observe an accepted socket.
+__net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS);
 
 // ── the RawLink shaping ─────────────────────────────────────────────────────
 //
@@ -377,20 +383,37 @@ const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, d
     // clock. A native module runs synchronously inside that same segment, so its elapsed
     // time is already billed by guest.go; `charge` is deliberately a no-op rather than a
     // second charge when guest-seam's common module path settles.
+    let outstandingHostCalls = 0;
     const nativeCall: NativeHostCall = (name, payload, callId, deadlineMs) => {
+        if (outstandingHostCalls >= DEFAULT_MAX_OUTSTANDING_HOST_CALLS) {
+            throw new Error(`guest: too many outstanding host calls (cap ${DEFAULT_MAX_OUTSTANDING_HOST_CALLS})`);
+        }
         const budget: CallBudget = {
             remainingMs: deadlineMs < 0 ? Infinity : deadlineMs,
             charge: () => {},
         };
-        void Promise.resolve(hostCall(name, new Uint8Array(payload), budget)).then(
-            (bytes: Uint8Array) => bridge.realmSettle(realm, callId, bytes, null),
-            (e: unknown) => bridge.realmSettle(realm, callId, null, errMessage(e)),
+        let answer: Promise<Uint8Array> | Uint8Array;
+        outstandingHostCalls++;
+        try {
+            answer = hostCall(name, new Uint8Array(payload), budget);
+        } catch (e) {
+            outstandingHostCalls--;
+            throw e;
+        }
+        void Promise.resolve(answer).then(
+            (bytes: Uint8Array) => {
+                if (outstandingHostCalls > 0) outstandingHostCalls--;
+                bridge.realmSettle(realm, callId, bytes, null);
+            },
+            (e: unknown) => {
+                if (outstandingHostCalls > 0) outstandingHostCalls--;
+                bridge.realmSettle(realm, callId, null, errMessage(e));
+            },
         );
         return null;
     };
     realm = bridge.createRealm(source, nativeCall, memoryLimitBytes ?? DEFAULT_REALM_MEMORY_BYTES,
-        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs),
-        DEFAULT_MAX_OUTSTANDING_HOST_CALLS);
+        deadlineMs === undefined ? DEFAULT_GUEST_DEADLINE_MS : (deadlineMs === Infinity ? -1 : deadlineMs));
     let disposed = false;
     return {
         // Serialized in the shared TS rather than in Go: one implementation of the realm

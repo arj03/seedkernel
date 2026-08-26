@@ -12,10 +12,6 @@ import (
 	"time"
 )
 
-// closeGrace bounds how long a graceful close() lets the writer flush queued sends (a
-// PeerLink rejection, a WS close frame), so a wedged peer cannot pin the writer forever.
-const closeGrace = 5 * time.Second
-
 // tcpKeepAlive is how long a connection may be idle before the kernel probes it, set on
 // both the dial and the listen path: it is the only thing that reclaims a socket whose
 // peer VANISHED (no FIN on a NAT rebind or a killed VM), while a present-but-silent peer
@@ -66,19 +62,20 @@ type sockChannel struct {
 	onMsg   func([]byte)
 	onClose func()
 
-	mu     sync.Mutex
-	conn   net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
-	queue  [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
-	queued int      // bytes held in queue, reported to the transport's stall clock
-	dead   bool
+	mu         sync.Mutex
+	conn       net.Conn // set at most once, under mu, before the reader/writer start (they read it lock-free); close/fail Close() it but never reassign
+	queue      [][]byte // sends awaiting the writer, in order (also buffers pre-connect sends)
+	queued     int      // bytes held in queue, reported to the transport's stall clock
+	dead       bool
+	closeGrace time.Duration // installed from the shared TypeScript network policy
 
 	wake chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
 }
 
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
-func newDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, wake: make(chan struct{}, 1)}
+func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace, wake: make(chan struct{}, 1)}
 	go func() {
 		conn, err := dialTCP(addr)
 		if err != nil {
@@ -101,8 +98,8 @@ func newDialChannel(addr string, onMsg func([]byte), onClose func()) *sockChanne
 
 // newInboundChannel wraps an already-open accepted socket: its writer starts immediately,
 // while the caller starts readLoop once the JS channel is registered (netHost.wrapInbound).
-func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func()) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, wake: make(chan struct{}, 1)}
+func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace, wake: make(chan struct{}, 1)}
 	go c.writeLoop()
 	return c
 }
@@ -201,7 +198,7 @@ func (c *sockChannel) close(graceful bool) {
 		c.signal() // wake a parked writer so it observes dead and exits
 		return
 	}
-	conn.SetWriteDeadline(time.Now().Add(closeGrace))
+	conn.SetWriteDeadline(time.Now().Add(c.closeGrace))
 	c.signal() // the writer flushes the queue, then Close()s and exits
 }
 
