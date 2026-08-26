@@ -9,7 +9,7 @@
 // WebSocket is absent is safe.
 import type { PeerId } from "../core/socket-seam.js";
 import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { parsePeerRef } from "./cli.js";
+import { parsePeerRef } from "./peer-addr.js";
 import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
@@ -118,7 +118,7 @@ export class WsNetwork extends SingleIdentityNetwork {
  *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
  *  ws:// scheme; pass wss:// explicitly for TLS.
  *
- *  Who the peer is comes from `parsePeerRef` (cli.ts), the one place that grammar is
+ *  Who the peer is comes from `parsePeerRef` (peer-addr.ts), the one place that grammar is
  *  written; this edge's address form being a URL is the only reason a second entry point
  *  exists. */
 export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
