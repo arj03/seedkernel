@@ -15,6 +15,9 @@ const N_LINK_CLOSE = "link/close";
 // A READ of a link's unsent backlog — the only way this program can tell a slow
 // exchange from a stalled one, since everything else it sees is its own bookkeeping.
 const N_LINK_STAT = "link/stat";
+// The one link name that carries something IN rather than out: a request this program
+// decoded off a link, handed to the host's claim routing.
+const N_LINK_DELIVER = "link/deliver";
 
 const N_TIMER_ARM = "timer/arm";
 const N_TIMER_CLEAR = "timer/clear";
@@ -233,28 +236,17 @@ function netLinkClose(linkId, graceful) { void host.call(N_LINK_CLOSE, args([lin
  *  stall clock to the deadline alone. */
 async function netLinkBuffered(linkId) { return readU32BE(await host.call(N_LINK_STAT, args([linkId], [])), 0); }
 
-/** The delivery half of one linkBytes return: `[count u32]` then that many records from
- *  the request/response layer (`ReqRes.onFrame`), each one
- *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`,
- *  or null when this frame decoded to nothing deliverable. `packLinkBytesResult` prefixes
- *  the event's optional authentication transition. Several records is the ordinary case,
- *  which is why every field is length-prefixed. */
-function packDeliveries(records) {
-  if (!records || records.length === 0) return null;
-  const head = new Uint8Array(4);
-  writeU32BE(head, 0, records.length);
-  return concatBytes([head, ...records]);
-}
-
-/** One `linkBytes` event's complete return. The event already names its link, so this
- *  value deliberately cannot redirect either result to another socket:
- *  `[authenticated u8][peer 32 when authenticated][delivery count + records]`.
- *  Empty means the read caused no externally visible transition or delivery. */
-function packLinkBytesResult(peer, deliveries) {
-  if (!peer && !deliveries) return null;
-  const state = Uint8Array.of(peer ? 1 : 0);
-  const emptyDeliveries = new Uint8Array(4);
-  return concatBytes([state, ...(peer ? [peer] : []), deliveries || emptyDeliveries]);
+/** Hand ONE request this program decoded to the host's claim routing:
+ *  `[claimLen u8][claim][attribution 32][payload]`, answered with the claimant's bytes
+ *  (empty both for a claim no peer may reach and for a handler that failed — one fact at
+ *  this boundary). Symmetric with an outbound `send` and under the same `link` privilege
+ *  as every other name here: it selects no link, and this program chose all three fields.
+ *
+ *  One request per call, so the payload simply runs to the end. It is the caller's job to
+ *  FIRE this and return from the event that decoded the request — the answer is another
+ *  turn of this realm, so awaiting it inside that event would hold the realm against it. */
+function netLinkDeliver(claim, attribution, payload) {
+  return host.call(N_LINK_DELIVER, concatBytes([Uint8Array.of(claim.length), claim, attribution, payload]));
 }
 
 /** Peer lint (§12.6): asked at msg3 when accepting, msg4 when dialing — before this
@@ -538,57 +530,50 @@ class Link {
   }
 
   /** Inbound bytes. Over-cap is a defensive abort. Every step rides the link's one work
-   *  chain, so handshake steps cannot interleave and delivery order holds. Returns a
-   *  promise for the delivery frame this input produced — the count-prefixed record
-   *  list, or null when none. */
+   *  chain, so handshake steps cannot interleave and arrival order holds. Answers when
+   *  this READ has been decoded — a request it carried is already on its way to the host
+   *  under its own `link/deliver` call, and is deliberately not waited for here. */
   onWire(bytes) {
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
       // boundaries already on it — but the two-stage cap is about how much a peer may
       // make us HOLD, not about who framed it. Without this, one huge message takes the
       // realm down.
-      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(null); }
-      // Same shape as the framer path below: the caller gets a COUNT-PREFIXED delivery
-      // frame (or null), never the bare record.
-      return this.enqueue(() => this.onMessage(bytes))
-        .then((d) => (d ? packDeliveries([d]) : null));
+      if (bytes.length > (this.authed ? maxFrameBytes : MAX_HANDSHAKE_FRAME_BYTES)) { this.abort(true); return Promise.resolve(); }
+      return this.enqueue(() => this.onMessage(bytes));
     }
-    // Deliveries collected as PROMISES, in arrival order: a length-framed chunk's parse
-    // loop fires `deliver` synchronously and does not await it, so packing has to wait
-    // for every step through Promise.all rather than count pushes.
+    // Steps collected as PROMISES, in arrival order: a length-framed chunk's parse loop
+    // fires `deliver` synchronously and does not await it, so finishing the read means
+    // waiting on every step through Promise.all rather than counting pushes.
     const out = [];
     const deliver = (m) => { out.push(this.enqueue(() => this.onMessage(m))); };
     try {
       const ok = this.framer.push(bytes, deliver);
       return Promise.resolve(ok).then(
         (good) => {
-          if (!good) { this.abort(true); return null; }
-          return Promise.all(out).then((ds) => {
-            const records = ds.filter((d) => d);
-            return records.length ? packDeliveries(records) : null;
-          });
+          if (!good) { this.abort(true); return; }
+          return Promise.all(out).then(() => {});
         },
-        () => { this.abort(true); return null; },
+        () => { this.abort(true); },
       );
     } catch {
       this.abort(true);
-      return Promise.resolve(null);
+      return Promise.resolve();
     }
   }
 
   /** Route one whole link message. A message is a bare body — the sender chooses
    *  nothing: which one it is follows from our role and how far the exchange got, each
    *  handler checks its exact width, and a post-auth body goes to the AEAD, which fails
-   *  closed (see §12.6). Returns a promise for the delivery frame a request produced,
-   *  or null for everything the handshake itself answers. */
+   *  closed (see §12.6). Answers when the step is done; nothing rides the value. */
   onMessage(m) {
-    if (this.closed) return Promise.resolve(null);
+    if (this.closed) return Promise.resolve();
     const step = this.authed
       ? this.onRecord(m)
       : this.weDialed
         ? (this.peerEph ? this.onMsg4(m) : this.onMsg2(m))
         : (this.peerEph ? this.onMsg3(m) : this.onMsg1(m));
-    return Promise.resolve(step).catch(() => { this.abort(true); return null; });
+    return Promise.resolve(step).catch(() => { this.abort(true); });
   }
 
   // Refuse WITHOUT saying so — every refusal funnels here, so they are
@@ -824,10 +809,10 @@ class Link {
   // strangers, and this peer proved who it is.
   async onRecord(body) {
     // Framed links were measured on arrival; this is the platform-framed link's floor.
-    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return null; }
-    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return null; }
+    if (!this.recvKey || body.length < TAG_LEN || body.length > maxFrameBytes) { this.abort(true); return; }
+    if (this.recvEpoch >= REJECT_AFTER_EPOCHS) { this.abort(); return; }
     const r = await aeadDec(this.recvKey, this.nonce(this.recvEpoch, this.recvCtr), body);
-    if (!r.ok) { this.abort(true); return null; }
+    if (!r.ok) { this.abort(true); return; }
     this.sawTraffic = true;
     // Advance only on success — a failed decrypt must never move the counter.
     if (++this.recvCtr >= this.rekeyAfter) {
@@ -836,8 +821,10 @@ class Link {
       this.recvCtr = 0;
     }
     // The reserved empty record: an authenticated end-of-stream.
-    if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return null; }
-    return await this.onFrame(this.peerId, r.pt);
+    if (r.pt.length === 0) { this.peerSaidGoodbye = true; this.close(); return; }
+    // Not awaited, and nothing to await: a request goes to the host as its own call, and
+    // this link's next record must not queue behind whoever answers it.
+    this.onFrame(this.peerId, r.pt);
   }
 
   onChannelClosed() {

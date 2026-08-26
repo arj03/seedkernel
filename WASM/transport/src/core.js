@@ -425,26 +425,18 @@ entry("linkOpen", (r) => {
   openLinks.set(linkId, link);
 });
 
+/** Bytes off one socket read. Awaits the READ's own decoding — framing, the handshake
+ *  step, the AEAD — but not what it decoded to: a request goes to the host as this
+ *  program's own `link/deliver` call, answered on a later turn. What rides this return is
+ *  authentication, and only from the read that completed it; the host binds it to this
+ *  event's link, so it names none. */
 entry("linkBytes", async (r) => {
   const link = findLink(r.u32());
-  // onWire answers a promise for the delivery frame. Authentication, if this read
-  // completed it, rides the same return and is bound host-side to this event's link.
   if (!link) return NOTHING;
-  const deliveries = await link.onWire(r.blob());
+  await link.onWire(r.blob());
   const peer = link.reportedPeer;
   link.reportedPeer = null;
-  return packLinkBytesResult(peer, deliveries) || NOTHING;
-});
-
-/** The claim handler's answer to a delivery this program returned off a `linkBytes`
- *  event: `[from blob][corr u32][payload]`. The host answers on a later turn of its
- *  own, never inside a frame, so nothing here re-enters this realm mid-record. */
-entry("linkResp", (r) => {
-  const from = r.blob();
-  const corr = r.u32();
-  const payload = r.blob();
-  const meta = reqres.redeemInbound(from, corr);
-  if (meta) reqres.respond(corr, meta.noReply, toHex(from), payload);
+  return peer || NOTHING;
 });
 
 entry("linkClosed", (r) => {

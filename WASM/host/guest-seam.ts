@@ -39,11 +39,11 @@ export interface SeamCalls {
     call(id: string, payload: Uint8Array): Promise<Uint8Array> | null;
 }
 
-/** Raw-link capability (§12.1): bytes over an opaque host-minted link id.
- *  Nothing here may re-enter the guest realm. The node's immutable facts never pass
- *  this way — the host invoked the freshly stood slot once, with them, before the
- *  binding is published (shell-core.ts), and the mutable address book arrives as
- *  `addr` events. This is only the byte pipe. */
+/** Raw-link capability (§12.1): bytes over an opaque host-minted link id, plus the one
+ *  call that goes the other way — `deliver`, which hands the host a request this occupant
+ *  decoded off those links. The node's immutable facts never pass this way — the host
+ *  invoked the freshly stood slot once, with them, before the binding is published
+ *  (shell-core.ts), and the mutable address book arrives as `addr` events. */
 export interface RawNet {
     /** Open a link to an opaque destination name, returning the link id — or 0 when the
      *  host has no route for it, which a caller treats as a fabric dropping a frame. The
@@ -58,6 +58,16 @@ export interface RawNet {
     /** Bytes written to this link that are not yet on the wire (socket-seam.ts
      *  `RawLink.buffered`). The transport host supplies 0 when its channel cannot say. */
     buffered(linkId: number): number;
+    /** Route one request this occupant decoded off its links: `(claim, attribution,
+     *  payload)`, answered with the claimant's bytes. No new authority — the call names no
+     *  link, and all three arguments are already the caller's own to choose, so it is worth
+     *  exactly what holding the sockets is worth (§12.10). Both a claim no peer may reach
+     *  and a handler that failed answer EMPTY: refusal and silence are one fact here.
+     *
+     *  The one member that enters a guest realm — the CLAIMANT's, never the caller's own
+     *  frame, since a realm serializes its invocations. The caller must therefore fire this
+     *  and return from its event rather than await it inside one. */
+    deliver(claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array>;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -495,6 +505,17 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             const out = new Uint8Array(4);
             writeU32BE(out, 0, rawNet().buffered(readU32BE(payload, 0)));
             return out;
+        },
+        // Inbound attributed delivery (§12.10), the one `link` name that carries something
+        // INTO the node rather than out of it: `[claimLen u8][claim][attribution 32]
+        // [payload …]`. The attribution is fixed at the kernel's caller-id width — it IS
+        // that field, filled with the authenticated sender — so nothing here is
+        // length-delimited except the claim, and the payload simply runs to the end. One
+        // request per call is what makes that safe.
+        "link/deliver": (payload) => {
+            const attrAt = 1 + payload[0];
+            const bodyAt = attrAt + HOST_CALLER_ID.length;
+            return rawNet().deliver(dec.decode(payload.subarray(1, attrAt)), payload.subarray(attrAt, bodyAt), payload.subarray(bodyAt));
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {

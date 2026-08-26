@@ -77,7 +77,8 @@ async function main() {
     ],
     guestSource: guest,
     // Exactly the services this program holds — `link` is the ONLY one carrying a
-    // privilege grant (inbound delivery is this slot's return convention, not a grant).
+    // privilege grant, and inbound delivery (`link/deliver`) is one of its names rather
+    // than a second grant.
     // What it provides back is the id it claims above, not a service (§12.1).
     guestRequires: ["node", "link", "timer"],
   });

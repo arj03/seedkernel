@@ -123,8 +123,9 @@ export interface LoadBundleOptions {
     guestDeadlineMs?: number;
     /** Observe this slot's own answer to a PEER-inbound frame, after it resolves
      *  (`deliverInbound`). The one gap left once dispatch is a single claim → slot map: the
-     *  wire consumes a delivery return on its way back out, so an embedder whose own
-     *  mounted app must paint what it just answered has no other path to those bytes.
+     *  link occupant consumes that answer on its way back out to the wire, so an embedder
+     *  whose own mounted app must paint what it just answered has no other path to those
+     *  bytes.
      *  Scoped to THIS load rather than the shell; a replacement load carries its own.
      *  Observation only: it cannot change what the caller receives, it is never consulted
      *  for a host loopback `invoke` or a cross-realm call, and a throw from it is swallowed. */
@@ -537,13 +538,14 @@ function createShell(opts: CreateShellOptions & {
         return { ...localConfig, ...facts };
     };
     netHost?.route((payload) => {
-        // The link occupant's `handle` return is the driver's to read: an inbound request
-        // the occupant decoded is returned as a delivery frame, which the driver hands to
-        // the shell's claim routing (`routeDeliver`) and answers back through `linkResp`.
+        // Platform link events into the occupant: sockets opening, bytes arriving, an
+        // address. What the occupant decoded off those bytes comes back the other way, as
+        // its own `link/deliver` call — never as a return read out of this one.
         return linkOwner ? hostCallSlot(linkOwner, payload) : null;
     }, () => linkOwner !== null, (claim, attribution, payload) => {
-        // The driver normalizes the answer to empty before writing it back, so refusal
-        // and silence are one fact at the boundary.
+        // The claim routing behind `link/deliver`. The driver normalizes the answer to
+        // empty before handing it back, so refusal and silence are one fact at the
+        // boundary.
         return deliverInbound(claim, attribution, payload);
     });
     /** Cross-realm call by local service id. Host prepends caller's 32-byte id — the local
@@ -612,7 +614,7 @@ function createShell(opts: CreateShellOptions & {
         const slot = claims.get(claim);
         return slot ? callFramed(slot, attribution, payload) : null;
     };
-    /** Inbound from outside this node (the link occupant's delivery return, routed by
+    /** Inbound from outside this node (the link occupant's `link/deliver` call, routed by
      *  `TransportHost`).
      *  A claim under the resolved slot's `services` — never its `protocols` — is local and
      *  refused here with no exception (§12.10): this reads the slot's signed `protocols`,

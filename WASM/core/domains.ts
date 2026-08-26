@@ -38,7 +38,7 @@ export const HOST_SERVICES = {
     fs: { privilege: "app", calls: ["get", "put", "list", "delete", "size", "stat"] },
     clock: { privilege: "app", calls: ["now"] },
     timer: { privilege: "app", calls: ["arm", "clear"] },
-    link: { privilege: "link", calls: ["open", "send", "close", "stat"] },
+    link: { privilege: "link", calls: ["open", "send", "close", "stat", "deliver"] },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
 /** The full `service/call` vocabulary as a template-literal union — what the dispatch
@@ -72,8 +72,9 @@ export const PRIVILEGES: readonly Privilege[] = [
     ...new Set(Object.values(HOST_SERVICES).map((s) => s.privilege).filter((p): p is Privilege => p !== "app")),
 ];
 /** The link privilege (§12.6), named so the shell can wire the socket driver to whatever
- *  holds it. The link occupant is the attributer: inbound delivery of a request it decoded
- *  off its links is that slot's return convention, never a second privilege. */
+ *  holds it. The link occupant is the attributer: `link/deliver` hands the host a request
+ *  it decoded off its own links, under this one privilege and never a second — the call
+ *  names no link, and all three of its arguments are the occupant's own to choose. */
 export const PRIVILEGE_LINK = "link" satisfies Privilege;
 /** Methods that leave something behind, typed against the catalog so a rename here is a
  *  build error. Refused until the slot commits (§3.1). A LOCAL service id (§12.10) is

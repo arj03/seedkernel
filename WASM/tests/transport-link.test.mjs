@@ -861,23 +861,22 @@ await test("a peer cannot reach a bundle's local service claim, the transport's 
   assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
 });
 
-// ── the delivery return, when one read carries several requests ──────────────
-// The link occupant answers a `linkBytes` event with an optional authenticated-peer
-// transition followed by `[count u32]` and that many delivery records, and the driver
-// routes each through the shell's claim table (§12.10). Several records in one return is
-// the ORDINARY case on a byte stream. It is also where attribution
-// is decided: the occupant writes the authenticated sender into each record, and if any
-// field ran to the end of the FRAME rather than to its own length, the next record would
-// be read out of this one's payload — a peer could hand the claim table a request
-// attributed to any key it liked.
+// ── delivery, when one read carries several requests ─────────────────────────
+// The link occupant hands each request it decodes to the shell's claim table as its own
+// `link/deliver` call (§12.10), and that is where attribution is decided: the occupant
+// names the authenticated sender, because it is the one that saw the plaintext. Several
+// requests per socket read is the ORDINARY case on a byte stream, and one call each is
+// what keeps them separate — nothing packs them into a shared buffer whose framing a
+// peer's own payload bytes could be read as.
 await test("DELIVERY: two pipelined requests in ONE read are two correctly attributed deliveries", async (keep) => {
   // framing 1: a byte-stream link, so the guest runs its own length framer and a single
   // read really can carry two whole messages. (The default fabric preserves message
-  // boundaries and can never produce more than one record.)
+  // boundaries and can never produce more than one.)
   const st = keep(await upPair({ framing: 1 }));
   const first = Uint8Array.from([0x11, 0x22, 0x33]);
-  // The second request's payload is itself a well-formed delivery record naming another
-  // claim and another sender — the shape a mis-parse would promote into a real delivery.
+  // The second request's payload names another claim and another sender in the shape the
+  // retired batch codec framed a record in. It is now just bytes — which is the property
+  // under test: a payload is never anything the delivery path parses.
   const forgedAttribution = new Uint8Array(32).fill(0xfe);
   const forgedClaim = Buffer.from("admin/grant", "utf8");
   const second = Uint8Array.from([
@@ -961,7 +960,9 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   driver.activate(owner);
   const peerA = new Uint8Array(32).fill(0xa1);
   const peerB = new Uint8Array(32).fill(0xb2);
-  const authResult = (peer, trailing = []) => Uint8Array.from([1, ...peer, 0, 0, 0, 0, ...trailing]);
+  // The whole `linkBytes` return: the authenticated peer, or nothing. Any other length is
+  // malformed — there is no second field for a suffix to sit behind.
+  const authResult = (peer, trailing = []) => Uint8Array.from([...peer, ...trailing]);
   let nextBytesResult = new Uint8Array();
   let pending = null;
   driver.route(async (payload) => {
@@ -992,8 +993,8 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
   assert(a.auth[0] === hexOf(peerA) && b.auth.length === 0,
     "A's linkBytes return must authenticate A and cannot select B");
 
-  // A second return cannot rename an authenticated link, and a malformed result has no
-  // valid prefix: neither authentication nor any later delivery may partially apply.
+  // A second return cannot rename an authenticated link, and a malformed result is
+  // refused whole: a valid 32-byte prefix does not authenticate anyone.
   nextBytesResult = authResult(peerB);
   aChannel.emit();
   nextBytesResult = authResult(peerB, [0xff]);

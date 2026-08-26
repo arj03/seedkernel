@@ -1,8 +1,9 @@
 // Socket driver (§12.6): link table, address book, listeners. Wire codec/AKE/router
-// run as the transport bundle's guest via `link/*`. No call re-enters a live frame.
+// run as the transport bundle's guest via `link/*`. No name here re-enters the CALLING
+// realm: the one that enters a realm at all is `deliver`, and it enters the claimant's.
 
 
-import { toHex, fromHex, readU32BE, writeU32BE, enc } from "../core/util.js";
+import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { DEFAULT_MAX_RAW_LINKS, MAX_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
@@ -24,19 +25,6 @@ interface OpenLinkRecord {
   onAuth?: (peerId: PeerId) => void;
   onClose?: (linkId: number, reason: number) => void;
   authenticated: boolean;
-}
-
-interface ReturnedDelivery {
-  noReply: boolean;
-  corr: number;
-  claim: string;
-  attribution: Uint8Array;
-  payload: Uint8Array;
-}
-
-interface LinkBytesResult {
-  peer: Uint8Array | null;
-  deliveries: ReturnedDelivery[];
 }
 
 /** No address book entry, or no channel factory at all. Link id 0 is never live, so the
@@ -134,9 +122,9 @@ class Args {
  *  go and the honest answer is to drop it. */
 export type TransportCall = (payload: Uint8Array) => Promise<Uint8Array> | null;
 
-/** The claim routing the link occupant's delivery return is handed to (§12.10). Inbound
- *  attributed delivery is the link slot's return convention, not a grant: the occupant that
- *  saw the plaintext is the one that attributes it. */
+/** The claim routing a `link/deliver` call is handed to (§12.10). `null` for a claim no
+ *  peer may reach. Inbound attributed delivery costs no grant beyond `link` itself: the
+ *  occupant that saw the plaintext is the one that attributes it. */
 export type TransportDeliver = (claim: string, attribution: Uint8Array, payload: Uint8Array) => Promise<Uint8Array> | null;
 
 export interface TransportHostOptions {
@@ -251,8 +239,8 @@ export class TransportHost {
 
   /** Wire this platform binding once. All callbacks resolve its capability owner
    *  dynamically, so claim changes never reconfigure this driver. `deliver` is the claim
-   *  routing the link occupant's delivery return is handed to — the host must route what
-   *  the link occupant decoded, whoever the occupant is (§12.10). */
+   *  routing a `link/deliver` call is handed to — the host must route what the link
+   *  occupant decoded, whoever the occupant is (§12.10). */
   route(transport: TransportCall, available: () => boolean, deliver?: TransportDeliver): void {
     this.transport = transport;
     this.transportAvailable = available;
@@ -343,11 +331,12 @@ export class TransportHost {
     });
   }
 
-  /** Invoke `linkBytes` and consume its event-bound return:
-   *  `[authenticated u8][peer 32 when authenticated][count u32][d…]`, each `d` =
-   *  `[noReply u8][corr u32][claimLen u8][claim][attrLen u32][attribution][payloadLen u32][payload]`
-   *  — empty when the occupant observed nothing. Neither result contains a link id: the
-   *  driver binds it to this invocation's captured channel and owner. */
+  /** Invoke `linkBytes` and consume its event-bound return: the 32-byte peer key when this
+   *  read completed the handshake, and nothing at all otherwise. A request the occupant
+   *  decoded off the same read does not ride here — it is handed over by its own
+   *  `link/deliver` call — so this buffer holds one fact and needs no length framing to
+   *  keep two apart. It contains no link id either: the driver binds the peer to this
+   *  invocation's captured channel and owner. */
   private linkBytes(linkId: number, bytes: Uint8Array): void {
     const channel = this.channels.get(linkId);
     if (!channel) return;
@@ -356,8 +345,8 @@ export class TransportHost {
     const r = this.toTransport(new Args("linkBytes").u32(linkId).blob(bytes));
     if (!r) return;
     void r.then((ret) => {
-      const parsed = this.parseLinkBytes(ret);
-      if (!parsed) {
+      if (ret.length === 0) return;
+      if (ret.length !== 32) {
         console.error(`[transport] malformed linkBytes return (${ret.length} bytes)`);
         return;
       }
@@ -368,93 +357,14 @@ export class TransportHost {
       // Authentication is meaningful only for a platform-owned openLink. A core link's
       // result cannot manufacture an openLink callback, and a duplicate cannot rename an
       // already-authenticated connection.
-      if (parsed.peer && open && this.openLinks.get(linkId) === open && !open.authenticated) {
-        open.authenticated = true;
-        try { open.onAuth?.(toHex(parsed.peer)); }
-        catch { /* a platform callback cannot corrupt delivery of the same read */ }
-      }
-      // The platform's onAuth hook is arbitrary embedder code and may synchronously reset
-      // or replace this binding. Do not let deliveries from the old result cross that edge.
-      if (this.activeOwner !== owner || this.channels.get(linkId) !== channel) return;
-      // Authentication is applied first: one byte-stream read may finish the handshake
-      // and carry the first request behind it.
-      this.deliverFrom(parsed.deliveries);
+      if (!open || this.openLinks.get(linkId) !== open || open.authenticated) return;
+      open.authenticated = true;
+      try { open.onAuth?.(toHex(ret)); }
+      catch { /* a platform callback cannot corrupt this driver's link table */ }
     }, (err: unknown) => {
       if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
       console.error(`[transport] error in linkBytes: ${String(err)}`);
     });
-  }
-
-  private static readonly dec = new TextDecoder();
-
-  /** Parse a whole `linkBytes` return before applying any part of it. A malformed return
-   *  therefore authenticates nobody and delivers nothing; peer-controlled bytes cannot
-   *  make a valid prefix take effect before a malformed suffix is noticed.
-   *
-   *  EVERY variable field is read by its own length, the payload included. One socket read
-   *  can carry several whole requests, so a record that ran to the end of the frame would
-   *  put the NEXT record's claim and attribution inside this one's payload — bytes a peer
-   *  wrote, letting it attribute its own request to any key it names. The complete return
-   *  must fit exactly or none of it takes effect. */
-  private parseLinkBytes(ret: Uint8Array): LinkBytesResult | null {
-    if (ret.length === 0) return { peer: null, deliveries: [] };
-    if (ret.length < 5 || ret[0] > 1) return null;
-    const dec = TransportHost.dec;
-    let off = 1;
-    let peer: Uint8Array | null = null;
-    if (ret[0] === 1) {
-      if (ret.length < off + 32 + 4) return null;
-      peer = ret.slice(off, off + 32);
-      off += 32;
-    }
-    if (ret.length < off + 4) return null;
-    const count = readU32BE(ret, off) >>> 0;
-    off += 4;
-    // Fourteen bytes is the smallest possible record. Bound the loop before trusting a
-    // guest-supplied count, even though each iteration below also checks its fields.
-    if (count > Math.floor((ret.length - off) / 14)) return null;
-    const deliveries: ReturnedDelivery[] = [];
-    for (let i = 0; i < count; i++) {
-      if (ret.length < off + 6 || ret[off] > 1) return null;
-      const noReply = ret[off] === 1;
-      const corr = readU32BE(ret, off + 1);
-      const claimLen = ret[off + 5];
-      if (ret.length < off + 6 + claimLen) return null;
-      const claim = dec.decode(ret.slice(off + 6, off + 6 + claimLen));
-      const attrStart = off + 6 + claimLen;
-      if (ret.length < attrStart + 4) return null;
-      const attrLen = readU32BE(ret, attrStart) >>> 0;
-      const lenStart = attrStart + 4 + attrLen;
-      if (lenStart + 4 > ret.length) return null;
-      const payloadLen = readU32BE(ret, lenStart) >>> 0;
-      const payloadStart = lenStart + 4;
-      const next = payloadStart + payloadLen;
-      if (next > ret.length) return null;
-      const attribution = ret.slice(attrStart + 4, lenStart);
-      const payload = ret.slice(payloadStart, next);
-      deliveries.push({ noReply, corr, claim, attribution, payload });
-      off = next;
-    }
-    return off === ret.length ? { peer, deliveries } : null;
-  }
-
-  /** Route already-validated delivery records. The occupant that saw the plaintext is the
-   *  one that attributes it; the driver does not reinterpret that claim. */
-  private deliverFrom(deliveries: ReturnedDelivery[]): void {
-    if (!this.deliver) return;
-    for (const { noReply, corr, claim, attribution, payload } of deliveries) {
-      void Promise.resolve(this.deliver(claim, attribution, payload)).then(
-        (answer: Uint8Array | null | undefined) => this.answer(noReply, attribution, corr, answer ?? EMPTY),
-        () => this.answer(noReply, attribution, corr, EMPTY),
-      );
-    }
-  }
-
-  /** The claim handler's answer back to the link occupant, which frames it and writes it
-   *  on the wire. A noReply request still ran its handler but asks for no bytes back. */
-  private answer(noReply: boolean, attribution: Uint8Array, corr: number, answer: Uint8Array): void {
-    if (noReply) return;
-    this.tell(new Args("linkResp").blob(attribution).u32(corr).blob(answer));
   }
 
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims the
@@ -515,6 +425,18 @@ export class TransportHost {
       buffered: (linkId) => {
         if (!ownsBinding()) return 0;
         try { return this.channels.get(linkId)?.buffered?.() ?? 0; } catch { return 0; }
+      },
+      // Inbound attributed delivery (§12.10): one request the occupant decoded, routed
+      // through the shell's claim table and answered back to the occupant, which frames it
+      // and writes it on the wire. Under the same binding check as every op above and no
+      // further grant — the occupant names no link here, and it already chose all three of
+      // these arguments. A claim no peer may reach and a handler that threw both answer
+      // EMPTY, so refusal and silence are one fact at this boundary.
+      deliver: (claim, attribution, payload) => {
+        if (!ownsBinding() || !this.deliver) return Promise.resolve(EMPTY);
+        const answer = this.deliver(claim, attribution, payload);
+        if (!answer) return Promise.resolve(EMPTY);
+        return answer.then((bytes) => bytes ?? EMPTY, () => EMPTY);
       },
     };
   }

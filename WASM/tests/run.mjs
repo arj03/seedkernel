@@ -507,14 +507,15 @@ async function testManifestClaimIsTheRouting() {
   console.log("  OK\n");
 }
 
-// ─── Test: the link slot's delivery return is the ONLY delivery path ──────────
-// Inbound attributed delivery is the link occupant's return convention, not a grant
+// ─── Test: `link/deliver` is the ONLY delivery path ──────────────────────────
+// Inbound attributed delivery is one of the `link` privilege's own names, not a grant
 // (README §12.10): the one slot that sees the plaintext is the one that attributes, so
 // there is no second privilege to grant or forget. The properties that had to be pinned
 // live at the one place they can be — over the real driver, claims and transport bundle:
 // a delivery reaches exactly the named ordinary claim, never a `services` LOCAL claim,
-// and a non-link app can never name a delivery path at all (transport-link.test.mjs:
-// "EXACT CLAIM", "a peer cannot reach a bundle's local service claim", "CALLER BOUNDARY").
+// and a bundle that does not hold `link` cannot name `link/deliver` at all, by the same
+// gate that refuses it `link/send` (transport-link.test.mjs: "EXACT CLAIM", "a peer
+// cannot reach a bundle's local service claim", "CALLER BOUNDARY").
 
 // ─── Test: the raw-link binding has ONE owner (§12.10) ───────────────────────
 // The driver has one event sink, so a second link-capable slot cannot be a composition: it
@@ -921,9 +922,9 @@ async function testPolicy() {
   threw = false;
   try { parsePolicy(JSON.stringify({ grants: { links: [goodHex] } })); } catch { threw = true; }
   assert(threw, "a grant naming no privilege this host has is refused by name");
-  // `route` is gone: delivery is the link slot's return convention, and a policy file
-  // written for the separate grant is a file this host does not mean — refused at the
-  // boot rather than read as an empty grant.
+  // `route` is gone: delivery is one of the `link` privilege's own names (`link/deliver`),
+  // and a policy file written for the separate grant is a file this host does not mean —
+  // refused at the boot rather than read as an empty grant.
   threw = false;
   try { parsePolicy(JSON.stringify({ grants: { route: [goodHex] } })); } catch { threw = true; }
   assert(threw, "`grants.route` is no longer a privilege key — refused by name, kept nobody");

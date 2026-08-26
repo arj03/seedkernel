@@ -76,8 +76,8 @@ function transportBundleAt(version, keys, guestSource) {
     guestSource: guest,
     // Exactly the services the transport guest holds — a mirror of the artifact manifest
     // (scripts/build-transport-bundle.mjs). `link` is what carries the `link` privilege
-    // the admission dispatch reads (§12.5); inbound delivery is this slot's return
-    // convention, not a name to declare.
+    // the admission dispatch reads (§12.5), inbound delivery (`link/deliver`) among its
+    // names: the unit declared here is the service, never the method.
     guestRequires: ["node", "link", "timer"],
   });
   return blob;
