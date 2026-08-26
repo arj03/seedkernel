@@ -1,7 +1,7 @@
 // Builds the transport bundle — the signed artifact the host ships and loads at boot
 // (§12.6): guest parts + ws.wasm + mlkem768.wasm, signed under suite 0x02 (Ed25519 + ML-DSA-65, §12.4,
-// §14.1) with host/bundle.ts's own authorBundle — the same functions the runtime signs
-// and verifies with, not a second copy. Writes build/transport.skb and
+// §14.1) with host/bundle-author.ts's authorBundle and the verifier's shared validation.
+// Writes build/transport.skb and
 // host/transport-bundle.ts (b64 inline; both gitignored — host/shell-node.ts imports the
 // latter, hence the narrow prebuild compile before the full tsc, see npm scripts).
 //
@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
-import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle.js";
+import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle-author.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -55,7 +55,7 @@ async function main() {
   sodium = withMlDsa65(sodium, createMlDsa65(mldsaInstance));
 
   // The author's key set: the Ed25519 key from the seed, and the ML-DSA-65 key derived
-  // from the SAME seed (host/bundle.ts `hybridAuthorKeysFromSeed`), so a rebuild with the
+  // from the SAME seed (host/bundle-author.ts `hybridAuthorKeysFromSeed`), so a rebuild with the
   // same key is the same author (§12.4).
   const keys = hybridAuthorKeysFromSeed(sodium, seed);
 

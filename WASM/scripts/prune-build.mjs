@@ -3,12 +3,12 @@
 //
 // tsc emits into `build/` but never cleans it, so deleting a host module leaves its
 // compiled corpse behind forever. Everything downstream then copies that corpse
-// faithfully, because everything downstream IS a faithful copy: `minify.mjs` walks
-// `build/` wholesale into `build-min/`, and a client's vendor step copies `build-min/`
-// wholesale into its own tree. Both of those already wipe their destination first, so
-// neither can be blamed for the stale file and neither can remove it — the orphan is
-// re-created from `build/` on every run. That is how `host/kem.js` outlived the move of
-// ML-KEM into the transport bundle.
+// faithfully: `minify.mjs` walks the runtime-eligible files in `build/` into `build-min/`
+// (excluding only the intentional offline `bundle-author.js` entry point), and a client's
+// vendor step copies `build-min/` wholesale into its own tree. Both of those already wipe
+// their destination first, so neither can be blamed for the stale file and neither can
+// remove it — the orphan is re-created from `build/` on every run. That is how `host/kem.js`
+// outlived the move of ML-KEM into the transport bundle.
 //
 // Scoped to `host/` and `core/`, the two subtrees tsconfig.json owns (rootDir "."), so
 // the asc outputs and `transport.skb` that share `build/` are never candidates.

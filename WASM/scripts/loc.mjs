@@ -58,6 +58,8 @@ const sharedRows = [
 // so reconciliation can tell them from "counted nowhere".
 const nativeTs = ["WASM/host/native-shim.ts", "WASM/host/native-polyfills.ts"];
 const countedElsewhere = [...nativeTs, "WASM/host/transport-bundle.ts"];
+// A public build-tool entry point, deliberately absent from both runtime artifacts.
+const offlineTs = ["WASM/host/bundle-author.ts"];
 
 /** Per-target JS: every non-test TS under core/ and host/ that the shared bundle does
  *  not compile in. Derived rather than listed, so a new backend counts itself. */
@@ -65,7 +67,7 @@ const jsFiles = ["core", "host"].flatMap((d) =>
     readdirSync(resolve(wasmDir, d))
         .filter((f) => f.endsWith(".ts"))
         .map((f) => `WASM/${d}/${f}`))
-    .filter((f) => !sharedSet.has(f) && !countedElsewhere.includes(f));
+    .filter((f) => !sharedSet.has(f) && !countedElsewhere.includes(f) && !offlineTs.includes(f));
 
 const goFiles = readdirSync(resolve(repoDir, "native"))
     .filter((f) => f.endsWith(".go") && !f.endsWith("_test.go"))

@@ -8,6 +8,7 @@
     "core/domains.ts",
     "core/wasm-limits.ts",
     "host/bundle.ts",
+    "host/bundle-author.ts",
     "host/pq.ts"
   ],
   "include": []

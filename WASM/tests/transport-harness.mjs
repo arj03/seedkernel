@@ -25,7 +25,7 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
  *  lives with the occupant and here, where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
 export const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
-export const { authorBundle } = await imp("build/host/bundle.js");
+export const { authorBundle } = await imp("build/host/bundle-author.js");
 export const TRANSPORT_SERVICE = "_net";
 export const { makeAuthor } = await imp("tests/testkit.mjs");
 

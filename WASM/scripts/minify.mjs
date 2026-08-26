@@ -71,13 +71,18 @@ function walk(d) {
   return files;
 }
 
+// Offline authoring is a package entry point from build/host, but build-min is the runtime
+// tree staged into browser shells. Keeping the signer out here makes that boundary physical.
+const runtimeFiles = (files) => files.filter((f) =>
+  relative(srcDir, f).split("\\").join("/") !== "host/bundle-author.js");
+
 if (!statSync(srcDir, { throwIfNoEntry: false })?.isDirectory()) {
   console.error("build/host not found — run `npm run build:host` first.");
   process.exit(1);
 }
 
 rmSync(outDir, { recursive: true, force: true });
-const files = walk(srcDir);
+const files = runtimeFiles(walk(srcDir));
 let gzIn = 0, gzOut = 0;
 for (const f of files) {
   const src = readFileSync(f, "utf8");

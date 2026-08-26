@@ -44,8 +44,9 @@ import { bytesEqual } from "./bytes.mjs";
 // The loader's admission step and name derivation (§5.1, §12.4) — tests drive the SAME
 // code path a bundle load does rather than a parallel copy of it.
 const { appKeyFor, genesisHash: bundleGenesisHash, hybridAuthorId, FreshnessMarks,
-         signManifest, verifyManifest, verifyBundle, loadBundleModules, packBundle, moduleFile, MANIFEST_FILE, GUEST_FILE }
+         verifyManifest, verifyBundle, loadBundleModules, moduleFile, MANIFEST_FILE, GUEST_FILE }
   = await imp("build/host/bundle.js");
+const { signManifest, packBundle } = await imp("build/host/bundle-author.js");
 const { policyFromJson, authorAllowlist, hostGates } = await imp("build/host/policy.js");
 const { withMlDsa65, loadMlDsa65, ML_DSA65_PK_LEN, ML_DSA65_SIG_LEN } = await imp("build/host/pq.js");
 const gHash = (b) => bundleGenesisHash(sodium, b);
@@ -1256,8 +1257,6 @@ async function testShellBoot() {
 
 async function testBundle() {
   console.log("Test: app bundle — signed manifest, integrity, governed load by the shell");
-  const { signManifest, verifyManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
-    = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -1352,8 +1351,7 @@ async function testBundle() {
 // shell peeks a received Offer through before asking for consent.
 async function testGuestBundleAndArchive() {
   console.log("Test: every app is a guest — bundle blob + verify/install split");
-  const { signManifest, verifyManifest, verifyBundle,
-          packBundle, unpackBundle, MANIFEST_FILE, moduleFile }
+  const { unpackBundle }
     = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -2046,8 +2044,6 @@ async function testSafeRealmConcurrency() {
 // downgrade path an attacker can ask for.
 async function testManifestSuiteByte() {
   console.log("Test: manifest suite byte — signed preimage, so an edited suite cannot verify");
-  const { signManifest, verifyManifest } = await imp("build/host/bundle.js");
-
   const author = testAuthor();
   // One module: this test is about the suite byte, not the module count.
   const manifest = { app: "suite-probe", version: 1, modules: [{ name: "fwd", hash: "aa" }], guest: { hash: "aa", requires: [] } };
@@ -2254,9 +2250,6 @@ async function testMlKemAcvpVectors() {
 
 async function testHybridManifestSuite() {
   console.log("Test: hybrid manifest suite 0x02 — both signatures required, id binds both keys");
-  const { signManifest, verifyManifest, hybridAuthorId,
-          verifyBundle, packBundle, MANIFEST_FILE }
-    = await imp("build/host/bundle.js");
 
   const keys = testAuthor();
   const ed = keys.ed, pq = keys.mlDsa;
@@ -2365,8 +2358,6 @@ async function testHybridManifestSuite() {
 // the known-good older bundle is refused as a downgrade and rollback is bricked (§12.4).
 async function testBundleCorruptNewerRollback() {
   console.log("Test: a corrupt newer bundle leaves the freshness mark intact (rollback stays possible)");
-  const { signManifest, packBundle, MANIFEST_FILE, GUEST_FILE, moduleFile }
-    = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -2433,7 +2424,6 @@ async function testBundleCorruptNewerRollback() {
 // uninstall without closing the door, or close it with the code still running.
 async function testAuthorRevocation() {
   console.log("Test: revoking an author key refuses its bundles and tears down what it landed");
-  const { signManifest, packBundle, MANIFEST_FILE, moduleFile } = await imp("build/host/bundle.js");
   const { mkdtempSync, rmSync, writeFileSync: wf } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join: pjoin } = await import("node:path");
@@ -2647,7 +2637,6 @@ async function testWrongTypedStoreIsRefused() {
 // at first use — a bundle the host can admit but can never serve (§12.2, §12.4).
 async function testAppNameLengthRefused() {
   console.log("Test: an over-long app name is refused at load, not at first use");
-  const { verifyManifest, signManifest } = await imp("build/host/bundle.js");
   const author = testAuthor();
   const mk = (app, extra = {}) => signManifest(sodium, author,
     { app, version: 1, modules: [], guest: GUEST(), ...extra });

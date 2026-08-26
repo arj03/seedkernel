@@ -55,8 +55,10 @@ export function testkit({ verbose = true } = {}) {
 // The author helper below reaches the loader's own derivations rather than restating them
 // — a test-side copy of an identity rule would agree with itself and nothing else.
 // Resolved from this file's location; every suite runs after `npm run build`.
-const { hybridAuthorId, hybridAuthorKeysFromSeed } = await import(
+const { hybridAuthorId } = await import(
   pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle.js")).href);
+const { hybridAuthorKeysFromSeed } = await import(
+  pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "build", "host", "bundle-author.js")).href);
 
 /** A manifest author (§12.4): the Ed25519 half, the ML-DSA-65 half, and the 32-byte id
  *  the two derive — built through the SHIPPED seed→key-set derivation, so a suite that

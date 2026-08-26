@@ -40,7 +40,7 @@ A minimal authoring function looks like this. `authorSeed` is a persisted 32-byt
 ```js
 import { writeFile } from "node:fs/promises";
 import { loadCrypto } from "seedkernel-wasm";
-import { authorBundle, hybridAuthorKeysFromSeed } from "seedkernel-wasm/bundle";
+import { authorBundle, hybridAuthorKeysFromSeed } from "seedkernel-wasm/bundle-author";
 
 export async function buildBundle({ authorSeed, version, wasm, guestSource }) {
   const sodium = await loadCrypto();
@@ -61,9 +61,10 @@ export async function buildBundle({ authorSeed, version, wasm, guestSource }) {
 
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
-| `./bundle` | `authorBundle` at build time; `verifyBundle` wherever a blob arrives — a build reading back a prior version, a page reading a fetched `.skb`; `hybridAuthorKeysFromSeed` and `hybridAuthorId` for the author identity you pin, `genesisHash` for content ids, `moduleFile` for a module's name inside the container | authoring: [seedstore `storage-bundle.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/scripts/storage-bundle.mjs), [seedchat `build-app-bundle.mjs`](https://github.com/arj03/seedchat/blob/main/scripts/build-app-bundle.mjs) — verifying: [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html), [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
+| `./bundle-author` | `authorBundle` and `hybridAuthorKeysFromSeed` in offline build scripts; lower-level `signManifest` and `packBundle` for verifier hardening tests | [seedstore `storage-bundle.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/scripts/storage-bundle.mjs), [seedchat `build-app-bundle.mjs`](https://github.com/arj03/seedchat/blob/main/scripts/build-app-bundle.mjs) |
+| `./bundle` | `verifyBundle` wherever a blob arrives — a build reading back a prior version, a page reading a fetched `.skb`; `hybridAuthorId` for the author identity you pin, `genesisHash` for content ids, `moduleFile` for a module's name inside the container | [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html), [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
 
-The module also carries the lower-level primitives that pair is built from. They stay exported for the runtime's own hardening tests and for a consumer that deliberately forges or tampers with a bundle to prove the verifier rejects it — not a path a client should take. Author with `authorBundle`, verify with `verifyBundle`.
+The authoring module also carries the lower-level signing and packing primitives. They stay exported for hardening tests and for a consumer that deliberately forges or tampers with a bundle to prove the verifier rejects it — not a path a client should take. Author with `authorBundle`, verify with `verifyBundle`. Runtime shells import only `./bundle`, which has no signing surface.
 
 ## 2. Runtime — boot a node and drive the shell
 

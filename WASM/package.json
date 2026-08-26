@@ -60,6 +60,10 @@
       "types": "./build/host/bundle.d.ts",
       "default": "./build/host/bundle.js"
     },
+    "./bundle-author": {
+      "types": "./build/host/bundle-author.d.ts",
+      "default": "./build/host/bundle-author.js"
+    },
     "./quickjs": {
       "types": "./quickjs/dist/variant.d.mts",
       "default": "./quickjs/dist/variant.mjs"

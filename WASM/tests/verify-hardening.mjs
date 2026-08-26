@@ -19,8 +19,9 @@ const { ModuleTable } = await imp("build/host/module-table.js");
 const { readMemoryLimits, checkModuleMemory, DEFAULT_MAX_OUTSTANDING_HOST_CALLS }
   = await imp("build/core/wasm-limits.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
-const { appKeyFor, appScopeFor, genesisHash, signManifest, verifyManifest, packBundle, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
+const { appKeyFor, appScopeFor, genesisHash, verifyManifest, loadBundleModules, MANIFEST_FILE, GUEST_FILE, FreshnessMarks }
   = await imp("build/host/bundle.js");
+const { signManifest, packBundle } = await imp("build/host/bundle-author.js");
 // ML-DSA-65 onto this instance, exactly as a target does at its crypto seam: a manifest
 // is signed and verified with both halves of the author's key set (§12.4), so a bare
 // libsodium cannot sign one.

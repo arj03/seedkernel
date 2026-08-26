@@ -22,7 +22,10 @@ const { bootShell } = await imp("build/host/shell-core.js");
 const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const { policyFromJson } = await imp("build/host/policy.js");
-const { FreshnessMarks, authorBundle, hybridAuthorId, hybridAuthorKeysFromSeed, verifyBundle } = await imp("build/host/bundle.js");
+const bundleApi = await imp("build/host/bundle.js");
+const authorApi = await imp("build/host/bundle-author.js");
+const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
+const { authorBundle, hybridAuthorKeysFromSeed } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const { TransportHost } = await imp("build/host/transport-host.js");
 const TRANSPORT_SERVICE = "_net";
@@ -35,6 +38,8 @@ const transportBlob = transportBundleBytes();
 const { ok, summary } = testkit();
 // Report-style: a failed check is logged and counted, and the suite keeps going.
 const assert = ok;
+assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signManifest", "packBundle", "authorBundle"]
+  .every((name) => !(name in bundleApi)), "the runtime bundle entry point has no authoring surface");
 // Read out of the artifact rather than restated: a hard-coded author is drift waiting
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportVerified = verifyBundle(sodium, transportBlob);
