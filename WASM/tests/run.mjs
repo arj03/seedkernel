@@ -33,6 +33,8 @@ const TEST_CONTACT = new Uint8Array(32).fill(3);
 const { createGuestSeam, guestSignScope, appSignScope }
   = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
+const TEST_TIMERS = { arm() {}, clear() {} };
+const TEST_CALLS = { call: () => null };
 const { readOp, writeOp } = await imp("build/core/op-frame.js");
 const { MemoryFs } = await imp("build/host/fs-memory.js");
 const enc = new TextEncoder();
@@ -746,8 +748,8 @@ async function testGuestSeam() {
   const signScope = appSignScope(id, id.publicKey, "testapp");
   const scopeBytes = guestSignScope(id.publicKey, "testapp");
   const seam = createGuestSeam({
-    platform: { sodium, identity: id },
-    grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls },
+    platform: { sodium, identity: id, now: () => Date.now() },
+    grants: { names: ALL_HOST_SERVICES, localServices, signScope, fs, calls, timers: TEST_TIMERS },
     // Scoped to one app, exactly as the shell scopes it: a bare name is a module
     // inside this app's map and cannot reach out of it.
     modules: {
@@ -1683,9 +1685,9 @@ async function testSeamGating() {
   const id = generateKeyPair();
   const stubTransport = { request: async (_peer, _proto, _payload) => new Uint8Array() };
   const mk = (names) => createGuestSeam({
-    platform: { sodium, identity: id, peers: () => [] },
-    grants: { names, signScope: appSignScope(id, new Uint8Array(32), "probe"), transport: stubTransport, fs: new MemoryFs() },
-    modules: { names: new Set(), call: () => null },
+    platform: { sodium, identity: id, now: () => Date.now(), peers: () => [] },
+    grants: { names, signScope: appSignScope(id, new Uint8Array(32), "probe"), transport: stubTransport, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
+    modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   });
   const U = (...xs) => new Uint8Array(xs);
   let threw = false;
@@ -1908,8 +1910,8 @@ async function testModuleCallChargedToGuestBudget() {
   const spinKey = appKey(id.publicKey, "app");
   await host.bindAll(spinKey, [{ name: "spin", wasm: SPIN_WASM }]);
   const seam = createGuestSeam({
-    platform: { sodium, identity: id },
-    grants: { names: ALL_HOST_SERVICES },
+    platform: { sodium, identity: id, now: () => Date.now() },
+    grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
     modules: {
       names: new Set(["spin"]),
       call: (n, p, deadlineMs) => host.slots.get(spinKey)?.call(n, p, deadlineMs) ?? Promise.resolve({ bytes: null, ms: 0 }),
@@ -1992,8 +1994,8 @@ async function testPreviousAbiRefused() {
     source,
     hostCall: createGuestSeam({
       platform: { sodium, identity: generateKeyPair(), now: () => 1 },
-      grants: { names: ALL_HOST_SERVICES },
-      modules: { names: new Set(), call: () => null },
+      grants: { names: ALL_HOST_SERVICES, calls: TEST_CALLS, timers: TEST_TIMERS },
+      modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
     }),
   });
   const out = await realm.call(new Uint8Array(0));

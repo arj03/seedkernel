@@ -56,9 +56,8 @@ export interface RawNet {
      *  first (socket-seam.ts `RawLink.close`). */
     close(linkId: number, graceful: boolean): void;
     /** Bytes written to this link that are not yet on the wire (socket-seam.ts
-     *  `RawLink.buffered`). Optional: a host whose channels cannot say omits it,
-     *  and the transport's stall clock degrades to a plain deadline. */
-    buffered?(linkId: number): number;
+     *  `RawLink.buffered`). The transport host supplies 0 when its channel cannot say. */
+    buffered(linkId: number): number;
 }
 
 /** The platform's event loop, as the one thing a zero-authority realm cannot do for
@@ -83,8 +82,8 @@ export interface SeamPlatform {
         publicKey: Uint8Array;
         privateKey: Uint8Array;
     };
-    /** Wall clock (ms). Defaults to Date.now. */
-    now?: () => number;
+    /** Wall clock (ms), defaulted by the shell before constructing a seam. */
+    now: () => number;
 }
 
 /** Per-REALM: exactly what THIS realm may reach — the names it may utter, the scope its
@@ -119,12 +118,12 @@ export interface SeamGrants {
      *  that reaches the `link` privilege, so nothing else can ever reach a descriptor
      *  whatever is installed (§1, capability-by-non-wiring). */
     rawNet?: RawNet;
-    /** The platform's event loop, for a guest that declares `timer`. */
-    timers?: HostTimers;
+    /** The platform's event loop. `names` decides whether this realm may reach it. */
+    timers: HostTimers;
     /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
      *  realm — reaching one is a grant like any other, and `names` above decides who holds
-     *  it. Absent only for a host-side caller with no routing to resolve against. */
-    calls?: SeamCalls;
+     *  it. */
+    calls: SeamCalls;
 }
 
 /** Per-APP: this bundle's OWN WASM modules, by the logical names its manifest declared.
@@ -134,7 +133,7 @@ export interface SeamModules {
     names: ReadonlySet<string>;
     /** Reach one of this app's modules by bare name. Async like every seam call;
      *  `deadlineMs` is the calling guest's remaining segment, never guest-supplied. */
-    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult> | null;
+    call: (name: string, payload: Uint8Array, deadlineMs?: number) => Promise<ModuleResult>;
 }
 
 /** Everything the seam needs, in the three groups that own it. */
@@ -386,7 +385,7 @@ function u64be(value: number): Uint8Array {
  *  guest may call. `crypto/*` is ungated; everything else is an authority. */
 function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string, SeamHandler> {
     const { sodium, identity } = platform;
-    const now = platform.now ?? (() => Date.now());
+    const now = platform.now;
     const fs = () => {
         if (!grants.fs)
             throw new Error("guest-seam: fs.* used but no fs backend wired");
@@ -397,11 +396,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
             throw new Error("guest-seam: link.* used but no raw net is wired");
         return grants.rawNet;
     };
-    const timers = () => {
-        if (!grants.timers)
-            throw new Error("guest-seam: timer.* used but no timer backend wired");
-        return grants.timers;
-    };
+    const timers = grants.timers;
     // Null-prototype, so the table holds exactly what is written here: a plain object
     // literal would answer `handlers["toString"]` with an inherited function.
     const handlers: Record<string, SeamHandler> = Object.assign(Object.create(null), {
@@ -498,18 +493,18 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         },
         "link/stat": (payload) => {
             const out = new Uint8Array(4);
-            writeU32BE(out, 0, rawNet().buffered?.(readU32BE(payload, 0)) ?? 0);
+            writeU32BE(out, 0, rawNet().buffered(readU32BE(payload, 0)));
             return out;
         },
         // ── timers: the platform's event loop ─────────────────────────────────────
         "timer/arm": (payload) => {
             // The live-timer cap is the BACKEND's, not here: the table is its memory to
             // spend.
-            timers().arm(readU32BE(payload, 0), readU32BE(payload, 4), payload.subarray(8));
+            timers.arm(readU32BE(payload, 0), readU32BE(payload, 4), payload.subarray(8));
             return NONE;
         },
         "timer/clear": (payload) => {
-            timers().clear(readU32BE(payload, 0));
+            timers.clear(readU32BE(payload, 0));
             return NONE;
         },
     } satisfies Record<HandlerKey, SeamHandler>);
@@ -558,8 +553,6 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // on a later turn, never inside this guest's frame; an id nothing claims is refused
         // by name rather than parked on a promise no one will settle.
         if (localServices.has(name)) {
-            if (!grants.calls)
-                throw new Error("guest-seam: " + name + " is a cross-realm call and this seam has no routing wired");
             const answer = grants.calls.call(name, payload);
             if (!answer)
                 throw new Error("guest-seam: no realm claims " + name);
@@ -595,10 +588,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // realm interrupt alone cannot catch a guest that only awaits.
         if (budget !== undefined && budget.remainingMs <= 0)
             throw new Error("guest-seam: execution budget exhausted before " + name);
-        const r = modules.call(name, payload, budget?.remainingMs);
-        if (r === null)
-            return Promise.resolve(NONE);
-        return r.then(({ bytes, ms }) => {
+        return modules.call(name, payload, budget?.remainingMs).then(({ bytes, ms }) => {
             // Bill the module's OWN processing time (measured on the worker that ran
             // it), never the issue-to-settle wall clock — a burst of fire-and-forget
             // module calls serialized through one worker would otherwise charge their

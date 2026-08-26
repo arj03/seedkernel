@@ -35,6 +35,8 @@ const { toHex } = await imp("build/core/util.js");
 const { admitAll } = await imp("build/host/policy.js");
 const { createGuestSeam } = await imp("build/host/guest-seam.js");
 const ALL_HOST_SERVICES = ["node", "fs", "clock", "timer", "link"];
+const TEST_TIMERS = { arm() {}, clear() {} };
+const TEST_CALLS = { call: () => null };
 const { callerOf, readOp, writeOp, guestOpFraming } = await imp("build/core/op-frame.js");
 const { createSafeRealm } = await imp("build/host/safe-js.js");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -157,9 +159,9 @@ console.log("\n§12.2 — the capability gates cannot be reached by omission");
 {
   const identity = sodium.crypto_sign_keypair();
   const base = {
-    platform: { sodium, identity, peers: () => [] },
-    grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs() },
-    modules: { names: new Set(), call: () => null },
+    platform: { sodium, identity, now: () => Date.now(), peers: () => [] },
+    grants: { transport: { request: async () => new Uint8Array() }, fs: new MemoryFs(), calls: TEST_CALLS, timers: TEST_TIMERS },
+    modules: { names: new Set(), call: async () => ({ bytes: null, ms: 0 }) },
   };
   throws(() => createGuestSeam({ ...base }), "omitting grants.names throws at construction");
   ok(typeof createGuestSeam({ ...base, grants: { ...base.grants, names: ALL_HOST_SERVICES } }) === "function",
