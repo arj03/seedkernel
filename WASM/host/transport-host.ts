@@ -7,6 +7,7 @@ import { DEFAULT_MAX_RAW_LINKS, MAX_FRAME_BYTES } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
+import { writeOp } from "./op-frame.js";
 
 /** Link kinds, as `linkOpen` declares them: CORE is the routing core's own (accepted through
  *  the channel factory, so dial bookkeeping and the half-open limiter apply); OPEN is a
@@ -82,14 +83,7 @@ const OP_HEADERS = new Map<string, Uint8Array>();
 function hostOpHeader(op: string): Uint8Array {
   let h = OP_HEADERS.get(op);
   if (h === undefined) {
-    // ASCII only: the bundle reads it back with charCodeAt, and a length in BYTES that
-    // a JS length in UTF-16 units would break on its first non-ASCII op.
-    const name = enc.encode(op);
-    if (name.length !== op.length || name.length > 255)
-      throw new Error(`transport: op name ${JSON.stringify(op)} must be 1..255 ASCII bytes`);
-    h = new Uint8Array(1 + name.length);
-    h[0] = name.length;
-    h.set(name, 1);
+    h = writeOp(op, EMPTY);
     OP_HEADERS.set(op, h);
   }
   return h;
