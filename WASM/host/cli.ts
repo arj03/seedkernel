@@ -6,7 +6,7 @@
 // failures are fatal, and the console lines. Those are decisions, and a decision made twice
 // eventually gets made differently.
 import { toHex, fromHex, isHex64, errMessage } from "../core/util.js";
-import { deriveNodeKeys, type NodeKeys, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
+import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import type { PeerAddr, PeerId } from "../core/socket-seam.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
@@ -217,12 +217,12 @@ function loadHex32(files: CliFiles, path: string, label: string): Uint8Array {
 /** Load the node's MASTER SEED from `--key`, or mint one and persist it 0600, and derive
  *  the node's keypair from it (§12.9). One 32-byte secret on disk; the master signs
  *  nothing itself, and the node's peer id is the derived channel key's public half. */
-function loadNodeKeys(host: CliHost, keyPath: string): NodeKeys {
+function loadNodeKeys(host: CliHost, keyPath: string): Keypair {
   const existing = host.readFile(keyPath);
-  if (existing !== null) return deriveNodeKeys(host.sodium, parseHex32(utf8.decode(existing), `--key ${keyPath}`));
+  if (existing !== null) return deriveNodeKey(host.sodium, parseHex32(utf8.decode(existing), `--key ${keyPath}`));
   const master = host.sodium.randombytes_buf(32);
   host.writeFile(keyPath, utf8enc.encode(toHex(master)), 0o600);
-  return deriveNodeKeys(host.sodium, master);
+  return deriveNodeKey(host.sodium, master);
 }
 
 /** The one console line a successful load prints (§12.4, §12.10): the app, its version, the
@@ -253,7 +253,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const policyJson = policyPath === undefined
     ? undefined
     : utf8.decode(mustRead(host, policyPath, "--policy"));
-  const keys = loadNodeKeys(host, keyPath);
+  const key = loadNodeKeys(host, keyPath);
   const contactSecretPath = args.get("contact-secret");
   const bundlePath = args.get("bundle");
   if (args.has("app-config") && bundlePath === undefined) {
@@ -270,7 +270,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
   const { shell, transport: net } = await host.standUp({
     dir,
     policyJson,
-    identity: keys.channel,
+    identity: key,
     contactSecret: contactSecretPath === undefined
       ? undefined
       : loadHex32(host, contactSecretPath, "--contact-secret"),
@@ -303,7 +303,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     await net.ready();
   }
 
-  host.log(`${host.banner} ${toHex(keys.channel.publicKey)}`);
+  host.log(`${host.banner} ${toHex(key.publicKey)}`);
   host.log(`  policy ${policyPath ?? "(none — installs disabled)"}`);
   host.log(`  store  ${dir} (fs.* backend)`);
   host.log(`  cohort ${peers.length} peer(s)`);

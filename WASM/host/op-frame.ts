@@ -1,11 +1,8 @@
 // op-frame — the optional client-side named-op envelope, as an importable module.
 // Clients and the operator CLI compose it; dispatch, timers, and the guest seam never
 // interpret it, because the kernel ABI ends after `[caller 32]`.
-//
-// This module is runtime — it is vendored into browser shells. The same three functions
-// exist as flat guest source in host/bundle-author.ts `guestOpFraming`, which a build
-// tool inlines into signed guest source and which stays offline for that reason.
-// Change one and change the other — `tests/run.mjs` fails the pair if they disagree.
+// A build tool needing the same codec as guest source takes it from bundle-author.ts
+// `guestOpFraming`; run.mjs fails the pair if they drift.
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched
  *  over the whole 32 bytes — an app key is grindable, so a prefix test is unsafe. */

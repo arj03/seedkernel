@@ -14,7 +14,7 @@ import type { CallBudget } from "./guest-seam.js";
 import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
 import { DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
-import { deriveNodeKeys } from "../core/subkeys.js";
+import { deriveNodeKey } from "../core/subkeys.js";
 import { FS_AVAILABLE_UNKNOWN, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_OUTSTANDING_HOST_CALLS, DEFAULT_REALM_MEMORY_BYTES, DEFAULT_SCRATCH_SIZE } from "../core/wasm-limits.js";
 import { toHex, fromHex, errMessage } from "../core/util.js";
@@ -509,10 +509,10 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     // The one secret a node stores: the 32-byte master seed in --key (§12.6.2b). Derived
     // HERE, by the shared subkey code the JS CLI runs, so this target's peer id is the key
     // the JS shell would compute from the same seed. Go holds the seed and nothing else.
-    const keys = deriveNodeKeys(sodium, fromHex(cfg.keyHex));
+    const key = deriveNodeKey(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
     const s = await makeTransportNode({
-        identity: keys.channel,
+        identity: key,
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
@@ -535,7 +535,7 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         await network.ready();
     }
     const status = {
-        peerId: toHex(keys.channel.publicKey), port: network.port, wsPort: network.wsPort,
+        peerId: toHex(key.publicKey), port: network.port, wsPort: network.wsPort,
     };
     return utf8.encode(JSON.stringify(status));
 }

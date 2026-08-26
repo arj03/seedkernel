@@ -156,15 +156,10 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     };
 }
 
-// ── guest source: the optional op-frame codec ────────────────────────────────
-// Not signing, but offline like the rest of this module: a build tool inlines these
-// into guest source before it is hashed and signed, so they must not reach the runtime
-// tree a browser shell vendors. host/op-frame.ts holds the same three functions as
-// TypeScript for host and test callers; `tests/run.mjs` cross-checks the two so this
-// copy cannot drift from the one clients import.
-
-/** The op-frame codec as flat guest source: `"use strict"` safe and import-free. The
- *  behavioural twin of host/op-frame.ts `callerOf`/`readOp`/`writeOp`. */
+/** The op-frame codec as flat guest source for a build tool to inline before signing:
+ *  `"use strict"` safe and import-free. Here rather than beside the TypeScript in
+ *  host/op-frame.ts so a browser shell does not vendor a source emitter; run.mjs holds
+ *  the two in step. */
 export function guestOpFraming(): string {
     return `
 // op-frame: optional client framing; seedkernel reads none of these body bytes.

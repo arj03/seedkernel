@@ -431,18 +431,18 @@ await test("READY: a second ready() does not strand the first", async (keep) => 
 });
 
 await test("SUBKEYS: one master seed, one derived identity, deterministic", async () => {
-  const { deriveNodeKeys } = await import("../build/core/subkeys.js");
+  const { deriveNodeKey } = await import("../build/core/subkeys.js");
   const master = new Uint8Array(32).fill(5);
-  const a = deriveNodeKeys(sodium, master), b = deriveNodeKeys(sodium, master);
+  const a = deriveNodeKey(sodium, master), b = deriveNodeKey(sodium, master);
   // Deterministic: a node rebuilds its key at boot from the one secret it stores.
-  assert(hexOf(a.channel.publicKey) === hexOf(b.channel.publicKey), "derivation must be deterministic");
-  const other = deriveNodeKeys(sodium, new Uint8Array(32).fill(6));
-  assert(hexOf(a.channel.publicKey) !== hexOf(other.channel.publicKey), "different masters, different keys");
+  assert(hexOf(a.publicKey) === hexOf(b.publicKey), "derivation must be deterministic");
+  const other = deriveNodeKey(sodium, new Uint8Array(32).fill(6));
+  assert(hexOf(a.publicKey) !== hexOf(other.publicKey), "different masters, different keys");
   // The master itself is never a signing key — only a derivation input.
-  assert(hexOf(a.channel.privateKey) !== hexOf(master), "the master seed must not be used as a key");
+  assert(hexOf(a.privateKey) !== hexOf(master), "the master seed must not be used as a key");
   // ONE key, deliberately: purposes are kept apart by the domain and scope the host binds
   // into every preimage, not by a second keypair (core/subkeys.ts).
-  assert(Object.keys(a).length === 1, "a node derives exactly one keypair");
+  assert(!("channel" in a), "derivation returns the keypair directly");
 });
 
 await test("NETWORK KEY: two networks are structurally unable to reach each other", async (keep) => {

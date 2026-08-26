@@ -16,7 +16,7 @@ const imp = (p) => import(pathToFileURL(join(root, p)).href);
 const { loadCrypto } = await imp("build/host/crypto-node.js");
 const sodium = await loadCrypto();
 const { runCli, parseArgs, parseHex32, loadedLine, DEFAULT_DIR, DEFAULT_KEY } = await imp("build/host/cli.js");
-const { deriveNodeKeys } = await imp("build/core/subkeys.js");
+const { deriveNodeKey } = await imp("build/core/subkeys.js");
 const { toHex } = await imp("build/core/util.js");
 
 const { ok, throws, summary } = testkit();
@@ -96,13 +96,13 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   ok(minted !== undefined, "an absent --key file is minted, not an error");
   const seedHex = new TextDecoder().decode(minted);
   ok(/^[0-9a-f]{64}$/.test(seedHex), "the minted key file holds 64 hex characters");
-  const keys = deriveNodeKeys(sodium, parseHex32(seedHex, "--key"));
-  ok(host.lines[0] === `seedkernel-test ${toHex(keys.channel.publicKey)}`,
+  const key = deriveNodeKey(sodium, parseHex32(seedHex, "--key"));
+  ok(host.lines[0] === `seedkernel-test ${toHex(key.publicKey)}`,
     "the banner line reports the derived key as the peer id");
   // ONE identity: the key that reaches standUp — and so `node/identity`, `node/sign` and
   // the handshake — is the same key the banner prints as the peer id. A node that signed
   // a record with anything else would name an author no peer in its cohort has heard of.
-  ok(toHex(host.stood.identity.publicKey) === toHex(keys.channel.publicKey),
+  ok(toHex(host.stood.identity.publicKey) === toHex(key.publicKey),
     "the node's identity is the peer id, not a sibling key");
 }
 

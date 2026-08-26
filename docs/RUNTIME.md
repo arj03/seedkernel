@@ -680,7 +680,7 @@ seedloader --policy ./allowed-keys.json --dir ./data --key ./node.key \
 Go's side of it is five primitives — `argv`, `readFile`, `writeFile`, `log`, `stdout` —
 plus `__fs.open`, which is how a data directory reaches the fs backend now that Go does
 not read `--dir` to find one. Even the `--key` file is read and minted in the shared
-flow: it holds the node's 32-byte master seed (§12.6.2b), and `deriveNodeKeys` produces the
+flow: it holds the node's 32-byte master seed (§12.6.2b), and `deriveNodeKey` produces the
 node's keypair from it, so both targets hold one secret on disk and derive the same peer id
 from the same seed.
 

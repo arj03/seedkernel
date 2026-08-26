@@ -3,7 +3,7 @@ package main
 import "testing"
 
 // The native node's identity IS the key the shared code derives from the master seed
-// (deriveNodeKeys, core/subkeys.ts, §12.6.2b), so the peer id it reports must be that
+// (deriveNodeKey, core/subkeys.ts, §12.6.2b), so the peer id it reports must be that
 // key's public half. Pins this target to the shared derivation rather than a raw keypair
 // of its own, and to ONE identity: the same key answers node/identity, signs guest records
 // and signs the handshake.
@@ -14,8 +14,8 @@ func TestBootNodeDerivesIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal("bootNode:", err)
 	}
-	derive := `deriveNodeKeys(sodium, fromHex("` + seedHex + `"))`
-	channel := evalString(t, `toHex(`+derive+`.channel.publicKey)`)
+	derive := `deriveNodeKey(sodium, fromHex("` + seedHex + `"))`
+	channel := evalString(t, `toHex(`+derive+`.publicKey)`)
 	if st.PeerID != channel {
 		t.Fatalf("peer id = %s, want the derived key %s", st.PeerID, channel)
 	}
