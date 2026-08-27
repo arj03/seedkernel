@@ -73,10 +73,10 @@ interface ShellPlatform {
      *  network can mint transcripts another's verifier accepts. */
     networkKey?: Uint8Array;
     /** The concrete channel adapter: the sockets, the listeners and the address book, all
-     *  the NODE's rather than any guest's. The platform CONSTRUCTS it, because every knob
-     *  on it (which addresses to bind, how many conns per peer, the half-open budgets) is
-     *  a deployment's answer — then hands it over, `shell.close()` closing it, so there is
-     *  one teardown rather than a second thing every embedder must remember.
+     *  the NODE's rather than any guest's. The platform CONSTRUCTS it with driver-owned
+     *  resources such as listeners and the raw-link ceiling, then hands it over;
+     *  `shell.close()` closes it, so there is one teardown rather than a second thing every
+     *  embedder must remember. Transport-program policy travels through bundle config.
      *
      *  Absent for a shell with no raw links at all (a browser edge). */
     transportHost?: TransportHost;
@@ -528,9 +528,9 @@ function createShell(opts: CreateShellOptions & {
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
-    /** Fold this node's immutable facts into a link occupant's ordinary LOCAL config.
-     *  Host facts win same-named keys: a load may add installation-local values, but it
-     *  cannot replace the identity or resource bounds owned by the driver. */
+    /** Fold this node's three immutable facts into a link occupant's ordinary LOCAL
+     *  config. Only peerId, networkKey and contactSecret are host-owned and win collisions;
+     *  transport-program policy remains the load's LOCAL override over signed APP defaults. */
     const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
         if (!hasLink(slot)) return localConfig;
         const facts = netHost?.initialConfig();
@@ -808,6 +808,10 @@ export interface BootShellOptions {
      *  the transport bundle under the pin, and starts its listeners. The object is retained,
      *  so getter-backed live options stay live. `false` or absent ⇒ no network. */
     transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | false;
+    /** Installation-local configuration for the automatically loaded transport bundle.
+     *  Passed through the ordinary one-load `localConfig` path; the signed bundle supplies
+     *  its own defaults in `manifest.guest.config`. */
+    transportConfig?: JsonObject;
     /** Boot auto-load of the pinned transport bundle. Default true. `false` ⇒ bootShell
      *  constructs the adapter but leaves the load to the caller. */
     transportLoad?: boolean;
@@ -895,7 +899,8 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
     try {
         if (transport && transportBlob && opts.transportLoad !== false) {
             try {
-                await shell.loadBundleBlob(transportBlob);
+                await shell.loadBundleBlob(transportBlob,
+                    opts.transportConfig === undefined ? undefined : { localConfig: opts.transportConfig });
             }
             catch (err) {
                 if (!isAdmissionRejected(err)) throw err;

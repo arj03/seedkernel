@@ -164,10 +164,10 @@ Transport behavior has three deliberate modes:
 | Configuration | Adapter | Transport bundle |
 | --- | --- | --- |
 | `transport` omitted or `false` | No `TransportHost`; `BootResult.transport` is `null` | Not loaded. The node has no network. |
-| `transport: { …options }` | `bootShell` constructs and returns the adapter, filling in the top-level `identity` and `networkKey` | The shipped bundle—or `transportBundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded; listeners are then started. |
-| `transport: { …options }`, `transportLoad: false` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob`; this is seedchat's lazy-first-connect mode. The options object is retained, so accessors such as seedchat's live `contactSecret` getter survive. |
+| `transport: { …options }` | `bootShell` constructs and returns the adapter, filling in the top-level `identity` and `networkKey` | The shipped bundle—or `transportBundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded with `transportConfig` as that load's `localConfig`; listeners are then started. |
+| `transport: { …options }`, `transportLoad: false` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob(blob, { localConfig })`; this is seedchat's lazy-first-connect mode. The options object is retained, so accessors such as seedchat's live `contactSecret` getter survive. |
 
-`transportBundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload.
+`transportBundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload. The transport's defaults are signed in its `guest.config`; `transportConfig` is the automatic-load convenience for operator overrides and reaches the guest as `LOCAL`, exactly like any other one-bundle `localConfig`.
 
 Two things it does *for* you, which is why you should not try to reproduce them:
 
@@ -176,7 +176,7 @@ Two things it does *for* you, which is why you should not try to reproduce them:
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
 
-`loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None of those values becomes author-signed bundle content; they belong to this installation and this load. For an ordinary app, `localConfig` becomes `LOCAL` unchanged. For the one slot reaching `link`, the shell adds the `TransportHost`'s node facts to `LOCAL` before standing the realm, with those host-owned keys winning collisions; callers do not need a separate transport initialization step.
+`loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None of those values becomes author-signed bundle content; they belong to this installation and this load. For an ordinary app, `localConfig` becomes `LOCAL` unchanged. For the one slot reaching `link`, the shell adds exactly three `TransportHost` node facts—`peerId`, `networkKey`, and `contactSecret`—to `LOCAL` before standing the realm, with those host-owned keys winning collisions; callers do not need a separate transport initialization step.
 
 The handle's `invoke` is bound to the slot this load stood. On an upgrade, a replacement load stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the load they intend to drive.
 

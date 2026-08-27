@@ -199,9 +199,9 @@ export function transportPolicy(authorHex, appAuthors = []) {
 }
 
 /** One transport host: a shell over a fresh identity + the transport bundle, and — unless
- *  `app: false` — the harness app that drives it. Options pass through to the driver
- *  (admitPeers, networkKey, contactSecret, channels, requestDeadlineMs, transportHalfOpen,
- *  maxRawLinks, linkIdleTimeoutMs). `request`/`sendNoReply`/`peers`/`seen`/`from`/`op` are
+ *  `app: false` — the harness app that drives it. Socket options pass to the driver;
+ *  guest-owned policy passes as the transport bundle's one-load LOCAL config.
+ *  `request`/`sendNoReply`/`peers`/`seen`/`from`/`op` are
  *  each a single `invoke` into the harness app, so the bytes cross exactly the seam a real
  *  app's would. */
 export async function makeTransportHost(opts = {}) {
@@ -213,17 +213,21 @@ export async function makeTransportHost(opts = {}) {
     channels: opts.channels,
     listen: opts.listen,
     contactSecret: opts.contactSecret,
-    admitPeers: opts.admitPeers,
-    connsPerPeer: opts.connsPerPeer,
-    requestDeadlineMs: opts.requestDeadlineMs,
-    maxHalfOpenUnverified: opts.transportHalfOpen?.unverified,
-    maxHalfOpenPerSource: opts.transportHalfOpen?.perSource,
-    maxHalfOpenVerified: opts.transportHalfOpen?.verified,
-    maxAuthedLinks: opts.transportHalfOpen?.authed,
-    // The DRIVER's own ceiling, not one of the tiers above: `transportHalfOpen` is what the
-    // guest enforces, this is what the host holds.
+    // The DRIVER's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
-    linkIdleTimeoutMs: opts.linkIdleTimeoutMs,
+  };
+  const transportConfig = {
+    ...(opts.transportConfig ?? {}),
+    ...(opts.admitPeers === undefined ? {} : {
+      admitPeers: opts.admitPeers.map((peer) => Buffer.from(peer).toString("hex")),
+    }),
+    ...(opts.connsPerPeer === undefined ? {} : { connsPerPeer: opts.connsPerPeer }),
+    ...(opts.requestDeadlineMs === undefined ? {} : { requestDeadlineMs: opts.requestDeadlineMs }),
+    ...(opts.transportHalfOpen?.unverified === undefined ? {} : { maxHalfOpenUnverified: opts.transportHalfOpen.unverified }),
+    ...(opts.transportHalfOpen?.perSource === undefined ? {} : { maxHalfOpenPerSource: opts.transportHalfOpen.perSource }),
+    ...(opts.transportHalfOpen?.verified === undefined ? {} : { maxHalfOpenVerified: opts.transportHalfOpen.verified }),
+    ...(opts.transportHalfOpen?.authed === undefined ? {} : { maxAuthedLinks: opts.transportHalfOpen.authed }),
+    ...(opts.linkIdleTimeoutMs === undefined ? {} : { linkIdleTimeoutMs: opts.linkIdleTimeoutMs }),
   };
   // bootShell owns the adapter but leaves the load to this harness because a test wants it
   // observable (sometimes refused). `transportBundle` is still stated: the blob
@@ -244,7 +248,7 @@ export async function makeTransportHost(opts = {}) {
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
-  await shell.loadBundleBlob(blob);
+  await shell.loadBundleBlob(blob, { localConfig: transportConfig });
   const node = { shell, driver, identity, appAuthor };
   if (opts.app === false) return node;
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));

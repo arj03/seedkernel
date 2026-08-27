@@ -10,23 +10,39 @@ const ownId = LOCAL.peerId;                 // node channel public key, hex
 const ownPk = fromHex(ownId);               // 32B node channel public key
 const networkKey = fromHex(LOCAL.networkKey);
 const contactSecret = fromHex(LOCAL.contactSecret); // OUR inbound gate (zeros = open)
-const connsPerPeer = Math.max(1, LOCAL.connsPerPeer);
+
+/** One policy number: this installation's override, else the author's signed default.
+ *  Every one of these bounds a resource, and a bound read as `undefined` does not fail
+ *  the comparison that applies it — it makes that comparison always false, which is a
+ *  cap silently absent rather than a cap set wrong. So an unresolved or non-finite value
+ *  throws HERE, at realm evaluation, and the bundle is refused at load rather than
+ *  running unbounded. A bundle carrying no `guest.config` fails on the first name. */
+function policy(name) {
+  const v = LOCAL[name] ?? APP[name];
+  if (!Number.isFinite(v) || v < 0) {
+    throw new Error(`transport: config ${name} must be a non-negative finite number`);
+  }
+  return v;
+}
+
+const connsPerPeer = Math.max(1, policy("connsPerPeer"));
 // The operator's peer list as a Set of hex keys, or null for "admit everyone".
-// A lint applied by `admits` (ake.js); a node fact in LOCAL.
-const admitPeers = LOCAL.admitPeers.length > 0 ? new Set(LOCAL.admitPeers) : null;
-// Fallback request deadline from LOCAL.
-const requestDeadlineMs = LOCAL.requestDeadlineMs;
+// A lint applied by `admits` (ake.js); LOCAL may override the signed APP default.
+const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
+if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
+const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
+const requestDeadlineMs = policy("requestDeadlineMs");
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
-// These bounds belong to whoever owns the resource (net-limits.ts, core); this module
-// only applies the values supplied in LOCAL.
-const maxFrameBytes = LOCAL.maxFrameBytes;
-const maxUnverified = LOCAL.maxHalfOpenUnverified;
-const maxPerSource = LOCAL.maxHalfOpenPerSource;
-const maxVerified = LOCAL.maxHalfOpenVerified;
-const maxAuthed = LOCAL.maxAuthedLinks;
+// These policies and their defaults belong to this signed program. LOCAL is the
+// installation's general override path; APP is the author's signed fallback.
+const maxFrameBytes = policy("maxFrameBytes");
+const maxUnverified = policy("maxHalfOpenUnverified");
+const maxPerSource = policy("maxHalfOpenPerSource");
+const maxVerified = policy("maxHalfOpenVerified");
+const maxAuthed = policy("maxAuthedLinks");
 // How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
-const linkIdleTimeoutMs = LOCAL.linkIdleTimeoutMs;
+const linkIdleTimeoutMs = policy("linkIdleTimeoutMs");
 
 // The one router and the one request/response layer per host instance.
 let router = null;
@@ -335,8 +351,9 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-// Build the transport from the immutable node facts in this installation's LOCAL config.
-// Mutable addresses still arrive later as ordinary `addr` events after publication.
+// Build the transport from signed APP defaults, installation-local overrides, and the
+// three immutable node facts in LOCAL. Mutable addresses still arrive later as ordinary
+// `addr` events after publication.
 router = new Router(ownPk, ownId);
 reqres = new ReqRes();
 core = new Core();

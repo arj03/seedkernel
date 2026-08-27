@@ -4,7 +4,7 @@
 
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
-import { DEFAULT_MAX_RAW_LINKS, MAX_FRAME_BYTES } from "../core/net-limits.js";
+import { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
@@ -32,29 +32,9 @@ interface OpenLinkRecord {
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 
-/** Default half-open budgets, shipped to the transport guest in LOCAL and enforced there
- *  (§12.6.2). Tests shrink them via TransportHostOptions. */
-export const DEFAULT_MAX_HALF_OPEN_UNVERIFIED = 1024;
-export const DEFAULT_MAX_HALF_OPEN_PER_SOURCE = 8;
-export const DEFAULT_MAX_HALF_OPEN_VERIFIED = 256;
-/** ...and the budget past the door: without it anybody who can complete a handshake opens
- *  links without limit, each holding a framer, session keys, timers and buffers. */
-export const DEFAULT_MAX_AUTHED_LINKS = 256;
-
 /** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
  *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
 export { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
-
-/** How long one request may take when its caller names no deadline. Generous on purpose: it
- *  has to be right for a caller who did not think about it. Shipped to the guest in LOCAL,
- *  since the request path is entirely the guest's. */
-export const DEFAULT_REQUEST_DEADLINE_MS = 10_000;
-
-/** How long an AUTHENTICATED link may carry no traffic before the guest retires it (the
- *  address book redials on the next send). The other half of the authed-link budget: the
- *  handshake deadlines stop applying the moment a link authenticates, so a cap alone would
- *  let a peer fill it and sit there. Generous — it is not a liveness probe. */
-export const DEFAULT_LINK_IDLE_TIMEOUT_MS = 300_000;
 
 // ── the driver's own event header ──────────────────────────────────────────────
 //
@@ -136,30 +116,10 @@ export interface TransportHostOptions {
   /** This node's contact secret, 32 bytes of full entropy, published with our address.
  *  Absent ⇒ an open node (§12.6.3). */
   contactSecret?: Uint8Array;
-  /** Fallback request deadline in ms for a caller that names none
- *  (default `DEFAULT_REQUEST_DEADLINE_MS`). */
-  requestDeadlineMs?: number;
-  /** Parallel connections per dialed peer (default 1). */
-  connsPerPeer?: number;
-  /** The host's inbound flood cap (default net-limits MAX_FRAME_BYTES), supplied to the
-   *  guest in LOCAL — the module never declares the number that bounds it. */
-  maxFrameBytes?: number;
-  /** Concurrent half-open budgets, enforced in the transport guest; tests shrink them. */
-  maxHalfOpenUnverified?: number;
-  maxHalfOpenPerSource?: number;
-  maxHalfOpenVerified?: number;
-  /** Concurrent AUTHENTICATED links, and how long one may sit idle before the guest
- *  retires it (ms; 0 disables the clock). */
-  maxAuthedLinks?: number;
-  linkIdleTimeoutMs?: number;
   /** Live raw links this driver will hold at once (default `DEFAULT_MAX_RAW_LINKS`).
  *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
  *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
-  /** The peers this node will talk to, as 32-byte channel keys — a lint the guest applies,
-   *  shipped to it in LOCAL. Absent ⇒ admit every peer that completes the handshake
- *  (§12.6.3). */
-  admitPeers?: Uint8Array[];
   /** The socket seam: dialing, listening, and the address book live here. Absent for a
  *  host-managed-transport-only node (browser edge), which opens links via openLink and
  *  whose link/open calls answer "no route". */
@@ -267,22 +227,10 @@ export class TransportHost {
   initialConfig(): JsonObject {
     const o = this.opts;
     const { identity, networkKey } = this.nodeFacts;
-    // Preserve the driver's u32 normalization now that these values no longer pass
-    // through Args.u32 on their way into the guest.
-    const u32 = (v: number): number => v >>> 0;
     return {
       peerId: toHex(identity.publicKey),
       networkKey: toHex(networkKey ?? ZERO32),
       contactSecret: toHex(o.contactSecret ?? ZERO32),
-      connsPerPeer: u32(o.connsPerPeer ?? 1),
-      maxHalfOpenUnverified: u32(o.maxHalfOpenUnverified ?? DEFAULT_MAX_HALF_OPEN_UNVERIFIED),
-      maxHalfOpenPerSource: u32(o.maxHalfOpenPerSource ?? DEFAULT_MAX_HALF_OPEN_PER_SOURCE),
-      maxHalfOpenVerified: u32(o.maxHalfOpenVerified ?? DEFAULT_MAX_HALF_OPEN_VERIFIED),
-      maxAuthedLinks: u32(o.maxAuthedLinks ?? DEFAULT_MAX_AUTHED_LINKS),
-      maxFrameBytes: u32(o.maxFrameBytes ?? MAX_FRAME_BYTES),
-      requestDeadlineMs: u32(o.requestDeadlineMs ?? DEFAULT_REQUEST_DEADLINE_MS),
-      linkIdleTimeoutMs: u32(o.linkIdleTimeoutMs ?? DEFAULT_LINK_IDLE_TIMEOUT_MS),
-      admitPeers: (o.admitPeers ?? []).map(toHex),
     };
   }
 

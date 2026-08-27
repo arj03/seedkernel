@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { loadCrypto } from "./crypto-node.js";
 import { policyFromJson } from "./policy.js";
-import { FreshnessMarks, freshnessPathFor } from "./bundle.js";
+import { FreshnessMarks, freshnessPathFor, type JsonObject } from "./bundle.js";
 import { NodeChannelFactory } from "./net-node.js";
 import { NodeFs } from "./fs-node.js";
 import { bootShell, type AppHandle, type LoadBundleOptions, type Shell as CoreShell, type ShellSodium } from "./shell-core.js";
@@ -51,9 +51,8 @@ export interface NodeShellOptions {
      *  author the `link` privilege (never the plain `authors` list). A shell without an
      *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
-    /** Default per-request deadline in ms — how long one net request may take before
-     *  it settles as unreachable, for a caller that names none of its own (§12.6). */
-    requestDeadlineMs?: number;
+    /** Installation-local configuration for the signed transport bundle. */
+    transportConfig?: JsonObject;
     /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3). Counts
      *  time the guest is running, not time parked on a host seam, so it bounds a wedged
      *  guest without penalising one awaiting the network. `Infinity` disables it. Threaded
@@ -136,11 +135,11 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
         freshnessStore: freshness,
         transport: {
             contactSecret: opts.contactSecret,
-            requestDeadlineMs: opts.requestDeadlineMs,
             channels: opts.channels ?? new NodeChannelFactory(),
             listen: opts.listen,
             wsListen: opts.wsListen,
         },
+        transportConfig: opts.transportConfig,
         transportBundle: opts.transportBundle,
         admit: policyFromJson(opts.policyJson),
         guestDeadlineMs: opts.guestDeadlineMs,

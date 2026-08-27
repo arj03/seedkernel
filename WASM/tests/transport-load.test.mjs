@@ -9,7 +9,7 @@
 // socket evicted or refused, does a member still complete its handshake — never a counter.
 
 import {
-  makeTransportHost, sodium as realSodium, LoopbackChannels, until,
+  makeTransportHost, sodium as realSodium, LoopbackChannels, until, transportBlob, verifyBundle,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -297,15 +297,14 @@ await test("sustained-rate headroom", async () => {
   // What the constants actually buy, stated as a rate rather than a count: a flood must
   // exceed this to keep the unverified budget saturated, and even then eviction (above)
   // says members are unaffected.
-  const { DEFAULT_MAX_HALF_OPEN_UNVERIFIED, DEFAULT_MAX_HALF_OPEN_VERIFIED }
-    = await import("../build/host/transport-host.js");
+  const defaults = verifyBundle(realSodium, transportBlob).manifest.guest.config;
   const deadlineMs = globalThis.__unverifiedMs ?? 2000;
-  const rate = DEFAULT_MAX_HALF_OPEN_UNVERIFIED / (deadlineMs / 1000);
-  note(`unverified budget ${DEFAULT_MAX_HALF_OPEN_UNVERIFIED} / ~${deadlineMs}ms ` +
+  const rate = defaults.maxHalfOpenUnverified / (deadlineMs / 1000);
+  note(`unverified budget ${defaults.maxHalfOpenUnverified} / ~${deadlineMs}ms ` +
        `= ${rate.toFixed(0)} conn/s to saturate`);
-  note(`verified budget ${DEFAULT_MAX_HALF_OPEN_VERIFIED}, reachable only with the contact secret`);
+  note(`verified budget ${defaults.maxHalfOpenVerified}, reachable only with the contact secret`);
   assert(rate >= 100, `saturation rate ${rate}/s is too easy to reach`);
-  assert(DEFAULT_MAX_HALF_OPEN_VERIFIED >= 64, "the members' budget should not be tight");
+  assert(defaults.maxHalfOpenVerified >= 64, "the members' budget should not be tight");
 });
 
 summary("transport load behaviour");

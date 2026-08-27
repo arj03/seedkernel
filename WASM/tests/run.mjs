@@ -2824,8 +2824,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
     assert(/^[0-9a-f]{64}$/.test(candidateLocal.peerId) && candidateLocal.peerId !== localConfig.peerId &&
       candidateLocal.networkKey === "00".repeat(32) &&
       candidateLocal.contactSecret === "00".repeat(32) &&
-      candidateLocal.requestDeadlineMs === 10000,
-      "the driver's immutable node facts are hex JSON and override same-named LOCAL keys");
+      candidateLocal.requestDeadlineMs === 1,
+      "only the driver's three immutable node facts override same-named LOCAL keys");
     assert(candidates[0].calls === 0,
       "standing a link slot does not invoke a second privileged init path");
     assertEqual(candidates[0].refused.sort(), ["_svc", "fs/put"],

@@ -8,7 +8,7 @@
 import {
   makeTransportHost, generateKeyPair, sodium, LoopbackChannels, CLOSE_REASON, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
-  transportBlob, transportAuthor, transportPolicy,
+  transportBlob, transportAuthor, transportPolicy, verifyBundle,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -1053,19 +1053,16 @@ await test("EVENT RETURNS: authentication and down cannot be redirected to anoth
 });
 
 await test("default caps are sane", async () => {
-  const {
-    DEFAULT_MAX_HALF_OPEN_UNVERIFIED, DEFAULT_MAX_HALF_OPEN_PER_SOURCE, DEFAULT_MAX_HALF_OPEN_VERIFIED,
-    DEFAULT_MAX_AUTHED_LINKS, DEFAULT_LINK_IDLE_TIMEOUT_MS,
-  } = await import("../build/host/transport-host.js");
-  assert(DEFAULT_MAX_AUTHED_LINKS > 0 && DEFAULT_MAX_AUTHED_LINKS <= 4096,
+  const defaults = verifyBundle(sodium, transportBlob).manifest.guest.config;
+  assert(defaults.maxAuthedLinks > 0 && defaults.maxAuthedLinks <= 4096,
     "the authenticated-link budget should be a real bound");
-  assert(DEFAULT_LINK_IDLE_TIMEOUT_MS >= 60_000,
+  assert(defaults.linkIdleTimeoutMs >= 60_000,
     "the idle clock must be generous enough that a quiet-but-live link is not churned");
-  assert(DEFAULT_MAX_HALF_OPEN_UNVERIFIED > 0 && DEFAULT_MAX_HALF_OPEN_UNVERIFIED <= 8192,
+  assert(defaults.maxHalfOpenUnverified > 0 && defaults.maxHalfOpenUnverified <= 8192,
     "unverified cap should be a real bound");
-  assert(DEFAULT_MAX_HALF_OPEN_VERIFIED > 0 && DEFAULT_MAX_HALF_OPEN_VERIFIED <= 4096,
+  assert(defaults.maxHalfOpenVerified > 0 && defaults.maxHalfOpenVerified <= 4096,
     "verified cap should be a real bound");
-  assert(DEFAULT_MAX_HALF_OPEN_PER_SOURCE > 0 && DEFAULT_MAX_HALF_OPEN_PER_SOURCE < DEFAULT_MAX_HALF_OPEN_UNVERIFIED,
+  assert(defaults.maxHalfOpenPerSource > 0 && defaults.maxHalfOpenPerSource < defaults.maxHalfOpenUnverified,
     "the per-source cap must bound one source well below the whole budget");
 });
 

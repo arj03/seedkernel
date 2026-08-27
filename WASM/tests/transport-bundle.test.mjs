@@ -11,6 +11,7 @@ import { testkit, makeAuthor } from "./testkit.mjs";
 // bundles must be signed over the byte-for-byte guest production signs, and a second copy
 // of the part order here would quietly sign a different program (scripts/guest-source.mjs).
 import { readGuestSource } from "../scripts/guest-source.mjs";
+import { TRANSPORT_APP_CONFIG } from "../scripts/transport-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -43,6 +44,8 @@ assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signManifest", "packBundl
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
+assert(JSON.stringify(transportVerified.manifest.guest.config) === JSON.stringify(TRANSPORT_APP_CONFIG),
+  "the shipped transport manifest signs the guest's complete default configuration");
 // The artifact is PQ-signed (§14.1): one hybrid suite, and the id policy pins is a key-set
 // hash, so both keys are on the verified result.
 assert(transportVerified.authorKeys.mlDsa !== undefined,
@@ -62,8 +65,9 @@ assert(derivedTransportAuthor === transportAuthor,
 
 // `guestSource` overrides the artifact's guest — the only caller that passes one hands in
 // a program that cannot compile, to fail the load at the point where the DRIVER stands
-// rather than at verify.
-function transportBundleAt(version, keys, guestSource) {
+// rather than at verify. `guestConfig` is `null` for the one caller signing a transport
+// with no config at all, which is refused at the same point and for the same reason.
+function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_APP_CONFIG) {
   const guest = guestSource ?? readGuestSource();
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const mlkemWasm = new Uint8Array(readFileSync(join(root, "browser/mlkem768.wasm")));
@@ -79,6 +83,7 @@ function transportBundleAt(version, keys, guestSource) {
     // the admission dispatch reads (§12.5), inbound delivery (`link/deliver`) among its
     // names: the unit declared here is the service, never the method.
     guestRequires: ["node", "link", "timer"],
+    guestConfig: guestConfig ?? undefined,
   });
   return blob;
 }
@@ -87,6 +92,37 @@ function transportBundleAt(version, keys, guestSource) {
 // reaches a handler on the other.
 const appAuthor = makeAuthor(sodium);
 const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
+
+// bootShell's convenience option is only syntax for this bundle's ordinary LOCAL load
+// config. The shell still guards its three node facts against collisions.
+{
+  let source = "";
+  const { shell } = await bootShell({
+    sodium,
+    identity: generateKeyPair(),
+    modules: new ModuleTable(),
+    freshnessStore: new FreshnessMarks(),
+    fs: false,
+    transport: {},
+    transportConfig: { requestDeadlineMs: 321, peerId: "operator-cannot-replace-this" },
+    transportBundle: transportBlob,
+    createRealm: async (o) => {
+      source = o.source;
+      return { call: async () => new Uint8Array(), dispose() {} };
+    },
+    admit: policyFromJson(JSON.stringify({
+      authors: [transportAuthor], grants: { link: [transportAuthor] },
+    })),
+  });
+  const [appConfig, localConfig] = Function(
+    source.split("\n").slice(0, 2).join("\n") + "\nreturn [APP, LOCAL];",
+  )();
+  assert(appConfig.requestDeadlineMs === TRANSPORT_APP_CONFIG.requestDeadlineMs,
+    "transport defaults arrive from signed APP config");
+  assert(localConfig.requestDeadlineMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.peerId),
+    "bootShell transportConfig reaches LOCAL while host-owned node facts win collisions");
+  shell.close();
+}
 /** One request through a node's app handle to `to` — the path a deployment uses. */
 async function request(app, to, payload) {
   return appRequest(app, to, payload);
@@ -98,7 +134,8 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     authors: [transportAuthor, appAuthorHex],
     grants: { link: [transportAuthor] },
   }));
-  const transportOptions = { channels, listen, requestDeadlineMs: 800 };
+  const transportOptions = { channels, listen };
+  const transportConfig = { requestDeadlineMs: 800 };
   // A test may pause a candidate right after its realm stands, before the shell publishes
   // it: its LOCAL facts are installed, but the incumbent still owns `_net`, which exposes
   // address-book updates in the replacement window deterministically.
@@ -123,7 +160,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     },
     admit: policy,
   });
-  await shell.loadBundleBlob(transportBlob);
+  await shell.loadBundleBlob(transportBlob, { localConfig: transportConfig });
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
   return { shell, transport, realmControl, app };
 }
@@ -227,6 +264,20 @@ assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mar
 assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
 assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
+
+// ── A transport that signs no bounds is refused, not run unbounded ───────────────
+// Every policy value the guest reads bounds a resource, and an absent one does not fail
+// the comparison that applies it — it makes that comparison always false, so a frame cap
+// read as `undefined` is a cap silently gone rather than a cap set wrong. The guest
+// therefore validates its own config at realm evaluation, which is a failed load.
+let noConfigFailed = false;
+let noConfigMsg = "";
+try { await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys, undefined, null)); }
+catch (e) { noConfigFailed = true; noConfigMsg = e.message; }
+assert(noConfigFailed && /maxFrameBytes|connsPerPeer|config/.test(noConfigMsg),
+  `a transport signing no guest.config fails the load (${noConfigMsg})`);
+assert((await request(a.app, bId, new Uint8Array([9]))).length === 1,
+  "…and the standing transport is untouched by the refusal");
 
 // ── A mark that cannot be persisted is a failed load ─────────────────────────────
 console.log("  an `_net` claimant whose mark cannot be persisted fails the load…");

@@ -16,6 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
+import { TRANSPORT_APP_CONFIG } from "./transport-config.mjs";
 import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle-author.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
@@ -81,6 +82,9 @@ async function main() {
     // than a second grant.
     // What it provides back is the id it claims above, not a service (§12.1).
     guestRequires: ["node", "link", "timer"],
+    // Transport policy belongs to this signed program. An installation may override any
+    // of these values through the load's LOCAL config; the guest applies LOCAL ?? APP.
+    guestConfig: TRANSPORT_APP_CONFIG,
   });
   // The 0x02 author id: the key-set hash policy pins, table names derive from, and
   // freshness is keyed by — NOT the Ed25519 key (bundle.ts `hybridAuthorId`). Carried

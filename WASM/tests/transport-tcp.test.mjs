@@ -43,8 +43,8 @@ async function makeNode(ws = false) {
     channels: new NodeChannelFactory(),
     listen: { host: HOST, port: 0 },
     ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
-    requestDeadlineMs: 2000,
   };
+  const transportConfig = { requestDeadlineMs: 2000 };
   // bootShell owns the adapter but leaves the load and listeners to this test, which
   // starts them by hand below.
   const { shell, transport } = await bootShell({
@@ -58,7 +58,7 @@ async function makeNode(ws = false) {
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
-  await shell.loadBundleBlob(transportBlob);
+  await shell.loadBundleBlob(transportBlob, { localConfig: transportConfig });
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
   return { shell, transport, app };
 }

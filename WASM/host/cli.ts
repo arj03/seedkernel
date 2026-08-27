@@ -48,7 +48,7 @@ export interface NodeSetup {
   contactSecret?: Uint8Array;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
-  requestDeadlineMs?: number;
+  transportConfig?: JsonObject;
   guestDeadlineMs?: number;
   realmMemoryBytes?: number;
   transportBundle?: Uint8Array;
@@ -226,7 +226,9 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     wsListen: args.has("ws-listen")
       ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
-    requestDeadlineMs: args.has("request-deadline") ? Number(args.get("request-deadline")) : undefined,
+    transportConfig: args.has("request-deadline")
+      ? { requestDeadlineMs: Number(args.get("request-deadline")) }
+      : undefined,
     // Guest resource bounds (§12.3), which only widen or tighten the shell's own
     // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
     // rather than reached by leaving a flag off.

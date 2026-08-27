@@ -4,7 +4,7 @@
 // inside QuickJS, bundled with every module it imports into native/host-shell.gen.js by
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
-import { verifyBundle, FreshnessMarks, freshnessPathFor, type PureModuleLoader } from "./bundle.js";
+import { verifyBundle, FreshnessMarks, freshnessPathFor, type JsonObject, type PureModuleLoader } from "./bundle.js";
 import { runCli, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parsePeerSpec } from "./peer-addr.js";
 import {
@@ -472,7 +472,7 @@ async function makeTransportNode(cfg: {
     };
     /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate. */
     networkKey?: Uint8Array;
-    requestDeadlineMs?: number;
+    transportConfig?: JsonObject;
     /** The §12.3 guest bounds, threaded through to `bootShell`: a bound the shell accepts
      *  but no target can set is a bound nobody has. */
     guestDeadlineMs?: number;
@@ -486,11 +486,11 @@ async function makeTransportNode(cfg: {
         networkKey: cfg.networkKey,
         transport: {
             contactSecret: cfg.contactSecret,
-            requestDeadlineMs: cfg.requestDeadlineMs,
             channels,
             listen: cfg.listen,
             wsListen: cfg.wsListen,
         },
+        transportConfig: cfg.transportConfig,
         transportBundle: cfg.transportBundle,
         // The admission predicate in force (§12.5): the shell closes over this
         // indirection rather than a fixed predicate, so trust can be narrowed or widened
@@ -517,7 +517,9 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
-        requestDeadlineMs: cfg.requestDeadlineMs,
+        transportConfig: cfg.requestDeadlineMs === undefined
+            ? undefined
+            : { requestDeadlineMs: cfg.requestDeadlineMs },
     });
     shell = s.shell;
     const network = s.transport;
@@ -570,7 +572,7 @@ function nativeCliHost(): CliHost {
                 contactSecret: cfg.contactSecret,
                 listen: cfg.listen,
                 wsListen: cfg.wsListen,
-                requestDeadlineMs: cfg.requestDeadlineMs,
+                transportConfig: cfg.transportConfig,
                 guestDeadlineMs: cfg.guestDeadlineMs,
                 realmMemoryBytes: cfg.realmMemoryBytes,
                 transportBundle: cfg.transportBundle,
