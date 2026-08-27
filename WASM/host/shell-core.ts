@@ -561,21 +561,6 @@ function createShell(opts: CreateShellOptions & {
             throw new Error(`shell: the "${PRIVILEGE_LINK}" binding is already held by '${keyOf(linkIncumbent)}' — uninstall it before installing another bundle that reaches "${PRIVILEGE_LINK}"`);
         }
     };
-    /** Persist freshness mark after the candidate stands, before claim commit. */
-    const commitMark = (loaded: LoadedBundle, prev: number) => {
-        const { author, manifest } = loaded;
-        try {
-            platform.freshnessStore.set(author, manifest.app, manifest.version);
-        }
-        catch (e) {
-            platform.freshnessStore.resetMark(author, manifest.app, prev);
-            throw new Error(
-                `shell: the candidate ran but its freshness mark could not be persisted — the running slot was unchanged: ${errMessage(e)}. ` +
-                "Fix the store and re-run the load.",
-                { cause: e },
-            );
-        }
-    };
     const doUninstall = (appKey: string) => {
         const i = slots.findIndex((slot) => keyOf(slot) === appKey);
         if (i < 0) return false;
@@ -682,7 +667,10 @@ function createShell(opts: CreateShellOptions & {
                 // what makes the commit atomic: the contest below, the mark, and the claim
                 // hand-over cannot be interleaved with another load or an uninstall.
                 refuseContested(loaded, key);
-                commitMark(loaded, ctx.highWater);
+                // A mark that cannot be persisted throws, and the store has already rolled
+                // itself back; the catch below disposes the candidate, so the running slot
+                // is untouched.
+                platform.freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
             }
             catch (err) {
                 disposeSlot(slot);

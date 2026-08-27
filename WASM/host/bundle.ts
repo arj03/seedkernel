@@ -93,7 +93,9 @@ export interface VerifiedManifest {
 export interface FreshnessStore {
     /** The highest `version` ever loaded for this `(author, app)`, or −Infinity if none. */
     get(author: Uint8Array, app: string): number;
-    /** Advance the mark to `version` (monotonic; a lower value never rewinds it). */
+    /** Advance the mark to `version` (monotonic; a lower value never rewinds it). Throws
+     *  if the write does not land, leaving the mark where it was, so a retry is not swallowed
+     *  by the monotonic rule. */
     set(author: Uint8Array, app: string, version: number): void;
     /** Has this author key been written off (§12.5)? Checked on every load. */
     isRevoked(author: Uint8Array): boolean;
@@ -101,10 +103,6 @@ export interface FreshnessStore {
      *  removes a key from this set, so an author re-added to the policy allowlist stays
      *  refused. */
     revoke(author: Uint8Array): void;
-    /** Roll a mark back to a captured previous value — the one legal rewind, for the load
-     *  that raised the mark and then failed to persist it, so in-memory state matches the
-     *  store the retry will persist against. */
-    resetMark(author: Uint8Array, app: string, previous: number): void;
 }
 
 /** One module invocation's answer: the transform's bytes (null when it failed), and `ms` —
@@ -569,25 +567,32 @@ export class FreshnessMarks {
         if (cur !== undefined && cur >= version)
             return; // monotonic: never rewound
         this.marks.set(k, version);
-        this.persist(this.serialize());
+        // Same rollback as `revoke`: a mark that did not reach disk must not stand in
+        // memory, or the retry hits the monotonic early return above and writes nothing
+        // while the next boot reads the old mark anyway.
+        try {
+            this.persist(this.serialize());
+        }
+        catch (e) {
+            if (cur === undefined)
+                this.marks.delete(k);
+            else
+                this.marks.set(k, cur);
+            throw new Error(`freshness store: the mark for '${app}' could not be persisted — it stays at ` +
+                `${cur === undefined ? "unset" : cur}: ${errMessage(e)}. Fix the store and load again.`, { cause: e });
+        }
     }
     isRevoked(author: Uint8Array): boolean {
         return this.revoked.has(toHex(author));
-    }
-    resetMark(author: Uint8Array, app: string, previous: number): void {
-        const k = this.key(author, app);
-        if (previous === -Infinity) this.marks.delete(k);
-        else this.marks.set(k, previous);
     }
     revoke(author: Uint8Array): void {
         const hex = toHex(author);
         if (this.revoked.has(hex))
             return;
         this.revoked.add(hex);
-        // Same rule as a mark that could not be persisted: in-memory state mirrors the store.
-        // Keeping the key revoked in memory would make the retry a silent no-op (the early
-        // return above) while nothing reaches disk, and the next boot admits the author
-        // anyway. Rolling back keeps `revoke` retryable.
+        // Same rollback as `set`: keeping the key revoked in memory would make the retry a
+        // silent no-op (the early return above) while nothing reaches disk, and the next
+        // boot admits the author anyway.
         try {
             this.persist(this.serialize());
         }
