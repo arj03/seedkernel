@@ -24,6 +24,33 @@ export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
  *  lives with the occupant and here, where the tests assert it. */
 export const CLOSE_REASON = { OPEN: 0, HANDSHAKE: 1, CLEAN: 2, ABORTED: 3, LOCAL: 4, TRUNCATED: 5 };
+
+/** A `ChannelFactory` that hands the driver channels the TEST built, so a test keeps the
+ *  instrumented object it is asserting on (`wirePair`'s recorder, tamperer and backlog).
+ *
+ *  It is the WebRTC shape, not a fabric: the platform says "here is a socket" and the link
+ *  states on itself whether we dialed it and who it expects. There is deliberately no
+ *  `connect` — a factory that only accepts is a real configuration, and it is the one that
+ *  lets a test hold both ends of a pair. */
+export class InjectedChannels {
+  #accept = null;
+  /** Binds nothing; the driver's `start()` calls this and gets its accept sink in. */
+  async listen(_tcp, _ws, onAccept) {
+    this.#accept = onAccept;
+    return { port: 0, wsPort: 0 };
+  }
+  close() { this.#accept = null; }
+  /** Hand one channel to the driver as the platform would. `weDialed`/`expectPeerId` are
+   *  set ON THE CHANNEL, exactly as `RtcChannel` states them. */
+  give(channel, { weDialed = false, expectPeerId } = {}) {
+    if (!this.#accept) throw new Error("InjectedChannels: the driver has not started yet");
+    if (weDialed) channel.weDialed = true;
+    if (expectPeerId !== undefined) channel.expectPeerId = expectPeerId;
+    this.#accept(channel);
+    return channel;
+  }
+}
+
 export const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 export const { authorBundle } = await imp("build/host/bundle-author.js");
 export const TRANSPORT_SERVICE = "_net";
@@ -215,6 +242,9 @@ export async function makeTransportHost(opts = {}) {
     contactSecret: opts.contactSecret,
     // The DRIVER's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
+    // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
+    // own observation seam, and the only place a test can read WHY a link went down.
+    onLinkClosed: opts.onLinkClosed,
   };
   const transportConfig = {
     ...(opts.transportConfig ?? {}),
@@ -313,6 +343,14 @@ export async function makeTransportHost(opts = {}) {
   };
   node.peers = () => driver.linkedPeers();
   return node;
+}
+
+/** Whether `node` holds an authenticated link to `peerHex` right now. The set lives in the
+ *  transport guest — a fact about links, and links are the guest's — so this is a question
+ *  rather than a field, and it is what a test reads instead of the per-link callbacks the
+ *  driver used to fire. */
+export async function linkedTo(node, peerHex) {
+  return (await node.driver.linkedPeers()).includes(peerHex);
 }
 
 /** Await a condition with a deadline — the tests' tick, bounded. The predicate is

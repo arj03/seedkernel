@@ -9,7 +9,7 @@
 // socket evicted or refused, does a member still complete its handshake — never a counter.
 
 import {
-  makeTransportHost, sodium as realSodium, LoopbackChannels, until, transportBlob, verifyBundle,
+  makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -185,7 +185,11 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     const d = silentDial(fabric, s.driver.port, `10.6.6.${i}`);
     // A dialer that opens under the real secret and then stalls needs a real msg1, which
     // only a real node can build — so borrow one and cut its socket after the first write.
-    const a = keep(await makeTransportHost({ channels: fabric.view(), contactSecret: CONTACT }));
+    // Its raw link arrives the way every link does: an `InjectedChannels` factory hands the
+    // driver the gated wrapper as a host-announced dial, exactly as a real factory would.
+    const factory = new InjectedChannels();
+    const a = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT }));
+    await a.driver.start();
     let wrote = 0;
     const raw = fabric.connect({ host: `10.6.7.${i}`, port: s.driver.port, transport: "tcp" });
     const gated = {
@@ -196,7 +200,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),
     };
-    a.driver.openLink({ channel: gated, weDialed: true, expectPeerId: s.driver.peerId, contactSecret: CONTACT });
+    factory.give(gated, { weDialed: true, expectPeerId: s.driver.peerId });
     d.ch.onClose(() => {});
   }
   await sleep(500);

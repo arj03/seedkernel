@@ -1,8 +1,7 @@
-// Shared host socket plumbing: FRAMING.PLATFORM RawLink base (Ws/Rtc) and the
-// bookkeeping RtcNetwork/WsNetwork share over one TransportHost.
+// Shared host socket plumbing: the FRAMING.PLATFORM RawLink base (Ws/Rtc) that wraps
+// any whole-message binary transport.
 
-import { FRAMING, type Framing, type PeerId } from "../core/socket-seam.js";
-import type { TransportHost } from "./transport-host.js";
+import { FRAMING, type Framing } from "../core/socket-seam.js";
 
 /** Pre-open send queue ceiling. Overflow fails the channel rather than dropping
  *  bytes (§16.1). */
@@ -143,43 +142,4 @@ export class MessageChannel extends BufferedChannel {
     // Both real transports drain their queued frames before going away, so a
     // graceful stop needs nothing extra here.
     protected stop(_graceful: boolean): void { this.t.close(); }
-}
-
-/** What RtcNetwork and WsNetwork share over one TransportHost: an identity, and the peer
- *  edges.
- *
- *  The edges are kept HERE rather than asked of the driver, because these classes hand the
- *  sockets over (`openLink`) and hear back per link — so "this peer's first link came up" and
- *  "its last went down" is a count this class already has everything to keep, where a
- *  host-side mirror of the transport's peer set would be two copies of one fact. */
-export abstract class SingleIdentityNetwork {
-    protected readonly driver: TransportHost;
-    protected readonly ownId: PeerId;
-    private readonly hooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void };
-    /** Authenticated links held per peer — the count whose 0↔1 crossings are the edges. */
-    private readonly live = new Map<PeerId, number>();
-    constructor(driver: TransportHost, hooks: { onPeerUp?: (peerId: PeerId) => void; onPeerDown?: (peerId: PeerId) => void }) {
-        this.driver = driver;
-        this.ownId = driver.peerId;
-        this.hooks = hooks;
-    }
-    /** A link to `peerId` authenticated. Fires onPeerUp on the peer's first. */
-    protected peerUp(peerId: PeerId): void {
-        const n = this.live.get(peerId) ?? 0;
-        this.live.set(peerId, n + 1);
-        if (n === 0) this.hooks.onPeerUp?.(peerId);
-    }
-    /** A link to `peerId` went away. Fires onPeerDown on the peer's last, and only for a
-     *  peer that was actually up — the down edge is the mirror of an up edge that fired,
-     *  not of every link that ever closed. */
-    protected peerDown(peerId: PeerId): void {
-        const n = this.live.get(peerId) ?? 0;
-        if (n === 0) return;
-        if (n === 1) { this.live.delete(peerId); this.hooks.onPeerDown?.(peerId); }
-        else this.live.set(peerId, n - 1);
-    }
-    /** The peers the TRANSPORT holds at least one authenticated link to. A question rather
-     *  than a field: the set lives in the transport guest. */
-    linkedPeers(): Promise<PeerId[]> { return this.driver.linkedPeers(); }
-    abstract close(): void;
 }

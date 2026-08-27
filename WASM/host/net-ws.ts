@@ -1,16 +1,16 @@
-// The browser↔node edge over a plain WebSocket. A browser cannot open raw TCP, and WebRTC
-// (net-rtc.ts) needs a signaling relay plus STUN; when a node is directly reachable, the
-// simplest path is a WebSocket straight at its --ws-listen endpoint.
+// The browser end of the socket seam (README §12.6): a `ChannelFactory` that dials
+// platform WebSockets. A browser cannot open raw TCP, and WebRTC (net-rtc.ts) needs a
+// signaling relay plus STUN; when a node is directly reachable, the simplest path is a
+// WebSocket straight at its --ws-listen endpoint.
 //
-// The browser end of the socket seam and nothing more: it opens platform WebSockets and
-// hands them to the driver's `openLink()`. Everything above — the handshake, the record
-// layer, the routing — is the transport bundle's, identical to the TCP path. The WebSocket
-// global is touched only inside a dial (or an injected factory), so importing it where
-// WebSocket is absent is safe.
-import type { PeerId } from "../core/socket-seam.js";
-import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { parsePeerRef } from "./peer-addr.js";
-import type { TransportHost, LinkHandle } from "./transport-host.js";
+// The peer this factory dials comes from the driver's address book (`addPeerAddr`), fed
+// by `link/open` — so the guest decides when and how many times to dial. `connsPerPeer`
+// is the transport bundle's signed policy now, not this file's. Everything above the
+// socket — the handshake, the record layer, the routing — is the transport bundle's,
+// identical to the TCP path. The WebSocket global is touched only inside `connect` (or an
+// injected factory), so importing it where WebSocket is absent is safe.
+import type { ChannelFactory, PeerAddr, RawLink } from "../core/socket-seam.js";
+import { MessageChannel } from "./net-channel.js";
 
 /** The minimal structural view of the platform WebSocket that WsChannel uses — so
  *  this module type-checks without committing to a DOM lib and accepts any
@@ -35,94 +35,40 @@ export class WsChannel extends MessageChannel {
 }
 
 export interface WsNetworkOptions {
-  /** The platform's concrete channel adapter. It holds the node identity, the network key,
-   *  the contact secret and the peer lint; this file only opens sockets. */
-  driver: TransportHost;
   /** Open a WebSocket to `url`. Defaults to the platform global. */
   webSocketFactory?: (url: string) => WsLike;
-  /** Called when a peer's link authenticates / drops. */
-  onPeerUp?: (peerId: PeerId) => void;
-  onPeerDown?: (peerId: PeerId) => void;
-  /** How many parallel connections to open per peer (default 1). A bulk transfer stripes
-   *  its frames across them — each its own link and record session — so a high-RTT link a
-   *  single TCP flow cannot fill is filled by N. The peer must accept multiple inbound
-   *  links for this to take effect. */
-  connsPerPeer?: number;
 }
 
-export class WsNetwork extends SingleIdentityNetwork {
-  private readonly mkWs: (url: string) => WsLike;
-  private readonly conns: number;
-  private readonly dialing = new Map<PeerId, LinkHandle[]>(); // every link we have dialed to a peer
+/** The whole URL back out of the address (`peer-addr.ts` `parsePeerSpec` put it there). A
+ *  host carrying an explicit `wss://` is how a deployment asks for TLS, a bare host
+ *  defaults to `ws://`, and the path is what a peer behind a reverse proxy answers on. */
+function wsUrl(addr: PeerAddr): string {
+  const origin = (addr.host.includes("://") ? addr.host : "ws://" + addr.host) + ":" + addr.port;
+  return origin + (addr.path ?? "");
+}
 
-  constructor(private readonly opts: WsNetworkOptions) {
-    super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
+export class WsNetwork implements ChannelFactory {
+  private readonly mkWs: (url: string) => WsLike;
+
+  constructor(opts: WsNetworkOptions = {}) {
     this.mkWs = opts.webSocketFactory
       ?? ((url: string) => new (globalThis as unknown as { WebSocket: new (u: string) => WsLike }).WebSocket(url));
-    this.conns = Math.max(1, Math.floor(opts.connsPerPeer ?? 1));
   }
 
-  // ── Network interface ──────────────────────────────────────────────────────────
-
-  /** Dial a cohort peer given `pubkey@host:port` (or `pubkey@ws://host:port[/path]`,
-   *  `wss://…` for TLS). The link authenticates in-channel, pinned to the declared
-   *  `pubkey`, and onPeerUp fires once it does. An idempotent top-up: it opens only the
-   *  shortfall to connsPerPeer, and returns the parsed peer id either way. */
-  connect(spec: string): PeerId {
-    const { peerId, contactSecret, url } = parseWsPeer(spec);
-    if (peerId === this.ownId) return peerId;
-    // `dialing` holds every live link dialed to this peer, pre- and post-auth, so its
-    // length is the current outbound flow count.
-    let arr = this.dialing.get(peerId);
-    if (!arr) {
-      arr = [];
-      this.dialing.set(peerId, arr);
-    }
-    for (let i = arr.length; i < this.conns; i++) {
-      const handle: LinkHandle = this.driver.openLink({
-        channel: new WsChannel(this.mkWs(url)),
-        weDialed: true,
-        expectPeerId: peerId, // pin the far key to the address we dialed
-        // DIALING gates on THEIR secret, from the peer spec: passing ours would seal msg1
-        // under a secret the peer has never seen, so every dial would draw silence.
-        contactSecret,
-        onAuth: () => this.peerUp(peerId),
-        onClose: () => { this.peerDown(peerId); this.forget(peerId, handle); },
-      });
-      arr.push(handle);
-    }
-    return peerId;
+  connect(addr: PeerAddr): RawLink {
+    return new WsChannel(this.mkWs(wsUrl(addr)));
   }
 
-  /** Tear down every link and the driver's channels. */
-  close(): void {
-    const pending: LinkHandle[] = [];
-    for (const arr of this.dialing.values()) for (const l of arr) pending.push(l);
-    this.dialing.clear();
-    for (const l of pending) l.close();
+  /** A browser binds nothing: every inbound link here is dialed by the far end at us as
+   *  a client, never accepted by this factory. */
+  async listen(
+    _tcp: { host: string; port: number } | undefined,
+    _ws: { host: string; port: number } | undefined,
+    _onAccept: (channel: RawLink) => void,
+  ): Promise<{ port: number; wsPort: number }> {
+    return { port: 0, wsPort: 0 };
   }
 
-  // A link died, or the peer lint declined it: drop it from the outbound pool. The router
-  // bookkeeping is the guest's.
-  private forget(peerId: PeerId, handle: LinkHandle): void {
-    const dl = this.dialing.get(peerId);
-    if (dl) {
-      const i = dl.indexOf(handle);
-      if (i >= 0) dl.splice(i, 1);
-      if (dl.length === 0) this.dialing.delete(peerId);
-    }
-  }
-}
-
-/** Parse a `pubkey@host:port` (or `pubkey@ws://host:port[/path]`) cohort peer spec
- *  into the peer id + the WebSocket URL to dial. A bare host:port defaults to the
- *  ws:// scheme; pass wss:// explicitly for TLS.
- *
- *  Who the peer is comes from `parsePeerRef` (peer-addr.ts), the one place that grammar is
- *  written; this edge's address form being a URL is the only reason a second entry point
- *  exists. */
-export function parseWsPeer(spec: string): { peerId: PeerId; contactSecret?: Uint8Array; url: string } {
-  const { peerId, contactSecret, location } = parsePeerRef(spec);
-  const url = (location.startsWith("ws://") || location.startsWith("wss://")) ? location : "ws://" + location;
-  return { peerId, contactSecret, url };
+  /** Nothing to release: the driver closes the channels it holds. */
+  close(): void { /* no listeners, no owned sockets */ }
 }

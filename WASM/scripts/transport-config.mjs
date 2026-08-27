@@ -13,4 +13,10 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   requestDeadlineMs: 10_000,
   linkIdleTimeoutMs: 300_000,
   admitPeers: Object.freeze([]),
+  // The dialing side's whole handshake deadline.
+  handshakeTimeoutMs: 10_000,
+  // The shorter clock an accept runs until a msg1 opens under the contact secret.
+  unverifiedTimeoutMs: 2_000,
+  // Frames per direction between key ratchets.
+  rekeyAfterFrames: 1 << 24,
 });

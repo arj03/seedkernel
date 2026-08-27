@@ -26,6 +26,17 @@ export interface RawLink {
    *  the address knows. Set on dialed WS links and nowhere else, never a route the bundle
    *  could dial for itself. */
   readonly authority?: string;
+  /** Whether THIS end opened the connection. Default false — a link the platform hands
+   *  over is an accept unless it says otherwise, and only the dialing side speaks
+   *  unprompted (§12.6.2). Set by a factory that dials on its own initiative: WebRTC,
+   *  where the polite/impolite tie-break decides who opens the channel. A link the guest
+   *  asked for (`link/open`) is a dial by construction and states nothing here. */
+  readonly weDialed?: boolean;
+  /** Who this end expects to find, lowercase hex — the handshake is refused if the far
+   *  end proves a different key. Meaningful only with `weDialed`, and only from a factory
+   *  that chose the peer itself (signaling named it); a guest dial pins the key it looked
+   *  the address up under. */
+  readonly expectPeerId?: PeerId;
 }
 
 /** The wire codecs a link can need, as the host declares one at open (§12.1). A closed set
@@ -55,14 +66,21 @@ export interface PeerAddr {
   port: number;
   transport: "tcp" | "ws";
   contactSecret?: Uint8Array;
+  /** The request target a WS peer answers on, when it is not the root — a deployment
+   *  behind a reverse proxy is reached at a path, and the browser's `WebSocket` takes the
+   *  whole URL. Carried on the address because that is the only place that knows it; a
+   *  target whose codec cannot name a request target ignores it. */
+  path?: string;
 }
 
 /** How the routing core opens sockets — the one platform seam. A target supplies
  *  TCP/WS dialing and listening behind the RawLink shape; everything above is
  *  the transport bundle's shared code (driven by the host). */
 export interface ChannelFactory {
-  /** Dial a peer; returns a RawLink that connects in the background. */
-  connect(addr: PeerAddr): RawLink;
+  /** Dial a peer; returns a RawLink that connects in the background. Absent for a factory
+   *  that only ever accepts (WebRTC, whose peers arrive through signaling rather than from
+   *  an address) — the driver answers `link/open` "no route" for it. */
+  connect?(addr: PeerAddr): RawLink;
   /** Bind the requested listeners, invoking onAccept(channel) for each inbound
  *  connection; resolves with the bound ports (0 where not listening). */
   listen(

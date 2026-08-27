@@ -45,10 +45,25 @@ export function parseHostPort(s: string, opts: { defaultHost?: string; allowEphe
   return { host, port };
 }
 
-/** Parse a `pk[.secret]@host:port` peer spec into the peer id + the address to dial:
- *  the socket-seam form (`PeerAddr`), for a target that opens its own TCP/WS sockets. */
+/** Split a location into its `host:port` and whatever path followed — `/` and everything
+ *  after it, at most once, and never inside the `//` of a scheme. A WS peer behind a
+ *  reverse proxy answers at a path rather than at the root, and only the address can say
+ *  so; `host:port` alone answers `undefined`, which is the root. */
+function splitPath(location: string): { hostPort: string; path?: string } {
+  const scheme = location.indexOf("://");
+  const from = scheme < 0 ? 0 : scheme + 3;
+  const slash = location.indexOf("/", from);
+  if (slash < 0) return { hostPort: location };
+  return { hostPort: location.slice(0, slash), path: location.slice(slash) };
+}
+
+/** Parse a `pk[.secret]@host:port[/path]` peer spec into the peer id + the address to
+ *  dial: the socket-seam form (`PeerAddr`), for a target that opens its own TCP/WS
+ *  sockets. A scheme stays with the host — `wss://` is how a deployment asks for TLS —
+ *  and a path rides in `PeerAddr.path`. */
 export function parsePeerSpec(spec: string, transport: "tcp" | "ws"): { peerId: PeerId; addr: PeerAddr } {
   const { peerId, contactSecret, location } = parsePeerRef(spec);
-  const { host, port } = parseHostPort(location);
-  return { peerId, addr: { host, port, transport, contactSecret } };
+  const { hostPort, path } = splitPath(location);
+  const { host, port } = parseHostPort(hostPort);
+  return { peerId, addr: { host, port, transport, contactSecret, path } };
 }

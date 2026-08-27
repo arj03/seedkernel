@@ -6,7 +6,6 @@
 
 import { encodeFrame, decodeOne, wsAcceptKey, wsBase64, WS_OP, SCRATCH_SIZE } from "./ws-module.mjs";
 import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
-import { parseWsPeer } from "../build/host/net-ws.js";
 import { parsePeerSpec } from "../build/host/peer-addr.js";
 import { testkit } from "./testkit.mjs";
 
@@ -87,18 +86,39 @@ test("peer specs: the optional contact secret parses on both transports", () => 
   const tcp = parsePeerSpec(`${PK}.${SEC}@1.2.3.4:9`, "tcp");
   assert(tcp.peerId === PK, "tcp peerId");
   assert(Buffer.from(tcp.addr.contactSecret).toString("hex") === SEC, "tcp contact secret");
-  const ws = parseWsPeer(`${PK}.${SEC}@host:1`);
+  const ws = parsePeerSpec(`${PK}.${SEC}@host:1`, "ws");
   assert(ws.peerId === PK, "ws peerId");
-  assert(Buffer.from(ws.contactSecret).toString("hex") === SEC, "ws contact secret");
+  assert(Buffer.from(ws.addr.contactSecret).toString("hex") === SEC, "ws contact secret");
 });
 
 test("peer specs: omitting the secret means an open peer, not a parse error", () => {
   assert(parsePeerSpec(`${PK}@1.2.3.4:9`, "tcp").addr.contactSecret === undefined, "tcp");
-  assert(parseWsPeer(`${PK}@host:1`).contactSecret === undefined, "ws");
+  assert(parsePeerSpec(`${PK}@host:1`, "ws").addr.contactSecret === undefined, "ws");
+});
+
+test("peer specs: a WS peer may state a scheme and a path, and neither disturbs the port", () => {
+  // The whole URL a browser's `WebSocket` needs has to survive the grammar, because the
+  // address is the only thing that knows it: `wss://` is how a deployment asks for TLS,
+  // and a path is how it is reached behind a reverse proxy. The port still parses out of
+  // the middle of both — a naive last-colon split would read `8080/chat` as the port.
+  const bare = parsePeerSpec(`${PK}@example.com:8080`, "ws").addr;
+  assert(bare.host === "example.com" && bare.port === 8080 && bare.path === undefined,
+    `a bare host:port must carry no path, got ${JSON.stringify(bare)}`);
+  const tls = parsePeerSpec(`${PK}@wss://relay.example.com:443`, "ws").addr;
+  assert(tls.host === "wss://relay.example.com" && tls.port === 443 && tls.path === undefined,
+    `a scheme must stay with the host, got ${JSON.stringify(tls)}`);
+  const proxied = parsePeerSpec(`${PK}.${SEC}@wss://relay.example.com:443/chat/v1`, "ws").addr;
+  assert(proxied.host === "wss://relay.example.com" && proxied.port === 443,
+    `a path must not disturb host:port, got ${JSON.stringify(proxied)}`);
+  assert(proxied.path === "/chat/v1", `the path must survive whole, got ${proxied.path}`);
+  assert(Buffer.from(proxied.contactSecret).toString("hex") === SEC,
+    "the credential half still parses alongside a path");
+  // The scheme's own `//` is not a path, and a root path is kept as one.
+  assert(parsePeerSpec(`${PK}@ws://h:1/`, "ws").addr.path === "/", "a bare root path is still a path");
 });
 
 test("peer specs: a malformed secret is rejected, not silently ignored", () => {
-  for (const [name, fn] of [["tcp", (x) => parsePeerSpec(x, "tcp")], ["ws", parseWsPeer]]) {
+  for (const [name, fn] of [["tcp", (x) => parsePeerSpec(x, "tcp")], ["ws", (x) => parsePeerSpec(x, "ws")]]) {
     let threw = false;
     try { fn(`${PK}.${"cc".repeat(20)}@host:1`); } catch { threw = true; }
     assert(threw, `${name} must reject a short contact secret`);

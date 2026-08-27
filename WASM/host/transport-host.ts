@@ -1,34 +1,24 @@
 // Socket driver (§12.6): link table, address book, listeners. Wire codec/AKE/router
 // run as the transport bundle's guest via `link/*`. No name here re-enters the CALLING
 // realm: the one that enters a realm at all is `deliver`, and it enters the claimant's.
+//
+// One link kind: every RawLink the driver holds — accepted through the channel factory,
+// or dialed by a factory on its own initiative (WebRTC) — is `register()`ed and announced
+// to the guest the same way. A link the guest itself dials goes out through `link/open`
+// and is never in this table until the resulting channel is registered.
 
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
-import { FRAMING, type ChannelFactory, type Framing, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
+import { FRAMING, type ChannelFactory, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
 import { writeOp } from "./op-frame.js";
 
-/** Link kinds, as `linkOpen` declares them: CORE is the routing core's own (accepted through
- *  the channel factory, so dial bookkeeping and the half-open limiter apply); OPEN is a
- *  host-managed transport — WebRTC, browser WS — that opened the socket itself. */
-const LINK_CORE = 0;
-const LINK_OPEN = 1;
-
-// The link close-reason codes are the occupant's vocabulary (transport/src/ake.js
-// `REASON_*`); the host relays the number and never interprets it.
-
 const EMPTY = new Uint8Array(0);
 
-interface OpenLinkRecord {
-  onAuth?: (peerId: PeerId) => void;
-  onClose?: (linkId: number, reason: number) => void;
-  authenticated: boolean;
-}
-
-/** No address book entry, or no channel factory at all. Link id 0 is never live, so the
- *  framing is moot — the guest reads the id first and stops. */
+/** No address book entry, no channel factory at all, or one that only accepts. Link id 0
+ *  is never live, so the framing is moot — the guest reads the id first and stops. */
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 
@@ -120,49 +110,20 @@ export interface TransportHostOptions {
  *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
  *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
-  /** The socket seam: dialing, listening, and the address book live here. Absent for a
- *  host-managed-transport-only node (browser edge), which opens links via openLink and
- *  whose link/open calls answer "no route". */
+  /** The socket seam: dialing, listening, and the address book live here. A browser edge
+ *  passes its WebRTC/WebSocket factory here; a factory with no `connect` (WebRTC, whose
+ *  peers arrive through signaling) is accept-only, and its `link/open` calls answer
+ *  "no route". */
   channels?: ChannelFactory;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
-}
-
-/** A link handle for a host-managed transport (WebRTC / browser WS): the socket
- *  is the caller's; the wire state machine runs in the transport guest. */
-export interface LinkHandle {
-  linkId: number;
-  /** Queue/send a wire frame on this link (pre-auth it buffers). */
-  send(frame: Uint8Array): void;
-  /** Deliberate teardown: announces the end of the stream, then closes the channel. A
- *  failure path closes the CHANNEL instead, which reads as a truncation. */
-  close(): void;
-}
-
-export interface OpenLinkOptions {
-  channel: RawLink;
-  /** true if we opened the connection (outbound dial), false if we accepted it. */
-  weDialed: boolean;
-  /** For an outbound dial, the peerId we expect to reach (hex) — the handshake is
- *  rejected if the far end presents a different key. */
-  expectPeerId?: PeerId;
-  /** THE PEER's contact secret for a dial (from the address); absent on a dial ⇒ the
-   *  peer is open (zero secret). Absent on an accept: the driver seals the accept under
-   *  ITS OWN current contact secret (§12.6.3), read at announce time — so a getter-backed
-   *  value changes the gate with no transport reload — and the LOCAL facts are the fallback. */
-  contactSecret?: Uint8Array;
-  /** Transport-supplied far-end identifier (an IP), for the half-open buckets. */
-  source?: string;
-  /** Override the half-open deadline (ms). Use only in tests; 0 and absent both mean
- *  "the bundle's own default". */
-  handshakeTimeoutMs?: number;
-  /** Frames per direction between key ratchets — a deployment-wide constant both ends must
- *  share; settable only because the boundary is otherwise unreachable in a test. */
-  rekeyAfterFrames?: number;
-  /** Fired once this link's identity verified AND the transport admitted it. */
-  onAuth?: (peerId: PeerId) => void;
-  /** Fired when the link tears down (any reason). */
-  onClose?: (linkId: number, reason: number) => void;
+  /** One link went down, with the occupant's one-byte reason (transport/src/ake.js
+ *  `REASON_*`) — a clean farewell, a defensive teardown, a cut stream. The host relays the
+ *  number and never interprets it: the vocabulary belongs to whichever bundle holds the
+ *  links. NODE-level and observation only, unlike the per-link callbacks it replaces —
+ *  nothing here can change what the occupant does, and an app that wants the peer set asks
+ *  the transport for it. */
+  onLinkClosed?: (linkId: number, reason: number) => void;
 }
 
 /** The host side of the node's network: sockets, addresses, listeners. Nothing on this
@@ -179,7 +140,6 @@ export class TransportHost {
   private readonly opts: Omit<TransportHostOptions, "identity" | "networkKey">;
   private readonly nodeFacts: Pick<TransportHostOptions, "identity" | "networkKey">;
   private readonly channels = new Map<number, RawLink>;
-  private readonly openLinks = new Map<number, OpenLinkRecord>();
   private readonly addrs = new Map<PeerId, PeerAddr>;
   private nextLinkId = 1;
   private call: TransportCall | null = null;
@@ -240,11 +200,15 @@ export class TransportHost {
    *  link, and the node keeps its listeners and address book (both are the node's, not
    *  the occupant's). */
   reset(): void {
-    const channels = [...this.channels.values()];
-    this.channels.clear();
-    this.openLinks.clear();
-    for (const c of channels) {
+    // Each link through the ordinary down path, rather than clearing the table first: a
+    // cleared table makes `channelClosed`'s liveness guard drop the channel's own callback,
+    // and the occupant would go on holding a link whose socket is already gone. Snapshotted
+    // because `channelClosed` deletes as it goes, and idempotent, so a backend callback
+    // racing this loop is a no-op. On a teardown or a handover the binding is released
+    // before this runs, so only a sever — where the same occupant stays — hears them.
+    for (const [linkId, c] of [...this.channels.entries()]) {
       try { c.close(false); } catch { /* already gone */ }
+      this.channelClosed(linkId, c);
     }
   }
 
@@ -275,42 +239,6 @@ export class TransportHost {
     });
   }
 
-  /** Invoke `linkBytes` and consume its event-bound return: the 32-byte peer key when this
-   *  read completed the handshake, and nothing at all otherwise. A request the occupant
-   *  decoded off the same read does not ride here — it is handed over by its own
-   *  `link/deliver` call — so this buffer holds one fact and needs no length framing to
-   *  keep two apart. It contains no link id either: the driver binds the peer to this
-   *  invocation's captured channel and owner. */
-  private linkBytes(linkId: number, bytes: Uint8Array): void {
-    const channel = this.channels.get(linkId);
-    if (!channel) return;
-    const owner = this.activeOwner;
-    const open = this.openLinks.get(linkId);
-    const r = this.toTransport(new Args("linkBytes").u32(linkId).blob(bytes));
-    if (!r) return;
-    void r.then((ret) => {
-      if (ret.length === 0) return;
-      if (ret.length !== 32) {
-        console.error(`[transport] malformed linkBytes return (${ret.length} bytes)`);
-        return;
-      }
-      // A close, reset or slot handover while the guest was awaiting makes this result
-      // stale. Link ids are monotonic, but checking the captured object as well makes the
-      // non-reuse assumption unnecessary to the authority boundary.
-      if (this.activeOwner !== owner || this.channels.get(linkId) !== channel) return;
-      // Authentication is meaningful only for a platform-owned openLink. A core link's
-      // result cannot manufacture an openLink callback, and a duplicate cannot rename an
-      // already-authenticated connection.
-      if (!open || this.openLinks.get(linkId) !== open || open.authenticated) return;
-      open.authenticated = true;
-      try { open.onAuth?.(toHex(ret)); }
-      catch { /* a platform callback cannot corrupt this driver's link table */ }
-    }, (err: unknown) => {
-      if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
-      console.error(`[transport] error in linkBytes: ${String(err)}`);
-    });
-  }
-
   /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims the
    *  binding — a node with no transport bundle is a legitimate configuration, so it has to
    *  be an answer rather than a promise that never settles. */
@@ -330,9 +258,9 @@ export class TransportHost {
       open: (dest) => {
         if (!ownsBinding()) return NO_ROUTE;
         // The destination is the peer's 32-byte channel key, resolved in the address book.
-        // No entry, or no channel factory at all (a browser edge), is "no route", which the
-        // caller treats as a fabric dropping a frame.
-        if (!this.opts.channels) return NO_ROUTE;
+        // No entry, or no channel factory at all, or one that only accepts (WebRTC), is
+        // "no route", which the caller treats as a fabric dropping a frame.
+        if (!this.opts.channels?.connect) return NO_ROUTE;
         const addr = this.addrs.get(toHex(dest));
         if (!addr) return NO_ROUTE;
         const channel = this.opts.channels.connect(addr);
@@ -400,93 +328,59 @@ export class TransportHost {
     }
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
+    // Inbound bytes are a plain event now — the request the occupant decoded off this
+    // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
-      if (this.channels.get(linkId) === channel) this.linkBytes(linkId, bytes);
+      if (this.channels.get(linkId) === channel) this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => this.channelClosed(linkId, channel));
     return linkId;
   }
 
-  /** One raw channel became unusable. The guest returns the close reason from this exact
-   *  event; no return field can select a sibling link. A stale owner/record cannot fire a
-   *  callback after handover. */
+  /** One raw channel became unusable: drop it from the table, tell the guest, and report
+   *  the reason it answers with. That one byte is the whole of what the occupant tells the
+   *  host about a link, and the only thing here that could not be worked out from the
+   *  socket: a descriptor closing looks identical whether it carried a farewell, a
+   *  defensive teardown or a cut stream. The event names the link, so the return carries
+   *  no link id and cannot be redirected at another socket; a malformed or absent answer
+   *  reads as `0` rather than guessing. */
   private channelClosed(linkId: number, channel: RawLink): void {
     if (this.channels.get(linkId) !== channel) return;
     this.channels.delete(linkId);
-    const owner = this.activeOwner;
-    const open = this.openLinks.get(linkId);
-    const finish = (reason: number) => {
-      if (!open || this.activeOwner !== owner || this.openLinks.get(linkId) !== open) return;
-      this.openLinks.delete(linkId);
-      try { open.onClose?.(linkId, reason); }
-      catch { /* the platform callback cannot retain a dead driver entry */ }
+    const report = (reason: number) => {
+      try { this.opts.onLinkClosed?.(linkId, reason); }
+      catch { /* a platform callback cannot corrupt this driver's link table */ }
     };
     const r = this.toTransport(new Args("linkClosed").u32(linkId));
-    if (!r) { finish(0); return; }
+    if (!r) { report(0); return; }
     void r.then(
-      (ret) => finish(ret.length === 1 ? ret[0] : 0),
+      (ret) => report(ret.length === 1 ? ret[0] : 0),
       (err: unknown) => {
-        finish(0);
+        report(0);
         if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
         console.error(`[transport] error in linkClosed: ${String(err)}`);
       },
     );
   }
 
-  /** Tell the transport about a link the HOST opened: an accepted socket, or one a
-   *  host-managed transport handed over. A dialed core link is not here — the guest opens
-   *  those itself through `link/open`. */
-  private announce(
-    linkId: number,
-    spec: {
-      weDialed: boolean; kind: number; framing: Framing; authority?: string; expectPeerId?: Uint8Array;
-      linkSecret?: Uint8Array; source?: string; handshakeTimeoutMs?: number;
-      rekeyAfterFrames?: number;
-    },
-  ): void {
+  /** Tell the transport about a link the HOST hands over: an accepted socket, or one a
+   *  factory dialed on its own initiative (WebRTC). A link the guest opened itself through
+   *  `link/open` is not here.
+   *
+   *  `linkSecret` is always OUR current contact secret, read HERE at announce time (so a
+   *  getter-backed value gates with no transport reload): an accept gates on our secret by
+   *  definition, and a dial the PLATFORM chose is same-deployment by construction, so it
+   *  presents the same value. A cross-deployment dial goes through `link/open` instead,
+   *  where the address book carries THAT peer's secret. */
+  private announce(linkId: number, channel: RawLink): void {
     this.tell(new Args("linkOpen")
       .u32(linkId)
-      .u8(spec.weDialed ? 1 : 0)
-      .u8(spec.kind)
-      .u8(spec.framing)
-      .blob(enc.encode(spec.authority ?? ""))
-      .u32(spec.handshakeTimeoutMs ?? 0)
-      .u32(spec.rekeyAfterFrames ?? 0)
-      .blob(spec.expectPeerId ?? EMPTY)
-      .blob(spec.linkSecret ?? EMPTY)
-      .blob(enc.encode(spec.source ?? "")));
-  }
-
-  /** Hand a host-owned channel to the transport (WebRTC / browser WS edges). The channel
-   *  object stays the caller's; the link state machine runs in the guest, keyed by the
-   *  returned link id. */
-  openLink(opts: OpenLinkOptions): LinkHandle {
-    if (!this.available()) throw new Error("transport: no bundle owns the raw-link binding");
-    const linkId = this.register(opts.channel);
-    // The channel is already closed (`register`), so this throws rather than returning a
-    // handle onto a dead socket: a host-managed transport can be told no, unlike an accept.
-    if (linkId === 0) throw new Error(`transport: raw link table is full (${this.opts.maxRawLinks ?? DEFAULT_MAX_RAW_LINKS} links)`);
-    this.openLinks.set(linkId, { onAuth: opts.onAuth, onClose: opts.onClose, authenticated: false });
-    this.announce(linkId, {
-      weDialed: opts.weDialed,
-      kind: LINK_OPEN,
-      framing: opts.channel.framing,
-      authority: opts.channel.authority,
-      expectPeerId: opts.expectPeerId ? fromHex(opts.expectPeerId) : undefined,
-      // The secret THIS link opens under: the peer's on a dial (an open peer = the zero
-      // secret said explicitly); OURS on an accept, read NOW from the options, so a
-      // getter-backed contact secret gates this node's accepting side with no transport
-      // reload (§12.6.3). The guest falls back to its LOCAL facts if the field is empty.
-      linkSecret: opts.weDialed ? (opts.contactSecret ?? ZERO32) : (this.opts.contactSecret ?? ZERO32),
-      source: opts.source,
-      handshakeTimeoutMs: opts.handshakeTimeoutMs,
-      rekeyAfterFrames: opts.rekeyAfterFrames,
-    });
-    return {
-      linkId,
-      send: (frame) => this.tell(new Args("linkSend").u32(linkId).blob(frame)),
-      close: () => { this.tell(new Args("linkClose").u32(linkId)); },
-    };
+      .u8(channel.weDialed ? 1 : 0)
+      .u8(channel.framing)
+      .blob(enc.encode(channel.authority ?? ""))
+      .blob(channel.expectPeerId ? fromHex(channel.expectPeerId) : EMPTY)
+      .blob(this.opts.contactSecret ?? ZERO32)
+      .blob(enc.encode(channel.remoteAddr ?? "")));
   }
 
   // ── the address book, dialing, listening ────────────────────────────────────
@@ -527,12 +421,7 @@ export class TransportHost {
         // policy ABOVE this table, so a connection the driver could not hold is not a link
         // to have an opinion about. Silent like every other pre-authentication refusal.
         if (linkId === 0) return;
-        this.announce(linkId, {
-          weDialed: false, kind: LINK_CORE, framing: channel.framing, source: channel.remoteAddr,
-          // An accept gates on OUR current secret, read at accept time, exactly like a
-          // host-managed open — the node facts stay only the fallback, not the truth.
-          linkSecret: this.opts.contactSecret ?? ZERO32,
-        });
+        this.announce(linkId, channel);
       },
     );
     this.port = port;
