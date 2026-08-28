@@ -8,7 +8,7 @@
 import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, CLOSE_REASON, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
-  transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo,
+  transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -454,8 +454,8 @@ await test("READY: a second ready() does not strand the first", async (keep) => 
   // guest, and each caller holds its own deferred.
   const st = keep(await upPair());
   const [r1, r2] = await Promise.all([
-    st.A.driver.ready(50).then(() => "ok", () => "failed"),
-    st.A.driver.ready(50).then(() => "ok", () => "failed"),
+    ready(st.A, 50).then(() => "ok", () => "failed"),
+    ready(st.A, 50).then(() => "ok", () => "failed"),
   ]);
   assert(r1 === "ok" && r2 === "ok", `both ready() calls must settle (got ${r1}/${r2})`);
 });
@@ -531,13 +531,17 @@ await test("CONTACT SECRET: it is the RECEIVER's, and only the receiver's", asyn
 async function makeTransportHostWithGetter(getSecret) {
   const identity = generateKeyPair();
   const factory = new InjectedChannels();
+  // One literal, not a spread at the boot call: a spread would FLATTEN the getter this
+  // test is about.
   const transport = {
     channels: factory,
     get contactSecret() { return getSecret(); },
+    load: false,
+    bundle: transportBlob,
   };
   const { shell, transport: driver } = await bootShell({
     sodium, identity, modules: new ModuleTable(), freshnessStore: new FreshnessMarks(),
-    fs: false, transport, transportLoad: false, transportBundle: transportBlob,
+    fs: false, transport,
     createRealm: async (o) => createSafeRealm(o), admit: transportPolicy(transportAuthor()),
   });
   await shell.loadBundleBlob(transportBlob);

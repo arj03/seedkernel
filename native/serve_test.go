@@ -58,7 +58,7 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   // it is the PEER's contact secret (§12.6), and without it the holder answers a stranger's
   // msg1 with silence — which is the whole point of the gate, and would show up here only
   // as a request timeout.
-  __net2.addr(holderId, "tcp://127.0.0.1:" + port, fromHex(contactSecretHex));
+  teachAddr(node.shell, holderId, "tcp://127.0.0.1:" + port, fromHex(contactSecretHex));
   await __net2.start();
   return new Uint8Array(0);
 };

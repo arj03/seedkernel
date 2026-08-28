@@ -134,7 +134,7 @@ func runTwoNode(t *testing.T, transport, portField, listenArgs string) {
 		  await a.transport.start();
 		  await a.shell.loadBundleBlob(__probe);
 		  const bApp = await b.shell.loadBundleBlob(__probe);
-		  b.transport.addr(aId, "%s://127.0.0.1:" + a.transport.%s);
+		  teachAddr(b.shell, aId, "%s://127.0.0.1:" + a.transport.%s);
 		  // The send op's own argument order (transport/src/core.js):
 		  // [noReply u8][deadline u32][to blob][proto blob][payload blob]. The op NAME that
 		  // leads it is the APP's framing, composed here (the shell passes bytes unread;

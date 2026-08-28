@@ -11,14 +11,19 @@
 // or dialed by a factory on its own initiative (WebRTC) — is `register()`ed and announced
 // to the guest the same way. A link the guest itself dials goes out through `link/open`
 // and is never in this table until the resulting channel is registered.
+//
+// Three events out, and nothing peer-shaped: `linkOpen`, `linkBytes`, `linkClosed`, on the
+// owner-keyed channel `activate` publishes — a socket event must reach the BINDING HOLDER,
+// not whoever claims a name. Cohorts, peers and addresses are claim calls on the
+// transport's `services` id instead, through `Shell.call` (§12.10).
 
 
-import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
+import { toHex, fromHex } from "../core/util.js";
 import { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
 import { FRAMING, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
-import { writeOp } from "./op-frame.js";
+import { OpArgs } from "./op-frame.js";
 
 const EMPTY = new Uint8Array(0);
 
@@ -31,67 +36,6 @@ const ZERO32 = new Uint8Array(32);
 /** Ceiling on what the DRIVER holds — a socket costs a descriptor the moment it
  *  is accepted, before the guest has an opinion. Occupant budgets sit above this. */
 export { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
-
-// ── the driver's own event header ──────────────────────────────────────────────
-//
-// Every payload the driver hands the transport has a `[opLen u8][op]` head. That
-// framing is the TRANSPORT BUNDLE's format (its own `readOp`, transport/src/util.js) —
-// content paired with this driver like the wire codec — NOT a kernel ABI: the kernel's
-// only obligation in front of it is the 32-byte caller id, added by the shell
-// (shell-core.ts `hostCallSlot`). A field written here and not read there desyncs the
-// payload, which is what forces the pair to move in one artifact.
-
-/** `[opLen u8][op]` for one op, memoized: the header is rebuilt on the inbound frame path,
- *  once per socket read per link. Sharing is safe — nothing mutates a header. */
-const OP_HEADERS = new Map<string, Uint8Array>();
-function hostOpHeader(op: string): Uint8Array {
-  let h = OP_HEADERS.get(op);
-  if (h === undefined) {
-    h = writeOp(op, EMPTY);
-    OP_HEADERS.set(op, h);
-  }
-  return h;
-}
-
-/** Op-argument encoder: the op NAME first as the discriminator, then u32 BE / u8 /
- *  length-prefixed blob fields in the order the op declares. The guest twin is `Reader`
- *  (transport/src/util.js); a field written and not read desyncs the payload rather than
- *  degrading quietly. */
-class Args {
-  /** The op this payload is for, or `""` for a nested blob. Read back by `tell`. */
-  readonly op: string;
-  private readonly parts: Uint8Array[] = [];
-  private len = 0;
-  /** Naming the op here rather than at the send lets `build()` emit the whole cross-realm
-   *  call in one pass; otherwise every payload is copied again behind its header, which on
-   *  `linkBytes` is a copy of the frame per socket read. */
-  constructor(op = "") {
-    this.op = op;
-    if (op !== "") this.raw(hostOpHeader(op));
-  }
-  u8(v: number): this {
-    const b = new Uint8Array(1);
-    b[0] = v;
-    return this.raw(b);
-  }
-  u32(v: number): this {
-    const b = new Uint8Array(4);
-    writeU32BE(b, 0, v);
-    return this.raw(b);
-  }
-  blob(b: Uint8Array): this {
-    const h = new Uint8Array(4);
-    writeU32BE(h, 0, b.length);
-    return this.raw(h).raw(b);
-  }
-  private raw(b: Uint8Array): this { this.parts.push(b); this.len += b.length; return this; }
-  build(): Uint8Array {
-    const out = new Uint8Array(this.len);
-    let off = 0;
-    for (const p of this.parts) { out.set(p, off); off += p.length; }
-    return out;
-  }
-}
 
 /** How the driver reaches the owner of this platform binding. `null` when nothing does — a
  *  node whose transport bundle has been uninstalled, where a socket event has nowhere to
@@ -222,13 +166,17 @@ export class TransportHost {
   get isClosed(): boolean { return this.closed; }
 
   // ── reaching the transport ──────────────────────────────────────────────────
+  //
+  // `OpArgs` (op-frame.ts) is the TRANSPORT BUNDLE's framing, not a kernel ABI: the
+  // kernel's only obligation in front of it is the 32-byte caller id the shell adds
+  // (shell-core.ts `hostCallSlot`). Paired with this driver like the wire codec, so the
+  // two move in one artifact.
 
-  /** Call the transport. `args.build()` is the bundle's own event framing; the shell
-   *  prepends the host's caller id at the realm call (shell-core.ts `hostCallSlot`).
+  /** Call the transport, with the shell's caller-id prefix added at the realm call.
    *
    *  Not unordered: the realm serializes invocations in acceptance order (realm-queue.ts),
    *  so bytes arriving on one link reach the occupant in arrival order. */
-  private toTransport(args: Args): Promise<Uint8Array> | null {
+  private toTransport(args: OpArgs): Promise<Uint8Array> | null {
     if (this.closed || !this.call) return null;
     return this.call(args.build());
   }
@@ -236,21 +184,12 @@ export class TransportHost {
   /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged,
    *  except a realm disposed out from under the op — this driver's own teardown or
    *  replacement, which would otherwise print an error per ordinary shutdown. */
-  private tell(args: Args): void {
+  private tell(args: OpArgs): void {
     const r = this.toTransport(args);
     if (r) void r.catch((err: unknown) => {
       if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
       console.error(`[transport] error in ${args.op}: ${String(err)}`);
     });
-  }
-
-  /** `toTransport` for an op whose answer the caller needs. Throws when nothing claims the
-   *  binding — a node with no transport bundle is a legitimate configuration, so it has to
-   *  be an answer rather than a promise that never settles. */
-  private ask(args: Args): Promise<Uint8Array> {
-    const r = this.toTransport(args);
-    if (!r) return Promise.reject(new Error("transport: no bundle owns the raw-link binding"));
-    return r;
   }
 
   // ── the capability backend the transport guest's seam is wired to ───────────
@@ -336,7 +275,7 @@ export class TransportHost {
     // Inbound bytes are a plain event now — the request the occupant decoded off this
     // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
-      if (this.channels.get(linkId) === channel) this.tell(new Args("linkBytes").u32(linkId).blob(bytes));
+      if (this.channels.get(linkId) === channel) this.tell(new OpArgs("linkBytes").u32(linkId).blob(bytes));
     });
     channel.onClose(() => this.channelClosed(linkId, channel));
     return linkId;
@@ -356,7 +295,7 @@ export class TransportHost {
       try { this.opts.onLinkClosed?.(linkId, reason); }
       catch { /* a platform callback cannot corrupt this driver's link table */ }
     };
-    const r = this.toTransport(new Args("linkClosed").u32(linkId));
+    const r = this.toTransport(new OpArgs("linkClosed").u32(linkId));
     if (!r) { report(0); return; }
     void r.then(
       (ret) => report(ret.length === 1 ? ret[0] : 0),
@@ -378,32 +317,17 @@ export class TransportHost {
    *  presents the same value. A cross-deployment dial goes through `link/open` instead, and
    *  the occupant's own address book carries THAT peer's secret. */
   private announce(linkId: number, channel: RawLink): void {
-    this.tell(new Args("linkOpen")
+    this.tell(new OpArgs("linkOpen")
       .u32(linkId)
       .u8(channel.weDialed ? 1 : 0)
       .u8(channel.framing)
-      .blob(enc.encode(channel.authority ?? ""))
+      .text(channel.authority ?? "")
       .blob(channel.expectPeerId ? fromHex(channel.expectPeerId) : EMPTY)
       .blob(this.opts.contactSecret ?? ZERO32)
-      .blob(enc.encode(channel.remoteAddr ?? "")));
+      .text(channel.remoteAddr ?? ""));
   }
 
-  // ── teaching the occupant a peer, listening ─────────────────────────────────
-
-  /** Teach the CURRENT occupant one peer: who it is, where to reach it, and the contact
-   *  secret that peer gates its door with (absent ⇒ an open peer). A pass-through and
-   *  nothing more — the driver retains no copy, because the address book is the occupant's
-   *  and dies with its realm. An embedder that replaces the transport re-supplies its peers,
-   *  either in the new load's `transportConfig` or by calling this again (§12.10).
-   *
-   *  `dest` is opaque to everything between here and `ChannelFactory.connect`; the peer id
-   *  is what the occupant keys its book on and what it pins the handshake to. */
-  addr(peerId: string, dest: string, contactSecret?: Uint8Array): void {
-    this.tell(new Args("addr")
-      .blob(fromHex(peerId))
-      .blob(contactSecret ?? ZERO32)
-      .blob(enc.encode(dest)));
-  }
+  // ── listening ───────────────────────────────────────────────────────────────
 
   /** Bind the listeners (if any) through the channel factory. */
   async start(): Promise<void> {
@@ -425,24 +349,6 @@ export class TransportHost {
     );
     this.port = port;
     this.wsPort = wsPort;
-  }
-
-  /** Dial every peer the occupant knows of and resolve once each is authenticated (or the
-   *  guest's deadline passes). Both the dialing and the waiting are the guest's — and so is
-   *  the list of who "every peer" is: the answer is this op's return value, handed back with
-   *  `defer()` when the last peer comes up, so nothing is held host-side. */
-  async ready(timeoutMs = 5000): Promise<void> {
-    await this.ask(new Args("ready").u32(timeoutMs));
-  }
-
-  /** The peers we currently hold at least one authenticated link to. The set lives in
-   *  the guest — it is a fact about links, and links are the guest's — so this is a
-   *  question rather than a field. */
-  async linkedPeers(): Promise<string[]> {
-    const bytes = await this.ask(new Args("peers"));
-    const out: string[] = [];
-    for (let off = 0; off + 32 <= bytes.length; off += 32) out.push(toHex(bytes.slice(off, off + 32)));
-    return out;
   }
 
   // ── lifecycle ───────────────────────────────────────────────────────────────

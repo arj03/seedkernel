@@ -9,7 +9,8 @@ import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
-import { writeOp } from "./op-frame.js";
+import { OpArgs, writeOp } from "./op-frame.js";
+import { TRANSPORT_SERVICE } from "./transport-bundle.js";
 import { parseHostPort, peersConfig } from "./peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, Shell } from "./shell-core.js";
@@ -75,14 +76,19 @@ export function transportConfigFrom(peerSpecs: readonly string[], requestDeadlin
   return Object.keys(cfg).length > 0 ? cfg : undefined;
 }
 
-/** The diagnosis a cohort operation needs when no bundle owns the raw-link binding. The
- *  adapter is always there — it is the platform's — so a node with no transport bundle answers
- *  "no route" rather than failing, which is a legitimate configuration (§12.6) and exactly
- *  the wrong answer to give an operator who typed `--peers`. */
-export function requireLinkBinding(transport: Pick<TransportHost, "available">, what: string): void {
-  if (!transport.available()) {
+/** Wait for the peers this node's transport was loaded with, or the deadline — a claim call
+ *  on the id that bundle claims, the same door a co-resident guest uses. Exported because
+ *  both targets' boots do this, so `ready` and its deadline are spelled once; the transport
+ *  settles the op either way, so this bounds the boot rather than deciding anything.
+ *
+ *  `null` means nothing claims that id: a node with no transport, which is a legitimate
+ *  configuration (§12.6) and a failure only once the operator asked for a cohort. */
+export function awaitCohort(shell: Pick<Shell, "call">, what: string): Promise<Uint8Array> {
+  const answer = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
+  if (!answer) {
     throw new Error(`shell: ${what} — load a bundle granted the "${PRIVILEGE_LINK}" privilege first`);
   }
+  return answer;
 }
 
 /** The platform under the operator flow. */
@@ -254,14 +260,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     realmMemoryBytes: args.has("guest-memory") ? Number(args.get("guest-memory")) * 1024 * 1024 : undefined,
     transportBundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
   });
-  // The addresses went in with the load above; what is left is to wait for the cohort. A
-  // policy admitting no transport bundle leaves nothing to dial FROM — say so, rather than
-  // letting the flag pass silently on a node with no network.
+  // The addresses went in with the load above; what is left is to wait for the cohort.
+  // Best-effort: the op settles on its own deadline rather than rejecting, so a member that
+  // is not up yet delays the boot but never fails it.
   if (peers.length > 0) {
-    requireLinkBinding(net, "--peers given, but there is nothing to dial from");
-    // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
-    // cohort member that is not up yet delays the boot but never fails it.
-    await net.ready();
+    await awaitCohort(shell, "--peers given, but there is nothing to dial from");
   }
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);

@@ -251,6 +251,17 @@ func claimManifest(t testing.TB, app string, protocols ...string) []byte {
 	return mjson
 }
 
+// isHostService mirrors core/domains.ts HOST_SERVICES, so a fixture's one `requires`
+// argument can be split into the manifest's two signed lists. Restated rather than read out
+// of the realm because it is the fixture's convenience; the loader refuses a wrong split.
+func isHostService(name string) bool {
+	switch name {
+	case "node", "fs", "clock", "timer", "link":
+		return true
+	}
+	return false
+}
+
 // appProtocols is the fixture's claim: the app's own name, whatever it requires. Claim
 // spellings carry no authority (§12.10) and the loader ties nothing to one, so a fixture
 // deriving `_net` from a `link/*` requires would only be borrowing the transport's claim
@@ -277,11 +288,12 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 		Name string `json:"name"`
 		Hash string `json:"hash"`
 	}
-	// requires + config live inside `guest` (§12.4), so "no authority" is an empty
+	// requires + calls + config live inside `guest` (§12.4), so "no authority" is an empty
 	// `requires` list rather than an absent object.
 	type guest struct {
 		Hash     string   `json:"hash"`
 		Requires []string `json:"requires"`
+		Calls    []string `json:"calls,omitempty"`
 	}
 	manifest := struct {
 		App       string   `json:"app"`
@@ -301,9 +313,17 @@ func manifestJSONForModule(t testing.TB, app string, version int, guestSrc strin
 			Name: moduleName, Hash: hex.EncodeToString(sd.genericHash(32, moduleBytes)),
 		}},
 		Guest: guest{
-			Hash:     hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
-			Requires: requires,
+			Hash: hex.EncodeToString(sd.genericHash(32, []byte(guestSrc))),
 		},
+	}
+	// One fixture argument, split into the two signed lists by the question the loader also
+	// asks: is this a host service?
+	for _, r := range requires {
+		if isHostService(r) {
+			manifest.Guest.Requires = append(manifest.Guest.Requires, r)
+		} else {
+			manifest.Guest.Calls = append(manifest.Guest.Calls, r)
+		}
 	}
 	if manifest.Guest.Requires == nil {
 		manifest.Guest.Requires = []string{}

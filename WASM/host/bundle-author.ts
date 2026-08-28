@@ -115,7 +115,10 @@ export interface UnsignedBundle {
     modules: { name: string; wasm: Uint8Array }[];
     /** Source text; the manifest commits to its UTF-8 encoding. */
     guestSource: string;
+    /** The host SERVICES this guest is granted — `manifest.guest.requires`. */
     guestRequires: string[];
+    /** The local service ids this guest calls — `manifest.guest.calls`. Omitted ≡ none. */
+    guestCalls?: string[];
     guestConfig?: JsonObject;
 }
 
@@ -135,6 +138,7 @@ export function authorBundle(sodium: ManifestCrypto, keys: HybridAuthorKeys, inp
     const guest: BundleGuest = {
         hash: toHex(genesisHash(sodium, guestBytes)),
         requires: input.guestRequires,
+        ...(input.guestCalls !== undefined ? { calls: input.guestCalls } : {}),
         ...(input.guestConfig !== undefined ? { config: input.guestConfig } : {}),
     };
     const manifest: BundleManifest = {

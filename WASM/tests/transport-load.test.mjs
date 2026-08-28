@@ -10,6 +10,7 @@
 
 import {
   makeTransportHost, sodium as realSodium, LoopbackChannels, InjectedChannels, until, transportBlob, verifyBundle,
+  ready, linkedPeers,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 
@@ -142,11 +143,11 @@ await test("an outside flood CANNOT keep members out", async () => {
   assert(flood.every((d) => !d.closed), "the unverified budget should be saturated, not shedding");
 
   const m = keep(await member(fabric, s, "10.9.9.9"));
-  await m.driver.ready(4000);
+  await ready(m, 4000);
   const evicted = flood.filter((d) => d.closed).length;
-  note(`under a saturating flood: member authenticated = ${(await m.driver.linkedPeers()).length === 1}; ` +
+  note(`under a saturating flood: member authenticated = ${(await linkedPeers(m)).length === 1}; ` +
        `${evicted} stranger(s) evicted`);
-  assert((await m.driver.linkedPeers()).includes(s.peerId),
+  assert((await linkedPeers(m)).includes(s.peerId),
     "A MEMBER WAS DENIED SERVICE BY AN OUTSIDE FLOOD — the budgets are not separated");
   assert(evicted >= 1, "a saturated budget must EVICT to make room, not refuse the newcomer");
   assert(flood[0].closed, "eviction must take the OLDEST stranger first");
@@ -167,8 +168,8 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
   for (let i = 0; i < ROUNDS; i++) {
     for (let j = 0; j < 4; j++) flood(); // attacker keeps pushing
     const m = keep(await member(fabric, s, `10.8.${i}.1`));
-    try { await m.driver.ready(4000); } catch { /* counted as a failure below */ }
-    if ((await m.driver.linkedPeers()).includes(s.peerId)) authed++;
+    try { await ready(m, 4000); } catch { /* counted as a failure below */ }
+    if ((await linkedPeers(m)).includes(s.peerId)) authed++;
   }
   note(`${authed}/${ROUNDS} members authenticated while ${ROUNDS * 4 + UNVER} flood connections churned`);
   assert(authed === ROUNDS, `${ROUNDS - authed} member(s) denied service under sustained flood`);
@@ -208,9 +209,9 @@ await test("a leaked contact secret cannot lock members out of the verified budg
 
   // A real member must still complete.
   const m = keep(await member(fabric, s, "10.7.7.7"));
-  await m.driver.ready(4000);
+  await ready(m, 4000);
   note(`after ${VER * 3} credentialled stalls against a ${VER}-slot verified budget, member got in`);
-  assert((await m.driver.linkedPeers()).includes(s.peerId),
+  assert((await linkedPeers(m)).includes(s.peerId),
     "A MEMBER WAS LOCKED OUT by a saturated verified budget");
 });
 
@@ -225,11 +226,11 @@ await test("the budget bounds links PAST the handshake, not just into it", async
   let everSaw = 0;
   for (let i = 0; i < AUTHED * 3; i++) {
     const m = keep(await member(fabric, s, `10.10.${i}.1`));
-    try { await m.driver.ready(4000); } catch { /* counted below */ }
-    if ((await m.driver.linkedPeers()).includes(s.peerId)) everSaw++;
+    try { await ready(m, 4000); } catch { /* counted below */ }
+    if ((await linkedPeers(m)).includes(s.peerId)) everSaw++;
     await sleep(30);
   }
-  const held = (await s.driver.linkedPeers()).length;
+  const held = (await linkedPeers(s)).length;
   note(`${AUTHED * 3} members authenticated against a ${AUTHED}-slot authed budget; ${held} link(s) held, ${everSaw} got in`);
   assert(everSaw === AUTHED * 3, `${AUTHED * 3 - everSaw} member(s) refused at the door — the authed tier must evict, not refuse`);
   assert(held <= AUTHED, `${held} authenticated links held against a budget of ${AUTHED}`);

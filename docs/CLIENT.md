@@ -51,6 +51,8 @@ export async function buildBundle({ authorSeed, version, wasm, guestSource }) {
     protocols: ["example/v1"],
     modules: [{ name: "codec", wasm }],
     guestSource,
+    // What this bundle calls on the HOST — services only. What it calls on a co-resident
+    // guest is `guestCalls`, a separate list carrying no privilege.
     guestRequires: [],
   });
 
@@ -73,9 +75,9 @@ The authoring module also carries the lower-level signing and packing primitives
 | Entry point | What you import it for | Where to look |
 | --- | --- | --- |
 | `./shell-core` | `bootShell` — the assembly. `AppHandle`, what a load hands back. `scopedFs`, to re-derive an app's fs view over a raw backend outside a running node. The admission constructors (`denyAll`, `admitAll`, `authorAllowlist`, `byPrivilege`, `allOf`, `policyFromJson`) are re-exported here too, so your `admit` comes from the same module | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) (a consent gate and a `contactSecret` getter), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) (a whole node wrapped as a class) |
-| `./op-frame` | The shared optional `[opLen u8][op ascii][args …]` client codec: `writeOp` for a host loopback, `readOp`/`callerOf` in a guest. This is a leaf helper over opaque `invoke` bytes; `shell-core`, timers, and the guest seam do not import or interpret it. A guest that cannot import takes the same codec as flat source from `./bundle-author`'s `guestOpFraming`, which stays out of this runtime module so a browser shell does not vendor a source emitter | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js), [seedchat `chat-app.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-app.js), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) |
+| `./op-frame` | The shared optional `[opLen u8][op ascii][args …]` client codec: `writeOp` for a host loopback, `readOp`/`callerOf` in a guest, and `OpArgs` for an op whose arguments are structured (`u8`/`u32`/length-prefixed `blob`/`text` fields, built in one pass). This is a leaf helper over opaque `invoke` bytes; `shell-core`, timers, and the guest seam do not import or interpret it. A guest that cannot import takes the same codec as flat source from `./bundle-author`'s `guestOpFraming`, which stays out of this runtime module so a browser shell does not vendor a source emitter | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js), [seedchat `chat-app.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-app.js), [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts) |
 | `./shell-node` | The Node platform adapter: `bootNodeShell` wires `NodeFs` on a data directory, a `node:net` channel factory and a file-backed freshness store into `bootShell`, then hands back the shell and channel adapter. This is a Node convenience, not a second kernel assembly; a client that owns its platform wiring calls `bootShell` | [seedstore `shell-run.test.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/shell-run.test.mjs) |
-| `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. When networking is configured, `bootShell` uses this blob by default; import it to pass a replacement explicitly, derive the policy pin, hash it, or inspect it | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
+| `./transport-bundle` | `transportBundleBytes()` — the shipped signed transport program, the blob that *is* the node's network. When networking is configured, `bootShell` uses this blob by default; import it to pass a replacement explicitly, derive the policy pin, hash it, or inspect it. `TRANSPORT_SERVICE` beside it is the local service id that blob claims (`"_net"`), which is what you hand `shell.call` to reach the running transport | [seedchat `chat-shell.js`](https://github.com/arj03/seedchat/blob/main/browser/chat-shell.js) |
 | `./guest-seam` | `appSigner` and `guestSignScope` for a host-side mirror of one slot's scoped sign/verify pair, so host code and guest code sign the same bytes | [seedstore `manifest.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/manifest.ts) |
 
 For a conventional Node process, `bootNodeShell` is the shortest complete path. The policy must admit ordinary app authors under `authors` and the shipped transport author under `grants.link`:
@@ -122,7 +124,7 @@ A deliberate per-target choice (Node vs. browser, WS vs. RTC, memory-fs vs. node
 | `./quickjs` | Nothing you call. It is the QuickJS engine `safe-js` names by bare specifier, so a **browser** client must carry it in its import map even though its own code never mentions it | the import map in [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html) |
 | `./fs`, `./fs-memory`, `./fs-node` | The `Fs` interface and safe-key checks, plus the two backends: in-memory (`bootShell`'s default) or a directory on disk | [seedstore `storage-node.ts`](https://github.com/arj03/seedstore/blob/main/WASM/host/storage-node.ts), [seedstore `bench-holder.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/bench-holder.mjs) |
 | `./net-node` | `NodeChannelFactory` — TCP over `node:net`, and nothing else | [seedstore `net.test.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/tests/net.test.mjs) |
-| `./peer-addr` | The `pk[.secret]@dest` grammar — `parsePeerRef`, `peersConfig`, `parseDest`, `parseHostPort`, `isHex64` — with no socket adapter under it. The one place a client takes the parser from, whether or not it opens a socket. `parsePeerRef(spec, "ws")` yields `{ peerId, contactSecret, dest }`, which a client hands to `driver.addr(...)` or, at boot, to `peersConfig(specs)` for the load's `transportConfig.peers`. It takes `pk[.secret]@[wss://]host:port[/path]`, so a scheme asks for TLS and a path reaches a peer behind a reverse proxy; `parseDest` is the other half, the one a `ChannelFactory` uses to decide what it can route | the in-repo caller is [`cli.ts`](../WASM/host/cli.ts) |
+| `./peer-addr` | The `pk[.secret]@dest` grammar — `parsePeerRef`, `peersConfig`, `parseDest`, `parseHostPort`, `isHex64` — with no socket adapter under it. The one place a client takes the parser from, whether or not it opens a socket. `parsePeerRef(spec, "ws")` yields `{ peerId, contactSecret, dest }`, which a client hands to an `addr` call through `shell.call(...)` or, at boot, to `peersConfig(specs)` for the load's `transport.config.peers`. It takes `pk[.secret]@[wss://]host:port[/path]`, so a scheme asks for TLS and a path reaches a peer behind a reverse proxy; `parseDest` is the other half, the one a `ChannelFactory` uses to decide what it can route | the in-repo caller is [`cli.ts`](../WASM/host/cli.ts) |
 | `./net-ws` | `WsNetwork` — a `ChannelFactory` that dials the `ws://`/`wss://` destinations `link/open` names, at a peer's `--ws-listen` port. No relay or STUN. Which peers, and how many links each, is the transport bundle's signed policy over its own address book, not this file's | [seedstore `p2p-cli.mjs`](https://github.com/arj03/seedstore/blob/main/WASM/scripts/p2p-cli.mjs), [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html) |
 | `./net-rtc` | `RtcNetwork` — an accept-only `ChannelFactory` over WebRTC and an application-supplied `Signaling` seam. Browser natively; Node/Bun by also supplying `peerConnectionFactory` | [seedstore `p2p.html`](https://github.com/arj03/seedstore/blob/main/WASM/browser/p2p.html), [seedchat `media-rtc.js`](https://github.com/arj03/seedchat/blob/main/browser/media-rtc.js) (subclassed for audio/video) |
 
@@ -164,14 +166,16 @@ Transport behavior has three deliberate modes:
 | Configuration | Adapter | Transport bundle |
 | --- | --- | --- |
 | `transport` omitted or `false` | No `TransportHost`; `BootResult.transport` is `null` | Not loaded. The node has no network. |
-| `transport: { …options }` | `bootShell` constructs and returns the adapter, filling in the top-level `identity` and `networkKey` | The shipped bundle—or `transportBundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded with `transportConfig` as that load's `localConfig`; listeners are then started. |
-| `transport: { …options }`, `transportLoad: false` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob(blob, { localConfig })`; this is seedchat's lazy-first-connect mode. The options object is retained, so accessors such as seedchat's live `contactSecret` getter survive. |
+| `transport: { …options }` | `bootShell` constructs and returns the adapter, filling in the top-level `identity` and `networkKey` | The shipped bundle—or `transport.bundle` when supplied—is pinned and offered for admission during boot. If admitted, it is loaded with `transport.config` as that load's `localConfig`; listeners are then started. |
+| `transport: { …options, load: false }` | `bootShell` constructs and returns the adapter | Loading is deferred. The caller later passes the selected bundle to `shell.loadBundleBlob(blob, { localConfig })`; this is seedchat's lazy-first-connect mode. The options object is retained, so accessors such as seedchat's live `contactSecret` getter survive — pass the object itself rather than a spread of it. |
 
-`transportBundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload. The transport's defaults are signed in its `guest.config`; `transportConfig` is the automatic-load convenience for operator overrides and reaches the guest as `LOCAL`, exactly like any other one-bundle `localConfig`.
+Everything about the node's network is that one object: the socket-side members (`channels`, `listen`, `wsListen`, `contactSecret`, `maxRawLinks`, `onLinkClosed`) plus `bundle`, `config` and `load`. They are one decision — the blob whose author is *pinned* is the blob that gets *loaded*, under the configuration that load is given — so they are one field rather than four siblings that can disagree.
+
+`transport.bundle` selects both the blob loaded in the automatic case and the blob whose author is pinned. It defaults to `transportBundleBytes()`. Passing different transport bytes is therefore a deliberate transport replacement, not just a different boot payload. The transport's defaults are signed in its `guest.config`; `transport.config` is the automatic-load convenience for operator overrides and reaches the guest as `LOCAL`, exactly like any other one-bundle `localConfig`.
 
 Two things it does *for* you, which is why you should not try to reproduce them:
 
-- **The transport author pin is ANDed onto your predicate, never substituted for it.** The transport bundle is admitted under a pin derived from the blob itself, so "only this author may be the network" is the assembly's business, not something you can lose by forgetting it. Your `admit` still has to admit as well — a deny-all node has no network, and an operator keeps the power to refuse a transport author, because AND means both. Running a different transport means passing a different `transportBundle`, which is what the pin is derived from.
+- **The transport author pin is ANDed onto your predicate, never substituted for it.** The transport bundle is admitted under a pin derived from the blob itself, so "only this author may be the network" is the assembly's business, not something you can lose by forgetting it. Your `admit` still has to admit as well — a deny-all node has no network, and an operator keeps the power to refuse a transport author, because AND means both. Running a different transport means passing a different `transport.bundle`, which is what the pin is derived from.
 - **It is fail-closed on a privilege it does not know.** `PRIVILEGES` is derived from the capability catalog, so a privileged name added to `core/domains.ts` appears here as a privilege with no branch, and bundles reaching it are refused until the assembly is taught about it. That is what makes "privileged bundles are the pin's business" a safe thing for your consent dialog to assume.
 
 A load returns an **`AppHandle`**: the app key, the app's fs scope and the scoped view over it, and an `invoke` already bound to that slot — so you drive the app through derivations the shell has already made. Take the handle; do not re-derive its parts.
@@ -179,6 +183,28 @@ A load returns an **`AppHandle`**: the app key, the app's fs scope and the scope
 `loadBundleBlob(blob, options)` also accepts installation-local `localConfig`, per-app `realmMemoryBytes` and `guestDeadlineMs` bounds, and an `onInbound` observer. None of those values becomes author-signed bundle content; they belong to this installation and this load. For an ordinary app, `localConfig` becomes `LOCAL` unchanged. For the one slot reaching `link`, the shell adds exactly three `TransportHost` node facts—`peerId`, `networkKey`, and `contactSecret`—to `LOCAL` before standing the realm, with those host-owned keys winning collisions; callers do not need a separate transport initialization step.
 
 The handle's `invoke` is bound to the slot this load stood. On an upgrade, a replacement load stands a NEW slot under the same key and returns its own handle; a handle taken before it keeps naming the version it was handed and rejects once that slot is disposed. There is no second key-addressed invoke on `Shell`: callers retain the handle returned by the load they intend to drive.
+
+## Reaching a claim from the host
+
+`shell.call(serviceId, payload)` calls the realm claiming that LOCAL service id, with the host's caller id — the host half of the same routing a co-resident guest reaches through `host.call`. It answers `null` when nothing claims the name, which is how "this node has no transport" is said. It resolves `services` claims and never `protocols`: a name a *peer* may reach is a peer's to reach.
+
+That is the door to the node's own network. Waiting for a cohort, listing linked peers and teaching an address are ordinary calls on the id the transport bundle claims (`TRANSPORT_SERVICE` from `./transport-bundle`, `"_net"` for the shipped one), composed with the codec both ends already share:
+
+```js
+import { OpArgs } from "seedkernel-wasm/op-frame";
+import { TRANSPORT_SERVICE } from "seedkernel-wasm/transport-bundle";
+
+// Teach the running transport one peer: [peer 32][secret 32][dest utf8], each blob-framed.
+const taught = shell.call(TRANSPORT_SERVICE, new OpArgs("addr")
+  .blob(peerId).blob(contactSecret ?? new Uint8Array(32)).text(dest).build());
+if (!taught) throw new Error("this node has no transport");
+await taught;
+
+// Wait for the cohort, or the deadline — the op settles either way.
+await shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
+```
+
+The op names and their argument order are the transport bundle's own content, not a kernel ABI — a replacement transport may spell them differently, which is why its service id travels with its blob. `BootResult.transport` keeps only what is genuinely the host's: the bound ports, `start()`, `reset()` and `close()`.
 
 ## Browser build artifacts are not package entry points
 

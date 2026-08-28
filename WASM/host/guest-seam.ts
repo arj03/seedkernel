@@ -106,16 +106,15 @@ export interface SeamPlatform {
  *  an undeclared name a refusal by name rather than a null backend surfacing later as a
  *  confusing failure. */
 export interface SeamGrants {
-    /** EXACTLY the manifest's declared `guest.requires` (§12.2) — service names and local
-     *  service ids together, as signed. A `host.call` naming a host method is refused unless
-     *  the method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
+    /** EXACTLY the manifest's declared `guest.requires` (§12.2) — the host SERVICES this
+     *  realm is granted, as signed. A `host.call` naming a host method is refused unless the
+     *  method's SERVICE (`serviceOf`) is a member; `crypto/*`, a bare module name and a
      *  declared local service pass regardless. */
     names: Iterable<string>;
-    /** THIS realm's declared local service ids — the `guest.requires` entries that are not
-     *  host services. What tells a bare `host.call` name apart from one of this bundle's own
-     *  modules (§12.10): declared here, it is a cross-realm call; otherwise it is a module.
-     *  Explicit rather than inferred from `names` because the two sets answer different
-     *  questions: what the manifest requires and which of those names are local. */
+    /** EXACTLY the manifest's declared `guest.calls` (§12.10) — the local service ids this
+     *  realm may reach on a co-resident guest, as signed. What tells a bare `host.call` name
+     *  from one of this bundle's own modules: declared here, it is a cross-realm call;
+     *  otherwise a module. */
     localServices?: ReadonlySet<string>;
     /** What `node/sign`/`node/verify` sign and check under — THIS SLOT's scope, derived
      *  once at load (`slotSignScope`): an app slot gets `DOMAIN_guest ‖ author ‖ app`,
@@ -132,9 +131,9 @@ export interface SeamGrants {
     rawNet?: RawNet;
     /** The platform's event loop. `names` decides whether this realm may reach it. */
     timers: HostTimers;
-    /** The cross-realm call: how a `_`-led name in `names` is answered. Wired for every
-     *  realm — reaching one is a grant like any other, and `names` above decides who holds
-     *  it. */
+    /** The cross-realm call: how a name in `localServices` is answered. Wired for every
+     *  realm — reaching one is a grant like any other, and the signed list above decides who
+     *  holds it. */
     calls: SeamCalls;
 }
 
@@ -384,8 +383,8 @@ const MAX_RANDOM_BYTES = 1 << 20; // 1 MiB per node/random call
 const ONE = new Uint8Array([1]);
 const ZERO = new Uint8Array([0]);
 const NONE = new Uint8Array(0);
-/** `grants.localServices`'s default: a realm that declared no local service reaches
- *  none, not every bare name. */
+/** `grants.localServices`'s default: a realm whose manifest named no `guest.calls` reaches
+ *  no local service, not every bare name. */
 const EMPTY_SET: ReadonlySet<string> = new Set();
 function u64be(value: number): Uint8Array {
     const out = new Uint8Array(8);
@@ -561,7 +560,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
     // JS of this file (§12.9), where a TypeScript signature enforces nothing — and a gate
     // that holds on one of two targets is not a gate.
     if (grants.names === undefined) {
-        throw new Error("guest-seam: grants.names is required — pass the manifest's declared requires");
+        throw new Error("guest-seam: grants.names is required — pass the manifest's declared guest.requires");
     }
     const allowed = new Set(grants.names);
     const localServices = grants.localServices ?? EMPTY_SET;
@@ -572,7 +571,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         // spelled: the id is an ordinary claim and may carry a `/` like any other, so
         // asking the declaration before the charset is what keeps one vocabulary from
         // becoming two. It can never shadow a host method — the loader refuses a
-        // `requires` entry whose head is a known service (bundle.ts). The callee answers
+        // `guest.calls` entry whose head is a known service (bundle.ts). The callee answers
         // on a later turn, never inside this guest's frame; an id nothing claims is refused
         // by name rather than parked on a promise no one will settle.
         if (localServices.has(name)) {
@@ -590,7 +589,7 @@ export function createGuestSeam(deps: GuestSeamDeps): HostCall {
         if (name.includes("/")) {
             const svc = serviceOf(name);
             if (svc && !allowed.has(svc)) {
-                throw new Error("guest-seam: " + name + " not declared by the bundle manifest requires");
+                throw new Error("guest-seam: " + name + " not declared by the bundle manifest guest.requires");
             }
             const fn = handlers[name];
             if (!fn)

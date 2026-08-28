@@ -31,7 +31,7 @@ const { ModuleTable } = await imp("build/host/module-table.js");
 const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
 // request is an app calling the id the transport claims (tests/transport-harness.mjs).
-const { harnessAppBlob, appRequest } = await imp("tests/transport-harness.mjs");
+const { harnessAppBlob, appRequest, addr, ready, linkedPeers } = await imp("tests/transport-harness.mjs");
 const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = transportBundleBytes();
@@ -103,9 +103,10 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     modules: new ModuleTable(),
     freshnessStore: new FreshnessMarks(),
     fs: false,
-    transport: {},
-    transportConfig: { requestDeadlineMs: 321, peerId: "operator-cannot-replace-this" },
-    transportBundle: transportBlob,
+    transport: {
+      config: { requestDeadlineMs: 321, peerId: "operator-cannot-replace-this" },
+      bundle: transportBlob,
+    },
     createRealm: async (o) => {
       source = o.source;
       return { call: async () => new Uint8Array(), dispose() {} };
@@ -120,7 +121,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   assert(appConfig.requestDeadlineMs === TRANSPORT_APP_CONFIG.requestDeadlineMs,
     "transport defaults arrive from signed APP config");
   assert(localConfig.requestDeadlineMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.peerId),
-    "bootShell transportConfig reaches LOCAL while host-owned node facts win collisions");
+    "bootShell transport.config reaches LOCAL while host-owned node facts win collisions");
   shell.close();
 }
 /** One request through a node's app handle to `to` — the path a deployment uses. */
@@ -134,7 +135,7 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     authors: [transportAuthor, appAuthorHex],
     grants: { link: [transportAuthor] },
   }));
-  const transportOptions = { channels, listen };
+  const transportOptions = { channels, listen, load: false, bundle: transportBlob };
   const transportConfig = { requestDeadlineMs: 800 };
   // A test may pause a candidate right after its realm stands, before the shell publishes
   // it: its LOCAL facts are installed, but the incumbent still owns `_net`, which exposes
@@ -150,8 +151,6 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
     freshnessStore,
     fs: false,
     transport: transportOptions,
-    transportLoad: false,
-    transportBundle: transportBlob,
     createRealm: async (o) => {
       const realm = await createSafeRealm(o);
       const pause = realmControl.pauseNext;
@@ -192,9 +191,9 @@ assert(aNet.port > 0 && bNet.port > 0 && cNet.port > 0, "all nodes bound loopbac
 // Each node runs the echo app, so both directions work — the upgrade below has to be
 // checked both ways: A dialing out through the new transport, and B reaching A.
 const bDest = `tcp://loopback:${bNet.port}`;
-aNet.addr(bId, bDest);
-await aNet.ready(2000);
-assert((await aNet.linkedPeers()).includes(bId), "A authenticated B over loopback (AKE ran)");
+await addr(a, bId, bDest);
+await ready(a, 2000);
+assert((await linkedPeers(a)).includes(bId), "A authenticated B over loopback (AKE ran)");
 
 const resp = await request(b.app, a.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through the record layer");
@@ -212,11 +211,11 @@ const publish = new Promise((resolve) => { publishCandidate = resolve; });
 a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; };
 const upgrading = a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
 await configured;
-// An address taught in the replacement window lands on whoever owns `_net` right NOW,
-// which is still the incumbent — the candidate's realm stands but is unpublished. `addr`
-// is a pass-through with no host-side book behind it, so this entry dies with the realm it
-// reached, and the assertion below is that it is GONE rather than replayed.
-aNet.addr(cId, `tcp://loopback:${cNet.port}`);
+// An address taught in the replacement window lands on whoever owns `_net` right NOW —
+// still the incumbent, since the candidate's realm stands but is unpublished. Nothing
+// host-side holds it, so the entry dies with that realm; the assertion below is that it is
+// GONE rather than replayed.
+await addr(a, cId, `tcp://loopback:${cNet.port}`);
 publishCandidate();
 await upgrading;
 
@@ -237,7 +236,7 @@ assert(strandedB && strandedC, "the replacement starts with an EMPTY address boo
 // itself. Live links never survived either — the session keys were private to the outgoing
 // realm — so this one request is a reconnect in both halves, over the same listener on the
 // same port B has always known.
-aNet.addr(bId, bDest);
+await addr(a, bId, bDest);
 const resp2 = await request(a.app, bId, new Uint8Array([9, 9]));
 assert(resp2.length === 2 && resp2[0] === 9, "A reconnects once the embedder re-supplies the address, through the NEW transport");
 
@@ -273,7 +272,7 @@ assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bund
 // A successful reinstall is a slot replacement like any other, so this realm's address book
 // is empty too and the embedder supplies it again. The refused loads above needed no such
 // line: nothing was replaced, so the standing occupant kept the book it already had.
-aNet.addr(bId, bDest);
+await addr(a, bId, bDest);
 assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
 

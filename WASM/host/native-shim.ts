@@ -5,7 +5,7 @@
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { verifyBundle, FreshnessMarks, freshnessPathFor, type JsonObject, type PureModuleLoader } from "./bundle.js";
-import { runCli, requireLinkBinding, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { runCli, awaitCohort, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
 import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
@@ -493,14 +493,15 @@ async function makeTransportNode(cfg: {
         sodium, identity: cfg.identity, modules, fs,
         freshnessStore: new NativeFreshnessStore(storeDir),
         networkKey: cfg.networkKey,
+        // The sockets and the signed program that drives them, in one object.
         transport: {
             contactSecret: cfg.contactSecret,
             channels,
             listen: cfg.listen,
             wsListen: cfg.wsListen,
+            bundle: cfg.transportBundle,
+            config: cfg.transportConfig,
         },
-        transportConfig: cfg.transportConfig,
-        transportBundle: cfg.transportBundle,
         // The admission predicate in force (§12.5): the shell closes over this
         // indirection rather than a fixed predicate, so trust can be narrowed or widened
         // without restarting the node (`setPolicy`).
@@ -535,13 +536,10 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     shell = s.shell;
     const network = s.transport;
     if (peers.length > 0) {
-        // The same diagnosis the operator flow gives (`--peers`): the adapter is the
-        // platform's and always there, so an unowned raw-link binding has to be said rather
-        // than discovered as a dial that answers nothing.
-        requireLinkBinding(s.transport, "peers were configured, but there is nothing to dial from");
-        // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
-        // cohort member that is not up yet delays the boot but never fails it.
-        await network.ready();
+        // The same diagnosis the operator flow gives `--peers`, through the same door.
+        // Best-effort: the op settles on its own deadline, so a member that is not up yet
+        // delays the boot but never fails it.
+        await awaitCohort(s.shell, "peers were configured, but there is nothing to dial from");
     }
     const status = {
         peerId: toHex(key.publicKey), port: network.port, wsPort: network.wsPort,

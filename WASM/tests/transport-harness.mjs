@@ -19,6 +19,7 @@ export const { policyFromJson } = await imp("build/host/policy.js");
 export const { FreshnessMarks, verifyBundle } = await imp("build/host/bundle.js");
 export const { ModuleTable } = await imp("build/host/module-table.js");
 export const { TransportHost } = await imp("build/host/transport-host.js");
+export const { OpArgs } = await imp("build/host/op-frame.js");
 export const { LoopbackChannels } = await imp("tests/loopback-channels.mjs");
 /** The link close-reason codes the transport guest returns from `linkClosed`
  *  (transport/src/ake.js, `REASON_*`). The host only relays the number, so the vocabulary
@@ -164,7 +165,9 @@ export function harnessAppBlob(author, mode = "echo") {
     modules: [],
     guestSource: HARNESS_GUEST,
     // The whole of what an app needs to talk to the network: the id the transport claims.
-    guestRequires: [TRANSPORT_SERVICE],
+    // A local call graph edge, so `calls`; this app holds no host service at all.
+    guestRequires: [],
+    guestCalls: [TRANSPORT_SERVICE],
     guestConfig: { mode },
   });
   return blob;
@@ -236,6 +239,10 @@ export async function makeTransportHost(opts = {}) {
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
   const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
+  // ONE literal rather than a spread at the boot call: an option may be getter-backed (a
+  // rotating contact secret), and a spread flattens it. `load: false` because a test wants
+  // the load observable (sometimes refused); `bundle` keeps the blob loaded below and the
+  // blob the pin admits one fact.
   const transport = {
     channels: opts.channels,
     listen: opts.listen,
@@ -245,6 +252,8 @@ export async function makeTransportHost(opts = {}) {
     // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
     // own observation seam, and the only place a test can read WHY a link went down.
     onLinkClosed: opts.onLinkClosed,
+    load: false,
+    bundle: opts.transportBlob ?? transportBlob,
   };
   const transportConfig = {
     ...(opts.transportConfig ?? {}),
@@ -259,10 +268,7 @@ export async function makeTransportHost(opts = {}) {
     ...(opts.transportHalfOpen?.authed === undefined ? {} : { maxAuthedLinks: opts.transportHalfOpen.authed }),
     ...(opts.linkIdleTimeoutMs === undefined ? {} : { linkIdleTimeoutMs: opts.linkIdleTimeoutMs }),
   };
-  // bootShell owns the adapter but leaves the load to this harness because a test wants it
-  // observable (sometimes refused). `transportBundle` is still stated: the blob
-  // loaded below and the blob the pin admits are one fact, not two that can drift.
-  const blob = opts.transportBlob ?? transportBlob;
+  const blob = transport.bundle;
   const { shell, transport: driver } = await bootShell({
     sodium: opts.sodium ?? sodium,
     identity,
@@ -273,8 +279,6 @@ export async function makeTransportHost(opts = {}) {
     fs: false,
     networkKey: opts.networkKey,
     transport,
-    transportLoad: false,
-    transportBundle: blob,
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
@@ -345,12 +349,43 @@ export async function makeTransportHost(opts = {}) {
     for (let off = 0; off + 32 <= b.length; off += 32) out.push(Buffer.from(b.slice(off, off + 32)).toString("hex"));
     return out;
   };
-  node.peers = () => driver.linkedPeers();
-  /** Teach this node one peer: where to reach it, and the secret that peer's door gates on.
-   *  A pass-through to the occupant's own address book — the driver retains nothing — so a
-   *  test that replaces the transport must say this again (§12.10). */
-  node.addr = (peerHex, dest, contactSecret) => driver.addr(peerHex, dest, contactSecret);
+  node.peers = () => linkedPeers(node);
+  node.addr = (peerHex, dest, contactSecret) => addr(node, peerHex, dest, contactSecret);
   return node;
+}
+
+/** The host's own door into the transport — exactly what the CLI composes, so a test drives
+ *  the real path. Throws when nothing claims the id: a node with no transport bundle. */
+export function transportOp(node, args) {
+  const answer = node.shell.call(TRANSPORT_SERVICE, args.build());
+  if (!answer) throw new Error("transport: no bundle claims " + TRANSPORT_SERVICE);
+  return answer;
+}
+
+/** Dial every known peer and resolve once each is authenticated, or the deadline passes. */
+export function ready(node, timeoutMs = 5000) {
+  return transportOp(node, new OpArgs("ready").u32(timeoutMs));
+}
+
+/** The peers this node holds at least one authenticated link to, as hex. */
+export async function linkedPeers(node) {
+  const bytes = await transportOp(node, new OpArgs("peers"));
+  const out = [];
+  for (let off = 0; off + 32 <= bytes.length; off += 32) {
+    out.push(Buffer.from(bytes.slice(off, off + 32)).toString("hex"));
+  }
+  return out;
+}
+
+/** Teach this node one peer: where to reach it, and the secret THAT peer's door gates on.
+ *  Straight into the occupant's book — the host retains nothing — so a test that replaces
+ *  the transport must say it again (§12.10). */
+export function addr(node, peerHex, dest, contactSecret) {
+  const ZERO32 = new Uint8Array(32);
+  return transportOp(node, new OpArgs("addr")
+    .blob(Buffer.from(peerHex, "hex"))
+    .blob(contactSecret ?? ZERO32)
+    .text(dest));
 }
 
 /** Whether `node` holds an authenticated link to `peerHex` right now. The set lives in the
@@ -358,7 +393,7 @@ export async function makeTransportHost(opts = {}) {
  *  rather than a field, and it is what a test reads instead of the per-link callbacks the
  *  driver used to fire. */
 export async function linkedTo(node, peerHex) {
-  return (await node.driver.linkedPeers()).includes(peerHex);
+  return (await linkedPeers(node)).includes(peerHex);
 }
 
 /** Await a condition with a deadline — the tests' tick, bounded. The predicate is

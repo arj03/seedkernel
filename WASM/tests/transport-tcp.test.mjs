@@ -26,7 +26,7 @@ const transportBlob = transportBundleBytes();
 const transportAuthor = Buffer.from(verifyBundle(sodium, transportBlob).author).toString("hex");
 // The app that drives the transport: a request is an app calling the id the transport
 // claims, so a test that sends one has to be an app (tests/transport-harness.mjs).
-const { harnessAppBlob, appRequest, generatorRequest } = await imp("tests/transport-harness.mjs");
+const { harnessAppBlob, appRequest, generatorRequest, addr, ready, linkedPeers } = await imp("tests/transport-harness.mjs");
 const { makeAuthor } = await imp("tests/testkit.mjs");
 const appAuthor = makeAuthor(sodium);
 const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
@@ -43,6 +43,8 @@ async function makeNode(ws = false) {
     channels: new NodeChannelFactory(),
     listen: { host: HOST, port: 0 },
     ...(ws ? { wsListen: { host: HOST, port: 0 } } : {}),
+    load: false,
+    bundle: transportBlob,
   };
   const transportConfig = { requestDeadlineMs: 2000 };
   // bootShell owns the adapter but leaves the load and listeners to this test, which
@@ -53,8 +55,6 @@ async function makeNode(ws = false) {
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: transportOptions,
-    transportLoad: false,
-    transportBundle: transportBlob,
     createRealm: async (o) => createSafeRealm(o),
     admit: policy,
   });
@@ -86,10 +86,10 @@ assert(aNet.port > 0 && bNet.port > 0, "both nodes bound real TCP listeners");
 const BIG = 512 * 1024;
 
 // The listener's port is only known now, so the peer is taught to the running occupant
-// rather than named in its load config — the same `addr` event either path ends in.
-aNet.addr(b.peerId, `tcp://${HOST}:${bNet.port}`);
-await aNet.ready(4000);
-assert((await aNet.linkedPeers()).includes(b.peerId), "the AKE completed over a real socket");
+// rather than named in its load config — the same `addr` op either path ends in.
+await addr(a, b.peerId, `tcp://${HOST}:${bNet.port}`);
+await ready(a, 4000);
+assert((await linkedPeers(a)).includes(b.peerId), "the AKE completed over a real socket");
 
 const small = await appRequest(a.app, b.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(small.length === 4 && small[3] === 4, "a small request round-trips through the guest's framer");
@@ -127,9 +127,9 @@ assert(dNet.wsPort > 0, "the WS listener bound");
 
 // The `ws://` scheme is the whole difference: the destination string sends the host's
 // factory at the same kind of TCP socket, which declares a different codec on it.
-cNet.addr(d.peerId, `ws://${HOST}:${dNet.wsPort}`);
-await cNet.ready(4000);
-assert((await cNet.linkedPeers()).includes(d.peerId), "the AKE completed through the WS upgrade");
+await addr(c, d.peerId, `ws://${HOST}:${dNet.wsPort}`);
+await ready(c, 4000);
+assert((await linkedPeers(c)).includes(d.peerId), "the AKE completed through the WS upgrade");
 
 const wsSmall = await appRequest(c.app, d.peerId, new Uint8Array([5, 6, 7]));
 assert(wsSmall.length === 3 && wsSmall[2] === 7, "a small request round-trips as masked WS frames");

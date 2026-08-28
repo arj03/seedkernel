@@ -16,7 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
-import { TRANSPORT_APP_CONFIG } from "./transport-config.mjs";
+import { TRANSPORT_APP_CONFIG, TRANSPORT_SERVICE } from "./transport-config.mjs";
 import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle-author.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
@@ -68,19 +68,17 @@ async function main() {
   const { blob, author } = authorBundle(sodium, keys, {
     app: "transport",
     version: 1,
-    // The local service name chosen by this composition. It has no kernel semantics — it
-    // is a `services` claim, reachable by a co-resident guest and by no peer, never a
-    // `protocols` claim (which is what a PEER may send to this slot).
-    services: ["_net"],
+    // A `services` claim — a co-resident guest's and the host's to reach — never a
+    // `protocols` claim, which is what a PEER may send to this slot.
+    services: [TRANSPORT_SERVICE],
     modules: [
       { name: "ws", wasm: wsWasm },
       { name: "mlkem", wasm: mlkemWasm },
     ],
     guestSource: guest,
-    // Exactly the services this program holds — `link` is the ONLY one carrying a
+    // Exactly the host services this program holds — `link` is the ONLY one carrying a
     // privilege grant, and inbound delivery (`link/deliver`) is one of its names rather
-    // than a second grant.
-    // What it provides back is the id it claims above, not a service (§12.1).
+    // than a second grant. It calls no co-resident guest, so there is no `guestCalls`.
     guestRequires: ["node", "link", "timer"],
     // Transport policy belongs to this signed program. An installation may override any
     // of these values through the load's LOCAL config; the guest applies LOCAL ?? APP.
@@ -99,6 +97,11 @@ async function main() {
 // A rebuild with a different key is a new author and a new policy entry; the ML-DSA half
 // is derived from the same seed, so one key file holds the whole identity.
 import { fromBase64 } from "../core/util.js";
+/** The local service id this bundle claims under \`services\` — what the CLI and an embedder
+ *  hand to \`Shell.call\`. Emitted with the blob it belongs to rather than known to the
+ *  loader: a REPLACEMENT transport may spell it differently, and then its entry is the one
+ *  the host reaches. */
+export const TRANSPORT_SERVICE = "${TRANSPORT_SERVICE}";
 const TRANSPORT_BUNDLE_B64 = "${b64}";
 let decoded: Uint8Array | null = null;
 /** The artifact-shipped transport bundle as raw bytes (§12.6) — the shape every

@@ -3,6 +3,11 @@
 // generic host that happens to load it.
 import { MAX_FRAME_BYTES } from "../build/core/net-limits.js";
 
+/** The local service id this composition claims under `services`: a co-resident guest's and
+ *  the host's to reach, no peer's. This program's own choice with no kernel semantics, which
+ *  is why it is emitted beside the blob rather than known to the loader. */
+export const TRANSPORT_SERVICE = "_net";
+
 export const TRANSPORT_APP_CONFIG = Object.freeze({
   connsPerPeer: 1,
   maxHalfOpenUnverified: 1024,

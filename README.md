@@ -48,7 +48,7 @@ Four things follow:
 - **One seam, name-addressed.** A guest reaches host authority by name through `host.call` and reaches its own pure modules through that same call: `host.call("node/random", …)`, `host.call("mlkem", …)`. There is no algorithm-provisioning catalog. The small `crypto/*` table is legacy host vocabulary already used by the current transport and trust root; it is frozen and shrinking, not an extension point.
 - **A pure transform is not a capability.** A function of bytes the guest already holds is computation it could have done itself. It ships as a module of the bundle that needs it. Authorities are the calls that reach something no endpoint module can hold: the node key, entropy source, clock, sockets and disk.
 - **Signing is domain separation, not parsing.** The node's Ed25519 key never leaves the host, so a module that needs a signature asks for one — and the host signs `DOMAIN ‖ scope ‖ opaque`, choosing both from the asking bundle's slot (one scope per slot, derived at load), over a suffix it does not read.
-- **Raw net is one capability; attributed delivery is one of its names.** The transport bundle consumes opaque links and provides its structured API under an ordinary local service name selected by composition (`_net` in the bundled setup) — declared in the manifest's `services` list, a co-resident guest's to reach, never its `protocols` list, which is what a peer may reach. Inbound requests reach the host's claim routing through `link/deliver`, under that same one capability: the occupant that sees the plaintext is the one that attributes it, the call names no link, and only one slot ever holds the sockets — so there is no second privilege to grant or forget. Public reach and local reach are two signed lists, read at the claim rather than parsed off its spelling, so no delivery lets a peer reach a name only a co-resident guest may call (§12.10).
+- **Raw net is one capability; attributed delivery is one of its names.** The transport bundle consumes opaque links and provides its structured API under an ordinary local service name selected by composition (`_net` in the bundled setup) — declared in the manifest's `services` list, a co-resident guest's (and the host's own) to reach, never its `protocols` list, which is what a peer may reach. Inbound requests reach the host's claim routing through `link/deliver`, under that same one capability: the occupant that sees the plaintext is the one that attributes it, the call names no link, and only one slot ever holds the sockets — so there is no second privilege to grant or forget. Public reach and local reach are two signed lists, read at the claim rather than parsed off its spelling, so no delivery lets a peer reach a name only a co-resident guest may call (§12.10).
 
 **And the core cannot grow back.** A confined module holds no ambient authority by construction (§12.2), so it can never hold a file descriptor — at any point in the process's life, whatever has already been installed. The host owns the socket forever, which is what makes raw I/O core permanently rather than for now.
 
@@ -150,22 +150,22 @@ The reference composition stacks the layers so each depends only on the layers b
 
 The runtime runs in a browser tab, on Node/Bun, and as a single native binary. Anything two nodes could *disagree* about is compiled once and shared; only the platform seam is written per target. The tree says which is which — `WASM/core/` is what has no endpoint substitute, `WASM/host/` is the runtime around it, `WASM/transport/` is signed content — but the line that matters is **shared vs per-target**: the shared set is exactly the file list `build:loader-bundles` compiles into `host-shell.gen.js`, which the Go binary embeds and runs in QuickJS. Everything else is one target's plumbing (`npm run loc` in `WASM/` computes the figures below).
 
-**Shared — compiled once, run by all three targets (2,078 LOC)**
+**Shared — compiled once, run by all three targets (2,084 LOC)**
 
 | Concern | Where | LOC |
 | --- | --- | --- |
-| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 497 |
-| Transport driver — channels by link id, outbound promises, listeners. No protocol, no state machine, no address book | `host/transport-host.ts` | 241 |
+| Bundle format and admission policy (§12.4, §12.5) | `host/bundle.ts`, `host/policy.ts` | 500 |
+| Transport driver — channels by link id and listeners, behind three socket events. No protocol, no state machine, no address book, nothing peer-shaped | `host/transport-host.ts` | 181 |
 | Guest seam — the guest ABI seam (§12.2) | `host/guest-seam.ts`, `host/realm-queue.ts` | 388 |
-| Shell and protocol routing (§12.10) | `host/shell-core.ts` | 408 |
-| Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/peer-addr.ts`, `host/op-frame.ts` | 272 |
+| Shell, node assembly and claim routing (§12.9, §12.10) | `host/shell-core.ts` | 427 |
+| Node startup and client framing — the operator flow: the flag set and its defaults, the order a node boots in (§12.5), what it prints; the optional named-op codec shared with clients | `host/cli.ts`, `host/peer-addr.ts`, `host/op-frame.ts` | 316 |
 | Core seam and vocabulary — the socket/`fs` contracts, the key space and flood bounds, domain prefixes, the master-seed subkey derivation (§12.6.2b), the manifest suite id and the host-call names | `core/*.ts` (7 files) | 272 |
 
 **Four reasons a row is shared**, and which reason applies decides whether it could ever leave the set:
 
 - **Trust root** — the bundle format and admission policy, the guest seam, the shell's assembly order. Whatever verifies a bundle, confines a guest or orders the load cannot itself arrive as a bundle. None of it is core by the end-to-end test; all of it is stuck.
 - **Vocabulary** — the domain prefixes, manifest suite id, authority names and flood bounds in `core/`. Core is the vocabulary a bundle's own signature is verified under; a bundle defining that vocabulary would be circular. A codec nothing verifies is not core. Pure transforms do not enter it either: seed store and the transport both ship their computations as modules and add no host name.
-- **A stable adapter** — the transport driver holds link ids and listeners, while raw-link events target the slot/platform binding that owns that capability. It resolves no addresses: `link/open` names an opaque destination the socket factory parses, and the address book behind it is the occupant's. Listener lifecycle follows host configuration, not claim lifecycle or service spelling.
+- **A stable adapter** — the transport driver holds link ids and listeners, while raw-link events target the slot/platform binding that owns that capability. Three events go out of it — `linkOpen`, `linkBytes`, `linkClosed` — and nothing else: waiting for a cohort, listing peers and teaching an address are ordinary claim calls the host makes through `Shell.call`, the same door a co-resident guest uses. It resolves no addresses: `link/open` names an opaque destination the socket factory parses, and the address book behind it is the occupant's. Listener lifecycle follows host configuration, not claim lifecycle or service spelling.
 - **Reuse** — protocol routing carries no security property and two nodes disagreeing about one is harmless (§12.10), so that row is shared to keep one rule on every target, not because agreement is load-bearing. The optional op codec likewise stays shared so clients and guest build tools do not each restate it.
 
 **Per-target platform — the seam, written once per target**
@@ -173,7 +173,7 @@ The runtime runs in a browser tab, on Node/Bun, and as a single native binary. A
 | Target | What | LOC |
 | --- | --- | --- |
 | **JS** (browser + Node) | sockets (TCP/WS/WebRTC), the `fs` backend, safe-js realms, worker-backed pure modules, manifest-verifier plumbing, entry points, key derivation | 1,359 TS |
-| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (410) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 1,960 Go + 503 TS |
+| **Native** (Go) | QuickJS embedding, event loop, libsodium and pure modules over wazero, raw net and fs — plus `native-shim.ts` (409) and `native-polyfills.ts` (93), both TypeScript and riding in the shared bundle | 1,960 Go + 502 TS |
 
 What differs is only the object that moves bytes, and wrapping it is host code on every target, because a confined guest never holds a socket. Whatever the object, it reaches the driver as a `RawLink` through the one `ChannelFactory` seam, and the bundle cannot tell the transports apart ([RUNTIME §12.1](docs/RUNTIME.md)). Wire framing is in neither table: length-prefixing a TCP stream and RFC 6455 are content by the end-to-end test, so they belong to the transport bundle — 1,477 lines of `transport/src/*.js` plus a 5 KB `ws.wasm`, signed content rather than host code at all.
 
