@@ -3,6 +3,7 @@
 // drive the transport through this ChannelFactory the way a node drives real sockets.
 
 import { FRAMING } from "../build/core/socket-seam.js";
+import { parseDest } from "../build/host/peer-addr.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
  *  mirroring a real socket; closing one end fires the other's onClose — the close
@@ -77,19 +78,23 @@ export class LoopbackChannels {
     return port;
   }
 
-  connect(addr) {
-    const onAccept = this.listeners.get(addr.port);
+  /** Dial an opaque destination, like a real `ChannelFactory` (core/socket-seam.ts): this
+   *  fabric speaks `tcp://host:port`, and anything else is a destination it cannot route. */
+  connect(dest) {
+    const d = parseDest(dest);
+    if (!d || d.scheme !== "tcp") return null;
+    const onAccept = this.listeners.get(d.port);
     if (!onAccept) {
       // A dial to a dead port: the channel fails immediately on the DIAL side
       // (mirroring ECONNREFUSED → the socket's error/close events), so the
       // transport forgets the link instead of holding it until the deadline.
-      const [dial] = LoopbackChannel.pair(addr.host);
+      const [dial] = LoopbackChannel.pair(d.host);
       queueMicrotask(() => dial.kill());
       return dial;
     }
-    // The address's host is the "far end" both sides see — it is what the
+    // The destination's host is the "far end" both sides see — it is what the
     // half-open limiter buckets accepts by (the per-source cap; §12.6.1).
-    const [dial, accepted] = LoopbackChannel.pair(addr.host);
+    const [dial, accepted] = LoopbackChannel.pair(d.host);
     queueMicrotask(() => onAccept(accepted));
     return dial;
   }
@@ -106,7 +111,7 @@ export class LoopbackChannels {
     const fabric = this;
     const mine = [];
     return {
-      connect: (addr) => fabric.connect(addr),
+      connect: (dest) => fabric.connect(dest),
       async listen(tcp, ws, onAccept) {
         const r = await fabric.listen(tcp, ws, onAccept);
         if (r.port) mine.push(r.port);

@@ -133,15 +133,15 @@ async function linked(chans, aOpts = {}, bOpts = {}) {
   await B.driver.start();
   // A presents its OWN contact secret (aOpts.contactSecret, default CONTACT) on the dial;
   // B's factory hands over a plain accept.
-  aFactory.give(chans[0], { weDialed: true, expectPeerId: B.driver.peerId });
+  aFactory.give(chans[0], { weDialed: true, expectPeerId: B.peerId });
   bFactory.give(chans[1]);
   return st;
 }
 
 /** Whether A currently holds an authenticated link to B, and the reverse. A question
  *  asked of the guest's live peer set, because that is the only place the answer lives. */
-const aUp = (st) => linkedTo(st.A, st.B.driver.peerId);
-const bUp = (st) => linkedTo(st.B, st.A.driver.peerId);
+const aUp = (st) => linkedTo(st.A, st.B.peerId);
+const bUp = (st) => linkedTo(st.B, st.A.peerId);
 
 /** The pair above, already authenticated — the starting point for every test whose
  *  subject is what happens *after* the handshake. */
@@ -157,7 +157,7 @@ async function upPair(chanOpts, aOpts, bOpts) {
  *  an accept on B's. Split out because several tests open a second link on nodes
  *  `linked()`/`upPair()` already built. */
 function openPair(A, B, chans) {
-  A.factory.give(chans[0], { weDialed: true, expectPeerId: B.driver.peerId });
+  A.factory.give(chans[0], { weDialed: true, expectPeerId: B.peerId });
   B.factory.give(chans[1]);
 }
 
@@ -171,7 +171,7 @@ console.log("\nTransport link hardening (§12.6.1) + concealed handshake (§12.6
 await test("baseline: two ends authenticate and exchange frames", async (keep) => {
   const st = keep(await upPair());
   const proto = PROTO;
-  const resp = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1, 2, 3]));
+  const resp = await st.A.request(st.B.peerId, proto, Uint8Array.from([1, 2, 3]));
   assert(resp.length === 3 && resp[2] === 3, `frames not delivered: ${resp.length}`);
   assert(await aUp(st), "the dialer must attribute the link to the peer it dialed");
   assert(await bUp(st), "the acceptor must attribute the link to the caller");
@@ -185,9 +185,9 @@ await test("a request's deadline is the CALLER's, not a node-wide clock", async 
   const proto = PROTO;
   // A holder that never answers: the deadline is the only thing that can settle these.
   const t0 = Date.now();
-  const short = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 150)
+  const short = st.A.request(st.B.peerId, proto, Uint8Array.from([1]), 150)
     .then(() => "resolved", () => Date.now() - t0);
-  const long = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([2]), 5000)
+  const long = st.A.request(st.B.peerId, proto, Uint8Array.from([2]), 5000)
     .then(() => "resolved", () => Date.now() - t0);
 
   const shortMs = await short;
@@ -215,7 +215,7 @@ await test("the deadline is a STALL clock: a request still draining out is not l
   const drain = setInterval(() => { chans[0].backlog = Math.max(0, chans[0].backlog - 4_000); }, 40);
 
   const t0 = Date.now();
-  const settled = st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+  const settled = st.A.request(st.B.peerId, proto, Uint8Array.from([1]), 100)
     .then(() => "resolved", () => Date.now() - t0);
 
   // While it drains, the request must survive well past its own deadline.
@@ -243,7 +243,7 @@ await test("a stalled link still settles on the deadline", async (keep) => {
   const proto = PROTO;
   chans[0].backlog = 40_000;                            // frozen: no drain interval
   const t0 = Date.now();
-  const ms = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([1]), 100)
+  const ms = await st.A.request(st.B.peerId, proto, Uint8Array.from([1]), 100)
     .then(() => "resolved", () => Date.now() - t0);
   assert(typeof ms === "number", "a stalled request must reject");
   assert(ms < 1500, `a frozen backlog must settle on the deadline, not wait forever (took ${ms}ms)`);
@@ -285,9 +285,9 @@ await test("CONCEALMENT: a responder says NOTHING to a caller without the contac
 await test("CONCEALMENT: neither identity appears in cleartext on the wire", async (keep) => {
   const st = keep(await upPair());
   const proto = PROTO;
-  await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([9]));
+  await st.A.request(st.B.peerId, proto, Uint8Array.from([9]));
   const wire = [...st.chans[0].sent, ...st.chans[1].sent].join("");
-  for (const [name, id] of [["initiator", st.A.driver.peerId], ["responder", st.B.driver.peerId]]) {
+  for (const [name, id] of [["initiator", st.A.peerId], ["responder", st.B.peerId]]) {
     assert(!wire.includes(id), `${name} identity key found in cleartext on the wire`);
   }
 });
@@ -302,7 +302,7 @@ await test("CONCEALMENT: msg1 carries no identity, so a seized static key reveal
   await until(() => chans[0].sent.length > 0, 4000, "msg1");
   const msg1 = Buffer.from(chans[0].sent[0], "hex");
   assert(msg1.length === 1265, `hybrid msg1 should be 1265 bytes, got ${msg1.length}`);
-  assert(!msg1.includes(Buffer.from(st.A.driver.peerId, "hex")), "msg1 must not carry the initiator identity");
+  assert(!msg1.includes(Buffer.from(st.A.peerId, "hex")), "msg1 must not carry the initiator identity");
 });
 
 await test("CONTACT SECRET: the address book alone does not grant a probe", async (keep) => {
@@ -343,7 +343,7 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
   // pool is keyed by `expectPeerId` on the dial, so an app send to that peer id queues
   // pre-auth rather than failing for want of a link — far over the (pre-auth) cap, but
   // maxFrameBytes is 2 MiB so it is well inside the post-auth one.
-  st.A.sendNoReply(st.B.driver.peerId, PROTO, new Uint8Array(64 * 1024).fill(7));
+  st.A.sendNoReply(st.B.peerId, PROTO, new Uint8Array(64 * 1024).fill(7));
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
   await settle();
   assert(!st.a.closed && !st.b.closed, "a full-size frame after auth must cross, not close the link");
@@ -364,7 +364,7 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
   const payload = new Uint8Array(48 * 1024).fill(0x5a);
   armed = true; // from here on, drop A's real delivery — it is re-fed manually below
   const before = chans[0].sent.length;
-  const respP = st.A.request(st.B.driver.peerId, proto, payload, 8000);
+  const respP = st.A.request(st.B.peerId, proto, payload, 8000);
   await until(() => chans[0].sent.length > before, 3000, "A's wire message");
   const wire = Uint8Array.from(Buffer.from(chans[0].sent[chans[0].sent.length - 1], "hex"));
   // Re-feed the exact bytes one at a time, yielding between pushes so each slice
@@ -390,7 +390,7 @@ await test("REASSEMBLY: slices that straddle the merge threshold reassemble too"
   for (let i = 0; i < payload.length; i++) payload[i] = (i * 7) & 255;
   armed = true;
   const before = chans[0].sent.length;
-  const respP = st.A.request(st.B.driver.peerId, PROTO, payload, 8000);
+  const respP = st.A.request(st.B.peerId, PROTO, payload, 8000);
   await until(() => chans[0].sent.length > before, 3000, "A's wire message");
   const wire = Uint8Array.from(Buffer.from(chans[0].sent[chans[0].sent.length - 1], "hex"));
   const sizes = [1, 3, 8191, 1, 8192, 2, 40_000, 1, 5000];
@@ -413,7 +413,7 @@ await test("SEND CAP: an app's over-cap request is refused BEFORE it is copied",
   // refused for existed.
   const st = keep(await upPair());
   let refused = "";
-  try { await st.A.request(st.B.driver.peerId, PROTO, new Uint8Array(3 * 1024 * 1024)); }
+  try { await st.A.request(st.B.peerId, PROTO, new Uint8Array(3 * 1024 * 1024)); }
   catch (e) { refused = String(e); }
   assert(refused.includes("over the frame cap"), `an over-cap send must be refused, got ${refused || "no error"}`);
   // ...and a malformed destination, which is what the hex conversion would have run on.
@@ -441,7 +441,7 @@ await test("IDLE: traffic keeps a link alive across the clock", async (keep) => 
   // link would be worse than none.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 80 }, { linkIdleTimeoutMs: 80 }));
   for (let i = 0; i < 8; i++) {
-    const r = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([i]));
+    const r = await st.A.request(st.B.peerId, PROTO, Uint8Array.from([i]));
     assert(r[0] === i, `frame ${i} did not come back — the link died under its idle clock`);
     await settle(40);
   }
@@ -501,7 +501,7 @@ await test("CONTACT SECRET: absent means OPEN — the node still conceals identi
   // neither public key crosses the wire.
   const st = keep(await upPair(undefined, { contactSecret: undefined }, { contactSecret: undefined }));
   const wire = [...st.chans[0].sent, ...st.chans[1].sent].join("");
-  for (const [name, id] of [["caller", st.A.driver.peerId], ["receiver", st.B.driver.peerId]]) {
+  for (const [name, id] of [["caller", st.A.peerId], ["receiver", st.B.peerId]]) {
     assert(!wire.includes(id), `${name} identity in cleartext on an open node`);
   }
 });
@@ -542,7 +542,7 @@ async function makeTransportHostWithGetter(getSecret) {
   });
   await shell.loadBundleBlob(transportBlob);
   await driver.start();
-  return { shell, driver, identity, factory };
+  return { shell, driver, identity, factory, peerId: hexOf(identity.publicKey) };
 }
 
 await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation has no re-install", async (keep) => {
@@ -566,7 +566,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   // The boot-time secret opens the door on both sides.
   const c1 = wirePair();
   openPair(A, B, c1);
-  await until(async () => (await linkedTo(A, B.driver.peerId)) && (await linkedTo(B, A.driver.peerId)),
+  await until(async () => (await linkedTo(A, B.peerId)) && (await linkedTo(B, A.peerId)),
     4000, "boot-time secret");
 
   // Rotate B's gate; A still presents the OLD value. The responder says nothing at all —
@@ -652,9 +652,9 @@ await test("handshake deadline closes a link that never speaks", async (keep) =>
   });
   keep({ close() { try { A.shell.close(); } catch { /* down */ } } });
   await A.driver.start();
-  factory.give(chans[0], { weDialed: true, expectPeerId: A.driver.peerId });
+  factory.give(chans[0], { weDialed: true, expectPeerId: A.peerId });
   await until(() => closed, 3000, "the deadline to close the link and notify");
-  assert(!(await linkedTo(A, A.driver.peerId)), "must not authenticate");
+  assert(!(await linkedTo(A, A.peerId)), "must not authenticate");
 });
 
 await test("rekey: the ratchet keeps frames flowing across an epoch boundary", async (keep) => {
@@ -663,7 +663,7 @@ await test("rekey: the ratchet keeps frames flowing across an epoch boundary", a
     { transportConfig: { rekeyAfterFrames: 4 } }));
   const proto = PROTO;
   for (let i = 0; i < 14; i++) {
-    const r = await st.A.request(st.B.driver.peerId, proto, Uint8Array.from([i]));
+    const r = await st.A.request(st.B.peerId, proto, Uint8Array.from([i]));
     assert(r[0] === i, `frame ${i} came back as ${r[0]} — ordering broke across a ratchet`);
   }
   assert(!st.a.closed && !st.b.closed, "link must survive rekeying");
@@ -676,7 +676,7 @@ await test("rekey: mismatched intervals desync (the must-match warning is real)"
     { transportConfig: { rekeyAfterFrames: 8 } }));
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
   for (let i = 0; i < 8; i++) {
-    st.A.sendNoReply(st.B.driver.peerId, PROTO, Uint8Array.from([i]));
+    st.A.sendNoReply(st.B.peerId, PROTO, Uint8Array.from([i]));
     await settle(20);
   }
   await until(() => st.b.closed, 3000, "a desync must tear the link down, not silently corrupt");
@@ -703,7 +703,7 @@ await test("goodbye is not delivered to the application as a frame", async (keep
   // headroom so the request settles well before the timeout fires.
   const st = keep(await upPair(undefined, { linkIdleTimeoutMs: 150 }));
   const proto = PROTO;
-  await st.A.request(st.B.driver.peerId, proto, new TextEncoder().encode("real"));
+  await st.A.request(st.B.peerId, proto, new TextEncoder().encode("real"));
   await until(() => st.b.closed, 3000, "the idle clock to retire the link");
   await settle(100);
   // What the far APP was handed, asked of the app itself — there is no host-side sink
@@ -742,7 +742,7 @@ await test("goodbye: an injected junk record must NOT produce a farewell", async
     },
   }));
   armed = true;
-  st.A.sendNoReply(st.B.driver.peerId, PROTO, new TextEncoder().encode("payload"));
+  st.A.sendNoReply(st.B.peerId, PROTO, new TextEncoder().encode("payload"));
   await until(() => st.a.closed && st.b.closed, 3000, "both ends to tear down");
   assert(corrupted, "the test did not actually corrupt a record");
   assert(st.b.reason === CLOSE_REASON.ABORTED, `victim should read ABORTED, got ${st.b.reason}`);
@@ -801,7 +801,7 @@ await test("GUARD: a refused caller learns NOTHING about the receiver", async (k
   // One message back (msg2, an ephemeral and a contact proof), then silence. The
   // receiver's identity and signature must never go out.
   assert(chans[1].sent.length === 1, `refused caller drew ${chans[1].sent.length} messages, want 1 (msg4 leaked)`);
-  assert(!chans[1].sent.join("").includes(st.B.driver.peerId),
+  assert(!chans[1].sent.join("").includes(st.B.peerId),
     "the receiver revealed its identity to a caller it then refused");
   assert(!(await aUp(st)), "a refused caller must not authenticate");
 });
@@ -821,7 +821,7 @@ await test("a decrypt failure does not advance the receive counter", async (keep
     },
   }));
   armed = true;
-  st.A.sendNoReply(st.B.driver.peerId, PROTO, new TextEncoder().encode("tampered"));
+  st.A.sendNoReply(st.B.peerId, PROTO, new TextEncoder().encode("tampered"));
   await until(() => st.b.closed, 3000, "a forged record must close the link");
   assert((await st.B.seen()).length === 0, "a forged record must not be delivered");
 });
@@ -853,12 +853,12 @@ await test("a peer-inbound answer reaches the loader through onInbound", async (
     onInbound: (claim, from, answer) => seen.push({ claim, from: Buffer.from(from).toString("hex"), answer }),
   });
 
-  const resp = await st.A.request(st.B.driver.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
+  const resp = await st.A.request(st.B.peerId, "watch/v1", Uint8Array.from([1, 2, 3]));
   assert(resp.length === 3 && resp[0] === 0xfe && resp[1] === 0xfd && resp[2] === 0xfc,
     `the caller must still get the app's own answer untouched, got ${[...resp]}`);
   assert(seen.length === 1, "onInbound must fire exactly once per peer-inbound answer");
   assert(seen[0].claim === "watch/v1", "…named the claim the frame arrived on");
-  assert(seen[0].from === st.A.driver.peerId,
+  assert(seen[0].from === st.A.peerId,
     "…and the AUTHENTICATED sender, exactly as dispatch attributes it");
   assert(bytesEqual(seen[0].answer, resp), "…carrying exactly the bytes the caller received");
 
@@ -880,12 +880,12 @@ await test("a peer cannot reach a bundle's local service claim, the transport's 
     const n = Buffer.from(op, "utf8");
     return Uint8Array.from([n.length, ...n]);
   };
-  const peers = await st.A.request(st.B.driver.peerId, "_net", opEnvelope("peers"));
+  const peers = await st.A.request(st.B.peerId, "_net", opEnvelope("peers"));
   assert(peers.length === 0,
     `the transport's own claim must not answer a peer, got ${peers.length} bytes: ${hexOf(peers)}`);
   // Not merely unanswered — never delivered: the ordinary claim still works on the same
   // link, so this is a routing rule and not a link that stopped carrying frames.
-  const ordinary = await st.A.request(st.B.driver.peerId, PROTO, Uint8Array.from([4, 5]));
+  const ordinary = await st.A.request(st.B.peerId, PROTO, Uint8Array.from([4, 5]));
   assert(ordinary.length === 2 && ordinary[1] === 5, "the app's own id still answers over the same link");
 });
 
@@ -916,8 +916,8 @@ await test("DELIVERY: two pipelined requests in ONE read are two correctly attri
   // Hold A's writes, issue both requests, then deliver them as one read.
   st.chans[0].hold();
   const sends = [
-    st.A.sendNoReply(st.B.driver.peerId, PROTO, first),
-    st.A.sendNoReply(st.B.driver.peerId, PROTO, second),
+    st.A.sendNoReply(st.B.peerId, PROTO, first),
+    st.A.sendNoReply(st.B.peerId, PROTO, second),
   ];
   await until(() => st.chans[0].held.length >= 2, 4000, "both requests written");
   const coalesced = st.chans[0].flush();
@@ -938,7 +938,7 @@ await test("DELIVERY: two pipelined requests in ONE read are two correctly attri
   assert(hexOf(seen[1]) === hexOf(second), `second payload intact, got ${hexOf(seen[1])}`);
   // And both are attributed to the peer that actually sent them — never to the key the
   // second payload names, which is the whole point of the crafted bytes above.
-  assert(from.length === 2 && from.every((f) => f === st.A.driver.peerId),
+  assert(from.length === 2 && from.every((f) => f === st.A.peerId),
     `both deliveries must be attributed to the sending peer, got ${from.join(", ")}`);
   assert(!from.includes(hexOf(forgedAttribution)),
     "a payload's own bytes must never become another delivery's attribution");
@@ -956,7 +956,7 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
   // `peers` through the APP's seam — a cross-realm call carrying the app's key, not the
   // host's 32 zero bytes. This is the path seedstore's guest takes to place replicas.
   const raw = await st.B.op("peers");
-  assert(raw.length === 32 && hexOf(raw) === st.A.driver.peerId,
+  assert(raw.length === 32 && hexOf(raw) === st.A.peerId,
     "an app asking `peers` must get the authenticated set back");
   // `linkBytes` through the same seam must be refused by NAME, not silently ignored.
   let refused = "";

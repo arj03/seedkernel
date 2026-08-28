@@ -5,8 +5,8 @@
 // scripts/bundle-loader.mjs.
 import { policyFromJson } from "./policy.js";
 import { verifyBundle, FreshnessMarks, freshnessPathFor, type JsonObject, type PureModuleLoader } from "./bundle.js";
-import { runCli, requireLinkBinding, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
-import { parsePeerSpec } from "./peer-addr.js";
+import { runCli, requireLinkBinding, transportConfigFrom, type CliHost, type NodeRuntime, type NodeSetup } from "./cli.js";
+import { parseDest } from "./peer-addr.js";
 import {
   bootShell, type AppHandle, type RealmFactory, type Shell, type ShellSodium,
 } from "./shell-core.js";
@@ -333,9 +333,18 @@ function framed(link: GoLink, framing: Framing, authority?: string): RawLink {
  *  producing RawLinks identically to the node:net factory, so the transport bundle's link
  *  state machine runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
-    connect: (addr) => addr.transport === "ws"
-        ? framed(netConnectRaw(addr.host, addr.port), FRAMING.WS_CLIENT, `${addr.host}:${addr.port}`)
-        : framed(netConnectRaw(addr.host, addr.port), FRAMING.LENGTH),
+    // The guest's opaque destination, resolved against what Go's sockets reach: `tcp://` is
+    // the node↔node path, `ws://` the same socket under the RFC 6455 codec, and `wss://` a
+    // destination with no TLS stack under it here, so it reads "no route" rather than
+    // dialing plaintext at a TLS port (net-node.ts makes the same call).
+    connect: (dest) => {
+        const d = parseDest(dest);
+        if (!d || d.scheme === "wss")
+            return null;
+        return d.scheme === "ws"
+            ? framed(netConnectRaw(d.host, d.port), FRAMING.WS_CLIENT, `${d.host}:${d.port}`)
+            : framed(netConnectRaw(d.host, d.port), FRAMING.LENGTH);
+    },
     listen: (tcp, ws, onAccept) => Promise.resolve({
         port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(framed(s, FRAMING.LENGTH))) : 0,
         wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(framed(s, FRAMING.WS_SERVER))) : 0,
@@ -512,27 +521,24 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     // the JS shell would compute from the same seed. Go holds the seed and nothing else.
     const key = deriveNodeKey(sodium, fromHex(cfg.keyHex));
     setPolicy(cfg.policyJson);
+    // The cohort is parsed BEFORE the boot and goes in as the transport's own configuration:
+    // the address book is the transport guest's, so a peer list is something a transport is
+    // loaded WITH, not something taught to a driver afterwards (§12.10).
+    const peers: string[] = cfg.peers ?? [];
     const s = await makeTransportNode({
         identity: key,
         contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
-        transportConfig: cfg.requestDeadlineMs === undefined
-            ? undefined
-            : { requestDeadlineMs: cfg.requestDeadlineMs },
+        transportConfig: transportConfigFrom(peers, cfg.requestDeadlineMs === undefined ? undefined : String(cfg.requestDeadlineMs)),
     });
     shell = s.shell;
     const network = s.transport;
-    const peers: string[] = cfg.peers ?? [];
     if (peers.length > 0) {
         // The same diagnosis the operator flow gives (`--peers`): the adapter is the
         // platform's and always there, so an unowned raw-link binding has to be said rather
         // than discovered as a dial that answers nothing.
         requireLinkBinding(s.transport, "peers were configured, but there is nothing to dial from");
-        for (const spec of peers) {
-            const { peerId, addr } = parsePeerSpec(spec, "tcp");
-            network.addPeerAddr(peerId, addr);
-        }
         // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
         // cohort member that is not up yet delays the boot but never fails it.
         await network.ready();

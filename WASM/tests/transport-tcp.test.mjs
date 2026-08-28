@@ -60,7 +60,10 @@ async function makeNode(ws = false) {
   });
   await shell.loadBundleBlob(transportBlob, { localConfig: transportConfig });
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return { shell, transport, app };
+  // The node's own channel key, hex. Read off the identity this factory minted rather than
+  // asked of the driver: it is the same `toHex(identity.publicKey)` every caller already
+  // holds, and the driver has nothing to say about peers any more (core/socket-seam.ts).
+  return { shell, transport, app, peerId: Buffer.from(identity.publicKey).toString("hex") };
 }
 
 const { ok, summary } = testkit();
@@ -82,17 +85,19 @@ assert(aNet.port > 0 && bNet.port > 0, "both nodes bound real TCP listeners");
 // its own cap on authentication, and it is certain to arrive as several TCP segments.
 const BIG = 512 * 1024;
 
-aNet.addPeerAddr(b.transport.peerId, { host: HOST, port: bNet.port, transport: "tcp" });
+// The listener's port is only known now, so the peer is taught to the running occupant
+// rather than named in its load config — the same `addr` event either path ends in.
+aNet.addr(b.peerId, `tcp://${HOST}:${bNet.port}`);
 await aNet.ready(4000);
-assert((await aNet.linkedPeers()).includes(b.transport.peerId), "the AKE completed over a real socket");
+assert((await aNet.linkedPeers()).includes(b.peerId), "the AKE completed over a real socket");
 
-const small = await appRequest(a.app, b.transport.peerId, new Uint8Array([1, 2, 3, 4]));
+const small = await appRequest(a.app, b.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(small.length === 4 && small[3] === 4, "a small request round-trips through the guest's framer");
 
 // The reassembly case: a response guaranteed to span many segments, checked byte for
 // byte. A framer that mishandled a partial length prefix or a split body would either
 // hang here or deliver a corrupted message rather than merely a short one.
-const big = await appRequest(a.app, b.transport.peerId, generatorRequest(BIG, 1));
+const big = await appRequest(a.app, b.peerId, generatorRequest(BIG, 1));
 assert(big.length === BIG, `a ${BIG}-byte response reassembled from many TCP segments`);
 let intact = true;
 for (let i = 0; i < BIG; i++) if (big[i] !== (i & 0xff)) { intact = false; break; }
@@ -120,17 +125,17 @@ await cNet.start();
 await dNet.start();
 assert(dNet.wsPort > 0, "the WS listener bound");
 
-// `transport: "ws"` is the whole difference: the host dials the same kind of TCP
-// socket and declares a different codec on it.
-cNet.addPeerAddr(d.transport.peerId, { host: HOST, port: dNet.wsPort, transport: "ws" });
+// The `ws://` scheme is the whole difference: the destination string sends the host's
+// factory at the same kind of TCP socket, which declares a different codec on it.
+cNet.addr(d.peerId, `ws://${HOST}:${dNet.wsPort}`);
 await cNet.ready(4000);
-assert((await cNet.linkedPeers()).includes(d.transport.peerId), "the AKE completed through the WS upgrade");
+assert((await cNet.linkedPeers()).includes(d.peerId), "the AKE completed through the WS upgrade");
 
-const wsSmall = await appRequest(c.app, d.transport.peerId, new Uint8Array([5, 6, 7]));
+const wsSmall = await appRequest(c.app, d.peerId, new Uint8Array([5, 6, 7]));
 assert(wsSmall.length === 3 && wsSmall[2] === 7, "a small request round-trips as masked WS frames");
 
 // Large enough to force 64-bit WS length headers and multi-segment reassembly at once.
-const wsBig = await appRequest(c.app, d.transport.peerId, generatorRequest(BIG, 7));
+const wsBig = await appRequest(c.app, d.peerId, generatorRequest(BIG, 7));
 assert(wsBig.length === BIG, `a ${BIG}-byte response crossed as WS frames`);
 let wsIntact = true;
 for (let i = 0; i < BIG; i++) if (wsBig[i] !== ((i * 7) & 0xff)) { wsIntact = false; break; }
@@ -141,7 +146,7 @@ assert(wsIntact, "every byte survived WS framing + reassembly");
 // hands over the next chunk without waiting for it: what keeps the two parses from running
 // over one reassembly buffer is the framer's read chain (framing.js `push`).
 const burst = await Promise.all(
-  Array.from({ length: 12 }, (_, i) => appRequest(c.app, d.transport.peerId, generatorRequest(1024 + i, 11 + i))));
+  Array.from({ length: 12 }, (_, i) => appRequest(c.app, d.peerId, generatorRequest(1024 + i, 11 + i))));
 let burstIntact = burst.length === 12;
 burst.forEach((resp, i) => {
   if (resp.length !== 1024 + i) { burstIntact = false; return; }

@@ -162,7 +162,10 @@ async function makeNode(channels, listen, freshnessStore = new FreshnessMarks())
   });
   await shell.loadBundleBlob(transportBlob, { localConfig: transportConfig });
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor));
-  return { shell, transport, realmControl, app };
+  // This node's channel key, hex. Off the identity minted here, not asked of the driver:
+  // it is `toHex(identity.publicKey)`, which every caller already holds.
+  const peerId = Buffer.from(identity.publicKey).toString("hex");
+  return { shell, transport, realmControl, app, peerId };
 }
 
 console.log("Test: transport bundle drives two nodes over loopback");
@@ -175,10 +178,10 @@ const a = await makeNode(fabric.view(), listen);
 const b = await makeNode(fabric.view(), listen);
 const aNet = a.transport;
 const bNet = b.transport;
-const bId = b.transport.peerId;
+const bId = b.peerId;
 const c = await makeNode(fabric.view(), listen);
 const cNet = c.transport;
-const cId = cNet.peerId;
+const cId = c.peerId;
 
 console.log("  starting listeners…");
 await aNet.start();
@@ -188,11 +191,12 @@ assert(aNet.port > 0 && bNet.port > 0 && cNet.port > 0, "all nodes bound loopbac
 
 // Each node runs the echo app, so both directions work — the upgrade below has to be
 // checked both ways: A dialing out through the new transport, and B reaching A.
-aNet.addPeerAddr(bId, { host: "loopback", port: bNet.port, transport: "tcp" });
+const bDest = `tcp://loopback:${bNet.port}`;
+aNet.addr(bId, bDest);
 await aNet.ready(2000);
 assert((await aNet.linkedPeers()).includes(bId), "A authenticated B over loopback (AKE ran)");
 
-const resp = await request(b.app, aNet.peerId, new Uint8Array([1, 2, 3, 4]));
+const resp = await request(b.app, a.peerId, new Uint8Array([1, 2, 3, 4]));
 assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through the record layer");
 
 // ── The upgrade: swap A's transport while it is running and linked ───────────────
@@ -200,7 +204,6 @@ assert(resp.length === 4 && resp[3] === 4, "B's request to A echoed back through
 // stable while the realm and its private session state are replaced.
 console.log("  upgrading A's transport in place…");
 const oldPort = aNet.port;
-const oldPeerId = aNet.peerId;
 const oldClaimant = a.shell.resolve(TRANSPORT_SERVICE);
 let candidateConfigured;
 const configured = new Promise((resolve) => { candidateConfigured = resolve; });
@@ -209,34 +212,39 @@ const publish = new Promise((resolve) => { publishCandidate = resolve; });
 a.realmControl.pauseNext = async () => { candidateConfigured(); await publish; };
 const upgrading = a.shell.loadBundleBlob(transportBundleAt(2, transportKeys));
 await configured;
-// The candidate's `init` facts were not snapped at the pause: this address update lands
-// after it, before the handover, while the incumbent still owns `_net`. The address book
-// is the NODE's, so it survives the commit iff the host replays it to the published
-// claimant; the facts the newcomer received in LOCAL never carried it.
-aNet.addPeerAddr(cId, { host: "loopback", port: cNet.port, transport: "tcp" });
+// An address taught in the replacement window lands on whoever owns `_net` right NOW,
+// which is still the incumbent — the candidate's realm stands but is unpublished. `addr`
+// is a pass-through with no host-side book behind it, so this entry dies with the realm it
+// reached, and the assertion below is that it is GONE rather than replayed.
+aNet.addr(cId, `tcp://loopback:${cNet.port}`);
 publishCandidate();
 await upgrading;
 
 assert(a.shell.resolve(TRANSPORT_SERVICE) === oldClaimant, "the update retained its own transport claim");
 assert(aNet.isClosed === false, "the adapter is neither closed nor leaked by the slot replacement");
 assert(aNet.port === oldPort, "the node stayed on the SAME port its peers hold");
-assert(aNet.peerId === oldPeerId, "the node identity is the host's, untouched by the swap");
 
-let racedAddrResp = null;
-try { racedAddrResp = await request(a.app, cId, new Uint8Array([7, 8, 9])); } catch { /* assertion below */ }
-assert(racedAddrResp?.length === 3 && racedAddrResp[2] === 9,
-  "an address added after candidate config but before claim commit is replayed to the replacement");
+// The COST of the address book living in the guest, stated as a test rather than left
+// implicit: neither the peer A was linked to nor the one taught mid-window survives the
+// swap, because both were entries in a realm that is gone. A request to either has nowhere
+// to go and fails on its deadline, exactly as a peer with no address always has.
+let strandedB = true, strandedC = true;
+try { await request(a.app, bId, new Uint8Array([9, 9])); strandedB = false; } catch { /* expected */ }
+try { await request(a.app, cId, new Uint8Array([7, 8, 9])); strandedC = false; } catch { /* expected */ }
+assert(strandedB && strandedC, "the replacement starts with an EMPTY address book — nothing is replayed to it");
 
-// Live links do not survive and are not meant to: session keys live in the outgoing
-// guest's private memory. What survives is the host's half — the address book — so the
-// first request redials and succeeds.
+// The embedder's part of the bargain: re-supply the address and the new guest dials it
+// itself. Live links never survived either — the session keys were private to the outgoing
+// realm — so this one request is a reconnect in both halves, over the same listener on the
+// same port B has always known.
+aNet.addr(bId, bDest);
 const resp2 = await request(a.app, bId, new Uint8Array([9, 9]));
-assert(resp2.length === 2 && resp2[0] === 9, "A reconnects from the re-seeded address book and requests through the NEW transport");
+assert(resp2.length === 2 && resp2[0] === 9, "A reconnects once the embedder re-supplies the address, through the NEW transport");
 
-// And the reverse direction: B dials A on the port it already knew, and reaches A's app
-// through the incoming guest.
-const resp3 = await request(b.app, aNet.peerId, new Uint8Array([5, 6, 7]));
-assert(resp3.length === 3 && resp3[2] === 7, "B reaches A on the unchanged port, through the new guest");
+// And the reverse direction over that fresh link: B answers back into A's app through the
+// incoming guest, so the replacement carries inbound frames as well as the ones it dialed.
+const resp3 = await request(b.app, a.peerId, new Uint8Array([5, 6, 7]));
+assert(resp3.length === 3 && resp3[2] === 7, "B reaches A through the new guest, on the unchanged port");
 
 // A downgrade is still refused: standing v2 advanced this author's (author, app) mark,
 // and the transport answers to that mark like any other bundle (§12.4).
@@ -262,6 +270,10 @@ try { await a.shell.loadBundleBlob(transportBundleAt(2, transportKeys)); }
 catch { v2Reloaded = false; }
 assert(v2Reloaded, "the known-good v2 reinstalls after the failed v3 — the mark records only what ran");
 assert(a.shell.resolve(TRANSPORT_SERVICE) !== null, "…and the reinstalled bundle holds the transport id again");
+// A successful reinstall is a slot replacement like any other, so this realm's address book
+// is empty too and the embedder supplies it again. The refused loads above needed no such
+// line: nothing was replaced, so the standing occupant kept the book it already had.
+aNet.addr(bId, bDest);
 assert((await request(a.app, bId, new Uint8Array([8, 8]))).length === 2,
   "…and the node is back on the network through it");
 
@@ -278,6 +290,21 @@ assert(noConfigFailed && /maxFrameBytes|connsPerPeer|config/.test(noConfigMsg),
   `a transport signing no guest.config fails the load (${noConfigMsg})`);
 assert((await request(a.app, bId, new Uint8Array([9]))).length === 1,
   "…and the standing transport is untouched by the refusal");
+
+// ── A cohort named wrong is a failed load, not a peer that looks down ────────────
+// The same rule one field over: a half-length peer key would key the guest's address book
+// under an id no handshake can ever match, and the only symptom would be a peer that never
+// links — indistinguishable from one that is switched off. So the guest checks the shape
+// of `LOCAL.peers` where it reads it, and a load naming a cohort wrong fails outright.
+let badPeersMsg = "";
+try {
+  await a.shell.loadBundleBlob(transportBundleAt(3, transportKeys), {
+    localConfig: { peers: [{ peerId: "ab".repeat(20), dest: "tcp://loopback:1" }] },
+  });
+} catch (e) { badPeersMsg = e.message; }
+assert(/peers/.test(badPeersMsg), `a short peer key in the cohort config fails the load (${badPeersMsg})`);
+assert((await request(a.app, bId, new Uint8Array([3]))).length === 1,
+  "…and that refusal too left the standing transport serving");
 
 // ── A mark that cannot be persisted is a failed load ─────────────────────────────
 console.log("  an `_net` claimant whose mark cannot be persisted fails the load…");

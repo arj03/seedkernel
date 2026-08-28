@@ -31,6 +31,12 @@ const connsPerPeer = Math.max(1, policy("connsPerPeer"));
 const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
+// The address book this installation was configured with: `{ peerId, dest, contactSecret? }`
+// in hex, seeded into `Core.addrs` once the core exists. The book is THIS realm's — the
+// host keeps no copy — so a transport replacement starts from whatever its own load named,
+// plus whatever `addr` events follow (§12.10).
+const configuredPeers = LOCAL.peers ?? APP.peers;
+if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const requestDeadlineMs = policy("requestDeadlineMs");
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
@@ -158,7 +164,7 @@ class Core {
   constructor() {
     this.connecting = new Map(); // peerId → Link[] (outbound, pre-auth)
     this.inbound = new Set();    // accepted, pre-auth
-    this.addrs = new Map();      // peerId → 32B contact secret (or null = open)
+    this.addrs = new Map();      // peerId → { dest, secret } — this program's address book
     this.readyWaiters = [];      // [{check, d, timer}] — one per in-flight ready()
     this.dialing = new Map();    // peerId → in-flight dial, so concurrent senders share one
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
@@ -175,8 +181,12 @@ class Core {
     return true;
   }
 
-  addAddr(peerBytes, secret) {
-    this.addrs.set(toHex(peerBytes), secret.length > 0 ? secret : null);
+  /** Learn (or re-learn) one peer: where to reach it and the secret its door gates on.
+   *  An EMPTY `dest` is a peer we know of but cannot dial — an RTC peer, whose links arrive
+   *  through signaling — which is a real entry and not a missing one: it carries the contact
+   *  secret an inbound link needs without pretending we hold a route. */
+  addAddr(peerBytes, secret, dest) {
+    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }
 
   /** Top a dialed peer up to connsPerPeer outbound links. One dial per peer at a time:
@@ -190,10 +200,14 @@ class Core {
   }
 
   async dialNow(peerId) {
-    if (!this.addrs.has(peerId)) return;
+    const addr = this.addrs.get(peerId);
+    // Unknown, or known and not dialable BY US: an entry with no destination is a peer whose
+    // links can only arrive (signaling brought it), so there is nothing to open here. Both
+    // read the same at every caller — the frame waits for an inbound link or is dropped.
+    if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const opened = await netLinkOpen(fromHex(peerId));
+      const opened = await netLinkOpen(addr.dest);
       if (opened.linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
       this.openLink({
         linkId: opened.linkId,
@@ -201,7 +215,7 @@ class Core {
         authority: opened.authority,
         weDialed: true,
         expectPeerId: fromHex(peerId),
-        linkSecret: this.addrs.get(peerId),
+        linkSecret: addr.secret,
         limiter: null,
         dialedPeerId: peerId,
       });
@@ -380,6 +394,22 @@ router.sink = (from, frame) => reqres.onFrame(from, frame);
 // The cohort edges stay in this heap; the host reads them with the `peers` op.
 router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
 router.onPeerDown = (peerId) => { connected.delete(peerId); };
+// The configured cohort, seeded before the host's first event can arrive. A `contactSecret`
+// left out is an OPEN peer — the same 32 zero bytes the `addr` event spells it with — and
+// not "fall back to ours", which is a different peer's door.
+//
+// Each field is checked here for the reason every other config value is (`policy`): a
+// half-length key would key this book under a peer no handshake can ever match, which
+// reads exactly like a peer that is down. A load that names a cohort wrong fails instead.
+for (const p of configuredPeers) {
+  const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
+  if (!p || !hex32(p.peerId)) throw new Error("transport: config peers[].peerId must be 64 lowercase hex characters");
+  if (p.contactSecret !== undefined && !hex32(p.contactSecret)) {
+    throw new Error("transport: config peers[].contactSecret must be 64 lowercase hex characters");
+  }
+  if (p.dest !== undefined && typeof p.dest !== "string") throw new Error("transport: config peers[].dest must be a string");
+  core.addAddr(fromHex(p.peerId), p.contactSecret === undefined ? ZERO32 : fromHex(p.contactSecret), p.dest ?? "");
+}
 
 /**
  * The one entrypoint. The kernel's part of the argument is exactly the 32-byte caller;
@@ -484,9 +514,13 @@ entry("send", (r, caller) => {
   return d.promise;
 });
 
+/** One peer, taught by the host on the embedder's behalf: who, the secret its door gates
+ *  on, and where to reach it. The destination is opaque to everything between this book and
+ *  the host's socket factory, and an EMPTY one is a peer we cannot dial (see `addAddr`). */
 entry("addr", (r) => {
   const peer = r.blob();
-  core.addAddr(peer, r.blob());
+  const secret = r.blob();
+  core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
 
 /** Wait until every known peer is linked, or the deadline passes. Deferred for the same

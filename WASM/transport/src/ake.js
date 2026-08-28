@@ -211,9 +211,11 @@ async function channelSign(root, th, id) {
 // microtask now, so callers `await`; an inbound request is dispatched with `.then`, and
 // an app's send is answered with `defer()`.
 
-/** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
-async function netLinkOpen(destBytes) {
-  const r = await host.call(N_LINK_OPEN, destBytes);
+/** Open a link to an opaque destination — the string this program's own address book holds
+ *  for a peer, which only the host's socket factory takes apart. 0 ⇒ no route: this node
+ *  cannot reach that destination, and the caller treats it as a fabric dropping a frame. */
+async function netLinkOpen(dest) {
+  const r = await host.call(N_LINK_OPEN, utf8Encode(dest));
   const authLen = readU32BE(r, 5);
   return {
     linkId: readU32BE(r, 0),

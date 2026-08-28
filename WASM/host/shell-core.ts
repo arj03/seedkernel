@@ -684,8 +684,9 @@ function createShell(opts: CreateShellOptions & {
             else slots[previousIndex] = slot;
             for (const claim of slotClaims(slot)) claims.set(claim, slot);
             // The outgoing guest's link state went with its realm (§4.3), so the sockets it
-            // held are torn down here rather than left as channels nobody can speak for. The
-            // incoming guest redials from the address book, which is the NODE's. After the
+            // held are torn down here rather than left as channels nobody can speak for. So
+            // did its address book, which is why the incoming guest redials from the peers
+            // its own load named and not from anything retained here (§12.10). After the
             // claim hand-over above, so `onClose` finds the channels already gone and queues
             // no `linkClosed` at the new realm for links it never had. Only ever a free
             // binding or this identity's own: `refuseContested` turned any other candidate
@@ -699,11 +700,6 @@ function createShell(opts: CreateShellOptions & {
             // The mark and every claim/link binding have landed, so this slot's writes and
             // cross-realm calls are now its own (`seamFor`).
             slot.active = true;
-            // The address book is mutable node state, not part of the immutable facts the
-            // occupant received in LOCAL. Publish first, then replay it through the
-            // ordinary host-event path. No await in between: a concurrent add is either
-            // in this replay or is announced directly to the newly published claimant.
-            if (hasLink(slot)) netHost?.replayAddresses();
             disposeSlot(previous);
             // The handle: the verified facts plus the bound slot — the key, the scoped fs
             // view and the loopback invoke. One object, so a caller cannot derive half of

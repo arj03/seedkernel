@@ -151,7 +151,7 @@ const netBenchHarness = `
 	  // guest boundary.
 	  const localArg = new Uint8Array(34);
 	  globalThis.benchLocalN = async (n) => { for (let i = 0; i < n; i++) await bApp.invoke(opFrame("echo", localArg)); return new Uint8Array(0); };
-	  netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });
+	  netB.addr(aId, "tcp://127.0.0.1:" + netA.port);
 	})();
 `
 

@@ -1,6 +1,11 @@
-// Socket driver (§12.6): link table, address book, listeners. Wire codec/AKE/router
-// run as the transport bundle's guest via `link/*`. No name here re-enters the CALLING
-// realm: the one that enters a realm at all is `deliver`, and it enters the claimant's.
+// Socket driver (§12.6): link table and listeners. Wire codec/AKE/router run as the
+// transport bundle's guest via `link/*`. No name here re-enters the CALLING realm: the
+// one that enters a realm at all is `deliver`, and it enters the claimant's.
+//
+// There is no address book here. `link/open` names an opaque destination — the socket-side
+// twin of an `fs` key — which this driver hands straight to the channel factory; WHICH
+// peers are worth dialing, and under whose contact secret, is the transport guest's own
+// bookkeeping (§12.10).
 //
 // One link kind: every RawLink the driver holds — accepted through the channel factory,
 // or dialed by a factory on its own initiative (WebRTC) — is `register()`ed and announced
@@ -10,15 +15,16 @@
 
 import { toHex, fromHex, writeU32BE, enc } from "../core/util.js";
 import { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
-import { FRAMING, type ChannelFactory, type PeerAddr, type PeerId, type RawLink } from "../core/socket-seam.js";
+import { FRAMING, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
 import { type RawNet } from "./guest-seam.js";
 import { writeOp } from "./op-frame.js";
 
 const EMPTY = new Uint8Array(0);
 
-/** No address book entry, no channel factory at all, or one that only accepts. Link id 0
- *  is never live, so the framing is moot — the guest reads the id first and stops. */
+/** A destination this target cannot route, no channel factory at all, or one that only
+ *  accepts. Link id 0 is never live, so the framing is moot — the guest reads the id first
+ *  and stops. */
 const NO_ROUTE = { linkId: 0, framing: FRAMING.PLATFORM, authority: "" } as const;
 const ZERO32 = new Uint8Array(32);
 
@@ -110,10 +116,10 @@ export interface TransportHostOptions {
  *  Unlike every budget above it, enforced HERE and never shipped to the guest: it bounds
  *  the host's own link table, not the occupant's link states. */
   maxRawLinks?: number;
-  /** The socket seam: dialing, listening, and the address book live here. A browser edge
- *  passes its WebRTC/WebSocket factory here; a factory with no `connect` (WebRTC, whose
- *  peers arrive through signaling) is accept-only, and its `link/open` calls answer
- *  "no route". */
+  /** The socket seam: dialing and listening live here, and so does every judgement about
+ *  what a destination string MEANS. A browser edge passes its WebRTC/WebSocket factory; a
+ *  factory with no `connect` (WebRTC, whose peers arrive through signaling) is accept-only,
+ *  and its `link/open` calls answer "no route". */
   channels?: ChannelFactory;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
@@ -126,21 +132,20 @@ export interface TransportHostOptions {
   onLinkClosed?: (linkId: number, reason: number) => void;
 }
 
-/** The host side of the node's network: sockets, addresses, listeners. Nothing on this
- *  object is reached by an app.
+/** The host side of the node's network: sockets and listeners. Nothing on this object is
+ *  reached by an app.
  *
- *  There is no link handover across a transport update: the driver holds the link ids and
- *  the address book, both the NODE's, but live links cannot survive — the session keys are
- *  in the outgoing guest's private memory (§4.3) — so an upgrade is a reconnect. */
+ *  There is no handover of ANY kind across a transport update. The listeners are the
+ *  node's and survive, but live links cannot — the session keys are in the outgoing guest's
+ *  private memory (§4.3) — and neither can the address book, which is now that guest's too.
+ *  So an upgrade is a reconnect, and the embedder re-supplies the addresses (§12.10). */
 export class TransportHost {
-  readonly peerId: PeerId;
   port = 0;
   wsPort = 0;
 
   private readonly opts: Omit<TransportHostOptions, "identity" | "networkKey">;
   private readonly nodeFacts: Pick<TransportHostOptions, "identity" | "networkKey">;
   private readonly channels = new Map<number, RawLink>;
-  private readonly addrs = new Map<PeerId, PeerAddr>;
   private nextLinkId = 1;
   private call: TransportCall | null = null;
   private deliver: TransportDeliver | null = null;
@@ -153,7 +158,6 @@ export class TransportHost {
   ) {
     this.opts = opts;
     this.nodeFacts = nodeFacts;
-    this.peerId = toHex(nodeFacts.identity.publicKey);
   }
 
   /** Wire the claim routing behind `link/deliver` once. Not owner-keyed: an inbound frame
@@ -182,8 +186,10 @@ export class TransportHost {
   }
 
   /** The immutable node facts folded into a link occupant's installation-local config.
-   *  Binary values use the same hex spelling as peer references. The address book is not
-   *  here: it is mutable node state, replayed after publication as `addr` events. */
+   *  Binary values use the same hex spelling as peer references. The peers to dial are NOT
+   *  here — they are the embedder's `transportConfig`, merged into the same `LOCAL` object
+   *  one layer up (shell-core.ts), because they are its configuration and not the node's
+   *  identity. */
   initialConfig(): JsonObject {
     const o = this.opts;
     const { identity, networkKey } = this.nodeFacts;
@@ -194,11 +200,10 @@ export class TransportHost {
     };
   }
 
-  /** Release link state owned by a departing link-capable slot, retaining listeners and
-   *  the address book for a replacement. Also the platform's own "sever": closing every
-   *  live socket without moving the binding — the occupant hears one `linkClosed` per
-   *  link, and the node keeps its listeners and address book (both are the node's, not
-   *  the occupant's). */
+  /** Release link state owned by a departing link-capable slot, retaining the listeners for
+   *  a replacement. Also the platform's own "sever": closing every live socket without
+   *  moving the binding — the occupant hears one `linkClosed` per link, and the node keeps
+   *  its listeners, which are the node's and not the occupant's. */
   reset(): void {
     // Each link through the ordinary down path, rather than clearing the table first: a
     // cleared table makes `channelClosed`'s liveness guard drop the channel's own callback,
@@ -257,13 +262,13 @@ export class TransportHost {
     return {
       open: (dest) => {
         if (!ownsBinding()) return NO_ROUTE;
-        // The destination is the peer's 32-byte channel key, resolved in the address book.
-        // No entry, or no channel factory at all, or one that only accepts (WebRTC), is
-        // "no route", which the caller treats as a fabric dropping a frame.
-        if (!this.opts.channels?.connect) return NO_ROUTE;
-        const addr = this.addrs.get(toHex(dest));
-        if (!addr) return NO_ROUTE;
-        const channel = this.opts.channels.connect(addr);
+        // The destination is opaque here and stays opaque: this driver neither parses it nor
+        // holds a table to look it up in. It goes to the channel factory, which is the one
+        // thing that knows what this target can reach and which codec applies (§12.1).
+        // No factory at all, one that only accepts (WebRTC), and a destination the factory
+        // refuses are all "no route" — which the caller treats as a fabric dropping a frame.
+        const channel = this.opts.channels?.connect?.(dest) ?? null;
+        if (!channel) return NO_ROUTE;
         // A full link table reads as "no route" too: the same answer for the same reason —
         // this driver cannot carry the frame.
         const linkId = this.register(channel);
@@ -370,8 +375,8 @@ export class TransportHost {
    *  `linkSecret` is always OUR current contact secret, read HERE at announce time (so a
    *  getter-backed value gates with no transport reload): an accept gates on our secret by
    *  definition, and a dial the PLATFORM chose is same-deployment by construction, so it
-   *  presents the same value. A cross-deployment dial goes through `link/open` instead,
-   *  where the address book carries THAT peer's secret. */
+   *  presents the same value. A cross-deployment dial goes through `link/open` instead, and
+   *  the occupant's own address book carries THAT peer's secret. */
   private announce(linkId: number, channel: RawLink): void {
     this.tell(new Args("linkOpen")
       .u32(linkId)
@@ -383,27 +388,21 @@ export class TransportHost {
       .blob(enc.encode(channel.remoteAddr ?? "")));
   }
 
-  // ── the address book, dialing, listening ────────────────────────────────────
+  // ── teaching the occupant a peer, listening ─────────────────────────────────
 
-  addPeerAddr(peerId: PeerId, addr: PeerAddr): void {
-    this.addrs.set(peerId, addr);
-    this.announceAddr(peerId, addr);
-  }
-
-  /** The guest's dial needs only the peer's contact secret (or the zero secret for an open
-   *  peer) to build msg1; the host keeps the full address, which `link/open` resolves the
-   *  peer key against. */
-  private announceAddr(peerId: PeerId, addr: PeerAddr): void {
+  /** Teach the CURRENT occupant one peer: who it is, where to reach it, and the contact
+   *  secret that peer gates its door with (absent ⇒ an open peer). A pass-through and
+   *  nothing more — the driver retains no copy, because the address book is the occupant's
+   *  and dies with its realm. An embedder that replaces the transport re-supplies its peers,
+   *  either in the new load's `transportConfig` or by calling this again (§12.10).
+   *
+   *  `dest` is opaque to everything between here and `ChannelFactory.connect`; the peer id
+   *  is what the occupant keys its book on and what it pins the handshake to. */
+  addr(peerId: string, dest: string, contactSecret?: Uint8Array): void {
     this.tell(new Args("addr")
       .blob(fromHex(peerId))
-      .blob(addr.contactSecret ?? ZERO32));
-  }
-
-  /** Seed the current raw-link owner from the node-owned address book. Called only after
-   *  a new claimant is published; later mutations use `addPeerAddr`'s identical event.
-   *  Queueing is synchronous, so a following `ready`/request cannot overtake the replay. */
-  replayAddresses(): void {
-    for (const [peerId, addr] of this.addrs) this.announceAddr(peerId, addr);
+      .blob(contactSecret ?? ZERO32)
+      .blob(enc.encode(dest)));
   }
 
   /** Bind the listeners (if any) through the channel factory. */
@@ -428,10 +427,10 @@ export class TransportHost {
     this.wsPort = wsPort;
   }
 
-  /** Dial every known peer address and resolve once each is authenticated (or the guest's
-   *  deadline passes). Both the dialing and the waiting are the guest's: the answer is this
-   *  op's return value, handed back with `defer()` when the last peer comes up, so nothing
-   *  is held host-side. */
+  /** Dial every peer the occupant knows of and resolve once each is authenticated (or the
+   *  guest's deadline passes). Both the dialing and the waiting are the guest's — and so is
+   *  the list of who "every peer" is: the answer is this op's return value, handed back with
+   *  `defer()` when the last peer comes up, so nothing is held host-side. */
   async ready(timeoutMs = 5000): Promise<void> {
     await this.ask(new Args("ready").u32(timeoutMs));
   }
@@ -439,9 +438,9 @@ export class TransportHost {
   /** The peers we currently hold at least one authenticated link to. The set lives in
    *  the guest — it is a fact about links, and links are the guest's — so this is a
    *  question rather than a field. */
-  async linkedPeers(): Promise<PeerId[]> {
+  async linkedPeers(): Promise<string[]> {
     const bytes = await this.ask(new Args("peers"));
-    const out: PeerId[] = [];
+    const out: string[] = [];
     for (let off = 0; off + 32 <= bytes.length; off += 32) out.push(toHex(bytes.slice(off, off + 32)));
     return out;
   }

@@ -16,7 +16,7 @@
 // `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
 // owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel } from "./net-channel.js";
-import { FRAMING, type ChannelFactory, type PeerId, type RawLink } from "../core/socket-seam.js";
+import { FRAMING, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { isHex64 } from "../core/util.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
@@ -48,9 +48,12 @@ export interface Signaling {
     close(): void;
 }
 
+/** Every signaling message names its sender, and a directed one its recipient, by channel
+ *  public key in lowercase hex — this file's own vocabulary. Nothing below it deals in
+ *  peers: a socket seam takes destinations, not identities (core/socket-seam.ts). */
 interface SignalBase {
-    from: PeerId;
-    to?: PeerId;
+    from: string;
+    to?: string;
 }
 
 type HelloSignal = SignalBase & { type: "hello" };
@@ -103,7 +106,7 @@ export interface RtcNetworkOptions {
      *  polite/impolite tie-break and for its own `hello`s. Cannot come from a driver: this
      *  factory is constructed BEFORE the driver, since `bootShell` builds the
      *  `TransportHost` from `transport.channels`. */
-    peerId: PeerId;
+    peerId: string;
     signaling: Signaling;
     /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
     rtcConfig?: RTCConfiguration;
@@ -114,7 +117,7 @@ export interface RtcNetworkOptions {
     /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
      *  admits every peer to the rendezvous; the in-channel peer lint (the
      *  driver's, run on a signature-verified id) is separate and always on. */
-    admitPeer?: (peerId: PeerId) => boolean;
+    admitPeer?: (peerId: string) => boolean;
 }
 
 // Keep physical data-channel messages below the conservative cross-browser ceiling while
@@ -124,7 +127,7 @@ export interface RtcNetworkOptions {
 export const RTC_CHUNK_BYTES = 48 * 1024;
 export class RtcChannel extends MessageChannel {
   override readonly framing = FRAMING.LENGTH;
-  constructor(dc: RTCDataChannel, readonly weDialed: boolean, readonly expectPeerId: PeerId) { super(dc); }
+  constructor(dc: RTCDataChannel, readonly weDialed: boolean, readonly expectPeerId: string) { super(dc); }
   protected override write(bytes: Uint8Array): void {
     for (let off = 0; off < bytes.length; off += RTC_CHUNK_BYTES) {
       super.write(bytes.subarray(off, Math.min(bytes.length, off + RTC_CHUNK_BYTES)));
@@ -141,9 +144,9 @@ export class RtcChannel extends MessageChannel {
 const MAX_UNESTABLISHED_PEERS = 256;
 export class RtcNetwork implements ChannelFactory {
     opts;
-    private readonly ownId: PeerId;
+    private readonly ownId: string;
     private onAccept: ((channel: RawLink) => void) | null = null;
-    readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-establish)
+    readonly peers = new Map<string, PeerEntry>(); // all (pre- and post-establish)
     private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
     constructor(opts: RtcNetworkOptions) {
         this.opts = opts;
@@ -191,7 +194,7 @@ export class RtcNetwork implements ChannelFactory {
         for (const e of this.peers.values()) if (!e.established) unestablished++;
         return unestablished < MAX_UNESTABLISHED_PEERS;
     }
-    ensurePeer(peerId: PeerId): PeerEntry {
+    ensurePeer(peerId: string): PeerEntry {
         const existing = this.peers.get(peerId);
         if (existing)
             return existing;
@@ -246,7 +249,7 @@ export class RtcNetwork implements ChannelFactory {
     // The impolite side opens the single ordered binary channel; the polite side gets
     // it via ondatachannel. Exactly one channel per pair, so there is no double-
     // connect to resolve (unlike TCP's dial race).
-    dialChannel(peerId: PeerId, e: PeerEntry) {
+    dialChannel(peerId: string, e: PeerEntry) {
         if (e.polite || e.linked)
             return;
         this.bindLink(peerId, e, e.pc.createDataChannel("seedkernel", { ordered: true }), /*weDialed*/ true);
@@ -265,7 +268,7 @@ export class RtcNetwork implements ChannelFactory {
      *  A channel with nowhere to go is not bound at all: the driver has not started its
      *  listeners yet, so the negotiation must be free to hand this peer over again rather
      *  than sit marked `linked` forever. */
-    bindLink(peerId: PeerId, e: PeerEntry, dc: RTCDataChannel, weDialed: boolean) {
+    bindLink(peerId: string, e: PeerEntry, dc: RTCDataChannel, weDialed: boolean) {
         if (e.linked)
             return; // already bound (a renegotiation re-fired ondatachannel)
         const accept = this.onAccept;
@@ -280,7 +283,7 @@ export class RtcNetwork implements ChannelFactory {
         e.linked = true;
         accept(new RtcChannel(dc, weDialed, peerId));
     }
-    forget(peerId: PeerId) {
+    forget(peerId: string) {
         const e = this.peers.get(peerId);
         if (!e)
             return;

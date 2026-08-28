@@ -54,7 +54,7 @@ async function server(fabric, halfOpen, opts = {}) {
  *  possible flood, and the one the deadline exists for. Resolves what the server did
  *  to it: `closed` flips when our socket is evicted or refused. */
 function silentDial(fabric, port, host) {
-  const ch = fabric.connect({ host, port, transport: "tcp" });
+  const ch = fabric.connect(`tcp://${host}:${port}`);
   const st = { ch, closed: false };
   ch.onData(() => {});
   ch.onClose(() => { st.closed = true; });
@@ -64,9 +64,10 @@ function silentDial(fabric, port, host) {
 /** A real member node that dials the server and must complete its handshake. */
 async function member(fabric, serverNode, host) {
   const m = await makeTransportHost({ channels: fabric.view(), contactSecret: CONTACT });
-  m.driver.addPeerAddr(serverNode.driver.peerId, {
-    host, port: serverNode.driver.port, transport: "tcp", contactSecret: CONTACT,
-  });
+  // The server's port is only known once it is listening, so the peer is taught to the
+  // running occupant rather than named in its load config. `host` is what the fabric hands
+  // back as `remoteAddr`, which is what the per-source cap buckets on (§12.6.1).
+  m.addr(serverNode.peerId, `tcp://${host}:${serverNode.driver.port}`, CONTACT);
   return m;
 }
 
@@ -145,7 +146,7 @@ await test("an outside flood CANNOT keep members out", async () => {
   const evicted = flood.filter((d) => d.closed).length;
   note(`under a saturating flood: member authenticated = ${(await m.driver.linkedPeers()).length === 1}; ` +
        `${evicted} stranger(s) evicted`);
-  assert((await m.driver.linkedPeers()).includes(s.driver.peerId),
+  assert((await m.driver.linkedPeers()).includes(s.peerId),
     "A MEMBER WAS DENIED SERVICE BY AN OUTSIDE FLOOD — the budgets are not separated");
   assert(evicted >= 1, "a saturated budget must EVICT to make room, not refuse the newcomer");
   assert(flood[0].closed, "eviction must take the OLDEST stranger first");
@@ -167,7 +168,7 @@ await test("members keep getting in under a SUSTAINED flood", async () => {
     for (let j = 0; j < 4; j++) flood(); // attacker keeps pushing
     const m = keep(await member(fabric, s, `10.8.${i}.1`));
     try { await m.driver.ready(4000); } catch { /* counted as a failure below */ }
-    if ((await m.driver.linkedPeers()).includes(s.driver.peerId)) authed++;
+    if ((await m.driver.linkedPeers()).includes(s.peerId)) authed++;
   }
   note(`${authed}/${ROUNDS} members authenticated while ${ROUNDS * 4 + UNVER} flood connections churned`);
   assert(authed === ROUNDS, `${ROUNDS - authed} member(s) denied service under sustained flood`);
@@ -191,7 +192,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     const a = keep(await makeTransportHost({ channels: factory, contactSecret: CONTACT }));
     await a.driver.start();
     let wrote = 0;
-    const raw = fabric.connect({ host: `10.6.7.${i}`, port: s.driver.port, transport: "tcp" });
+    const raw = fabric.connect(`tcp://10.6.7.${i}:${s.driver.port}`);
     const gated = {
       remoteAddr: raw.remoteAddr,
       send: (b) => { if (++wrote <= 1) raw.send(b); },
@@ -200,7 +201,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),
     };
-    factory.give(gated, { weDialed: true, expectPeerId: s.driver.peerId });
+    factory.give(gated, { weDialed: true, expectPeerId: s.peerId });
     d.ch.onClose(() => {});
   }
   await sleep(500);
@@ -209,7 +210,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
   const m = keep(await member(fabric, s, "10.7.7.7"));
   await m.driver.ready(4000);
   note(`after ${VER * 3} credentialled stalls against a ${VER}-slot verified budget, member got in`);
-  assert((await m.driver.linkedPeers()).includes(s.driver.peerId),
+  assert((await m.driver.linkedPeers()).includes(s.peerId),
     "A MEMBER WAS LOCKED OUT by a saturated verified budget");
 });
 
@@ -225,7 +226,7 @@ await test("the budget bounds links PAST the handshake, not just into it", async
   for (let i = 0; i < AUTHED * 3; i++) {
     const m = keep(await member(fabric, s, `10.10.${i}.1`));
     try { await m.driver.ready(4000); } catch { /* counted below */ }
-    if ((await m.driver.linkedPeers()).includes(s.driver.peerId)) everSaw++;
+    if ((await m.driver.linkedPeers()).includes(s.peerId)) everSaw++;
     await sleep(30);
   }
   const held = (await s.driver.linkedPeers()).length;

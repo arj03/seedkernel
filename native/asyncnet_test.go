@@ -82,9 +82,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(
-		`netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });`,
+		`netB.addr(aId, "tcp://127.0.0.1:" + netA.port);`,
 	)); err != nil {
-		t.Fatal("addPeerAddr:", err)
+		t.Fatal("addr:", err)
 	}
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and

@@ -279,7 +279,11 @@ export async function makeTransportHost(opts = {}) {
     admit: policy,
   });
   await shell.loadBundleBlob(blob, { localConfig: transportConfig });
-  const node = { shell, driver, identity, appAuthor };
+  // The node's own channel key, hex — off the identity this harness minted, not asked of
+  // the driver: it is `toHex(identity.publicKey)`, which every caller of this factory
+  // already holds, and the driver says nothing about peers any more (core/socket-seam.ts).
+  const peerId = Buffer.from(identity.publicKey).toString("hex");
+  const node = { shell, driver, identity, appAuthor, peerId };
   if (opts.app === false) return node;
   const app = await shell.loadBundleBlob(harnessAppBlob(appAuthor, opts.mode ?? "echo"));
 
@@ -342,6 +346,10 @@ export async function makeTransportHost(opts = {}) {
     return out;
   };
   node.peers = () => driver.linkedPeers();
+  /** Teach this node one peer: where to reach it, and the secret that peer's door gates on.
+   *  A pass-through to the occupant's own address book — the driver retains nothing — so a
+   *  test that replaces the transport must say this again (§12.10). */
+  node.addr = (peerHex, dest, contactSecret) => driver.addr(peerHex, dest, contactSecret);
   return node;
 }
 

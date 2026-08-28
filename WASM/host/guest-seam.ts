@@ -45,10 +45,12 @@ export interface SeamCalls {
  *  invoked the freshly stood slot once, with them, before the binding is published
  *  (shell-core.ts), and the mutable address book arrives as `addr` events. */
 export interface RawNet {
-    /** Open a link to an opaque destination name, returning the link id — or 0 when the
-     *  host has no route for it, which a caller treats as a fabric dropping a frame. The
-     *  caller learns no route it could dial for itself, only which wire codec applies. */
-    open(dest: Uint8Array): { linkId: number; framing: number; authority: string };
+    /** Open a link to an opaque destination — the socket-side twin of an `fs` key — returning
+     *  the link id, or 0 when this host has no route for it, which a caller treats as a
+     *  fabric dropping a frame. The string is the CALLER's own name for a peer's location,
+     *  handed down to be resolved; what comes back is only which wire codec applies, never a
+     *  route the caller learns something new from. */
+    open(dest: string): { linkId: number; framing: number; authority: string };
     /** Write whole bytes to a link. Silently dropped if the link is already gone —
      *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
     send(linkId: number, bytes: Uint8Array): void;
@@ -484,7 +486,7 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // No peer, no protocol id, no correlation: those are the transport's own. Inbound
         // bytes arrive the other way, as ordinary invocations of the transport's `handle`.
         "link/open": (payload) => {
-            const link = rawNet().open(payload);
+            const link = rawNet().open(dec.decode(payload));
             const authority = enc.encode(link.authority);
             const out = new Uint8Array(9 + authority.length);
             writeU32BE(out, 0, link.linkId);

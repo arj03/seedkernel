@@ -13,6 +13,11 @@ export const TRANSPORT_APP_CONFIG = Object.freeze({
   requestDeadlineMs: 10_000,
   linkIdleTimeoutMs: 300_000,
   admitPeers: Object.freeze([]),
+  // Peers this program dials, as `{ peerId, dest, contactSecret? }` in hex. Empty by
+  // default because a cohort is a DEPLOYMENT's fact, not an author's — an installation
+  // names it in `LOCAL`, and does so again for a replacement transport, whose address book
+  // starts empty like every other part of a fresh realm (§12.10).
+  peers: Object.freeze([]),
   // The dialing side's whole handshake deadline.
   handshakeTimeoutMs: 10_000,
   // The shorter clock an accept runs until a msg1 opens under the contact secret.
