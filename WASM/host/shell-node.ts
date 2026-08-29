@@ -133,14 +133,15 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
         networkKey: opts.networkKey,
         fs,
         freshnessStore: freshness,
+        // The sockets and the signed program that drives them, in one object.
         transport: {
             contactSecret: opts.contactSecret,
             channels: opts.channels ?? new NodeChannelFactory(),
             listen: opts.listen,
             wsListen: opts.wsListen,
+            bundle: opts.transportBundle,
+            config: opts.transportConfig,
         },
-        transportConfig: opts.transportConfig,
-        transportBundle: opts.transportBundle,
         admit: policyFromJson(opts.policyJson),
         guestDeadlineMs: opts.guestDeadlineMs,
         realmMemoryBytes: opts.realmMemoryBytes,

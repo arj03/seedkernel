@@ -58,7 +58,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		  // slot, so the host loopback stands in for the cross-realm call — the same
 		  // slot, the same entrypoint, the app's own op framing recomposed here (the
 		  // shell passes bytes and never reads them).
-		  __buildGuestSeam(["_net"], idB, { call: (id, payload) => {
+		  __buildGuestSeam([], idB, { call: (id, payload) => {
 		    const n = payload[0];
 		    let op = "";
 		    for (let i = 0; i < n; i++) op += String.fromCharCode(payload[1 + i]);
@@ -68,7 +68,7 @@ func TestAsyncNetInitiator(t *testing.T) {
 		    for (let i = 0; i < op.length; i++) framed[1 + i] = op.charCodeAt(i);
 		    framed.set(args, 1 + op.length);
 		    return globalThis.__nodeBApp.invoke(framed);
-		  } });
+		  } }, undefined, ["_net"]);
 		})();
 	`, hex.EncodeToString(sender.id())))); err != nil {
 		t.Fatal("setup:", err)
@@ -82,9 +82,9 @@ func TestAsyncNetInitiator(t *testing.T) {
 		t.Fatal("start:", err)
 	}
 	if _, err := qc.Eval("peer.js", qjs.Code(
-		`netB.addPeerAddr(aId, { host: "127.0.0.1", port: netA.port, transport: "tcp" });`,
+		`teachAddr(__nodeB.shell, aId, "tcp://127.0.0.1:" + netA.port);`,
 	)); err != nil {
-		t.Fatal("addPeerAddr:", err)
+		t.Fatal("addr:", err)
 	}
 
 	// The initiator guest: build a `send` op for the transport (peer from APP config) and

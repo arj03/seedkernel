@@ -32,13 +32,11 @@ const P_DH = "crypto/x25519/dh";
 const X25519_BASEPOINT = new Uint8Array([9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
-// Link kinds as the host's `linkOpen` declares them: 0 = an accepted socket (half-open
-// limiter applies), 1 = a host-managed transport that opened the socket itself.
-const LINK_CORE = 0;
-const LINK_OPEN = 1;
-
-// Link close-reason codes returned from the driver's `linkClosed` event — mirror
-// Link.closeReason. The event already names the link, so the return carries no link id.
+// Why a link went down, returned from the driver's `linkClosed` event. The event already
+// names the link, so the return carries no link id and cannot speak about another socket.
+// This is the ONE thing the host cannot work out for itself: it sees a descriptor close,
+// while whether that was a farewell, a defensive abort or a cut stream is a fact only the
+// end holding the session keys ever had.
 const REASON_OPEN = 0, REASON_HANDSHAKE = 1, REASON_CLEAN = 2, REASON_ABORTED = 3,
       REASON_LOCAL = 4, REASON_TRUNCATED = 5;
 
@@ -84,10 +82,7 @@ const LABEL_R2I = utf8Encode("seedkernel-session-r->i-v1\0");
 const DOMAIN_CHANNEL = utf8Encode("seedkernel-channel-id-v1\0");
 
 // Per-suite policy constants, keyed by the suite byte; the host never reads them.
-const REKEY_AFTER_FRAMES = 1 << 24;  // frames per direction before the key ratchets
 const REJECT_AFTER_EPOCHS = 1 << 16; // ratchets per direction before the link retires
-const HANDSHAKE_TIMEOUT_MS = 10_000;
-const UNVERIFIED_TIMEOUT_MS = 2_000;
 const MAX_QUEUE_BYTES = 1024 * 1024; // pre-auth send buffer byte budget (drop-oldest)
 
 // ── the seam helpers ──────────────────────────────────────────────────────────
@@ -216,9 +211,11 @@ async function channelSign(root, th, id) {
 // microtask now, so callers `await`; an inbound request is dispatched with `.then`, and
 // an app's send is answered with `defer()`.
 
-/** Open a link to an opaque destination (the peer's channel key); 0 ⇒ no route. */
-async function netLinkOpen(destBytes) {
-  const r = await host.call(N_LINK_OPEN, destBytes);
+/** Open a link to an opaque destination — the string this program's own address book holds
+ *  for a peer, which only the host's socket factory takes apart. 0 ⇒ no route: this node
+ *  cannot reach that destination, and the caller treats it as a fabric dropping a frame. */
+async function netLinkOpen(dest) {
+  const r = await host.call(N_LINK_OPEN, utf8Encode(dest));
   const authLen = readU32BE(r, 5);
   return {
     linkId: readU32BE(r, 0),
@@ -300,10 +297,11 @@ class Link {
     this.onAuth = spec.onAuth;
     this.onFrame = spec.onFrame;
     this.onClose = spec.onClose;
-    this.handshakeTimeoutMs = spec.handshakeTimeoutMs;
-    this.rekeyAfter = spec.rekeyAfterFrames || REKEY_AFTER_FRAMES;
-    // The secret this link opens under: THE PEER's on a dial, OURS on an accept — carried
-    // per link at open, so the gate tracks the node's secret (§12.6.3).
+    this.rekeyAfter = rekeyAfterFrames;
+    // The secret this link opens under, carried per link so the gate tracks the node's
+    // CURRENT value rather than the boot-time fallback (§12.6.3): THE PEER's on a dial we
+    // made out of the address book, OURS on anything the host handed over — an accept, or
+    // a dial a platform factory chose, which is same-deployment by construction.
     this.contactSecret = spec.linkSecret || contactSecret;
     this.root = null; // set by the boot chain below — every seam call is async now
 
@@ -320,12 +318,9 @@ class Link {
     this.peerEph = null;
     this.closed = false;
     this.notified = false;
-    // Set exactly once by a host-managed link's onAuth callback and consumed by the
-    // `linkBytes` invocation that caused it. Invariant: onAuth runs synchronously only
-    // from onWire's inbound msg3/msg4 path; a new deferred/timer auth path must report the
-    // peer through its own event instead of this read-coupled latch. It contains no link id:
-    // the driver binds the returned peer to the event's own captured link.
-    this.reportedPeer = null;
+    // How this link ended, for `closeReason`: whether WE tore it down, and whether the
+    // teardown was defensive (a peer did something wrong) rather than merely our own
+    // decision. Both are set once, on the way down, and read once by `linkClosed`.
     this.closedLocally = false;
     this.aborted = false;
     this.slot = null;
@@ -368,10 +363,10 @@ class Link {
       this.root = await hash(DOMAIN_CHANNEL, networkKeyBytes);
       if (this.weDialed) {
         await this.ensureKeys();
-        this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
+        this.armDeadline(handshakeTimeoutMs);
         await this.sendMsg1();
       } else {
-        this.armDeadline(this.handshakeTimeoutMs || UNVERIFIED_TIMEOUT_MS);
+        this.armDeadline(unverifiedTimeoutMs);
       }
     })();
     this.work.catch(() => {
@@ -391,8 +386,8 @@ class Link {
   }
 
   /** Close the host channel and notify, but AFTER the current event: the caller's
-   *  bookkeeping (core.openLink's pools, entry "openLink"'s `openLinks`) runs once the
-   *  constructor returns. */
+   *  bookkeeping (core.openLink's connecting/inbound pools) runs once the constructor
+   *  returns. */
   deferTeardown() {
     this.closed = true;
     this.closedLocally = true;
@@ -511,6 +506,13 @@ class Link {
     });
   }
 
+  /** Why this link ended, as the occupant alone can say it. `handshake` is a link that
+   *  never got there; `clean` is the peer's own end-of-stream record; `aborted` is a
+   *  teardown a peer PROVOKED (a forged record, a refused identity, an over-cap frame);
+   *  `local` is our own deliberate shutdown; `truncated` is a stream that just stopped.
+   *  The split matters: defining a truncation as `authed && !peerSaidGoodbye` would flag
+   *  every deliberate close we make, and an attacker who could induce a farewell could
+   *  make an arbitrary cut look like a clean shutdown to the far end. */
   get closeReason() {
     if (!this.closed) return "open";
     if (!this.authed) return "handshake";
@@ -673,7 +675,7 @@ class Link {
     if (!probe.ok) { this.stall(); return; }
     // Proved: move off the contended budget before the expensive work.
     if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stall(); return; }
-    this.armDeadline(this.handshakeTimeoutMs || HANDSHAKE_TIMEOUT_MS);
+    this.armDeadline(handshakeTimeoutMs);
     await this.ensureKeys();
     const dh = await scalarmult(this.myEph.privateKey, ephI);
     if (!dh.ok) { this.stall(); return; }

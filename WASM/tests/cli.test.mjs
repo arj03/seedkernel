@@ -76,11 +76,14 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
         resolve: () => "_net",
         revoke: () => [],
         uninstall: () => false,
+        // The one door the operator flow reaches the network through. `null` is the whole
+        // of "this node has no transport" as the CLI sees it.
+        call: () => (linkAvailable ? Promise.resolve(new Uint8Array(0)) : null),
         loadBundleBlob: async () => { throw new Error("no bundle in this test"); },
         invoke: async () => new Uint8Array(0),
         close: () => { host.closed = true; },
         ...shell,
-      }, transport: { port, wsPort, available: () => linkAvailable } };
+      }, transport: { port, wsPort } };
     },
   };
   return host;
@@ -237,13 +240,14 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   ok(host.lines.includes("  tcp    listening on :7777"), "the console reports the port actually bound");
   ok(host.lines[host.lines.length - 1] === "serving — Ctrl-C to stop", "and ends with the serving line");
 }
-// --peers with no raw-link binding says what is wrong before touching the adapter.
+// --peers with nothing claiming the transport's service id says what is wrong rather than
+// letting the flag pass silently on a node with no network.
 {
   const host = fakeHost(["--key", join(work, "p.key"), "--peers", `${good}@127.0.0.1:7000`],
     { linkAvailable: false });
   let msg = "";
   try { await runCli(host); } catch (e) { msg = String(e.message); }
-  ok(msg.includes("there is nothing to dial from"), "--peers without a raw-link binding explains itself");
+  ok(msg.includes("there is nothing to dial from"), "--peers with no transport claimant explains itself");
 }
 
 console.log("\n— the load line —");

@@ -332,8 +332,8 @@ func TestGuestRealmBudgetSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam(["_net"], __id,
-			{ call: async () => new Uint8Array([9]) });
+		__buildGuestSeam([], __id,
+			{ call: async () => new Uint8Array([9]) }, undefined, ["_net"]);
 	`)); err != nil {
 		t.Fatal("setup:", err)
 	}
@@ -399,8 +399,8 @@ func TestGuestRealmCloseSettlesInflightCall(t *testing.T) {
 	if _, err := qc.Eval("setup.js", qjs.Code(`
 		globalThis.__id = sodium.crypto_sign_keypair();
 		globalThis.__peer = toHex(sodium.crypto_sign_keypair().publicKey);
-		__buildGuestSeam(["_net"], __id,
-			{ call: () => new Promise(() => {}) });
+		__buildGuestSeam([], __id,
+			{ call: () => new Promise(() => {}) }, undefined, ["_net"]);
 	`)); err != nil {
 		t.Fatal("setup:", err)
 	}

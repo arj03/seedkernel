@@ -85,13 +85,14 @@ const boot = async (cfg) => (await bootNodeShell(cfg)).shell;
 async function bootTestShell({ pinAuthor, ...opts } = {}) {
   const identity = opts.identity ?? generateKeyPair();
   const pinned = pinAuthor ? {
-    transport: {},
-    transportLoad: false,
-    transportBundle: packBundle({
-      [MANIFEST_FILE]: signManifest(sodium, pinAuthor,
-        { app: "pin", version: 1, modules: [], guest: GUEST() }),
-      [GUEST_FILE]: GUEST_BYTES,
-    }),
+    transport: {
+      load: false,
+      bundle: packBundle({
+        [MANIFEST_FILE]: signManifest(sodium, pinAuthor,
+          { app: "pin", version: 1, modules: [], guest: GUEST() }),
+        [GUEST_FILE]: GUEST_BYTES,
+      }),
+    },
   } : {};
   const { shell } = await bootShell({
     sodium,
@@ -400,8 +401,7 @@ async function testManifestClaimIsTheRouting() {
   try {
     shell = await bootTestShell({
       identity,
-      transport: {},
-      transportLoad: false,
+      transport: { load: false },
       createRealm: async () => {
         realmBuilds++;
         return { call: async () => new Uint8Array(), dispose() {} };
@@ -471,15 +471,19 @@ async function testManifestClaimIsTheRouting() {
       verifyManifest(sodium, signManifest(sodium, author,
         { app: "reserved", version: 1, services: [claim], modules: [], guest: GUEST() }));
     }
-    // The same name in both lists would be ambiguous about which reach it grants, so it
-    // is refused as malformed rather than admitted under either.
+    // Two maps, so uniqueness is PER LIST. A name in both is not ambiguous — it says
+    // "reachable by a peer AND by a co-resident guest", which is a thing a bundle may mean
+    // and the two maps express without a rule. A duplicate WITHIN one list still is.
     {
+      assert(verifyManifest(sodium, signManifest(sodium, author,
+        { app: "dual", version: 1, protocols: ["both"], services: ["both"], modules: [], guest: GUEST() })) !== null,
+        "a name claimed in BOTH `protocols` and `services` is two reaches, not a conflict");
       let threw = false;
       try {
         verifyManifest(sodium, signManifest(sodium, author,
-          { app: "ambiguous", version: 1, protocols: ["dual"], services: ["dual"], modules: [], guest: GUEST() }));
+          { app: "dup", version: 1, protocols: ["twice", "twice"], modules: [], guest: GUEST() }));
       } catch (e) { threw = /malformed manifest/.test(String(e)); }
-      assert(threw, "a name claimed in both `protocols` and `services` is refused");
+      assert(threw, "a name claimed twice in the SAME list is still refused");
     }
     // The property that actually matters: a name in `services` is unreachable from a
     // PEER while the SAME bundle's `protocols` name is — checked through the real
@@ -1125,16 +1129,23 @@ async function testGuestAbi() {
     { app: "abi", version: 1, modules: [] })); } catch (e) { noGuest = e.message; }
   assert(noGuest.includes("every app is a guest"), `a manifest without a guest is refused by name (got: ${noGuest})`);
 
-  // Requires speak at SERVICE granularity (§12.2): a finer method name is a refused
-  // manifest, since the seam gates a `host.call` by the method's service, never by the
-  // exact method — a manifest naming one would ask for a grant finer than the seam can
-  // enforce.
+  // `requires` is the HOST's list and nothing else: a closed vocabulary of SERVICES
+  // (§12.2), since each one is a privilege an operator grants. A finer method name asks for
+  // a grant finer than the seam can enforce — the seam gates a `host.call` by the method's
+  // SERVICE — and a local service id belongs in the other list entirely. Both are refused,
+  // each naming the fix.
   {
     let refused = "";
     try { verifyManifest(sodium, mk({ hash, requires: ["fs/get"] })); }
     catch (e) { refused = e.message; }
-    assert(refused.includes("names a host METHOD") && refused.includes('"fs"'),
+    assert(refused.includes('declare the SERVICE "fs"'),
       `a manifest requiring the method "fs/get" is refused, naming the service to declare instead (got: ${refused})`);
+
+    let local = "";
+    try { verifyManifest(sodium, mk({ hash, requires: ["_backup"] })); }
+    catch (e) { local = e.message; }
+    assert(local.includes("guest.calls"),
+      `a local service id in guest.requires is refused, naming the list it belongs in (got: ${local})`);
   }
   // …and the SERVICE, by exact name, is what a manifest may require — the guest still
   // calls the finer-grained method; being undeclarable at that granularity is not being
@@ -1142,28 +1153,33 @@ async function testGuestAbi() {
   assert(verifyManifest(sodium, mk({ hash, requires: ["fs"] })) !== null,
     "a service, by exact name, is what a manifest may require");
 
-  // A bare name colliding with this bundle's OWN module name is refused: the seam's
+  // A called id colliding with this bundle's OWN module name is refused: the seam's
   // dispatch resolves a declared local service before this bundle's modules, so a
-  // collision would silently shadow the module (guest-seam.ts).
+  // collision would silently shadow the module (guest-seam.ts). A called id spelled like a
+  // host method is refused for the mirror reason.
   {
-    const withModule = (requires) => signManifest(sodium, author, {
+    const withModule = (calls) => signManifest(sodium, author, {
       app: "abi", version: 1,
       modules: [{ name: "codec", hash: "aa" }],
-      guest: { hash, requires },
+      guest: { hash, requires: [], calls },
     });
     let refused = "";
     try { verifyManifest(sodium, withModule(["codec"])); } catch (e) { refused = e.message; }
     assert(refused.includes("codec") && refused.includes("module"),
-      `a local service id colliding with this bundle's own module name is refused (got: ${refused})`);
+      `a called local service id colliding with this bundle's own module name is refused (got: ${refused})`);
     assert(verifyManifest(sodium, withModule([])) !== null,
-      "…and the same module name is fine when nothing declares it as a local service too");
+      "…and the same module name is fine when nothing calls a service by it too");
+    let shadow = "";
+    try { verifyManifest(sodium, withModule(["fs/get"])); } catch (e) { shadow = e.message; }
+    assert(shadow.includes('"fs" service'),
+      `a called id spelled like a host method is refused (got: ${shadow})`);
   }
 
-  // Any OTHER bare or slashed name — not a known service, not a collision — is a
-  // legitimate LOCAL service id (§12.10): the vocabulary is open on that half, since
-  // whether anything actually claims it is answered at the call, never at the manifest.
-  assert(verifyManifest(sodium, mk({ hash, requires: ["_backup", "reporting/v2"] })) !== null,
-    "an arbitrary local service id verifies; nothing claiming it yet is not a manifest error");
+  // Any OTHER bare or slashed name is a legitimate LOCAL service id (§12.10): the
+  // vocabulary is open on that half, since whether anything actually claims it is answered
+  // at the call, never at the manifest.
+  assert(verifyManifest(sodium, mk({ hash, requires: [], calls: ["_backup", "reporting/v2"] })) !== null,
+    "an arbitrary called local service id verifies; nothing claiming it yet is not a manifest error");
 
   console.log("  OK\n");
 }
@@ -2742,7 +2758,8 @@ async function testCandidateRealmCannotActBeforeCommit() {
       modules: [{ name: "fwd", hash: toHex(gHash(forwarderBytes)) }],
       guest: {
         hash: toHex(gHash(guest)),
-        requires: ["fs", "link", "_svc"],
+        requires: ["fs", "link"],
+        calls: ["_svc"],
       },
     }),
     [moduleFile("fwd")]: forwarderBytes,

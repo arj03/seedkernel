@@ -1,7 +1,8 @@
-// Platform-neutral shell (§12.9). `bootShell` is the one assembly path — pin, defaults,
-// load order. Targets displace platform members only (main.ts, native-shim.ts, seedchat,
-// seedstore). `createShell` is private: it would skip the transport author pin. Signed
-// bundles are the only way slots land (§12.4).
+// Platform-neutral shell (§12.9). `bootShell` is THE assembly path — defaults, the
+// transport author pin, the claim maps, the load order — and the only way to a Shell, so
+// there is no second constructor that could skip the pin. Targets displace platform members
+// only (main.ts, native-shim.ts, seedchat, seedstore). Signed bundles are the only way slots
+// land (§12.4).
 import { denyAll, allOf, hostGates, type Admit, type AdmissionContext } from "./policy.js";
 import { appKeyFor, appScopeFor, FreshnessMarks, genesisHash, isJsonObject, privilegesOf, verifyBundle, loadBundleModules, type FreshnessStore, type JsonObject, type LoadedBundle, type ManifestVerifier, type PureModuleLoader, type PureModules } from "./bundle.js";
 import { createGuestSeam, slotSignScope, HOST_CALLER_ID, type SeamCrypto, type SignScope, type HostCall, type HostTimers } from "./guest-seam.js";
@@ -9,8 +10,8 @@ import { TransportHost, type TransportHostOptions } from "./transport-host.js";
 import { transportBundleBytes } from "./transport-bundle.js";
 import { isSafeFsKey, isSafeFsScope, type Fs } from "../core/fs.js";
 import { DEFAULT_GUEST_DEADLINE_MS, DEFAULT_MAX_LIVE_TIMERS, DEFAULT_MAX_TIMER_PAYLOAD_BYTES, DEFAULT_REALM_MEMORY_BYTES } from "../core/wasm-limits.js";
-import { isIrreversible, isService, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
-import { enc, fromHex, toHex, writeU32BE, errMessage, concatBytes } from "../core/util.js";
+import { isIrreversible, PRIVILEGE_LINK, type Privilege } from "../core/domains.js";
+import { enc, fromHex, toHex, errMessage, concatBytes } from "../core/util.js";
 import { type SafeRealm } from "./safe-js.js";
 import type { Keypair } from "../core/subkeys.js";
 
@@ -44,66 +45,6 @@ export type RealmFactory = (opts: {
     deadlineMs?: number;
 }) => Promise<SafeRealm>;
 
-/** The platform seam — everything the shell needs that varies by target. `fs` is optional
- *  ("a node with no disk"): a bundle declaring `fs` on such a shell gets no backend wired,
- *  so its first `fs/*` call throws by name rather than resolving to a pretend store
- *  (§12.2). `createRealm` is required — every app is a guest.
- *
- *  The current channel adapter remains a platform resource. Its events are bound directly
- *  to the slot granted its raw-link capability; claim names play no part. */
-interface ShellPlatform {
-    sodium: ShellSodium;
-    /** The node's keypair (§12.9): its public half is this node's peer id and the one
-     *  identity every target reports through `node/identity`. The handshake and the seam's
-     *  SIGN op both sign with it, under different domains and scopes. */
-    identity: Keypair;
-    /** Target-specific builder for a bundle's private pure modules (§4). */
-    modules: PureModuleLoader;
-    fs?: Fs;
-    freshnessStore: FreshnessStore;
-    createRealm: RealmFactory;
-    now?: () => number;
-    /** Which network this node belongs to — an isolation boundary, not a gate (§12.6);
-     *  absent ⇒ the public network. Feeds the raw link configuration and the signing scope
-     *  of the slot reaching `link` (`slotSignScope`).
-     *
-     *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
-     *  the only binding of a link occupant's signature to this node's network that the
-     *  slot occupant cannot choose. Drop it from the preimage and a transport on one
-     *  network can mint transcripts another's verifier accepts. */
-    networkKey?: Uint8Array;
-    /** The concrete channel adapter: the sockets, the listeners and the address book, all
-     *  the NODE's rather than any guest's. The platform CONSTRUCTS it with driver-owned
-     *  resources such as listeners and the raw-link ceiling, then hands it over;
-     *  `shell.close()` closes it, so there is one teardown rather than a second thing every
-     *  embedder must remember. Transport-program policy travels through bundle config.
-     *
-     *  Absent for a shell with no raw links at all (a browser edge). */
-    transportHost?: TransportHost;
-}
-
-interface CreateShellOptions {
-    /** The operator's admission predicate (§12.5) — one `Admit` asked once per load,
-     *  between verify and install. An allowlist, a consent dialog and "the bundle my
-     *  operator handed me" are three constructors of this type; a deployment answering per
-     *  capability composes `byPrivilege`. Absent ⇒ deny-all. The host's own gates —
-     *  revocation, the coherence rules, the downgrade guard — are composed AROUND whatever
-     *  is passed here (`hostGates`). */
-    admit?: Admit;
-    /** This node's DEFAULT QuickJS heap limit for a guest realm, in bytes. Omitted ⇒
-     *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI
-     *  `--guest-memory`); a single load raises or lowers it for its own realm with
-     *  `LoadBundleOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
-    realmMemoryBytes?: number;
-    /** This node's DEFAULT budget of guest execution time per entrypoint invocation, in ms.
-     *  Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. Counts time the guest
-     *  is *running*, not time parked on a host seam, so it bounds a wedged guest without
-     *  penalising one awaiting the network. The operator's number, not the author's: unlike
-     *  the module memory ceiling (§4.3), how long this node spends on one message is a
-     *  property of the deployment. */
-    guestDeadlineMs?: number;
-}
-
 /** Configuration supplied by this installation for one particular bundle load. Kept
  *  separate from the author's signed `APP`, and scoped to this call rather than to the
  *  shell, which may host unrelated apps at once. The guest receives it as `LOCAL` and owns
@@ -133,13 +74,23 @@ export interface LoadBundleOptions {
 }
 
 export interface Shell {
-    /** Which app serves this protocol, or null (§12.10). A read of the projection the
-     *  installed manifests define — there is nothing to write here. The one owner kind is
-     *  a bundle slot: dispatch is a single claim → slot map. */
-    resolve(proto: string): string | null;
-    /** Every protocol this node serves, as `[proto, owner]` — what an operator's console
-     *  line or a shell's UI lists. A snapshot, not the live map. */
+    /** Which app serves this claim, or null (§12.10) — a peer-reachable `protocols` name
+     *  first, then a locally reachable `services` one. A read of the projection the
+     *  installed manifests define; there is nothing to write here. The one owner kind is a
+     *  bundle slot. */
+    resolve(claim: string): string | null;
+    /** Every claim this node serves, as `[claim, owner]` — what an operator's console line
+     *  or a shell's UI lists, peer-reachable names first. A snapshot, not the live maps. */
     routes(): [string, string][];
+    /** Call the realm claiming this LOCAL service id, with the host's caller id; `null`
+     *  when nothing claims it. The host half of the routing a co-resident guest reaches
+     *  through `host.call`, so it resolves `services` and never `protocols`.
+     *
+     *  The third door into a realm, and the three have distinct audiences: `AppHandle.invoke`
+     *  is slot-bound, this is local reach, `link/deliver` is peer reach. An embedder or the
+     *  CLI composes the op frame (op-frame.ts) — this is how the node's own transport is
+     *  asked to wait for a cohort, list peers, or learn an address. */
+    call(serviceId: string, payload: Uint8Array): Promise<Uint8Array> | null;
     /** Filesystem backend, or absent for a node with no disk (a bundle declaring the
      *  `fs` cap then gets no backend wired — its first `fs/*` call throws). */
     fs?: Fs;
@@ -323,42 +274,179 @@ export function scopedFs(inner: Fs, scope: string): Fs {
   };
 }
 
-function createShell(opts: CreateShellOptions & {
-    platform: ShellPlatform;
-}): Shell {
-    const { platform } = opts;
-    const sodium = platform.sodium;
+/** This node's network in one object (§12.6): the socket-side members are the driver's
+ *  (`TransportHostOptions` minus the two facts the node states at the top level), and
+ *  `bundle`/`config`/`load` say which signed transport program it pins and loads.
+ *
+ *  One object rather than four siblings because they are one decision: the blob whose
+ *  author is PINNED is the blob that gets loaded. */
+export interface TransportOptions extends Omit<TransportHostOptions, "identity" | "networkKey"> {
+    /** The transport bundle to PIN — and, unless `load` is false, to load. Default: the
+     *  artifact-shipped one. The pin's author is DERIVED from this blob, so passing different
+     *  bytes is a deliberate transport replacement. */
+    bundle?: Uint8Array;
+    /** Installation-local config for that load, through the ordinary `localConfig` path. */
+    config?: JsonObject;
+    /** Whether the boot loads the pinned bundle. Default true; `false` leaves the load to
+     *  the caller, under the same pin. */
+    load?: boolean;
+}
+
+/** JS-target assembly options (§12.9). Every field but `sodium` and `identity` has a
+ *  default; the pin and the load order are part of standing a node up, which is why there
+ *  is one assembly path and no way to reach the shell around it. */
+export interface BootShellOptions {
+    /** The crypto surface the shell needs — core libsodium with the ML-DSA-65 verifier
+     *  mixed in (the one thing no target can default: main.ts loads it, a browser page
+     *  readies it). */
+    sodium: ShellSodium;
+    /** The node's keypair (§12.9): its public half is this node's peer id and the one
+     *  identity every target reports through `node/identity`. The handshake and the seam's
+     *  SIGN op both sign with it, under different domains and scopes. */
+    identity: Keypair;
+    /** YOUR admission predicate (§12.5) — the one branch that is actually yours: an
+     *  operator's policy, a consent dialog, or `() => true` for "the bundle my operator
+     *  handed me IS the trust decision". The transport author pin is ANDed onto it here, and
+     *  the host's own gates (`hostGates`) below, so no posture can lose either. Consulted for
+     *  EVERY bundle, privileged ones included. Absent ⇒ deny-all. */
+    admit?: Admit;
+    /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
+     *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
+     *
+     *  `false` is "a node with no disk" (§12.2): no backend wired at all, so a bundle
+     *  declaring the `fs` cap has its first `fs/*` call throw by name rather than resolve
+     *  to a pretend store. Said rather than omitted, because omitting is what asks for the
+     *  in-memory default. */
+    fs?: Fs | false;
+    /** The persisted bundle-freshness store (§12.4). Default: `FreshnessMarks`,
+     *  in-memory. */
+    freshnessStore?: FreshnessStore;
+    /** The target-specific builder for a bundle's private pure modules (§4). Default:
+     *  `ModuleTable`, the JS worker-backed builder; the native loader passes its Go-backed
+     *  one. */
+    modules?: PureModuleLoader;
+    /** The confined realm factory (§12.3) — every app is a guest, so there is always one.
+     *  Default: the lazy safe-js import, since the QuickJS engine is heavy and loads on the
+     *  first realm. */
+    createRealm?: RealmFactory;
+    now?: () => number;
+    /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate;
+     *  absent ⇒ the public network. It reaches BOTH the transport driver and the signing
+     *  scope of the slot reaching `link` (`slotSignScope`).
+     *
+     *  The scope is the load-bearing use: `node/sign` prefixes and never parses, so it is
+     *  the only binding of a link occupant's signature to this node's network that the slot
+     *  occupant cannot choose. Drop it from the preimage and a transport on one network can
+     *  mint transcripts another's verifier accepts. */
+    networkKey?: Uint8Array;
+    /** This node's DEFAULT budget of guest execution time per entrypoint invocation, in ms.
+     *  Omitted ⇒ `DEFAULT_GUEST_DEADLINE_MS`; `Infinity` disables it. Counts time the guest
+     *  is *running*, not time parked on a host seam, so it bounds a wedged guest without
+     *  penalising one awaiting the network. The operator's number, not the author's: unlike
+     *  the module memory ceiling (§4.3), how long this node spends on one message is a
+     *  property of the deployment. */
+    guestDeadlineMs?: number;
+    /** This node's DEFAULT QuickJS heap limit for a guest realm, in bytes. Omitted ⇒
+     *  `DEFAULT_REALM_MEMORY_BYTES`. The operator's node-wide answer (CLI `--guest-memory`);
+     *  a single load raises or lowers it for its own realm with
+     *  `LoadBundleOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
+    realmMemoryBytes?: number;
+    /** This node's network, whole (§12.6). An OPTIONS object ⇒ the boot constructs the
+     *  `TransportHost` (identity and networkKey come from the fields above, never restated),
+     *  admits the bundle under the pin derived from it, and starts its listeners. The object
+     *  is RETAINED, so getter-backed options such as a rotating contact secret stay live —
+     *  pass it, never a spread of it. `false` or absent ⇒ no network. */
+    transport?: TransportOptions | false;
+}
+
+/** What `bootShell` hands back: the shell, plus the channel adapter — the one piece the
+ *  shell does not expose and a platform still has to drive (the listeners, the ports). The
+ *  SAME object the shell holds, not a copy. */
+export interface BootResult {
+    shell: Shell;
+    /** The channel adapter. Null ONLY on a node with no network (`transport` absent or
+     *  `false`). The fs backend is not here: it is `shell.fs`, whether the caller passed one
+     *  or took the default. */
+    transport: TransportHost | null;
+}
+
+/** Stand a node up: the platform parts, the transport author pin, the shell, and the load
+ *  of the signed transport program that IS the node's network (§12.6). The one assembly
+ *  path — a second way to a Shell would be one that skipped the pin. */
+export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
+    const sodium = opts.sodium;
+    // The defaults are imported lazily: they are JS-target parts (a worker-backed module
+    // builder, the QuickJS realm engine), and the one target that never takes them (the
+    // native loader, which supplies Go-backed equivalents) must not pay for them.
+    // `false` is a node with no disk, the one member whose absence is NOT its default:
+    // omitted asks for the in-memory backend, said-as-false asks for none.
+    const backend = opts.fs === false ? undefined : opts.fs ?? new ((await import("./fs-memory.js")).MemoryFs)();
     // The key rule applied once, over whatever backend this target supplied, so every host
     // admits exactly the same key space — which is what decides the contents a node stores
     // and advertises.
-    const fs = platform.fs ? validatedFs(platform.fs) : undefined;
-    const moduleLoader = platform.modules;
-    // THE admission predicate (§12.5). The host's own invariants come first and are
-    // composed here rather than by the operator: an `admitAll` posture, or a consent
-    // dialog that always says yes, must not be a way to lose revocation or the downgrade
-    // guard.
-    const admit: Admit = allOf(hostGates, opts.admit ?? denyAll);
+    const fs = backend ? validatedFs(backend) : undefined;
+    const moduleLoader = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
+    const createRealm = opts.createRealm
+        ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
+    const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
+    const now = opts.now ?? (() => Date.now());
+    // Identity + network key are the NODE's, so they come from the top-level fields. The
+    // caller's object is passed through intact: a spread would flatten live getters.
+    const net = opts.transport === false ? undefined : opts.transport;
+    const netHost = net
+        ? new TransportHost(net, { identity: opts.identity, networkKey: opts.networkKey })
+        : null;
+    // The author is DERIVED from the blob, never restated — the pin is the whole of "only
+    // this author may be the network" (§12.5).
+    const transportBlob = netHost ? (net!.bundle ?? transportBundleBytes()) : null;
+    let transportAuthorHex: string | null = null;
+    if (transportBlob) {
+        try {
+            transportAuthorHex = toHex(verifyBundle(sodium, transportBlob).author);
+        }
+        catch { /* malformed blob — the load below refuses it by name */ }
+    }
+    // THE admission predicate (§12.5): the host's own gates, then the caller's, then the
+    // transport pin. Composed HERE so no posture can lose a member — an `admitAll`, or a
+    // consent dialog that always says yes, must not shed revocation or the pin. The pin is a
+    // VETO, never an appointment: it can only refuse.
+    //
+    // FAIL-CLOSED on a privilege it does not know: `PRIVILEGES` is derived from the
+    // capability catalog, so a privileged name added there arrives here with no branch and
+    // is refused rather than waved through. A new privilege is taught to the assembly
+    // deliberately, in this one place.
+    const admit: Admit = allOf(hostGates, opts.admit ?? denyAll, (v, ctx) => {
+        if (ctx.privileges.length === 0) return true;
+        for (const priv of ctx.privileges) {
+            if (priv !== PRIVILEGE_LINK) return false;
+        }
+        return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
+    });
+
+    // ── what this node holds ────────────────────────────────────────────────────
     const slots: AppSlot[] = [];
-    /** protocol claim → complete bundle slot (§12.10) — a projection of what is installed,
-     *  structure of its own: every entry comes from some installed manifest's signed
-     *  `protocols`, so there is nothing to write, persist, or keep in step. Materialized
-     *  rather than scanned for because it is read once per inbound frame. */
-    const claims = new Map<string, AppSlot>();
-    /** The existing concrete channel adapter is supplied and owned by the platform. The
-     *  shell may wire raw-link calls to it, but it is not part of the Shell API. */
-    const netHost = platform.transportHost;
-    // The tail of every initiator `invoke` call. close() defers realm disposal onto
-    // this so a call parked mid-await (a repair pass waiting out an unreachable peer)
-    // is never resumed into a freed realm — a QuickJS use-after-free (§2.1).
+    /** Two audiences, two maps (§12.10): `peerClaims` from every installed manifest's
+     *  `protocols`, `localClaims` from its `services`. Which map holds a name IS its reach,
+     *  so an inbound frame is one lookup and nothing tests the manifest a second time. Both
+     *  are projections of what is installed — nothing to write, persist or keep in step —
+     *  and materialized rather than scanned because each is read once per delivery.
+     *
+     *  A name in both is a bundle saying "reachable either way", so uniqueness is enforced
+     *  per map (`refuseContested`), never across them. */
+    const peerClaims = new Map<string, AppSlot>();
+    const localClaims = new Map<string, AppSlot>();
+    // The tail of every host-initiated call into a realm. close() defers realm disposal onto
+    // this, so a call parked mid-await (a repair pass on an unreachable peer, an operator
+    // waiting for a cohort) is never resumed into a freed realm — a QuickJS
+    // use-after-free (§2.1).
     let inFlight = Promise.resolve();
     const keyOf = (slot: AppSlot) => appKeyFor(slot.verifiedBundle.author, slot.verifiedBundle.manifest.app);
-    const findSlot = (appKey: string) => slots.find((slot) => keyOf(slot) === appKey);
-    /** Every name a manifest claims, public and local together (§12.10) — the union the
-     *  `claims` map is keyed on, one owner per name across both lists. `protocols` and
-     *  `services` are disjoint by construction (`validateManifest`), so this is a plain
-     *  concatenation, never a merge that could collapse two different reaches into one. */
-    const manifestClaims = (manifest: LoadedBundle["manifest"]) => [...(manifest.protocols ?? []), ...(manifest.services ?? [])];
-    const slotClaims = (slot: AppSlot) => manifestClaims(slot.verifiedBundle.manifest);
+    /** Each signed list paired with the map it claims in, so every caller iterating a
+     *  bundle's claims covers both audiences. */
+    const booksOf = (manifest: LoadedBundle["manifest"]): readonly (readonly [Map<string, AppSlot>, readonly string[], string])[] => [
+        [peerClaims, manifest.protocols ?? [], "protocols"],
+        [localClaims, manifest.services ?? [], "services"],
+    ];
     const reachesLink = (manifest: LoadedBundle["manifest"]) => privilegesOf(manifest).includes(PRIVILEGE_LINK);
     /** Whether `slot` holds the raw-link binding. Exclusive, like a claim: the driver has
      *  ONE event sink, so two holders are not a composition — the second would take the
@@ -367,8 +455,10 @@ function createShell(opts: CreateShellOptions & {
      *  binding's holder. */
     const hasLink = (slot: AppSlot) => reachesLink(slot.verifiedBundle.manifest);
     const releaseClaims = (slot: AppSlot) => {
-        for (const claim of slotClaims(slot)) {
-            if (claims.get(claim) === slot) claims.delete(claim);
+        for (const [book, names] of booksOf(slot.verifiedBundle.manifest)) {
+            for (const claim of names) {
+                if (book.get(claim) === slot) book.delete(claim);
+            }
         }
     };
     /** An empty slot for `loaded`, with its timer table already pointed at the realm the
@@ -388,8 +478,8 @@ function createShell(opts: CreateShellOptions & {
                 console.error(`[shell] guest error in timer: ${errMessage(err)}`);
             });
         });
-        const appScope = appScopeFor(platform.sodium, loaded.author, loaded.manifest.app);
-        const scope = slotSignScope(platform, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
+        const appScope = appScopeFor(sodium, loaded.author, loaded.manifest.app);
+        const scope = slotSignScope(opts, loaded.author, loaded.manifest.app, privilegesOf(loaded.manifest));
         slot = {
             verifiedBundle: loaded,
             pureModules,
@@ -418,16 +508,16 @@ function createShell(opts: CreateShellOptions & {
         const json = JSON.stringify(value);
         return `const ${name} = JSON.parse(${JSON.stringify(json)});\n`;
     };
-    /** Stand one candidate realm. It remains outside `slots` and `claims` until this and
-     *  the freshness write both succeed. Both bounds resolve per load: this load's number,
-     *  else the node's default, else the shared one — never the author's, since a bundle
-     *  cannot ask for more of the host than the operator gave it. */
+    /** Stand one candidate realm. It remains outside `slots` and the claim maps until this
+     *  and the freshness write both succeed. Both bounds resolve per load: this load's
+     *  number, else the node's default, else the shared one — never the author's, since a
+     *  bundle cannot ask for more of the host than the operator gave it. */
     const standRealm = async (slot: AppSlot, localConfig: JsonObject, load: LoadBundleOptions): Promise<void> => {
         const b = slot.verifiedBundle;
         // Absent ≡ `{}`, so `APP` is always an object to read names off (isValidManifest
         // already refused any non-object).
         const appConfig = b.manifest.guest.config ?? {};
-        slot.realm = await platform.createRealm({
+        slot.realm = await createRealm({
             source: jsonPreamble("APP", appConfig) + jsonPreamble("LOCAL", localConfig) + b.guestSource,
             hostCall: seamFor(slot),
             memoryLimitBytes: load.realmMemoryBytes ?? opts.realmMemoryBytes ?? DEFAULT_REALM_MEMORY_BYTES,
@@ -435,36 +525,29 @@ function createShell(opts: CreateShellOptions & {
         });
     };
     /** Wire the `host.call` seam one admitted bundle's realm runs against (guest-seam.ts),
-     *  as the three things that own it: what this NODE is (`platform`), what this REALM
-     *  may reach (`grants`), and what this APP installed (`modules`). A bundle reaching
-     *  `link` is wired with `rawNet`: without it a bundle is never handed a socket
-     *  descriptor (§1, capability-by-non-wiring). Timers are NOT such a grant — `timer/*`
-     *  is an ordinary `"app"` authority, so every realm gets a table. */
+     *  as the three things that own it: what this NODE is, what this REALM may reach
+     *  (`grants`), and what this APP installed (`modules`). A bundle reaching `link` is
+     *  wired with `rawNet`: without it a bundle is never handed a socket descriptor (§1,
+     *  capability-by-non-wiring). Timers are NOT such a grant — `timer/*` is an ordinary
+     *  `"app"` authority, so every realm gets a table. */
     const seamFor = (slot: AppSlot): HostCall => {
         const b = slot.verifiedBundle;
         const links = hasLink(slot);
-        // THIS realm's own local service ids — the `requires` entries that are not host
-        // services. Computed once per slot: it is what tells a bare `host.call` name apart
-        // from this bundle's own module (guest-seam.ts dispatch), and what the
-        // irreversibility guard below folds in, since a local cross-realm call leaves
-        // something behind in the callee like `fs/put` does in this realm.
-        const localServices = new Set(b.manifest.guest.requires.filter((r) => !isService(r)));
+        // As signed. Tells a bare `host.call` name from this bundle's own module
+        // (guest-seam.ts dispatch), and feeds the irreversibility guard below.
+        const localServices = new Set(b.manifest.guest.calls ?? []);
         // The 32 bytes this realm is attributed by when it calls another: the app key,
         // hashed. The same shape as the sender key prepended to an inbound frame, so a
         // callee reads one field whether the caller was a peer or a co-resident app. Zero
         // is the HOST's own, and no app key derives it.
-        const callerId = genesisHash(platform.sodium, enc.encode(keyOf(slot)));
+        const callerId = genesisHash(sodium, enc.encode(keyOf(slot)));
         const fullSeam = createGuestSeam({
-            platform: {
-                sodium: platform.sodium,
-                identity: platform.identity,
-                now: platform.now ?? (() => Date.now()),
-            },
+            platform: { sodium, identity: opts.identity, now },
             grants: {
-                // The declared requires ARE the gate — a `host.call` naming a host method
-                // resolves iff the method's SERVICE is one of these. `crypto/*` and the
-                // bundle's own module names are exempt: a fixed catalog and the app's own
-                // code, never grants.
+                // The two signed lists, unmodified. A `host.call` naming a host method
+                // resolves iff the method's SERVICE is in `requires`. `crypto/*` and the
+                // bundle's own module names are exempt from both — a fixed catalog and the
+                // app's own code, never grants.
                 names: new Set(b.manifest.guest.requires),
                 localServices,
                 // What node/sign signs under: this slot's ONE scope, derived at load —
@@ -483,7 +566,7 @@ function createShell(opts: CreateShellOptions & {
                 // may be installed before its service, and a later load may replace that
                 // service — a claimant captured at seam construction would pin this realm
                 // to whoever was there first.
-                calls: { call: (id, payload) => crossRealmCall(callerId, id, payload) },
+                calls: { call: (id, payload) => callClaimant(localClaims, id, callerId, payload) },
                 rawNet: links ? netHost?.rawNet(slot) : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
@@ -501,10 +584,9 @@ function createShell(opts: CreateShellOptions & {
         // node facts through its installation-local config, never by reading them off this
         // seam. The refusal THROWS at the call site like every gate refusal (guest-seam.ts).
         return (name, payload, budget) => {
-            // A local service id leaves something behind in the CALLEE the same way
-            // `fs/put` leaves something behind in this realm — folded in here rather than
-            // into `isIrreversible` itself, which knows only the dispatch-level catalog and
-            // nothing about any one slot's own `requires`.
+            // A cross-realm call leaves something behind in the CALLEE the way `fs/put`
+            // does here. Folded in at this slot rather than into `isIrreversible`, which
+            // knows the dispatch catalog and nothing about one slot's `calls`.
             if (!slot.active && (isIrreversible(name) || localServices.has(name))) {
                 throw new Error(`shell: '${name}' is refused until this bundle's installation commits`);
             }
@@ -517,17 +599,16 @@ function createShell(opts: CreateShellOptions & {
     const callSlot = (slot: AppSlot, input: Uint8Array) => slot.realm
         ? slot.realm.call(input)
         : Promise.reject(new Error("shell: the guest's realm is not standing yet"));
-    /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
-     *  caller id the shell holds (loopback and socket/address events). */
-    const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
-        callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
-    /** Loopback invoke with host caller id. Chained onto `inFlight` so `close()`
-     *  waits for parked calls (§2.1). */
-    const invokeSlot = (slot: AppSlot, payload: Uint8Array): Promise<Uint8Array> => {
-        const call = hostCallSlot(slot, payload);
+    /** Chain a host-initiated call onto `inFlight`, so `close()` waits for it rather than
+     *  freeing the realm out from under it (§2.1). */
+    const track = (call: Promise<Uint8Array>): Promise<Uint8Array> => {
         inFlight = inFlight.then(() => call, () => call).catch(() => { }) as Promise<void>;
         return call;
     };
+    /** An event the HOST writes into a slot: `[32 zero bytes][driver body]` — the one
+     *  caller id the shell holds (loopback and socket events). */
+    const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
+        callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
     /** Fold this node's three immutable facts into a link occupant's ordinary LOCAL
      *  config. Only peerId, networkKey and contactSecret are host-owned and win collisions;
      *  transport-program policy remains the load's LOCAL override over signed APP defaults. */
@@ -538,19 +619,17 @@ function createShell(opts: CreateShellOptions & {
             throw new Error(`shell: a bundle reaching "${PRIVILEGE_LINK}" has nowhere to go on a shell with no raw-link driver`);
         return { ...localConfig, ...facts };
     };
-    /** Cross-realm call by local service id. Host prepends caller's 32-byte id — the local
-     *  half of `callClaimant`'s one table, the same claim → slot lookup a peer-inbound frame
-     *  resolves through (`deliverInbound`). */
-    const crossRealmCall = (callerId: Uint8Array, id: string, payload: Uint8Array): Promise<Uint8Array> | null => {
-        return callClaimant(id, callerId, payload);
-    };
     /** Refuse a candidate contesting a claim or the raw-link binding another identity
-     *  holds (§12.10). Asked before candidate code runs, then again in the commit window. */
+     *  holds (§12.10). Asked before candidate code runs, then again in the commit window.
+     *  Per MAP: the same name under `protocols` and `services` is two claims, not a
+     *  contest. */
     const refuseContested = (loaded: LoadedBundle, key: string) => {
-        for (const claim of manifestClaims(loaded.manifest)) {
-            const incumbent = claims.get(claim);
-            if (incumbent && keyOf(incumbent) !== key) {
-                throw new Error(`shell: claim '${claim}' is already held by '${keyOf(incumbent)}'`);
+        for (const [book, names, audience] of booksOf(loaded.manifest)) {
+            for (const claim of names) {
+                const incumbent = book.get(claim);
+                if (incumbent && keyOf(incumbent) !== key) {
+                    throw new Error(`shell: ${audience} claim '${claim}' is already held by '${keyOf(incumbent)}'`);
+                }
             }
         }
         // Refused rather than shadowed for the same reason a claim is, and LOUDLY because
@@ -579,23 +658,19 @@ function createShell(opts: CreateShellOptions & {
         input.set(payload, attribution.length);
         return callSlot(slot, input);
     };
-    /** Hand a request to the realm claiming `claim` — the local half of the one table a
-     *  peer-inbound frame also resolves through (`deliverInbound`). Answer is the realm's
-     *  Promise. */
-    const callClaimant = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
-        const slot = claims.get(claim);
+    /** Hand a request to the realm claiming `claim` in `book`. `null` when nothing claims
+     *  it — an answer, rather than a promise no one will settle. */
+    const callClaimant = (book: Map<string, AppSlot>, claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
+        const slot = book.get(claim);
         return slot ? callFramed(slot, attribution, payload) : null;
     };
-    /** Inbound from outside this node (the link occupant's `link/deliver` call, routed by
-     *  `TransportHost`).
-     *  A claim under the resolved slot's `services` — never its `protocols` — is local and
-     *  refused here with no exception (§12.10): this reads the slot's signed `protocols`,
-     *  no second structure kept in step with it. Once the answer resolves it is also handed
-     *  to the slot's own `onInbound`, if the load that installed it named one. */
+    /** Inbound from outside this node (the link occupant's `link/deliver` call). One lookup
+     *  on `peerClaims`, so a `services` claim is unreachable by a peer by construction
+     *  rather than by a second test against the slot's manifest. The resolved answer also
+     *  goes to the slot's `onInbound`, if its load named one. */
     const deliverInbound = (claim: string, attribution: Uint8Array, payload: Uint8Array): Promise<Uint8Array> | null => {
-        const slot = claims.get(claim);
+        const slot = peerClaims.get(claim);
         if (!slot) return null;
-        if (!(slot.verifiedBundle.manifest.protocols ?? []).includes(claim)) return null;
         const answer = callFramed(slot, attribution, payload);
         if (slot.onInbound) {
             const onInbound = slot.onInbound;
@@ -611,17 +686,21 @@ function createShell(opts: CreateShellOptions & {
         }
         return answer;
     };
-    // The claim routing behind `link/deliver` (§12.10), wired once: the driver normalizes
-    // the answer to empty before handing it back, so refusal and silence are one fact at
-    // the boundary. Not owner-keyed like `activate` — an inbound frame resolves through
-    // the claim table above, whoever currently occupies the link.
+    // Wired once. Not owner-keyed like `activate`: an inbound frame resolves through
+    // `peerClaims`, whoever currently occupies the link. The driver normalizes the answer
+    // to empty, so refusal and silence are one fact at that boundary.
     netHost?.routeInbound(deliverInbound);
-    return {
-        resolve: (proto) => {
-            const slot = claims.get(proto);
+
+    const shell: Shell = {
+        resolve(name) {
+            const slot = peerClaims.get(name) ?? localClaims.get(name);
             return slot ? keyOf(slot) : null;
         },
-        routes: () => [...claims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
+        routes: () => [...peerClaims, ...localClaims].map(([claim, slot]): [string, string] => [claim, keyOf(slot)]),
+        call: (serviceId, payload) => {
+            const answer = callClaimant(localClaims, serviceId, HOST_CALLER_ID, payload);
+            return answer && track(answer);
+        },
         fs,
         sodium,
         async loadBundleBlob(blob, loadOpts = {}) {
@@ -640,8 +719,8 @@ function createShell(opts: CreateShellOptions & {
             // makes "nothing has landed" hold for the whole decision.
             const ctx: AdmissionContext = {
                 privileges,
-                highWater: platform.freshnessStore.get(v.author, v.manifest.app),
-                revoked: platform.freshnessStore.isRevoked(v.author),
+                highWater: freshnessStore.get(v.author, v.manifest.app),
+                revoked: freshnessStore.isRevoked(v.author),
             };
             if (!(await admit(v, ctx)))
                 throw new Error(ADMISSION_REJECTED);
@@ -670,7 +749,7 @@ function createShell(opts: CreateShellOptions & {
                 // A mark that cannot be persisted throws, and the store has already rolled
                 // itself back; the catch below disposes the candidate, so the running slot
                 // is untouched.
-                platform.freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
+                freshnessStore.set(loaded.author, loaded.manifest.app, loaded.manifest.version);
             }
             catch (err) {
                 disposeSlot(slot);
@@ -682,10 +761,13 @@ function createShell(opts: CreateShellOptions & {
             if (previous) releaseClaims(previous);
             if (previousIndex < 0) slots.push(slot);
             else slots[previousIndex] = slot;
-            for (const claim of slotClaims(slot)) claims.set(claim, slot);
+            for (const [book, names] of booksOf(loaded.manifest)) {
+                for (const claim of names) book.set(claim, slot);
+            }
             // The outgoing guest's link state went with its realm (§4.3), so the sockets it
-            // held are torn down here rather than left as channels nobody can speak for. The
-            // incoming guest redials from the address book, which is the NODE's. After the
+            // held are torn down here rather than left as channels nobody can speak for. So
+            // did its address book, which is why the incoming guest redials from the peers
+            // its own load named and not from anything retained here (§12.10). After the
             // claim hand-over above, so `onClose` finds the channels already gone and queues
             // no `linkClosed` at the new realm for links it never had. Only ever a free
             // binding or this identity's own: `refuseContested` turned any other candidate
@@ -699,11 +781,6 @@ function createShell(opts: CreateShellOptions & {
             // The mark and every claim/link binding have landed, so this slot's writes and
             // cross-realm calls are now its own (`seamFor`).
             slot.active = true;
-            // The address book is mutable node state, not part of the immutable facts the
-            // occupant received in LOCAL. Publish first, then replay it through the
-            // ordinary host-event path. No await in between: a concurrent add is either
-            // in this replay or is announced directly to the newly published claimant.
-            if (hasLink(slot)) netHost?.replayAddresses();
             disposeSlot(previous);
             // The handle: the verified facts plus the bound slot — the key, the scoped fs
             // view and the loopback invoke. One object, so a caller cannot derive half of
@@ -714,7 +791,7 @@ function createShell(opts: CreateShellOptions & {
                 fs: slot.fsScope,
                 appScope: slot.appScope,
                 invoke: (payload) => slot.active
-                    ? invokeSlot(slot, payload)
+                    ? track(hostCallSlot(slot, payload))
                     : Promise.reject(new Error(`shell: app '${key}' slot is no longer loaded`)),
             };
             return handle;
@@ -728,7 +805,7 @@ function createShell(opts: CreateShellOptions & {
             // Persist FIRST, then tear down. The other order leaves a window in which the
             // apps are gone but nothing refuses the key, and the case this exists for is a
             // key that is actively publishing.
-            platform.freshnessStore.revoke(fromHex(hex));
+            freshnessStore.revoke(fromHex(hex));
             const gone = [];
             for (const slot of [...slots]) {
                 if (toHex(slot.verifiedBundle.author) === hex) {
@@ -744,159 +821,30 @@ function createShell(opts: CreateShellOptions & {
             const dispose = () => {
                 for (const slot of slots) disposeSlot(slot);
                 slots.length = 0;
-                claims.clear();
+                peerClaims.clear();
+                localClaims.clear();
             };
             inFlight.then(dispose, dispose);
         },
     };
-}
 
-/** JS-target assembly options (§12.9). Every field but `sodium` and `identity`
- *  has a default; the pin and load order are part of standing a node up. */
-export interface BootShellOptions {
-    /** The crypto surface the shell needs — core libsodium with the ML-DSA-65 verifier
-     *  mixed in (the one thing no target can default: main.ts loads it, a browser page
-     *  readies it). */
-    sodium: ShellSodium;
-    /** The node's keypair (§12.9): its public half is this node's peer id and the one
-     *  identity every target reports through `node/identity`. */
-    identity: Keypair;
-    /** YOUR admission predicate (§12.5) — the one branch that is actually yours: an
-     *  operator's policy, a consent dialog, or `() => true` for "the bundle my operator
-     *  handed me IS the trust decision". The transport author pin is ANDed onto it here, and
-     *  the host's own gates (`hostGates`) by the shell, so no posture can lose either.
-     *  Consulted for EVERY bundle, privileged ones included. Absent ⇒ deny-all. */
-    admit?: Admit;
-    /** The fs backend the shell's `fs` capability and every app's scoped view sit on.
-     *  Default: `MemoryFs`. A disk-backed node (main.ts) passes its `NodeFs`.
-     *
-     *  `false` is "a node with no disk" (§12.2): no backend wired at all, so a bundle
-     *  declaring the `fs` cap has its first `fs/*` call throw by name rather than resolve
-     *  to a pretend store. Said rather than omitted, because omitting is what asks for the
-     *  in-memory default. */
-    fs?: Fs | false;
-    /** The persisted bundle-freshness store (§12.4). Default: `FreshnessMarks`,
-     *  in-memory. */
-    freshnessStore?: FreshnessStore;
-    /** The builder for a bundle's private pure modules (§4). Default: `ModuleTable`, the
-     *  JS worker-backed builder; the native loader passes its Go-backed one. */
-    modules?: PureModuleLoader;
-    /** The confined realm factory (§12.3). Default: the lazy safe-js import — the QuickJS
-     *  engine is heavy, so it loads on the first realm, which is why realm creation is a
-     *  platform member rather than something the shared shell reaches for itself. */
-    createRealm?: RealmFactory;
-    now?: () => number;
-    /** Which network this node belongs to (§12.6) — an isolation boundary, not a gate.
-     *  Absent ⇒ the public network. */
-    networkKey?: Uint8Array;
-    guestDeadlineMs?: number;
-    realmMemoryBytes?: number;
-    /** The channel adapter. An OPTIONS object ⇒ bootShell constructs the `TransportHost`
-     *  (identity and networkKey come from the top-level fields, never restated), admits
-     *  the transport bundle under the pin, and starts its listeners. The object is retained,
-     *  so getter-backed live options stay live. `false` or absent ⇒ no network. */
-    transport?: Omit<TransportHostOptions, "identity" | "networkKey"> | false;
-    /** Installation-local configuration for the automatically loaded transport bundle.
-     *  Passed through the ordinary one-load `localConfig` path; the signed bundle supplies
-     *  its own defaults in `manifest.guest.config`. */
-    transportConfig?: JsonObject;
-    /** Boot auto-load of the pinned transport bundle. Default true. `false` ⇒ bootShell
-     *  constructs the adapter but leaves the load to the caller. */
-    transportLoad?: boolean;
-    /** The transport bundle to PIN — and, in the options case, load. Default: the
-     *  artifact-shipped one (`transportBundleBytes`). */
-    transportBundle?: Uint8Array;
-}
-
-/** What `bootShell` hands back: the shell, plus the channel adapter — the one piece the
- *  shell does not expose and a platform still has to drive (the address book, the
- *  listeners). The SAME object the shell holds, not a copy. */
-export interface BootResult {
-    shell: Shell;
-    /** The channel adapter. Null ONLY on a node with no network (`transport` absent or
-     *  `false`) — which the overloads below say in the type, so a caller that asked for a
-     *  network does not assert its way past a null that cannot happen. The fs backend is
-     *  not here: it is `shell.fs`, whether the caller passed one or took the default. */
-    transport: TransportHost | null;
-}
-
-export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
-    const sodium = opts.sodium;
-    // The defaults are imported lazily: they are JS-target parts (a worker-backed module
-    // builder, the QuickJS realm engine), and the one target that never takes them (the
-    // native loader, which supplies Go-backed equivalents) must not pay for them.
-    // `false` is a node with no disk, the one member whose absence is NOT its default:
-    // omitted asks for the in-memory backend, said-as-false asks for none.
-    const fs = opts.fs === false ? undefined : opts.fs ?? new ((await import("./fs-memory.js")).MemoryFs)();
-    const modules = opts.modules ?? new ((await import("./module-table.js")).ModuleTable)();
-    const createRealm = opts.createRealm
-        ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
-    const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
-    // The channel adapter is CONSTRUCTED here when given options (identity + network key
-    // are the NODE's, so they are taken from the top-level fields), absent when false. Keep
-    // the caller's object intact: live getters such as a rotating contact secret must not
-    // be flattened by assembly.
-    const transport = opts.transport
-        ? new TransportHost(opts.transport, { identity: opts.identity, networkKey: opts.networkKey })
-        : null;
-    // The transport bundle this node pins, and (when constructed here) loads: the
-    // caller's or the artifact-shipped one. Its author is DERIVED from the blob, never
-    // restated — the pin is the whole of "only this author may be the network" (§12.5).
-    const transportBlob = transport ? (opts.transportBundle ?? transportBundleBytes()) : null;
-    let transportAuthorHex: string | null = null;
-    if (transportBlob) {
-        try {
-            transportAuthorHex = toHex(verifyBundle(sodium, transportBlob).author);
-        }
-        catch { /* malformed blob — the load below refuses it by name */ }
-    }
-    // The implicit transport pin, composed AROUND the caller's predicate: a bundle reaching
-    // `link` must be signed by the transport bundle's own author. The caller's predicate
-    // still has to admit as well, and nobody can LOSE the pin by forgetting it.
-    //
-    // It is keyed on the privileges the manifest reaches, and FAIL-CLOSED on the ones it
-    // does not know. `PRIVILEGES` is derived from the capability catalog (core/domains.ts),
-    // so a privileged name added there appears here as a privilege with no branch — and a
-    // bundle reaching it is refused rather than waved through by a caller whose gate says
-    // "privileged bundles are the pin's business". A new privilege is taught to the
-    // assembly deliberately, in this one place.
-    const admit: Admit = allOf(opts.admit ?? denyAll, (v, ctx) => {
-        if (ctx.privileges.length === 0) return true;
-        for (const priv of ctx.privileges) {
-            if (priv !== PRIVILEGE_LINK) return false;
-        }
-        return transportAuthorHex !== null && toHex(v.author) === transportAuthorHex;
-    });
-    const shell = createShell({
-        platform: {
-            sodium, identity: opts.identity, modules, fs,
-            freshnessStore, networkKey: opts.networkKey,
-            transportHost: transport ?? undefined,
-            createRealm, now: opts.now,
-        },
-        admit,
-        guestDeadlineMs: opts.guestDeadlineMs,
-        realmMemoryBytes: opts.realmMemoryBytes,
-    });
-    // The transport bundle IS the node's network (§12.6): verify + govern under the
-    // composed predicate, install, and the shell stands the driver up. A predicate that
-    // refuses the transport author leaves the node without a network, a deliberate
-    // configuration rather than an error. `transportLoad: false` leaves the load to the
-    // caller while bootShell still owns the adapter. A boot that throws returns no handle,
-    // so whatever it stood up must not leak: one teardown, the shell's.
+    // The transport bundle IS the node's network (§12.6), admitted through the ordinary
+    // load. A predicate that refuses its author leaves the node without one — a deliberate
+    // configuration, not an error. A boot that throws returns no handle, so whatever it
+    // stood up must not leak: one teardown, the shell's.
     try {
-        if (transport && transportBlob && opts.transportLoad !== false) {
+        if (netHost && transportBlob && net!.load !== false) {
             try {
                 await shell.loadBundleBlob(transportBlob,
-                    opts.transportConfig === undefined ? undefined : { localConfig: opts.transportConfig });
+                    net!.config === undefined ? undefined : { localConfig: net!.config });
             }
             catch (err) {
                 if (!isAdmissionRejected(err)) throw err;
                 console.warn('  no transport: the policy does not grant this bundle the "link" privilege');
             }
-            await transport.start();
+            await netHost.start();
         }
-        return { shell, transport };
+        return { shell, transport: netHost };
     }
     catch (err) {
         shell.close();

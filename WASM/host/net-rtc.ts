@@ -1,8 +1,8 @@
 // The WebRTC socket seam (README §12.6): peers reach each other directly over
 // RTCDataChannels, so the relay is only a signaling rendezvous and there is no server in
 // the data path. This file manages RTCPeerConnections and signaling and hands each data
-// channel to the driver's `openLink()`; everything above — the handshake, the record layer,
-// the routing — is the transport bundle's, identical to the TCP path.
+// channel to the driver as a `ChannelFactory`; everything above — the handshake, the
+// record layer, the routing — is the transport bundle's, identical to the TCP path.
 //
 // Raw I/O only. Anything a peer connection can carry BESIDES bytes (live audio/video)
 // belongs to the app, which subclasses RtcNetwork and works against the PeerEntry `pc`.
@@ -14,19 +14,26 @@
 // Browser-native, but the platform globals are referenced only inside RtcNetwork, so importing
 // this under Node is safe — a console peer joins the same mesh by passing its own
 // `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
-// owes openLink a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
-import { MessageChannel, SingleIdentityNetwork } from "./net-channel.js";
-import { FRAMING, type PeerId } from "../core/socket-seam.js";
+// owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
+import { MessageChannel } from "./net-channel.js";
+import { FRAMING, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { isHex64 } from "../core/util.js";
-import type { TransportHost, LinkHandle } from "./transport-host.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
  *  Exported because it is the seam an app subclass works against — see the note on media
  *  above. */
 export interface PeerEntry {
   pc: RTCPeerConnection;
-  link: LinkHandle | null;
-  authed: boolean;
+  /** Whether this entry's data channel is already bound to a RawLink — guards against a
+   *  renegotiation re-firing `ondatachannel` and handing the driver a second channel for
+   *  the same peer. */
+  linked: boolean;
+  /** Whether the underlying peer connection has completed DTLS/ICE (`connectionState`
+   *  reached "connected"). This is what `admitNewPeer`'s speculative-entry cap asks: a
+   *  connection this far along cost a real handshake, not just a relayed `hello`, so it no
+   *  longer counts against the cap — regardless of whether the transport above it has
+   *  authenticated. */
+  established: boolean;
   polite: boolean;
   makingOffer: boolean;
   pendingIce: RTCIceCandidateInit[];
@@ -41,9 +48,12 @@ export interface Signaling {
     close(): void;
 }
 
+/** Every signaling message names its sender, and a directed one its recipient, by channel
+ *  public key in lowercase hex — this file's own vocabulary. Nothing below it deals in
+ *  peers: a socket seam takes destinations, not identities (core/socket-seam.ts). */
 interface SignalBase {
-    from: PeerId;
-    to?: PeerId;
+    from: string;
+    to?: string;
 }
 
 type HelloSignal = SignalBase & { type: "hello" };
@@ -92,12 +102,11 @@ function signalMsg(value: unknown): SignalMsg | undefined {
 }
 
 export interface RtcNetworkOptions {
-    /** The platform's concrete channel adapter. It holds the node identity, the network
-     *  key, the contact secret and the peer lint; this file only manages connections. */
-    driver: TransportHost;
-    /** Resolve a peer's contact secret when dialing it. Signaling already names the
-     *  peer, so it can carry the credential too. */
-    peerContactFor?: (peerId: PeerId) => Uint8Array | undefined;
+    /** This node's own channel public key, hex — the negotiation needs it for the
+     *  polite/impolite tie-break and for its own `hello`s. Cannot come from a driver: this
+     *  factory is constructed BEFORE the driver, since `bootShell` builds the
+     *  `TransportHost` from `transport.channels`. */
+    peerId: string;
     signaling: Signaling;
     /** ICE servers (STUN/TURN). For LAN/localhost a public STUN list is enough. */
     rtcConfig?: RTCConfiguration;
@@ -108,11 +117,7 @@ export interface RtcNetworkOptions {
     /** Optional peer allowlist, applied to SIGNALING messages. Absent (the default)
      *  admits every peer to the rendezvous; the in-channel peer lint (the
      *  driver's, run on a signature-verified id) is separate and always on. */
-    admitPeer?: (peerId: PeerId) => boolean;
-    /** Called when a peer's link authenticates / drops. The storage demo uses these
-     *  to mirror the live mesh into a StorageNode's cohort (addPeer/removePeer). */
-    onPeerUp?: (peerId: PeerId) => void;
-    onPeerDown?: (peerId: PeerId) => void;
+    admitPeer?: (peerId: string) => boolean;
 }
 
 // Keep physical data-channel messages below the conservative cross-browser ceiling while
@@ -122,28 +127,46 @@ export interface RtcNetworkOptions {
 export const RTC_CHUNK_BYTES = 48 * 1024;
 export class RtcChannel extends MessageChannel {
   override readonly framing = FRAMING.LENGTH;
-  constructor(dc: RTCDataChannel) { super(dc); }
+  constructor(dc: RTCDataChannel, readonly weDialed: boolean, readonly expectPeerId: string) { super(dc); }
   protected override write(bytes: Uint8Array): void {
     for (let off = 0; off < bytes.length; off += RTC_CHUNK_BYTES) {
       super.write(bytes.subarray(off, Math.min(bytes.length, off + RTC_CHUNK_BYTES)));
     }
   }
 }
-// Cap on speculative (unauthenticated) peer entries the relay can force us to allocate by
-// spamming `hello`s with arbitrary `from` values. Authenticated peers do not count, so a
-// genuine fleet is unconstrained.
-const MAX_UNAUTHED_PEERS = 256;
-export class RtcNetwork extends SingleIdentityNetwork {
+// Cap on speculative peer entries the relay can force us to allocate by spamming `hello`s
+// with arbitrary `from` values. An entry stops being speculative once its peer connection
+// establishes (PeerEntry.established) — that cost a real DTLS/ICE handshake, not just a
+// relayed `hello` — so a genuine fleet is unconstrained. What keeps the escaped side of
+// that line bounded is `bindLink`'s channel watch: an entry that establishes but never
+// carries an authenticated link loses its data channel to the transport's own deadline,
+// and the entry with it.
+const MAX_UNESTABLISHED_PEERS = 256;
+export class RtcNetwork implements ChannelFactory {
     opts;
-    readonly peers = new Map<PeerId, PeerEntry>(); // all (pre- and post-auth)
+    private readonly ownId: string;
+    private onAccept: ((channel: RawLink) => void) | null = null;
+    readonly peers = new Map<string, PeerEntry>(); // all (pre- and post-establish)
     private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
     constructor(opts: RtcNetworkOptions) {
-        super(opts.driver, { onPeerUp: opts.onPeerUp, onPeerDown: opts.onPeerDown });
         this.opts = opts;
+        this.ownId = opts.peerId;
         // Resolved once per network rather than per ensurePeer, so the browser global is
         // only touched where it exists.
         this.makePc = opts.peerConnectionFactory ?? ((cfg) => new RTCPeerConnection(cfg));
         opts.signaling.onMessage((m) => this.onSignal(m));
+    }
+    // ── ChannelFactory interface ─────────────────────────────────────────────────
+    /** A browser binds no port; every RTC link arrives through signaling. `connect` is
+     *  deliberately absent (socket-seam.ts `ChannelFactory`): RTC peers come from
+     *  signaling, never from an address. */
+    async listen(
+        _tcp: { host: string; port: number } | undefined,
+        _ws: { host: string; port: number } | undefined,
+        onAccept: (channel: RawLink) => void,
+    ): Promise<{ port: number; wsPort: number }> {
+        this.onAccept = onAccept;
+        return { port: 0, wsPort: 0 };
     }
     // ── Network interface ────────────────────────────────────────────────────────
     /** Announce ourselves into the room so present peers begin the WebRTC dance.
@@ -163,20 +186,20 @@ export class RtcNetwork extends SingleIdentityNetwork {
         this.opts.signaling.close();
     }
     // ── per-peer connection (perfect negotiation) ───────────────────────────────────
-    /** Whether a NEW (pre-auth) peer entry may be created. The relay can force speculative
-     *  entries by naming arbitrary peers in hellos AND in offers, so every path that would
-     *  CREATE one answers to the same cap. */
+    /** Whether a NEW (not yet established) peer entry may be created. The relay can force
+     *  speculative entries by naming arbitrary peers in hellos AND in offers, so every path
+     *  that would CREATE one answers to the same cap. */
     private admitNewPeer(): boolean {
-        let unauthed = 0;
-        for (const e of this.peers.values()) if (!e.authed) unauthed++;
-        return unauthed < MAX_UNAUTHED_PEERS;
+        let unestablished = 0;
+        for (const e of this.peers.values()) if (!e.established) unestablished++;
+        return unestablished < MAX_UNESTABLISHED_PEERS;
     }
-    ensurePeer(peerId: PeerId): PeerEntry {
+    ensurePeer(peerId: string): PeerEntry {
         const existing = this.peers.get(peerId);
         if (existing)
             return existing;
         const pc = this.makePc(this.opts.rtcConfig);
-        const e: PeerEntry = { pc, link: null, authed: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] };
+        const e: PeerEntry = { pc, linked: false, established: false, polite: this.ownId > peerId, makingOffer: false, pendingIce: [] };
         this.peers.set(peerId, e);
         pc.addEventListener("icecandidate", (ev) => {
             if (ev.candidate)
@@ -201,7 +224,14 @@ export class RtcNetwork extends SingleIdentityNetwork {
         pc.addEventListener("datachannel", (ev) => this.bindLink(peerId, e, ev.channel, /*weDialed*/ false));
         pc.addEventListener("connectionstatechange", () => {
             const s = pc.connectionState;
-            if (s === "disconnected") {
+            if (s === "connected") {
+                // A completed DTLS/ICE connection is no longer a speculative entry the
+                // relay conjured for free (admitNewPeer). Whether the transport ABOVE it
+                // authenticates is that guest's business from here — this file's watch
+                // ends at the peer connection.
+                e.established = true;
+            }
+            else if (s === "disconnected") {
                 // A transient path failure (network blip, NAT rebind): restartIce()
                 // schedules negotiationneeded with fresh credentials and the link recovers
                 // without a teardown. Only "failed"/"closed" are terminal.
@@ -219,28 +249,41 @@ export class RtcNetwork extends SingleIdentityNetwork {
     // The impolite side opens the single ordered binary channel; the polite side gets
     // it via ondatachannel. Exactly one channel per pair, so there is no double-
     // connect to resolve (unlike TCP's dial race).
-    dialChannel(peerId: PeerId, e: PeerEntry) {
-        if (e.polite || e.link)
+    dialChannel(peerId: string, e: PeerEntry) {
+        if (e.polite || e.linked)
             return;
         this.bindLink(peerId, e, e.pc.createDataChannel("seedkernel", { ordered: true }), /*weDialed*/ true);
     }
-    bindLink(peerId: PeerId, e: PeerEntry, dc: RTCDataChannel, weDialed: boolean) {
-        if (e.link)
+    /** Hand the data channel to the driver as a RawLink. The link's fate — whether it
+     *  authenticates, and when it dies — is entirely the transport guest's from here; what
+     *  this file still owns is the CHANNEL, so it watches the one event that says the
+     *  channel is gone.
+     *
+     *  That watch is what bounds the entry table. A `hello` costs a peer connection, and
+     *  `admitNewPeer` stops counting an entry once DTLS/ICE establishes — cheap enough that
+     *  a relay naming fabricated peers could otherwise allocate without limit. It cannot,
+     *  because the transport above tears an unauthenticated link down on its own deadline
+     *  (`unverifiedTimeoutMs`), the driver closes the channel, and the entry goes with it.
+     *
+     *  A channel with nowhere to go is not bound at all: the driver has not started its
+     *  listeners yet, so the negotiation must be free to hand this peer over again rather
+     *  than sit marked `linked` forever. */
+    bindLink(peerId: string, e: PeerEntry, dc: RTCDataChannel, weDialed: boolean) {
+        if (e.linked)
             return; // already bound (a renegotiation re-fired ondatachannel)
-        const handle = this.driver.openLink({
-            channel: new RtcChannel(dc),
-            weDialed,
-            // Dialing gates on THEIR secret; accepting gates on OURS — and the driver
-            // seals an accept by itself, reading its contact secret at announce time, so
-            // nothing is supplied here for a link we did not dial.
-            contactSecret: weDialed ? this.opts.peerContactFor?.(peerId) : undefined,
-            expectPeerId: peerId, // the transport pins the far key to who signaling said it is
-            onAuth: () => { e.authed = true; this.peerUp(peerId); },
-            onClose: () => { this.peerDown(peerId); this.forget(peerId); },
-        });
-        e.link = handle;
+        const accept = this.onAccept;
+        if (!accept) {
+            try { dc.close(); } catch { /* ignore */ }
+            return;
+        }
+        // One data channel per peer connection and it is never re-bound, so the channel
+        // going away is terminal for this entry — exactly what the link's old onClose said.
+        dc.addEventListener("close", () => this.forget(peerId));
+        dc.addEventListener("error", () => this.forget(peerId));
+        e.linked = true;
+        accept(new RtcChannel(dc, weDialed, peerId));
     }
-    forget(peerId: PeerId) {
+    forget(peerId: string) {
         const e = this.peers.get(peerId);
         if (!e)
             return;
@@ -270,11 +313,11 @@ export class RtcNetwork extends SingleIdentityNetwork {
     }
     private async onHello(msg: HelloSignal) {
         const broadcast = !msg.to;
-        // A speculative entry that never authenticated is a zombie; a fresh broadcast
+        // A speculative entry that never established is a zombie; a fresh broadcast
         // hello means the peer reloaded, so replace it.
         if (broadcast) {
             const existing = this.peers.get(msg.from);
-            if (existing && !existing.authed)
+            if (existing && !existing.established)
                 this.forget(msg.from);
         }
         // The cap is on CREATION, whatever shape the hello took: a directed hello

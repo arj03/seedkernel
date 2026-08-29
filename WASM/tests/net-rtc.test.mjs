@@ -1,7 +1,7 @@
 // net-rtc.test.mjs — RtcNetwork's untrusted signaling boundary and speculative-entry cap
 // (§12.6.1). A signaling endpoint can name arbitrary `from` values in hellos AND in SDP
 // offers, and every entry carries an RTCPeerConnection — so decoding precedes policy and
-// every path that CREATES an entry answers to the same MAX_UNAUTHED_PEERS bound. Pinned with
+// every path that CREATES an entry answers to the same MAX_UNESTABLISHED_PEERS bound. Pinned with
 // stubs: the browser globals are referenced only inside methods, so net-rtc runs under Node.
 // Run after `npm run build`.
 
@@ -16,10 +16,11 @@ import { testkit } from "./testkit.mjs";
 
 const { test, assert, summary } = testkit();
 
-// The cap the transport relay is bound to (net-rtc.ts). A peer with an entry
-// already — pre- or post-auth — is never counted against it, so a genuine fleet
-// is unconstrained; only NEW speculative entries are.
-const MAX_UNAUTHED_PEERS = 256;
+// The cap the transport relay is bound to (net-rtc.ts). An entry stops counting once its
+// peer connection ESTABLISHES — DTLS/ICE completes (`PeerEntry.established`) — not once the
+// transport link above it authenticates, so a genuine fleet is unconstrained; only NEW
+// speculative entries are.
+const MAX_UNESTABLISHED_PEERS = 256;
 const peerId = (n) => String(n).padStart(64, "0");
 
 console.log("\nRtcNetwork signaling boundary and speculative-entry cap (§12.6.1)\n");
@@ -40,11 +41,7 @@ await test("RtcNetwork validates opaque signaling messages before admitting them
   };
   const ownId = peerId(0);
   const net = new RtcNetwork({
-    driver: {
-      peerId: ownId,
-      setPeerHooks() {},
-      openLink() { return { linkId: 1, send() {}, close() {} }; },
-    },
+    peerId: ownId,
     signaling,
     admitPeer() { admitted++; return true; },
     peerConnectionFactory: () => {
@@ -130,18 +127,14 @@ await test("RtcChannel fails closed when a chunked write throws after a prefix",
   assert(writes === 2, "a failed channel must never append bytes after the truncated frame");
 });
 
-await test("offers cannot force more than MAX_UNAUTHED_PEERS peer entries", async () => {
+await test("offers cannot force more than MAX_UNESTABLISHED_PEERS peer entries", async () => {
   // The old cap applied to the broadcast-hello path only: an offer from an
   // arbitrary `from` created an entry (and an RTCPeerConnection) unconditionally.
   const signaling = { send() {}, onMessage() {}, close() {} };
   const pcs = { n: 0 };
-  const driver = {
-    peerId: peerId(0),
-    setPeerHooks() {},
-    openLink() { return { linkId: 1, send() {}, close() {} }; },
-  };
+  const ownId = peerId(0);
   const net = new RtcNetwork({
-    driver,
+    peerId: ownId,
     signaling,
     peerConnectionFactory: () => {
       pcs.n++;
@@ -162,23 +155,23 @@ await test("offers cannot force more than MAX_UNAUTHED_PEERS peer entries", asyn
   // the rest must be dropped without allocating a connection.
   const offer = (from) => ({ type: "sdp", from, sdp: { type: "offer", sdp: "x" } });
   for (let i = 1; i <= 300; i++) await net.onSignal(offer(peerId(i)));
-  assert(net.peers.size === MAX_UNAUTHED_PEERS,
-    `offers must cap peer entries at ${MAX_UNAUTHED_PEERS}, got ${net.peers.size}`);
-  assert(pcs.n === MAX_UNAUTHED_PEERS,
+  assert(net.peers.size === MAX_UNESTABLISHED_PEERS,
+    `offers must cap peer entries at ${MAX_UNESTABLISHED_PEERS}, got ${net.peers.size}`);
+  assert(pcs.n === MAX_UNESTABLISHED_PEERS,
     `the connection factory must be reached exactly as many times, got ${pcs.n}`);
 
   // An entry that already exists is still served — the cap is on creation.
   await net.onSignal(offer(peerId(1)));
-  assert(net.peers.size === MAX_UNAUTHED_PEERS, "a repeat offer must not create a second entry");
-  assert(pcs.n === MAX_UNAUTHED_PEERS, "a repeat offer must not open a second connection");
+  assert(net.peers.size === MAX_UNESTABLISHED_PEERS, "a repeat offer must not create a second entry");
+  assert(pcs.n === MAX_UNESTABLISHED_PEERS, "a repeat offer must not open a second connection");
 
   // The hello path answers to the same cap — including DIRECTED hellos, which name
   // us too and could spam a slot just as well as broadcast ones.
   for (let i = 301; i <= 350; i++) {
-    await net.onSignal({ type: "hello", from: peerId(i), to: driver.peerId });
+    await net.onSignal({ type: "hello", from: peerId(i), to: ownId });
   }
-  assert(net.peers.size === MAX_UNAUTHED_PEERS, `hellos must not exceed the same cap (got ${net.peers.size})`);
-  assert(pcs.n === MAX_UNAUTHED_PEERS, "and no further connections may have been opened");
+  assert(net.peers.size === MAX_UNESTABLISHED_PEERS, `hellos must not exceed the same cap (got ${net.peers.size})`);
+  assert(pcs.n === MAX_UNESTABLISHED_PEERS, "and no further connections may have been opened");
 
   net.close();
 });

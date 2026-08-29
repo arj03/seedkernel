@@ -54,13 +54,11 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   globalThis.__requesterNode = node;
   const net = node.transport;
   globalThis.__net2 = net;
-  // The secret rides in the ADDRESS, not in this node's own config: on a dial it is the
-  // PEER's contact secret (§12.6), and without it the holder answers a stranger's msg1
-  // with silence — which is the whole point of the gate, and would show up here only as
-  // a request timeout.
-  __net2.addPeerAddr(holderId, {
-    host: "127.0.0.1", port, transport: "tcp", contactSecret: fromHex(contactSecretHex),
-  });
+  // The secret is taught WITH the address, not read from this node's own config: on a dial
+  // it is the PEER's contact secret (§12.6), and without it the holder answers a stranger's
+  // msg1 with silence — which is the whole point of the gate, and would show up here only
+  // as a request timeout.
+  teachAddr(node.shell, holderId, "tcp://127.0.0.1:" + port, fromHex(contactSecretHex));
   await __net2.start();
   return new Uint8Array(0);
 };

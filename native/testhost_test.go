@@ -38,6 +38,38 @@ const nativeHandleHarness = `
     body.set(args, 5);
     return app.invoke(body);
   };
+  // Teaching a peer is a claim call on the id the transport bundle claims — the host's own
+  // door into the network. The op frame is written out here rather than by widening the
+  // production QuickJS globals with the client codec, as invokeApp does for its own frame.
+  const opFrame = (op, args) => {
+    const out = new Uint8Array(1 + op.length + args.length);
+    out[0] = op.length;
+    for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i);
+    out.set(args, 1 + op.length);
+    return out;
+  };
+  const blob = (b) => {
+    const out = new Uint8Array(4 + b.length);
+    out[0] = b.length >>> 24; out[1] = (b.length >>> 16) & 255;
+    out[2] = (b.length >>> 8) & 255; out[3] = b.length & 255;
+    out.set(b, 4);
+    return out;
+  };
+  globalThis.teachAddr = (shell, peerHex, dest, contactSecret) => {
+    const parts = [
+      blob(fromHex(peerHex)),
+      blob(contactSecret || new Uint8Array(32)),
+      blob(new TextEncoder().encode(dest)),
+    ];
+    let n = 0;
+    for (const p of parts) n += p.length;
+    const args = new Uint8Array(n);
+    let off = 0;
+    for (const p of parts) { args.set(p, off); off += p.length; }
+    const answer = shell.call("_net", opFrame("addr", args));
+    if (!answer) throw new Error("native test: nothing claims _net on this node");
+    return answer;
+  };
 })();
 `
 
@@ -223,11 +255,11 @@ func applyPolicy(policyJSON string) error {
 
 // testGuestSeamJS installs __buildGuestSeam / __callSeam: a TEST-ONLY convenience over the
 // shared createGuestSeam, so a test can hand a realm a seam with no signed bundle behind
-// it. Production wires the seam from the admitted manifest's requires (§12.2), which is
-// why this lives in a _test file.
+// it. Production wires the seam from the admitted manifest's guest.requires and
+// guest.calls (§12.2, §12.10), which is why this lives in a _test file.
 const testGuestSeamJS = `
 "use strict";
-globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
+globalThis.__buildGuestSeam = function (names, identity, calls, scope, localServices) {
   globalThis.__guestSeam = createGuestSeam({
     // Per NODE.
     platform: { sodium, identity, now: () => Date.now() },
@@ -236,10 +268,9 @@ globalThis.__buildGuestSeam = function (names, identity, calls, scope) {
     // — never grants) — plus the backends behind them.
     grants: {
       names,
-      // The names that are not host services are this realm's LOCAL service ids, split
-      // out exactly as the shell splits them from a manifest's requires (§12.10): it is
-      // what tells one from a bare module name at the dispatch.
-      localServices: new Set(names.filter((n) => !isService(n))),
+      // This realm's LOCAL service ids — the manifest's own guest.calls in production
+      // (§12.10). What tells one from a bare module name at the dispatch.
+      localServices: new Set(localServices || []),
       signScope: scope || undefined,
       fs,
       // The routing a local service id resolves through: the shell's, in production.

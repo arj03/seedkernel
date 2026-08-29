@@ -89,10 +89,17 @@ func TestManifestClaimIsTheRouting(t *testing.T) {
 		t.Fatalf("a malformed protocol id must be refused at the load: %s", status)
 	}
 
-	// Legacy transport spellings are ordinary local claims; no claim name carries authority.
-	netPath, _ := signBundleJSON(t, author, "netsquat", claimManifest(t, "netsquat", "_net"), stubGuestSrc)
-	if status := loadBundle(netPath); !strings.Contains(status, "claim '_net' is already held") {
-		t.Fatalf("_net must reach ordinary claim-conflict handling: %s", status)
+	// Two claim lists are two maps: the shipped transport holds "_net" under `services`, so
+	// the same spelling under `protocols` is a second reach with its own owner, not a
+	// contest. No claim name carries authority either way.
+	netPath, netKey := signBundleJSON(t, author, "netsquat", claimManifest(t, "netsquat", "_net"), stubGuestSrc)
+	if status := loadBundle(netPath); status != loadedLine("netsquat", 1, netKey, "_net") {
+		t.Fatalf("a protocols claim spelled _net is a peer-side name of its own: %s", status)
+	}
+	// Within ONE map it is still one owner.
+	dupPath, _ := signBundleJSON(t, author, "netsquat2", claimManifest(t, "netsquat2", "_net"), stubGuestSrc)
+	if status := loadBundle(dupPath); !strings.Contains(status, "claim '_net' is already held") {
+		t.Fatalf("a contested protocols claim must be refused: %s", status)
 	}
 	hostPath, _ := signBundleJSON(t, author, "hostsquat", claimManifest(t, "hostsquat", "_host"), stubGuestSrc)
 	if status := loadBundle(hostPath); !strings.Contains(status, "serves _host") {

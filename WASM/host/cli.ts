@@ -9,8 +9,9 @@ import { toHex, fromHex, errMessage } from "../core/util.js";
 import { deriveNodeKey, type SubkeyCrypto, type Keypair } from "../core/subkeys.js";
 import { isJsonObject, type JsonObject } from "./bundle.js";
 import { PRIVILEGE_LINK } from "../core/domains.js";
-import { writeOp } from "./op-frame.js";
-import { parseHostPort, parsePeerSpec } from "./peer-addr.js";
+import { OpArgs, writeOp } from "./op-frame.js";
+import { TRANSPORT_SERVICE } from "./transport-bundle.js";
+import { parseHostPort, peersConfig } from "./peer-addr.js";
 import type { TransportHost } from "./transport-host.js";
 import type { AppHandle, Shell } from "./shell-core.js";
 
@@ -60,14 +61,34 @@ export interface NodeRuntime {
   transport: TransportHost;
 }
 
-/** The diagnosis a cohort operation needs when no bundle owns the raw-link binding. The
- *  adapter is always there — it is the platform's — so a node with no transport bundle answers
- *  "no route" rather than failing, which is a legitimate configuration (§12.6) and exactly
- *  the wrong answer to give an operator who typed `--peers`. */
-export function requireLinkBinding(transport: Pick<TransportHost, "available">, what: string): void {
-  if (!transport.available()) {
+/** The transport's installation-local config, assembled from the flags that name one. The
+ *  cohort belongs HERE rather than in a call after the boot: the address book lives in the
+ *  transport's realm now, so "who this node dials" is part of what a transport is loaded
+ *  WITH, and a replacement is loaded with it again (§12.10). `undefined` when no flag
+ *  named anything, so a default load stays a default load.
+ *
+ *  Exported because both targets' `standUp` paths build the same object out of the same two
+ *  flags, one of them from a Go-side config blob rather than argv. */
+export function transportConfigFrom(peerSpecs: readonly string[], requestDeadline?: string): JsonObject | undefined {
+  const cfg: JsonObject = {};
+  if (peerSpecs.length > 0) cfg.peers = peersConfig(peerSpecs);
+  if (requestDeadline !== undefined) cfg.requestDeadlineMs = Number(requestDeadline);
+  return Object.keys(cfg).length > 0 ? cfg : undefined;
+}
+
+/** Wait for the peers this node's transport was loaded with, or the deadline — a claim call
+ *  on the id that bundle claims, the same door a co-resident guest uses. Exported because
+ *  both targets' boots do this, so `ready` and its deadline are spelled once; the transport
+ *  settles the op either way, so this bounds the boot rather than deciding anything.
+ *
+ *  `null` means nothing claims that id: a node with no transport, which is a legitimate
+ *  configuration (§12.6) and a failure only once the operator asked for a cohort. */
+export function awaitCohort(shell: Pick<Shell, "call">, what: string): Promise<Uint8Array> {
+  const answer = shell.call(TRANSPORT_SERVICE, new OpArgs("ready").u32(5000).build());
+  if (!answer) {
     throw new Error(`shell: ${what} — load a bundle granted the "${PRIVILEGE_LINK}" privilege first`);
   }
+  return answer;
 }
 
 /** The platform under the operator flow. */
@@ -213,6 +234,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     localConfig = parsed;
   }
 
+  // Cohort peers, parsed BEFORE the node stands up because they are now part of the
+  // transport's own configuration rather than something taught to a driver afterwards
+  // (§12.10). A malformed reference therefore fails before anything is listening.
+  const peers = list(args.get("peers"));
+
   const { shell, transport: net } = await host.standUp({
     dir,
     policyJson,
@@ -226,9 +252,7 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     wsListen: args.has("ws-listen")
       ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
-    transportConfig: args.has("request-deadline")
-      ? { requestDeadlineMs: Number(args.get("request-deadline")) }
-      : undefined,
+    transportConfig: transportConfigFrom(peers, args.get("request-deadline")),
     // Guest resource bounds (§12.3), which only widen or tighten the shell's own
     // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
     // rather than reached by leaving a flag off.
@@ -236,19 +260,11 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     realmMemoryBytes: args.has("guest-memory") ? Number(args.get("guest-memory")) * 1024 * 1024 : undefined,
     transportBundle: args.has("transport") ? mustRead(host, args.get("transport")!, "--transport") : undefined,
   });
-  // Cohort peers: teach the transport their addresses so it can dial them. A policy
-  // admitting no transport bundle leaves nothing to dial FROM — say so, rather than
-  // letting the flag pass silently on a node with no network.
-  const peers = list(args.get("peers"));
+  // The addresses went in with the load above; what is left is to wait for the cohort.
+  // Best-effort: the op settles on its own deadline rather than rejecting, so a member that
+  // is not up yet delays the boot but never fails it.
   if (peers.length > 0) {
-    requireLinkBinding(net, "--peers given, but there is nothing to dial from");
-    for (const spec of peers) {
-      const { peerId, addr } = parsePeerSpec(spec, "tcp");
-      net.addPeerAddr(peerId, addr);
-    }
-    // Best-effort: ready() resolves on its own timeout rather than rejecting, so a
-    // cohort member that is not up yet delays the boot but never fails it.
-    await net.ready();
+    await awaitCohort(shell, "--peers given, but there is nothing to dial from");
   }
 
   host.log(`${host.banner} ${toHex(key.publicKey)}`);

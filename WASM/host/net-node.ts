@@ -8,8 +8,9 @@
 // the transport bundle over its own ws.wasm — one WS code path, and no node:http here.
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
-import { FRAMING, type Framing, type PeerAddr, type RawLink } from "../core/socket-seam.js";
+import { FRAMING, type Framing, type RawLink } from "../core/socket-seam.js";
 import { TCP_LINGER_MS } from "../core/net-limits.js";
+import { parseDest } from "./peer-addr.js";
 
 // ── An unframed RawLink over a node:net socket ────────────────────────────────
 // Raw bytes in and out, no boundaries; a WS link is the same socket with a different codec
@@ -60,10 +61,17 @@ export class NodeChannelFactory {
     /** Takes no crypto: the WebSocket client key and the frame masks are the transport
      *  bundle's, which reaches entropy through `node/random` like any other authority. */
     constructor() {}
-    connect(addr: PeerAddr): RawLink {
-        const socket = tcpConnect(addr.port, addr.host);
-        return addr.transport === "ws"
-            ? nodeRawStream(socket, FRAMING.WS_CLIENT, addr.host + ":" + addr.port)
+    /** Resolve the guest's opaque destination against what node:net can actually reach.
+     *  `tcp://` is the node↔node path and `ws://` the same socket under the RFC 6455 codec;
+     *  `wss://` is a real destination this factory has no TLS stack for, so it reads "no
+     *  route" here rather than dialing a plaintext socket at a TLS port and failing later as
+     *  a handshake that never completes. */
+    connect(dest: string): RawLink | null {
+        const d = parseDest(dest);
+        if (!d || d.scheme === "wss") return null;
+        const socket = tcpConnect(d.port, d.host);
+        return d.scheme === "ws"
+            ? nodeRawStream(socket, FRAMING.WS_CLIENT, d.host + ":" + d.port)
             : nodeRawStream(socket, FRAMING.LENGTH);
     }
     async listen(tcp: {

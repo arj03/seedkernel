@@ -31,6 +31,12 @@ const connsPerPeer = Math.max(1, policy("connsPerPeer"));
 const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
+// The address book this installation was configured with: `{ peerId, dest, contactSecret? }`
+// in hex, seeded into `Core.addrs` once the core exists. The book is THIS realm's — the
+// host keeps no copy — so a transport replacement starts from whatever its own load named,
+// plus whatever `addr` events follow (§12.10).
+const configuredPeers = LOCAL.peers ?? APP.peers;
+if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
 const requestDeadlineMs = policy("requestDeadlineMs");
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
@@ -43,6 +49,14 @@ const maxVerified = policy("maxHalfOpenVerified");
 const maxAuthed = policy("maxAuthedLinks");
 // How long an AUTHENTICATED link may carry no traffic before it is retired; 0 disables.
 const linkIdleTimeoutMs = policy("linkIdleTimeoutMs");
+// How long a link may stay pre-authentication: the dialing side's whole handshake, and
+// the shorter clock an accept runs until a msg1 opens under the contact secret. 0
+// disables, like every other deadline here.
+const handshakeTimeoutMs = policy("handshakeTimeoutMs");
+const unverifiedTimeoutMs = policy("unverifiedTimeoutMs");
+// Frames per direction between key ratchets — a deployment-wide constant BOTH ends must
+// share; a mismatch desynchronizes the record layer and the link dies.
+const rekeyAfterFrames = Math.max(1, policy("rekeyAfterFrames"));
 
 // The one router and the one request/response layer per host instance.
 let router = null;
@@ -56,8 +70,13 @@ const timers = new Map();
 // Deferred teardowns (see Link constructor): flushed after the current event.
 const deferQueue = [];
 
-// Host-managed (openLink) links by id — the pre-auth ones are in no pool.
-const openLinks = new Map();
+// Links that are down but whose SOCKET the platform has not reported yet, by id. A link we
+// tore down ourselves is out of every pool the moment it finishes — but the causal event,
+// `linkClosed`, arrives a turn later and its return is the only thing that carries WHY. So
+// the link is kept here until that event consumes it. Bounded by construction: the driver
+// answers every close with exactly one `linkClosed`, including on a sever, and each one
+// drains its entry.
+const closing = new Map();
 
 // The link limiter, over budgets from LOCAL (§12.6.2). THREE tiers: a slot is acquired
 // when a socket is accepted, moves to `verified` when a msg1 opens under the contact
@@ -145,7 +164,7 @@ class Core {
   constructor() {
     this.connecting = new Map(); // peerId → Link[] (outbound, pre-auth)
     this.inbound = new Set();    // accepted, pre-auth
-    this.addrs = new Map();      // peerId → 32B contact secret (or null = open)
+    this.addrs = new Map();      // peerId → { dest, secret } — this program's address book
     this.readyWaiters = [];      // [{check, d, timer}] — one per in-flight ready()
     this.dialing = new Map();    // peerId → in-flight dial, so concurrent senders share one
     this.limiter = new LinkLimiter(maxUnverified, maxPerSource, maxVerified, maxAuthed);
@@ -162,8 +181,12 @@ class Core {
     return true;
   }
 
-  addAddr(peerBytes, secret) {
-    this.addrs.set(toHex(peerBytes), secret.length > 0 ? secret : null);
+  /** Learn (or re-learn) one peer: where to reach it and the secret its door gates on.
+   *  An EMPTY `dest` is a peer we know of but cannot dial — an RTC peer, whose links arrive
+   *  through signaling — which is a real entry and not a missing one: it carries the contact
+   *  secret an inbound link needs without pretending we hold a route. */
+  addAddr(peerBytes, secret, dest) {
+    this.addrs.set(toHex(peerBytes), { dest, secret: secret.length > 0 ? secret : null });
   }
 
   /** Top a dialed peer up to connsPerPeer outbound links. One dial per peer at a time:
@@ -177,10 +200,14 @@ class Core {
   }
 
   async dialNow(peerId) {
-    if (!this.addrs.has(peerId)) return;
+    const addr = this.addrs.get(peerId);
+    // Unknown, or known and not dialable BY US: an entry with no destination is a peer whose
+    // links can only arrive (signaling brought it), so there is nothing to open here. Both
+    // read the same at every caller — the frame waits for an inbound link or is dropped.
+    if (!addr || addr.dest === "") return;
     const have = router.linkCount(peerId) + (this.connecting.get(peerId) || []).length;
     for (let n = have; n < connsPerPeer; n++) {
-      const opened = await netLinkOpen(fromHex(peerId));
+      const opened = await netLinkOpen(addr.dest);
       if (opened.linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
       this.openLink({
         linkId: opened.linkId,
@@ -188,7 +215,7 @@ class Core {
         authority: opened.authority,
         weDialed: true,
         expectPeerId: fromHex(peerId),
-        linkSecret: this.addrs.get(peerId),
+        linkSecret: addr.secret,
         limiter: null,
         dialedPeerId: peerId,
       });
@@ -206,13 +233,15 @@ class Core {
       linkSecret: spec.linkSecret,
       source: spec.source,
       limiter: spec.limiter,
-      handshakeTimeoutMs: spec.handshakeTimeoutMs,
-      rekeyAfterFrames: spec.rekeyAfterFrames,
       onAuth: (pid, l) => this.onAuth(pid, l),
       onFrame: (pid, frame) => router.deliver(pid, frame),
       onClose: (l) => this.forget(l),
     });
-    if (spec.weDialed) Core.push(this.connecting, spec.dialedPeerId, link);
+    // `connecting` is keyed by peer because it is what steers an outbound frame at a link
+    // that has not authenticated yet — a dial whose peer we cannot name steers nothing, so
+    // it waits in `inbound` like an accept. (`spec.weDialed` is still passed to `Link`; it
+    // decides who speaks first.)
+    if (spec.dialedPeerId) Core.push(this.connecting, spec.dialedPeerId, link);
     else this.inbound.add(link);
     return link;
   }
@@ -231,6 +260,9 @@ class Core {
       if (Core.drop(this.connecting, pid, link)) break;
     }
     router.remove(link);
+    // Out of every pool, but not yet out of this program: `linkClosed` still has to be
+    // able to say why it went (see `closing`).
+    closing.set(link.linkId, link);
   }
 
   // A frame for a peer with no routable link yet: dial, then hand the frame to the
@@ -293,12 +325,12 @@ class Core {
   }
 }
 
-/** Every core link, wherever it currently sits: authenticated ones live in the
- *  router's pools, pre-auth ones in the core's connecting/inbound tables, a
- *  host-managed one in `openLinks`. */
+/** Every link, wherever it currently sits: authenticated ones live in the router's pools,
+ *  pre-auth ones in the core's connecting/inbound tables, and one already torn down waits
+ *  in `closing` for the socket event that will ask why. */
 function findLink(linkId) {
-  const open = openLinks.get(linkId);
-  if (open) return open;
+  const gone = closing.get(linkId);
+  if (gone) return gone;
   for (const pool of router.links.values()) {
     for (const link of pool) if (link.linkId === linkId) return link;
   }
@@ -362,6 +394,22 @@ router.sink = (from, frame) => reqres.onFrame(from, frame);
 // The cohort edges stay in this heap; the host reads them with the `peers` op.
 router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
 router.onPeerDown = (peerId) => { connected.delete(peerId); };
+// The configured cohort, seeded before the host's first event can arrive. A `contactSecret`
+// left out is an OPEN peer — the same 32 zero bytes the `addr` event spells it with — and
+// not "fall back to ours", which is a different peer's door.
+//
+// Each field is checked here for the reason every other config value is (`policy`): a
+// half-length key would key this book under a peer no handshake can ever match, which
+// reads exactly like a peer that is down. A load that names a cohort wrong fails instead.
+for (const p of configuredPeers) {
+  const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
+  if (!p || !hex32(p.peerId)) throw new Error("transport: config peers[].peerId must be 64 lowercase hex characters");
+  if (p.contactSecret !== undefined && !hex32(p.contactSecret)) {
+    throw new Error("transport: config peers[].contactSecret must be 64 lowercase hex characters");
+  }
+  if (p.dest !== undefined && typeof p.dest !== "string") throw new Error("transport: config peers[].dest must be a string");
+  core.addAddr(fromHex(p.peerId), p.contactSecret === undefined ? ZERO32 : fromHex(p.contactSecret), p.dest ?? "");
+}
 
 /**
  * The one entrypoint. The kernel's part of the argument is exactly the 32-byte caller;
@@ -384,89 +432,53 @@ function handle(argBytes) {
   }
 }
 
-/** A link the HOST opened: an accepted socket (kind CORE), or one a host-managed
- *  transport handed over (kind OPEN, either direction). A core link we dialed never
- *  arrives here. `linkSecret` is the secret THIS link opens under: the peer's on a dial,
- *  the host's own current one on an accept — so an accept gates on the secret now, not
- *  on the fallback in LOCAL (§12.6.3). */
+/** A link the HOST hands over: an accepted socket, or one a platform factory dialed
+ *  itself. A link we opened through `link/open` never arrives here. `linkSecret` is the
+ *  secret THIS link opens under: the host's own current one, whichever direction opened
+ *  it — so an accept, and a same-deployment dial, both gate on the secret now, not on the
+ *  fallback in LOCAL (§12.6.3). */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
   const weDialed = r.u8() === 1;
-  const kind = r.u8();
   const framing = r.u8();
   const authority = r.blob();
-  const handshakeTimeoutMs = r.u32();
-  const rekeyAfterFrames = r.u32();
   const expectPeerId = r.blob();
   const linkSecret = r.blob();
   const source = r.blob();
-  const spec = {
+  core.openLink({
     linkId, weDialed, framing,
     authority: authority.length > 0 ? utf8Decode(authority) : "",
     expectPeerId: expectPeerId.length > 0 ? expectPeerId.slice() : null,
     linkSecret: linkSecret.length > 0 ? linkSecret.slice() : null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
-    handshakeTimeoutMs: handshakeTimeoutMs > 0 ? handshakeTimeoutMs : undefined,
-    rekeyAfterFrames: rekeyAfterFrames > 0 ? rekeyAfterFrames : undefined,
-    limiter: null,
-  };
-  if (kind === LINK_CORE) {
     // Only an accept spends half-open budget; a dial is our own decision to make.
-    spec.limiter = weDialed ? null : core.limiter;
-    spec.dialedPeerId = weDialed ? toHex(expectPeerId) : null;
-    core.openLink(spec);
-    return;
-  }
-  // A host-managed transport (WebRTC / browser WS): the socket is the caller's;
-  // auth goes to the shared router, and the host tracks the link by its id.
-  const link = new Link(Object.assign({}, spec, {
-    onAuth: (peerId, l) => {
-      // The peer lint answered at msg3/msg4 (`admits`); what is left is the
-      // double-connect tie-break. The host owns this socket, so the `linkBytes` event
-      // that completed authentication returns the peer without a guest-selected link id.
-      if (!router.promote(peerId, l)) { l.close(); return; }
-      l.reportedPeer = fromHex(peerId);
-    },
-    onFrame: (peerId, frame) => router.deliver(peerId, frame),
-    // `l`, not the `link` binding below: a Link that tears itself down in its own
-    // constructor (a refused limiter slot, a failed timer arm) notifies from the
-    // deferred flush, and `link` is a `const` that was never initialized — closing
-    // over it would raise a ReferenceError instead of telling the host its socket is down.
-    onClose: (l) => {
-      router.remove(l);
-      // Keep the closed link as a tombstone until the platform reports the raw socket's
-      // `linkClosed` event. Its return carries the reason; deleting it here would lose
-      // that causal event on a locally initiated close.
-    },
-  }));
-  openLinks.set(linkId, link);
+    limiter: weDialed ? null : core.limiter,
+    dialedPeerId: weDialed && expectPeerId.length > 0 ? toHex(expectPeerId) : null,
+  });
 });
 
 /** Bytes off one socket read. Awaits the READ's own decoding — framing, the handshake
- *  step, the AEAD — but not what it decoded to: a request goes to the host as this
- *  program's own `link/deliver` call, answered on a later turn. What rides this return is
- *  authentication, and only from the read that completed it; the host binds it to this
- *  event's link, so it names none. */
+ *  step, the AEAD — but answers nothing: a request it decoded goes to the host as this
+ *  program's own `link/deliver` call, on a later turn. */
 entry("linkBytes", async (r) => {
   const link = findLink(r.u32());
-  if (!link) return NOTHING;
-  await link.onWire(r.blob());
-  const peer = link.reportedPeer;
-  link.reportedPeer = null;
-  return peer || NOTHING;
+  if (link) await link.onWire(r.blob());
+  // Explicit, because this op is `async`: `handle`'s `|| NOTHING` sees a truthy Promise
+  // and never applies, so a bare `undefined` here would reach the seam's return check.
+  return NOTHING;
 });
 
+/** The socket is gone. The return is the one-byte reason (`reasonCode`, ake.js) — a fact
+ *  only this program ever held, since it is the end with the session keys. It carries no
+ *  link id: the event names the link, so a return cannot speak about another socket, and a
+ *  link already reported is off `closing` and answers nothing a second time. */
 entry("linkClosed", (r) => {
   const linkId = r.u32();
   const link = findLink(linkId);
   if (!link) return NOTHING;
   link.onChannelClosed();
-  const out = Uint8Array.of(reasonCode(link));
-  // Host-managed links stay here until this exact event so their down report cannot be
-  // redirected to another platform-owned socket. Core links were already forgotten by
-  // their own onClose callback and have no platform callback to answer.
-  if (openLinks.get(linkId) === link) openLinks.delete(linkId);
-  return out;
+  closing.delete(linkId);
+  return Uint8Array.of(reasonCode(link));
 });
 
 /** A fired deadline (§12.2): the shell's per-realm timer table re-entering this realm as
@@ -502,9 +514,13 @@ entry("send", (r, caller) => {
   return d.promise;
 });
 
+/** One peer, taught by the host on the embedder's behalf: who, the secret its door gates
+ *  on, and where to reach it. The destination is opaque to everything between this book and
+ *  the host's socket factory, and an EMPTY one is a peer we cannot dial (see `addAddr`). */
 entry("addr", (r) => {
   const peer = r.blob();
-  core.addAddr(peer, r.blob());
+  const secret = r.blob();
+  core.addAddr(peer, secret, utf8Decode(r.blob()));
 });
 
 /** Wait until every known peer is linked, or the deadline passes. Deferred for the same
@@ -528,15 +544,3 @@ entry("peers", () => {
 // both the HOST's, and it closes them itself (transport-host.ts `close`) rather than
 // asking an occupant that must not be able to refuse. What is left is this realm's heap,
 // which dies with the realm.
-
-// ── the host-managed link handle (openLink's LinkHandle) ──────────────────────
-
-entry("linkSend", (r) => {
-  const link = findLink(r.u32());
-  if (link) link.send(r.blob().slice());
-});
-
-entry("linkClose", (r) => {
-  const link = findLink(r.u32());
-  if (link) link.close();
-});
