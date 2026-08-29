@@ -186,6 +186,16 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       return c;
     };
   }
+  /** Release every phantom context discovered since the previous drain. Best-effort: a
+   *  context may already have been disposed while unwinding another engine operation. */
+  const disposePhantoms = (): void => {
+    for (const phantom of phantoms) {
+      if (phantom.alive) {
+        try { phantom.dispose(); } catch { /* already gone */ }
+      }
+    }
+    phantoms.clear();
+  };
   const clock = configureRealm(ctx, opts);
   let disposed = false;
   let outstandingHostCalls = 0;
@@ -220,12 +230,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
       // not before: when a job throws in the same call that grew the heap, `res.error` is a
       // handle the phantom minted, so freeing the context first would turn the release above
       // into a throw on a dead Lifetime.
-      for (const phantom of phantoms) {
-        if (phantom.alive) {
-          try { phantom.dispose(); } catch { /* already gone */ }
-        }
-      }
-      phantoms.clear();
+      disposePhantoms();
     }
   };
 
@@ -323,12 +328,7 @@ export async function createSafeRealm(opts: SafeRealmOptions): Promise<SafeRealm
     // here, or repeated rejected installs turn a bounded guest into an unbounded host leak.
     disposed = true;
     outstandingHostCalls = 0;
-    for (const phantom of phantoms) {
-      if (phantom.alive) {
-        try { phantom.dispose(); } catch { /* already gone */ }
-      }
-    }
-    phantoms.clear();
+    disposePhantoms();
     try {
       if (ctx.alive) ctx.dispose();
     } finally {
