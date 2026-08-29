@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import _sodium from "libsodium-wrappers";
 import { testkit, makeAuthor } from "./testkit.mjs";
+import { readGuestSource } from "../scripts/guest-source.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const imp = (p) => import(pathToFileURL(join(root, p)).href);
@@ -603,12 +604,11 @@ console.log("\n§12.2 — the host caller id is matched over all 32 bytes, not b
   ok(!callerOf(withCaller(leadingZero)).fromHost,
     "an app key that is zero everywhere but its last byte is not the host — the match is not a leading-zero-run shortcut");
 
-  // The transport bundle carries its OWN copy of this reader (transport/src/util.js) —
-  // content paired with its driver, so the fix has to hold there too. Evaluated out of
-  // the signed source rather than restated, so the two cannot drift apart silently.
-  const utilSrc = readFileSync(join(root, "transport", "src", "util.js"), "utf8");
-  const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(utilSrc);
-  ok(m !== null, "the transport bundle's own callerOf is where this test expects it");
+  // The transport assembler injects the canonical generated reader into its signed source.
+  // Evaluate that assembled source rather than restating the reader in this test.
+  const transportSrc = readGuestSource(guestOpFraming());
+  const m = /function callerOf\(arg\) \{[\s\S]*?\n\}/.exec(transportSrc);
+  ok(m !== null, "the transport assembler injected the canonical callerOf");
   const transportCallerOf = new Function(`${m[0]}; return callerOf;`)();
   ok(transportCallerOf(withCaller(new Uint8Array(32))).fromHost, "the transport reads 32 zero bytes as the host proper");
   ok(!transportCallerOf(withCaller(nearHost)).fromHost, "…and refuses a near-miss as the host proper");

@@ -10,6 +10,7 @@
     "core/wasm-limits.ts",
     "host/bundle.ts",
     "host/bundle-author.ts",
+    "host/op-frame.ts",
     "host/pq.ts"
   ],
   "include": []

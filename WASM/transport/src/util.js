@@ -108,45 +108,7 @@ Reader.prototype.blob = function () {
   return s;
 };
 
-// ── the caller prefix and the op envelope ──────────────────────────────────────
-//
-// The kernel's inbound shape is `handle([caller 32][body …])`: attribution only. What
-// this program does with the bytes after the caller is ITS format, so the helpers here are
-// this bundle's own spellings (paired with transport-host.ts), not a kernel ABI. The op
-// is a NAME, never a tag byte — an unimplemented op fails loud.
-
-/** The two kinds of caller, told apart by those 32 bytes and nothing else: the HOST
- *  proper (`[0x00 × 32]`, platform events and loopbacks — a fired deadline re-enters this
- *  way too, naming the host-only `timer` op like any other event, §12.2) and an APP (its
- *  app key, derived host-side from the admitted manifest, exactly as an inbound frame
- *  carries the authenticated sender's key).
- *
- *  The host id is matched over the WHOLE 32 bytes. An app key is a hash of facts its
- *  author picks, so a prefix test is a name an app can grind its way into. */
-function callerOf(arg) {
-  const caller = arg.subarray(0, 32);
-  let fromHost = true;
-  for (let i = 0; i < 32; i++) {
-    if (caller[i] !== 0) fromHost = false;
-  }
-  return { fromHost, caller, body: arg.subarray(32) };
-}
-
-/** `[opLen u8][op ascii][args …]` — this bundle's one envelope. Malformed framing
- *  throws rather than yielding a truncated name that reads as an unimplemented op. */
-function readOp(body) {
-  const n = body.length > 0 ? body[0] : -1;
-  if (n < 0 || body.length < 1 + n) throw new Error("transport: malformed op envelope");
-  let op = "";
-  for (let i = 0; i < n; i++) op += String.fromCharCode(body[1 + i]);
-  return { op, args: body.subarray(1 + n) };
-}
-
-/** The same, written — an app's or the host's payload, handed over as-is. */
-function writeOp(op, args) {
-  const out = new Uint8Array(1 + op.length + args.length);
-  out[0] = op.length;
-  for (let i = 0; i < op.length; i++) out[1 + i] = op.charCodeAt(i) & 0xff;
-  out.set(args, 1 + op.length);
-  return out;
-}
+// ── the caller prefix and op envelope ───────────────────────────────────────
+// Injected from host/op-frame.ts by scripts/guest-source.mjs. Keeping a marker here makes
+// omission fail during assembly instead of producing a signed guest with missing globals.
+/* @seedkernel-op-frame */

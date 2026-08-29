@@ -26,7 +26,7 @@ const { policyFromJson } = await imp("build/host/policy.js");
 const bundleApi = await imp("build/host/bundle.js");
 const authorApi = await imp("build/host/bundle-author.js");
 const { FreshnessMarks, hybridAuthorId, verifyBundle } = bundleApi;
-const { authorBundle, hybridAuthorKeysFromSeed } = authorApi;
+const { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } = authorApi;
 const { ModuleTable } = await imp("build/host/module-table.js");
 const TRANSPORT_SERVICE = "_net";
 // The app that drives the transport: there is no host-side request facade left, so a
@@ -35,6 +35,7 @@ const { harnessAppBlob, appRequest, addr, ready, linkedPeers } = await imp("test
 const { transportBundleBytes } = await imp("build/host/transport-bundle.js");
 
 const transportBlob = transportBundleBytes();
+const currentTransportGuest = readGuestSource(guestOpFraming());
 const { ok, summary } = testkit();
 // Report-style: a failed check is logged and counted, and the suite keeps going.
 const assert = ok;
@@ -44,6 +45,12 @@ assert(["encodeManifest", "hybridAuthorKeysFromSeed", "signManifest", "packBundl
 // to happen, and rebuilding the bundle with a different key is a supported thing to do.
 const transportVerified = verifyBundle(sodium, transportBlob);
 const transportAuthor = Buffer.from(transportVerified.author).toString("hex");
+assert(transportVerified.guestSource === currentTransportGuest,
+  "the shipped transport contains the canonical generated op-frame source");
+// The guest text is what the manifest hashes, and the parts are checked out CRLF on
+// Windows and LF elsewhere — so the assembler normalizes, or the same commit signs
+// different bytes depending on who built it.
+assert(!currentTransportGuest.includes("\r"), "the assembled transport guest is LF-only, so its manifest hash is the same on every platform");
 assert(JSON.stringify(transportVerified.manifest.guest.config) === JSON.stringify(TRANSPORT_APP_CONFIG),
   "the shipped transport manifest signs the guest's complete default configuration");
 // The artifact is PQ-signed (§14.1): one hybrid suite, and the id policy pins is a key-set
@@ -68,7 +75,7 @@ assert(derivedTransportAuthor === transportAuthor,
 // rather than at verify. `guestConfig` is `null` for the one caller signing a transport
 // with no config at all, which is refused at the same point and for the same reason.
 function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_APP_CONFIG) {
-  const guest = guestSource ?? readGuestSource();
+  const guest = guestSource ?? currentTransportGuest;
   const wsWasm = new Uint8Array(readFileSync(join(root, "build/ws.wasm")));
   const mlkemWasm = new Uint8Array(readFileSync(join(root, "browser/mlkem768.wasm")));
   const { blob } = authorBundle(sodium, keys, {

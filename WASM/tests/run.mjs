@@ -2981,23 +2981,24 @@ async function testInPlaceUpgradeReleasesTheOldSlot() {
   console.log("  OK\n");
 }
 
-// ─── Test: the guest-source op-frame twin matches the TypeScript one ─────────
+// ─── Test: generated guest op-frame source is the canonical implementation ─────
 //
-// The codec exists twice: host/op-frame.ts for callers that can import, and
-// host/bundle-author.ts `guestOpFraming` as flat source a build tool inlines into a
-// guest. Only one of the two may reach the runtime tree a browser shell vendors, so
-// they cannot be one file and nothing but this test keeps them honest. One input per
-// boundary a hand-copy lands on — the rest of the codec is the same six lines twice.
-function testOpFrameGuestTwin() {
-  console.log("Test: the inlined guest op-frame codec behaves exactly like host/op-frame.ts");
+// host/op-frame.ts owns the functions. `guestOpFraming` serializes those exact compiled
+// functions for import-free guests; the transport assembler injects the same fragment.
+// Exercise the emitted program at every boundary so serialization cannot change behavior.
+function testGeneratedOpFrame() {
+  console.log("Test: generated guest op-frame source preserves the canonical implementation");
+  // Every caller inlines this fragment into a guest it then SIGNS, so the bytes must not
+  // depend on the machine that compiled op-frame.ts. Line endings are the part that does.
+  assert(!guestOpFraming().includes("\r"), "the emitted op-frame source is LF-only, so a signed guest is the same bytes anywhere");
   const host = { callerOf, readOp, writeOp };
   const guest = new Function(`"use strict";${guestOpFraming()}
     return { callerOf, readOp, writeOp };`)();
-  // Outcome, not message: the TS copies quote the offending op name and a guest carries
-  // no formatter, so what must agree is accept-vs-reject and the bytes on accept.
+  // Outcome, not message: the emitted source and module execute in different contexts, so
+  // what must agree is accept-vs-reject and the bytes on accept.
   const out = (impl, fn, args) => { try { return JSON.stringify(impl[fn](...args)); } catch { return "threw"; } };
   const agree = (label, fn, ...args) =>
-    assert(out(host, fn, args) === out(guest, fn, args), `${label}: the guest twin and host disagree`);
+    assert(out(guest, fn, args) === out(host, fn, args), `${label}: generated source and host disagree`);
 
   // A caller id differing from the host's all-zero one in its LAST byte: a prefix test
   // would call this the host.
@@ -3009,6 +3010,9 @@ function testOpFrameGuestTwin() {
   // from `len < n`.
   agree("a length one byte past the end", "readOp", Uint8Array.from([2, 0x61]));
   agree("an ordinary op", "writeOp", "put", Uint8Array.from([1, 2, 3]));
+  agree("an empty op name", "writeOp", "", new Uint8Array(0));
+  agree("a 255-byte op name", "writeOp", "a".repeat(255), new Uint8Array(0));
+  agree("a 256-byte op name", "writeOp", "a".repeat(256), new Uint8Array(0));
   // 0x80 is the only code point that separates a `> 127` ceiling from a `> 128` one.
   agree("an op at the first non-ASCII code point", "writeOp", "a" + String.fromCharCode(0x80), new Uint8Array(0));
   console.log("  OK\n");
@@ -3020,7 +3024,7 @@ await testFullLifecycle();
 await testInstallRejectsUntrustedAuthor();
 await testManifestHashIsEnforced();
 await testDenyAllPolicyRejects();
-testOpFrameGuestTwin();
+testGeneratedOpFrame();
 await testBundleRefusesNonModule();
 await testDerivedNamesKeepAuthorsApart();
 await testManifestClaimIsTheRouting();

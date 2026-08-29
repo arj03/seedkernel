@@ -1,7 +1,10 @@
 // Named-op envelope shared by clients and guest code. The kernel ABI ends at `[caller 32]`;
 // driver event names live in core/domains.ts (§12.2).
-// A build tool needing the same codec as guest source takes it from bundle-author.ts
-// `guestOpFraming`; run.mjs fails the pair if they drift.
+// The three functions below are serialized by bundle-author.ts's `guestOpFraming` for
+// import-free guests, and the transport assembler injects that source before signing — so
+// they must reference nothing outside themselves, not even this file's imports. The type
+// system does not say so: run.mjs's `testGeneratedOpFrame` EXECUTES the emitted source, and
+// that is what catches a free variable — a new code path here needs a case there.
 import { writeU32BE, enc } from "../core/util.js";
 
 /** Split a `handle` argument: `[caller 32][body …]`. The host id is all-zero, matched

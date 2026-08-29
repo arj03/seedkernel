@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import sodiumDefault from "libsodium-wrappers";
 import { readGuestSource } from "./guest-source.mjs";
 import { TRANSPORT_APP_CONFIG, TRANSPORT_SERVICE } from "./transport-config.mjs";
-import { authorBundle, hybridAuthorKeysFromSeed } from "../build/host/bundle-author.js";
+import { authorBundle, guestOpFraming, hybridAuthorKeysFromSeed } from "../build/host/bundle-author.js";
 import { createMlDsa65, withMlDsa65 } from "../build/host/pq.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -60,7 +60,7 @@ async function main() {
   // same key is the same author (§12.4).
   const keys = hybridAuthorKeysFromSeed(sodium, seed);
 
-  const guest = readGuestSource();
+  const guest = readGuestSource(guestOpFraming());
   // Both pure transforms ride IN the bundle: RFC 6455 framing and the handshake KEM are
   // content, admitted through the one signed install path and reached by logical name.
   const wsWasm = readFileSync(join(root, "build", "ws.wasm"));
