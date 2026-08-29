@@ -46,7 +46,6 @@ export interface NodeSetup {
   dir: string;
   policyJson?: string;
   identity: Keypair;
-  contactSecret?: Uint8Array;
   listen?: { host: string; port: number };
   wsListen?: { host: string; port: number };
   transportConfig?: JsonObject;
@@ -61,18 +60,14 @@ export interface NodeRuntime {
   transport: TransportHost;
 }
 
-/** The transport's installation-local config, assembled from the flags that name one. The
- *  cohort belongs HERE rather than in a call after the boot: the address book lives in the
- *  transport's realm now, so "who this node dials" is part of what a transport is loaded
- *  WITH, and a replacement is loaded with it again (§12.10). `undefined` when no flag
- *  named anything, so a default load stays a default load.
- *
- *  Exported because both targets' `standUp` paths build the same object out of the same two
- *  flags, one of them from a Go-side config blob rather than argv. */
-export function transportConfigFrom(peerSpecs: readonly string[], requestDeadline?: string): JsonObject | undefined {
+/** This node's transport config, shared by the CLI and native assemblies (§12.6). */
+export function transportConfigFrom(
+  peerSpecs: readonly string[], requestDeadline?: string, contactSecret?: Uint8Array,
+): JsonObject | undefined {
   const cfg: JsonObject = {};
   if (peerSpecs.length > 0) cfg.peers = peersConfig(peerSpecs);
   if (requestDeadline !== undefined) cfg.requestDeadlineMs = Number(requestDeadline);
+  if (contactSecret !== undefined) cfg.contactSecret = toHex(contactSecret);
   return Object.keys(cfg).length > 0 ? cfg : undefined;
 }
 
@@ -243,16 +238,14 @@ export async function runCli(host: CliHost): Promise<CliResult> {
     dir,
     policyJson,
     identity: key,
-    contactSecret: contactSecretPath === undefined
-      ? undefined
-      : loadHex32(host, contactSecretPath, "--contact-secret"),
     listen: args.has("listen")
       ? parseHostPort(args.get("listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
     wsListen: args.has("ws-listen")
       ? parseHostPort(args.get("ws-listen")!, { defaultHost: "0.0.0.0", allowEphemeral: true })
       : undefined,
-    transportConfig: transportConfigFrom(peers, args.get("request-deadline")),
+    transportConfig: transportConfigFrom(peers, args.get("request-deadline"),
+      contactSecretPath === undefined ? undefined : loadHex32(host, contactSecretPath, "--contact-secret")),
     // Guest resource bounds (§12.3), which only widen or tighten the shell's own
     // defaults. `--guest-timeout 0` reads as Infinity — "no budget" said explicitly,
     // rather than reached by leaving a flag off.

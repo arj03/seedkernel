@@ -16,7 +16,7 @@
 // `peerConnectionFactory`. Signaling is likewise supplied behind the seam below: the kernel
 // owes the driver a byte duplex, not a particular ICE/DTLS stack or rendezvous protocol.
 import { MessageChannel } from "./net-channel.js";
-import { FRAMING, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
+import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { isHex64 } from "../core/util.js";
 
 /** One peer connection and everything the negotiation state machine hangs off it.
@@ -126,8 +126,9 @@ export interface RtcNetworkOptions {
 // without asking WebRTC to carry that record as one message.
 export const RTC_CHUNK_BYTES = 48 * 1024;
 export class RtcChannel extends MessageChannel {
-  override readonly framing = FRAMING.LENGTH;
-  constructor(dc: RTCDataChannel, readonly weDialed: boolean, readonly expectPeerId: string) { super(dc); }
+  /** Exposes chunked RTC messages as a byte stream, preserving large writes. */
+  readonly stream = true;
+  constructor(dc: RTCDataChannel) { super(dc); }
   protected override write(bytes: Uint8Array): void {
     for (let off = 0; off < bytes.length; off += RTC_CHUNK_BYTES) {
       super.write(bytes.subarray(off, Math.min(bytes.length, off + RTC_CHUNK_BYTES)));
@@ -145,7 +146,7 @@ const MAX_UNESTABLISHED_PEERS = 256;
 export class RtcNetwork implements ChannelFactory {
     opts;
     private readonly ownId: string;
-    private onAccept: ((channel: RawLink) => void) | null = null;
+    private onAccept: ((channel: RawLink, arrival?: Arrival) => void) | null = null;
     readonly peers = new Map<string, PeerEntry>(); // all (pre- and post-establish)
     private readonly makePc: (config?: RTCConfiguration) => RTCPeerConnection;
     constructor(opts: RtcNetworkOptions) {
@@ -163,7 +164,7 @@ export class RtcNetwork implements ChannelFactory {
     async listen(
         _tcp: { host: string; port: number } | undefined,
         _ws: { host: string; port: number } | undefined,
-        onAccept: (channel: RawLink) => void,
+        onAccept: (channel: RawLink, arrival?: Arrival) => void,
     ): Promise<{ port: number; wsPort: number }> {
         this.onAccept = onAccept;
         return { port: 0, wsPort: 0 };
@@ -281,7 +282,8 @@ export class RtcNetwork implements ChannelFactory {
         dc.addEventListener("close", () => this.forget(peerId));
         dc.addEventListener("error", () => this.forget(peerId));
         e.linked = true;
-        accept(new RtcChannel(dc, weDialed, peerId));
+        // Signaling-created links have no listener; arrival records the selected dialer.
+        accept(new RtcChannel(dc), { weDialed, expectPeerId: peerId });
     }
     forget(peerId: string) {
         const e = this.peers.get(peerId);

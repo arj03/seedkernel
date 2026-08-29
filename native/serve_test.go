@@ -49,7 +49,8 @@ globalThis.startRequester = async function (holderId, port, contactSecretHex) {
   const id = sodium.crypto_sign_keypair();
   globalThis.__peerId = toHex(id.publicKey);
   const node = await makeTransportNode({
-    identity: id, contactSecret: fromHex(contactSecretHex), timeoutMs: 2000,
+    // Contact policy is transport config (§12.6.3).
+    identity: id, transportConfig: { contactSecret: contactSecretHex }, timeoutMs: 2000,
   });
   globalThis.__requesterNode = node;
   const net = node.transport;

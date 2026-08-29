@@ -3,7 +3,7 @@
 //   grants   — per realm (declared names, scopes, backends); unwired = unreachable
 //   modules  — per app (this bundle's WASM, by logical name)
 import { concatBytes, writeU32BE, readU32BE, enc, dec } from "../core/util.js";
-import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
+import { DOMAIN_GUEST, DOMAIN_LINK_SCOPE, AUTHORITY_CALLS, HOST_SERVICES, HOST_TRANSFORM_NAMES, PRIVILEGE_LINK, serviceOf, type HostTransformName, type CapabilityName, type Privilege } from "../core/domains.js";
 import { type Fs } from "../core/fs.js";
 import type { ModuleResult } from "./bundle.js";
 
@@ -45,12 +45,8 @@ export interface SeamCalls {
  *  invoked the freshly stood slot once, with them, before the binding is published
  *  (shell-core.ts), and the mutable address book arrives as `addr` events. */
 export interface RawNet {
-    /** Open a link to an opaque destination — the socket-side twin of an `fs` key — returning
-     *  the link id, or 0 when this host has no route for it, which a caller treats as a
-     *  fabric dropping a frame. The string is the CALLER's own name for a peer's location,
-     *  handed down to be resolved; what comes back is only which wire codec applies, never a
-     *  route the caller learns something new from. */
-    open(dest: string): { linkId: number; framing: number; authority: string };
+    /** Open an opaque destination; id 0 means no route (§12.1). */
+    open(dest: string): { linkId: number; stream: boolean };
     /** Write whole bytes to a link. Silently dropped if the link is already gone —
      *  a caller cannot distinguish that from the far end vanishing mid-write anyway. */
     send(linkId: number, bytes: Uint8Array): void;
@@ -486,12 +482,9 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         // bytes arrive the other way, as ordinary invocations of the transport's `handle`.
         "link/open": (payload) => {
             const link = rawNet().open(dec.decode(payload));
-            const authority = enc.encode(link.authority);
-            const out = new Uint8Array(9 + authority.length);
+            const out = new Uint8Array(5);
             writeU32BE(out, 0, link.linkId);
-            out[4] = link.framing;
-            writeU32BE(out, 5, authority.length);
-            out.set(authority, 9);
+            out[4] = link.stream ? 1 : 0;
             return out;
         },
         "link/send": (payload) => {
@@ -542,6 +535,14 @@ function hostCatalog(platform: SeamPlatform, grants: SeamGrants): Record<string,
         }
         if (!name.includes("/")) {
             throw new Error(`guest-seam: host-call name "${name}" has no "/" — a bare name is a bundle's own module (§12.2), so this would shadow one`);
+        }
+    }
+    // Events are bare guest ops, not host-call names (§12.2).
+    for (const service of Object.values(HOST_SERVICES)) {
+        for (const event of ("events" in service ? service.events : []) as readonly string[]) {
+            if (event.includes("/")) {
+                throw new Error(`guest-seam: event name "${event}" has a "/" — an event is a bare op in the occupant's own envelope (§12.2), so this would spell a host-call name`);
+            }
         }
     }
     return handlers;

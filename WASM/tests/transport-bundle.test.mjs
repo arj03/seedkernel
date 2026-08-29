@@ -93,8 +93,7 @@ function transportBundleAt(version, keys, guestSource, guestConfig = TRANSPORT_A
 const appAuthor = makeAuthor(sodium);
 const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
 
-// bootShell's convenience option is only syntax for this bundle's ordinary LOCAL load
-// config. The shell still guards its three node facts against collisions.
+// `transport.config` becomes `LOCAL` (§12.10).
 {
   let source = "";
   const { shell } = await bootShell({
@@ -104,7 +103,7 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
     freshnessStore: new FreshnessMarks(),
     fs: false,
     transport: {
-      config: { requestDeadlineMs: 321, peerId: "operator-cannot-replace-this" },
+      config: { requestDeadlineMs: 321, networkKey: "operator-cannot-replace-this" },
       bundle: transportBlob,
     },
     createRealm: async (o) => {
@@ -120,8 +119,8 @@ const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   )();
   assert(appConfig.requestDeadlineMs === TRANSPORT_APP_CONFIG.requestDeadlineMs,
     "transport defaults arrive from signed APP config");
-  assert(localConfig.requestDeadlineMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.peerId),
-    "bootShell transport.config reaches LOCAL while host-owned node facts win collisions");
+  assert(localConfig.requestDeadlineMs === 321 && /^[0-9a-f]{64}$/.test(localConfig.networkKey),
+    "bootShell transport.config reaches LOCAL while the host-owned node fact wins a collision");
   shell.close();
 }
 /** One request through a node's app handle to `to` — the path a deployment uses. */

@@ -274,13 +274,8 @@ export function scopedFs(inner: Fs, scope: string): Fs {
   };
 }
 
-/** This node's network in one object (§12.6): the socket-side members are the driver's
- *  (`TransportHostOptions` minus the two facts the node states at the top level), and
- *  `bundle`/`config`/`load` say which signed transport program it pins and loads.
- *
- *  One object rather than four siblings because they are one decision: the blob whose
- *  author is PINNED is the blob that gets loaded. */
-export interface TransportOptions extends Omit<TransportHostOptions, "identity" | "networkKey"> {
+/** This node's network, whole (§12.6). */
+export interface TransportOptions extends Omit<TransportHostOptions, "networkKey"> {
     /** The transport bundle to PIN — and, unless `load` is false, to load. Default: the
      *  artifact-shipped one. The pin's author is DERIVED from this blob, so passing different
      *  bytes is a deliberate transport replacement. */
@@ -351,11 +346,7 @@ export interface BootShellOptions {
      *  a single load raises or lowers it for its own realm with
      *  `LoadBundleOptions.realmMemoryBytes`, where an appetite belonging to one app goes. */
     realmMemoryBytes?: number;
-    /** This node's network, whole (§12.6). An OPTIONS object ⇒ the boot constructs the
-     *  `TransportHost` (identity and networkKey come from the fields above, never restated),
-     *  admits the bundle under the pin derived from it, and starts its listeners. The object
-     *  is RETAINED, so getter-backed options such as a rotating contact secret stay live —
-     *  pass it, never a spread of it. `false` or absent ⇒ no network. */
+    /** Optional node network. The options object is retained to preserve live accessors. */
     transport?: TransportOptions | false;
 }
 
@@ -390,11 +381,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         ?? (async (o) => (await import("./safe-js.js")).createSafeRealm(o));
     const freshnessStore = opts.freshnessStore ?? new FreshnessMarks();
     const now = opts.now ?? (() => Date.now());
-    // Identity + network key are the NODE's, so they come from the top-level fields. The
-    // caller's object is passed through intact: a spread would flatten live getters.
     const net = opts.transport === false ? undefined : opts.transport;
     const netHost = net
-        ? new TransportHost(net, { identity: opts.identity, networkKey: opts.networkKey })
+        ? new TransportHost(net, { networkKey: opts.networkKey })
         : null;
     // The author is DERIVED from the blob, never restated — the pin is the whole of "only
     // this author may be the network" (§12.5).
@@ -567,7 +556,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
                 // service — a claimant captured at seam construction would pin this realm
                 // to whoever was there first.
                 calls: { call: (id, payload) => callClaimant(localClaims, id, callerId, payload) },
-                rawNet: links ? netHost?.rawNet(slot) : undefined,
+                rawNet: links ? netHost?.rawNet() : undefined,
                 // Unconditional for the same reason `fs` is.
                 timers: slot.timers,
             },
@@ -609,9 +598,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
      *  caller id the shell holds (loopback and socket events). */
     const hostCallSlot = (slot: AppSlot, body: Uint8Array): Promise<Uint8Array> =>
         callSlot(slot, concatBytes([HOST_CALLER_ID, body]));
-    /** Fold this node's three immutable facts into a link occupant's ordinary LOCAL
-     *  config. Only peerId, networkKey and contactSecret are host-owned and win collisions;
-     *  transport-program policy remains the load's LOCAL override over signed APP defaults. */
+    /** Add the host-owned network key to transport `LOCAL` (§12.10). */
     const configFor = (slot: AppSlot, localConfig: JsonObject): JsonObject => {
         if (!hasLink(slot)) return localConfig;
         const facts = netHost?.initialConfig();
@@ -645,7 +632,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         if (i < 0) return false;
         const [slot] = slots.splice(i, 1);
         releaseClaims(slot);
-        if (hasLink(slot)) netHost?.release(slot);
+        if (hasLink(slot)) netHost?.release();
         disposeSlot(slot);
         return true;
     };
@@ -686,9 +673,7 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
         }
         return answer;
     };
-    // Wired once. Not owner-keyed like `activate`: an inbound frame resolves through
-    // `peerClaims`, whoever currently occupies the link. The driver normalizes the answer
-    // to empty, so refusal and silence are one fact at that boundary.
+    // Inbound requests use current peer claims (§12.10).
     netHost?.routeInbound(deliverInbound);
 
     const shell: Shell = {
@@ -774,9 +759,9 @@ export async function bootShell(opts: BootShellOptions): Promise<BootResult> {
             // away, and a version that DROPS `link/*` releases the binding the same way
             // dropping a claim releases the claim.
             if (hasLink(slot)) {
-                netHost?.activate(slot, (payload) => hostCallSlot(slot, payload));
+                netHost?.activate((payload) => hostCallSlot(slot, payload));
             } else if (replacingLinkOwner) {
-                netHost?.release(previous!);
+                netHost?.release();
             }
             // The mark and every claim/link binding have landed, so this slot's writes and
             // cross-realm calls are now its own (`seamFor`).

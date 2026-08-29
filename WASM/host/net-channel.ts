@@ -1,15 +1,8 @@
-// Shared host socket plumbing: the FRAMING.PLATFORM RawLink base (Ws/Rtc) that wraps
-// any whole-message binary transport.
-
-import { FRAMING, type Framing } from "../core/socket-seam.js";
-
 /** Pre-open send queue ceiling. Overflow fails the channel rather than dropping
  *  bytes (§16.1). */
 const MAX_PREOPEN_QUEUE_BYTES = 1024 * 1024; // 1 MiB
 
 export abstract class BufferedChannel {
-    /** Every subclass here wraps a transport that already has message boundaries. */
-    readonly framing: Framing = FRAMING.PLATFORM;
     protected onMsg: ((bytes: Uint8Array) => void) | null = null;
     protected onCls: (() => void) | null = null;
     private readonly pending: Uint8Array[] = [];

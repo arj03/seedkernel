@@ -8,7 +8,7 @@
 import {
   makeTransportHost, generateKeyPair, sodium, InjectedChannels, CLOSE_REASON, until, PROTO,
   authorBundle, bootShell, TransportHost, ModuleTable, FreshnessMarks, createSafeRealm,
-  transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready,
+  transportBlob, transportAuthor, transportPolicy, verifyBundle, linkedTo, ready, contact,
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
@@ -20,7 +20,7 @@ import { bytesEqual } from "./bytes.mjs";
 // what the guest asked. Delivery is deferred a microtask (like a real socket); `hold`/
 // `flush` model a byte stream's several whole messages arriving in ONE read — the held
 // writes are handed to the far end as a single `onData`.
-function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, framing = 0 } = {}) {
+function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive, stream = false } = {}) {
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
     sent: [], closeArgs: [], dead: false, inFlight: 0,
@@ -60,7 +60,7 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
         if (!this.peer.dead) this.peer.msg?.(out);
       });
     },
-    framing,
+    stream,
     onData(cb) { this.msg = cb; },
     onClose(cb) { this.cls = cb; },
     close(graceful = false) {
@@ -92,19 +92,7 @@ const CONTACT = new Uint8Array(32).fill(7);
  *  assertion in this file is "after things have settled", never "immediately". */
 const settle = (ms = 250) => new Promise((r) => setTimeout(r, ms));
 
-/** Two nodes and one link between them, opened from both ends over `chans`. Every link is
- *  born the same way: a `ChannelFactory` (`InjectedChannels`, one per side so a test keeps
- *  the SAME instrumented `chans` it built) hands the driver a channel, the driver registers
- *  and announces it, and the guest hears one `linkOpen`. What a link states about itself it
- *  states on the CHANNEL — `weDialed`, `expectPeerId` — not in options at the call.
- *
- *  `aOpts`/`bOpts` go to the shells (identity, contactSecret, networkKey, admitPeers,
- *  transportConfig, …). A dialer now presents ITS OWN contact secret on a host-announced
- *  dial (the driver's `announce()`), so a test that used to pass `dialSecret` sets
- *  `aOpts.contactSecret` instead. `st.a`/`st.b` keep the `closed`/`reason` shape most
- *  assertions already read — that is still a real event (`onLinkClosed`), just NODE-level
- *  now rather than per link — but `authed`/`peer` are gone: authentication is a question
- *  asked of the guest's live peer set (`linkedTo`), not a callback recorded here. */
+/** Stand two transport bundles over injected raw links and arrival metadata. */
 async function linked(chans, aOpts = {}, bOpts = {}) {
   const aFactory = new InjectedChannels();
   const bFactory = new InjectedChannels();
@@ -324,7 +312,7 @@ await test("FRAME CAP: an unauthenticated peer cannot declare a large frame", as
   // and dribbling the body. On a length-framed link the declaration is the 4-byte prefix;
   // one over the pre-auth cap is fatal on sight — the body never arrives and nothing is
   // allocated for it.
-  const chans = wirePair({ framing: 1 });
+  const chans = wirePair({ stream: true });
   const st = keep(await linked(chans));
   chans[1].msg(new Uint8Array([0x00, 0x01, 0x00, 0x00])); // declares 64 KiB, cap is 8 KiB
   await settle();
@@ -337,7 +325,7 @@ await test("FRAME CAP: authentication raises it, before anything can arrive unde
   // authenticates at msg3 and may put application data on the wire alongside msg4 — which
   // arrives in the same delivery. Raising the cap afterwards would measure that first
   // frame against the handshake bound and kill every connection on its first real exchange.
-  const chans = wirePair({ framing: 1 });
+  const chans = wirePair({ stream: true });
   const st = keep(await linked(chans));
   // The app path, issued before the handshake completes: the guest's own `connecting`
   // pool is keyed by `expectPeerId` on the dial, so an app send to that peer id queues
@@ -355,7 +343,7 @@ await test("REASSEMBLY: a frame dribbled one byte at a time is still one message
   // none are. The framer's merge rule (framing.js): arbitrary slice boundaries in,
   // exactly one message out.
   let armed = false;
-  const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
+  const chans = wirePair({ stream: true, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
   const proto = PROTO;
@@ -383,7 +371,7 @@ await test("REASSEMBLY: slices that straddle the merge threshold reassemble too"
   // arrived) and slices crossing the threshold in both directions turn a boundary error
   // into a message that never completes or completes wrong.
   let armed = false;
-  const chans = wirePair({ framing: 1, tamper: (b, from) => (from === "A" && armed ? null : b) });
+  const chans = wirePair({ stream: true, tamper: (b, from) => (from === "A" && armed ? null : b) });
   const st = keep(await linked(chans));
   await until(async () => (await aUp(st)) && (await bUp(st)), 4000, "handshake");
   const payload = new Uint8Array(96 * 1024);
@@ -523,45 +511,19 @@ await test("CONTACT SECRET: it is the RECEIVER's, and only the receiver's", asyn
   assert(!(await aUp(st2)) && !(await bUp(st2)), "another node's secret must not authenticate");
 });
 
-/** One transport host whose contact secret is a LIVE getter — the shape a platform with a
- *  rotating gate has (§12.6.3). Deliberately parallels makeTransportHost in the pieces a
- *  test needs: bootShell must retain the options object, so the driver RE-READS the secret
- *  when it announces a link. Returns the channel factory too, since that is what a link
- *  arrives through. */
-async function makeTransportHostWithGetter(getSecret) {
-  const identity = generateKeyPair();
-  const factory = new InjectedChannels();
-  // One literal, not a spread at the boot call: a spread would FLATTEN the getter this
-  // test is about.
-  const transport = {
-    channels: factory,
-    get contactSecret() { return getSecret(); },
-    load: false,
-    bundle: transportBlob,
-  };
-  const { shell, transport: driver } = await bootShell({
-    sodium, identity, modules: new ModuleTable(), freshnessStore: new FreshnessMarks(),
-    fs: false, transport,
-    createRealm: async (o) => createSafeRealm(o), admit: transportPolicy(transportAuthor()),
-  });
-  await shell.loadBundleBlob(transportBlob);
-  await driver.start();
-  return { shell, driver, identity, factory, peerId: hexOf(identity.publicKey) };
-}
-
 await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation has no re-install", async (keep) => {
-  // The driver re-reads its contact secret when it announces a link, so rotating the
-  // GETTER rotates both the dialer's presented value and the accept gate instantly; the
-  // guest's boot-time init facts are only the fallback. Before this, the gate was the
-  // boot-time snapshot and a rotation cost a transport re-load, killing every live link
-  // for a credential change. A now needs a getter too, since a host-announced dial
-  // presents OUR OWN current secret rather than one a test hands to a single call.
+  // Rotation updates transport state without reloading or dropping live links.
   const secretB = new Uint8Array(32).fill(11);
   const secretC = new Uint8Array(32).fill(22);
-  let currentA = secretB, currentB = secretB;
-  const A = await makeTransportHostWithGetter(() => currentA);
-  const B = await makeTransportHostWithGetter(() => currentB);
+  const aFactory = new InjectedChannels();
+  const bFactory = new InjectedChannels();
+  const A = await makeTransportHost({ channels: aFactory, contactSecret: secretB });
+  const B = await makeTransportHost({ channels: bFactory, contactSecret: secretB });
+  A.factory = aFactory;
+  B.factory = bFactory;
   keep(async () => { try { A.shell.close(); } catch { /* already down */ } try { B.shell.close(); } catch { /* already down */ } });
+  await A.driver.start();
+  await B.driver.start();
   // A spy for "the bundle was never re-loaded": the rotation below must not reach it.
   let loads = 0;
   const origLoad = B.shell.loadBundleBlob;
@@ -576,7 +538,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   // Rotate B's gate; A still presents the OLD value. The responder says nothing at all —
   // checked on THIS pair's own wire, since the node-level peer set already reads "linked"
   // from the surviving c1 link and cannot tell a new attempt's outcome apart from it.
-  currentB = secretC;
+  await contact(B, secretC);
   const c2 = wirePair();
   openPair(A, B, c2);
   await settle();
@@ -586,7 +548,7 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   // c3 (both ends complete their two-message half of the handshake), for the same reason
   // the failure case above is checked on the wire rather than the aggregate peer set —
   // and the guest never re-loaded to get it.
-  currentA = secretC;
+  await contact(A, secretC);
   const c3 = wirePair();
   openPair(A, B, c3);
   await until(() => c3[0].sent.length >= 2 && c3[1].sent.length >= 2, 4000, "rotated secret handshake");
@@ -594,6 +556,22 @@ await test("CONTACT SECRET: an accept gates on the CURRENT secret — rotation h
   assert(loads === 0, `a secret rotation must not re-load the transport (loaded ${loads} times)`);
   // The link that authenticated under the old secret is untouched by a rotation.
   assert(!c1[0].dead && !c1[1].dead, "a live link must not be torn down by a rotation");
+});
+
+await test("CONTACT SECRET: the rotation is the host's, and takes 32 bytes or none", async (keep) => {
+  // Invalid lengths fail loudly; app callers cannot rotate deployment credentials.
+  const A = await makeTransportHost({ channels: new InjectedChannels(), contactSecret: CONTACT });
+  keep({ close() { try { A.shell.close(); } catch { /* already down */ } } });
+  let refused = "";
+  try { await contact(A, Uint8Array.of(1, 2, 3)); } catch (e) { refused = String(e); }
+  assert(refused.includes("32 bytes"), `a short secret must be refused, got ${refused || "no error"}`);
+  // Use a valid payload shape to isolate the caller check.
+  const arg = new Uint8Array(36);
+  arg[3] = 32;
+  let appRefused = "";
+  try { await A.op("contact", arg); } catch (e) { appRefused = String(e); }
+  assert(appRefused.includes("not an app"),
+    `an app naming the rotation must be refused, got ${appRefused || "no error"}`);
 });
 
 await test("SEVER: driver.reset() kills live links and keeps the binding owned", async (keep) => {
@@ -901,10 +879,8 @@ await test("a peer cannot reach a bundle's local service claim, the transport's 
 // what keeps them separate — nothing packs them into a shared buffer whose framing a
 // peer's own payload bytes could be read as.
 await test("DELIVERY: two pipelined requests in ONE read are two correctly attributed deliveries", async (keep) => {
-  // framing 1: a byte-stream link, so the guest runs its own length framer and a single
-  // read really can carry two whole messages. (The default fabric preserves message
-  // boundaries and can never produce more than one.)
-  const st = keep(await upPair({ framing: 1 }));
+  // Stream framing permits one read to contain multiple messages.
+  const st = keep(await upPair({ stream: true }));
   const first = Uint8Array.from([0x11, 0x22, 0x33]);
   // The second request's payload names another claim and another sender in the shape the
   // retired batch codec framed a record in. It is now just bytes — which is the property
@@ -970,14 +946,9 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
     `an app naming a platform event must be refused, got ${refused || "no error"}`);
 });
 
-// The event result carries no link id: the driver supplies it from the event context and
-// checks the captured owner/channel again after the result settles. Exercise that boundary
-// with a deliberately dishonest occupant rather than the real, pinned transport bundle, and
-// against the DRIVER's own plumbing (activate/rawNet) over a `ChannelFactory` accept — the
-// same path production takes.
+// A reply applies only to the captured channel (§12.10).
 await test("DRIVER BOUNDARY: the down report names its own socket, once", async (keep) => {
   class ManualChannel {
-    framing = 0;
     data = null;
     closed = null;
     send() {}
@@ -1000,13 +971,12 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   const readU32 = (b, off) => ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0;
   const events = [];
   const downs = [];
-  const owner = {};
   const factory = new InjectedChannels();
   const driver = keep(new TransportHost(
     { channels: factory, onLinkClosed: (linkId, reason) => downs.push({ linkId, reason }) },
-    { identity: generateKeyPair() },
+    {},
   ));
-  driver.activate(owner, async (payload) => {
+  driver.activate(async (payload) => {
     const n = payload[0];
     const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
     const rest = payload.subarray(1 + n);
@@ -1041,7 +1011,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   // way a real socket's own close would arrive) must not report a second time: this is the
   // idempotence the deleted "explicit close() fires onClose exactly once" test covered,
   // now at the driver's own close/backend-callback boundary instead of a per-link handle.
-  driver.rawNet(owner).close(aLinkId, false);
+  driver.rawNet().close(aLinkId, false);
   await until(() => downs.length === 1, 1000, "A's close to report down");
   assert(downs[0].linkId === aLinkId && downs[0].reason === CLOSE_REASON.LOCAL,
     `A's close must report down once with LOCAL, got ${JSON.stringify(downs)}`);
@@ -1056,7 +1026,7 @@ await test("DRIVER BOUNDARY: the down report names its own socket, once", async 
   factory.give(cChannel);
   const cLinkId = events.find((e) => e.op === "linkOpen").linkId;
   events.length = 0;
-  driver.rawNet(owner).send(cLinkId, Uint8Array.of(1, 2, 3));
+  driver.rawNet().send(cLinkId, Uint8Array.of(1, 2, 3));
   await until(() => downs.some((d) => d.linkId === cLinkId), 1000, "the throwing channel's close to report down");
   assert(cChannel.stops === 1, `a throwing raw send must close the backend once, got ${cChannel.stops}`);
   const cDowns = downs.filter((d) => d.linkId === cLinkId);

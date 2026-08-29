@@ -1,6 +1,5 @@
-// op-frame — the optional client-side named-op envelope, as an importable module.
-// Clients and the operator CLI compose it; dispatch, timers, and the guest seam never
-// interpret it, because the kernel ABI ends after `[caller 32]`.
+// Named-op envelope shared by clients and guest code. The kernel ABI ends at `[caller 32]`;
+// driver event names live in core/domains.ts (§12.2).
 // A build tool needing the same codec as guest source takes it from bundle-author.ts
 // `guestOpFraming`; run.mjs fails the pair if they drift.
 import { writeU32BE, enc } from "../core/util.js";

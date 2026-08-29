@@ -3,6 +3,8 @@
 const N_SIGN = "node/sign";
 const N_VERIFY = "node/verify";
 const N_RANDOM = "node/random";
+// Read from the host so it matches `node/sign` (§12.2).
+const N_IDENTITY = "node/identity";
 /** This bundle's own RFC 6455 codec, by the logical name its manifest declares. A bare
  *  name — no `/` — is what makes it a module rather than a host name (§12.2). */
 const N_WS = "ws";
@@ -216,12 +218,8 @@ async function channelSign(root, th, id) {
  *  cannot reach that destination, and the caller treats it as a fabric dropping a frame. */
 async function netLinkOpen(dest) {
   const r = await host.call(N_LINK_OPEN, utf8Encode(dest));
-  const authLen = readU32BE(r, 5);
-  return {
-    linkId: readU32BE(r, 0),
-    framing: r[4],
-    authority: authLen > 0 ? utf8Decode(r.subarray(9, 9 + authLen)) : "",
-  };
+  // Destination selects the codec (§12.1).
+  return { linkId: readU32BE(r, 0), stream: r[4] === 1 };
 }
 /** Fire-and-forget wire ops: a link/send cannot answer anything worth having (the
  *  channel drops silently when the link is gone either way), so their rejections are
@@ -288,9 +286,8 @@ function fireTimer(id) {
 class Link {
   constructor(spec) {
     this.linkId = spec.linkId;
-    // PLATFORM means the transport under us already has message boundaries (a browser
-    // WebSocket, an RTCDataChannel); anything else is a byte duplex we frame ourselves.
-    this.framer = makeFramer(spec.framing, spec.linkId, spec.weDialed, spec.authority);
+    // Framing derives from stream shape and route metadata (§12.1).
+    this.framer = makeFramer(spec.stream, spec.linkId, spec.dest, spec.listener);
     this.weDialed = spec.weDialed;
     this.expectPeerId = spec.expectPeerId;   // 32B or null
     this.source = spec.source;               // remoteAddr for the limiter, if any
@@ -298,10 +295,8 @@ class Link {
     this.onFrame = spec.onFrame;
     this.onClose = spec.onClose;
     this.rekeyAfter = rekeyAfterFrames;
-    // The secret this link opens under, carried per link so the gate tracks the node's
-    // CURRENT value rather than the boot-time fallback (§12.6.3): THE PEER's on a dial we
-    // made out of the address book, OURS on anything the host handed over — an accept, or
-    // a dial a platform factory chose, which is same-deployment by construction.
+    // Address-book dials use the peer's secret; platform-opened links use our live secret
+    // (§12.6.3).
     this.contactSecret = spec.linkSecret || contactSecret;
     this.root = null; // set by the boot chain below — every seam call is async now
 

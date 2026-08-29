@@ -5,11 +5,25 @@
 // ============================================================================
 
 // ── per-host state, read from installation-local config ──────────────────────
+// Identity comes from `node/identity`, so it cannot drift from `node/sign` (§12.2).
+// Initialization is async; config validation stays synchronous so invalid bundles fail
+// during load (§12.4).
 
-const ownId = LOCAL.peerId;                 // node channel public key, hex
-const ownPk = fromHex(ownId);               // 32B node channel public key
+let ownPk = null;                       // 32B node channel public key, once `ready` has run
+let ownId = "";                         // the same, hex
 const networkKey = fromHex(LOCAL.networkKey);
-const contactSecret = fromHex(LOCAL.contactSecret); // OUR inbound gate (zeros = open)
+const ZERO32 = new Uint8Array(32);
+
+const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
+
+// Inbound gate; zero means open. The host-only `contact` op rotates it at runtime (§12.6.3).
+let contactSecret = ZERO32;
+if (LOCAL.contactSecret !== undefined) {
+  if (!hex32(LOCAL.contactSecret)) {
+    throw new Error("transport: config contactSecret must be 64 lowercase hex characters");
+  }
+  contactSecret = fromHex(LOCAL.contactSecret);
+}
 
 /** One policy number: this installation's override, else the author's signed default.
  *  Every one of these bounds a resource, and a bound read as `undefined` does not fail
@@ -31,12 +45,22 @@ const connsPerPeer = Math.max(1, policy("connsPerPeer"));
 const configuredAdmitPeers = LOCAL.admitPeers ?? APP.admitPeers;
 if (!Array.isArray(configuredAdmitPeers)) throw new Error("transport: config admitPeers must be an array");
 const admitPeers = configuredAdmitPeers.length > 0 ? new Set(configuredAdmitPeers) : null;
-// The address book this installation was configured with: `{ peerId, dest, contactSecret? }`
-// in hex, seeded into `Core.addrs` once the core exists. The book is THIS realm's — the
-// host keeps no copy — so a transport replacement starts from whatever its own load named,
-// plus whatever `addr` events follow (§12.10).
+// Validate the guest-owned address book during load. Missing peer secrets mean open nodes
+// (§12.10).
 const configuredPeers = LOCAL.peers ?? APP.peers;
 if (!Array.isArray(configuredPeers)) throw new Error("transport: config peers must be an array");
+const cohort = configuredPeers.map((p) => {
+  if (!p || !hex32(p.peerId)) throw new Error("transport: config peers[].peerId must be 64 lowercase hex characters");
+  if (p.contactSecret !== undefined && !hex32(p.contactSecret)) {
+    throw new Error("transport: config peers[].contactSecret must be 64 lowercase hex characters");
+  }
+  if (p.dest !== undefined && typeof p.dest !== "string") throw new Error("transport: config peers[].dest must be a string");
+  return {
+    peer: fromHex(p.peerId),
+    secret: p.contactSecret === undefined ? ZERO32 : fromHex(p.contactSecret),
+    dest: p.dest ?? "",
+  };
+});
 const requestDeadlineMs = policy("requestDeadlineMs");
 // The peers we hold at least one authenticated link to; the host asks with `peers`.
 const connected = new Set();
@@ -211,8 +235,8 @@ class Core {
       if (opened.linkId === 0) return; // no route — a fabric with nowhere to send drops the frame
       this.openLink({
         linkId: opened.linkId,
-        framing: opened.framing,
-        authority: opened.authority,
+        stream: opened.stream,
+        dest: addr.dest,
         weDialed: true,
         expectPeerId: fromHex(peerId),
         linkSecret: addr.secret,
@@ -226,8 +250,9 @@ class Core {
   openLink(spec) {
     const link = new Link({
       linkId: spec.linkId,
-      framing: spec.framing,
-      authority: spec.authority,
+      stream: spec.stream,
+      dest: spec.dest,
+      listener: spec.listener,
       weDialed: spec.weDialed,
       expectPeerId: spec.expectPeerId,
       linkSecret: spec.linkSecret,
@@ -365,7 +390,6 @@ function findLink(linkId) {
 // bookkeeping is never undone by an onClose that ran before its caller finished.
 
 const NOTHING = new Uint8Array(0);
-const ZERO32 = new Uint8Array(32);
 
 // Answer on a later turn without holding the realm's queue; the kernel supplies the
 // release marker (`__deferred`), everything else is ours.
@@ -383,39 +407,31 @@ function entry(name, fn) { ops[name] = fn; }
  *  `ops` itself, so an inherited `toString` is not an admitted op. */
 const APP_OPS = Object.assign(Object.create(null), { send: 1, peers: 1 });
 
-// Build the transport from signed APP defaults, installation-local overrides, and the
-// three immutable node facts in LOCAL. Mutable addresses still arrive later as ordinary
-// `addr` events after publication.
-router = new Router(ownPk, ownId);
-reqres = new ReqRes();
-core = new Core();
-reqres.attach((to, frame) => core.sendFrame(to, frame));
-router.sink = (from, frame) => reqres.onFrame(from, frame);
-// The cohort edges stay in this heap; the host reads them with the `peers` op.
-router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
-router.onPeerDown = (peerId) => { connected.delete(peerId); };
-// The configured cohort, seeded before the host's first event can arrive. A `contactSecret`
-// left out is an OPEN peer — the same 32 zero bytes the `addr` event spells it with — and
-// not "fall back to ours", which is a different peer's door.
-//
-// Each field is checked here for the reason every other config value is (`policy`): a
-// half-length key would key this book under a peer no handshake can ever match, which
-// reads exactly like a peer that is down. A load that names a cohort wrong fails instead.
-for (const p of configuredPeers) {
-  const hex32 = (v) => typeof v === "string" && v.length === 64 && !/[^0-9a-f]/.test(v);
-  if (!p || !hex32(p.peerId)) throw new Error("transport: config peers[].peerId must be 64 lowercase hex characters");
-  if (p.contactSecret !== undefined && !hex32(p.contactSecret)) {
-    throw new Error("transport: config peers[].contactSecret must be 64 lowercase hex characters");
-  }
-  if (p.dest !== undefined && typeof p.dest !== "string") throw new Error("transport: config peers[].dest must be a string");
-  core.addAddr(fromHex(p.peerId), p.contactSecret === undefined ? ZERO32 : fromHex(p.contactSecret), p.dest ?? "");
+// Early calls await this promise (§12.3).
+const ready = (async () => {
+  ownPk = (await host.call(N_IDENTITY, NOTHING)).slice();
+  ownId = toHex(ownPk);
+  router = new Router(ownPk, ownId);
+  reqres = new ReqRes();
+  core = new Core();
+  reqres.attach((to, frame) => core.sendFrame(to, frame));
+  router.sink = (from, frame) => reqres.onFrame(from, frame);
+  // The cohort edges stay in this heap; the host reads them with the `peers` op.
+  router.onPeerUp = (peerId) => { connected.add(peerId); core.checkReady(); };
+  router.onPeerDown = (peerId) => { connected.delete(peerId); };
+  for (const p of cohort) core.addAddr(p.peer, p.secret, p.dest);
+})();
+// Avoid an unhandled rejection if the realm is disposed before its first invocation.
+ready.catch(() => {});
+
+/** Pre-ready calls defer without holding the realm queue (§12.3). */
+function handle(argBytes) {
+  if (core) return dispatch(argBytes);
+  globalThis.__deferred = true;
+  return ready.then(() => dispatch(argBytes));
 }
 
-/**
- * The one entrypoint. The kernel's part of the argument is exactly the 32-byte caller;
- * everything after it is this bundle's format (util.js `callerOf`/`readOp`).
- */
-function handle(argBytes) {
+function dispatch(argBytes) {
   const { fromHost, caller, body } = callerOf(argBytes);
   try {
     const { op, args } = readOp(body);
@@ -432,24 +448,20 @@ function handle(argBytes) {
   }
 }
 
-/** A link the HOST hands over: an accepted socket, or one a platform factory dialed
- *  itself. A link we opened through `link/open` never arrives here. `linkSecret` is the
- *  secret THIS link opens under: the host's own current one, whichever direction opened
- *  it — so an accept, and a same-deployment dial, both gate on the secret now, not on the
- *  fallback in LOCAL (§12.6.3). */
+/** Platform-opened link event (§12.1). */
 entry("linkOpen", (r) => {
   const linkId = r.u32();
   const weDialed = r.u8() === 1;
-  const framing = r.u8();
-  const authority = r.blob();
+  const stream = r.u8() === 1;
+  const listener = r.blob();
   const expectPeerId = r.blob();
-  const linkSecret = r.blob();
   const source = r.blob();
   core.openLink({
-    linkId, weDialed, framing,
-    authority: authority.length > 0 ? utf8Decode(authority) : "",
+    linkId, weDialed, stream,
+    listener: listener.length > 0 ? utf8Decode(listener) : "",
+    dest: "",
     expectPeerId: expectPeerId.length > 0 ? expectPeerId.slice() : null,
-    linkSecret: linkSecret.length > 0 ? linkSecret.slice() : null,
+    linkSecret: null,
     source: source.length > 0 ? utf8Decode(source) : undefined,
     // Only an accept spends half-open budget; a dial is our own decision to make.
     limiter: weDialed ? null : core.limiter,
@@ -521,6 +533,15 @@ entry("addr", (r) => {
   const peer = r.blob();
   const secret = r.blob();
   core.addAddr(peer, secret, utf8Decode(r.blob()));
+});
+
+/** Rotate the inbound contact secret (§12.6.3). */
+entry("contact", (r) => {
+  const secret = r.blob();
+  if (secret.length !== 0 && secret.length !== PK_LEN) {
+    throw new Error("transport: contact needs 32 bytes, or none for an open node");
+  }
+  contactSecret = secret.length === 0 ? ZERO32 : secret.slice();
 });
 
 /** Wait until every known peer is linked, or the deadline passes. Deferred for the same

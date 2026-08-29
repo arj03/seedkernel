@@ -41,13 +41,9 @@ export class InjectedChannels {
     return { port: 0, wsPort: 0 };
   }
   close() { this.#accept = null; }
-  /** Hand one channel to the driver as the platform would. `weDialed`/`expectPeerId` are
-   *  set ON THE CHANNEL, exactly as `RtcChannel` states them. */
-  give(channel, { weDialed = false, expectPeerId } = {}) {
+  give(channel, arrival = {}) {
     if (!this.#accept) throw new Error("InjectedChannels: the driver has not started yet");
-    if (weDialed) channel.weDialed = true;
-    if (expectPeerId !== undefined) channel.expectPeerId = expectPeerId;
-    this.#accept(channel);
+    this.#accept(channel, arrival);
     return channel;
   }
 }
@@ -239,14 +235,9 @@ export async function makeTransportHost(opts = {}) {
   const appAuthor = opts.appAuthor ?? makeAuthor(opts.sodium ?? sodium);
   const appAuthorHex = Buffer.from(appAuthor.id).toString("hex");
   const policy = transportPolicy(opts.transportAuthorHex ?? transportAuthor(), [appAuthorHex]);
-  // ONE literal rather than a spread at the boot call: an option may be getter-backed (a
-  // rotating contact secret), and a spread flattens it. `load: false` because a test wants
-  // the load observable (sometimes refused); `bundle` keeps the blob loaded below and the
-  // blob the pin admits one fact.
   const transport = {
     channels: opts.channels,
     listen: opts.listen,
-    contactSecret: opts.contactSecret,
     // The DRIVER's own ceiling, not one of the guest's link-state tiers.
     maxRawLinks: opts.maxRawLinks,
     // The occupant's one-byte reason per link teardown (CLOSE_REASON above) — the node's
@@ -257,6 +248,9 @@ export async function makeTransportHost(opts = {}) {
   };
   const transportConfig = {
     ...(opts.transportConfig ?? {}),
+    ...(opts.contactSecret === undefined ? {} : {
+      contactSecret: Buffer.from(opts.contactSecret).toString("hex"),
+    }),
     ...(opts.admitPeers === undefined ? {} : {
       admitPeers: opts.admitPeers.map((peer) => Buffer.from(peer).toString("hex")),
     }),
@@ -386,6 +380,11 @@ export function addr(node, peerHex, dest, contactSecret) {
     .blob(Buffer.from(peerHex, "hex"))
     .blob(contactSecret ?? ZERO32)
     .text(dest));
+}
+
+/** Rotate the inbound contact secret (§12.6.3). */
+export function contact(node, secret) {
+  return transportOp(node, new OpArgs("contact").blob(secret ?? new Uint8Array(0)));
 }
 
 /** Whether `node` holds an authenticated link to `peerHex` right now. The set lives in the

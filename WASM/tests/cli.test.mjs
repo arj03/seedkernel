@@ -184,7 +184,8 @@ function fakeHost(argv, { port = 0, wsPort = 0, shell = {}, linkAvailable = true
   writeFileSync(secretPath, good);
   const host = fakeHost(["--key", join(work, "c.key"), "--contact-secret", secretPath]);
   await runCli(host);
-  ok(toHex(host.stood.contactSecret) === good, "--contact-secret is read from the file it names");
+  ok(host.stood.transportConfig.contactSecret === good,
+    "--contact-secret is read from the file it names, into the transport's own config");
 }
 {
   const badPath = join(work, "bad.hex");

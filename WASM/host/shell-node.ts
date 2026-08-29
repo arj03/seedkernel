@@ -29,8 +29,6 @@ export interface NodeShellOptions {
     /** This node's keypair (README §12.6) — the derived channel keypair, whose public
      *  half is the peer id and the node's one identity (§12.9). */
     identity: Keypair;
-    /** Optional deployment secret (§12.6.3). */
-    contactSecret?: Uint8Array;
     listen?: {
         host: string;
         port: number;
@@ -51,7 +49,7 @@ export interface NodeShellOptions {
      *  author the `link` privilege (never the plain `authors` list). A shell without an
      *  admitted transport bundle has no network. */
     transportBundle?: Uint8Array;
-    /** Installation-local configuration for the signed transport bundle. */
+    /** Transport `LOCAL` config, such as peers and `contactSecret` (§12.10). */
     transportConfig?: JsonObject;
     /** Budget of guest *execution* time per entrypoint invocation, in ms (§12.3). Counts
      *  time the guest is running, not time parked on a host seam, so it bounds a wedged
@@ -135,7 +133,6 @@ export async function bootNodeShell(opts: NodeShellOptions): Promise<NodeShellRu
         freshnessStore: freshness,
         // The sockets and the signed program that drives them, in one object.
         transport: {
-            contactSecret: opts.contactSecret,
             channels: opts.channels ?? new NodeChannelFactory(),
             listen: opts.listen,
             wsListen: opts.wsListen,

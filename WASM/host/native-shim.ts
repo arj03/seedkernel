@@ -12,7 +12,7 @@ import {
 } from "./shell-core.js";
 import { serializeCalls } from "./realm-queue.js";
 import type { CallBudget } from "./guest-seam.js";
-import { FRAMING, type ChannelFactory, type Framing, type RawLink } from "../core/socket-seam.js";
+import { LISTENER, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS } from "../core/net-limits.js";
 import type { Keypair } from "../core/subkeys.js";
 import { deriveNodeKey } from "../core/subkeys.js";
@@ -167,11 +167,7 @@ export const fs: Fs = {
   async stat() { const s = __fs.stat(); return { used: s.used, available: s.available === -1 ? FS_AVAILABLE_UNKNOWN : s.available }; },
 };
 
-/** Go's socket byte primitives (native/sock.go): a raw byte duplex and nothing else. The
- *  whole networking seam — wire codec, handshake, routing — is the transport bundle's, over
- *  the same primitive every target hands it. A link arrives WITHOUT a `framing`: which codec
- *  applies follows from the address, which is this file's to read and never Go's. */
-type GoLink = Omit<RawLink, "framing">;
+/** Go's raw byte-stream primitives (§12.1). */
 declare const __net: {
   /** Install host-owned socket limits before any channel can be opened. */
   install(maxLiveChannels: number, closeGraceMs: number): void;
@@ -204,9 +200,7 @@ __net.install(DEFAULT_MAX_RAW_LINKS, TCP_LINGER_MS);
 const netChans = new Map<number, { deliver: (bytes: Uint8Array) => void; closed: () => void }>();
 const netAccepts = new Map<number, (id: number, remoteAddr: string) => void>();
 
-/** One RawLink (core/socket-seam.ts), minus its framing: Go vends one socket kind
- *  and this file says which codec runs over it. */
-function makeGoLink(id: number, remoteAddr?: string): GoLink {
+function makeGoLink(id: number, remoteAddr?: string): RawLink {
   let onData: (bytes: Uint8Array) => void = () => {};
   let onClose: () => void = () => {};
   netChans.set(id, {
@@ -214,6 +208,7 @@ function makeGoLink(id: number, remoteAddr?: string): GoLink {
     closed: () => { netChans.delete(id); onClose(); },
   });
   return {
+    stream: true,
     remoteAddr,
     send: (bytes) => __net.send(id, bytes),
     buffered: () => __net.buffered(id),
@@ -225,11 +220,11 @@ function makeGoLink(id: number, remoteAddr?: string): GoLink {
   };
 }
 
-function netConnectRaw(host: string, port: number): GoLink {
+function netConnectRaw(host: string, port: number): RawLink {
   return makeGoLink(__net.connect(host, port));
 }
 
-function netListenRaw(host: string, port: number, onAccept: (s: GoLink) => void): number {
+function netListenRaw(host: string, port: number, onAccept: (s: RawLink) => void): number {
   const bound = __net.listen(host, port);
   if (bound < 0) throw new Error("netListenRaw: bind failed");
   netAccepts.set(bound, (id, remoteAddr) => onAccept(makeGoLink(id, remoteAddr)));
@@ -324,30 +319,20 @@ class NativeFreshnessStore extends FreshnessMarks {
         bridge.writeFile(this.path, utf8.encode(json), 0o600);
     }
 }
-/** Say which codec a Go socket carries. The bytes are Go's; the boundaries are the
- *  transport bundle's, and this is the one place that decides which rule it applies. */
-function framed(link: GoLink, framing: Framing, authority?: string): RawLink {
-    return { ...link, framing, authority };
-}
 /** This target's socket seam: the transport driver's ChannelFactory over Go's sockets,
  *  producing RawLinks identically to the node:net factory, so the transport bundle's link
  *  state machine runs over Go's primitives unchanged. */
 const channels: ChannelFactory = {
-    // The guest's opaque destination, resolved against what Go's sockets reach: `tcp://` is
-    // the node↔node path, `ws://` the same socket under the RFC 6455 codec, and `wss://` a
-    // destination with no TLS stack under it here, so it reads "no route" rather than
-    // dialing plaintext at a TLS port (net-node.ts makes the same call).
+    // Go has no TLS socket here, so `wss://` is unroutable (§12.1).
     connect: (dest) => {
         const d = parseDest(dest);
         if (!d || d.scheme === "wss")
             return null;
-        return d.scheme === "ws"
-            ? framed(netConnectRaw(d.host, d.port), FRAMING.WS_CLIENT, `${d.host}:${d.port}`)
-            : framed(netConnectRaw(d.host, d.port), FRAMING.LENGTH);
+        return netConnectRaw(d.host, d.port);
     },
     listen: (tcp, ws, onAccept) => Promise.resolve({
-        port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(framed(s, FRAMING.LENGTH))) : 0,
-        wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(framed(s, FRAMING.WS_SERVER))) : 0,
+        port: tcp ? netListenRaw(tcp.host, tcp.port, (s) => onAccept(s, { listener: LISTENER.TCP })) : 0,
+        wsPort: ws ? netListenRaw(ws.host, ws.port, (s) => onAccept(s, { listener: LISTENER.WS })) : 0,
     }),
     // Close the bound listeners (and, in Go, their accept goroutines) on teardown.
     close: () => { netCloseListeners(); },
@@ -385,9 +370,8 @@ const embeddedTransportAuthor = (() => {
  *  the vendored qjs.wasm — so guest.go arms a wazero deadline instead, which makes a budget
  *  kill fatal to the realm rather than a catchable JS error. */
 const createRealm: RealmFactory = async ({ source, hostCall, memoryLimitBytes, deadlineMs }) => {
-    // Assigned before any guest code can call back: bridge.createRealm evaluates the guest,
-    // whose top level may call the seam but reads only Promises — there is nothing to
-    // await at top level, so nothing settles inside realm construction.
+    // Go does not pump this guest queue during evaluation, so settlement cannot precede
+    // assignment (§12.3).
     let realm: number;
     // Go supplies the live segment remainder because it owns this realm's execution
     // clock. A native module runs synchronously inside that same segment, so its elapsed
@@ -470,7 +454,6 @@ function theShell() {
  *  Config is an object so a positional drift against Go is a type error. */
 async function makeTransportNode(cfg: {
     identity: Keypair;
-    contactSecret?: Uint8Array;
     listen?: {
         host: string;
         port: number;
@@ -495,7 +478,6 @@ async function makeTransportNode(cfg: {
         networkKey: cfg.networkKey,
         // The sockets and the signed program that drives them, in one object.
         transport: {
-            contactSecret: cfg.contactSecret,
             channels,
             listen: cfg.listen,
             wsListen: cfg.wsListen,
@@ -528,10 +510,14 @@ async function bootNode(cfgJson: string): Promise<Uint8Array> {
     const peers: string[] = cfg.peers ?? [];
     const s = await makeTransportNode({
         identity: key,
-        contactSecret: cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
         listen: cfg.listen,
         wsListen: cfg.wsListen,
-        transportConfig: transportConfigFrom(peers, cfg.requestDeadlineMs === undefined ? undefined : String(cfg.requestDeadlineMs)),
+        // Contact policy is transport config (§12.6.3).
+        transportConfig: transportConfigFrom(
+            peers,
+            cfg.requestDeadlineMs === undefined ? undefined : String(cfg.requestDeadlineMs),
+            cfg.contactSecretHex ? fromHex(cfg.contactSecretHex) : undefined,
+        ),
     });
     shell = s.shell;
     const network = s.transport;
@@ -573,7 +559,6 @@ function nativeCliHost(): CliHost {
             setPolicy(cfg.policyJson ?? null);
             const stood = await makeTransportNode({
                 identity: cfg.identity,
-                contactSecret: cfg.contactSecret,
                 listen: cfg.listen,
                 wsListen: cfg.wsListen,
                 transportConfig: cfg.transportConfig,

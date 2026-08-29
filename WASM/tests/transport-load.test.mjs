@@ -197,7 +197,7 @@ await test("a leaked contact secret cannot lock members out of the verified budg
     const gated = {
       remoteAddr: raw.remoteAddr,
       send: (b) => { if (++wrote <= 1) raw.send(b); },
-      framing: raw.framing,
+      stream: raw.stream,
       onData: (cb) => raw.onData(cb),
       onClose: (cb) => raw.onClose(cb),
       close: (g) => raw.close(g),

@@ -1,6 +1,5 @@
-// Wire framing for links the platform did not frame (§12.6.2). TCP is
-// [len u32 BE][bytes]; WS/RTC already have message boundaries. Two-stage cap:
-// handshake bound pre-auth, MAX_FRAME_BYTES once admitted.
+// Guest-owned framing. Codec derives from stream shape plus destination/listener metadata
+// (§12.1).
 
 /** Pre-auth frame cap. 8 KiB leaves room for the suite's ML-KEM-768 encapsulation
  *  key (1184 B); unlike the platform ceiling, this is transport-bundle content. */
@@ -363,13 +362,20 @@ function headerValue(head, name) {
   return m ? m[1] : null;
 }
 
-/** How a link is framed, as the host declares it at open; what to do about it is here. */
-const FRAMING_PLATFORM = 0, FRAMING_LENGTH = 1, FRAMING_WS_CLIENT = 2, FRAMING_WS_SERVER = 3;
+/** Must match `LISTENER.WS` in core/socket-seam.ts. */
+const LISTENER_WS = "ws";
 
-function makeFramer(framing, linkId, weDialed, authority) {
+function makeFramer(stream, linkId, dest, listener) {
   const put = (bytes) => netLinkSend(linkId, bytes);
-  if (framing === FRAMING_LENGTH) return new LengthFramer(put);
-  if (framing === FRAMING_WS_CLIENT) return new WsFramer(put, true, authority || "");
-  if (framing === FRAMING_WS_SERVER) return new WsFramer(put, false, "");
-  return null; // FRAMING_PLATFORM: the transport under us already has boundaries
+  if (!stream) return null;
+  if (dest) {
+    // The socket factory already accepted the destination; framing needs only its codec
+    // and, for WebSocket, the HTTP Host value.
+    const ws = /^wss?:\/\/([^/]+)/i.exec(dest);
+    if (ws) return new WsFramer(put, true, ws[1]);
+    return new LengthFramer(put);
+  }
+  // Unlabelled platform dials, such as RTC, use length framing.
+  if (listener === LISTENER_WS) return new WsFramer(put, false, "");
+  return new LengthFramer(put);
 }

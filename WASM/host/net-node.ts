@@ -3,23 +3,18 @@
 // nothing else. The handshake, link routing and request/response layer run in the transport
 // bundle's guest, driven by TransportHost.
 //
-// WebSocket is handled as a wire codec *over a raw TCP listener*: this file binds the
-// listener and says which codec applies, while the RFC 6455 handshake and framing run in
-// the transport bundle over its own ws.wasm — one WS code path, and no node:http here.
+// TCP and WebSocket listeners expose the same byte stream; the transport bundle selects
+// framing from the destination or listener label (§12.1).
 import { createServer as createTcpServer, connect as tcpConnect, type Server as TcpServer, type Socket } from "node:net";
 
-import { FRAMING, type Framing, type RawLink } from "../core/socket-seam.js";
+import { LISTENER, type Arrival, type RawLink } from "../core/socket-seam.js";
 import { TCP_LINGER_MS } from "../core/net-limits.js";
 import { parseDest } from "./peer-addr.js";
 
-// ── An unframed RawLink over a node:net socket ────────────────────────────────
-// Raw bytes in and out, no boundaries; a WS link is the same socket with a different codec
-// declared on it. node:net buffers writes issued before connect, so the link is writable
-// from birth — the transport can send its HELLO the moment it is constructed.
-function nodeRawStream(socket: Socket, framing: Framing, authority?: string): RawLink {
+// node:net buffers pre-connect writes, so the link is immediately writable.
+function nodeRawStream(socket: Socket): RawLink {
     return {
-        framing,
-        authority,
+        stream: true,
         // The peer's IP, for the per-source half-open cap only (§12.6.1) — unauthenticated
         // and never an identity. Captured now because `socket.remoteAddress` reads undefined
         // once destroyed, and the limiter must release the bucket it took.
@@ -61,18 +56,11 @@ export class NodeChannelFactory {
     /** Takes no crypto: the WebSocket client key and the frame masks are the transport
      *  bundle's, which reaches entropy through `node/random` like any other authority. */
     constructor() {}
-    /** Resolve the guest's opaque destination against what node:net can actually reach.
-     *  `tcp://` is the node↔node path and `ws://` the same socket under the RFC 6455 codec;
-     *  `wss://` is a real destination this factory has no TLS stack for, so it reads "no
-     *  route" here rather than dialing a plaintext socket at a TLS port and failing later as
-     *  a handshake that never completes. */
+    /** Dial TCP-backed destinations; `wss://` is unsupported because this factory has no TLS. */
     connect(dest: string): RawLink | null {
         const d = parseDest(dest);
         if (!d || d.scheme === "wss") return null;
-        const socket = tcpConnect(d.port, d.host);
-        return d.scheme === "ws"
-            ? nodeRawStream(socket, FRAMING.WS_CLIENT, d.host + ":" + d.port)
-            : nodeRawStream(socket, FRAMING.LENGTH);
+        return nodeRawStream(tcpConnect(d.port, d.host));
     }
     async listen(tcp: {
         host: string;
@@ -80,19 +68,19 @@ export class NodeChannelFactory {
     } | undefined, ws: {
         host: string;
         port: number;
-    } | undefined, onAccept: (channel: RawLink) => void): Promise<{
+    } | undefined, onAccept: (channel: RawLink, arrival?: Arrival) => void): Promise<{
         port: number;
         wsPort: number;
     }> {
         let port = 0, wsPort = 0;
         const tasks: Promise<void>[] = [];
         if (tcp) {
-            const server = createTcpServer((socket) => onAccept(nodeRawStream(socket, FRAMING.LENGTH)));
+            const server = createTcpServer((s) => onAccept(nodeRawStream(s), { listener: LISTENER.TCP }));
             this.tcpServer = server;
             tasks.push(listenOn(server, tcp).then((p) => { port = p; }));
         }
         if (ws) {
-            const server = createTcpServer((socket) => onAccept(nodeRawStream(socket, FRAMING.WS_SERVER)));
+            const server = createTcpServer((s) => onAccept(nodeRawStream(s), { listener: LISTENER.WS }));
             this.wsServer = server;
             tasks.push(listenOn(server, ws).then((p) => { wsPort = p; }));
         }

@@ -2,15 +2,14 @@
 // Test infrastructure, so it stays out of the shared bundle every target ships: tests
 // drive the transport through this ChannelFactory the way a node drives real sockets.
 
-import { FRAMING } from "../build/core/socket-seam.js";
+import { LISTENER } from "../build/core/socket-seam.js";
 import { parseDest } from "../build/host/peer-addr.js";
 
 /** One end of an in-process socket pair. Delivery is asynchronous (a microtask),
  *  mirroring a real socket; closing one end fires the other's onClose — the close
  *  semantics of BufferedChannel's fail() path on a real channel. */
 class LoopbackChannel {
-  /** A socket pair with `send` as the boundary: one send is one delivery. */
-  framing = FRAMING.PLATFORM;
+  // `send` preserves message boundaries, so `stream` stays absent.
   peer = null;
   msg = null;
   cls = null;
@@ -64,8 +63,9 @@ export class LoopbackChannels {
 
   async listen(tcp, ws, onAccept) {
     let port = 0, wsPort = 0;
-    if (tcp) { port = this.bind(tcp.port, onAccept); }
-    if (ws) { wsPort = this.bind(ws.port, onAccept); }
+    // Match the production listener labels used to select framing.
+    if (tcp) { port = this.bind(tcp.port, (ch) => onAccept(ch, { listener: LISTENER.TCP })); }
+    if (ws) { wsPort = this.bind(ws.port, (ch) => onAccept(ch, { listener: LISTENER.WS })); }
     this.port = port;
     this.wsPort = wsPort;
     return { port, wsPort };

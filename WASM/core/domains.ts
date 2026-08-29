@@ -30,17 +30,21 @@ export const HOST_TRANSFORM_NAMES = [
 ] as const;
 
 export type HostTransformName = (typeof HOST_TRANSFORM_NAMES)[number];
-/** The host SERVICES — the unit a manifest declares and an operator grants. Each key is
- *  everything before the first `/` of the method names it fronts; `calls` is dispatch
- *  vocabulary, not a second grant. `timer` is `"app"`, not a privilege. */
+/** Host-service ABI (§12.2): `calls` enter the host; `events` enter the service occupant. */
 export const HOST_SERVICES = {
     node: { privilege: "app", calls: ["sign", "verify", "identity", "random"] },
     fs: { privilege: "app", calls: ["get", "put", "list", "delete", "size", "stat"] },
     clock: { privilege: "app", calls: ["now"] },
     timer: { privilege: "app", calls: ["arm", "clear"] },
-    link: { privilege: "link", calls: ["open", "send", "close", "stat", "deliver"] },
+    link: {
+        privilege: "link",
+        calls: ["open", "send", "close", "stat", "deliver"],
+        events: ["linkOpen", "linkBytes", "linkClosed"],
+    },
 } as const;
 export type ServiceName = keyof typeof HOST_SERVICES;
+export const LINK_EVENTS = HOST_SERVICES.link.events;
+export type LinkEvent = (typeof LINK_EVENTS)[number];
 /** The full `service/call` vocabulary as a template-literal union — what the dispatch
  *  table's keys are typed against (guest-seam.ts `HandlerKey`). */
 export type CapabilityName = {

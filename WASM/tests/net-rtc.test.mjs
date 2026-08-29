@@ -93,7 +93,7 @@ await test("RtcChannel exposes a length-framed stream and caps physical messages
     addEventListener(type, cb) { listeners.set(type, cb); },
   };
   const channel = new RtcChannel(dc);
-  assert(channel.framing === 1, "RTC bytes must run through the transport's LENGTH framer");
+  assert(channel.stream === true, "RTC bytes are a byte duplex the guest must frame itself");
   listeners.get("open")();
   const bytes = new Uint8Array(RTC_CHUNK_BYTES * 2 + 7).fill(0x5a);
   channel.send(bytes);
