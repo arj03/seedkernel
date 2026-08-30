@@ -109,40 +109,6 @@ func TestSockChannelReadBackpressure(t *testing.T) {
 	c.close(false)
 }
 
-// TestSockChannelReadTokenBackstop pins the leak backstop: every JS path returns the read
-// token, so one that never comes back is a bug above this file — and the reader must fail
-// the channel rather than park on it forever, holding the socket and its goroutine with no
-// deadline left (the silent-read one is cleared the moment a peer speaks).
-func TestSockChannelReadTokenBackstop(t *testing.T) {
-	prev := readResumeTimeout
-	readResumeTimeout = 150 * time.Millisecond
-	defer func() { readResumeTimeout = prev }()
-
-	c1, c2 := net.Pipe()
-	defer c2.Close()
-	in := make(chan string, 1)
-	gone := make(chan struct{})
-	c := newInboundChannel(c1, func(b []byte) { in <- string(b) }, func() { close(gone) }, testCloseGrace)
-	go c.readLoop()
-
-	if _, err := c2.Write([]byte("first")); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case got := <-in:
-		if got != "first" {
-			t.Fatalf("first read = %q", got)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("first read was never delivered")
-	}
-	// The token is now out with the (absent) driver, and never comes back.
-	waitOn(t, gone, "the never-resumed reader to fail its channel")
-	if _, err := c2.Write([]byte("second")); err == nil {
-		t.Fatal("the socket must be closed once the reader gave up on the token")
-	}
-}
-
 // TestSockChannelCloseFlushesQueuedSends pins the deliberate-close contract: queued
 // sends drain to the peer before the socket closes, and close() never fires onClose.
 func TestSockChannelCloseFlushesQueuedSends(t *testing.T) {

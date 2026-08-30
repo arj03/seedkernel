@@ -248,34 +248,17 @@ export class TransportHost {
       try { channel.close(false); } catch { /* already gone */ }
       this.channelClosed(linkId, channel);
     };
-    /** What was held while the realm worked, as one delivery. Stream slices carry no
-     *  boundaries of their own, so they coalesce the way a paused socket's next read
-     *  returns everything its receive buffer took — under the same per-delivery cap a
-     *  live read answers to. A message adapter keeps its boundaries, one at a time. */
-    const takeHeld = (): Uint8Array => {
-      let n = 0, size = 0;
-      if (channel.stream) {
-        while (n < held.length && (n === 0 || size + held[n].length <= MAX_FRAME_BYTES)) size += held[n++].length;
-      } else {
-        size = held[0].length;
-        n = 1;
-      }
-      heldBytes -= size;
-      if (n === 1) return held.shift() as Uint8Array;
-      const out = new Uint8Array(size);
-      let off = 0;
-      for (const part of held.splice(0, n)) { out.set(part, off); off += part.length; }
-      return out;
-    };
     /** One read has finished (or the link has just been registered): drain what was held
-     *  behind it. A LOOP rather than a call back into itself — a vacant binding answers
-     *  every read synchronously, and recursing there would put the whole held queue on
-     *  the stack. */
+     *  behind it, oldest first. A LOOP rather than a call back into itself — a vacant
+     *  binding answers every read synchronously, and recursing there would put the whole
+     *  held queue on the stack. */
     const releaseRead = () => {
       for (;;) {
         if (this.channels.get(linkId) !== channel) { dropHeld(); return; }
-        if (held.length === 0) break;
-        if (!dispatchRead(takeHeld())) return; // in flight: its settle re-enters here
+        const next = held.shift();
+        if (!next) break;
+        heldBytes -= next.length;
+        if (!dispatchRead(next)) return; // in flight: its settle re-enters here
       }
       readActive = false;
       try { channel.setReadable?.(true); }

@@ -26,14 +26,6 @@ const tcpKeepAlive = 30 * time.Second
 // shrink it.
 var silentReadTimeout = 30 * time.Second
 
-// readResumeTimeout bounds a read whose token the JS driver never returns. Every path up
-// there returns it — on the realm's answer, on its rejection, and when the binding is
-// vacant — so this is a LEAK backstop, not a policy deadline: it must sit far above any
-// realm turn, and it fires only on a bug above this file. Without it a lost token parks
-// the reader forever, holding the socket and its goroutine with no deadline left (the
-// silent-read one is cleared the moment a peer speaks). A var so a test can shrink it.
-var readResumeTimeout = 5 * time.Minute
-
 // Socket buffers stay at kernel defaults — an explicit SO_RCVBUF/SO_SNDBUF is clamped to
 // net.core.{r,w}mem_max and LOCKS the buffer, disabling the autotuning that grows it to
 // ~6 MB as a bulk transfer ramps (a fixed 4 MiB once pinned holder connections to a
@@ -158,21 +150,9 @@ func (c *sockChannel) resume() {
 }
 
 // waitReadable parks until this link's read token comes back, and answers whether the loop
-// may read. backstop is the reader's own reusable timer — one per readLoop rather than one
-// per read, since this sits on the receive hot path.
-func (c *sockChannel) waitReadable(backstop *time.Timer) bool {
-	if !backstop.Stop() {
-		select {
-		case <-backstop.C:
-		default:
-		}
-	}
-	backstop.Reset(readResumeTimeout)
-	select {
-	case <-c.readGate:
-	case <-backstop.C:
-		c.fail() // the token never came back: a bug above us, not a peer we can bill
-	}
+// may read. Both teardowns wakeReader(), so a parked reader always observes a dead channel.
+func (c *sockChannel) waitReadable() bool {
+	<-c.readGate
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return !c.dead
@@ -292,10 +272,8 @@ func (c *sockChannel) readLoop() {
 	// without ever bounding one that has.
 	conn.SetReadDeadline(time.Now().Add(silentReadTimeout))
 	spoke := false
-	backstop := time.NewTimer(readResumeTimeout)
-	defer backstop.Stop()
 	for {
-		if !c.waitReadable(backstop) {
+		if !c.waitReadable() {
 			return
 		}
 		n, err := conn.Read(chunk)

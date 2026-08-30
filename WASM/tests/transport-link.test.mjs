@@ -1060,13 +1060,11 @@ await test("DRIVER BACKPRESSURE: one blocked read cannot fill the realm queue", 
 
 /** The production shape of an adapter with NO platform backpressure: a browser WebSocket
  *  and an RTCDataChannel both deliver whatever arrives, so neither can implement
- *  `setReadable` — the driver has to hold their bursts itself. `stream` mirrors
- *  RtcChannel, which chunks its own writes and so delivers slices, not messages. */
+ *  `setReadable` — the driver has to hold their bursts itself. */
 class UnpausableChannel {
   data = null;
   closed = null;
   closes = 0;
-  constructor(stream = false) { this.stream = stream; }
   send() {}
   onData(cb) { this.data = cb; }
   onClose(cb) { this.closed = cb; }
@@ -1113,26 +1111,6 @@ await test("DRIVER BACKPRESSURE: an unpausable adapter's burst is held, in order
   const order = h.reads.map((r) => r[r.length - 1]).join(",");
   assert(order === "1,2,3,4,5,6", `held reads must arrive whole and in order, got ${order}`);
   assert(channel.closes === 0, "the link must survive the whole burst");
-});
-
-// Held slices of a STREAM have no boundaries of their own, so the driver hands the realm
-// what it accumulated as one read — the way a paused socket's next read returns whatever
-// its receive buffer took, rather than one realm turn per 48 KiB RTC chunk.
-await test("DRIVER BACKPRESSURE: held stream slices resume as one read", async (keep) => {
-  const h = heldReadDriver(keep);
-  await h.driver.start();
-  const channel = new UnpausableChannel(true);
-  h.factory.give(channel);
-  await settle(0);
-
-  for (let i = 1; i <= 6; i++) channel.emit(Uint8Array.of(i, i));
-  await until(() => h.reads.length === 1, 1000, "the first slice");
-  h.next();
-  await until(() => h.reads.length === 2, 1000, "the coalesced remainder");
-  assert(h.reads[0].length === 2, `the live slice is delivered as it came, got ${h.reads[0].length}`);
-  assert(h.reads[1].join(",") === "2,2,3,3,4,4,5,5,6,6",
-    `held slices must coalesce in order, got ${h.reads[1].join(",")}`);
-  assert(channel.closes === 0, "a coalescing stream link must survive its burst");
 });
 
 // The hold is a bound, not a buffer: a peer that outruns the realm loses its link rather
