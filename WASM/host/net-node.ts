@@ -21,6 +21,7 @@ function nodeRawStream(socket: Socket): RawLink {
         remoteAddr: socket.remoteAddress ?? undefined,
         send: (bytes: Uint8Array) => { socket.write(bytes); },
         onData: (cb: (chunk: Uint8Array) => void) => { socket.on("data", (chunk: Uint8Array) => cb(new Uint8Array(chunk))); },
+        setReadable: (enabled) => { if (enabled) socket.resume(); else socket.pause(); },
         // error and close both mean "gone"; the caller's teardown is idempotent.
         onClose: (cb: () => void) => { socket.on("close", cb); socket.on("error", cb); },
         // A graceful stop must FLUSH: `destroy()` drops the write buffer, so the

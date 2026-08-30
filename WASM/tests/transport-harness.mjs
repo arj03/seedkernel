@@ -273,7 +273,15 @@ export async function makeTransportHost(opts = {}) {
     fs: false,
     networkKey: opts.networkKey,
     transport,
-    createRealm: async (o) => createSafeRealm(o),
+    createRealm: async (o) => createSafeRealm(opts.onHostCall
+      ? {
+          ...o,
+          hostCall: (...args) => {
+            opts.onHostCall(...args);
+            return o.hostCall(...args);
+          },
+        }
+      : o),
     admit: policy,
   });
   await shell.loadBundleBlob(blob, { localConfig: transportConfig });

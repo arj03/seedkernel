@@ -111,6 +111,14 @@ func exposeNet(qc *qjs.Context, el *eventLoop) *netHost {
 		}
 		return t.Context().NewInt64(0), nil
 	}))
+	o.SetPropertyStr("resume", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
+		if len(t.Args()) >= 1 {
+			if ch := n.get(t.Args()[0].Int64()); ch != nil {
+				ch.resume()
+			}
+		}
+		return nil, nil
+	}))
 	o.SetPropertyStr("closeListeners", qc.Function(func(t *qjs.This) (*qjs.Value, error) {
 		n.closeListeners()
 		return nil, nil

@@ -3,7 +3,12 @@
 
 
 import { toHex, fromHex } from "../core/util.js";
-import { DEFAULT_MAX_RAW_LINKS } from "../core/net-limits.js";
+import {
+  DEFAULT_MAX_RAW_LINKS,
+  MAX_FRAME_BYTES,
+  MAX_INBOUND_HOLD_BYTES,
+  MAX_INBOUND_HOLD_SLICES,
+} from "../core/net-limits.js";
 import { type LinkEvent } from "../core/domains.js";
 import { type Arrival, type ChannelFactory, type RawLink } from "../core/socket-seam.js";
 import { type JsonObject } from "./bundle.js";
@@ -139,15 +144,18 @@ export class TransportHost {
     return this.call(args.build());
   }
 
-  /** `toTransport` for an op whose answer nobody is waiting on. A rejection is logged,
-   *  except a realm disposed out from under the op — this driver's own teardown or
-   *  replacement, which would otherwise print an error per ordinary shutdown. */
+  /** A rejected op nobody was waiting on. Logged, except a realm disposed out from under
+   *  it — this driver's own teardown or replacement, which would otherwise print an error
+   *  per ordinary shutdown. */
+  private reportOpError(op: string, err: unknown): void {
+    if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
+    console.error(`[transport] error in ${op}: ${String(err)}`);
+  }
+
+  /** `toTransport` for an op whose answer nobody is waiting on. */
   private tell(args: OpArgs): void {
     const r = this.toTransport(args);
-    if (r) void r.catch((err: unknown) => {
-      if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
-      console.error(`[transport] error in ${args.op}: ${String(err)}`);
-    });
+    if (r) void r.catch((err: unknown) => this.reportOpError(args.op, err));
   }
 
   // ── the capability backend the transport guest's seam is wired to ───────────
@@ -226,12 +234,87 @@ export class TransportHost {
     }
     const linkId = this.nextLinkId++;
     this.channels.set(linkId, channel);
+    // Admit one read per link into the serialized realm at a time. An adapter that can be
+    // paused is paused at the socket, where the peer's own transport pushes back; one that
+    // cannot is held HERE, bounded by MAX_INBOUND_HOLD_BYTES, past which the peer is
+    // outrunning the realm and the link fails instead of the queue growing.
+    let readActive = false;
+    const held: Uint8Array[] = [];
+    let heldBytes = 0;
+
+    const dropHeld = () => { held.length = 0; heldBytes = 0; };
+    const failReadSide = () => {
+      dropHeld();
+      try { channel.close(false); } catch { /* already gone */ }
+      this.channelClosed(linkId, channel);
+    };
+    /** What was held while the realm worked, as one delivery. Stream slices carry no
+     *  boundaries of their own, so they coalesce the way a paused socket's next read
+     *  returns everything its receive buffer took — under the same per-delivery cap a
+     *  live read answers to. A message adapter keeps its boundaries, one at a time. */
+    const takeHeld = (): Uint8Array => {
+      let n = 0, size = 0;
+      if (channel.stream) {
+        while (n < held.length && (n === 0 || size + held[n].length <= MAX_FRAME_BYTES)) size += held[n++].length;
+      } else {
+        size = held[0].length;
+        n = 1;
+      }
+      heldBytes -= size;
+      if (n === 1) return held.shift() as Uint8Array;
+      const out = new Uint8Array(size);
+      let off = 0;
+      for (const part of held.splice(0, n)) { out.set(part, off); off += part.length; }
+      return out;
+    };
+    /** One read has finished (or the link has just been registered): drain what was held
+     *  behind it. A LOOP rather than a call back into itself — a vacant binding answers
+     *  every read synchronously, and recursing there would put the whole held queue on
+     *  the stack. */
+    const releaseRead = () => {
+      for (;;) {
+        if (this.channels.get(linkId) !== channel) { dropHeld(); return; }
+        if (held.length === 0) break;
+        if (!dispatchRead(takeHeld())) return; // in flight: its settle re-enters here
+      }
+      readActive = false;
+      try { channel.setReadable?.(true); }
+      catch { failReadSide(); }
+    };
+    /** Hand one read to the realm. Answers false when the read is IN FLIGHT, or the link
+     *  died trying — true only when it was over before it began, which is the vacant
+     *  binding and nothing else. */
+    const dispatchRead = (bytes: Uint8Array): boolean => {
+      readActive = true;
+      try { channel.setReadable?.(false); }
+      catch { failReadSide(); return false; }
+      let result: Promise<Uint8Array> | null;
+      try { result = this.toTransport(ev("linkBytes").u32(linkId).blob(bytes)); }
+      catch (err) { this.reportOpError("linkBytes", err); return true; }
+      if (!result) return true;
+      void result.then(releaseRead, (err: unknown) => { this.reportOpError("linkBytes", err); releaseRead(); });
+      return false;
+    };
+
     // Inbound bytes are a plain event now — the request the occupant decoded off this
     // read rides its own `link/deliver` call, not a return here.
     channel.onData((bytes) => {
-      if (this.channels.get(linkId) === channel) this.tell(ev("linkBytes").u32(linkId).blob(bytes));
+      if (this.channels.get(linkId) !== channel) return;
+      // Platform-framed adapters have no declared-length prefix at which to enforce the
+      // hard host cap. Refuse the oversized delivery before OpArgs copies it into a realm
+      // invocation; stream backends naturally deliver much smaller slices.
+      if (bytes.length > MAX_FRAME_BYTES) { failReadSide(); return; }
+      if (!readActive) {
+        if (dispatchRead(bytes)) releaseRead(); // over before it began: go back to draining
+        return;
+      }
+      if (held.length >= MAX_INBOUND_HOLD_SLICES
+        || heldBytes + bytes.length > MAX_INBOUND_HOLD_BYTES) { failReadSide(); return; }
+      // A custom RawLink may reuse its callback buffer, so what we hold owns its bytes.
+      held.push(bytes.slice());
+      heldBytes += bytes.length;
     });
-    channel.onClose(() => this.channelClosed(linkId, channel));
+    channel.onClose(() => { dropHeld(); this.channelClosed(linkId, channel); });
     return linkId;
   }
 
@@ -253,11 +336,7 @@ export class TransportHost {
     if (!r) { report(0); return; }
     void r.then(
       (ret) => report(ret.length === 1 ? ret[0] : 0),
-      (err: unknown) => {
-        report(0);
-        if (String((err as Error)?.message ?? err).includes("realm disposed")) return;
-        console.error(`[transport] error in linkClosed: ${String(err)}`);
-      },
+      (err: unknown) => { report(0); this.reportOpError("linkClosed", err); },
     );
   }
 

@@ -26,6 +26,14 @@ const tcpKeepAlive = 30 * time.Second
 // shrink it.
 var silentReadTimeout = 30 * time.Second
 
+// readResumeTimeout bounds a read whose token the JS driver never returns. Every path up
+// there returns it — on the realm's answer, on its rejection, and when the binding is
+// vacant — so this is a LEAK backstop, not a policy deadline: it must sit far above any
+// realm turn, and it fires only on a bug above this file. Without it a lost token parks
+// the reader forever, holding the socket and its goroutine with no deadline left (the
+// silent-read one is cleared the moment a peer speaks). A var so a test can shrink it.
+var readResumeTimeout = 5 * time.Minute
+
 // Socket buffers stay at kernel defaults — an explicit SO_RCVBUF/SO_SNDBUF is clamped to
 // net.core.{r,w}mem_max and LOCKS the buffer, disabling the autotuning that grows it to
 // ~6 MB as a bulk transfer ramps (a fixed 4 MiB once pinned holder connections to a
@@ -47,6 +55,7 @@ func dialTCP(addr string) (net.Conn, error) {
 type rawChannel interface {
 	send(bytes []byte)
 	buffered() int
+	resume()
 	close(graceful bool)
 }
 
@@ -69,13 +78,21 @@ type sockChannel struct {
 	dead       bool
 	closeGrace time.Duration // installed from the shared TypeScript network policy
 
-	wake chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
+	wake     chan struct{} // cap 1: nudges the writer after queue/dead change; coalesces bursts
+	readGate chan struct{} // one token permits one socket read / serialized realm turn
+}
+
+func newReadGate() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{} // the first read may start immediately
+	return gate
 }
 
 // newDialChannel returns a channel that connects in the background (the dial path):
 // the caller can send immediately and the bytes flush once connected.
 func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace, wake: make(chan struct{}, 1)}
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, closeGrace: closeGrace,
+		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go func() {
 		conn, err := dialTCP(addr)
 		if err != nil {
@@ -99,7 +116,8 @@ func newDialChannel(addr string, onMsg func([]byte), onClose func(), closeGrace 
 // newInboundChannel wraps an already-open accepted socket: its writer starts immediately,
 // while the caller starts readLoop once the JS channel is registered (netHost.wrapInbound).
 func newInboundChannel(conn net.Conn, onMsg func([]byte), onClose func(), closeGrace time.Duration) *sockChannel {
-	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace, wake: make(chan struct{}, 1)}
+	c := &sockChannel{onMsg: onMsg, onClose: onClose, conn: conn, closeGrace: closeGrace,
+		wake: make(chan struct{}, 1), readGate: newReadGate()}
 	go c.writeLoop()
 	return c
 }
@@ -131,6 +149,40 @@ func (c *sockChannel) buffered() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.queued
+}
+
+// Each delivery consumes the sole read token. The JS driver returns it only after that
+// read's serialized realm turn settles, so excess bytes stay in the socket receive window.
+func (c *sockChannel) resume() {
+	c.wakeReader()
+}
+
+// waitReadable parks until this link's read token comes back, and answers whether the loop
+// may read. backstop is the reader's own reusable timer — one per readLoop rather than one
+// per read, since this sits on the receive hot path.
+func (c *sockChannel) waitReadable(backstop *time.Timer) bool {
+	if !backstop.Stop() {
+		select {
+		case <-backstop.C:
+		default:
+		}
+	}
+	backstop.Reset(readResumeTimeout)
+	select {
+	case <-c.readGate:
+	case <-backstop.C:
+		c.fail() // the token never came back: a bug above us, not a peer we can bill
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.dead
+}
+
+func (c *sockChannel) wakeReader() {
+	select {
+	case c.readGate <- struct{}{}:
+	default:
+	}
 }
 
 // signal nudges the writer without blocking: the cap-1 buffer coalesces bursts, and the
@@ -196,10 +248,12 @@ func (c *sockChannel) close(graceful bool) {
 	if !graceful {
 		conn.Close()
 		c.signal() // wake a parked writer so it observes dead and exits
+		c.wakeReader()
 		return
 	}
 	conn.SetWriteDeadline(time.Now().Add(c.closeGrace))
 	c.signal() // the writer flushes the queue, then Close()s and exits
+	c.wakeReader()
 }
 
 // fail is the error teardown: close the socket and fire onClose so the owner drops the
@@ -219,6 +273,7 @@ func (c *sockChannel) fail() {
 		conn.Close() // also unblocks a writer mid-Write; it errors out, sees dead, and exits
 	}
 	c.signal() // wake a parked writer so it observes dead and exits
+	c.wakeReader()
 	c.onClose()
 }
 
@@ -237,7 +292,12 @@ func (c *sockChannel) readLoop() {
 	// without ever bounding one that has.
 	conn.SetReadDeadline(time.Now().Add(silentReadTimeout))
 	spoke := false
+	backstop := time.NewTimer(readResumeTimeout)
+	defer backstop.Stop()
 	for {
+		if !c.waitReadable(backstop) {
+			return
+		}
 		n, err := conn.Read(chunk)
 		if n > 0 {
 			if !spoke {
@@ -245,6 +305,9 @@ func (c *sockChannel) readLoop() {
 				conn.SetReadDeadline(time.Time{}) // said something: the guest's link deadlines own it now
 			}
 			c.onMsg(append([]byte(nil), chunk[:n]...))
+		} else if err == nil {
+			// A zero-byte, nil-error read made no realm turn to return the token.
+			c.resume()
 		}
 		if err != nil {
 			c.fail() // including the deadline: a socket that opened and never spoke

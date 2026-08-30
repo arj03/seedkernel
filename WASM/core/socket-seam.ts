@@ -4,6 +4,9 @@ export interface RawLink {
   send(bytes: Uint8Array): void;
   /** One message, or an arbitrary slice when `stream` is true. */
   onData(cb: (bytes: Uint8Array) => void): void;
+  /** Stop/start inbound delivery around one serialized transport-realm turn. Optional;
+   * TransportHost gives adapters without platform backpressure one fallback message. */
+  setReadable?(enabled: boolean): void;
   onClose(cb: () => void): void;
   /** `graceful` permits flushing queued writes. */
   close(graceful?: boolean): void;

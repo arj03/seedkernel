@@ -12,6 +12,7 @@ import {
 } from "./transport-harness.mjs";
 import { testkit } from "./testkit.mjs";
 import { bytesEqual } from "./bytes.mjs";
+import { MAX_INBOUND_HOLD_BYTES, MAX_INBOUND_HOLD_SLICES } from "../build/core/net-limits.js";
 
 // ── an instrumented channel pair ─────────────────────────────────────────────
 // The RawLink shape (core/socket-seam.ts) plus the hooks these tests need: every byte
@@ -24,7 +25,8 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
   const mk = (name, remoteAddr) => ({
     name, remoteAddr,
     sent: [], closeArgs: [], dead: false, inFlight: 0,
-    msg: null, cls: null, peer: null,
+    msg: null, rawMsg: null, cls: null, peer: null,
+    paused: false, inbound: [],
     holding: false, held: [],
     /** Queue writes rather than delivering them, until `flush`. */
     hold() { this.holding = true; this.held = []; },
@@ -61,12 +63,37 @@ function wirePair({ addrA = "10.0.0.1", addrB = "10.0.0.2", tamper, destructive,
       });
     },
     stream,
-    onData(cb) { this.msg = cb; },
+    onData(cb) {
+      this.rawMsg = cb;
+      this.msg = (bytes) => {
+        if (!this.paused) { this.rawMsg?.(bytes); return; }
+        this.inbound.push(Uint8Array.from(bytes));
+      };
+    },
+    setReadable(enabled) {
+      if (!enabled) { this.paused = true; return; }
+      if (this.inbound.length === 0) { this.paused = false; return; }
+      let next = this.inbound.shift();
+      // A real paused TCP socket leaves bytes in the kernel, whose next Read coalesces
+      // available slices. Model that rather than turning a byte-dribble test into tens of
+      // thousands of already-delivered host events.
+      if (this.stream && this.inbound.length > 0) {
+        const parts = [next, ...this.inbound.splice(0)];
+        const size = parts.reduce((n, part) => n + part.length, 0);
+        next = new Uint8Array(size);
+        let off = 0;
+        for (const part of parts) { next.set(part, off); off += part.length; }
+      }
+      // Keep the socket paused until this queued read is actually delivered; otherwise a
+      // newly arriving slice could overtake it in the resume microtask window.
+      queueMicrotask(() => { this.paused = false; this.msg?.(next); });
+    },
     onClose(cb) { this.cls = cb; },
     close(graceful = false) {
       this.closeArgs.push(graceful);
       if (this.dead) return;
       this.dead = true;
+      this.inbound.length = 0;
       if (destructive && !graceful) this.inFlight = 0;
       queueMicrotask(() => this.peer.kill());
     },
@@ -254,6 +281,39 @@ await test("handshake messages are exact-length: a trailing byte is refused", as
     if (len === 81) assert(!(await aUp(st)), "a rejected msg1 must leave the initiator unauthenticated");
     st.close();
   }
+});
+
+await test("an exact-size invalid handshake latches before repeated KEM work", async (keep) => {
+  // A malformed msg2 has the right public shape, so the initiator has to perform its DH
+  // and ML-KEM decapsulation before the concealed tag can reject it. Once that rejection
+  // has made the exchange terminal, replaying the same body must be a cheap silent stall:
+  // doing the decapsulation again lets one socket turn bandwidth into repeated PQ work.
+  let invalidMsg2 = null;
+  let fromB = 0;
+  let initiatorKemCalls = 0;
+  const chans = wirePair({
+    // msg2 is the FIRST thing the responder puts on the wire — named that way rather than
+    // by its width, so a suite change cannot turn this tamper into a silent no-op.
+    tamper: (bytes, from) => {
+      if (from !== "B" || ++fromB !== 1) return bytes;
+      invalidMsg2 = Uint8Array.from(bytes);
+      invalidMsg2[invalidMsg2.length - 1] ^= 0x80;
+      return invalidMsg2;
+    },
+  });
+  const st = keep(await linked(chans, {
+    onHostCall: (name) => { if (name === "mlkem") initiatorKemCalls++; },
+  }));
+  await until(() => invalidMsg2 !== null, 4000, "the responder to answer msg1");
+  await settle(750); // let the initiator do — and finish — its decapsulation
+  const afterFirstFailure = initiatorKemCalls;
+  assert(afterFirstFailure > 0, "the initiator must have reached ML-KEM at all");
+
+  for (let i = 0; i < 8; i++) chans[0].msg(invalidMsg2);
+  await settle(750);
+  assert(initiatorKemCalls === afterFirstFailure,
+    `a terminal invalid msg2 repeated ML-KEM work (${afterFirstFailure} -> ${initiatorKemCalls} calls)`);
+  assert(!(await aUp(st)) && !(await bUp(st)), "a latched invalid exchange must remain unauthenticated");
 });
 
 await test("CONCEALMENT: a responder says NOTHING to a caller without the contact secret", async (keep) => {
@@ -944,6 +1004,204 @@ await test("CALLER BOUNDARY: an app may name `peers`, but not a platform event",
   catch (e) { refused = String(e); }
   assert(refused.includes("the host's, not an app's"),
     `an app naming a platform event must be refused, got ${refused || "no error"}`);
+});
+
+// A raw read is accepted only while its channel can be held at the socket boundary.
+await test("DRIVER BACKPRESSURE: one blocked read cannot fill the realm queue", async (keep) => {
+  class PausableChannel {
+    data = null;
+    closed = null;
+    paused = false;
+    pauses = 0;
+    resumes = 0;
+    send() {}
+    onData(cb) { this.data = cb; }
+    onClose(cb) { this.closed = cb; }
+    setReadable(enabled) {
+      this.paused = !enabled;
+      if (enabled) this.resumes++; else this.pauses++;
+    }
+    close() {}
+    emit(bytes = Uint8Array.of(1)) {
+      if (this.paused) return false;
+      this.data?.(bytes);
+      return true;
+    }
+  }
+
+  let releaseRead;
+  const blockedRead = new Promise((resolve) => { releaseRead = resolve; });
+  let acceptedReads = 0;
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost({ channels: factory }, {}));
+  driver.activate((payload) => {
+    const n = payload[0];
+    const op = new TextDecoder().decode(payload.subarray(1, 1 + n));
+    if (op === "linkBytes") { acceptedReads++; return blockedRead; }
+    return Promise.resolve(new Uint8Array());
+  });
+  await driver.start();
+  const channel = new PausableChannel();
+  factory.give(channel);
+  await settle(0);
+
+  let deliveredBySocket = 0;
+  for (let i = 0; i < 1000; i++) if (channel.emit()) deliveredBySocket++;
+  assert(deliveredBySocket === 1 && acceptedReads === 1,
+    `a blocked realm accepted ${acceptedReads} of ${deliveredBySocket} socket reads`);
+  assert(channel.pauses === 1 && channel.paused,
+    `the socket must be paused for the read's lifetime (pauses ${channel.pauses})`);
+
+  releaseRead(new Uint8Array());
+  await until(() => channel.resumes === 1 && !channel.paused, 1000, "the socket read to resume");
+  channel.emit(Uint8Array.of(2));
+  await until(() => acceptedReads === 2, 1000, "the next read after resume");
+});
+
+/** The production shape of an adapter with NO platform backpressure: a browser WebSocket
+ *  and an RTCDataChannel both deliver whatever arrives, so neither can implement
+ *  `setReadable` — the driver has to hold their bursts itself. `stream` mirrors
+ *  RtcChannel, which chunks its own writes and so delivers slices, not messages. */
+class UnpausableChannel {
+  data = null;
+  closed = null;
+  closes = 0;
+  constructor(stream = false) { this.stream = stream; }
+  send() {}
+  onData(cb) { this.data = cb; }
+  onClose(cb) { this.closed = cb; }
+  close() { this.closes++; }
+  emit(bytes) { this.data?.(bytes); }
+}
+
+/** A driver whose `linkBytes` answer each test releases by hand, recording what it saw. */
+function heldReadDriver(keep) {
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost({ channels: factory }, {}));
+  const reads = [];
+  let release = null;
+  driver.activate((payload) => {
+    const n = payload[0];
+    if (new TextDecoder().decode(payload.subarray(1, 1 + n)) !== "linkBytes") {
+      return Promise.resolve(new Uint8Array());
+    }
+    // `linkBytes` is [opLen u8][op][linkId u32][blobLen u32][blob] — the blob runs to the end.
+    reads.push(payload.subarray(1 + n + 4 + 4));
+    return new Promise((r) => { release = () => r(new Uint8Array()); });
+  });
+  return { factory, driver, reads, next: () => { const r = release; release = null; r(); } };
+}
+
+// An adapter that cannot be paused is held by the DRIVER instead of the socket. Without
+// this, a browser WebSocket or an RTCDataChannel — which chunks every write it makes —
+// loses its link the moment a peer's third message lands inside one realm turn.
+await test("DRIVER BACKPRESSURE: an unpausable adapter's burst is held, in order", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const channel = new UnpausableChannel();
+  h.factory.give(channel);
+  await settle(0);
+
+  const BURST = 6;
+  for (let i = 1; i <= BURST; i++) channel.emit(Uint8Array.of(i));
+  await until(() => h.reads.length === 1, 1000, "the first read");
+  assert(channel.closes === 0, "a burst within the hold bound must not fail the link");
+  for (let i = 2; i <= BURST; i++) {
+    h.next();
+    await until(() => h.reads.length === i, 1000, `held read ${i}`);
+  }
+  const order = h.reads.map((r) => r[r.length - 1]).join(",");
+  assert(order === "1,2,3,4,5,6", `held reads must arrive whole and in order, got ${order}`);
+  assert(channel.closes === 0, "the link must survive the whole burst");
+});
+
+// Held slices of a STREAM have no boundaries of their own, so the driver hands the realm
+// what it accumulated as one read — the way a paused socket's next read returns whatever
+// its receive buffer took, rather than one realm turn per 48 KiB RTC chunk.
+await test("DRIVER BACKPRESSURE: held stream slices resume as one read", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const channel = new UnpausableChannel(true);
+  h.factory.give(channel);
+  await settle(0);
+
+  for (let i = 1; i <= 6; i++) channel.emit(Uint8Array.of(i, i));
+  await until(() => h.reads.length === 1, 1000, "the first slice");
+  h.next();
+  await until(() => h.reads.length === 2, 1000, "the coalesced remainder");
+  assert(h.reads[0].length === 2, `the live slice is delivered as it came, got ${h.reads[0].length}`);
+  assert(h.reads[1].join(",") === "2,2,3,3,4,4,5,5,6,6",
+    `held slices must coalesce in order, got ${h.reads[1].join(",")}`);
+  assert(channel.closes === 0, "a coalescing stream link must survive its burst");
+});
+
+// The hold is a bound, not a buffer: a peer that outruns the realm loses its link rather
+// than growing the driver's queue on its behalf (§16.1).
+await test("DRIVER BACKPRESSURE: a peer outrunning the realm loses its link", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const channel = new UnpausableChannel();
+  h.factory.give(channel);
+  await settle(0);
+
+  const SLICE = 1 << 20; // 1 MiB, well under the per-delivery frame cap
+  const over = Math.floor(MAX_INBOUND_HOLD_BYTES / SLICE) + 2; // one dispatched, the rest held
+  for (let i = 0; i < over && channel.closes === 0; i++) channel.emit(new Uint8Array(SLICE));
+  assert(channel.closes === 1, "a peer past the hold bound must have its link closed");
+  assert(h.reads.length === 1, `only the dispatched read may reach the realm, got ${h.reads.length}`);
+});
+
+// The byte bound alone is not enough: one-byte messages cost far more than their bytes,
+// so the hold is bounded by slice COUNT too.
+await test("DRIVER BACKPRESSURE: tiny messages cannot outrun the hold by count", async (keep) => {
+  const h = heldReadDriver(keep);
+  await h.driver.start();
+  const channel = new UnpausableChannel();
+  h.factory.give(channel);
+  await settle(0);
+
+  const one = Uint8Array.of(9);
+  const over = MAX_INBOUND_HOLD_SLICES + 2; // one dispatched, MAX held, one past the bound
+  let sent = 0;
+  for (; sent < over && channel.closes === 0; sent++) channel.emit(one);
+  assert(channel.closes === 1, "a peer past the slice bound must have its link closed");
+  assert(sent * one.length < MAX_INBOUND_HOLD_BYTES,
+    "the count bound must bite long before the byte bound it backs up");
+});
+
+// A read the transport answers with "no route" is over before it began, so a full hold
+// drains in one synchronous pass. It must drain as a LOOP: one stack frame per held slice
+// is not what a bounded queue promises, and the socket must end up readable again.
+await test("DRIVER BACKPRESSURE: a hold answered synchronously drains whole", async (keep) => {
+  const factory = new InjectedChannels();
+  const driver = keep(new TransportHost({ channels: factory }, {}));
+  let reads = 0;
+  let releaseFirst;
+  driver.activate((payload) => {
+    const n = payload[0];
+    if (new TextDecoder().decode(payload.subarray(1, 1 + n)) !== "linkBytes") {
+      return Promise.resolve(new Uint8Array());
+    }
+    // The first read occupies the realm; every later one answers on the spot.
+    if (++reads > 1) return null;
+    return new Promise((r) => { releaseFirst = () => r(new Uint8Array()); });
+  });
+  await driver.start();
+  const channel = new UnpausableChannel();
+  factory.give(channel);
+  await settle(0);
+
+  const BURST = MAX_INBOUND_HOLD_SLICES;
+  for (let i = 0; i < BURST; i++) channel.emit(Uint8Array.of(1));
+  assert(reads === 1 && channel.closes === 0,
+    `the hold must have taken the burst behind one read (reads ${reads}, closes ${channel.closes})`);
+
+  releaseFirst();
+  await settle(50);
+  assert(reads === BURST, `every held slice must reach the realm, got ${reads} of ${BURST}`);
+  assert(channel.closes === 0, "a fully drained hold must leave the link alive");
+  channel.emit(Uint8Array.of(2));
+  assert(reads === BURST + 1, "and the link must be readable again once the hold is empty");
 });
 
 // A reply applies only to the captured channel (§12.10).

@@ -312,6 +312,7 @@ class Link {
     this.queuedBytes = 0;
     this.peerEph = null;
     this.closed = false;
+    this.stalled = false;
     this.notified = false;
     // How this link ended, for `closeReason`: whether WE tore it down, and whether the
     // teardown was defensive (a peer did something wrong) rather than merely our own
@@ -531,6 +532,10 @@ class Link {
    *  this READ has been decoded — a request it carried is already on its way to the host
    *  under its own `link/deliver` call, and is deliberately not waited for here. */
   onWire(bytes) {
+    // A concealed refusal is terminal for this exchange. The socket stays silent until
+    // its already-armed deadline retires it, but subsequent reads do not reparse frames or
+    // repeat proof/KEM work.
+    if (this.closed || this.stalled) return Promise.resolve();
     if (!this.framer) {
       // A platform-framed link (browser WebSocket, RTCDataChannel) arrives with message
       // boundaries already on it — but the two-stage cap is about how much a peer may
@@ -564,7 +569,9 @@ class Link {
    *  handler checks its exact width, and a post-auth body goes to the AEAD, which fails
    *  closed (see §12.6). Answers when the step is done; nothing rides the value. */
   onMessage(m) {
-    if (this.closed) return Promise.resolve();
+    // Several complete frames can share one stream read and are enqueued before the first
+    // is processed. Re-check here so a refusal by the first cheaply consumes the rest.
+    if (this.closed || this.stalled) return Promise.resolve();
     const step = this.authed
       ? this.onRecord(m)
       : this.weDialed
@@ -574,8 +581,21 @@ class Link {
   }
 
   // Refuse WITHOUT saying so — every refusal funnels here, so they are
-  // indistinguishable from each other and from silence (§12.6.2).
-  stall() { /* deliberately nothing */ }
+  // indistinguishable from each other and from silence (§12.6.2). Terminal: what was
+  // wrong was the PEER's, and nothing it can send on this connection changes that.
+  stall() {
+    if (this.stalled) return;
+    this.stalled = true;
+    // The timer and half-open slot remain live: silence must still cost the sender a slot
+    // until the normal deadline. Private handshake material has no further use, though.
+    this.clearEphemeral();
+  }
+
+  // Refuse the same way, but for OUR contention rather than anything the peer did, so the
+  // exchange is not terminal: a caller that arrived while the verified budget was full may
+  // try again on this connection before its deadline retires it. Indistinguishable on the
+  // wire — both are silence — and a retry costs one AEAD open, the same as a fresh dial.
+  stallBusy() { /* deliberately nothing */ }
 
   async becomeAuthed() {
     this.authed = true;
@@ -669,7 +689,7 @@ class Link {
       w1.slice(SUITE_LEN + EPH_LEN + KEM_PK_LEN));
     if (!probe.ok) { this.stall(); return; }
     // Proved: move off the contended budget before the expensive work.
-    if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stall(); return; }
+    if (this.slot && this.slot.limiter && !this.slot.limiter.promote(this.slot)) { this.stallBusy(); return; }
     this.armDeadline(handshakeTimeoutMs);
     await this.ensureKeys();
     const dh = await scalarmult(this.myEph.privateKey, ephI);

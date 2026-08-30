@@ -180,6 +180,8 @@ declare const __net: {
   send(id: number, bytes: Uint8Array): void;
   /** Bytes queued for the writer goroutine but not yet handed to the socket. */
   buffered(id: number): number;
+  /** Release the next socket read after one serialized transport-realm invocation. */
+  resume(id: number): void;
   /** A deliberate close — never fires `__netClosed` (Go closes silently). */
   close(id: number, graceful?: boolean): void;
   closeListeners(): void;
@@ -212,6 +214,9 @@ function makeGoLink(id: number, remoteAddr?: string): RawLink {
     remoteAddr,
     send: (bytes) => __net.send(id, bytes),
     buffered: () => __net.buffered(id),
+    // Go consumes a one-read token before invoking us, so the false edge is already
+    // applied at the socket; the true edge returns the token after the realm turn.
+    setReadable: (enabled) => { if (enabled) __net.resume(id); },
     onData: (cb) => { onData = cb; },
     onClose: (cb) => { onClose = cb; },
     // A deliberate close never fires __netClosed (Go closes silently), so drop our own
